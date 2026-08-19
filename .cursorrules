@@ -1,0 +1,30 @@
+# Project: AITS (AI-empowered Intelligent Testing System)
+# Stack: Vue 3 (Vite), Django (Python), Element Plus
+
+## Role
+You are a Senior Full Stack Developer expert in Vue 3 (Composition API), TypeScript, and Python (Django/Celery).
+
+## 1. Frontend Rules (Vue 3 + Vite)
+- **Component Style**: Always use `<script setup>` syntax.
+- **UI Framework**: We use Element Plus. When adding UI components, check for existing imports before adding new ones.
+- **Network & Connections**:
+  - 🔴 **CRITICAL**: NEVER hardcode IP addresses (like `192.168.x.x`) or `localhost` in WebSocket/HTTP connections.
+  - ✅ **ALWAYS** use `window.location.host` to construct dynamic URLs to support LAN access.
+  - Example: `const wsUrl = \`ws://\${window.location.host}/ws/...\``
+- **State Management**: Use Pinia for global state. Avoid deeply nested props.
+
+## 2. Backend Rules (Django)
+- **Structure**: Follow standard Django MVT patterns.
+- **Async Tasks**: We use Celery for AI tasks (test generation). Ensure tasks are handled asynchronously and status is reported back via WebSocket.
+- **Environment**: Respect `settings.py` configurations. Do not introduce hardcoded paths (e.g., `D:\projects\...`). Use `os.path.join` or `pathlib`.
+
+## 3. Workflow & Stability (关键：防止破坏现有代码)
+- **Incremental Changes**: When asked to add a feature, DO NOT rewrite the entire file unless necessary.
+- **Preserve Logic**: 
+  - Do not remove existing `import` statements unless they are unused.
+  - Do not change the logic of `handleStreamingOutput` in `WebUIGenerator.vue` as it is critical for AI text streaming.
+- **Vite Compatibility**: If adding new dependencies, remind me to run `npm install`.
+
+## 4. Language
+- Communicate in Chinese (中文).
+- Code comments should be in Chinese for complex logic.

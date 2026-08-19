@@ -1,0 +1,1062 @@
+"""
+WebUI Playwright智能体
+用于生成WebUI测试脚本的智能体
+使用mcp-use集成MCP访问能力，支持流式输出
+"""
+
+import logging
+import asyncio
+import os
+import shutil
+import platform
+import subprocess
+from collections import deque
+from typing import TypedDict, Dict, Any, Optional
+from datetime import datetime
+from django.core.cache import cache
+from .models import MCPConfiguration
+from langgraph.graph import StateGraph, END
+from common.websocket import websocket_message_service, send_node_start_notification_helper
+from common.parsers import extract_python_from_output
+from .model_manager import get_llm_manager
+from mcp_use import MCPClient, MCPAgent
+
+logger = logging.getLogger(__name__)
+
+def _enforce_script_guarantees(script: str, description: str = '') -> str:
+    """轻量级草稿脚本兜底：仅保证基础导包合法"""
+    if not script or not script.strip():
+        return script
+    required_import = 'from playwright.async_api import async_playwright, expect'
+    if required_import not in script:
+        script = required_import + '\n' + script
+    return script
+
+
+# 定义WebUI Playwright Agent状态数据结构
+class WebUIPlaywrightAgentState(TypedDict):
+    """WebUI Playwright测试脚本生成Agent的状态数据"""
+    description: str                    # 用户需求描述
+    url: str                           # 目标URL
+    user_id: int                       # 用户ID
+    project_id: Optional[int]          # 项目ID
+    script_name: Optional[str]         # 脚本名称
+    mcp_config: Dict[str, Any]         # MCP服务器配置
+    test_case_id: Optional[int]        # 测试用例ID
+    steps_info: Optional[str]          # 测试步骤（JSON 或结构化文本）
+    expected_result: Optional[str]      # 预期结果
+    yaml_test_script: Optional[str]     # 生成的yaml测试脚本
+    test_script: Optional[str]          # 转换后的Python测试脚本
+    script_id: Optional[int]            # 保存的脚本ID
+    current_step: str                   # 当前执行步骤
+
+
+class WebUIPlaywrightAgent:
+    """WebUI Playwright测试脚本生成智能体"""
+    
+    def __init__(self, user_id: int, user=None, enable_streaming: bool = True):
+        self.user = user
+        self.user_id = user_id
+        self.enable_streaming = enable_streaming
+        self.project_id = None
+        self.script_name = None
+        self.mcp_config = {}
+        self.test_case_id = None
+        # 外部注入：当前Celery任务ID（用于协作式取消）
+        self.celery_task_id: Optional[str] = None
+        
+        # 修复LoggingProxy问题
+        try:
+            import sys
+            import subprocess
+            
+            # 保存原始的subprocess.Popen
+            original_popen = subprocess.Popen
+            
+            def patched_popen(*args, **kwargs):
+                # 如果stderr是LoggingProxy，替换为subprocess.PIPE
+                if 'stderr' in kwargs and hasattr(kwargs['stderr'], '__class__') and 'LoggingProxy' in str(kwargs['stderr'].__class__):
+                    kwargs['stderr'] = subprocess.PIPE
+                return original_popen(*args, **kwargs)
+            
+            # 应用补丁
+            subprocess.Popen = patched_popen
+            logger.info("已应用LoggingProxy修复补丁")
+            
+        except Exception as e:
+            logger.warning(f"应用LoggingProxy修复补丁失败: {e}")
+        
+        # 启用MCP调试模式
+        try:
+            import mcp_use
+            mcp_use.set_debug(1)  # 设置INFO级别调试
+            logger.info("MCP调试模式已启用")
+        except Exception as e:
+            logger.warning(f"启用MCP调试模式失败: {e}")
+        
+        # 初始化LLM管理器
+        try:
+            self.llm_manager = get_llm_manager()
+            logger.info(f"LLM管理器初始化成功: {self.llm_manager.get_model_info()}")
+        except Exception as e:
+            logger.error(f"LLM管理器初始化失败: {e}")
+            raise RuntimeError(f"LLM管理器初始化失败: {e}") from e
+        
+        # 初始化MCP客户端
+        self.mcp_client = None
+        self.mcp_agent = None
+        # MCP日志handler（避免重复挂载导致日志重复）
+        self._mcp_log_handler = None
+        # 最近输出去重：只在短窗口内去重，避免刷屏
+        self._recent_log_hashes = deque(maxlen=200)
+        
+        # 构建LangGraph工作流
+        self.workflow = self._build_workflow()
+
+    def _is_cancelled(self) -> bool:
+        """通过cache标记判断是否已请求取消（由停止接口写入）。"""
+        if not self.celery_task_id:
+            return False
+        return bool(cache.get(f"celery:cancel:{self.celery_task_id}"))
+
+    async def _wait_cancel_signal(self, poll_interval: float = 0.5):
+        """异步等待取消信号（用于并发取消 mcp_agent.run）。"""
+        while True:
+            if self._is_cancelled():
+                return
+            await asyncio.sleep(poll_interval)
+    
+    
+    def _initialize_mcp_client(self, config: Dict[str, Any]) -> MCPClient:
+        """初始化MCP客户端"""
+        try:
+            # 临时修改sys.stderr以避免LoggingProxy问题
+            import sys
+            import subprocess
+            
+            # 保存原始stderr
+            original_stderr = sys.stderr
+            
+            try:
+                # 临时将stderr设置为subprocess.PIPE
+                sys.stderr = subprocess.PIPE
+                
+                # 验证MCP配置
+                self._validate_mcp_config(config)
+                
+                # 创建MCP客户端
+                client = MCPClient.from_dict(config)
+                
+                logger.info("MCP客户端创建成功")
+                return client
+                
+            finally:
+                # 恢复原始stderr
+                sys.stderr = original_stderr
+                
+        except Exception as e:
+            logger.error(f"MCP客户端初始化失败: {e}")
+            raise RuntimeError(f"MCP客户端初始化失败: {e}") from e
+    
+    def _validate_mcp_config(self, config: Dict[str, Any]) -> None:
+        """验证MCP配置（增强Windows平台支持）"""
+        mcp_servers = config.get('mcpServers', {})
+        if not mcp_servers:
+            raise ValueError("MCP配置中没有找到mcpServers")
+        
+        is_windows = platform.system() == 'Windows'
+        
+        for server_name, server_config in mcp_servers.items():
+            if 'command' not in server_config:
+                raise ValueError(f"MCP服务器 {server_name} 缺少command字段")
+            
+            command = server_config['command']
+            args = server_config.get('args', [])
+            
+            logger.info(f"验证MCP服务器 {server_name}: command={command}, args={args}")
+            
+            # 检查命令是否存在
+            command_path = shutil.which(command)
+            if not command_path:
+                error_msg = f"MCP服务器命令 '{command}' 在PATH中未找到"
+                logger.error(error_msg)
+                
+                # Windows平台特殊提示
+                if is_windows:
+                    if command == 'npx':
+                        error_msg += "。请确保已安装Node.js，并且npx在PATH中可用。"
+                    elif command.endswith('.sh') or command.endswith('.bash'):
+                        error_msg += "。Windows系统不支持直接执行.sh脚本，请使用对应的Windows可执行文件。"
+                
+                raise ValueError(error_msg)
+            
+            # Windows平台额外验证
+            if is_windows:
+                # 检查文件是否存在且可执行
+                if os.path.exists(command_path):
+                    # 检查是否是有效的可执行文件
+                    if command_path.endswith('.sh') or command_path.endswith('.bash'):
+                        raise ValueError(f"Windows系统不支持执行Shell脚本: {command_path}。请使用Windows可执行文件或npx。")
+                    
+                    # 对于npx，检查Node.js是否可用
+                    if command == 'npx':
+                        try:
+                            result = subprocess.run(
+                                ['node', '--version'],
+                                capture_output=True,
+                                text=True,
+                                timeout=5
+                            )
+                            if result.returncode != 0:
+                                raise ValueError("Node.js未正确安装或不可用")
+                            logger.info(f"Node.js版本: {result.stdout.strip()}")
+                        except FileNotFoundError:
+                            raise ValueError("Node.js未安装。请先安装Node.js才能使用npx命令。")
+                        except Exception as e:
+                            logger.warning(f"检查Node.js时出错: {e}")
+                else:
+                    logger.warning(f"命令路径不存在: {command_path}")
+            
+            logger.info(f"MCP服务器 {server_name} 验证通过: {command_path}")
+    
+    def _initialize_mcp_agent(self, client: MCPClient) -> MCPAgent:
+        """初始化MCP智能体"""
+        try:
+            # 临时修改sys.stderr以避免LoggingProxy问题
+            import sys
+            import subprocess
+            
+            # 保存原始stderr
+            original_stderr = sys.stderr
+            
+            try:
+                # 临时将stderr设置为subprocess.PIPE
+                sys.stderr = subprocess.PIPE
+                
+                # 获取LLM模型实例
+                llm_model = self.llm_manager.current_llm
+                
+                if not llm_model:
+                    raise RuntimeError("LLM模型未初始化")
+                
+                # 记录使用的LLM模型信息
+                model_info = self.llm_manager.get_model_info()
+                logger.info(f"使用LLM模型: {model_info}")
+                
+                # 创建MCP智能体
+                agent = MCPAgent(
+                    llm=llm_model,
+                    client=client,
+                    max_steps=30
+                )
+                
+                logger.info("MCP智能体初始化成功")
+                return agent
+                
+            finally:
+                # 恢复原始stderr
+                sys.stderr = original_stderr
+                
+        except Exception as e:
+            logger.error(f"MCP智能体初始化失败: {e}")
+            raise RuntimeError(f"MCP智能体初始化失败: {e}") from e
+    
+    def _build_workflow(self) -> StateGraph:
+        """构建LangGraph工作流"""
+        # 创建状态图
+        graph = StateGraph(WebUIPlaywrightAgentState)
+        
+        # 添加所有节点
+        graph.add_node("load_mcp_config", self._load_mcp_config_node)
+        graph.add_node("initialize_mcp", self._initialize_mcp_node)
+        graph.add_node("call_mcp", self._call_mcp_node)
+        graph.add_node("save_script", self._save_script_node)
+        
+        # 设置入口点
+        graph.set_entry_point("load_mcp_config")
+        
+        # 添加条件边
+        graph.add_conditional_edges(
+            "load_mcp_config",
+            self._decide_after_config_load,
+            {
+                "initialize_mcp": "initialize_mcp",
+                "__end__": END
+            }
+        )
+        
+        graph.add_conditional_edges(
+            "initialize_mcp",
+            self._decide_after_mcp_init,
+            {
+                "call_mcp": "call_mcp",
+                "__end__": END
+            }
+        )
+        
+        graph.add_conditional_edges(
+            "call_mcp",
+            self._decide_after_mcp_call,
+            {
+                "save_script": "save_script",
+                "__end__": END
+            }
+        )
+
+        graph.add_edge("save_script", END)
+        
+        return graph.compile()
+    
+    def _send_websocket_message(self, content: str, step: str = ""):
+        """发送WebSocket流式消息"""
+        if not self.enable_streaming or not self.user_id:
+            return False
+        
+        try:
+            timestamp = datetime.now().isoformat()
+            
+            # 检查WebSocket服务是否可用
+            if not websocket_message_service.is_available():
+                logger.error("WebSocket服务不可用，无法发送消息")
+                return False
+            
+            success = websocket_message_service.send_streaming_output(
+                user_id=self.user_id,
+                step=step,
+                content=content,
+                timestamp=timestamp,
+                room_type="webui_auto_test"
+            )
+            
+            if not success:
+                logger.warning(f"WebSocket流式消息发送失败: step={step}")
+            
+            return success
+        except Exception as e:
+            logger.error(f"WebSocket消息发送异常: {e}")
+            return False
+    
+    def _send_node_start_notification(self, node_name: str, node_display_name: str):
+        """发送节点开始执行通知（使用统一的辅助函数）"""
+        return send_node_start_notification_helper(
+            user_id=self.user_id,
+            node_name=node_name,
+            node_display_name=node_display_name,
+            enable_streaming=self.enable_streaming,
+            room_type="webui_auto_test"
+        )
+    
+    def _send_task_completed_notification(self, state: WebUIPlaywrightAgentState):
+        """发送任务完成通知"""
+        if not self.enable_streaming or not self.user_id:
+            return False
+        
+        try:
+            timestamp = datetime.now().isoformat()
+            
+            # 检查WebSocket服务是否可用
+            if not websocket_message_service.is_available():
+                logger.error("WebSocket服务不可用，无法发送任务完成通知")
+                return False
+            
+            # 构建任务结果
+            result = {
+                "test_script": state.get("test_script"),
+                "script_id": state.get("script_id"),
+                "test_case_id": state.get("test_case_id"),
+                "current_step": state.get("current_step", "completed")
+            }
+            
+            success = websocket_message_service.send_task_completed(
+                user_id=self.user_id,
+                task_id="webui_auto_test",
+                result=result,
+                message="任务完成",
+                timestamp=timestamp,
+                room_type="webui_auto_test"
+            )
+            
+            if success:
+                logger.info("任务完成通知发送成功")
+            else:
+                logger.warning("WebSocket任务完成通知发送失败")
+            
+            return success
+        except Exception as e:
+            logger.error(f"WebSocket任务完成通知发送异常: {e}")
+            return False
+    
+    def _process_and_send_mcp_output(self, message: str, levelno: int = logging.INFO):
+        """处理并发送MCP智能体输出到前端（带去重/过滤）"""
+        if not message:
+            return
+        
+        message = message.strip()
+        if not message:
+            return
+        
+        # 过滤掉过长/噪音内容
+        if "📄 Tool result:" in message:
+            return
+        if "Anonymized telemetry enabled" in message or "MCP_USE_ANONYMIZED_TELEMETRY" in message:
+            return
+
+        # 去重：短窗口内相同消息只发一次（解决重复日志）
+        msg_hash = hash(message)
+        if msg_hash in self._recent_log_hashes:
+            return
+        self._recent_log_hashes.append(msg_hash)
+        
+        self._send_websocket_message(f"{message}\n", "MCP智能体运行")
+        
+    
+    def _load_mcp_config_node(self, state: WebUIPlaywrightAgentState) -> Dict[str, Any]:
+        """1. 加载MCP配置节点"""
+        self._send_node_start_notification("load_mcp_config", "加载MCP配置")
+        
+        try:
+            # 获取用户ID
+            user_id = state.get("user_id")
+            
+            # 发送开始加载的消息
+            self._send_websocket_message("开始加载MCP配置...\n", "加载MCP配置")
+            
+            # 构建查询条件
+            query_filter = {'is_active': True}
+            if user_id:
+                query_filter['created_by_id'] = user_id
+            
+            # 查询启用的MCP配置
+            mcp_configs = MCPConfiguration.objects.filter(**query_filter)
+            
+            if not mcp_configs.exists():
+                logger.info(f"用户 {user_id} 没有找到启用的MCP配置")
+                mcp_config = {"mcpServers": {}}
+                self._send_websocket_message(f"⚠️ 用户 {user_id} 没有找到启用的MCP配置\n", "加载MCP配置")
+            else:
+                logger.info(f"找到 {mcp_configs.count()} 个启用的MCP配置")
+                
+                # 发送找到配置的消息
+                self._send_websocket_message(f"📋 找到 {mcp_configs.count()} 个启用的MCP配置\n", "加载MCP配置")
+                
+                # 查找包含mcp-playwright且激活的配置
+                playwright_config = None
+                for config in mcp_configs:
+                    try:
+                        config_dict = config.get_config_dict()
+                        mcp_servers = config_dict.get('mcpServers', {})
+                        
+                        # 检查是否包含mcp-playwright
+                        if 'playwright' not in mcp_servers:
+                            continue
+                        
+                        # 检查mcp-playwright是否激活
+                        playwright_config_data = mcp_servers['playwright']
+                        is_active = playwright_config_data.get('is_active', True)  # 默认为激活状态
+                        
+                        if not is_active:
+                            logger.warning(f"MCP配置 {config.id} 中的playwright未激活")
+                            continue
+                        
+                        playwright_config = config
+                        logger.info(f"找到mcp-playwright配置: {config.id}")
+                        break
+                        
+                    except Exception as e:
+                        logger.warning(f"解析MCP配置 {config.id} 失败: {e}")
+                        continue
+                
+                # 构建MCP配置
+                if playwright_config:
+                    try:
+                        config_dict = playwright_config.get_config_dict()
+                        mcp_config = {"mcpServers": config_dict['mcpServers']}
+                        
+                        # 修改playwright配置以避免LoggingProxy问题
+                        if 'playwright' in mcp_config['mcpServers']:
+                            playwright_server_config = mcp_config['mcpServers']['playwright']
+                            
+                            # 设置环境变量
+                            if 'env' not in playwright_server_config:
+                                playwright_server_config['env'] = {}
+                            
+                            playwright_server_config['env']['PYTHONUNBUFFERED'] = '1'
+                            playwright_server_config['env']['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
+                            
+                            # 添加超时设置
+                            if 'timeout' not in playwright_server_config:
+                                playwright_server_config['timeout'] = 30
+                            
+                            # 确保命令和参数正确
+                            if 'command' not in playwright_server_config:
+                                logger.error("MCP playwright配置缺少command字段")
+                                raise ValueError("MCP playwright配置缺少command字段")
+                            
+                            logger.info(f"MCP playwright配置: command={playwright_server_config.get('command')}, args={playwright_server_config.get('args', [])}")
+                        
+                        logger.info(f"成功加载mcp-playwright配置: {list(config_dict['mcpServers'].keys())}")
+                        
+                        # 发送成功消息
+                        self._send_websocket_message(f"✅ 成功加载mcp-playwright配置: {list(config_dict['mcpServers'].keys())}\n", "加载MCP配置")
+                    except Exception as e:
+                        logger.error(f"构建MCP配置失败: {e}")
+                        mcp_config = {"mcpServers": {}}
+                        # 发送错误消息
+                        self._send_websocket_message(f"❌ 构建MCP配置失败: {str(e)}\n", "加载MCP配置")
+                else:
+                    logger.warning("没有找到mcp-playwright配置")
+                    # 发送错误消息并返回失败状态
+                    self._send_websocket_message("❌ 没有找到mcp-playwright配置，请先配置MCP服务器\n", "加载MCP配置")
+                    return {
+                        "mcp_config": {"mcpServers": {}},
+                        "current_step": "config_load_failed"
+                    }
+                
+        except Exception as e:
+            logger.error(f"加载MCP配置失败: {e}")
+            # 发送错误消息并返回失败状态
+            self._send_websocket_message(f"❌ 加载MCP配置失败: {str(e)}\n", "加载MCP配置")
+            return {
+                "mcp_config": {"mcpServers": {}},
+                "current_step": "config_load_failed"
+            }
+        
+        return {
+            "mcp_config": mcp_config,
+            "current_step": "config_loaded"
+        }
+    
+    def _initialize_mcp_node(self, state: WebUIPlaywrightAgentState) -> Dict[str, Any]:
+        """2. 初始化MCP客户端和智能体节点"""
+        self._send_node_start_notification("initialize_mcp", "初始化MCP客户端")
+        
+        try:
+            # 验证MCP配置
+            mcp_config = state.get("mcp_config", {})
+            if not mcp_config:
+                raise RuntimeError("MCP配置为空")
+            
+            # 初始化MCP客户端
+            self.mcp_client = self._initialize_mcp_client(mcp_config)
+            self._send_websocket_message("MCP客户端初始化完成\n", "初始化MCP客户端")
+            
+            # 初始化MCP智能体（会话将在调用时按需创建）
+            self.mcp_agent = self._initialize_mcp_agent(self.mcp_client)
+            
+            return {
+                "current_step": "mcp_initialized"
+            }
+        except Exception as e:
+            logger.error(f"初始化MCP失败: {e}")
+            self._send_websocket_message(f"❌ 初始化MCP失败: {str(e)}\n", "初始化MCP客户端")
+            return {
+                "current_step": "mcp_init_failed"
+            }
+    
+    async def _ensure_mcp_sessions(self) -> bool:
+        """确保MCP会话已创建（异步版本，增强错误处理）"""
+        if not self.mcp_client:
+            raise RuntimeError("MCP客户端未初始化")
+        
+        try:
+            # 创建或重新创建MCP会话
+            await self.mcp_client.create_all_sessions()
+            logger.debug("MCP会话已确保创建")
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"创建MCP会话失败: {error_msg}")
+            
+            # Windows平台特殊错误处理
+            import platform
+            if platform.system() == 'Windows':
+                if 'WinError 193' in error_msg or '不是有效的 Win32 应用程序' in error_msg:
+                    detailed_error = (
+                        "MCP命令执行失败：不是有效的Win32应用程序。\n"
+                        "可能的原因：\n"
+                        "1. 命令路径不正确或文件不存在\n"
+                        "2. 尝试执行了非Windows可执行文件（如.sh脚本）\n"
+                        "3. 架构不匹配（32位/64位）\n"
+                        "4. 如果使用npx，请确保Node.js已正确安装\n"
+                        f"错误详情: {error_msg}"
+                    )
+                    logger.error(detailed_error)
+                    self._send_websocket_message(f"❌ {detailed_error}\n", "MCP会话创建")
+            
+            return False
+    
+    async def _cleanup_mcp_resources(self):
+        """清理MCP资源（会话和客户端）"""
+        try:
+            if self.mcp_client:
+                await self.mcp_client.close_all_sessions()
+                logger.debug("MCP会话已关闭")
+        except Exception as e:
+            logger.warning(f"清理MCP资源时出错: {e}")
+        finally:
+            self.mcp_client = None
+            self.mcp_agent = None
+    
+    async def _call_mcp_node(self, state: WebUIPlaywrightAgentState) -> Dict[str, Any]:
+        """4. 调用MCP节点生成Playwright Python测试脚本"""
+        self._send_node_start_notification("call_mcp", "调用MCP执行并生成Playwright Python脚本")
+        
+        try:
+            if not self.mcp_agent:
+                raise RuntimeError("MCP智能体未初始化")
+            
+            # 构建用户需求描述
+            description = state['description']
+            target_url = state['url']
+
+            # 获取当前项目已定义的标准元素库 (POM)
+            elements_context = "当前项目暂无收录的标准页面元素。"
+            if state.get("project_id"):
+                try:
+                    from web_testing.models import WebElement
+                    elements = WebElement.objects.filter(page__project_id=state["project_id"]).select_related('page')
+                    if elements.exists():
+                        el_list = [
+                            f"- 页面【{el.page.name}】| 元素: {el.name} | 定位器: {el.locator_type}={el.locator_value} | 推荐操作: {el.action_type or '自动识别'}"
+                            for el in elements
+                        ]
+                        elements_context = "\n".join(el_list)
+                except Exception as e:
+                    logger.error(f"提取项目 POM 元素库失败: {e}")
+
+            # 构建MCP调用提示词 - 直接生成playwright Python脚本
+            mcp_prompt = f"""
+你是一个 Playwright 自动化测试专家，请根据以下信息生成测试脚本：
+
+【目标 URL】: {target_url}
+【用户需求】: {description}
+
+【核心准则：标准元素库 (POM) 优先】
+在生成脚本时，必须优先使用以下已定义的标准元素定位器。如果库中存在匹配业务语义的元素，严禁自行"脑补"其他选择器：
+{elements_context}
+
+【代码编写规范】
+1. 必须使用 `from playwright.async_api import async_playwright, expect`（文件头部强制导入）。
+2. 使用 `pytest` 风格编写，测试函数定义为 `def test_xxx(page: Page):`，函数名需体现用户需求语义。
+3. 只能使用 pytest fixture 提供的 `page`，禁止在代码内部使用 `with sync_playwright()`。
+4. 若标准元素库中不存在所需元素，请遵循 Playwright 最佳实践，优先使用稳定选择器（`get_by_role`, `get_by_label`, `get_by_placeholder` 等）。
+5. 测试脚本必须包含至少一个断言，使用 `expect(...)` 进行验证。
+6. 必须使用相对路径访问页面，例如 `page.goto("/")`，以便支持外部传入的 base_url。
+7. 脚本必须为完整、可直接运行的 Python 代码，严禁包含任何解释、说明文字或 Markdown 格式标记。
+8. 严禁包含注释或未使用的 import。
+
+【操作类型严格区分 - 必须遵守】
+- 输入类操作（fill/输入）：需要传入文本参数，如 `page.get_by_placeholder("手机号").fill("13800138000")`。
+- 点击/无参类操作（click、访问网站、导航等）：绝对不允许传递或定义任何参数。调用时仅 `page.get_by_role("button").click()`，禁止写成 `click(text="")` 或给无参方法定义 text 参数。
+- 若定义 Fallback 类或降级处理方法，点击按钮、访问链接等无参操作的方法签名为 `def method(self):`，严禁 `def method(self, text):`。
+
+【起步导航规范 - 显式化 - 必须遵守】
+- 在 run(page) 或 test_xxx(page) 函数内部的第一行，必须显式生成 `await page.goto("/")`。
+- 目的：即便底层有 BaseURL 注入，也必须在脚本中让用户看到起步动作，增强可读性与完整性。
+- 绝对禁止在脚本中硬编码完整域名（如 http://...）。基地址(Base URL) 由 BrowserContext 统一管理。
+
+【智能断言规范 - 死命令 - 必须遵守】
+- 你生成的 run(page) 必须以 `await expect(...)` 结尾。
+- 严禁将断言逻辑写在 POM 页面类的方法内部，必须写在 run(page) 的最后一行，直接操作 page 对象进行校验。
+- 动态提取关键词：分析 expected_result/预期结果，提取 4-10 个核心业务字符，忽略引导词（系统显示、用户看到、应该、弹出等）。
+- 优先使用 `await expect(page.get_by_text("关键词")).to_be_visible()`，默认不开启 exact=True。
+- 若预期涉及 URL 跳转，使用 `await expect(page).to_have_url(re.compile(r"..."))`。
+
+【POM 职责分离 - 必须遵守】
+- POM 类的方法仅负责元素操作（点击、输入、选择、悬停），不负责页面跳转。
+- 所有的页面跳转（goto）必须由 run(page) 主动发起，严禁在 POM 方法内部调用 page.goto。
+
+【代码示例（参考形态）】
+```python
+async def run(page):
+    # 第一步：显式起步
+    await page.goto("/")
+    
+    # ... 业务操作 ...
+    
+    # 最终步：智能断言 (假设预期结果为: 系统提示手机号格式不正确)
+    await expect(page.get_by_text("手机号格式不正确")).to_be_visible()
+```
+"""
+            
+            # 发送开始生成的消息
+            self._send_websocket_message(f"用户需求: {description}\n", "MCP智能体生成")
+            self._send_websocket_message(f"目标URL: {target_url}\n", "MCP智能体生成")
+            
+            # 调用MCP智能体生成脚本（异步调用）
+            try:
+                raw_output = await self._call_mcp_agent_async(mcp_prompt)
+            except RuntimeError as e:
+                # 如果是取消异常，返回明确的取消状态
+                if "任务已被取消" in str(e):
+                    self._send_websocket_message("⛔ 任务已被取消，已终止脚本生成\n", "MCP智能体生成")
+                    return {
+                        "current_step": "cancelled",
+                        "test_script": None,
+                        "cancelled": True
+                    }
+                # 其他RuntimeError继续抛出
+                raise
+            
+            if not raw_output:
+                logger.error("MCP生成脚本失败: 返回空内容")
+                # 发送失败消息
+                self._send_websocket_message("❌ MCP生成脚本失败: 返回空内容\n", "MCP智能体生成")
+                return {
+                    "current_step": "script_generation_failed",
+                    "test_script": None
+                }
+            
+            # 从MCP输出中提取Python脚本
+            script = extract_python_from_output(raw_output)
+
+            if script:
+                script = _enforce_script_guarantees(script)
+            
+            if not script:
+                logger.warning("从MCP输出中提取Playwright Python脚本失败")
+                # 发送失败消息
+                self._send_websocket_message("❌ 从MCP输出中提取Playwright Python脚本失败\n", "MCP智能体生成")
+                return {
+                    "current_step": "script_generation_failed",
+                    "test_script": None
+                }
+            
+            
+            # 发送脚本生成完成的消息
+            self._send_websocket_message("🎉 脚本生成完成！\n", "MCP智能体生成")
+            
+            return {
+                "test_script": script,
+                "current_step": "script_generated"
+            }
+        except RuntimeError as e:
+            if "任务已被取消" in str(e):
+                self._send_websocket_message("⛔ 任务已被取消，已终止脚本生成\n", "MCP智能体生成")
+                return {"current_step": "cancelled", "test_script": None, "cancelled": True}
+            raise
+        except Exception as e:
+            logger.error(f"MCP生成Playwright Python测试脚本失败: {e}")
+            self._send_websocket_message(f"❌ MCP生成Playwright Python测试脚本失败: {str(e)}\n", "MCP智能体生成")
+            return {"current_step": "script_generation_failed", "test_script": None}
+    
+    async def _call_mcp_agent_async(self, prompt: str) -> str:
+        """异步调用MCP智能体生成脚本"""
+        # 在开始前检查是否已取消
+        if self._is_cancelled():
+            self._send_websocket_message("已收到停止指令，终止MCP智能体执行\n", "MCP智能体运行")
+            raise RuntimeError("任务已被取消")
+        
+        max_retries = 3
+        base_retry_delay = 2  # 基础重试延迟（秒）
+        
+        for attempt in range(max_retries):
+            # 每次重试前检查是否已取消
+            if self._is_cancelled():
+                self._send_websocket_message("已收到停止指令，终止MCP智能体执行\n", "MCP智能体运行")
+                raise RuntimeError("任务已被取消")
+            
+            try:
+                # 确保MCP会话已创建
+                if not await self._ensure_mcp_sessions():
+                    raise RuntimeError("MCP会话创建失败")
+                
+                # 设置日志处理器捕获MCP输出
+                mcp_handler = self._setup_mcp_output_handler()
+                
+                try:
+                    self._send_websocket_message("📝 MCP智能体终端输出:\n", "MCP智能体运行")
+                    # 使用MCP智能体的run方法（并发监听取消）
+                    run_task = asyncio.create_task(self.mcp_agent.run(prompt))
+                    cancel_task = asyncio.create_task(self._wait_cancel_signal())
+
+                    done, pending = await asyncio.wait(
+                        {run_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    # 取消信号先到：尽力取消run_task
+                    if cancel_task in done and self._is_cancelled():
+                        self._send_websocket_message("已收到停止指令，正在尝试终止当前MCP执行...\n", "MCP智能体运行")
+                        run_task.cancel()
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise RuntimeError("任务已被取消")
+
+                    # MCP执行先结束：取消cancel_task
+                    cancel_task.cancel()
+                    try:
+                        await cancel_task
+                    except asyncio.CancelledError:
+                        pass
+
+                    result = await run_task
+                    
+                    self._send_websocket_message("✅ MCP智能体运行完成\n", "MCP智能体运行")
+                    return result
+                
+                finally:
+                    # 清理日志处理器
+                    self._cleanup_mcp_output_handler(mcp_handler)
+                    
+            except RuntimeError as e:
+                # 如果是取消异常，直接抛出，不重试
+                if "任务已被取消" in str(e):
+                    raise
+                # 其他RuntimeError继续重试逻辑
+                logger.error(f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                
+                if attempt < max_retries - 1:
+                    # 指数退避重试
+                    retry_delay = base_retry_delay * (2 ** attempt)
+                    self._send_websocket_message(
+                        f"⚠️ 连接失败，{retry_delay}秒后重试...\n", 
+                        "MCP智能体运行"
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    # 最后一次尝试失败
+                    self._send_websocket_message(
+                        f"❌ MCP智能体运行失败: {str(e)}\n", 
+                        "MCP智能体运行"
+                    )
+                    raise
+            except Exception as e:
+                logger.error(f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                
+                if attempt < max_retries - 1:
+                    # 指数退避重试
+                    retry_delay = base_retry_delay * (2 ** attempt)
+                    self._send_websocket_message(
+                        f"⚠️ 连接失败，{retry_delay}秒后重试...\n", 
+                        "MCP智能体运行"
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    # 最后一次尝试失败
+                    self._send_websocket_message(
+                        f"❌ MCP智能体运行失败: {str(e)}\n", 
+                        "MCP智能体运行"
+                    )
+                    raise
+        
+        raise Exception("MCP智能体运行失败，已达到最大重试次数")
+    
+    def _setup_mcp_output_handler(self):
+        """设置MCP输出日志处理器（INFO/WARN/ERROR均捕获，避免重复挂载）"""
+        import logging
+        
+        class MCPOutputHandler(logging.Handler):
+            def __init__(self, agent_instance):
+                super().__init__()
+                self.agent = agent_instance
+            
+            def emit(self, record):
+                try:
+                    message = self.format(record)
+                    self.agent._process_and_send_mcp_output(message, record.levelno)
+                except Exception as e:
+                    # 避免handler异常导致日志系统递归
+                    logger.warning(f"MCP日志处理器异常: {e}")
+        
+        mcp_logger = logging.getLogger('mcp_use')
+
+        # 如果已经挂了handler，直接复用，避免重复输出
+        if self._mcp_log_handler and self._mcp_log_handler in mcp_logger.handlers:
+            return self._mcp_log_handler
+
+        handler = MCPOutputHandler(self)
+        handler.setLevel(logging.INFO)  # 过滤DEBUG，减少噪音（需要DEBUG可改为DEBUG）
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        mcp_logger.addHandler(handler)
+        self._mcp_log_handler = handler
+        return handler
+    
+    def _cleanup_mcp_output_handler(self, handler):
+        """清理MCP输出日志处理器"""
+        import logging
+        mcp_logger = logging.getLogger('mcp_use')
+        try:
+            if handler and handler in mcp_logger.handlers:
+                mcp_logger.removeHandler(handler)
+        finally:
+            if handler == self._mcp_log_handler:
+                self._mcp_log_handler = None
+    
+
+    
+    def _decide_after_config_load(self, state: WebUIPlaywrightAgentState) -> str:
+        """配置加载后的决策"""
+        if state.get("current_step") == "config_loaded":
+            return "initialize_mcp"
+        elif state.get("current_step") == "config_load_failed":
+            return "__end__"
+        else:
+            return "__end__"
+    
+    def _decide_after_mcp_init(self, state: WebUIPlaywrightAgentState) -> str:
+        """MCP初始化后的决策：当前Agent仅用于AI实验室，直接走自由探索节点"""
+        if state.get("current_step") != "mcp_initialized":
+            return "__end__"
+        return "call_mcp"
+    
+    def _decide_after_mcp_call(self, state: WebUIPlaywrightAgentState) -> str:
+        """MCP调用后的决策"""
+        # 如果已取消，直接结束
+        if state.get("current_step") == "cancelled" or state.get("cancelled"):
+            return "__end__"
+        if state.get("current_step") == "script_generated" and state.get("test_script"):
+            return "save_script"
+        else:
+            return "__end__"
+    
+    
+    
+    def _save_script_node(self, state: WebUIPlaywrightAgentState) -> WebUIPlaywrightAgentState:
+        """保存脚本到数据库"""
+        # 发送节点开始通知
+        self._send_node_start_notification("save_script", "保存脚本到数据库")
+        
+        try:
+            python_script = state.get("test_script")
+            user_id = state.get("user_id")
+            project_id = state.get("project_id")
+            script_name = state.get("script_name", "WebUI Playwright测试脚本")
+            description = state.get("description")
+            url = state.get("url")
+            test_case_id = state.get("test_case_id")  # 获取测试用例ID
+            
+            if not python_script:
+                logger.warning("没有Python脚本内容需要保存")
+                return {
+                    **state,
+                    "current_step": "save_failed"
+                }
+            
+            # 判断保存方式：如果有test_case_id则是选择测试用例方式，否则是手动填写方式
+            if test_case_id:
+                # 选择测试用例方式：保存到WebUITestCase模型的test_script_content字段
+                self._send_websocket_message("💾 开始保存Python脚本到测试用例...\n", "脚本保存")
+                
+                # 导入模型
+                from web_testing.models import WebUITestCase
+                from django.contrib.auth import get_user_model
+                
+                # 获取自定义用户模型
+                User = get_user_model()
+                user = User.objects.get(id=user_id)
+                
+                # 获取测试用例并更新test_script_content字段
+                test_case = WebUITestCase.objects.get(id=test_case_id, user=user)
+                test_case.test_script_content = python_script
+                test_case.save()
+                self._send_websocket_message(f"✅ Python脚本已保存到测试用例: {test_case.title}\n", "脚本保存")
+                
+                # 发送任务完成通知
+                self._send_task_completed_notification(state)
+                
+                return {
+                    **state,
+                    "test_case_id": test_case_id,
+                    "current_step": "saved"
+                }
+            else:
+                # 手动填写方式：不保存到数据库，只返回成功状态
+                # 发送任务完成通知
+                self._send_task_completed_notification(state)
+                
+                return {
+                    **state,
+                    "current_step": "saved"
+                }
+            
+        except Exception as e:
+            logger.error(f"保存Python脚本失败: {e}")
+            self._send_websocket_message(f"❌ 保存Python脚本失败: {str(e)}\n", "脚本保存")
+            return {
+                **state,
+                "current_step": "save_failed"
+            }
+    
+    
+
+    async def run(self, description: str, url: str = "") -> Dict[str, Any]:
+        """运行WebUI测试脚本生成智能体"""
+        try:
+            if not self.workflow:
+                raise RuntimeError("LangGraph工作流未初始化，无法运行WebUI测试脚本生成智能体")
+            return await self._run_with_langgraph(description, url)
+                
+        except RuntimeError as e:
+            # 如果是取消异常，返回明确的取消状态
+            if "任务已被取消" in str(e):
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "error": "任务已被取消",
+                    "current_step": "cancelled"
+                }
+            # 其他RuntimeError继续抛出
+            raise
+        except Exception as e:
+            error_msg = f"运行WebUI测试脚本生成智能体失败: {str(e)}"
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "current_step": "failed"
+            }
+        finally:
+            # 清理MCP资源
+            await self._cleanup_mcp_resources()
+    
+    async def _run_with_langgraph(self, description: str, url: str) -> Dict[str, Any]:
+        """使用LangGraph工作流运行"""
+        initial_state = {
+            "description": description,
+            "url": url,
+            "user_id": self.user_id,
+            "project_id": self.project_id,
+            "script_name": self.script_name,
+            "mcp_config": self.mcp_config,
+            "test_script": None,
+            "script_id": None,
+            "current_step": "initialized"
+        }
+        result = await self.workflow.ainvoke(initial_state)
+        
+        # 检查是否是因为取消
+        if result.get("current_step") == "cancelled" or result.get("cancelled"):
+            return {
+                "success": False,
+                "cancelled": True,
+                "error": "任务已被取消",
+                "current_step": "cancelled"
+            }
+        
+        # 检查是否有错误
+        if not result.get("test_script"):
+            return {
+                "success": False,
+                "error": "测试脚本生成失败",
+                "current_step": result.get("current_step", "unknown")
+            }
+        
+        # 返回成功结果
+        return {
+            "success": True,
+            "test_script": result.get("test_script"),
+            "script_id": result.get("script_id"),
+            "model_info": self.llm_manager.get_model_info(),
+            "model_type": "llm",
+            "current_step": result.get("current_step", "completed")
+        }
+
+
+
+
+def create_webui_playwright_agent(user, user_id: int = None, enable_streaming: bool = True) -> WebUIPlaywrightAgent:
+    """创建WebUI Playwright智能体实例"""
+    return WebUIPlaywrightAgent(user, user_id, enable_streaming)

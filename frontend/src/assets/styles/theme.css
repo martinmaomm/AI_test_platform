@@ -1,0 +1,164 @@
+/* AITS 全站主题变量 - 亮色 / 深色 */
+
+/* ========== 默认（无 data-theme 时）使用亮色 ========== */
+html:not([data-theme]) {
+  /* 页面通用 */
+  --app-bg: #f5f7fa;
+  --app-bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #e4e7ed 100%);
+  --app-text-primary: #303133;
+  --app-text-secondary: #606266;
+  --app-text-muted: #909399;
+  --app-border: #e6e6e6;
+  --app-border-light: #ebeef5;
+
+  /* Layout - 顶栏/侧边栏 */
+  --layout-header-bg: #fff;
+  --layout-header-border: #e6e6e6;
+  --layout-sidebar-bg: #304156;
+  --layout-sidebar-text: #bfcbd9;
+  --layout-sidebar-active: #409eff;
+  --layout-main-bg: #f0f2f5;
+  --layout-tab-bg: #fff;
+  --layout-tab-border: #e6e6e6;
+  --layout-tab-active-bg: #ecf5ff;
+  --layout-hover-bg: #f5f7fa;
+
+  /* 列表页 - 项目列表等 */
+  --page-wrapper-bg: #f5f7fa;
+  --page-content-bg: #ffffff;
+  --page-content-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+  --page-card-hover-shadow: 0 15px 30px rgba(0, 0, 0, 0.1);
+
+  /* Dashboard 驾驶舱（保留 cockpit 前缀兼容） */
+  --cockpit-bg: linear-gradient(135deg, #f5f7fa 0%, #e4e7ed 100%);
+  --cockpit-grid-line: rgba(0, 0, 0, 0.025);
+  --cockpit-card-bg: rgba(255, 255, 255, 0.7);
+  --cockpit-card-bg-hover: rgba(255, 255, 255, 0.85);
+  --cockpit-card-border: rgba(255, 255, 255, 0.4);
+  --cockpit-card-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+  --cockpit-card-shadow-hover: 0 8px 32px rgba(0, 0, 0, 0.06);
+  --cockpit-blur: 12px;
+  --cockpit-text-primary: #303133;
+  --cockpit-text-secondary: #606266;
+  --cockpit-text-muted: #909399;
+  --cockpit-chart-bg: rgba(0, 0, 0, 0.03);
+  --cockpit-chart-inset: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --cockpit-chart-highlight: 0 1px 0 rgba(255, 255, 255, 0.5);
+  --cockpit-activity-bg: rgba(0, 0, 0, 0.02);
+  --cockpit-activity-border: rgba(64, 158, 255, 0.3);
+  --cockpit-drag-handle-bg: rgba(0, 0, 0, 0.04);
+  --cockpit-edit-outline: rgba(64, 158, 255, 0.5);
+  --cockpit-placeholder-bg: linear-gradient(135deg, rgba(64, 158, 255, 0.25) 0%, rgba(100, 180, 255, 0.15) 100%);
+  --cockpit-placeholder-border: rgba(64, 158, 255, 0.4);
+  --cockpit-flow-highlight: rgba(255, 255, 255, 0.6);
+  --cockpit-portal-glow-api: 0 10px 30px rgba(64, 158, 255, 0.3);
+  --cockpit-portal-glow-web: 0 10px 30px rgba(103, 194, 58, 0.3);
+  --cockpit-portal-glow-app: 0 10px 30px rgba(230, 162, 60, 0.3);
+  --cockpit-portal-glow-perf: 0 10px 30px rgba(156, 39, 176, 0.3);
+}
+
+/* ========== 亮色 - 现代白 ========== */
+html[data-theme='light'] {
+  --app-bg: #f5f7fa;
+  --app-bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #e4e7ed 100%);
+  --app-text-primary: #303133;
+  --app-text-secondary: #606266;
+  --app-text-muted: #909399;
+  --app-border: #e6e6e6;
+  --app-border-light: #ebeef5;
+
+  --layout-header-bg: #fff;
+  --layout-header-border: #e6e6e6;
+  --layout-sidebar-bg: #304156;
+  --layout-sidebar-text: #bfcbd9;
+  --layout-sidebar-active: #409eff;
+  --layout-main-bg: #f0f2f5;
+  --layout-tab-bg: #fff;
+  --layout-tab-border: #e6e6e6;
+  --layout-tab-active-bg: #ecf5ff;
+  --layout-hover-bg: #f5f7fa;
+
+  --page-wrapper-bg: #f5f7fa;
+  --page-content-bg: #ffffff;
+  --page-content-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+  --page-card-hover-shadow: 0 15px 30px rgba(0, 0, 0, 0.1);
+
+  --cockpit-bg: linear-gradient(135deg, #f5f7fa 0%, #e4e7ed 100%);
+  --cockpit-grid-line: rgba(0, 0, 0, 0.025);
+  --cockpit-card-bg: rgba(255, 255, 255, 0.7);
+  --cockpit-card-bg-hover: rgba(255, 255, 255, 0.85);
+  --cockpit-card-border: rgba(255, 255, 255, 0.4);
+  --cockpit-card-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+  --cockpit-card-shadow-hover: 0 8px 32px rgba(0, 0, 0, 0.06);
+  --cockpit-blur: 12px;
+  --cockpit-text-primary: #303133;
+  --cockpit-text-secondary: #606266;
+  --cockpit-text-muted: #909399;
+  --cockpit-chart-bg: rgba(0, 0, 0, 0.03);
+  --cockpit-chart-inset: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --cockpit-chart-highlight: 0 1px 0 rgba(255, 255, 255, 0.5);
+  --cockpit-activity-bg: rgba(0, 0, 0, 0.02);
+  --cockpit-activity-border: rgba(64, 158, 255, 0.3);
+  --cockpit-drag-handle-bg: rgba(0, 0, 0, 0.04);
+  --cockpit-edit-outline: rgba(64, 158, 255, 0.5);
+  --cockpit-placeholder-bg: linear-gradient(135deg, rgba(64, 158, 255, 0.25) 0%, rgba(100, 180, 255, 0.15) 100%);
+  --cockpit-placeholder-border: rgba(64, 158, 255, 0.4);
+  --cockpit-flow-highlight: rgba(255, 255, 255, 0.6);
+  --cockpit-portal-glow-api: 0 10px 30px rgba(64, 158, 255, 0.3);
+  --cockpit-portal-glow-web: 0 10px 30px rgba(103, 194, 58, 0.3);
+  --cockpit-portal-glow-app: 0 10px 30px rgba(230, 162, 60, 0.3);
+  --cockpit-portal-glow-perf: 0 10px 30px rgba(156, 39, 176, 0.3);
+}
+
+/* ========== 深色 - 赛博极客 ========== */
+html[data-theme='dark'] {
+  --app-bg: #0d1117;
+  --app-bg-gradient: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #21262d 100%);
+  --app-text-primary: #e6edf3;
+  --app-text-secondary: #8b949e;
+  --app-text-muted: #6e7681;
+  --app-border: rgba(255, 255, 255, 0.08);
+  --app-border-light: rgba(255, 255, 255, 0.06);
+
+  --layout-header-bg: #161b22;
+  --layout-header-border: rgba(255, 255, 255, 0.08);
+  --layout-sidebar-bg: #0d1117;
+  --layout-sidebar-text: #8b949e;
+  --layout-sidebar-active: #58a6ff;
+  --layout-main-bg: #0d1117;
+  --layout-tab-bg: #161b22;
+  --layout-tab-border: rgba(255, 255, 255, 0.08);
+  --layout-tab-active-bg: rgba(88, 166, 255, 0.15);
+  --layout-hover-bg: rgba(255, 255, 255, 0.08);
+
+  --page-wrapper-bg: #0d1117;
+  --page-content-bg: #161b22;
+  --page-content-shadow: 0 4px 24px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --page-card-hover-shadow: 0 12px 32px rgba(64, 158, 255, 0.2);
+
+  --cockpit-bg: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #21262d 100%);
+  --cockpit-grid-line: rgba(255, 255, 255, 0.04);
+  --cockpit-card-bg: rgba(22, 27, 34, 0.75);
+  --cockpit-card-bg-hover: rgba(33, 38, 45, 0.85);
+  --cockpit-card-border: rgba(255, 255, 255, 0.08);
+  --cockpit-card-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  --cockpit-card-shadow-hover: 0 8px 40px rgba(0, 0, 0, 0.5);
+  --cockpit-blur: 16px;
+  --cockpit-text-primary: #e6edf3;
+  --cockpit-text-secondary: #8b949e;
+  --cockpit-text-muted: #6e7681;
+  --cockpit-chart-bg: rgba(0, 0, 0, 0.25);
+  --cockpit-chart-inset: 0 2px 12px rgba(0, 0, 0, 0.4);
+  --cockpit-chart-highlight: 0 1px 0 rgba(255, 255, 255, 0.06);
+  --cockpit-activity-bg: rgba(255, 255, 255, 0.03);
+  --cockpit-activity-border: rgba(64, 158, 255, 0.5);
+  --cockpit-drag-handle-bg: rgba(255, 255, 255, 0.08);
+  --cockpit-edit-outline: rgba(64, 158, 255, 0.6);
+  --cockpit-placeholder-bg: linear-gradient(135deg, rgba(64, 158, 255, 0.2) 0%, rgba(100, 180, 255, 0.1) 100%);
+  --cockpit-placeholder-border: rgba(64, 158, 255, 0.5);
+  --cockpit-flow-highlight: rgba(255, 255, 255, 0.9);
+  --cockpit-portal-glow-api: 0 12px 40px rgba(64, 158, 255, 0.45);
+  --cockpit-portal-glow-web: 0 12px 40px rgba(103, 194, 58, 0.45);
+  --cockpit-portal-glow-app: 0 12px 40px rgba(230, 162, 60, 0.45);
+  --cockpit-portal-glow-perf: 0 12px 40px rgba(156, 39, 176, 0.45);
+}

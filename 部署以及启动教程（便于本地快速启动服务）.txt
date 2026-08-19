@@ -1,0 +1,54 @@
+--->前置环境准备：
+# 把拿到的aits_v2压缩到目录D:\dev\proj下面，打开anaconda prompt命令行窗口，然后执行：
+cd D:\dev\proj\aits_v2\backend
+d:
+
+# 在backend目录下创建python 3.12.12的环境，环境命名aits_v2，也可以命名其他，比如aits_backend，你命名的是什么，那么下面使用conda activate命令激活就要用相应的名字
+conda create -n aits_v2 python=3.12.12
+
+# 激活环境
+conda activate aits_v2
+
+# 安装后端依赖
+pip install -r requirements.txt
+
+# 数据库初始化（必做）：
+# 先强制扫描所有应用（特别是 ai_core）
+python manage.py makemigrations
+python manage.py makemigrations ai_core
+# 将表结构真正写入数据库
+python manage.py migrate
+
+# 创建管理员，执行以下的命令，按照提示初始化一个用户名，电子邮件，以及password（此用户是登录系统的初始化用户）
+python manage.py createsuperuser
+
+# 打开一个cmd窗口，进入到前端目录下，执行npm install下载依赖
+cd D:\dev\proj\aits_v2\frontend
+d:
+npm install
+
+
+
+--->服务启动：
+# 启动django后台（打开一个新的anaconda prompt命令行窗口）
+cd D:\dev\proj\aits_v2\backend
+d:
+conda activate aits_v2
+python run_asgi.py
+
+# 启动Celery Worker（打开一个新的anaconda prompt命令行窗口）：
+cd d:\dev\proj\aits_v2\backend
+d:
+conda activate aits_v2
+celery -A aits_backend worker -l info -P eventlet
+
+# Celery Beat定时任务调度器（打开一个新的anaconda prompt命令行窗口，启用定时任务功能）
+cd d:\dev\proj\aits_v2\backend
+d:
+conda activate aits_v2
+celery -A aits_backend beat --loglevel=info
+
+# 前端服务（cmd命令行下执行即可）
+cd d:\dev\proj\aits_v2\frontend
+d:
+npm run dev

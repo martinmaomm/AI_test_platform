@@ -633,7 +633,7 @@ API 规范（API Specifications）
                     
                     # 将Pydantic模型转换为字典并清理（使用统一方法）
                     from .api_testcase_generator import ApiTestcaseGeneratorService
-                    test_case_dict = response.model_dump()
+                    test_case_dict = response.model_dump(by_alias=True)
                     cleaned_dict = ApiTestcaseGeneratorService._clean_httprunner_script(test_case_dict)
                     
                     # 转换为格式化的JSON字符串（统一使用这种方式）

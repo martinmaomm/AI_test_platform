@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Dict, List, Any, Optional, Union
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from django.db import transaction
 from django.contrib.auth import get_user_model
 from ai_core.model_manager import get_llm_manager
@@ -21,11 +21,17 @@ User = get_user_model()
 
 class HttpRunnerRequest(BaseModel):
     """HttpRunner 请求结构"""
+    model_config = ConfigDict(populate_by_name=True)
+
     method: str = Field(description="HTTP方法，如 GET, POST, PUT, DELETE 等")
     url: str = Field(description="请求URL路径")
     params: Dict[str, Any] = Field(default_factory=dict, description="查询参数")
     headers: Dict[str, str] = Field(default_factory=dict, description="请求头")
-    json: Optional[Union[Dict, List]] = Field(default=None, description="JSON请求体")
+    json_body: Optional[Union[Dict, List]] = Field(
+        default=None,
+        alias="json",
+        description="JSON请求体",
+    )
     data: Optional[Union[str, Dict[str, Any]]] = Field(default=None, description="表单数据")
     cookies: Dict[str, str] = Field(default_factory=dict, description="Cookies")
     timeout: float = Field(default=120, description="请求超时时间（秒）")
@@ -33,10 +39,16 @@ class HttpRunnerRequest(BaseModel):
 
 class HttpRunnerTestStep(BaseModel):
     """HttpRunner 测试步骤"""
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str = Field(description="步骤名称")
     request: HttpRunnerRequest = Field(description="请求信息")
     extract: Dict[str, str] = Field(default_factory=dict, description="提取变量，格式：{'变量名': 'jsonpath表达式'}")
-    validate: List[Dict[str, Any]] = Field(default_factory=list, description="断言列表，必须是字典列表格式，如：[{'eq': ['status_code', 200]}, {'eq': ['body.success', True]}]。每个字典的键是断言类型（eq/ne/gt/lt/contains等），值是列表[jsonpath, 期望值]")
+    validators: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        alias="validate",
+        description="断言列表，必须是字典列表格式，如：[{'eq': ['status_code', 200]}, {'eq': ['body.success', True]}]。每个字典的键是断言类型（eq/ne/gt/lt/contains等），值是列表[jsonpath, 期望值]",
+    )
     variables: Dict[str, Any] = Field(default_factory=dict, description="步骤级变量")
 
 
@@ -680,7 +692,7 @@ class ApiTestcaseGeneratorService:
             test_case_model = self._build_httprunner_test_case(test_cases, endpoint_details)
             
             # 转换为字典并清理（统一处理）
-            script_dict = self._clean_httprunner_script(test_case_model.model_dump())
+            script_dict = self._clean_httprunner_script(test_case_model.model_dump(by_alias=True))
             
             # 转换为格式化的JSON字符串（统一使用这种方式）
             return json.dumps(script_dict, ensure_ascii=False, indent=2)
@@ -840,7 +852,7 @@ class ApiTestcaseGeneratorService:
             config=error_config,
             teststeps=[]
         )
-        return json.dumps(error_test_case.model_dump(), ensure_ascii=False, indent=2)
+        return json.dumps(error_test_case.model_dump(by_alias=True), ensure_ascii=False, indent=2)
     
     def _process_path_params(self, path: str, path_params: Dict[str, Any]) -> str:
         """处理路径参数，替换路径中的占位符"""

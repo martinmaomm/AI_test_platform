@@ -7,7 +7,7 @@
     <div class="cockpit-toolbar">
       <h1 class="cockpit-title">
         <span class="title-icon">◈</span>
-        智能驾驶舱
+        数据面板
       </h1>
       <div class="toolbar-actions">
         <el-select
@@ -114,8 +114,14 @@
           <div
             v-else-if="item.i.startsWith('portal-')"
             class="glass-card portal-card"
-            :class="[item.i, { 'edit-border': editMode }]"
-            @click="!editMode && handlePortalClick(item.i)"
+            :class="[
+              item.i,
+              {
+                'edit-border': editMode,
+                'portal-disabled': !editMode && isPortalDisabled(item.i)
+              }
+            ]"
+            @click="!editMode && !isPortalDisabled(item.i) && handlePortalClick(item.i)"
           >
             <div v-if="editMode" class="drag-handle">
               <el-icon><Rank /></el-icon>
@@ -270,6 +276,7 @@ const defaultLayout = [
 const layout = ref(loadLayout())
 
 const INFRA_ITEMS = ['section-infra', 'portal-ai-config', 'portal-settings']
+const DISABLED_PORTAL_ITEMS = ['portal-app', 'portal-perf']
 
 // 旧布局 key 映射到新 key（兼容已保存布局）
 const LAYOUT_MIGRATION = {
@@ -493,8 +500,8 @@ function getPortalTitle(i) {
   const map = {
     'portal-api': 'API 自动化',
     'portal-web': 'Web 自动化',
-    'portal-app': 'App 自动化',
-    'portal-perf': '性能测试',
+    'portal-app': 'App 自动化（开发中）',
+    'portal-perf': '性能测试（开发中）',
     'portal-ai-config': 'AI 实验室配置',
     'portal-settings': '全局系统设置'
   }
@@ -511,6 +518,10 @@ function getPortalDesc(i) {
     'portal-settings': '邮件通知配置、环境变量、用户权限。'
   }
   return map[i] || ''
+}
+
+function isPortalDisabled(i) {
+  return DISABLED_PORTAL_ITEMS.includes(i)
 }
 
 function handlePortalClick(i) {
@@ -1019,6 +1030,19 @@ onMounted(async () => {
 
 .portal-card.portal-settings:hover {
   box-shadow: 0 8px 24px rgba(100, 116, 139, 0.25), var(--cockpit-card-shadow);
+}
+
+/* 尚未开放的业务入口：普通模式下只展示，不允许点击 */
+.portal-card.portal-disabled {
+  cursor: not-allowed;
+  filter: grayscale(1);
+  opacity: 0.55;
+  transform: none;
+  box-shadow: var(--cockpit-card-shadow);
+}
+
+.portal-card.portal-disabled:hover .portal-glow-bar::after {
+  display: none;
 }
 
 .portal-card-inner {

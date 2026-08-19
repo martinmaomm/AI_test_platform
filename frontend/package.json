@@ -1,7 +1,7 @@
 {
   "name": "aits-frontend",
   "version": "1.0.0",
-  "description": "AITS系统前端应用",
+  "description": "测试平台系统前端应用",
   "type": "module",
   "scripts": {
     "dev": "vite",

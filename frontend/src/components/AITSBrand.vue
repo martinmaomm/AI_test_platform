@@ -1,6 +1,6 @@
 <template>
   <div class="aits-brand" :class="[`aits-brand--${size}`]">
-    <h1 class="brand-title">AITS</h1>
+    <h1 class="brand-title">AITesting</h1>
     <div class="brand-accent">
       <span class="brand-accent-glow" />
     </div>

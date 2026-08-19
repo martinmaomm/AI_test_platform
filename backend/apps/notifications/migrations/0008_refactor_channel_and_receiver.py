@@ -1,5 +1,6 @@
 # 重构：全局渠道 NotificationChannel + 项目接收对象 NotificationReceiver
 
+from django.conf import settings
 from django.db import migrations, models
 import django.db.models.deletion
 
@@ -63,6 +64,7 @@ def noop(apps, schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
         ('projects', '0001_initial'),
         ('notifications', '0007_notificationchannel_project'),
     ]
@@ -84,8 +86,8 @@ class Migration(migrations.Migration):
                 ('is_active', models.BooleanField(default=True, verbose_name='是否启用')),
                 ('created_at', models.DateTimeField(auto_now_add=True, verbose_name='创建时间')),
                 ('updated_at', models.DateTimeField(auto_now=True, verbose_name='更新时间')),
-                ('created_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='created_notification_channels', to='auth.user', verbose_name='创建人')),
-                ('updated_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='updated_notification_channels', to='auth.user', verbose_name='修改人')),
+                ('created_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='created_notification_channels', to=settings.AUTH_USER_MODEL, verbose_name='创建人')),
+                ('updated_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='updated_notification_channels', to=settings.AUTH_USER_MODEL, verbose_name='修改人')),
             ],
             options={
                 'verbose_name': '全局渠道',

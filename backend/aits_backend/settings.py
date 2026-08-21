@@ -321,8 +321,8 @@ CHANNEL_LAYERS = {
 
 # JWT配置
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=600),  # AccessToken 有效期
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),    # RefreshToken 有效期
+    "ACCESS_TOKEN_LIFETIME": timedelta(days=7),       # AccessToken 有效期：7天
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),      # RefreshToken 有效期：7天
     "ROTATE_REFRESH_TOKENS": True,                  # 刷新 token 时生成新的 refresh
     "BLACKLIST_AFTER_ROTATION": True,               # 旧的 refresh 是否作废
     "AUTH_HEADER_TYPES": ("Bearer",),               # 请求头格式: Authorization: Bearer <token>

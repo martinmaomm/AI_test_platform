@@ -40,9 +40,14 @@
               </div>
               <div class="card-footer">
                 <span class="project-meta">{{ formatDate(project.created_at) }}</span>
-                <el-button type="primary" size="small" @click="enterProject(project)">
-                  进入工作区
-                </el-button>
+                <div class="footer-actions">
+                  <el-button type="warning" size="small" @click="openEditDialog(project)">
+                    编辑
+                  </el-button>
+                  <el-button type="primary" size="small" @click="enterProject(project)">
+                    进入工作区
+                  </el-button>
+                </div>
               </div>
             </el-card>
           </el-col>
@@ -77,6 +82,14 @@
           <el-button type="primary" :loading="creating" @click="submitCreate">确定</el-button>
         </template>
       </el-dialog>
+
+      <ProjectEditDialog
+        v-model="showEditDialog"
+        :project="editingProject"
+        project-type-label="API"
+        :saving="updating"
+        @save="submitEdit"
+      />
     </div>
   </div>
 </template>
@@ -87,7 +100,8 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Plus, Connection } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
-import { getProjects, createProject } from '@/api/projects'
+import ProjectEditDialog from '@/components/project/ProjectEditDialog.vue'
+import { getProjects, createProject, updateProject } from '@/api/projects'
 import { useProjectStore } from '@/stores/project'
 import dayjs from 'dayjs'
 
@@ -96,9 +110,12 @@ const projectStore = useProjectStore()
 
 const loading = ref(false)
 const creating = ref(false)
+const updating = ref(false)
 const projectList = ref([])
 const showCreateDialog = ref(false)
+const showEditDialog = ref(false)
 const createFormRef = ref(null)
+const editingProject = ref(null)
 
 const createForm = reactive({ name: '', description: '' })
 
@@ -138,6 +155,47 @@ const enterProject = async (project) => {
     router.push('/api-testing/function-navigation')
   } catch {
     ElMessage.error('设置项目失败，请重试')
+  }
+}
+
+const openEditDialog = (project) => {
+  editingProject.value = { ...project }
+  showEditDialog.value = true
+}
+
+const submitEdit = async (data) => {
+  if (!editingProject.value) return
+  updating.value = true
+  try {
+    const response = await updateProject(editingProject.value.id, data)
+    const responseData = response?.data && typeof response.data === 'object'
+      ? response.data
+      : (response || {})
+    const updatedProject = { ...editingProject.value, ...data, ...responseData }
+    const projectIndex = projectList.value.findIndex(item => item.id === updatedProject.id)
+    if (projectIndex >= 0) projectList.value[projectIndex] = updatedProject
+
+    if (projectStore.currentProject?.id === updatedProject.id) {
+      try {
+        await projectStore.setCurrentProject(updatedProject)
+      } catch {
+        // 项目更新已成功；即使当前项目偏好同步失败，也先更新本地状态。
+        projectStore.currentProject = updatedProject
+      }
+    }
+
+    showEditDialog.value = false
+    ElMessage.success('项目更新成功')
+    await loadProjects()
+  } catch (error) {
+    const detail = error.response?.data
+    ElMessage.error(
+      detail?.message || detail?.error?.message ||
+      (typeof detail?.detail === 'string' ? detail.detail : null) ||
+      '项目更新失败'
+    )
+  } finally {
+    updating.value = false
   }
 }
 
@@ -300,6 +358,11 @@ onMounted(() => loadProjects())
   justify-content: space-between;
   padding-top: 16px;
   border-top: 1px solid var(--app-border-light);
+}
+
+.footer-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .project-meta {

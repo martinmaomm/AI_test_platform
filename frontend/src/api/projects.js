@@ -24,7 +24,10 @@ export const createProject = async (data) => {
 
 // 更新项目
 export const updateProject = async (id, data) => {
-  const response = await api.put(`/projects/${id}/`, data)
+  const response = await api.patch(`/projects/${id}/`, {
+    name: data?.name,
+    description: data?.description,
+  })
   return response.data
 }
 

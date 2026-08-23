@@ -1998,9 +1998,36 @@ class DebugScenarioStepsView(APIView):
             # elapsed 从 SessionData.stat 中读取（StepData 本身无 elapsed 字段）
             stat = data.get('stat') or {}
             elapsed_ms = stat.get('elapsed_ms') or stat.get('response_time_ms') or 0
+
+            # HttpRunner 将提取结果保存在 StepData.export_vars，
+            # 将断言明细保存在 SessionData.validators.validate_extractor。
+            extract_result = sd.get('export_vars') or {}
+            validators = data.get('validators') or {}
+            raw_validate_results = (
+                validators.get('validate_extractor', [])
+                if isinstance(validators, dict)
+                else []
+            )
+            validate_result = []
+            for item in raw_validate_results:
+                if not isinstance(item, dict):
+                    continue
+                validate_result.append({
+                    'comparator': item.get('comparator', ''),
+                    'check': item.get('check', ''),
+                    'check_value': item.get('check_value'),
+                    'expect': item.get('expect_value', item.get('expect')),
+                    'expect_value': item.get('expect_value'),
+                    'passed': item.get('check_result') == 'pass',
+                    'check_result': item.get('check_result', ''),
+                    'message': item.get('message', ''),
+                })
+
             step_responses.append({
                 'name': sd.get('name', ''),
                 'success': sd.get('success', False),
+                'extract_result': extract_result,
+                'validate_result': validate_result,
                 # --- response ---
                 'status_code': resp.get('status_code'),
                 'headers': dict(resp.get('headers') or {}),
@@ -2025,4 +2052,3 @@ class DebugScenarioStepsView(APIView):
             },
             message="调试执行完成"
         )
-

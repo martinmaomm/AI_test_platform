@@ -557,7 +557,7 @@
                       <span class="debug-collapse-label">响应头 (Headers)</span>
                     </div>
                   </template>
-                  <pre class="debug-headers-pre">{{ JSON.stringify(stepDebugResponse.headers, null, 2) }}</pre>
+                  <pre class="debug-headers-pre debug-headers-pre--light">{{ JSON.stringify(stepDebugResponse.headers, null, 2) }}</pre>
                 </el-collapse-item>
 
               </el-collapse>
@@ -824,14 +824,40 @@ const availableVariables = computed(() => {
   return list
 })
 
+// 复制文本到剪贴板：局域网 HTTP 页面不一定支持 navigator.clipboard，需提供降级方案。
+const copyTextToClipboard = async (text) => {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+  textArea.setAttribute('readonly', '')
+  textArea.style.position = 'fixed'
+  textArea.style.left = '-9999px'
+  textArea.style.opacity = '0'
+  document.body.appendChild(textArea)
+  textArea.select()
+
+  try {
+    if (!document.execCommand('copy')) {
+      throw new Error('浏览器拒绝了复制操作')
+    }
+  } finally {
+    textArea.remove()
+  }
+}
+
 // 复制变量引用到剪贴板
-const copyVarRef = (varName) => {
+const copyVarRef = async (varName) => {
   const ref = '${' + varName + '}'
-  navigator.clipboard.writeText(ref).then(() => {
+  try {
+    await copyTextToClipboard(ref)
     ElMessage.success(`已复制 ${ref} 到剪贴板`)
-  }).catch(() => {
+  } catch {
     ElMessage.info(`变量名：${ref}`)
-  })
+  }
 }
 
 const activeTab = ref('basic')

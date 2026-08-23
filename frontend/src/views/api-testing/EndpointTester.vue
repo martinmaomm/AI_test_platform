@@ -2405,9 +2405,24 @@ const handleSend = async () => {
     }
 
     // ── 4. 提取结果 / 断言结果 ─────────────────────────────────────────
-    // 调试接口暂不返回逐条提取/断言明细，保留空态 UI 提示
-    extractResult.value  = null
-    validateResult.value = []
+    // 后端从 HttpRunner 的 StepData.export_vars 和 validators 中返回结果。
+    const rawExtractResult = firstStep.extract_result ?? firstStep.export_vars ?? null
+    extractResult.value =
+      rawExtractResult && typeof rawExtractResult === 'object'
+        ? rawExtractResult
+        : null
+
+    const rawValidateResult = firstStep.validate_result ?? []
+    validateResult.value = Array.isArray(rawValidateResult)
+      ? rawValidateResult.map(item => ({
+          comparator: item.comparator ?? item.assert ?? '',
+          check:      item.check ?? '',
+          expect:     item.expect_value ?? item.expect ?? '',
+          passed:     item.passed ?? item.check_result === 'pass',
+          checkValue: item.check_value,
+          message:    item.message ?? '',
+        }))
+      : []
 
     // ── 5. 写入状态缓存（以用例 ID 为 key，切换用例后可恢复现场）──────────
     saveExecutionCache(caseInfo.value?.id, {

@@ -329,11 +329,13 @@ class HttpRunner(object):
                 # __run_step_request 抛出异常前未返回 step_data，手动构造
                 step_data = StepData(name=step.name)
                 step_data.success = False
+                step_data.error = str(e)
                 # 深拷贝当前 session 数据（此时 req_resps 包含本步骤的实际 HTTP 响应）
                 if hasattr(self.__session, "data") and self.__session.data:
                     step_data.data = copy.deepcopy(self.__session.data)
                 self.__step_datas.append(step_data)
             elif step_data is not None:
+                step_data.error = str(e)
                 self.__step_datas.append(step_data)
             # 重新抛出异常，让run_testcase决定是否继续执行
             raise
@@ -341,12 +343,17 @@ class HttpRunner(object):
             # 其他异常（如变量替换失败）：无论 step_data 是否创建，都必须追加记录
             # 确保 step_datas 的长度与 teststeps 一一对应，前端依赖此顺序取最后一条
             if step_data is not None:
+                step_data.error = str(e)
                 self.__step_datas.append(step_data)
             else:
                 # 步骤在发起 HTTP 请求之前就已失败（如变量未找到），
                 # 创建一个空的失败记录占位，使索引不错位
                 failed_step_data = StepData(name=step.name)
                 failed_step_data.success = False
+                failed_step_data.error = str(e)
+                # 如果请求已经拿到响应但在提取/解析阶段失败，保留响应快照供执行记录查看。
+                if hasattr(self.__session, "data") and self.__session.data:
+                    failed_step_data.data = copy.deepcopy(self.__session.data)
                 self.__step_datas.append(failed_step_data)
             # 重新抛出异常
             raise
@@ -419,6 +426,9 @@ class HttpRunner(object):
                 except Exception as e:
                     # 其他异常也继续执行，但记录错误
                     logger.error(f"Step '{step.name}' encountered an error, but continuing with next steps: {str(e)}")
+                    # 提取、变量替换等非断言异常也必须影响整条场景结果，避免出现步骤失败但场景误报成功。
+                    self.success = False
+                    self.__last_failure = e
                     # 尝试保存step_data（如果__run_step中已创建）
                     try:
                         # 如果__run_step中已创建step_data，它应该已经被添加到__step_datas

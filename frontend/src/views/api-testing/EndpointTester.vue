@@ -1988,7 +1988,7 @@ const buildJsonTree = (val, path = 'body', key = 'body') => {
       valType:  'array',
       preview:  `[${val.length}]`,
       children: val.flatMap((v, i) =>
-        buildJsonTree(v, `${path}.${i}`, String(i))
+        buildJsonTree(v, `${path}[${i}]`, String(i))
       ),
     }]
   }
@@ -2103,7 +2103,9 @@ const evaluateJsonPath = (path) => {
   }
 
   try {
-    const parts = path.trim().split('.')
+    // 数组使用标准 JMESPath 下标；同时兼容历史生成的 body.items.0 写法。
+    const normalizedPath = path.trim().replace(/\[(\d+)\]/g, '.$1')
+    const parts = normalizedPath.split('.')
     let cur = root
     for (const part of parts) {
       if (cur === null || cur === undefined) {

@@ -329,7 +329,7 @@
               </template>
               <div class="tab-section">
                 <div class="section-tip">
-                  对响应结果进行断言。<b>实际值</b>支持 JSONPath（如 <code>body.code</code>、<code>status_code</code>）
+                  对响应结果进行断言。<b>实际值</b>支持 JSONPath（如 <code>body.code</code>、<code>status_code</code>）；期望值填写 <code>200</code> 为数字，填写 <code>"200"</code> 为字符串
                 </div>
 
                 <!-- 断言列表 -->
@@ -377,7 +377,7 @@
                     </el-select>
                     <el-input
                       v-model="rule.expected"
-                      placeholder="期望值"
+                      placeholder='200 或 "200"'
                       size="small"
                       style="flex: 2;"
                     >
@@ -915,7 +915,7 @@ const buildJsonTree = (val, path = 'body', key = 'body') => {
       valType: 'array',
       preview: `[${val.length}]`,
       children: val.flatMap((v, i) =>
-        buildJsonTree(v, `${path}.${i}`, String(i))
+        buildJsonTree(v, `${path}[${i}]`, String(i))
       ),
     }]
   }
@@ -981,13 +981,7 @@ const handleNodePick = (data) => {
 
   } else if (pickerMode.value === 'validate') {
     const raw = data.rawValue
-    if (raw === null) {
-      row.expected = 'null'
-    } else if (typeof raw === 'object') {
-      row.expected = JSON.stringify(raw)
-    } else {
-      row.expected = String(raw)
-    }
+    row.expected = formatAssertionLiteral(raw)
     ElMessage.success(`已回填路径：${data.path}，期望值：${row.expected}`)
 
   } else {
@@ -1111,6 +1105,59 @@ const dynVarDisplay = (v) =>
 // -------- 本地步骤状态 --------
 const localStep = ref(null)
 
+/**
+ * 将场景断言输入框中的字面量转换成实际 JSON 类型。
+ * 不加引号的数字按数字处理，使用双引号包裹的数字保持为字符串。
+ */
+const parseAssertionLiteral = (raw) => {
+  if (typeof raw !== 'string') return raw
+
+  const text = raw.trim()
+  if (!text) return ''
+  if (text.startsWith('$')) return raw
+
+  if (text.startsWith('"') && text.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(text)
+      return typeof parsed === 'string' ? parsed : raw
+    } catch {
+      return raw
+    }
+  }
+
+  if (text === 'true') return true
+  if (text === 'false') return false
+  if (text === 'null') return null
+
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(text)) {
+    const parsed = Number(text)
+    return Number.isFinite(parsed) ? parsed : raw
+  }
+
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try {
+      return JSON.parse(text)
+    } catch {
+      return raw
+    }
+  }
+
+  return raw
+}
+
+/** 将已有断言值回显到输入框，并保留数字和字符串的原始类型。 */
+const formatAssertionLiteral = (value) => {
+  if (value === undefined) return ''
+  if (value === null) return 'null'
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value) } catch { return String(value) }
+  }
+  if (typeof value !== 'string') return String(value)
+
+  const parsed = parseAssertionLiteral(value)
+  return parsed !== value ? JSON.stringify(value) : value
+}
+
 // 将 HttpRunner step 转换为可编辑形态（含 _headers 等辅助字段）
 const deserializeStep = (step) => {
   if (!step) return null
@@ -1144,13 +1191,21 @@ const deserializeStep = (step) => {
   if (Array.isArray(step.validate)) {
     validateList = step.validate.map(v => {
       if (v.comparator !== undefined) {
-        return { comparator: v.comparator, actual: String(v.actual ?? ''), expected: String(v.expected ?? '') }
+        return {
+          comparator: v.comparator,
+          actual: String(v.actual ?? ''),
+          expected: formatAssertionLiteral(v.expected),
+        }
       }
       const entries = Object.entries(v)
       if (entries.length > 0) {
         const [comparator, args] = entries[0]
         if (Array.isArray(args) && args.length >= 2) {
-          return { comparator, actual: String(args[0]), expected: String(args[1]) }
+          return {
+            comparator,
+            actual: String(args[0]),
+            expected: formatAssertionLiteral(args[1]),
+          }
         }
         if (Array.isArray(args) && args.length === 1) {
           return { comparator, actual: String(args[0]), expected: '' }
@@ -1253,7 +1308,7 @@ const serializeStep = (s) => {
 
   const validate = s._validateList
     .filter(v => v.actual || v.expected)
-    .map(v => ({ [v.comparator]: [v.actual, v.expected] }))
+    .map(v => ({ [v.comparator]: [v.actual, parseAssertionLiteral(v.expected)] }))
 
   const result = {
     name: s.name,
@@ -1561,7 +1616,9 @@ const resolveHrPath = (path, responseData) => {
   }
 
   // 确定根对象
-  const parts = p.split('.')
+  // 数组使用标准 JMESPath 下标；同时兼容历史生成的 body.items.0 写法。
+  const normalizedPath = p.replace(/\[(\d+)\]/g, '.$1')
+  const parts = normalizedPath.split('.')
   let root
   let remainParts
 

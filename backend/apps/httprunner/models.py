@@ -160,6 +160,7 @@ class StepData(BaseModel):
     name: Text = ""  # teststep name
     data: Union[SessionData, List['StepData']] = None
     export_vars: VariablesMapping = {}
+    error: Text = ""  # 运行阶段错误（包括提取/断言前置解析错误）
 
 
 StepData.update_forward_refs()

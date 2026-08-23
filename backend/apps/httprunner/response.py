@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Text, Any
 
 import jmespath
@@ -155,7 +156,9 @@ class ResponseObject(object):
             return expr
 
         try:
-            check_value = jmespath.search(expr, resp_obj_meta)
+            # 兼容历史 UI 生成的 body.items.0 写法，统一转换为合法的数组下标。
+            normalized_expr = re.sub(r'\.(\d+)(?=\.|$)', r'[\1]', expr)
+            check_value = jmespath.search(normalized_expr, resp_obj_meta)
         except JMESPathError as ex:
             logger.error(
                 f"failed to search with jmespath\n"

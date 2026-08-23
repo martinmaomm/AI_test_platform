@@ -191,6 +191,23 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+class ProjectUpdateSerializer(serializers.ModelSerializer):
+    """项目编辑序列化器，只允许修改名称和描述。"""
+
+    class Meta:
+        model = Project
+        fields = ['name', 'description']
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError('项目名称不能为空')
+        return value
+
+    def validate_description(self, value):
+        return value.strip()
+
+
 class ProjectCreateSerializer(serializers.ModelSerializer):
     """项目创建序列化器"""
     project_type = serializers.ChoiceField(

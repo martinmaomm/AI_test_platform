@@ -1,4 +1,5 @@
 from rest_framework import generics, permissions, status, viewsets
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
@@ -11,7 +12,7 @@ from users.models import UserPreference
 from .models import Project, ProjectMember
 from .serializers import (
     ProjectSerializer, ProjectCreateSerializer, ProjectMemberSerializer,
-    ProjectMemberCreateSerializer, ProjectDetailSerializer
+    ProjectMemberCreateSerializer, ProjectDetailSerializer, ProjectUpdateSerializer
 )
 from common.api import response
 
@@ -46,12 +47,26 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return ProjectCreateSerializer
-        elif self.action in ['retrieve', 'update', 'partial_update']:
+        elif self.action in ['update', 'partial_update']:
+            return ProjectUpdateSerializer
+        elif self.action == 'retrieve':
             return ProjectDetailSerializer
         return ProjectSerializer
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        """仅允许项目负责人或拥有编辑权限的成员修改项目基本信息。"""
+        project = self.get_object()
+        can_edit = (
+            project.created_by_id == self.request.user.id
+            or project.owner_id == self.request.user.id
+            or project.members.filter(user=self.request.user, can_edit=True).exists()
+        )
+        if not can_edit:
+            raise PermissionDenied('您没有权限编辑此项目')
+        serializer.save()
 
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()

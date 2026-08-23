@@ -415,6 +415,21 @@
                     </div>
                   </div>
                 </div>
+                <div v-else class="step-error-placeholder">
+                  <div class="step-error-header">
+                    <div class="step-error-title">
+                      <span class="step-error-number">{{ index + 1 }}</span>
+                      <span>{{ step.name || `Step ${index + 1}` }}</span>
+                    </div>
+                    <span class="status-badge failed">
+                      <i class="el-icon-close"></i>
+                      FAILED
+                    </span>
+                  </div>
+                  <div class="step-error-message">
+                    {{ step.error || '该步骤未生成响应快照，可能在变量替换、提取或断言阶段失败，请查看执行日志。' }}
+                  </div>
+                </div>
               </div>
             </div>
             <div v-else class="no-steps">
@@ -1498,6 +1513,51 @@ onMounted(() => {
 .step-item:hover {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
   transform: translateY(-1px);
+}
+
+.step-error-placeholder {
+  padding: 12px 14px;
+  background: #fff8f8;
+  border-left: 3px solid #ea4335;
+}
+
+.step-error-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #2c3e50;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.step-error-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.step-error-number {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #ea4335;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.step-error-message {
+  margin: 8px 0 0 28px;
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .step-header {

@@ -800,7 +800,7 @@
                   <template #default="{ row }">
                     <el-input
                       v-model="row.expect"
-                      placeholder="200"
+                      placeholder='200 或 "200"'
                       size="small"
                       class="mono-input"
                     />
@@ -1572,6 +1572,73 @@ const KNOWN_COMPARATORS = new Set([
 ])
 
 /**
+ * 将断言输入框中的字面量转换成实际 JSON 类型。
+ *
+ * 约定：
+ * - 200 / 20.5 / true / false / null 按 JSON 字面量解析
+ * - "200" 保持为字符串
+ * - {"code": 200} / [1, 2] 解析为对象或数组
+ * - 变量表达式和普通文本保持为字符串
+ */
+const parseAssertionLiteral = (raw) => {
+  if (typeof raw !== 'string') return raw
+
+  const text = raw.trim()
+  if (!text) return ''
+
+  // HttpRunner 变量表达式不能当作 JSON 字面量解析。
+  if (text.startsWith('$')) return raw
+
+  // 双引号是字符串类型的显式标记，使用 JSON 规则解析转义字符。
+  if (text.startsWith('"') && text.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(text)
+      return typeof parsed === 'string' ? parsed : raw
+    } catch {
+      return raw
+    }
+  }
+
+  if (text === 'true') return true
+  if (text === 'false') return false
+  if (text === 'null') return null
+
+  // 整数、浮点数和科学计数法。
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(text)) {
+    const parsed = Number(text)
+    return Number.isFinite(parsed) ? parsed : raw
+  }
+
+  // 允许断言对象和数组，同时避免误解析普通文本。
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try {
+      return JSON.parse(text)
+    } catch {
+      return raw
+    }
+  }
+
+  return raw
+}
+
+/**
+ * 将已有断言值回显到输入框，并保留原始值类型。
+ * 例如后端返回字符串 "200" 时，输入框显示为 "200"，保存后仍是字符串。
+ */
+const formatAssertionLiteral = (value) => {
+  if (value === undefined) return ''
+  if (value === null) return 'null'
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value) } catch { return String(value) }
+  }
+  if (typeof value !== 'string') return String(value)
+
+  // 只有当不加引号会被解析成其他类型时才补引号，避免普通文本全部显示引号。
+  const parsed = parseAssertionLiteral(value)
+  return parsed !== value ? JSON.stringify(value) : value
+}
+
+/**
  * 解析一个 HttpRunner dict/list 参数表（params / headers）
  * 兼容格式：{key: value} 字典 或 [{key, value}] 列表
  */
@@ -1640,7 +1707,7 @@ const parseValidate = (rawList) => {
       return {
         comparator,
         check:  String(arr[0] ?? ''),
-        expect: arr[1] !== undefined ? String(arr[1]) : '',
+        expect: arr[1] !== undefined ? formatAssertionLiteral(arr[1]) : '',
       }
     }
 
@@ -1649,7 +1716,7 @@ const parseValidate = (rawList) => {
       return {
         comparator: String(v.assert ?? v.comparator ?? 'eq'),
         check:      String(v.check  ?? ''),
-        expect:     v.expect !== undefined ? String(v.expect) : '',
+        expect:     v.expect !== undefined ? formatAssertionLiteral(v.expect) : '',
       }
     }
 
@@ -2003,15 +2070,9 @@ const handleNodePick = (data) => {
     ElMessage.success(`已回填路径：${data.path}${!row.varName ? '' : `，变量名：${row.varName}`}`)
 
   } else if (mode === 'validate') {
-    // 断言验证：将 rawValue 转换为字符串写入期望值
+    // 断言验证：回填时保留 rawValue 的原始类型
     const raw = data.rawValue
-    if (raw === null) {
-      row.expect = 'null'
-    } else if (typeof raw === 'object') {
-      row.expect = JSON.stringify(raw)
-    } else {
-      row.expect = String(raw)
-    }
+    row.expect = formatAssertionLiteral(raw)
     ElMessage.success(`已回填路径：${data.path}，期望值：${row.expect}`)
 
   } else {
@@ -2428,7 +2489,7 @@ const buildHttpRunnerStep = (stepName = '测试步骤') => {
   // validate: [{comparator, check, expect}] → [{comparator: [check, expect]}]
   const validators = requestData.validate
     .filter(v => String(v.check ?? '').trim())
-    .map(v => ({ [v.comparator]: [v.check, v.expect] }))
+    .map(v => ({ [v.comparator]: [v.check, parseAssertionLiteral(v.expect)] }))
 
   const setupHooks    = requestData.setup_hooks_rows.map(r => r.hook).filter(Boolean)
   const teardownHooks = requestData.teardown_hooks_rows.map(r => r.hook).filter(Boolean)

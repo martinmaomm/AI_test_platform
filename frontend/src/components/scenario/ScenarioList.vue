@@ -93,14 +93,6 @@
               <el-icon style="vertical-align: -2px; font-size: 11px;"><List /></el-icon>
               {{ scenario.steps_count ?? 0 }} 个步骤
             </span>
-            <el-tag
-              size="small"
-              :type="getPriorityType(scenario.priority)"
-              effect="plain"
-              class="meta-priority"
-            >
-              {{ getPriorityLabel(scenario.priority) }}
-            </el-tag>
           </div>
         </div>
 
@@ -232,17 +224,6 @@ const handleDragEnd = async () => {
     ElMessage.error('更新场景顺序失败：' + (e?.message || '未知错误'))
     loadScenarios()
   }
-}
-
-// -------- 优先级显示 --------
-const getPriorityType = (priority) => {
-  const map = { low: 'info', medium: '', high: 'warning', critical: 'danger' }
-  return map[priority] ?? 'info'
-}
-
-const getPriorityLabel = (priority) => {
-  const map = { low: '低', medium: '中', high: '高', critical: '紧急' }
-  return map[priority] ?? priority ?? '中'
 }
 
 // -------- 从 script_content 计算步骤数 --------
@@ -401,7 +382,6 @@ const copyScenario = async (scenario) => {
     const payload = {
       title: newTitle,
       test_case_type: 'scenario',
-      priority: detail.priority || 'medium',
       description: detail.description || `由"${scenario.title}"复制`,
       timeout: detail.timeout ?? 10,
       retry_count: detail.retry_count ?? 0,
@@ -678,10 +658,6 @@ defineExpose({ loadScenarios, refreshStepsCount, selectById, selectedScenarios, 
   display: flex;
   align-items: center;
   gap: 2px;
-}
-
-.meta-priority {
-  font-size: 10px;
 }
 
 /* 更多按钮：默认隐藏，hover 时显示 */

@@ -45,6 +45,20 @@ from ai_core.models import LLMConfiguration
 logger = logging.getLogger(__name__)
 
 
+def _get_response_definitions(spec):
+    """只提取响应模型解析所需的 Swagger/OpenAPI 定义，避免暴露整份规范元数据。"""
+    metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
+    definitions = metadata.get('definitions')
+    components = metadata.get('components')
+    components = components if isinstance(components, dict) else {}
+    schemas = components.get('schemas')
+
+    return {
+        'definitions': definitions if isinstance(definitions, dict) else {},
+        'schemas': schemas if isinstance(schemas, dict) else {},
+    }
+
+
 class APISpecificationListView(generics.ListCreateAPIView):
     """API规范列表和创建视图"""
     serializer_class = APISpecificationSerializer
@@ -335,8 +349,8 @@ class APIEndpointListView(generics.ListAPIView):
                 spec.project.members.filter(user=self.request.user).exists()):
             return APIEndpoint.objects.none()
 
-        # 返回此规范下的所有端点（预加载 module 避免 N+1）
-        return spec.endpoints.select_related('module').all()
+        # 返回此规范下的所有端点（预加载 module/spec 避免 N+1）
+        return spec.endpoints.select_related('module', 'spec').all()
 
     def list(self, request, *args, **kwargs):
         """自定义列表响应，直接返回所有数据"""
@@ -357,6 +371,7 @@ class APIEndpointListView(generics.ListAPIView):
                 'parameters': endpoint.parameters,
                 'request_body': endpoint.request_body,
                 'responses': endpoint.responses,
+                'response_definitions': _get_response_definitions(endpoint.spec),
                 'tags': endpoint.tags,
                 'operation_id': endpoint.operation_id,
                 'module_id': endpoint.module_id,
@@ -391,8 +406,8 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
                 spec.project.members.filter(user=self.request.user).exists()):
             return APIEndpoint.objects.none()
 
-        # 返回此规范下的所有端点（预加载 module 避免 N+1）
-        return spec.endpoints.select_related('module').all()
+        # 返回此规范下的所有端点（预加载 module/spec 避免 N+1）
+        return spec.endpoints.select_related('module', 'spec').all()
 
     def retrieve(self, request, *args, **kwargs):
         """自定义详情响应"""
@@ -407,6 +422,7 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
             'parameters': instance.parameters,
             'request_body': instance.request_body,
             'responses': instance.responses,
+            'response_definitions': _get_response_definitions(instance.spec),
             'tags': instance.tags,
             'operation_id': instance.operation_id,
             'module_id': instance.module_id,

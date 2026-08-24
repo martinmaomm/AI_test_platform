@@ -16,6 +16,8 @@ from langgraph.graph import StateGraph, END
 from .model_manager import get_llm_manager
 from .rag_service import get_rag_manager
 from .api_testcase_generator import HttpRunnerTestCase, HttpRunnerConfig, HttpRunnerTestStep, HttpRunnerRequest
+from .scenario_preflight_validator import ScenarioPreflightValidator
+from .scenario_contract import build_generation_endpoint
 from api_testing.models import APISpecification, APIEndpoint, APITestCase
 from projects.models import Project
 from django.contrib.auth import get_user_model
@@ -35,12 +37,16 @@ class ScenarioAgentState(TypedDict):
     mapped_apis: Optional[List[Dict[str, Any]]]
     api_specifications: Optional[List[Dict[str, Any]]]
     generated_script: Optional[str]
+    validation_report: Optional[Dict[str, Any]]
     test_case_id: Optional[int]
     error_message: Optional[str]
     current_step: str
 
 class ScenarioGenerationAgent:
     """智能场景生成器Agent"""
+
+    # 生成后的语义修复只允许有限次数，避免错误脚本反复消耗模型调用。
+    MAX_SCENARIO_REPAIR_ATTEMPTS = 2
     
     def __init__(self, project_id: int, user_request: str, user_id: int = None, 
                  enable_streaming: bool = True, streaming_callback: Optional[Callable[[str, str], None]] = None):
@@ -66,6 +72,7 @@ class ScenarioGenerationAgent:
         workflow.add_node("map_to_apis", self._map_to_apis)
         workflow.add_node("fetch_api_specifications", self._fetch_api_specifications)
         workflow.add_node("generate_scenario_script", self._generate_scenario_script)
+        workflow.add_node("validate_scenario_script", self._validate_scenario_script)
         workflow.add_node("save_test_case", self._save_test_case_node)
         
         # 设置线性执行流程
@@ -73,7 +80,8 @@ class ScenarioGenerationAgent:
         workflow.add_edge("requirement_parsing", "map_to_apis")
         workflow.add_edge("map_to_apis", "fetch_api_specifications")
         workflow.add_edge("fetch_api_specifications", "generate_scenario_script")
-        workflow.add_edge("generate_scenario_script", "save_test_case")
+        workflow.add_edge("generate_scenario_script", "validate_scenario_script")
+        workflow.add_edge("validate_scenario_script", "save_test_case")
         workflow.add_edge("save_test_case", END)
         
         return workflow.compile()
@@ -362,22 +370,29 @@ class ScenarioGenerationAgent:
                     
                     # 获取API端点信息（使用正确的字段名 spec）
                     endpoints = APIEndpoint.objects.filter(spec=spec)
+                    spec_metadata = spec.metadata or {}
+                    definitions = (
+                        spec_metadata.get("definitions", {})
+                        if isinstance(spec_metadata, dict)
+                        else {}
+                    )
                     
                     api_specs.append({
                         "id": spec.id,
                         "name": spec.spec_name or spec.file_name,
                         "description": spec.description,
                         "spec_type": spec.spec_type,
-                        "parsed_content": spec.parsed_content,
                         "endpoints": [
-                            {
+                            build_generation_endpoint({
                                 "id": endpoint.id,
                                 "path": endpoint.path,
                                 "method": endpoint.method,
                                 "summary": endpoint.summary,
                                 "description": endpoint.description,
-                                "parameters": endpoint.parameters
-                            }
+                                "parameters": endpoint.parameters,
+                                "request_body": endpoint.request_body,
+                                "responses": endpoint.responses,
+                            }, definitions=definitions)
                             for endpoint in endpoints
                         ],
                         "relevance_score": mapped_api["relevance_score"]
@@ -438,7 +453,16 @@ API 规范（API Specifications）
 6. 每个步骤的 request.url 必须精确匹配API规范中的某个端点的 path 字段
 7. 每个步骤的 request.method 必须精确匹配API规范中对应端点的 method 字段
 
-请根据这三段信息自动推理完整测试流程，并生成符合 HttpRunner v3 JSON 格式的测试脚本。
+🚨 响应契约规则（优先级高于通用经验，必须遵守）：
+1. API 规范中每个端点的 responses.content 中包含该接口可参考的 response example 和 response schema。
+2. 每个步骤的 validate 和 extract 必须优先、且只能参考当前 method + path 对应端点的 responses。
+3. 如果 response example 存在，body 路径必须来自 example 的真实字段；期望值必须参考 example，并保持数字、字符串、布尔值和 null 的原始类型。
+4. 如果只有 response schema，body 路径只能来自 schema.properties 或 schema.items 中定义的字段；不能自行创造 code、success、data、token 等字段。
+5. 如果没有 response example 或 response schema，不要猜测任何 body 字段；该步骤最多生成 status_code 断言。
+6. 禁止把其他接口的响应字段复制到当前接口，也禁止套用通用的 body.success、body.code、body.data.token 模板。
+7. 提取变量必须来自当前接口已知的 response 路径；后续步骤只能引用前序步骤成功提取的变量。
+
+请根据用户需求、业务上下文、API 请求契约和 API 响应契约自动推理完整测试流程，并生成符合 HttpRunner v3 JSON 格式的测试脚本。
 
 📌 输出要求（必须严格遵守）
 
@@ -456,20 +480,18 @@ API 规范（API Specifications）
      * url: 请求URL路径（字符串，如 "/api/users"）
      * params: 查询参数（字典，所有值必须是字符串，如 {{"limit": "10", "page": "1"}}）
      * headers: 请求头（字典，如 {{"Content-Type": "application/json"}}）
-     * json: JSON请求体（字典或列表，用于POST/PUT/PATCH请求）
-     * data: 表单数据（字符串或字典）
+     * json: JSON请求体（字典或列表；Content-Type 为 application/json 时必须使用此字段）
+     * data: 表单数据或原始文本请求体（Content-Type 为 form-data、x-www-form-urlencoded、text/plain 等时使用）
+     * json 和 data 只能二选一，不能同时作为有效请求体输出
    - extract: 提取变量（字典，格式：{{"变量名": "jsonpath表达式"}}，如 {{"user_id": "body.data.user_id"}}）
    - validate: 断言列表（必须是字典列表格式，每个字典的键是断言类型，值是列表）
-     * 格式：[{{"eq": ["status_code", 200]}}, {{"eq": ["body.success", true]}}]
+     * 格式：[{{"eq": ["status_code", 200]}}]
      * 常用断言类型：eq（等于）、ne（不等于）、gt（大于）、lt（小于）、contains（包含）
      * 每个断言是字典：{{"断言类型": ["jsonpath", 期望值]}}
-     * JSONPath 必须使用双引号，如 "body.data.user_id"
+     * JSONPath 必须使用双引号，并且必须能在当前接口 response example 或 schema 中找到，如 "body.data.user_id"
      * 示例：
        - {{"eq": ["status_code", 200]}}
-       - {{"eq": ["body.data.user_id", "123"]}}
-       - {{"ne": ["body.data.token", null]}}
-       - {{"eq": ["body.success", true]}}
-       - {{"contains": ["body.data.username", "testuser"]}}
+       - {{"eq": ["body.<field_from_current_response>", <value_from_current_response>]}}
    - variables: 步骤级变量（字典，可选）
 
 3. 提取与数据传递规则
@@ -480,95 +502,20 @@ API 规范（API Specifications）
    - validate 必须是字典列表，不能是列表的列表
    - 每个断言必须是字典格式：{{"断言类型": ["jsonpath", 期望值]}}
    - 常用断言类型：eq（等于）、ne（不等于）、gt（大于）、lt（小于）、contains（包含）
-   - JSONPath 必须使用双引号，如 "body.data.user_id"
+   - JSONPath 必须使用双引号，并且必须来自当前接口的 response example 或 schema
    - 错误格式（不要使用）：[["eq", ["status_code", 200]]]
    - 正确格式（必须使用）：[{{"eq": ["status_code", 200]}}]
 
 5. 请求参数规则
    - params 中所有值必须是字符串类型
    - json 中的数字、布尔值、null 使用JSON原生格式（不加引号）
+   - 请求体类型必须依据 API 规范的 request_body.content 或 Content-Type 选择：application/json 使用 json；表单类型使用 data 对象；纯文本、XML 等使用 data 字符串
+   - 不要因为 Pydantic 字段可选就额外输出空的 data；JSON 请求不要同时输出 data
 
-📌 输出格式示例
-
-假设API规范中有以下端点：
-- POST /user/register - 用户注册
-- POST /user/login - 用户登录
-- GET /user/profile - 获取用户信息
-
-那么你生成的测试脚本必须使用这些exact路径：
-
-{{
-  "config": {{
-    "name": "用户注册登录流程测试",
-    "base_url": "http://example.com",
-    "variables": {{}},
-    "verify": false
-  }},
-  "teststeps": [
-    {{
-      "name": "用户注册",
-      "request": {{
-        "method": "POST",
-        "url": "/user/register",
-        "headers": {{
-          "Content-Type": "application/json"
-        }},
-        "json": {{
-          "username": "testuser",
-          "password": "password123",
-          "email": "test@example.com"
-        }}
-      }},
-      "extract": {{
-        "user_id": "body.data.user_id"
-      }},
-      "validate": [
-        {{"eq": ["status_code", 201]}},
-        {{"eq": ["body.success", true]}}
-      ]
-    }},
-    {{
-      "name": "用户登录",
-      "request": {{
-        "method": "POST",
-        "url": "/user/login",
-        "headers": {{
-          "Content-Type": "application/json"
-        }},
-        "json": {{
-          "username": "testuser",
-          "password": "password123"
-        }}
-      }},
-      "extract": {{
-        "token": "body.data.token"
-      }},
-      "validate": [
-        {{"eq": ["status_code", 200]}},
-        {{"eq": ["body.success", true]}}
-      ]
-    }},
-    {{
-      "name": "获取用户信息",
-      "request": {{
-        "method": "GET",
-        "url": "/user/profile",
-        "headers": {{
-          "Content-Type": "application/json",
-          "Authorization": "Bearer ${{token}}"
-        }}
-      }},
-      "validate": [
-        {{"eq": ["status_code", 200]}},
-        {{"eq": ["body.data.user_id", "${{user_id}}"]}}
-      ]
-    }}
-  ]
-}}
-
-⚠️ 注意：上面的示例中，url字段使用的是 "/user/register"、"/user/login"、"/user/profile"，
-这是因为API规范中定义的就是这些路径。如果API规范中定义的是 "/api/users/register"，
-那么你就必须使用 "/api/users/register"，不能自己改成其他格式！
+📌 输出格式提醒
+- 下面只要求输出 JSON 结构，不提供任何可照抄的业务字段示例。
+- 每个接口的响应字段、状态码和期望值都必须从上方对应端点的 response example 或 response schema 推导。
+- 如果响应契约没有定义 body 字段，请不要为了“丰富断言”而补充业务字段。
 
 ⚠️ 重要提示
 - 必须严格按照 HttpRunner JSON 格式输出
@@ -693,6 +640,214 @@ API 规范（API Specifications）
             state["error_message"] = error_msg
         
         return state
+
+    def _validate_scenario_script(self, state: ScenarioAgentState) -> ScenarioAgentState:
+        """检查场景脚本，并对确定性错误执行有限次数的 AI 修复。"""
+        if state.get("error_message"):
+            logger.warning("跳过场景预检查，因为前一个节点有错误")
+            return state
+
+        try:
+            self._send_node_start_notification(
+                "validate_scenario_script",
+                "场景预检查",
+                "检查变量定义、变量使用顺序、提取路径和断言结构",
+            )
+            state["current_step"] = "validating_scenario_script"
+
+            generated_script = state.get("generated_script")
+            if not generated_script:
+                error_msg = "没有生成的测试脚本，无法执行场景预检查"
+                state["error_message"] = error_msg
+                return state
+
+            try:
+                test_data = (
+                    json.loads(generated_script)
+                    if isinstance(generated_script, str)
+                    else generated_script
+                )
+            except (TypeError, json.JSONDecodeError) as exc:
+                error_msg = f"生成的测试脚本不是有效JSON，无法执行场景预检查: {exc}"
+                state["error_message"] = error_msg
+                return state
+
+            validator = ScenarioPreflightValidator()
+            report = validator.validate(
+                test_data,
+                api_specifications=state.get("api_specifications") or [],
+            )
+            repair_history: List[Dict[str, Any]] = []
+            repair_attempts = 0
+
+            while (
+                report.get("summary", {}).get("error_count", 0) > 0
+                and repair_attempts < self.MAX_SCENARIO_REPAIR_ATTEMPTS
+            ):
+                repair_attempts += 1
+                before_summary = dict(report.get("summary", {}))
+                self._send_node_start_notification(
+                    "repair_scenario_script",
+                    "自动修复脚本",
+                    f"根据第 {repair_attempts} 轮预检查结果修正变量、路径或断言问题",
+                )
+                self._send_streaming_output(
+                    f"🔧 发现 {before_summary.get('error_count', 0)} 个确定性问题，"
+                    f"正在自动修复（第 {repair_attempts}/{self.MAX_SCENARIO_REPAIR_ATTEMPTS} 轮）...",
+                    "repair_scenario_script",
+                )
+
+                current_script = state.get("generated_script") or generated_script
+                try:
+                    repaired_script = self._repair_scenario_script(
+                        current_script=current_script,
+                        validation_report=report,
+                        state=state,
+                        attempt=repair_attempts,
+                    )
+                    if not repaired_script or repaired_script.strip() == str(current_script).strip():
+                        repair_history.append({
+                            "attempt": repair_attempts,
+                            "changed": False,
+                            "error_count_before": before_summary.get("error_count", 0),
+                            "message": "AI 未生成与原脚本不同的修复结果",
+                        })
+                        break
+
+                    repaired_script = self._auto_fix_api_paths(
+                        repaired_script,
+                        state.get("api_specifications") or [],
+                    )
+                    repaired_data = json.loads(repaired_script)
+                    repaired_report = validator.validate(
+                        repaired_data,
+                        api_specifications=state.get("api_specifications") or [],
+                    )
+                    after_summary = dict(repaired_report.get("summary", {}))
+                    state["generated_script"] = repaired_script
+                    report = repaired_report
+                    repair_history.append({
+                        "attempt": repair_attempts,
+                        "changed": True,
+                        "error_count_before": before_summary.get("error_count", 0),
+                        "error_count_after": after_summary.get("error_count", 0),
+                        "warning_count_after": after_summary.get("warning_count", 0),
+                    })
+                    logger.info(
+                        "场景脚本第 %s 轮自动修复完成：错误 %s -> %s",
+                        repair_attempts,
+                        before_summary.get("error_count", 0),
+                        after_summary.get("error_count", 0),
+                    )
+                except Exception as repair_exc:
+                    repair_history.append({
+                        "attempt": repair_attempts,
+                        "changed": False,
+                        "error_count_before": before_summary.get("error_count", 0),
+                        "message": f"自动修复失败：{repair_exc}",
+                    })
+                    logger.warning("场景脚本自动修复失败（第 %s 轮）: %s", repair_attempts, repair_exc)
+                    break
+
+            report["repair_attempts"] = repair_attempts
+            report["repair_history"] = repair_history
+            report.setdefault("summary", {})["repair_attempts"] = repair_attempts
+            state["validation_report"] = report
+
+            summary = report.get("summary", {})
+            error_count = summary.get("error_count", 0)
+            warning_count = summary.get("warning_count", 0)
+            if error_count:
+                error_msg = (
+                    f"场景预检查未通过：自动修复 {repair_attempts} 轮后仍有 "
+                    f"{error_count} 个错误、{warning_count} 个警告，测试用例未保存"
+                )
+                state["error_message"] = error_msg
+                self._send_streaming_output(
+                    f"❌ {error_msg}\n已保留当前生成草稿，请根据检查报告继续调整。",
+                    "validate_scenario_script",
+                )
+                logger.warning("场景预检查未通过: %s", report)
+            else:
+                if repair_attempts:
+                    message = (
+                        f"✅ 场景脚本已自动修复并通过检查：共修复 {repair_attempts} 轮，"
+                        f"仍有 {warning_count} 个警告"
+                    )
+                else:
+                    message = f"✅ 场景预检查完成：0 个错误、{warning_count} 个警告"
+                self._send_streaming_output(message, "validate_scenario_script")
+                logger.info("场景预检查通过: %s", report)
+
+        except Exception as exc:
+            error_msg = f"场景预检查失败: {exc}"
+            logger.error(error_msg, exc_info=True)
+            state["error_message"] = error_msg
+
+        return state
+
+    def _repair_scenario_script(
+        self,
+        current_script: str,
+        validation_report: Dict[str, Any],
+        state: ScenarioAgentState,
+        attempt: int,
+    ) -> str:
+        """让模型根据结构化检查报告修正当前脚本，并返回新的 HttpRunner JSON。"""
+        if self.llm_manager is None:
+            self.llm_manager = get_llm_manager()
+        if not self.llm_manager or not self.llm_manager.current_llm:
+            raise RuntimeError("LLM不可用，无法自动修复场景脚本")
+
+        repair_prompt = ChatPromptTemplate.from_template("""
+你是一名负责修复 HttpRunner 场景脚本的测试开发工程师。
+
+用户需求：
+{user_request}
+
+API 规范（必须保持 method 和 path 精确匹配）：
+{api_specifications}
+
+当前脚本：
+{current_script}
+
+确定性预检查报告：
+{validation_report}
+
+请仅根据报告中的 errors 修复当前脚本，不要重写业务流程，不要新增没有依据的接口、参数、响应字段或变量。
+
+修复规则：
+1. 保留当前脚本中已经正确的步骤、请求方法、请求路径和请求参数。
+2. undefined_variable：优先引用前序步骤已经 extract 的变量；如果没有可靠来源，删除该变量引用或改为当前请求契约中已有的静态值，不要凭空发明变量。
+3. invalid_response_path、invalid_assertion、invalid_extract：按 HttpRunner v3 JSON 结构修复；无法确认响应 body 字段时只保留 status_code 断言。
+4. response_path_not_in_contract 和 response_path_unverified 是警告，不要为了消除警告而猜测业务字段；如果保留字段，必须来自当前接口响应 example 或 schema。
+5. 期望值保持 JSON 原始类型：数字不要改成字符串，字符串不要改成数字，布尔值和 null 也不要加引号。
+6. 变量只能被后续步骤使用，不能在同一步 extract 后立即作为当前请求输入使用。
+7. 只输出符合 HttpRunnerTestCase 结构的 JSON，不要输出 Markdown、解释文字或代码围栏。
+
+这是第 {attempt} 轮修复。修复后必须输出完整脚本，而不是局部片段。
+""")
+        messages = repair_prompt.format_messages(
+            user_request=self.user_request,
+            api_specifications=json.dumps(
+                state.get("api_specifications") or [],
+                ensure_ascii=False,
+            ),
+            current_script=current_script,
+            validation_report=json.dumps(validation_report, ensure_ascii=False),
+            attempt=attempt,
+        )
+
+        structured_llm = self.llm_manager.current_llm.with_structured_output(HttpRunnerTestCase)
+        response = structured_llm.invoke(messages)
+        if response is None:
+            raise ValueError("自动修复返回了空结果")
+
+        from .api_testcase_generator import ApiTestcaseGeneratorService
+
+        repaired_data = response.model_dump(by_alias=True)
+        cleaned_data = ApiTestcaseGeneratorService._clean_httprunner_script(repaired_data)
+        return json.dumps(cleaned_data, ensure_ascii=False, indent=2)
     
     def _auto_fix_api_paths(self, script_content: str, api_specs: List[Dict]) -> str:
         """
@@ -951,6 +1106,7 @@ API 规范（API Specifications）
             mapped_apis=None,
             api_specifications=None,
             generated_script=None,
+            validation_report=None,
             test_case_id=None,
             error_message=None,
             current_step="initialized"
@@ -964,7 +1120,9 @@ API 规范（API Specifications）
             return {
                 "success": False,
                 "error": result["error_message"],
-                "current_step": result.get("current_step", "unknown")
+                "current_step": result.get("current_step", "unknown"),
+                "generated_script": result.get("generated_script"),
+                "validation_report": result.get("validation_report"),
             }
         
         # 返回成功结果（包含test_case_id）
@@ -972,4 +1130,5 @@ API 规范（API Specifications）
             "success": True,
             "test_case_id": result.get("test_case_id"),
             "generated_script": result.get("generated_script"),
+            "validation_report": result.get("validation_report"),
         }

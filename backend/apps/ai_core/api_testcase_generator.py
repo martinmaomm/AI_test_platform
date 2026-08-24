@@ -32,7 +32,10 @@ class HttpRunnerRequest(BaseModel):
         alias="json",
         description="JSON请求体",
     )
-    data: Optional[Union[str, Dict[str, Any]]] = Field(default=None, description="表单数据")
+    data: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="表单数据或原始文本请求体；application/json 必须使用 json 字段",
+    )
     cookies: Dict[str, str] = Field(default_factory=dict, description="Cookies")
     timeout: float = Field(default=120, description="请求超时时间（秒）")
 
@@ -708,6 +711,7 @@ class ApiTestcaseGeneratorService:
         确保格式符合HttpRunner要求：
         1. validate 字段必须是字典列表格式
         2. 移除 request.data 和 request.json 中的 None 值
+        3. 根据 JSON 请求体优先规则清理互相冲突的 body 字段
         
         Args:
             script_dict: HttpRunner脚本字典
@@ -723,6 +727,26 @@ class ApiTestcaseGeneratorService:
                 continue
             
             request = teststep['request']
+
+            # JSON 与表单/原始文本请求体必须互斥。部分模型会因为 Pydantic
+            # 可选字段同时输出 json 和 data；只要 json 有效，就以 json 为准。
+            content_type = ""
+            headers = request.get("headers") or {}
+            if isinstance(headers, dict):
+                for header_name, header_value in headers.items():
+                    if str(header_name).lower() == "content-type":
+                        content_type = str(header_value).lower()
+                        break
+
+            has_json = request.get("json") is not None
+            has_data = request.get("data") is not None
+            is_json_content = "application/json" in content_type or "+json" in content_type
+            if not has_json and has_data and is_json_content and isinstance(request.get("data"), (dict, list)):
+                request["json"] = request.pop("data")
+                has_json = True
+                has_data = False
+            if has_json and has_data:
+                del request["data"]
             
             # 移除 None 值的字段（HttpRunner Pydantic模型不接受None）
             if 'data' in request and request['data'] is None:

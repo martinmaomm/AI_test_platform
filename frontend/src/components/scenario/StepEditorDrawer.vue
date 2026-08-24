@@ -177,6 +177,7 @@
                     <el-radio-button label="none">无</el-radio-button>
                     <el-radio-button label="json">JSON</el-radio-button>
                     <el-radio-button label="data">Form Data</el-radio-button>
+                    <el-radio-button label="raw">Raw Body</el-radio-button>
                   </el-radio-group>
 
                   <!-- JSON 插入变量/函数（分组 Dropdown） -->
@@ -251,6 +252,15 @@
                       添加字段
                     </el-button>
                   </div>
+                  <el-input
+                    v-else-if="bodyType === 'raw'"
+                    v-model="localStep._rawBody"
+                    type="textarea"
+                    :rows="6"
+                    placeholder="请输入原始文本、XML 或其他非 JSON 请求体"
+                    resize="vertical"
+                    style="font-family: Consolas, Monaco, monospace; font-size: 12px;"
+                  />
                   <div v-if="bodyType === 'json'" class="form-tip">支持 HttpRunner 变量引用：${variable_name}</div>
                 </el-form-item>
               </el-form>
@@ -654,14 +664,59 @@
                 响应规范参考
               </div>
               <div class="apiref-resp-body">
-                <MonacoEditor
-                  v-if="responseRefJson"
-                  :value="responseRefJson"
-                  language="json"
-                  theme="vs"
-                  :read-only="true"
-                  height="100%"
-                />
+                <div v-if="responseReferenceItems.length > 0" class="response-reference-list">
+                  <div
+                    v-for="item in responseReferenceItems"
+                    :key="item.statusCode"
+                    class="response-reference-item"
+                  >
+                    <div class="response-reference-status">
+                      <el-tag
+                        size="small"
+                        effect="plain"
+                        :type="responseStatusTagType(item.statusCode)"
+                      >{{ item.statusCode }}</el-tag>
+                      <span class="response-reference-description">{{ item.description }}</span>
+                    </div>
+
+                    <div
+                      v-for="content in item.contents"
+                      :key="`${item.statusCode}-${content.mediaType}`"
+                      class="response-reference-content"
+                    >
+                      <div class="response-reference-content-type">
+                        响应内容类型
+                        <code>{{ content.mediaType }}</code>
+                      </div>
+
+                      <div v-if="content.exampleJson" class="response-reference-block">
+                        <div class="response-reference-label">Example Value</div>
+                        <MonacoEditor
+                          :value="content.exampleJson"
+                          language="json"
+                          theme="vs"
+                          :read-only="true"
+                          height="180px"
+                        />
+                      </div>
+
+                      <div v-if="content.modelJson" class="response-reference-block">
+                        <div class="response-reference-label">Model</div>
+                        <MonacoEditor
+                          :value="content.modelJson"
+                          language="json"
+                          theme="vs"
+                          :read-only="true"
+                          height="180px"
+                        />
+                      </div>
+                    </div>
+
+                    <div v-if="item.contents.length === 0" class="response-reference-no-body">
+                      未定义响应体
+                    </div>
+                  </div>
+                </div>
                 <div v-else class="no-response-ref">
                   <el-icon class="no-ref-icon"><Document /></el-icon>
                   <p class="no-ref-text">暂无响应示例数据</p>
@@ -1163,12 +1218,42 @@ const deserializeStep = (step) => {
   if (!step) return null
 
   const req = step.request ?? {}
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key)
+  const contentType = Object.entries(req.headers ?? {})
+    .find(([key]) => key.toLowerCase() === 'content-type')?.[1]
+    ?.toString()
+    .toLowerCase() || ''
+  const isJsonContent = contentType.includes('application/json') || contentType.includes('+json')
+  const isFormContent = contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')
 
   let bType = 'none'
-  if (req.json !== undefined && req.json !== null && Object.keys(req.json ?? {}).length >= 0) {
-    bType = req.json !== null ? 'json' : 'none'
+  let bodyJson = ''
+  let rawBody = ''
+  const hasJsonBody = hasOwn(req, 'json') && req.json !== undefined && req.json !== null
+  const hasDataBody = hasOwn(req, 'data') && req.data !== undefined && req.data !== null
+
+  // request.json 是最明确的类型标记，不能被同时存在的 data 字段覆盖。
+  if (hasJsonBody) {
+    bType = 'json'
+    bodyJson = typeof req.json === 'string'
+      ? req.json
+      : JSON.stringify(req.json, null, 2)
+  } else if (hasOwn(req, 'raw') && req.raw !== undefined && req.raw !== null) {
+    bType = 'raw'
+    rawBody = String(req.raw)
+  } else if (hasDataBody) {
+    if (isJsonContent) {
+      bType = 'json'
+      bodyJson = typeof req.data === 'string'
+        ? req.data
+        : JSON.stringify(req.data, null, 2)
+    } else if (typeof req.data === 'string' && !isFormContent) {
+      bType = 'raw'
+      rawBody = req.data
+    } else {
+      bType = 'data'
+    }
   }
-  if (req.data !== undefined) bType = 'data'
 
   // extract: 支持对象和数组格式
   let extractList = []
@@ -1231,7 +1316,8 @@ const deserializeStep = (step) => {
     _extractList: extractList,
     _validateList: validateList,
     _bodyType: bType,
-    _bodyJson: req.json !== undefined ? JSON.stringify(req.json, null, 2) : '',
+    _bodyJson: bodyJson,
+    _rawBody: rawBody,
     _variablesJson: (vars && Object.keys(vars).length > 0) ? JSON.stringify(vars, null, 2) : ''
   }
 }
@@ -1302,6 +1388,8 @@ const serializeStep = (s) => {
   } else if (bodyType.value === 'data') {
     const data = kvListToObject(s._formData)
     if (Object.keys(data).length > 0) req.data = data
+  } else if (bodyType.value === 'raw') {
+    if (s._rawBody !== undefined && s._rawBody !== '') req.data = s._rawBody
   }
 
   const extract = kvListToObject(s._extractList)
@@ -1413,51 +1501,201 @@ const requestParamRows = computed(() => {
 })
 
 // -------- 响应参考 computed --------
-// 从 OpenAPI responses 对象中提取可读的 JSON 示例字符串
-const responseRefJson = computed(() => {
-  const responses = props.responseRef
-  if (!responses || typeof responses !== 'object') return null
+// 将 Swagger/OpenAPI responses 转成和 Swagger UI 类似的状态码分组数据。
+const responseReferenceItems = computed(() => {
+  const reference = props.responseRef
+  if (!reference || typeof reference !== 'object') return []
 
-  // 优先取 200 响应，其次取第一个 2xx 响应
-  const statusKey = Object.keys(responses).find(k => k === '200')
-    || Object.keys(responses).find(k => k.startsWith('2'))
-    || Object.keys(responses)[0]
+  // 兼容旧版直接传 responses，以及新版 { responses, definitions } 包装对象。
+  const responses = reference.responses && typeof reference.responses === 'object'
+    ? reference.responses
+    : reference
+  const definitions = reference.responses && typeof reference.responses === 'object'
+    ? (reference.definitions || {})
+    : {}
 
-  if (!statusKey) return null
+  return Object.entries(responses).map(([statusCode, response]) => {
+    const normalizedResponse = response && typeof response === 'object' ? response : {}
+    return {
+      statusCode,
+      description: normalizedResponse.description || '—',
+      contents: buildResponseContents(normalizedResponse, definitions)
+    }
+  })
+})
 
-  const statusResp = responses[statusKey]
-  if (!statusResp) return null
+function responseStatusTagType(statusCode) {
+  const code = Number.parseInt(statusCode, 10)
+  if (code >= 200 && code < 300) return 'success'
+  if (code >= 300 && code < 400) return 'warning'
+  if (code >= 400) return 'danger'
+  return 'info'
+}
 
-  // 提取顺序：example -> examples.default.value -> schema example -> schema 构造
-  const content = statusResp.content
-  if (content) {
-    const mediaType = content['application/json'] || Object.values(content)[0]
-    if (mediaType) {
-      if (mediaType.example !== undefined) {
-        return JSON.stringify(mediaType.example, null, 2)
-      }
-      if (mediaType.examples) {
-        const firstEx = Object.values(mediaType.examples)[0]
-        if (firstEx?.value !== undefined) {
-          return JSON.stringify(firstEx.value, null, 2)
-        }
-      }
-      if (mediaType.schema) {
-        const built = buildExampleFromSchema(mediaType.schema)
-        if (built !== null) return JSON.stringify(built, null, 2)
-      }
+function buildResponseContents(response, definitions) {
+  const content = response.content
+  let mediaEntries = content && typeof content === 'object'
+    ? Object.entries(content).map(([mediaType, media]) => ({
+        mediaType,
+        media: media && typeof media === 'object' ? media : {}
+      }))
+    : []
+
+  // Swagger 2.0 把响应 schema/examples 放在响应对象本身，不使用 content。
+  if (mediaEntries.length === 0 && (
+    response.schema ||
+    response.example !== undefined ||
+    (response.examples && typeof response.examples === 'object')
+  )) {
+    const examples = response.examples && typeof response.examples === 'object'
+      ? response.examples
+      : {}
+    const exampleMediaTypes = Object.keys(examples)
+    if (exampleMediaTypes.length > 0) {
+      mediaEntries = exampleMediaTypes.map(mediaType => ({
+        mediaType,
+        media: { example: examples[mediaType] }
+      }))
+    } else {
+      mediaEntries = [{
+        mediaType: 'application/json',
+        media: {}
+      }]
     }
   }
 
-  // 兜底：整个 responses 对象
-  return JSON.stringify(responses, null, 2)
-})
+  return mediaEntries.map(({ mediaType, media }) => {
+    const schema = media.schema || response.schema || null
+    const resolvedSchema = schema
+      ? resolveResponseSchema(schema, definitions)
+      : null
+    const explicitExample = getResponseExample(response, media)
+    const exampleValue = explicitExample.found
+      ? explicitExample.value
+      : (resolvedSchema ? buildExampleFromSchema(resolvedSchema) : null)
 
-// 根据 JSON Schema 构造示例对象（浅层处理）
+    return {
+      mediaType,
+      exampleJson: exampleValue !== null && exampleValue !== undefined
+        ? toPrettyJson(exampleValue)
+        : null,
+      modelJson: resolvedSchema ? toPrettyJson(resolvedSchema) : null
+    }
+  })
+}
+
+function getResponseExample(response, media) {
+  if (Object.prototype.hasOwnProperty.call(media, 'example')) {
+    return { found: true, value: media.example }
+  }
+  if (media.examples && typeof media.examples === 'object') {
+    const firstExample = Object.values(media.examples)[0]
+    if (firstExample && typeof firstExample === 'object' && 'value' in firstExample) {
+      return { found: true, value: firstExample.value }
+    }
+    if (firstExample !== undefined) return { found: true, value: firstExample }
+  }
+  if (Object.prototype.hasOwnProperty.call(response, 'example')) {
+    return { found: true, value: response.example }
+  }
+  return { found: false, value: null }
+}
+
+function resolveResponseSchema(schema, definitions, resolvingRefs = new Set()) {
+  if (!schema || typeof schema !== 'object') return schema
+
+  if (typeof schema.$ref === 'string') {
+    const ref = schema.$ref
+    const target = lookupResponseDefinition(ref, definitions)
+    if (target && !resolvingRefs.has(ref)) {
+      const nextRefs = new Set(resolvingRefs)
+      nextRefs.add(ref)
+      const localSchema = { ...schema }
+      delete localSchema.$ref
+      return resolveResponseSchema(
+        { ...target, ...localSchema },
+        definitions,
+        nextRefs
+      )
+    }
+  }
+
+  const resolved = { ...schema }
+  if (resolved.properties && typeof resolved.properties === 'object') {
+    resolved.properties = Object.fromEntries(
+      Object.entries(resolved.properties).map(([key, value]) => [
+        key,
+        resolveResponseSchema(value, definitions, resolvingRefs)
+      ])
+    )
+  }
+  if (resolved.items) {
+    resolved.items = resolveResponseSchema(resolved.items, definitions, resolvingRefs)
+  }
+  for (const keyword of ['allOf', 'oneOf', 'anyOf']) {
+    if (Array.isArray(resolved[keyword])) {
+      resolved[keyword] = resolved[keyword].map(item =>
+        resolveResponseSchema(item, definitions, resolvingRefs)
+      )
+    }
+  }
+  if (resolved.additionalProperties && typeof resolved.additionalProperties === 'object') {
+    resolved.additionalProperties = resolveResponseSchema(
+      resolved.additionalProperties,
+      definitions,
+      resolvingRefs
+    )
+  }
+  return resolved
+}
+
+function lookupResponseDefinition(ref, definitions) {
+  if (!ref || typeof ref !== 'string') return null
+  const prefixMap = [
+    ['#/definitions/', definitions?.definitions],
+    ['#/components/schemas/', definitions?.schemas]
+  ]
+  for (const [prefix, table] of prefixMap) {
+    if (ref.startsWith(prefix) && table && typeof table === 'object') {
+      const rawName = ref.slice(prefix.length)
+      const name = rawName.replace(/~1/g, '/').replace(/~0/g, '~')
+      return table[name] || null
+    }
+  }
+  return null
+}
+
+function toPrettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return null
+  }
+}
+
+// 根据已解析的 JSON Schema 构造 Swagger 风格示例值。
 function buildExampleFromSchema(schema, depth = 0) {
-  if (!schema || depth > 4) return null
+  if (!schema || depth > 6) return null
   if (schema.example !== undefined) return schema.example
   if (schema.default !== undefined) return schema.default
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0]
+
+  if (Array.isArray(schema.allOf) && schema.allOf.length > 0) {
+    const merged = schema.allOf.reduce((result, part) => {
+      const value = buildExampleFromSchema(part, depth + 1)
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return { ...result, ...value }
+      }
+      return result
+    }, {})
+    if (Object.keys(merged).length > 0) return merged
+  }
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    return buildExampleFromSchema(schema.oneOf[0], depth + 1)
+  }
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+    return buildExampleFromSchema(schema.anyOf[0], depth + 1)
+  }
 
   const type = schema.type
   if (type === 'object' || schema.properties) {
@@ -1472,8 +1710,8 @@ function buildExampleFromSchema(schema, depth = 0) {
     const itemEx = buildExampleFromSchema(schema.items || {}, depth + 1)
     return itemEx !== null ? [itemEx] : []
   }
-  if (type === 'string') return schema.enum ? schema.enum[0] : ''
-  if (type === 'integer' || type === 'number') return schema.enum ? schema.enum[0] : 0
+  if (type === 'string') return 'string'
+  if (type === 'integer' || type === 'number') return 0
   if (type === 'boolean') return false
   if (type === 'null') return null
   return null
@@ -2473,8 +2711,81 @@ const handleSave = () => {
 
 .apiref-resp-body {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
   min-height: 0;
+}
+
+.response-reference-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 2px 8px 0;
+}
+
+.response-reference-item {
+  overflow: hidden;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+  background: var(--el-bg-color);
+}
+
+.response-reference-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  background: var(--el-fill-color-light);
+}
+
+.response-reference-description {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--el-text-color-regular);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.response-reference-content {
+  padding: 8px;
+}
+
+.response-reference-content-type {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+
+.response-reference-content-type code {
+  padding: 1px 4px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 3px;
+  color: var(--el-color-primary);
+  background: var(--el-fill-color-light);
+  font-family: Consolas, Monaco, 'Courier New', monospace;
+}
+
+.response-reference-block + .response-reference-block {
+  margin-top: 8px;
+}
+
+.response-reference-label {
+  margin: 0 0 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.response-reference-no-body {
+  padding: 8px 10px;
+  color: var(--el-text-color-placeholder);
+  font-size: 11px;
 }
 
 .apiref-section-title {

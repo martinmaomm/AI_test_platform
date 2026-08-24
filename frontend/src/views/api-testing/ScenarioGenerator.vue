@@ -83,6 +83,91 @@
 
                 <!-- 结果展示 -->
                 <div v-if="message.result" class="message-result">
+                  <!-- AI 场景脚本的确定性预检查结果 -->
+                  <div v-if="message.result.validation_report" class="result-section validation-report-section">
+                    <h4>🔍 生成结果检查</h4>
+                    <div class="validation-summary">
+                      <el-tag
+                        :type="message.result.validation_report.valid ? 'success' : 'danger'"
+                        size="small"
+                      >
+                        {{ message.result.validation_report.valid ? '检查通过' : '检查未通过' }}
+                      </el-tag>
+                      <el-tag type="danger" size="small">
+                        {{ message.result.validation_report.summary?.error_count || 0 }} 个错误
+                      </el-tag>
+                      <el-tag type="warning" size="small">
+                        {{ message.result.validation_report.summary?.warning_count || 0 }} 个警告
+                      </el-tag>
+                      <el-tag
+                        v-if="message.result.validation_report.repair_attempts"
+                        type="info"
+                        size="small"
+                      >
+                        自动修复 {{ message.result.validation_report.repair_attempts }} 轮
+                      </el-tag>
+                      <span class="validation-summary-text">
+                        共检查 {{ message.result.validation_report.summary?.step_count || 0 }} 个步骤
+                      </span>
+                    </div>
+
+                    <div v-if="message.result.error" class="validation-result-message">
+                      {{ message.result.error }}
+                    </div>
+
+                    <div v-if="message.result.validation_report.errors?.length" class="validation-issues">
+                      <div
+                        v-for="(issue, issueIndex) in message.result.validation_report.errors"
+                        :key="`validation-error-${issueIndex}`"
+                        class="validation-issue validation-error"
+                      >
+                        <div class="validation-issue-header">
+                          <el-tag type="danger" size="small">错误</el-tag>
+                          <span v-if="issue.step">步骤 {{ issue.step }}</span>
+                          <code v-if="issue.field">{{ issue.field }}</code>
+                        </div>
+                        <div class="validation-issue-message">{{ issue.message }}</div>
+                        <div v-if="issue.suggestion" class="validation-issue-suggestion">
+                          建议：{{ issue.suggestion }}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div v-if="message.result.validation_report.warnings?.length" class="validation-issues">
+                      <div
+                        v-for="(issue, issueIndex) in message.result.validation_report.warnings"
+                        :key="`validation-warning-${issueIndex}`"
+                        class="validation-issue validation-warning"
+                      >
+                        <div class="validation-issue-header">
+                          <el-tag type="warning" size="small">警告</el-tag>
+                          <span v-if="issue.step">步骤 {{ issue.step }}</span>
+                          <code v-if="issue.field">{{ issue.field }}</code>
+                        </div>
+                        <div class="validation-issue-message">{{ issue.message }}</div>
+                        <div v-if="issue.suggestion" class="validation-issue-suggestion">
+                          建议：{{ issue.suggestion }}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="message.result.generated_script" class="result-section generated-script-section">
+                    <h4>📄 当前生成脚本草稿</h4>
+                    <el-alert
+                      v-if="message.result.success === false"
+                      title="脚本尚未保存，仅供查看和手工修正"
+                      type="warning"
+                      :closable="false"
+                      show-icon
+                    />
+                    <el-collapse class="generated-script-collapse">
+                      <el-collapse-item title="展开查看完整 HttpRunner JSON" name="generated-script">
+                        <pre class="generated-script-content">{{ message.result.generated_script }}</pre>
+                      </el-collapse-item>
+                    </el-collapse>
+                  </div>
+
                   <div v-if="message.result.scenario_plan" class="result-section">
                     <h4>📝 场景计划</h4>
                     <div class="scenario-plan">
@@ -487,11 +572,15 @@ const handleTaskCompleted = (data) => {
   })
 
   // 处理任务结果
-  if (data.result) {
+  if (data.result && data.result.success === false) {
+    const validationMessage = data.result.message || data.result.error || data.message || '场景脚本预检查未通过，测试用例未保存'
+    addChatMessage('ai', `⚠️ ${validationMessage}`, data.result, 'error')
+    ElMessage.warning(validationMessage)
+  } else if (data.result) {
     // 显示完成消息和结果，使用后端返回的消息
-    const successMessage = data.message || '🎉 场景生成完成！'
+    const successMessage = data.result.message || data.message || '🎉 场景生成完成！'
     addChatMessage('ai', successMessage, data.result, 'success')
-    ElMessage.success(data.message || '场景生成成功！')
+    ElMessage.success(data.result.message || data.message || '场景生成成功！')
   } else {
     // 任务完成但结果异常
     const warningMessage = data.message || '⚠️ 场景生成完成，但结果已过期，请重新生成'
@@ -1147,6 +1236,113 @@ const getNodeStatusText = (status) => {
 /* 结果展示 */
 .message-result {
   margin-top: 16px;
+}
+
+.validation-report-section {
+  padding: 16px;
+  background-color: #fffaf0;
+  border: 1px solid #f3d19e;
+  border-radius: 8px;
+}
+
+.validation-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.validation-summary-text {
+  color: #909399;
+  font-size: 12px;
+}
+
+.validation-result-message {
+  margin-bottom: 12px;
+  color: #606266;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.validation-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.validation-issue {
+  padding: 10px 12px;
+  border-radius: 6px;
+  border-left: 3px solid;
+  background-color: #ffffff;
+}
+
+.validation-error {
+  border-left-color: #f56c6c;
+}
+
+.validation-warning {
+  border-left-color: #e6a23c;
+}
+
+.validation-issue-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #606266;
+  font-size: 12px;
+}
+
+.validation-issue-header code {
+  color: #303133;
+  word-break: break-all;
+}
+
+.validation-issue-message {
+  margin-top: 6px;
+  color: #303133;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.validation-issue-suggestion {
+  margin-top: 4px;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.generated-script-section {
+  padding: 16px;
+  background-color: #f8f9fa;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+}
+
+.generated-script-section .el-alert {
+  margin-bottom: 12px;
+}
+
+.generated-script-collapse {
+  background-color: #ffffff;
+  border: 1px solid #dcdfe6;
+  border-radius: 6px;
+}
+
+.generated-script-content {
+  max-height: 460px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  background-color: #1e1e1e;
+  color: #d4d4d4;
+  border-radius: 4px;
+  font-family: Monaco, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .result-section {

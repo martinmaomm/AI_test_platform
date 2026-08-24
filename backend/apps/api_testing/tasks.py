@@ -235,6 +235,23 @@ def _execute_scenario_generation(task_instance, project_id: int, user_request: s
             if not result.get('success'):
                 error_msg = result.get('error', '场景生成失败')
                 logger.error(f"场景生成失败: {error_msg}")
+
+                # 预检查属于“生成流程已完成但脚本未通过校验”的业务结果，
+                # 仍通过 task_completed 返回报告，便于前端展示具体问题。
+                validation_report = result.get('validation_report')
+                if validation_report:
+                    return {
+                        'success': False,
+                        'status': 'completed',
+                        'message': '场景脚本自动修复后仍有问题，测试用例未保存；当前草稿已保留',
+                        'error': error_msg,
+                        'validation_report': validation_report,
+                        'generated_script': result.get('generated_script', ''),
+                        'test_case_id': None,
+                        'task_id': None,
+                        'user_id': user_id
+                    }
+
                 return build_error_result(None, f'AI场景生成失败: {error_msg}')
             
             # 构建最终结果（test_case_id 已由 Agent 保存并返回）
@@ -244,6 +261,7 @@ def _execute_scenario_generation(task_instance, project_id: int, user_request: s
                 'message': '智能场景测试用例生成成功',
                 'test_case_id': result.get('test_case_id'),
                 'generated_script': result.get('generated_script', ''),
+                'validation_report': result.get('validation_report'),
                 'task_id': None,
                 'user_id': user_id
             }
@@ -1045,4 +1063,3 @@ def _execute_api_test_suite(
                 'skipped_cases': 0,
                 'error': error_msg
             }
-

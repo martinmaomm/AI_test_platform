@@ -1010,7 +1010,10 @@ const editStep = async (step, index) => {
   await loadEndpointCache()
   const hit = findEndpoint(step.request?.method, step.request?.url)
   endpointResponseRef.value = (hit?.responses && Object.keys(hit.responses).length > 0)
-    ? hit.responses
+    ? {
+        responses: hit.responses,
+        definitions: hit.response_definitions || {}
+      }
     : null
   endpointRequestRef.value = hit
     ? { parameters: hit.parameters || [], requestBody: hit.request_body || {} }

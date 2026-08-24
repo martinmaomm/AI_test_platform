@@ -54,14 +54,6 @@
               <el-option label="边界测试" value="boundary" />
               <el-option label="安全测试" value="security" />
             </el-select>
-            <el-select v-model="priorityFilter" placeholder="优先级" clearable style="width: 120px;"
-              @change="handleSearch">
-              <el-option label="全部" value="" />
-              <el-option label="低" value="low" />
-              <el-option label="中" value="medium" />
-              <el-option label="高" value="high" />
-              <el-option label="紧急" value="critical" />
-            </el-select>
             <el-input v-model="searchQuery" placeholder="输入关键字查询" style="width: 200px;" clearable
               @input="handleSearch">
               <template #prefix>
@@ -111,9 +103,6 @@
                       {{ getTestTypeLabel(testCase.test_type) }}
                     </el-tag>
                     <el-tag type="primary" size="small">{{ getStepsCount(testCase) }} 步</el-tag>
-                    <el-tag :type="getPriorityTag(testCase.priority)" size="small">
-                      {{ getPriorityLabel(testCase.priority) }}
-                    </el-tag>
                   </div>
                   <div class="item-actions">
                     <el-button type="primary" size="small" @click.stop="runTestCase(testCase)"
@@ -137,9 +126,6 @@
             <p v-if="selectedTestCase.description" class="preview-desc">{{ selectedTestCase.description }}</p>
             <div class="preview-meta">
               <el-tag size="small">{{ getStepsCount(selectedTestCase) }} 步</el-tag>
-              <el-tag :type="getPriorityTag(selectedTestCase.priority)" size="small">
-                {{ getPriorityLabel(selectedTestCase.priority) }}
-              </el-tag>
             </div>
           </div>
           <div v-else class="empty-state">
@@ -176,7 +162,7 @@
     </el-alert>
 
     <!-- 测试用例详情右侧滑栏 -->
-    <APICaseEditDetail v-model="showDetailDialog" :test-case="selectedTestCase" @run="runTestCase"
+    <APICaseEditDetail v-model="showDetailDialog" :test-case="selectedTestCase" :show-priority="false" @run="runTestCase"
       @update="handleTestCaseUpdate" />
 
     <!-- 测试结果详情对话框 -->
@@ -334,7 +320,6 @@ const executingTestCases = ref(new Set())
 const endpointFilter = ref('')  // 端点过滤器
 const summaryFilter = ref('')  // 端点摘要/操作过滤器
 const testCaseTypeFilter = ref('')
-const priorityFilter = ref('')
 const searchQuery = ref('')
 
 // 视图模式 - 场景测试用例只需要列表视图
@@ -530,10 +515,6 @@ const filteredTestCases = computed(() => {
     filtered = filtered.filter(tc => tc.test_type === testCaseTypeFilter.value)
   }
 
-  if (priorityFilter.value) {
-    filtered = filtered.filter(tc => tc.priority === priorityFilter.value)
-  }
-
   if (searchQuery.value) {
     filtered = filtered.filter(testCase =>
       testCase.title.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
@@ -597,7 +578,6 @@ const loadTestCases = async () => {
       page_size: pageSize.value,
       test_case_type: 'scenario',  // 只加载场景测试用例
       test_type: testCaseTypeFilter.value,
-      priority: priorityFilter.value,
       search: searchQuery.value
     }
 
@@ -652,7 +632,25 @@ const handleCurrentChange = (page) => {
 
 const handleTestCaseUpdate = async (updatedTestCase) => {
   try {
-    loadTestCases()
+    const savedTestCase = updatedTestCase?.data && !updatedTestCase.id
+      ? updatedTestCase.data
+      : updatedTestCase
+
+    if (savedTestCase?.id) {
+      const mergeSavedTestCase = (testCase) => (
+        testCase.id === savedTestCase.id
+          ? { ...testCase, ...savedTestCase }
+          : testCase
+      )
+      testCases.value = testCases.value.map(mergeSavedTestCase)
+      draggableList.value = draggableList.value.map(mergeSavedTestCase)
+
+      if (selectedTestCase.value?.id === savedTestCase.id) {
+        selectedTestCase.value = { ...selectedTestCase.value, ...savedTestCase }
+      }
+    }
+
+    await loadTestCases()
   } catch (error) {
     handleError(error.message || '未知错误', '刷新失败')
   }
@@ -769,14 +767,6 @@ const getTestTypeTag = (type) => {
   return testTypeMap[type]?.tag || 'info'
 }
 
-const getPriorityLabel = (priority) => {
-  return priorityMap[priority]?.label || priority
-}
-
-const getPriorityTag = (priority) => {
-  return priorityMap[priority]?.tag || 'info'
-}
-
 const toggleGroup = (groupKey) => {
   const index = expandedGroups.value.indexOf(groupKey)
   if (index > -1) {
@@ -807,13 +797,6 @@ const methodMap = {
   'PUT': { class: 'method-put', color: '#e6a23c' },
   'DELETE': { class: 'method-delete', color: '#f56c6c' },
   'PATCH': { class: 'method-patch', color: '#409eff' }
-}
-
-const priorityMap = {
-  'low': { label: '低', tag: 'info' },
-  'medium': { label: '中', tag: 'warning' },
-  'high': { label: '高', tag: 'danger' },
-  'critical': { label: '紧急', tag: 'danger' }
 }
 
 const testTypeMap = {

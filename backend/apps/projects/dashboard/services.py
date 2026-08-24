@@ -52,7 +52,7 @@ def _api_summary(project_id):
     total_steps = 0
     passed_steps = 0
     for exec in today_execs.select_related('case_execution_detail', 'suite_execution_detail'):
-        if exec.exec_type == 'case':
+        if exec.exec_type in ('case', 'scenario'):
             try:
                 detail = exec.case_execution_detail
                 total_steps += 1

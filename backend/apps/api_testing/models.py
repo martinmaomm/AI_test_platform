@@ -375,6 +375,7 @@ class APITestExecution(models.Model):
     
     EXECUTION_TYPE_CHOICES = [
         ('case', '单用例执行'),
+        ('scenario', '场景执行'),
         ('suite', '套件执行'),
     ]
     
@@ -460,7 +461,7 @@ class APITestExecution(models.Model):
     @property
     def pass_rate(self):
         """通过率"""
-        if self.exec_type == 'case':
+        if self.exec_type in ('case', 'scenario'):
             return 100.0 if self.status == 'passed' else 0.0
         elif self.exec_type == 'suite':
             try:
@@ -605,4 +606,3 @@ class APITestSuiteCaseExecution(models.Model):
     
     def __str__(self):
         return f"{self.name} - {self.get_status_display()}"
-

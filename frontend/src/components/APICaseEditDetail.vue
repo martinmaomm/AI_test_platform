@@ -71,7 +71,7 @@
               </div>
               <div class="info-content">
                 <div class="tags-container">
-                  <div class="tag-group">
+                  <div v-if="showPriority" class="tag-group">
                     <span class="tag-label">优先级:</span>
                     <el-select 
                       v-model="editForm.priority" 
@@ -582,6 +582,10 @@ const props = defineProps({
   testCase: {
     type: Object,
     default: null
+  },
+  showPriority: {
+    type: Boolean,
+    default: true
   }
 })
 

@@ -661,6 +661,7 @@ class APITestExecutionListSerializer(serializers.ModelSerializer):
 
 class APITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     """单用例执行详情序列化器 - 用于单用例执行详情页面"""
+    exec_type = serializers.CharField(source='execution.exec_type', read_only=True)
     test_case_title = serializers.CharField(source='test_case.title', read_only=True)
     test_case_description = serializers.CharField(source='test_case.description', read_only=True)
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
@@ -670,7 +671,7 @@ class APITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = APITestCaseExecutionDetail
         fields = [
-            'id', 'execution', 'test_case', 'test_case_title', 'test_case_description',
+            'id', 'execution', 'exec_type', 'test_case', 'test_case_title', 'test_case_description',
             'name', 'status', 'environment_name', 'environment_base_url',
             'start_time', 'end_time', 'duration',
             'error_message', 'log', 'httprunner_result'
@@ -807,4 +808,3 @@ class APITestCaseScriptUpdateSerializer(serializers.ModelSerializer):
                         {'script_content': 'script_content 必须是合法的 JSON 字符串或 JSON 对象'}
                     )
         return value
-

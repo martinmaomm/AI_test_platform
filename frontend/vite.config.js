@@ -19,7 +19,8 @@ export default defineConfig({
   assetsInclude: ['**/*.worker.js'],
   server: {
     port: 5173,
-	host: '0.0.0.0',// 韬哥加！！
+	host: '0.0.0.0',// 允许外网访问
+  allowedHosts: ['home.maoyijiu.top'],
     proxy: {
       '/api/v1': {
         target: 'http://127.0.0.1:8000',

@@ -884,8 +884,9 @@ class ExecuteAPITestCaseView(APIView):
                 )
             
             # 创建测试执行记录（使用新的模型结构）
+            execution_type = 'scenario' if test_case.test_case_type == 'scenario' else 'case'
             execution = APITestExecution.objects.create(
-                exec_type='case',
+                exec_type=execution_type,
                 name=test_case.title,
                 description=test_case.description,
                 status='pending',
@@ -929,9 +930,10 @@ class ExecuteAPITestCaseView(APIView):
                     "execution_id": execution.id,
                     "task_id": task.id,
                     "execution_name": test_case.title,
+                    "exec_type": execution.exec_type,
                     "environment_name": environment.name
                 },
-                message="测试用例执行已开始"
+                message="场景执行已开始" if execution_type == 'scenario' else "测试用例执行已开始"
             )
             
         except Exception as e:
@@ -1729,7 +1731,7 @@ class APITestExecutionListView(generics.ListAPIView):
         
         # 支持按执行类型过滤
         exec_type = self.request.GET.get('exec_type')
-        if exec_type in ['case', 'suite']:
+        if exec_type in ['case', 'scenario', 'suite']:
             queryset = queryset.filter(exec_type=exec_type)
         
         # 支持按状态过滤
@@ -1775,7 +1777,7 @@ class APITestCaseExecutionDetailView(APIView):
             ).filter(
                 execution_id=pk,
                 execution__executor=user,
-                execution__exec_type='case'
+                execution__exec_type__in=['case', 'scenario']
             ).first()
             
             if not case_detail:
@@ -1788,7 +1790,7 @@ class APITestCaseExecutionDetailView(APIView):
             return response(
                 kind="success",
                 data=serializer.data,
-                message="获取单用例执行详情成功"
+                message="获取用例执行详情成功"
             )
         except Exception as e:
             logger.error(f"获取单用例执行详情失败: {e}", exc_info=True)
@@ -1895,7 +1897,7 @@ class APITestExecutionDeleteView(APIView):
             exec_name = execution.name
 
             # 删除相关的执行详情记录
-            if exec_type == 'case' and hasattr(execution, 'case_execution_detail'):
+            if exec_type in ('case', 'scenario') and hasattr(execution, 'case_execution_detail'):
                 execution.case_execution_detail.delete()
             elif exec_type == 'suite' and hasattr(execution, 'suite_execution_detail'):
                 # 删除套件执行详情及其子用例执行记录

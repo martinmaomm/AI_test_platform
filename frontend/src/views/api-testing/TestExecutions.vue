@@ -85,6 +85,7 @@
             <el-select v-model="filters.exec_type" placeholder="执行类型" clearable style="width: 120px;">
               <el-option label="全部" value="" />
               <el-option label="单用例" value="case" />
+              <el-option label="场景" value="scenario" />
               <el-option label="套件" value="suite" />
             </el-select>
             <el-select v-model="filters.status" placeholder="执行状态" clearable style="width: 140px;">
@@ -125,8 +126,8 @@
 
         <el-table-column prop="exec_type" label="执行类型" width="100" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.exec_type === 'case' ? 'primary' : 'success'" size="small">
-              {{ row.exec_type === 'case' ? '单用例' : '套件' }}
+            <el-tag :type="getExecutionTypeTag(row.exec_type)" size="small">
+              {{ getExecutionTypeText(row.exec_type) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -204,7 +205,7 @@
         @close="detailDialogVisible = false" />
       
       <!-- 单用例执行详情 -->
-      <APITestCaseExecutionDetail v-else-if="selectedRun && selectedRun.exec_type === 'case'" 
+      <APITestCaseExecutionDetail v-else-if="selectedRun && ['case', 'scenario'].includes(selectedRun.exec_type)"
         :result="selectedRun" :visible="detailDialogVisible"
         @close="detailDialogVisible = false" />
     </el-dialog>
@@ -321,6 +322,12 @@ const triggerTypeMap = {
   ci_cd: 'CI/CD'
 }
 
+const executionTypeMap = {
+  case: { text: '单用例', tag: 'primary' },
+  scenario: { text: '场景', tag: 'warning' },
+  suite: { text: '套件', tag: 'success' }
+}
+
 // 获取测试名称
 const getTestName = (item) => {
   return item.name || item.test_case_name || '未命名测试'
@@ -344,6 +351,14 @@ const getStatusText = (status) => {
 
 const getTriggerTypeText = (triggerType) => {
   return triggerTypeMap[triggerType] || triggerType
+}
+
+const getExecutionTypeText = (execType) => {
+  return executionTypeMap[execType]?.text || execType || '未知'
+}
+
+const getExecutionTypeTag = (execType) => {
+  return executionTypeMap[execType]?.tag || 'info'
 }
 
 // 格式化执行时长
@@ -490,7 +505,7 @@ const viewDetails = async (row) => {
   try {
     // 根据执行类型调用不同的API
     let response
-    if (row.exec_type === 'case') {
+    if (['case', 'scenario'].includes(row.exec_type)) {
       response = await getAPITestCaseExecutionDetail(projectStore.currentProjectId, row.id)
     } else if (row.exec_type === 'suite') {
       response = await getAPITestSuiteExecutionDetail(projectStore.currentProjectId, row.id)
@@ -607,11 +622,15 @@ onMounted(async () => {
     if (row) {
       await viewDetails(row)
     } else {
-      // 记录可能在其他页，尝试直接拉取详情（场景执行通常为 case 类型）
+      // 记录可能在其他页，尝试直接拉取单用例/场景详情
       try {
         const res = await getAPITestCaseExecutionDetail(projectStore.currentProjectId, targetId)
         if (res?.success && res?.data) {
-          selectedRun.value = { ...res.data, id: targetId, exec_type: 'case' }
+          selectedRun.value = {
+            ...res.data,
+            id: targetId,
+            exec_type: res.data.exec_type || 'case'
+          }
           detailDialogVisible.value = true
         }
       } catch {

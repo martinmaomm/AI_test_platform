@@ -13,15 +13,70 @@ import subprocess
 from collections import deque
 from typing import TypedDict, Dict, Any, Optional
 from datetime import datetime
+from channels.db import database_sync_to_async
 from django.core.cache import cache
 from .models import MCPConfiguration
 from langgraph.graph import StateGraph, END
+from langgraph.errors import GraphRecursionError
 from common.websocket import websocket_message_service, send_node_start_notification_helper
 from common.parsers import extract_python_from_output
 from .model_manager import get_llm_manager
 from mcp_use import MCPClient, MCPAgent
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_POM_CONTEXT = "当前项目暂无收录的标准页面元素。"
+_NON_RETRYABLE_MCP_ERROR_MARKERS = (
+    "executable doesn't exist",
+    "browsertype.launch",
+    "failed to initialize browser",
+    "browser executable",
+)
+
+
+def _load_project_pom_context(project_id: int) -> str:
+    """同步读取项目POM元素，供异步节点通过database_sync_to_async调用。"""
+    from web_testing.models import WebElement
+
+    elements = list(
+        WebElement.objects.filter(page__project_id=project_id).select_related('page')
+    )
+    if not elements:
+        return _DEFAULT_POM_CONTEXT
+
+    return "\n".join(
+        f"- 页面【{element.page.name}】| 元素: {element.name} | "
+        f"定位器: {element.locator_type}={element.locator_value} | "
+        f"推荐操作: {element.action_type or '自动识别'}"
+        for element in elements
+    )
+
+
+def _is_non_retryable_mcp_error(error: Exception) -> bool:
+    """识别浏览器不可用或智能体达到上限等不适合重试的错误。"""
+    if isinstance(error, GraphRecursionError):
+        return True
+
+    error_text = str(error).lower()
+    return any(marker in error_text for marker in _NON_RETRYABLE_MCP_ERROR_MARKERS)
+
+
+def _get_non_retryable_mcp_error_message(error: Exception) -> str:
+    """将底层MCP错误转换为前端可理解的提示。"""
+    if isinstance(error, GraphRecursionError):
+        return (
+            "MCP智能体超过最大执行步数，通常表示Playwright浏览器工具未能正常返回结果。"
+            "请确认Celery所在机器已安装Chromium，并重启Celery后重试。"
+        )
+
+    error_text = str(error).lower()
+    if any(marker in error_text for marker in _NON_RETRYABLE_MCP_ERROR_MARKERS):
+        return (
+            "Playwright浏览器启动失败，未找到浏览器可执行文件。请在运行Celery的机器执行 "
+            "npx -y playwright install chromium，完成后重启Celery。"
+        )
+
+    return str(error)
 
 def _enforce_script_guarantees(script: str, description: str = '') -> str:
     """轻量级草稿脚本兜底：仅保证基础导包合法"""
@@ -610,17 +665,12 @@ class WebUIPlaywrightAgent:
             target_url = state['url']
 
             # 获取当前项目已定义的标准元素库 (POM)
-            elements_context = "当前项目暂无收录的标准页面元素。"
+            elements_context = _DEFAULT_POM_CONTEXT
             if state.get("project_id"):
                 try:
-                    from web_testing.models import WebElement
-                    elements = WebElement.objects.filter(page__project_id=state["project_id"]).select_related('page')
-                    if elements.exists():
-                        el_list = [
-                            f"- 页面【{el.page.name}】| 元素: {el.name} | 定位器: {el.locator_type}={el.locator_value} | 推荐操作: {el.action_type or '自动识别'}"
-                            for el in elements
-                        ]
-                        elements_context = "\n".join(el_list)
+                    elements_context = await database_sync_to_async(
+                        _load_project_pom_context
+                    )(state["project_id"])
                 except Exception as e:
                     logger.error(f"提取项目 POM 元素库失败: {e}")
 
@@ -805,6 +855,17 @@ async def run(page):
                 # 如果是取消异常，直接抛出，不重试
                 if "任务已被取消" in str(e):
                     raise
+                if _is_non_retryable_mcp_error(e):
+                    error_message = _get_non_retryable_mcp_error_message(e)
+                    logger.error(
+                        f"MCP智能体遇到不可重试错误: {error_message}",
+                        exc_info=True,
+                    )
+                    self._send_websocket_message(
+                        f"❌ {error_message}\n",
+                        "MCP智能体运行",
+                    )
+                    raise RuntimeError(error_message) from e
                 # 其他RuntimeError继续重试逻辑
                 logger.error(f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 
@@ -819,11 +880,22 @@ async def run(page):
                 else:
                     # 最后一次尝试失败
                     self._send_websocket_message(
-                        f"❌ MCP智能体运行失败: {str(e)}\n", 
+                        f"❌ MCP智能体运行失败: {str(e)}\n",
                         "MCP智能体运行"
                     )
                     raise
             except Exception as e:
+                if _is_non_retryable_mcp_error(e):
+                    error_message = _get_non_retryable_mcp_error_message(e)
+                    logger.error(
+                        f"MCP智能体遇到不可重试错误: {error_message}",
+                        exc_info=True,
+                    )
+                    self._send_websocket_message(
+                        f"❌ {error_message}\n",
+                        "MCP智能体运行",
+                    )
+                    raise RuntimeError(error_message) from e
                 logger.error(f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 
                 if attempt < max_retries - 1:

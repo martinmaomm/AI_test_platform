@@ -94,12 +94,16 @@
                       id="description" 
                       v-model="manualFormData.description" 
                       placeholder="描述测试操作..." 
-                      rows="2"
+                      rows="8"
+                      :maxlength="MAX_DESCRIPTION_LENGTH"
                       required 
                       :disabled="isCreating" 
                       class="compact-textarea" 
                       :class="{ 'invalid': manualFormData.description && manualFormData.description.trim().length === 0 }"
                     ></textarea>
+                    <div class="description-counter">
+                      {{ manualFormData.description.length }}/{{ MAX_DESCRIPTION_LENGTH }}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -249,9 +253,13 @@ const isValidUrl = (url) => {
   }
 }
 
+const MAX_DESCRIPTION_LENGTH = 2000
+
 // 表单验证计算属性
 const isFormValid = computed(() => {
-  return isValidUrl(manualFormData.url) && manualFormData.description.trim().length > 0
+  return isValidUrl(manualFormData.url) &&
+    manualFormData.description.trim().length > 0 &&
+    manualFormData.description.length <= MAX_DESCRIPTION_LENGTH
 })
 
 // WebSocket相关状态
@@ -1138,8 +1146,17 @@ onUnmounted(() => {
 
 .compact-textarea {
   resize: vertical;
-  min-height: 60px;
+  min-height: 180px;
+  max-height: 480px;
+  line-height: 1.6;
   font-family: inherit;
+}
+
+.description-counter {
+  margin-top: 4px;
+  color: #9ca3af;
+  font-size: 12px;
+  text-align: right;
 }
 
 .selected-info {

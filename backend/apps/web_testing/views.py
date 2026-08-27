@@ -43,6 +43,8 @@ from .tasks import (
 
 logger = logging.getLogger(__name__)
 
+MAX_WEBUI_TEST_DESCRIPTION_LENGTH = 2000
+
 
 # ============ 分页配置 ============
 
@@ -168,6 +170,18 @@ class CreateWebUITestScriptView(APIView):
             for field in required_fields:
                 if field not in data:
                     return response('error', message=f'缺少必需字段: {field}', status_code=status.HTTP_400_BAD_REQUEST)
+
+            description = data.get('description')
+            if not isinstance(description, str) or not description.strip():
+                return response('error', message='测试描述不能为空', status_code=status.HTTP_400_BAD_REQUEST)
+
+            description = description.strip()
+            if len(description) > MAX_WEBUI_TEST_DESCRIPTION_LENGTH:
+                return response(
+                    'error',
+                    message=f'测试描述不能超过{MAX_WEBUI_TEST_DESCRIPTION_LENGTH}个字符',
+                    status_code=status.HTTP_400_BAD_REQUEST
+                )
             
             # 从URL路径参数获取项目ID
             from projects.models import Project
@@ -177,8 +191,8 @@ class CreateWebUITestScriptView(APIView):
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             task = generate_webui_test_script_task.delay(
-                script_name=f"WebUI测试脚本_{timestamp}_{data['description'][:20]}",
-                description=data['description'],
+                script_name=f"WebUI测试脚本_{timestamp}_{description[:20]}",
+                description=description,
                 url=data['url'],
                 user_id=request.user.id,
                 project_id=project.id,

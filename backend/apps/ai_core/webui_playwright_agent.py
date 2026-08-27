@@ -7,6 +7,7 @@ WebUI Playwright智能体
 import logging
 import asyncio
 import os
+import re
 import shutil
 import platform
 import subprocess
@@ -14,6 +15,7 @@ from collections import deque
 from typing import TypedDict, Dict, Any, Optional
 from datetime import datetime
 from channels.db import database_sync_to_async
+from django.conf import settings
 from django.core.cache import cache
 from .models import MCPConfiguration
 from langgraph.graph import StateGraph, END
@@ -26,12 +28,147 @@ from mcp_use import MCPClient, MCPAgent
 logger = logging.getLogger(__name__)
 
 _DEFAULT_POM_CONTEXT = "当前项目暂无收录的标准页面元素。"
+MCP_MAX_STEPS = 30
+MCP_BROWSER_TOOL_CALL_LIMIT = 12
+
+MCP_EXPLORATION_CONSTRAINTS = f"""- 调用 `playwright_navigate` 时必须显式传入 JSON 布尔值 `headless: true`，不得省略，也不得传字符串 `\"true\"`。
+- 所有浏览器工具调用合计最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次；仅在缺少必要页面结构、可见文本或定位器时调用工具。
+- 获取生成脚本所需的页面结构后，立即停止所有工具调用，只输出完整、可提取的 Python Playwright 脚本。
+- 单个业务操作失败后最多补充一次页面检查；生成阶段不要求真实跑通完整业务流程，也不要反复重放已失败的操作。
+- 不要为了验证脚本而继续截图、读取 HTML、检查控制台或重复登录；最终回复只能是完整 Python 脚本。"""
+
+MCP_AGENT_ADDITIONAL_INSTRUCTIONS = f"""这是生成任务的系统级稳定性约束，优先级高于用户任务中的探索性要求：
+{MCP_EXPLORATION_CONSTRAINTS}
+"""
+
+MCP_ERROR_GRAPH_RECURSION = "graph_recursion"
+MCP_ERROR_TOOL_PARAMETER = "tool_parameter"
+MCP_ERROR_BROWSER = "browser"
+MCP_ERROR_RATE_LIMIT = "rate_limit"
+MCP_ERROR_TRANSIENT = "transient"
+MCP_ERROR_OTHER = "other"
+
+_PLAYWRIGHT_TOOL_PARAMETER_ERROR_MARKERS = (
+    "headless: expected boolean",
+    "headless expected boolean",
+    "headless must be boolean",
+    "headless must be a boolean",
+    "invalid headless",
+)
 _NON_RETRYABLE_MCP_ERROR_MARKERS = (
     "executable doesn't exist",
-    "browsertype.launch",
     "failed to initialize browser",
     "browser executable",
+    "failed to launch browser",
+    "browser was not found",
+    "missing executable",
+    "executable file not found",
 )
+_TRANSIENT_MCP_ERROR_MARKERS = (
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "server disconnected",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+)
+_HTTP_STATUS_PATTERN = re.compile(r"\b(429|503|504)\b")
+
+
+def _iter_exception_chain(error: BaseException):
+    """遍历异常及其 cause/context，兼容被 RuntimeError 包装的底层错误。"""
+    current: Optional[BaseException] = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _exception_text(error: BaseException) -> str:
+    """获取异常链文本，仅用于错误分类。"""
+    return " | ".join(
+        str(candidate) for candidate in _iter_exception_chain(error) if str(candidate)
+    ).lower()
+
+
+def _classify_mcp_error(error: BaseException) -> str:
+    """将 MCP 执行异常归类为可测试、可重试的稳定类别。"""
+    if any(
+        isinstance(candidate, GraphRecursionError)
+        for candidate in _iter_exception_chain(error)
+    ):
+        return MCP_ERROR_GRAPH_RECURSION
+
+    error_text = _exception_text(error)
+    if "upstream_rate_limited" in error_text or "too many requests" in error_text:
+        return MCP_ERROR_RATE_LIMIT
+    status_match = _HTTP_STATUS_PATTERN.search(error_text)
+    if status_match and status_match.group(1) == "429":
+        return MCP_ERROR_RATE_LIMIT
+    if any(marker in error_text for marker in _PLAYWRIGHT_TOOL_PARAMETER_ERROR_MARKERS):
+        return MCP_ERROR_TOOL_PARAMETER
+    if any(marker in error_text for marker in _NON_RETRYABLE_MCP_ERROR_MARKERS):
+        return MCP_ERROR_BROWSER
+    if (
+        (status_match and status_match.group(1) in {"503", "504"})
+        or any(
+            isinstance(candidate, (ConnectionError, TimeoutError))
+            for candidate in _iter_exception_chain(error)
+        )
+        or any(marker in error_text for marker in _TRANSIENT_MCP_ERROR_MARKERS)
+    ):
+        return MCP_ERROR_TRANSIENT
+    return MCP_ERROR_OTHER
+
+
+def _is_non_retryable_mcp_error(error: BaseException) -> bool:
+    """识别浏览器、递归超限和上游限流等不适合重试的错误。"""
+    return _classify_mcp_error(error) in {
+        MCP_ERROR_GRAPH_RECURSION,
+        MCP_ERROR_TOOL_PARAMETER,
+        MCP_ERROR_BROWSER,
+        MCP_ERROR_RATE_LIMIT,
+    }
+
+
+def _get_mcp_error_message(error: BaseException) -> str:
+    """将底层 MCP 错误转换为固定的前端提示。"""
+    error_kind = _classify_mcp_error(error)
+    if error_kind == MCP_ERROR_GRAPH_RECURSION:
+        return (
+            "MCP智能体超过最大执行步数，页面探索未在限制内完成。"
+            "请缩短测试描述或减少需要探索的操作后重试。"
+        )
+    if error_kind == MCP_ERROR_TOOL_PARAMETER:
+        return (
+            "Playwright MCP工具参数错误：调用 playwright_navigate 时必须传入 JSON boolean "
+            "headless: true，不能省略或传字符串 \"true\"。请修正工具参数后重试，"
+            "本次任务不会自动重试。"
+        )
+    if error_kind == MCP_ERROR_BROWSER:
+        return (
+            "Playwright浏览器启动失败或找不到可执行文件。请确认运行Celery的机器已安装"
+            "与当前MCP版本匹配的Chromium，并检查PLAYWRIGHT_BROWSERS_PATH后重启Celery。"
+        )
+    if error_kind == MCP_ERROR_RATE_LIMIT:
+        return (
+            "上游模型服务触发限流（429/UPSTREAM_RATE_LIMITED），本次任务不会自动重试。"
+            "请等待限流窗口结束后重试，或切换可用模型、提高服务配额。"
+        )
+    if error_kind == MCP_ERROR_TRANSIENT:
+        return "MCP服务暂时不可用（503/504或临时连接错误），有限重试后仍未恢复，请稍后重试。"
+    return "MCP智能体运行失败，请查看Celery日志。"
+
+
+def _get_non_retryable_mcp_error_message(error: BaseException) -> str:
+    """兼容旧调用方：返回已分类的 MCP 错误提示。"""
+    return _get_mcp_error_message(error)
 
 
 def _load_project_pom_context(project_id: int) -> str:
@@ -51,32 +188,6 @@ def _load_project_pom_context(project_id: int) -> str:
         for element in elements
     )
 
-
-def _is_non_retryable_mcp_error(error: Exception) -> bool:
-    """识别浏览器不可用或智能体达到上限等不适合重试的错误。"""
-    if isinstance(error, GraphRecursionError):
-        return True
-
-    error_text = str(error).lower()
-    return any(marker in error_text for marker in _NON_RETRYABLE_MCP_ERROR_MARKERS)
-
-
-def _get_non_retryable_mcp_error_message(error: Exception) -> str:
-    """将底层MCP错误转换为前端可理解的提示。"""
-    if isinstance(error, GraphRecursionError):
-        return (
-            "MCP智能体超过最大执行步数，通常表示Playwright浏览器工具未能正常返回结果。"
-            "请确认Celery所在机器已安装Chromium，并重启Celery后重试。"
-        )
-
-    error_text = str(error).lower()
-    if any(marker in error_text for marker in _NON_RETRYABLE_MCP_ERROR_MARKERS):
-        return (
-            "Playwright浏览器启动失败，未找到浏览器可执行文件。请在运行Celery的机器执行 "
-            "npx -y playwright install chromium，完成后重启Celery。"
-        )
-
-    return str(error)
 
 def _enforce_script_guarantees(script: str, description: str = '') -> str:
     """轻量级草稿脚本兜底：仅保证基础导包合法"""
@@ -302,10 +413,14 @@ class WebUIPlaywrightAgent:
                 agent = MCPAgent(
                     llm=llm_model,
                     client=client,
-                    max_steps=30
+                    max_steps=MCP_MAX_STEPS,
+                    additional_instructions=MCP_AGENT_ADDITIONAL_INSTRUCTIONS,
                 )
                 
-                logger.info("MCP智能体初始化成功")
+                logger.info(
+                    "MCP智能体初始化成功：已启用 headless:true 约束，浏览器工具预算=%s 次",
+                    MCP_BROWSER_TOOL_CALL_LIMIT,
+                )
                 return agent
                 
             finally:
@@ -537,6 +652,18 @@ class WebUIPlaywrightAgent:
                             
                             playwright_server_config['env']['PYTHONUNBUFFERED'] = '1'
                             playwright_server_config['env']['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
+
+                            # 支持将浏览器缓存放在项目目录，便于部署时复用。
+                            # 相对路径统一按 backend 根目录解析，避免受 Celery 启动目录影响。
+                            browser_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH')
+                            if browser_path:
+                                if not os.path.isabs(browser_path):
+                                    browser_path = os.path.join(str(settings.BASE_DIR), browser_path)
+                                playwright_server_config['env']['PLAYWRIGHT_BROWSERS_PATH'] = os.path.abspath(browser_path)
+                                logger.info(
+                                    "Playwright浏览器缓存目录: %s",
+                                    playwright_server_config['env']['PLAYWRIGHT_BROWSERS_PATH'],
+                                )
                             
                             # 添加超时设置
                             if 'timeout' not in playwright_server_config:
@@ -681,6 +808,10 @@ class WebUIPlaywrightAgent:
 【目标 URL】: {target_url}
 【用户需求】: {description}
 
+【MCP探索约束】
+以下约束必须在本次任务中执行，并与系统级指令保持一致：
+{MCP_EXPLORATION_CONSTRAINTS}
+
 【核心准则：标准元素库 (POM) 优先】
 在生成脚本时，必须优先使用以下已定义的标准元素定位器。如果库中存在匹配业务语义的元素，严禁自行"脑补"其他选择器：
 {elements_context}
@@ -786,8 +917,15 @@ async def run(page):
                 return {"current_step": "cancelled", "test_script": None, "cancelled": True}
             raise
         except Exception as e:
-            logger.error(f"MCP生成Playwright Python测试脚本失败: {e}")
-            self._send_websocket_message(f"❌ MCP生成Playwright Python测试脚本失败: {str(e)}\n", "MCP智能体生成")
+            error_message = _get_mcp_error_message(e)
+            logger.error(
+                f"MCP生成Playwright Python测试脚本失败: {error_message}",
+                exc_info=True,
+            )
+            self._send_websocket_message(
+                f"❌ MCP生成Playwright Python测试脚本失败: {error_message}\n",
+                "MCP智能体生成",
+            )
             return {"current_step": "script_generation_failed", "test_script": None}
     
     async def _call_mcp_agent_async(self, prompt: str) -> str:
@@ -851,14 +989,16 @@ async def run(page):
                     # 清理日志处理器
                     self._cleanup_mcp_output_handler(mcp_handler)
                     
-            except RuntimeError as e:
+            except Exception as e:
                 # 如果是取消异常，直接抛出，不重试
                 if "任务已被取消" in str(e):
                     raise
+
+                error_kind = _classify_mcp_error(e)
+                error_message = _get_mcp_error_message(e)
                 if _is_non_retryable_mcp_error(e):
-                    error_message = _get_non_retryable_mcp_error_message(e)
                     logger.error(
-                        f"MCP智能体遇到不可重试错误: {error_message}",
+                        f"MCP智能体遇到不可重试错误: type={error_kind}",
                         exc_info=True,
                     )
                     self._send_websocket_message(
@@ -866,50 +1006,25 @@ async def run(page):
                         "MCP智能体运行",
                     )
                     raise RuntimeError(error_message) from e
-                # 其他RuntimeError继续重试逻辑
-                logger.error(f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                
+
+                # 503/504、临时 MCP 连接错误及其他未知错误保持有限重试。
+                logger.error(
+                    f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): type={error_kind}",
+                    exc_info=True,
+                )
+
                 if attempt < max_retries - 1:
                     # 指数退避重试
                     retry_delay = base_retry_delay * (2 ** attempt)
                     self._send_websocket_message(
-                        f"⚠️ 连接失败，{retry_delay}秒后重试...\n", 
+                        f"⚠️ 连接失败，{retry_delay}秒后重试...\n",
                         "MCP智能体运行"
                     )
                     await asyncio.sleep(retry_delay)
                 else:
                     # 最后一次尝试失败
                     self._send_websocket_message(
-                        f"❌ MCP智能体运行失败: {str(e)}\n",
-                        "MCP智能体运行"
-                    )
-                    raise
-            except Exception as e:
-                if _is_non_retryable_mcp_error(e):
-                    error_message = _get_non_retryable_mcp_error_message(e)
-                    logger.error(
-                        f"MCP智能体遇到不可重试错误: {error_message}",
-                        exc_info=True,
-                    )
-                    self._send_websocket_message(
-                        f"❌ {error_message}\n",
-                        "MCP智能体运行",
-                    )
-                    raise RuntimeError(error_message) from e
-                logger.error(f"运行MCP智能体失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                
-                if attempt < max_retries - 1:
-                    # 指数退避重试
-                    retry_delay = base_retry_delay * (2 ** attempt)
-                    self._send_websocket_message(
-                        f"⚠️ 连接失败，{retry_delay}秒后重试...\n", 
-                        "MCP智能体运行"
-                    )
-                    await asyncio.sleep(retry_delay)
-                else:
-                    # 最后一次尝试失败
-                    self._send_websocket_message(
-                        f"❌ MCP智能体运行失败: {str(e)}\n", 
+                        f"❌ MCP智能体运行失败: {error_message}\n",
                         "MCP智能体运行"
                     )
                     raise
@@ -1073,8 +1188,8 @@ async def run(page):
             # 其他RuntimeError继续抛出
             raise
         except Exception as e:
-            error_msg = f"运行WebUI测试脚本生成智能体失败: {str(e)}"
-            logger.error(error_msg)
+            error_msg = f"运行WebUI测试脚本生成智能体失败: {_get_mcp_error_message(e)}"
+            logger.error(error_msg, exc_info=True)
             return {
                 "success": False,
                 "error": error_msg,

@@ -14,6 +14,7 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from django.shortcuts import get_object_or_404
 from django.db import transaction, models
+from django.db.models import Q
 from django.utils import timezone
 
 from common.api import response
@@ -207,6 +208,75 @@ class CreateWebUITestScriptView(APIView):
         except Exception as e:
             logger.error(f"创建WebUI测试脚本失败: {e}")
             return response('error', message=f'创建失败: {str(e)}', status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SaveGeneratedWebUITestScriptView(APIView):
+    """保存 AI 脚本实验室生成的脚本为 WebUI 测试用例。"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        title = str(request.data.get('title', '')).strip()
+        description = str(request.data.get('description', '')).strip()
+        url = str(request.data.get('url', '')).strip()
+        script_content = str(request.data.get('test_script_content', '')).strip()
+
+        if not title:
+            return response('error', message='测试用例标题不能为空', status_code=status.HTTP_400_BAD_REQUEST)
+        if len(title) > 200:
+            return response('error', message='测试用例标题不能超过200个字符', status_code=status.HTTP_400_BAD_REQUEST)
+        if not description:
+            return response('error', message='测试描述不能为空', status_code=status.HTTP_400_BAD_REQUEST)
+        if len(description) > MAX_WEBUI_TEST_DESCRIPTION_LENGTH:
+            return response(
+                'error',
+                message=f'测试描述不能超过{MAX_WEBUI_TEST_DESCRIPTION_LENGTH}个字符',
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+        if not script_content:
+            return response('error', message='脚本内容不能为空', status_code=status.HTTP_400_BAD_REQUEST)
+
+        project = Project.objects.filter(
+            Q(id=project_id),
+            Q(created_by=request.user) |
+            Q(owner=request.user) |
+            Q(members__user=request.user)
+        ).distinct().first()
+        if not project:
+            return response('error', message='项目不存在或无权限访问', status_code=status.HTTP_404_NOT_FOUND)
+
+        try:
+            test_case = WebUITestCase.objects.create(
+                title=title,
+                description=description,
+                url=url or None,
+                user=request.user,
+                project=project,
+                test_script_content=script_content,
+                priority='medium',
+                category='functional',
+                preconditions=[],
+                steps=[],
+                expected_result='脚本执行成功'
+            )
+            logger.info(
+                'AI脚本实验室脚本已保存为测试用例: id=%s, project_id=%s, user_id=%s',
+                test_case.id,
+                project.id,
+                request.user.id,
+            )
+            return response(
+                'success',
+                data={
+                    'id': test_case.id,
+                    'title': test_case.title,
+                    'project_id': test_case.project_id,
+                    'has_script': True,
+                },
+                message='脚本已保存到测试用例'
+            )
+        except Exception as e:
+            logger.error(f'保存 AI 生成脚本失败: {e}', exc_info=True)
+            return response('error', message=f'保存脚本失败: {str(e)}', status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class CreateWebUITestScriptFromTestCaseView(APIView):

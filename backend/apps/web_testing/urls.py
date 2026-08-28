@@ -16,6 +16,7 @@ urlpatterns = [
 
     # ============ WebUI测试脚本管理 ============
     path('scripts/', views.CreateWebUITestScriptView.as_view(), name='create-webui-test-script'),
+    path('scripts/save/', views.SaveGeneratedWebUITestScriptView.as_view(), name='save-generated-webui-test-script'),
     path('scripts/stop/', views.StopWebUITestScriptView.as_view(), name='stop-webui-test-script'),
     path('scripts/from-testcase/', views.CreateWebUITestScriptFromTestCaseView.as_view(), name='create-webui-test-script-from-testcase'),
     path('scripts/from-testcase/stop/', views.StopWebUITestScriptFromTestCaseView.as_view(), name='stop-webui-test-script-from-testcase'),

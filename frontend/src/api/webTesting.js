@@ -204,6 +204,12 @@ export const createWebUITestScript = async (projectId, data) => {
   return response.data
 }
 
+// 保存 AI 脚本实验室生成的脚本为测试用例
+export const saveGeneratedWebUITestScript = async (projectId, data) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/scripts/save/`, data)
+  return response.data
+}
+
 // 基于测试用例创建WebUI测试脚本
 export const createWebUITestScriptFromTestCase = async (projectId, data) => {
   const response = await api.post(`/projects/${projectId}/web-testing/scripts/from-testcase/`, data)

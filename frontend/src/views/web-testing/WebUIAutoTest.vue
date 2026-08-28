@@ -159,6 +159,16 @@
                 </el-button>
               </el-button-group>
             </div>
+            <el-button
+              v-if="finalScript"
+              type="success"
+              size="small"
+              :loading="isSaving"
+              :disabled="isSaving || !!savedTestCaseId"
+              @click="saveGeneratedScript"
+            >
+              {{ savedTestCaseId ? '已保存到测试用例' : '保存到测试用例' }}
+            </el-button>
           </div>
           
           <!-- 实时输出视图 -->
@@ -217,8 +227,8 @@ import { useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/project'
 import { useAuthStore } from '@/stores/auth'
 import { Loading, VideoPlay, Refresh, DocumentCopy, Download, Warning, Setting, Link, CircleClose } from '@element-plus/icons-vue'
-import { ElMessageBox } from 'element-plus'
-import { createWebUITestScript, stopWebUITestScript } from '@/api/webTesting'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { createWebUITestScript, saveGeneratedWebUITestScript, stopWebUITestScript } from '@/api/webTesting'
 import { 
   WebSocketManager, 
   WebSocketMessageHandler
@@ -274,6 +284,8 @@ const currentView = ref('streaming')
 const finalScript = ref('')
 const currentTaskId = ref(null) // 当前任务的ID
 const isStopping = ref(false) // 是否正在停止任务
+const isSaving = ref(false)
+const savedTestCaseId = ref(null)
 
 
 // 时间线相关
@@ -431,6 +443,7 @@ const handleNodeStart = (data) => {
 const handleTaskCompleted = (data) => {
   // 结束加载状态
   isGenerating.value = false
+  savedTestCaseId.value = null
 
   // 确保save_script节点被标记为执行中，然后完成
   updateTimelineNode('save_script', 'executing')
@@ -458,8 +471,6 @@ const handleTaskCompleted = (data) => {
   isCreating.value = false
   currentTaskId.value = null
   
-  // 刷新测试用例列表
-  loadTestCases()
 }
 
 // 处理任务失败
@@ -697,6 +708,7 @@ const createTestScript = async () => {
     isCreating.value = true
     streamingContent.value = ''
     finalScript.value = ''
+    savedTestCaseId.value = null
     currentView.value = 'streaming'
     currentTaskId.value = null
     resetTimeline()
@@ -727,6 +739,66 @@ const createTestScript = async () => {
     alert(`创建失败: ${error.message}`)
     isCreating.value = false
     currentTaskId.value = null
+  }
+}
+
+// 将当前生成的脚本保存为可在“测试用例管理”中继续编辑和执行的测试用例
+const saveGeneratedScript = async () => {
+  if (!finalScript.value || isSaving.value || savedTestCaseId.value) return
+
+  const defaultTitle = `WebUI脚本_${new Date().toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).replace(/[/:]/g, '').replace(/\s/g, '_')}`
+
+  let title
+  try {
+    const promptResult = await ElMessageBox.prompt(
+      '保存后可以在“WebUI测试用例管理”中继续编辑、生成代码和执行。',
+      '保存到测试用例',
+      {
+        confirmButtonText: '保存',
+        cancelButtonText: '取消',
+        inputValue: defaultTitle,
+        inputPlaceholder: '请输入测试用例标题',
+        inputValidator: (value) => {
+          const normalized = value?.trim() || ''
+          if (!normalized) return '测试用例标题不能为空'
+          if (normalized.length > 200) return '测试用例标题不能超过200个字符'
+          return true
+        }
+      }
+    )
+    title = promptResult.value.trim()
+  } catch {
+    return
+  }
+
+  try {
+    isSaving.value = true
+    const response = await saveGeneratedWebUITestScript(projectStore.currentProjectId, {
+      title,
+      description: manualFormData.description.trim(),
+      url: manualFormData.url.trim(),
+      test_script_content: finalScript.value
+    })
+
+    if (!response.success) {
+      throw new Error(response.message || '保存脚本失败')
+    }
+
+    savedTestCaseId.value = response.data?.id || response.data?.test_case_id
+    ElMessage.success(`脚本已保存，可在测试用例管理中查看（ID: ${savedTestCaseId.value}）`)
+  } catch (error) {
+    console.error('保存生成脚本失败:', error)
+    ElMessage.error(error.response?.data?.message || error.message || '保存脚本失败')
+  } finally {
+    isSaving.value = false
   }
 }
 

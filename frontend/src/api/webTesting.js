@@ -263,11 +263,12 @@ export const batchGenerateTestCaseCode = async (projectId, caseIds, framework = 
 // 保存测试用例脚本（POM 单点维护：test_function 含 import，page_classes 存 WebPage.pom_code）
 export const saveTestCaseScript = async (projectId, testCaseId, payload, framework = 'playwright') => {
   const body = typeof payload === 'string'
-    ? { script_content: payload, framework }
+    ? { script_content: payload, script_source: 'manual', framework }
     : {
         script_content: payload.script_content,
         page_classes: payload.page_classes,
         test_function: payload.test_function,
+        script_source: payload.script_source || payload.source || 'manual',
         framework
       }
   const response = await api.post(

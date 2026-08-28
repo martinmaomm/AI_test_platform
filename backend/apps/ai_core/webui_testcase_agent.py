@@ -764,6 +764,8 @@ class WebUITestCaseGenerator:
                     module_id=safe_module_id,
                     test_script_content=None
                 )
+                from web_testing.script_contract import store_script_content
+                store_script_content(test_case, None, source='requirement_ai')
                 created_test_cases.append({
                     'id': test_case.id,
                     'title': test_case.title,

@@ -40,7 +40,7 @@ from .tasks import (
     cancel_task,
     fill_locators_from_html_task
 )
-from .script_contract import ScriptContractError, normalize_for_storage
+from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 
 logger = logging.getLogger(__name__)
 
@@ -235,11 +235,6 @@ class SaveGeneratedWebUITestScriptView(APIView):
         if not script_content:
             return response('error', message='脚本内容不能为空', status_code=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            script_content = normalize_for_storage(script_content)
-        except ScriptContractError as exc:
-            return response('error', message=f'脚本格式不符合规范：{exc}', status_code=status.HTTP_400_BAD_REQUEST)
-
         project = Project.objects.filter(
             Q(id=project_id),
             Q(created_by=request.user) |
@@ -250,19 +245,20 @@ class SaveGeneratedWebUITestScriptView(APIView):
             return response('error', message='项目不存在或无权限访问', status_code=status.HTTP_404_NOT_FOUND)
 
         try:
-            test_case = WebUITestCase.objects.create(
-                title=title,
-                description=description,
-                url=url or None,
-                user=request.user,
-                project=project,
-                test_script_content=script_content,
-                priority='medium',
-                category='functional',
-                preconditions=[],
-                steps=[],
-                expected_result='脚本执行成功'
-            )
+            with transaction.atomic():
+                test_case = WebUITestCase.objects.create(
+                    title=title,
+                    description=description,
+                    url=url or None,
+                    user=request.user,
+                    project=project,
+                    priority='medium',
+                    category='functional',
+                    preconditions=[],
+                    steps=[],
+                    expected_result='脚本执行成功'
+                )
+                store_script_content(test_case, script_content, source='mcp_exploration')
             logger.info(
                 'AI脚本实验室脚本已保存为测试用例: id=%s, project_id=%s, user_id=%s',
                 test_case.id,
@@ -279,6 +275,8 @@ class SaveGeneratedWebUITestScriptView(APIView):
                 },
                 message='脚本已保存到测试用例'
             )
+        except ScriptContractError as e:
+            return response('error', message=f'脚本格式不符合规范：{e}', status_code=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.error(f'保存 AI 生成脚本失败: {e}', exc_info=True)
             return response('error', message=f'保存脚本失败: {str(e)}', status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -667,13 +665,13 @@ def get_webui_test_execution_statistics(request, project_id):
         
         # 统计各种状态的WebUI测试执行数量
         stats = {
-            'total': WebUITestExecution.objects.filter(executor=user).count(),
-            'pending': WebUITestExecution.objects.filter(executor=user, status='pending').count(),
-            'running': WebUITestExecution.objects.filter(executor=user, status='running').count(),
-            'passed': WebUITestExecution.objects.filter(executor=user, status='passed').count(),
-            'failed': WebUITestExecution.objects.filter(executor=user, status='failed').count(),
-            'error': WebUITestExecution.objects.filter(executor=user, status='error').count(),
-            'stopped': WebUITestExecution.objects.filter(executor=user, status='stopped').count(),
+            'total': WebUITestExecution.objects.filter(executor=user, project_id=project_id).count(),
+            'pending': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='pending').count(),
+            'running': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='running').count(),
+            'passed': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='passed').count(),
+            'failed': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='failed').count(),
+            'error': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='error').count(),
+            'stopped': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='stopped').count(),
         }
         
         # 计算成功率
@@ -1601,6 +1599,7 @@ class WebUITestCaseGenerateCodeView(APIView):
         if result_data:
             resp["page_classes"] = result_data.get("page_classes", [])
             resp["test_function"] = result_data.get("test_function", code)
+            resp["script_source"] = "step_generator"
         return Response(resp)
 
 
@@ -1663,8 +1662,14 @@ class WebUITestCaseSaveScriptView(APIView):
                 "message": "禁止将 Page 类（含定位器）存入用例。请使用带 import 的 test_function 格式保存，定位器仅存于 WebPage.pom_code。"
             }, status=400)
 
-        test_case.test_script_content = to_save
-        test_case.save(update_fields=['test_script_content', 'updated_at'])
+        source = request.data.get('script_source', request.data.get('source', 'manual'))
+        try:
+            store_script_content(test_case, to_save, source=source)
+        except ScriptContractError as exc:
+            return Response({
+                "success": False,
+                "message": f"脚本格式不符合规范：{exc}",
+            }, status=400)
         return Response({
             "success": True,
             "message": "脚本已保存"
@@ -1722,7 +1727,7 @@ class ExecuteWebUITestCaseView(APIView):
         """执行WebUI测试用例"""
         try:
             # 获取测试用例
-            test_case = get_object_or_404(WebUITestCase, pk=pk)
+            test_case = get_object_or_404(WebUITestCase, pk=pk, project_id=project_id)
             
             # 检查权限
             if not (test_case.project.created_by == request.user or 
@@ -1784,6 +1789,7 @@ class ExecuteWebUITestCaseView(APIView):
                 'name': test_case.title,
                 'description': test_case.description,
                 'executor': request.user,
+                'project': test_case.project,
                 'environment': environment,
                 'status': 'pending',
                 'trigger_type': 'manual'
@@ -1986,7 +1992,9 @@ class WebUITestSuiteAddTestCaseView(APIView):
             logger.info(f"请求数据: {request.data}")
             
             # 获取测试套件
-            test_suite = get_object_or_404(WebUITestSuite, pk=pk, user=request.user)
+            test_suite = get_object_or_404(
+                WebUITestSuite, pk=pk, project_id=project_id, user=request.user
+            )
             logger.info(f"找到测试套件: {test_suite.name}")
             
             # 验证请求数据
@@ -2132,6 +2140,7 @@ class ExecuteWebUITestSuiteView(APIView):
                 'name': test_suite.name,
                 'description': test_suite.description,
                 'executor': request.user,
+                'project': test_suite.project,
                 'environment': environment,
                 'status': 'pending',
                 'trigger_type': 'manual'
@@ -2189,22 +2198,24 @@ class ExecuteWebUITestSuiteView(APIView):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def get_webui_test_suite_statistics(request):
+def get_webui_test_suite_statistics(request, project_id):
     """获取WebUI测试套件统计信息"""
     try:
         user = request.user
         
         # 基础统计
-        total_suites = WebUITestSuite.objects.filter(user=user).count()
-        active_suites = WebUITestSuite.objects.filter(user=user, status='active').count()
+        suites = WebUITestSuite.objects.filter(user=user, project_id=project_id)
+        total_suites = suites.count()
+        active_suites = suites.filter(status='active').count()
         
         # 执行统计
-        total_executions = WebUITestExecution.objects.filter(executor=user).count()
-        passed_executions = WebUITestExecution.objects.filter(executor=user, status='passed').count()
-        failed_executions = WebUITestExecution.objects.filter(executor=user, status='failed').count()
+        executions = WebUITestExecution.objects.filter(executor=user, project_id=project_id)
+        total_executions = executions.count()
+        passed_executions = executions.filter(status='passed').count()
+        failed_executions = executions.filter(status='failed').count()
         
         # 测试套件执行统计
-        suite_executions = WebUITestExecution.objects.filter(executor=user, exec_type='suite')
+        suite_executions = executions.filter(exec_type='suite')
         total_suite_executions = suite_executions.count()
         passed_suite_executions = suite_executions.filter(status='passed').count()
         failed_suite_executions = suite_executions.filter(status='failed').count()
@@ -2213,7 +2224,7 @@ def get_webui_test_suite_statistics(request):
         # 计算套件中的测试用例统计
         total_suite_cases = 0
         active_suite_cases = 0
-        for suite in WebUITestSuite.objects.filter(user=user):
+        for suite in suites:
             total_suite_cases += suite.test_cases_count
             active_suite_cases += suite.active_test_cases_count
         
@@ -2253,8 +2264,11 @@ class TestExecutionListView(generics.ListAPIView):
     def get_queryset(self):
         """获取当前用户的执行记录"""
         user = self.request.user
-        queryset = WebUITestExecution.objects.filter(executor=user).select_related(
-            'executor', 'environment'
+        project_id = self.kwargs.get('project_id')
+        queryset = WebUITestExecution.objects.filter(
+            executor=user, project_id=project_id
+        ).select_related(
+            'executor', 'environment', 'project'
         ).prefetch_related(
             'case_execution_detail__test_case',
             'suite_execution_detail__test_suite'
@@ -2308,6 +2322,7 @@ class TestCaseExecutionDetailView(APIView):
             ).get(
                 execution_id=pk,  # 通过execution_id查找
                 execution__executor=user,
+                execution__project_id=project_id,
                 execution__exec_type='case'
             )
             
@@ -2350,6 +2365,7 @@ class TestSuiteExecutionDetailView(APIView):
             ).get(
                 execution_id=pk,  # 通过execution_id查找
                 execution__executor=user,
+                execution__project_id=project_id,
                 execution__exec_type='suite'
             )
             
@@ -2379,14 +2395,15 @@ class TestExecutionCasesView(APIView):
     """执行记录子用例视图 - 如果是套件执行，返回子用例执行详情"""
     permission_classes = [IsAuthenticated]
     
-    def get(self, request, pk):
+    def get(self, request, project_id, pk):
         """获取套件执行的子用例执行详情"""
         try:
             # 获取执行记录
             execution = get_object_or_404(
                 WebUITestExecution,
                 pk=pk,
-                executor=request.user
+                executor=request.user,
+                project_id=project_id,
             )
             
             # 检查是否为套件执行
@@ -2476,7 +2493,8 @@ class TestExecutionDeleteView(APIView):
                 'case_execution_detail', 'suite_execution_detail'
             ).get(
                 pk=pk,
-                executor=user
+                executor=user,
+                project_id=project_id
             )
             
             # 记录执行信息用于日志

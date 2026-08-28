@@ -1134,10 +1134,10 @@ async def run(page):
                     "current_step": "save_failed"
                 }
 
-            from web_testing.script_contract import normalize_for_storage
+            from web_testing.script_contract import ScriptContractError, normalize_for_storage, store_script_content
             try:
                 python_script = normalize_for_storage(python_script)
-            except ValueError as exc:
+            except ScriptContractError as exc:
                 self._send_websocket_message(f"❌ 脚本不符合统一契约，未保存: {exc}\n", "脚本保存")
                 return {**state, "current_step": "save_failed", "error": str(exc)}
             
@@ -1155,9 +1155,12 @@ async def run(page):
                 user = User.objects.get(id=user_id)
                 
                 # 获取测试用例并更新test_script_content字段
-                test_case = WebUITestCase.objects.get(id=test_case_id, user=user)
-                test_case.test_script_content = python_script
-                test_case.save()
+                test_case = WebUITestCase.objects.get(
+                    id=test_case_id,
+                    user=user,
+                    project_id=project_id,
+                )
+                store_script_content(test_case, python_script, source='mcp_exploration')
                 self._send_websocket_message(f"✅ Python脚本已保存到测试用例: {test_case.title}\n", "脚本保存")
                 
                 # 发送任务完成通知

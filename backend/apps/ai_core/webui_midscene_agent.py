@@ -757,12 +757,24 @@ tasks:
                 url=url,
                 user=user,
                 project=project,
-                test_script_content=js_script,  # 使用JavaScript脚本作为测试脚本
+                # MidScene 的 JavaScript 文件是独立产物，不写入 Python Playwright
+                # 用例字段，避免破坏 WebUITestCase 的脚本契约。
+                test_script_content=None,
                 priority='medium',
                 category='functional',
                 preconditions=[],
                 steps=[],
                 expected_result='脚本执行成功'
+            )
+            from web_testing.script_contract import store_script_content
+            store_script_content(
+                test_case,
+                None,
+                source='manual',
+                generation_metadata={
+                    'midscene_yaml_path': yaml_file_path,
+                    'midscene_js_path': js_file_path,
+                },
             )
             
             logger.info(f"测试用例保存成功，ID: {test_case.id}")

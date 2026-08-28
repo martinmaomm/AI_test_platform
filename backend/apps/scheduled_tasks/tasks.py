@@ -191,6 +191,7 @@ def _execute_web_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
                 status='pending',
                 trigger_type='schedule',
                 executor=task.user,
+                project=suite.project,
                 environment=task.environment,
                 browser='chromium'  # 默认浏览器
             )
@@ -475,4 +476,3 @@ def run_task_manually(self, task_id: int, execution_log_id: Optional[int] = None
     手动执行定时任务（可由视图预传 execution_log_id 以便前端轮询）
     """
     return run_scheduled_task(task_id, execution_log_id)
-

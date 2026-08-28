@@ -62,6 +62,23 @@ class WebUITestCase(models.Model):
         ('ui', '界面测试'),
         ('integration', '集成测试'),
     ]
+
+    SCRIPT_SOURCE_CHOICES = [
+        ('manual', '手工编写'),
+        ('requirement_ai', '需求 AI'),
+        ('mcp_exploration', 'MCP 探索'),
+        ('step_generator', '步骤生成器'),
+        ('legacy', '历史脚本'),
+    ]
+    SCRIPT_STATUS_CHOICES = [
+        ('none', '无脚本'),
+        ('ready', '可执行'),
+        ('legacy', '旧格式'),
+        ('invalid', '无效'),
+    ]
+    SCRIPT_FRAMEWORK_CHOICES = [
+        ('playwright_python_async', 'Playwright Python Async'),
+    ]
     
     # 基本信息
     title = models.CharField(max_length=200, verbose_name="测试用例标题")
@@ -79,6 +96,21 @@ class WebUITestCase(models.Model):
     
     # 测试脚本内容
     test_script_content = models.TextField(blank=True, null=True, verbose_name="测试脚本内容")
+    script_source = models.CharField(
+        max_length=30, choices=SCRIPT_SOURCE_CHOICES, default='manual', verbose_name='脚本来源'
+    )
+    script_status = models.CharField(
+        max_length=20, choices=SCRIPT_STATUS_CHOICES, default='none', verbose_name='脚本状态'
+    )
+    script_framework = models.CharField(
+        max_length=50,
+        choices=SCRIPT_FRAMEWORK_CHOICES,
+        default='playwright_python_async',
+        verbose_name='脚本框架',
+    )
+    script_version = models.PositiveIntegerField(default=0, verbose_name='脚本版本')
+    script_validation_error = models.TextField(blank=True, default='', verbose_name='脚本校验错误')
+    generation_metadata = models.JSONField(default=dict, blank=True, verbose_name='生成元数据')
     
     # 关联信息
     user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="创建用户")
@@ -191,22 +223,27 @@ class WebUITestCase(models.Model):
         """获取测试脚本内容"""
         return self.test_script_content
     
-    def set_script_content(self, content):
-        """设置测试脚本内容"""
-        self.test_script_content = content
-        self.save(update_fields=['test_script_content'])
+    def set_script_content(self, content, source='manual', generation_metadata=None):
+        """通过统一存储服务设置测试脚本内容。"""
+        from .script_contract import store_script_content
+        return store_script_content(self, content, source=source, generation_metadata=generation_metadata)
     
-    def clear_script_content(self):
-        """清除测试脚本内容"""
-        self.test_script_content = None
-        self.save(update_fields=['test_script_content'])
+    def clear_script_content(self, source='manual'):
+        """通过统一存储服务清除测试脚本内容。"""
+        return self.set_script_content(None, source=source)
     
     def get_script_info(self):
         """获取脚本信息摘要"""
         return {
             'has_script': self.has_script,
             'script_content': self.test_script_content,
-            'content_length': len(self.test_script_content) if self.test_script_content else 0
+            'content_length': len(self.test_script_content) if self.test_script_content else 0,
+            'script_source': self.script_source,
+            'script_status': self.script_status,
+            'script_framework': self.script_framework,
+            'script_version': self.script_version,
+            'script_validation_error': self.script_validation_error,
+            'generation_metadata': self.generation_metadata,
         }
 
 
@@ -253,6 +290,14 @@ class WebUITestExecution(models.Model):
     # 触发信息
     trigger_type = models.CharField(max_length=20, choices=TRIGGER_TYPE_CHOICES, default='manual', verbose_name="触发方式")
     executor = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="执行者")
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='webui_executions',
+        verbose_name='所属项目',
+    )
     
     # 环境信息
     environment = models.ForeignKey(Environment, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="执行环境")
@@ -279,6 +324,16 @@ class WebUITestExecution(models.Model):
         verbose_name = "WebUI测试执行记录"
         verbose_name_plural = "WebUI测试执行记录"
         ordering = ['-created_at']
+        indexes = [
+            models.Index(
+                fields=['project', 'executor', 'created_at'],
+                name='webui_exec_proj_exec_created',
+            ),
+            models.Index(
+                fields=['project', 'status'],
+                name='webui_exec_project_status',
+            ),
+        ]
     
     def __str__(self):
         return f"{self.name} ({self.get_exec_type_display()})"

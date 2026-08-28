@@ -25,6 +25,16 @@ class NormalizedScript:
     warning: Optional[str] = None
 
 
+SCRIPT_SOURCE_VALUES = {
+    "manual",
+    "requirement_ai",
+    "mcp_exploration",
+    "step_generator",
+    "legacy",
+}
+SCRIPT_FRAMEWORK = "playwright_python_async"
+
+
 def _parse(content: str) -> ast.Module:
     if not isinstance(content, str) or not content.strip():
         raise ScriptContractError("脚本内容为空，无法执行")
@@ -139,6 +149,48 @@ def normalize_for_storage(content: str) -> str:
     ):
         raise ScriptContractError("保存脚本不得包含 if __name__ 运行入口")
     return content.strip()
+
+
+def store_script_content(
+    test_case,
+    content: Optional[str],
+    *,
+    source: str = "manual",
+    generation_metadata: Optional[dict] = None,
+):
+    """Persist script content and its metadata in one place.
+
+    A real content replacement and clearing an existing script both advance
+    the version.  Initial creation without a script keeps version ``0``.
+    Invalid content is rejected before the model is changed.
+    """
+
+    if source not in SCRIPT_SOURCE_VALUES:
+        raise ScriptContractError(f"不支持的脚本来源: {source}")
+    has_content = content is not None and bool(str(content).strip())
+    normalized = normalize_for_storage(content) if has_content else None
+    old_content = getattr(test_case, "test_script_content", None)
+    old_version = int(getattr(test_case, "script_version", 0) or 0)
+    should_advance = bool(getattr(test_case, "pk", None)) and (has_content or bool(old_content))
+
+    test_case.test_script_content = normalized
+    test_case.script_source = source
+    test_case.script_status = "ready" if normalized else "none"
+    test_case.script_framework = SCRIPT_FRAMEWORK
+    test_case.script_validation_error = ""
+    test_case.generation_metadata = generation_metadata if isinstance(generation_metadata, dict) else {}
+    test_case.script_version = old_version + 1 if should_advance else old_version
+    test_case.save(update_fields=[
+        "test_script_content",
+        "script_source",
+        "script_status",
+        "script_framework",
+        "script_version",
+        "script_validation_error",
+        "generation_metadata",
+        "updated_at",
+    ])
+    return test_case
 
 
 def normalize_script(content: str) -> NormalizedScript:

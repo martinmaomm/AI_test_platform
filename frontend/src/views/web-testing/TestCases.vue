@@ -1039,7 +1039,8 @@ const generateCode = async (row, framework = 'playwright') => {
       currentCaseId.value = row.id
       lastGenerateResult.value = {
         page_classes: res.page_classes || [],
-        test_function: res.test_function || ''
+        test_function: res.test_function || '',
+        script_source: res.script_source || 'manual'
       }
       codeDialogVisible.value = true
       ElMessage.success('✨ 脚本语义匹配成功！')
@@ -1114,7 +1115,8 @@ const saveGeneratedCode = async () => {
       ? {
           test_function: lastGenerateResult.value.test_function,
           page_classes: lastGenerateResult.value.page_classes || [],
-          script_content: ''
+          script_content: '',
+          script_source: lastGenerateResult.value.script_source || 'manual'
         }
       : generatedCode.value
     const res = await saveTestCaseScript(

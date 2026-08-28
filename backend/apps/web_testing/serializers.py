@@ -8,7 +8,7 @@ from .models import (
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
     WebPage, WebElement
 )
-from .script_contract import ScriptContractError, normalize_for_storage
+from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 
 
 class WebPageSerializer(serializers.ModelSerializer):
@@ -69,6 +69,8 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
             'priority', 'priority_display', 'category', 'category_display',
             # 模块与脚本
             'module_id', 'has_script',
+            'script_source', 'script_status', 'script_framework', 'script_version',
+            'script_validation_error', 'generation_metadata',
             # 时间信息
             'created_at', 'updated_at',
             # 执行状态记录
@@ -77,6 +79,8 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'id', 'created_by_username', 'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
+            'script_source', 'script_status', 'script_framework', 'script_version',
+            'script_validation_error', 'generation_metadata',
         ]
 
 
@@ -110,7 +114,8 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
             # 测试内容
             'preconditions', 'steps', 'expected_result',
             # 脚本信息
-            'test_script_content',
+            'test_script_content', 'script_source', 'script_status', 'script_framework',
+            'script_version', 'script_validation_error', 'generation_metadata',
             # 时间信息
             'created_at', 'updated_at',
             # 执行状态记录
@@ -119,7 +124,24 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'id', 'created_by_username', 'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
+            'script_source', 'script_status', 'script_framework', 'script_version',
+            'script_validation_error', 'generation_metadata',
         ]
+
+    def update(self, instance, validated_data):
+        has_script_content = 'test_script_content' in validated_data
+        script_content = validated_data.pop('test_script_content', None)
+        instance = super().update(instance, validated_data)
+        if has_script_content:
+            try:
+                store_script_content(
+                    instance,
+                    script_content,
+                    source='manual',
+                )
+            except ScriptContractError as exc:
+                raise serializers.ValidationError({'test_script_content': str(exc)})
+        return instance
 
 
 class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
@@ -137,7 +159,8 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
             # 测试内容
             'preconditions', 'steps', 'expected_result',
             # 脚本信息
-            'test_script_content'
+            'test_script_content', 'script_source', 'script_status', 'script_framework',
+            'script_version', 'script_validation_error', 'generation_metadata'
         ]
         extra_kwargs = {
             'title': {'required': True},
@@ -148,13 +171,24 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
             'priority': {'required': False, 'default': 'medium'},
             'category': {'required': False, 'default': 'functional'},
             'preconditions': {'required': False, 'default': list},
-            'steps': {'required': False, 'default': list}
+            'steps': {'required': False, 'default': list},
         }
+        read_only_fields = [
+            'script_status', 'script_framework', 'script_version',
+            'script_validation_error', 'generation_metadata',
+        ]
     
     def create(self, validated_data):
         # 自动设置用户
         validated_data['user'] = self.context['request'].user
-        return super().create(validated_data)
+        script_content = validated_data.pop('test_script_content', None)
+        script_source = validated_data.pop('script_source', 'manual')
+        test_case = super().create(validated_data)
+        try:
+            return store_script_content(test_case, script_content, source=script_source)
+        except ScriptContractError as exc:
+            test_case.delete()
+            raise serializers.ValidationError({'test_script_content': str(exc)})
 
     def validate_test_script_content(self, value):
         if value in (None, ''):
@@ -171,6 +205,7 @@ class WebUITestExecutionListSerializer(serializers.ModelSerializer):
     environment_name = serializers.CharField(source='environment.name', read_only=True)
     pass_rate = serializers.FloatField(read_only=True)
     execution_duration = serializers.FloatField(read_only=True)
+    project_id = serializers.IntegerField(read_only=True)
     
     class Meta:
         model = WebUITestExecution
@@ -178,12 +213,13 @@ class WebUITestExecutionListSerializer(serializers.ModelSerializer):
             'id', 'exec_type', 'name', 'description',
             'status', 'trigger_type',
             'executor_name', 'environment_name',
+            'project_id',
             'browser', 'task_id', 'start_time', 'end_time', 'duration',
             'log_path', 'report_path', 'pass_rate', 'execution_duration',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'id', 'executor', 'created_at', 'updated_at'
+            'id', 'executor', 'project_id', 'created_at', 'updated_at'
         ]
 
 
@@ -195,11 +231,12 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
     environment_base_url = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
     allure_report_url = serializers.SerializerMethodField()
+    project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
     
     class Meta:
         model = WebUITestSuiteExecutionDetail
         fields = [
-            'id', 'execution', 'test_suite', 'test_suite_name',
+            'id', 'execution', 'project_id', 'test_suite', 'test_suite_name',
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',
             'pass_rate', 'browser', 'environment_name', 'environment_base_url',
             'start_time', 'end_time', 'duration', 'allure_report', 'allure_report_url',
@@ -348,12 +385,14 @@ class WebUITestSuiteAddTestCaseSerializer(serializers.Serializer):
 
 class WebUITestExecutionCreateSerializer(serializers.ModelSerializer):
     """WebUI测试执行创建序列化器"""
+    project_id = serializers.IntegerField(read_only=True)
     
     class Meta:
         model = WebUITestExecution
         fields = [
-            'exec_type', 'name', 'description', 'trigger_type', 'environment', 'browser'
+            'exec_type', 'name', 'description', 'trigger_type', 'environment', 'browser', 'project_id'
         ]
+        read_only_fields = ['project_id']
         extra_kwargs = {
             'exec_type': {'required': True},
             'name': {'required': True},
@@ -376,11 +415,12 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     browser = serializers.CharField(source='execution.browser', read_only=True)
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
     environment_base_url = serializers.SerializerMethodField()
+    project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
     
     class Meta:
         model = WebUITestCaseExecutionDetail
         fields = [
-            'id', 'execution', 'test_case', 'test_case_title', 'test_case_description',
+            'id', 'execution', 'project_id', 'test_case', 'test_case_title', 'test_case_description',
             'status', 'browser', 'environment_name', 'environment_base_url',
             'start_time', 'end_time', 'duration',
             'error_message', 'log', 'screenshot_path', 'video_path'

@@ -11,6 +11,8 @@ import shutil
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
+from .script_contract import materialize_script
+
 logger = logging.getLogger(__name__)
 
 # 常量定义
@@ -58,7 +60,7 @@ class PlaywrightRunner:
         work_dir = self._create_work_dir(f"playwright_python_{script_id}_")
         
         try:
-            self._create_test_file(work_dir, script_content)
+            self._create_test_file(work_dir, script_content, config)
             self._create_pytest_config(work_dir)
             result = self._run_pytest_command(work_dir, config)
             allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
@@ -76,9 +78,10 @@ class PlaywrightRunner:
     def run_suite_test(self, suite_id: str, test_cases_data: List[Dict[str, Any]], config: ExecutionConfig) -> ExecutionResult:
         """执行测试套件"""
         work_dir = self._create_work_dir(f"playwright_suite_{suite_id}_")
-        
         try:
-            test_files, skipped_results = self._create_suite_test_files(work_dir, test_cases_data, config.suite_name)
+            test_files, skipped_results = self._create_suite_test_files(
+                work_dir, test_cases_data, config.suite_name, config
+            )
 
             # 统计临时目录下生成的 .py 文件数量，若为 0 则直接返回错误，避免盲目启动 Pytest
             py_files = [f for f in os.listdir(work_dir) if f.endswith('.py')]
@@ -116,18 +119,28 @@ class PlaywrightRunner:
         """创建临时工作目录"""
         return tempfile.mkdtemp(prefix=prefix, dir=self.temp_base_dir)
     
-    def _create_test_file(self, work_dir: str, script_content: str) -> str:
+    def _create_test_file(self, work_dir: str, script_content: str, config: ExecutionConfig) -> str:
         """创建测试文件"""
-        if not script_content or not script_content.strip():
-            raise ValueError("脚本内容为空，无法执行测试")
-        
         test_file = os.path.join(work_dir, "test_playwright.py")
         with open(test_file, 'w', encoding='utf-8') as f:
-            f.write(script_content)
+            f.write(materialize_script(
+                script_content,
+                "test_webui_case",
+                browser=config.browser,
+                headed=config.headed,
+                base_url=config.base_url,
+            ))
         return test_file
     
-    def _create_suite_test_files(self, work_dir: str, test_cases_data: List[Dict[str, Any]], suite_name: Optional[str] = None) -> tuple:
+    def _create_suite_test_files(
+        self,
+        work_dir: str,
+        test_cases_data: List[Dict[str, Any]],
+        suite_name: Optional[str] = None,
+        config: Optional[ExecutionConfig] = None,
+    ) -> tuple:
         """创建套件测试文件，并输出详细日志便于排查"""
+        config = config or ExecutionConfig()
         test_files = []
         skipped_results = []
 
@@ -151,14 +164,17 @@ class PlaywrightRunner:
                 continue
 
             try:
-                # 如果提供了套件名称且需要生成Allure报告，添加allure.suite装饰器
-                if suite_name:
-                    script_content = self._add_allure_suite_decorator(script_content, suite_name)
-
                 test_file = os.path.join(work_dir, f"test_case_{test_case_id}.py")
                 test_files.append(test_file)
                 with open(test_file, 'w', encoding='utf-8') as f:
-                    f.write(script_content)
+                    f.write(materialize_script(
+                        script_content,
+                        f"test_case_{test_case_id}",
+                        browser=config.browser,
+                        headed=config.headed,
+                        base_url=config.base_url,
+                        suite_name=suite_name,
+                    ))
                 logger.info(
                     f"[脚本生成] 用例 #{idx + 1} (id={test_case_id}, title={test_case_title}): 成功写入 {os.path.basename(test_file)}"
                 )
@@ -251,13 +267,7 @@ python_functions = test_*
 
     def _run_pytest_command(self, work_dir: str, config: ExecutionConfig) -> subprocess.CompletedProcess:
         """执行pytest命令"""
-        cmd = ["python", "-m", "pytest", "--browser", config.browser, "-v", "--tb=short"]
-        
-        if config.headed:
-            cmd.append("--headed")
-        
-        if config.base_url:
-            cmd.extend(["--base-url", config.base_url])
+        cmd = ["python", "-m", "pytest", "-v", "--tb=short"]
         
         if config.generate_allure:
             allure_results_dir = os.path.join(work_dir, "allure-results")
@@ -269,6 +279,7 @@ python_functions = test_*
             'PLAYWRIGHT_BROWSER': config.browser,
             'PLAYWRIGHT_HEADED': str(config.headed).lower(),
             'PYTEST_TIMEOUT': str(config.timeout),
+            'PLAYWRIGHT_BASE_URL': config.base_url or '',
             'PYTHONIOENCODING': 'utf-8',  # 防止 Windows GBK 编码报错
         })
 

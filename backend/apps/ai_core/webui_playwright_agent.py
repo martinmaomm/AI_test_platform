@@ -190,13 +190,11 @@ def _load_project_pom_context(project_id: int) -> str:
 
 
 def _enforce_script_guarantees(script: str, description: str = '') -> str:
-    """轻量级草稿脚本兜底：仅保证基础导包合法"""
+    """Normalize generated code to the shared async ``run(page)`` contract."""
     if not script or not script.strip():
         return script
-    required_import = 'from playwright.async_api import async_playwright, expect'
-    if required_import not in script:
-        script = required_import + '\n' + script
-    return script
+    from web_testing.script_contract import normalize_for_storage
+    return normalize_for_storage(script)
 
 
 # 定义WebUI Playwright Agent状态数据结构
@@ -817,13 +815,13 @@ class WebUIPlaywrightAgent:
 {elements_context}
 
 【代码编写规范】
-1. 必须使用 `from playwright.async_api import async_playwright, expect`（文件头部强制导入）。
-2. 使用 `pytest` 风格编写，测试函数定义为 `def test_xxx(page: Page):`，函数名需体现用户需求语义。
-3. 只能使用 pytest fixture 提供的 `page`，禁止在代码内部使用 `with sync_playwright()`。
+1. 必须使用 Python Playwright 异步 API；文件头部导入 `expect`（如需）。
+2. 只能输出一个业务入口：`async def run(page)`，不要输出 `def test_xxx`、pytest fixture 或其他测试入口。
+3. 不得在代码内部创建或关闭 browser/context/page，不得调用 `async_playwright()`、`launch()` 或 `new_page()`。
 4. 若标准元素库中不存在所需元素，请遵循 Playwright 最佳实践，优先使用稳定选择器（`get_by_role`, `get_by_label`, `get_by_placeholder` 等）。
 5. 测试脚本必须包含至少一个断言，使用 `expect(...)` 进行验证。
 6. 必须使用相对路径访问页面，例如 `page.goto("/")`，以便支持外部传入的 base_url。
-7. 脚本必须为完整、可直接运行的 Python 代码，严禁包含任何解释、说明文字或 Markdown 格式标记。
+7. 脚本必须为包含 `async def run(page)` 的 Python 代码，严禁包含任何解释、说明文字或 Markdown 格式标记。
 8. 严禁包含注释或未使用的 import。
 
 【操作类型严格区分 - 必须遵守】
@@ -832,7 +830,7 @@ class WebUIPlaywrightAgent:
 - 若定义 Fallback 类或降级处理方法，点击按钮、访问链接等无参操作的方法签名为 `def method(self):`，严禁 `def method(self, text):`。
 
 【起步导航规范 - 显式化 - 必须遵守】
-- 在 run(page) 或 test_xxx(page) 函数内部的第一行，必须显式生成 `await page.goto("/")`。
+- 在 `run(page)` 函数内部的第一行，必须显式生成 `await page.goto("/")`。
 - 目的：即便底层有 BaseURL 注入，也必须在脚本中让用户看到起步动作，增强可读性与完整性。
 - 绝对禁止在脚本中硬编码完整域名（如 http://...）。基地址(Base URL) 由 BrowserContext 统一管理。
 
@@ -901,7 +899,12 @@ async def run(page):
             script = extract_python_from_output(raw_output)
 
             if script:
-                script = _enforce_script_guarantees(script)
+                try:
+                    script = _enforce_script_guarantees(script)
+                except ValueError as exc:
+                    logger.warning("生成脚本不符合统一契约: %s", exc)
+                    self._send_websocket_message(f"❌ 生成脚本格式不符合规范: {exc}\n", "MCP智能体生成")
+                    return {"current_step": "script_generation_failed", "test_script": None}
             
             if not script:
                 logger.warning("从MCP输出中提取Playwright Python脚本失败")
@@ -1130,6 +1133,13 @@ async def run(page):
                     **state,
                     "current_step": "save_failed"
                 }
+
+            from web_testing.script_contract import normalize_for_storage
+            try:
+                python_script = normalize_for_storage(python_script)
+            except ValueError as exc:
+                self._send_websocket_message(f"❌ 脚本不符合统一契约，未保存: {exc}\n", "脚本保存")
+                return {**state, "current_step": "save_failed", "error": str(exc)}
             
             # 判断保存方式：如果有test_case_id则是选择测试用例方式，否则是手动填写方式
             if test_case_id:

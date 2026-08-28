@@ -8,6 +8,7 @@ from .models import (
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
     WebPage, WebElement
 )
+from .script_contract import ScriptContractError, normalize_for_storage
 
 
 class WebPageSerializer(serializers.ModelSerializer):
@@ -88,6 +89,14 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
         queryset=WebUITestModule.objects.all(), required=False, allow_null=True, source='module'
     )
     has_script = serializers.BooleanField(read_only=True)
+
+    def validate_test_script_content(self, value):
+        if value in (None, ''):
+            return value
+        try:
+            return normalize_for_storage(value)
+        except ScriptContractError as exc:
+            raise serializers.ValidationError(str(exc))
     
     class Meta:
         model = WebUITestCase
@@ -146,6 +155,14 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
         # 自动设置用户
         validated_data['user'] = self.context['request'].user
         return super().create(validated_data)
+
+    def validate_test_script_content(self, value):
+        if value in (None, ''):
+            return value
+        try:
+            return normalize_for_storage(value)
+        except ScriptContractError as exc:
+            raise serializers.ValidationError(str(exc))
 
 
 class WebUITestExecutionListSerializer(serializers.ModelSerializer):

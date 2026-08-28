@@ -35,12 +35,12 @@ from .pom_code_generator import _to_page_class_name, _to_locator_var_name, _get_
 from .tasks import (
     generate_webui_test_script_task,
     generate_webui_test_script_from_testcase_task,
-    execute_webui_test_task,
     generate_midscene_script_task,
     execute_webui_test_suite_task,
     cancel_task,
     fill_locators_from_html_task
 )
+from .script_contract import ScriptContractError, normalize_for_storage
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +235,11 @@ class SaveGeneratedWebUITestScriptView(APIView):
         if not script_content:
             return response('error', message='脚本内容不能为空', status_code=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            script_content = normalize_for_storage(script_content)
+        except ScriptContractError as exc:
+            return response('error', message=f'脚本格式不符合规范：{exc}', status_code=status.HTTP_400_BAD_REQUEST)
+
         project = Project.objects.filter(
             Q(id=project_id),
             Q(created_by=request.user) |
@@ -392,51 +397,6 @@ class StopWebUITestScriptFromTestCaseView(APIView):
         except Exception as e:
             logger.error(f"停止基于测试用例的WebUI测试脚本生成任务失败: {e}")
             return response('error', message=f'停止失败: {str(e)}', status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class ExecuteWebUITestView(APIView):
-    """执行WebUI测试"""
-    permission_classes = [IsAuthenticated]
-    
-    def post(self, request, project_id, script_id):
-        try:
-            script = get_object_or_404(WebUITestCase, id=script_id, user=request.user)
-            
-            if script.status != 'completed':
-                return response('error', message='脚本尚未完成生成，无法执行', status_code=status.HTTP_400_BAD_REQUEST)
-            
-            if not script.test_script_content:
-                return response('error', message='测试脚本内容为空，无法执行', status_code=status.HTTP_400_BAD_REQUEST)
-            
-            # 创建执行记录
-            with transaction.atomic():
-                execution = WebUITestExecution.objects.create(
-                    test_case=script,
-                    user=request.user,
-                    status='pending'
-                )
-                
-                # 启动测试执行任务
-                task = execute_webui_test_task.delay(
-                    execution_id=execution.id,
-                    user_id=request.user.id
-                )
-                
-                # 更新任务ID
-                execution.task_id = task.id
-                execution.save()
-            
-            return response('success', data={
-                'execution_id': execution.id,
-                'task_id': task.id,
-                'message': 'WebUI测试执行已启动...'
-            })
-            
-        except Exception as e:
-            logger.error(f"执行WebUI测试失败: {e}")
-            return response('error', message=f'执行失败: {str(e)}', status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
 
 
 # ============ MidScene脚本相关API ============
@@ -1462,7 +1422,7 @@ def _generate_playwright_from_steps(test_case, project_id, step_to_element_id=No
     lines = [
         'import re',
         'import datetime',
-        'from playwright.async_api import async_playwright, expect, TimeoutError as PWTimeoutError',
+        'from playwright.async_api import expect',
         ''
     ]
     # 写入标准导包语句
@@ -1473,6 +1433,7 @@ def _generate_playwright_from_steps(test_case, project_id, step_to_element_id=No
 
     lines.append('async def run(page):')
     lines.append('    """执行测试 - 严格调用已有 POM 类方法"""')
+    lines.append('    await page.goto("/")')
 
     # 实例化所有涉及的 Page 对象
     for meta in page_meta.values():
@@ -1534,46 +1495,7 @@ def _generate_playwright_from_steps(test_case, project_id, step_to_element_id=No
             lines.append(f'    {line}')
     lines.append('')
 
-    # 4. 生成本地运行入口（含 Timeout 根因自动诊断）
-    lines.append('async def main():')
-    lines.append('    async with async_playwright() as p:')
-    lines.append('        browser = await p.chromium.launch(headless=False)')
-    lines.append('        page = await browser.new_page()')
-    if getattr(test_case, 'url', None):
-        url_esc = str(test_case.url).replace('\\', '\\\\').replace('"', '\\"')
-        lines.append(f'        await page.goto("{url_esc}")')
-    lines.append('        try:')
-    lines.append('            await run(page)')
-    lines.append('            print(f"[{datetime.datetime.now().strftime(\'%H:%M:%S\')}] ✅ 执行完毕: 测试通过")')
-    lines.append('        except PWTimeoutError as e:')
-    lines.append('            error_msg = str(e)')
-    lines.append('            count_match = re.search(r"resolved to (\\d+) elements", error_msg)')
-    lines.append('            print("\\n" + "━"*55)')
-    lines.append('            print("💡 执行诊断报告")')
-    lines.append('            print("━"*55)')
-    lines.append('            print(f"❌ 步骤失败: {error_msg.splitlines()[0]}")')
-    lines.append('            print("\\n🔍 根因自动诊断:")')
-    lines.append('            print("-" * 55)')
-    lines.append('            if count_match:')
-    lines.append('                print(f"检测到定位器冲突！该定位语句在当前页面实际上找到了 {count_match.group(1)} 个匹配的元素。")')
-    lines.append('                print("Playwright 因为无法确定该操作哪一个元素，导致执行一直挂起直到超时。")')
-    lines.append('                print("\\n🛠️ 修复建议:")')
-    lines.append('                print("1. 检查页面是否存在隐藏的同名按钮/输入框。")')
-    lines.append('                print("2. 建议前往元素库，将定位器优化为复合选择器，如：a.send-code:has-text(\'获取验证码\')")')
-    lines.append('            elif "visible" in error_msg:')
-    lines.append('                print("元素在页面上虽然存在，但处于【不可见】或【被遮挡】状态。")')
-    lines.append('                print("\\n🛠️ 修复建议:")')
-    lines.append('                print("1. 检查是否被全局 Loading 遮罩或弹窗挡住。")')
-    lines.append('                print("2. 尝试在执行此步前添加短暂等待或关闭遮挡物。")')
-    lines.append('            else:')
-    lines.append('                print("页面响应超时，未能在规定时间内找到目标元素。")')
-    lines.append('                print("\\n🛠️ 修复建议: 检查网络、页面加载状态，或校验断言文字是否匹配。")')
-    lines.append('            print("━"*55 + "\\n")')
-    lines.append('            raise  # 再次抛出异常以便系统标记为失败')
-    lines.append('        finally:')
-    lines.append('            await browser.close()')
-    lines.append('')
-    lines.append('# 如需直接运行: import asyncio; asyncio.run(main())')
+    # 4. 只返回 run(page) 业务脚本；浏览器生命周期由统一执行器负责
 
     final_code = '\n'.join(lines)
 
@@ -1724,6 +1646,14 @@ class WebUITestCaseSaveScriptView(APIView):
         to_save = (test_function or script_content or '').strip()
         if not to_save:
             to_save = script_content or ''
+
+        try:
+            to_save = normalize_for_storage(to_save)
+        except ScriptContractError as exc:
+            return Response({
+                "success": False,
+                "message": f"脚本格式不符合规范：{exc}",
+            }, status=400)
 
         # 防护：当有 library pages 时，禁止将内联 Page 类存入 test_case
         # （无 page_classes 时允许 fallback 或旧格式兼容）

@@ -263,7 +263,8 @@ def _execute_webui_test_logic(task_instance, execution_id: int, user_id: int) ->
         update_task_progress(task_instance, 30, '正在执行WebUI测试...')
         
         # 使用Playwright执行器执行脚本
-        execution_result = _run_test_script(script.test_script_content, script.url, script.project_id, None)
+        managed_script = _compose_script_for_execution(script.test_script_content, script.project_id)
+        execution_result = _run_test_script(managed_script, script.url)
         
         # 步骤3: 保存执行结果
         update_task_progress(task_instance, 80, '正在保存执行结果...')
@@ -376,6 +377,8 @@ def _run_test_suite_from_db_workspace(
             work_dir=work_dir,
             suite_name=suite_name,
             base_url=base_url_val,
+            browser=(options or {}).get('browser', 'chromium'),
+            headed=(options or {}).get('headed', True),
         )
 
         # 3. 统计 .py 文件数量，若为 0 则直接返回错误
@@ -509,102 +512,6 @@ def _run_test_suite_script(test_cases_data: list, base_url: str = None, options:
             'success': False,
             'error': str(e)
         }
-
-
-def _run_sandbox_test_script(script_content: str, project_id: int, base_url: str = None) -> dict:
-    """
-    构建本地沙箱，动态注入 POM 并强制弹出浏览器执行。
-    当 base_url 存在时，注入标准的 BrowserContext 以支持相对路径导航。
-    """
-    try:
-        # 1. 强制激活本地执行入口与可视化模式，并加入慢动作(500ms)
-        script_content = re.sub(
-            r'headless\s*=\s*(True|False)',
-            'headless=False, slow_mo=500',
-            script_content,
-        )
-        if "asyncio.run(main())" not in script_content or "# 如需直接运行" in script_content:
-            script_content += "\n\nif __name__ == '__main__':\n    import asyncio\n    asyncio.run(main())\n"
-
-        # 2. 注入标准的 BrowserContext 基础 URL，并强制兜底访问根路径
-        escaped_url = base_url.replace('\\', '\\\\').replace("'", "\\'") if base_url else ""
-
-        def _inject_context(match):
-            indent = match.group(1)
-            if base_url:
-                return (
-                    f"{indent}context = await browser.new_context(base_url='{escaped_url}')\n"
-                    f"{indent}page = await context.new_page()\n"
-                    f"{indent}await page.goto('/')  # 框架级兜底导航"
-                )
-            return f"{indent}page = await browser.new_page()"
-
-        script_content = re.sub(
-            r'^(\s*)page\s*=\s*await\s+browser\.new_page\(\)',
-            _inject_context,
-            script_content,
-            count=1,
-            flags=re.MULTILINE,
-        )
-
-        # 3. 在关闭浏览器前强制停留 3 秒，便于观察最后一步
-        script_content = re.sub(
-            r'^(\s*)await browser\.close\(\)',
-            r'\1await page.wait_for_timeout(3000)\n\1await browser.close()',
-            script_content,
-            count=1,
-            flags=re.MULTILINE,
-        )
-
-        # 4. 解析需要的 Page 类
-        import_pattern = re.compile(r'from\s+pages\.(\w+)\s+import\s+(\w+)')
-        imports_found = import_pattern.findall(script_content)
-
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            base_path = Path(tmpdirname)
-            pages_dir = base_path / "pages"
-            pages_dir.mkdir()
-            (pages_dir / "__init__.py").touch()
-
-            # 5. 从数据库提取最新的 POM 代码写入沙箱
-            for module_name, class_name in imports_found:
-                page = WebPage.objects.filter(project_id=project_id, page_class_name=class_name).first()
-                if page and page.pom_code:
-                    page_file = pages_dir / f"{module_name}.py"
-                    page_file.write_text(page.pom_code, encoding='utf-8')
-
-            # 6. 写入测试用例主脚本
-            test_file = base_path / "run_test.py"
-            test_file.write_text(script_content, encoding='utf-8')
-
-            # 7. 启动子进程执行 (注入 PYTHONPATH)
-            env = os.environ.copy()
-            env['PYTHONPATH'] = str(base_path)
-
-            logger.info(f"在本地沙箱中启动测试: {base_path}")
-            process = subprocess.run(
-                ['python', 'run_test.py'],
-                cwd=str(base_path),
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding='utf-8'  # 解决 Windows 下的 GBK 解码报错
-            )
-
-            success = process.returncode == 0
-            return {
-                'success': success,
-                'result': {
-                    'stdout': process.stdout,
-                    'stderr': process.stderr,
-                    'test_file': str(test_file)
-                },
-                'error': process.stderr if not success else '',
-                'log': process.stdout if success else (process.stderr or '执行失败')
-            }
-    except Exception as e:
-        logger.error(f"沙箱执行异常: {e}")
-        return {'success': False, 'error': str(e)}
 
 
 def _run_test_script(script_content: str, base_url: str = None, options: dict = None) -> Dict[str, Any]:
@@ -760,11 +667,12 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         logger.info(f"使用脚本内容长度: {len(script_content)}")
         logger.info(f"使用基础URL: {base_url}")
         
-        # 步骤4: 执行测试脚本（沙箱模式：临时目录 + POM 注入 + 本地浏览器弹窗）
+        # 步骤4: 统一执行测试脚本；浏览器生命周期由 PlaywrightRunner 物化器管理
         update_task_progress(task_instance, 50, '正在执行WebUI测试...')
         
         project_id = test_case.project.id
-        execution_result = _run_sandbox_test_script(script_content, project_id, base_url)
+        managed_script = _compose_script_for_execution(script_content, project_id)
+        execution_result = _run_test_script(managed_script, base_url, options)
         
         # 步骤5: 保存执行结果
         update_task_progress(task_instance, 80, '正在保存执行结果...')
@@ -943,6 +851,8 @@ def _build_suite_workspace_from_db(
     work_dir: str,
     suite_name: str = None,
     base_url: str = "http://mall.lemonban.com:3344",
+    browser: str = "chromium",
+    headed: bool = True,
 ) -> tuple:
     """
     从数据库直接搬运代码资产到标准化目录结构，不调用代码生成器。
@@ -1014,18 +924,15 @@ def _build_suite_workspace_from_db(
 
         test_file = os.path.join(work_dir, f'test_case_{test_case_id}.py')
         try:
-            content = script_content
-            # 【核心修复】：动态替换相对路径为完整 URL（兼容双引号和单引号）
-            content = content.replace('await page.goto("/")', f'await page.goto("{base_url}/")')
-            content = content.replace("await page.goto('/')", f"await page.goto('{base_url}/')")
-            # 【Pytest 兼容层】：若脚本无 test_ 函数，注入包装入口
-            if 'def test_' not in content:
-                content += "\n\n# =============== Pytest 兼容层 ==============="
-                content += f"\ndef test_case_{test_case_id}_wrapper():"
-                content += "\n    import asyncio"
-                content += "\n    # 调用脚本自带的 main() 函数"
-                content += "\n    asyncio.run(main())"
-                content += "\n"
+            from .script_contract import materialize_script
+            content = materialize_script(
+                script_content,
+                f"test_case_{test_case_id}",
+                browser=browser,
+                headed=headed,
+                base_url=base_url,
+                suite_name=suite_name,
+            )
 
             with open(test_file, 'w', encoding='utf-8') as f:
                 f.write(content)

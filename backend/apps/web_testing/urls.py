@@ -21,10 +21,6 @@ urlpatterns = [
     path('scripts/from-testcase/', views.CreateWebUITestScriptFromTestCaseView.as_view(), name='create-webui-test-script-from-testcase'),
     path('scripts/from-testcase/stop/', views.StopWebUITestScriptFromTestCaseView.as_view(), name='stop-webui-test-script-from-testcase'),
     
-    # WebUI测试执行
-    path('scripts/<int:script_id>/execute/', views.ExecuteWebUITestView.as_view(), name='execute-webui-test'),
-    
-    
     # ============ MidScene脚本管理 ============
     path('midscene/generate/', views.GenerateMidSceneScriptView.as_view(), name='generate-midscene-script'),
     path('midscene/scripts/', views.list_midscene_scripts, name='list-midscene-scripts'),

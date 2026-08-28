@@ -6,18 +6,21 @@ WebUI Playwright智能体
 
 import logging
 import asyncio
+import json
 import os
 import re
 import shutil
 import platform
 import subprocess
-from collections import deque
+import threading
+from collections import Counter, deque
 from typing import TypedDict, Dict, Any, Optional
 from datetime import datetime
 from channels.db import database_sync_to_async
 from django.conf import settings
 from django.core.cache import cache
 from .models import MCPConfiguration
+from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.graph import StateGraph, END
 from langgraph.errors import GraphRecursionError
 from common.websocket import websocket_message_service, send_node_start_notification_helper
@@ -29,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_POM_CONTEXT = "当前项目暂无收录的标准页面元素。"
 MCP_MAX_STEPS = 60
-MCP_BROWSER_TOOL_CALL_LIMIT = 24
+MCP_BROWSER_TOOL_CALL_LIMIT = 50
 
 MCP_EXPLORATION_CONSTRAINTS = f"""- 调用 `playwright_navigate` 时必须显式传入 JSON 布尔值 `headless: true`，不得省略，也不得传字符串 `\"true\"`。
 - 所有浏览器工具调用合计最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次；仅在缺少必要页面结构、可见文本或定位器时调用工具。
@@ -47,6 +50,10 @@ MCP_ERROR_BROWSER = "browser"
 MCP_ERROR_RATE_LIMIT = "rate_limit"
 MCP_ERROR_TRANSIENT = "transient"
 MCP_ERROR_OTHER = "other"
+MCP_ERROR_TOOL_BUDGET = "tool_budget"
+MCP_ERROR_REPEATED_INTERACTION = "repeated_interaction"
+MCP_ERROR_INTERACTION_FAILURE = "interaction_failure"
+MCP_ERROR_LOGIN_FAILED = "login_failed"
 
 _PLAYWRIGHT_TOOL_PARAMETER_ERROR_MARKERS = (
     "headless: expected boolean",
@@ -80,6 +87,291 @@ _TRANSIENT_MCP_ERROR_MARKERS = (
 _HTTP_STATUS_PATTERN = re.compile(r"\b(429|503|504)\b")
 
 
+class MCPToolGuardError(RuntimeError):
+    """不可重试的 MCP 浏览器工具守卫异常。"""
+
+    retryable = False
+
+    def __init__(self, error_kind: str, message: str):
+        self.error_kind = error_kind
+        super().__init__(message)
+
+
+_MCP_TOOL_GUARD_ERROR_KINDS = {
+    MCP_ERROR_TOOL_BUDGET,
+    MCP_ERROR_REPEATED_INTERACTION,
+    MCP_ERROR_INTERACTION_FAILURE,
+    MCP_ERROR_LOGIN_FAILED,
+}
+
+_PAGE_CHECK_TOOLS = {"playwright_get_visible_text", "playwright_get_visible_html"}
+_READ_ONLY_BROWSER_TOOLS = _PAGE_CHECK_TOOLS | {
+    "playwright_screenshot",
+    "playwright_console_logs",
+    "browser_console_logs",
+}
+_LOCATOR_INTERACTION_TOOLS = {
+    "playwright_click",
+    "playwright_iframe_click",
+    "playwright_click_and_switch_tab",
+    "playwright_fill",
+    "playwright_iframe_fill",
+    "playwright_select",
+    "playwright_hover",
+    "playwright_upload_file",
+    "playwright_drag",
+    "playwright_press_key",
+}
+_LOGIN_MARKERS = ("登录", "login", "sign in", "signin")
+_SENSITIVE_INPUT_KEY = re.compile(
+    r"password|passwd|pwd|token|secret|authorization|api[_-]?key|密码|口令",
+    re.IGNORECASE,
+)
+
+
+def _guard_tool_name(serialized: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(serialized, dict):
+        return ""
+    return str(serialized.get("name") or "").strip().lower()
+
+
+def _guard_input_text(inputs: Any, input_str: str = "") -> str:
+    if isinstance(inputs, dict):
+        try:
+            return json.dumps(inputs, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return str(inputs)
+    return str(input_str or "")
+
+
+def _normalize_guard_value(value: Any, key: str = "") -> Any:
+    if _SENSITIVE_INPUT_KEY.search(key):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _normalize_guard_value(item_value, str(item_key))
+            for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_guard_value(item) for item in value]
+    if isinstance(value, set):
+        return sorted(_normalize_guard_value(item) for item in value)
+    return value
+
+
+def _normalize_guard_input(inputs: Any, input_str: str = "") -> str:
+    source = inputs if isinstance(inputs, dict) else input_str
+    normalized = _normalize_guard_value(source)
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _guard_output_text(output: Any) -> str:
+    if hasattr(output, "content"):
+        return _guard_output_text(output.content)
+    if isinstance(output, dict):
+        return json.dumps(output, ensure_ascii=False, sort_keys=True, default=str)
+    if isinstance(output, (list, tuple)):
+        return " ".join(_guard_output_text(item) for item in output)
+    return str(output or "")
+
+
+class MCPBrowserToolGuard(BaseCallbackHandler):
+    """在 LangChain 工具执行前后限制 MCP 浏览器探索行为。"""
+
+    raise_error = True
+    run_inline = True
+
+    def __init__(self, max_tool_calls: int = MCP_BROWSER_TOOL_CALL_LIMIT):
+        super().__init__()
+        self.max_tool_calls = max_tool_calls
+        self.total_tool_calls = 0
+        self.tool_call_counts = Counter()
+        self.interaction_call_counts = Counter()
+        self.consecutive_interaction_failures = 0
+        self.login_page_detected = False
+        self.login_form_seen = False
+        self.login_attempts = 0
+        self.login_checks_since_attempt = 0
+        self.login_verified = False
+        self.termination_reason = None
+        self._terminal_error = None
+        self._active_interactions = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _is_browser_tool(tool_name: str) -> bool:
+        return tool_name.startswith("playwright_") or tool_name == "browser_console_logs"
+
+    @staticmethod
+    def _is_interaction_tool(tool_name: str) -> bool:
+        return (
+            MCPBrowserToolGuard._is_browser_tool(tool_name)
+            and tool_name not in _READ_ONLY_BROWSER_TOOLS
+        )
+
+    @staticmethod
+    def _is_login_page(output: Any) -> bool:
+        text = _guard_output_text(output).lower()
+        if not text.strip():
+            return False
+        has_login_marker = any(marker in text for marker in _LOGIN_MARKERS)
+        has_username_field = "请输入用户名" in text or "username" in text
+        has_password_field = "请输入密码" in text or "password" in text
+        has_login_form = (
+            (has_username_field and has_password_field)
+            or "获取体验账号" in text
+            or "login-form" in text
+        )
+        return has_login_marker and has_login_form
+
+    @staticmethod
+    def _is_meaningful_page_check(output: Any) -> bool:
+        text = _guard_output_text(output).strip().lower()
+        return bool(text) and not MCPBrowserToolGuard._is_failed_output(output)
+
+    @staticmethod
+    def _is_failed_output(output: Any) -> bool:
+        if isinstance(output, dict) and (output.get("error") or output.get("status") == "error"):
+            return True
+        text = _guard_output_text(output).strip().lower()
+        return bool(
+            re.search(
+                r"operation failed|error executing tool|timeout .* exceeded|"
+                r"failed to|could not|invalid .*selector|exception",
+                text,
+            )
+        )
+
+    def _is_login_submission(self, tool_name: str, inputs: Any, input_str: str) -> bool:
+        text = _guard_input_text(inputs, input_str).lower()
+        if tool_name.endswith("_press_key"):
+            return "enter" in text and self.login_form_seen
+        if tool_name.endswith("_click"):
+            return (
+                any(marker in text for marker in _LOGIN_MARKERS)
+                or (self.login_page_detected and self.login_form_seen)
+            )
+        if tool_name == "playwright_evaluate":
+            return (
+                any(marker in text for marker in _LOGIN_MARKERS)
+                and any(marker in text for marker in ("fetch", "submit", ".click", "/login"))
+            )
+        return False
+
+    def _raise_guard(self, error_kind: str, message: str):
+        if self._terminal_error is None:
+            self.termination_reason = error_kind
+            self._terminal_error = MCPToolGuardError(error_kind, message)
+        raise self._terminal_error
+
+    def _record_interaction_failure(self):
+        self.consecutive_interaction_failures += 1
+        if self.consecutive_interaction_failures >= 3:
+            self._raise_guard(
+                MCP_ERROR_INTERACTION_FAILURE,
+                "浏览器定位交互连续失败 3 次，已终止脚本生成。请检查定位器、页面状态或登录结果后重试。",
+            )
+
+    def _record_page_check(self, tool_name: str, output: Any):
+        if tool_name not in _PAGE_CHECK_TOOLS or not self._is_meaningful_page_check(output):
+            return
+        if self._is_login_page(output):
+            self.login_page_detected = True
+            if self.login_attempts and not self.login_verified:
+                self.login_checks_since_attempt += 1
+                if self.login_checks_since_attempt >= 2:
+                    self._raise_guard(
+                        MCP_ERROR_LOGIN_FAILED,
+                        "登录失败：提交登录后连续两次页面检查仍停留在登录页，已终止脚本生成。请检查登录流程后重试。",
+                    )
+        elif self.login_attempts or self.login_form_seen:
+            self.login_verified = True
+            self.login_checks_since_attempt = 0
+
+    def on_tool_start(
+        self,
+        serialized: Optional[Dict[str, Any]],
+        input_str: str,
+        *,
+        run_id=None,
+        parent_run_id=None,
+        inputs=None,
+        **kwargs,
+    ):
+        tool_name = _guard_tool_name(serialized)
+        if not self._is_browser_tool(tool_name):
+            return
+        with self._lock:
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            if self.total_tool_calls >= self.max_tool_calls:
+                self._raise_guard(
+                    MCP_ERROR_TOOL_BUDGET,
+                    f"浏览器工具调用已达到本次任务上限（{self.max_tool_calls} 次），已终止脚本生成。请缩短探索范围后重试。",
+                )
+
+            if tool_name == "playwright_fill":
+                text = _guard_input_text(inputs, input_str).lower()
+                if "password" in text or "密码" in text or "username" in text or "用户名" in text:
+                    self.login_form_seen = True
+
+            if self._is_login_submission(tool_name, inputs, input_str) and not self.login_verified:
+                if self.login_attempts >= 1:
+                    self._raise_guard(
+                        MCP_ERROR_LOGIN_FAILED,
+                        "登录失败：尚未确认登录成功前再次提交登录，已终止脚本生成。请检查登录流程后重试。",
+                    )
+                self.login_attempts += 1
+                self.login_checks_since_attempt = 0
+
+            interaction_key = None
+            if self._is_interaction_tool(tool_name):
+                interaction_key = (tool_name, _normalize_guard_input(inputs, input_str))
+                if self.interaction_call_counts[interaction_key] >= 2:
+                    self._raise_guard(
+                        MCP_ERROR_REPEATED_INTERACTION,
+                        "检测到相同的交互操作及参数已执行 2 次，已终止脚本生成。请检查定位器或操作流程后重试。",
+                    )
+
+            self.total_tool_calls += 1
+            self.tool_call_counts[tool_name] += 1
+            if interaction_key is not None:
+                self.interaction_call_counts[interaction_key] += 1
+                self._active_interactions[run_id] = {
+                    "interaction_key": interaction_key,
+                    "is_locator_interaction": tool_name in _LOCATOR_INTERACTION_TOOLS,
+                }
+
+    def on_tool_end(self, output: Any, *, run_id=None, parent_run_id=None, **kwargs):
+        with self._lock:
+            if self._terminal_error is not None:
+                return
+            active_interaction = self._active_interactions.pop(run_id, None)
+            if active_interaction and active_interaction["is_locator_interaction"]:
+                if self._is_failed_output(output):
+                    self._record_interaction_failure()
+                else:
+                    self.consecutive_interaction_failures = 0
+            tool_name = str(kwargs.get("name") or "").strip().lower()
+            self._record_page_check(tool_name, output)
+
+    def on_tool_error(self, error: BaseException, *, run_id=None, parent_run_id=None, **kwargs):
+        with self._lock:
+            if self._terminal_error is not None:
+                return
+            active_interaction = self._active_interactions.pop(run_id, None)
+            if active_interaction and active_interaction["is_locator_interaction"]:
+                self._record_interaction_failure()
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "total_tool_calls": self.total_tool_calls,
+                "tool_counts": dict(self.tool_call_counts),
+                "termination_reason": self.termination_reason,
+            }
+
+
 def _iter_exception_chain(error: BaseException):
     """遍历异常及其 cause/context，兼容被 RuntimeError 包装的底层错误。"""
     current: Optional[BaseException] = error
@@ -99,6 +391,9 @@ def _exception_text(error: BaseException) -> str:
 
 def _classify_mcp_error(error: BaseException) -> str:
     """将 MCP 执行异常归类为可测试、可重试的稳定类别。"""
+    for candidate in _iter_exception_chain(error):
+        if isinstance(candidate, MCPToolGuardError):
+            return candidate.error_kind
     if any(
         isinstance(candidate, GraphRecursionError)
         for candidate in _iter_exception_chain(error)
@@ -134,12 +429,15 @@ def _is_non_retryable_mcp_error(error: BaseException) -> bool:
         MCP_ERROR_TOOL_PARAMETER,
         MCP_ERROR_BROWSER,
         MCP_ERROR_RATE_LIMIT,
-    }
+    } | _MCP_TOOL_GUARD_ERROR_KINDS
 
 
 def _get_mcp_error_message(error: BaseException) -> str:
     """将底层 MCP 错误转换为固定的前端提示。"""
     error_kind = _classify_mcp_error(error)
+    for candidate in _iter_exception_chain(error):
+        if isinstance(candidate, MCPToolGuardError):
+            return str(candidate)
     if error_kind == MCP_ERROR_GRAPH_RECURSION:
         return (
             "MCP智能体超过最大执行步数，页面探索未在限制内完成。"
@@ -269,6 +567,7 @@ class WebUIPlaywrightAgent:
         # 初始化MCP客户端
         self.mcp_client = None
         self.mcp_agent = None
+        self._mcp_tool_guard = MCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
         # MCP日志handler（避免重复挂载导致日志重复）
         self._mcp_log_handler = None
         # 最近输出去重：只在短窗口内去重，避免刷屏
@@ -276,6 +575,19 @@ class WebUIPlaywrightAgent:
         
         # 构建LangGraph工作流
         self.workflow = self._build_workflow()
+
+    def _log_mcp_tool_guard_stats(self) -> None:
+        """记录不包含工具参数和凭据的任务级守卫统计。"""
+        tool_guard = getattr(self, "_mcp_tool_guard", None)
+        if not tool_guard:
+            return
+        stats = tool_guard.get_stats()
+        logger.info(
+            "MCP浏览器工具守卫统计: total=%s, counts=%s, termination_reason=%s",
+            stats["total_tool_calls"],
+            stats["tool_counts"],
+            stats["termination_reason"] or "none",
+        )
 
     def _is_cancelled(self) -> bool:
         """通过cache标记判断是否已请求取消（由停止接口写入）。"""
@@ -406,6 +718,11 @@ class WebUIPlaywrightAgent:
                 # 记录使用的LLM模型信息
                 model_info = self.llm_manager.get_model_info()
                 logger.info(f"使用LLM模型: {model_info}")
+
+                tool_guard = getattr(self, "_mcp_tool_guard", None)
+                if tool_guard is None:
+                    tool_guard = MCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
+                    self._mcp_tool_guard = tool_guard
                 
                 # 创建MCP智能体
                 agent = MCPAgent(
@@ -413,6 +730,7 @@ class WebUIPlaywrightAgent:
                     client=client,
                     max_steps=MCP_MAX_STEPS,
                     additional_instructions=MCP_AGENT_ADDITIONAL_INSTRUCTIONS,
+                    callbacks=[tool_guard],
                 )
                 
                 logger.info(
@@ -885,6 +1203,8 @@ async def run(page):
                     }
                 # 其他RuntimeError继续抛出
                 raise
+            finally:
+                self._log_mcp_tool_guard_stats()
             
             if not raw_output:
                 logger.error("MCP生成脚本失败: 返回空内容")

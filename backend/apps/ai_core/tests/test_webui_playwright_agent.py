@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from uuid import uuid4
 
 from langgraph.errors import GraphRecursionError
 
@@ -10,11 +11,17 @@ from ai_core.webui_playwright_agent import (
     MCP_BROWSER_TOOL_CALL_LIMIT,
     MCP_ERROR_BROWSER,
     MCP_ERROR_GRAPH_RECURSION,
+    MCP_ERROR_INTERACTION_FAILURE,
+    MCP_ERROR_LOGIN_FAILED,
+    MCP_ERROR_REPEATED_INTERACTION,
     MCP_ERROR_TOOL_PARAMETER,
+    MCP_ERROR_TOOL_BUDGET,
     MCP_ERROR_RATE_LIMIT,
     MCP_ERROR_TRANSIENT,
     MCP_EXPLORATION_CONSTRAINTS,
     MCP_MAX_STEPS,
+    MCPBrowserToolGuard,
+    MCPToolGuardError,
     WebUIPlaywrightAgent,
     _classify_mcp_error,
     _get_mcp_error_message,
@@ -49,6 +56,9 @@ class WebUIPlaywrightAgentStabilityTests(unittest.TestCase):
             kwargs["additional_instructions"],
             MCP_AGENT_ADDITIONAL_INSTRUCTIONS,
         )
+        self.assertEqual(len(kwargs["callbacks"]), 1)
+        self.assertIsInstance(kwargs["callbacks"][0], MCPBrowserToolGuard)
+        self.assertNotIn("retry_on_error", kwargs)
         logger_info.assert_any_call(
             "MCP智能体初始化成功：已启用 headless:true 约束，浏览器工具预算=%s 次",
             MCP_BROWSER_TOOL_CALL_LIMIT,
@@ -209,6 +219,24 @@ class WebUIPlaywrightAgentRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("最大执行步数", str(raised.exception))
         self.assertNotIn("Chromium", str(raised.exception))
 
+    async def test_tool_guard_errors_do_not_retry(self):
+        error = MCPToolGuardError(
+            MCP_ERROR_TOOL_BUDGET,
+            "浏览器工具调用已达到本次任务上限",
+        )
+        agent = self._build_agent(error)
+
+        with patch(
+            "ai_core.webui_playwright_agent.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            with self.assertRaises(RuntimeError) as raised:
+                await agent._call_mcp_agent_async("prompt")
+
+        self.assertEqual(agent.mcp_agent.run.await_count, 1)
+        sleep.assert_not_awaited()
+        self.assertIn("工具调用", str(raised.exception))
+
     async def test_503_504_and_connection_errors_are_retried(self):
         errors = (
             RuntimeError("HTTP 503 Service Unavailable"),
@@ -228,6 +256,226 @@ class WebUIPlaywrightAgentRetryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result, "generated script")
                 self.assertEqual(agent.mcp_agent.run.await_count, 2)
                 sleep.assert_awaited_once_with(2)
+
+
+class MCPBrowserToolGuardTests(unittest.TestCase):
+    @staticmethod
+    def _start(guard, tool_name, inputs=None):
+        run_id = uuid4()
+        guard.on_tool_start(
+            {"name": tool_name},
+            "",
+            run_id=run_id,
+            inputs=inputs or {},
+        )
+        return run_id
+
+    @staticmethod
+    def _end(guard, run_id, tool_name, output="ok"):
+        guard.on_tool_end(output, run_id=run_id, name=tool_name)
+
+    def test_hard_budget_stops_before_next_tool_execution(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=2)
+        first = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, first, "playwright_get_visible_text", "首页")
+        second = self._start(guard, "playwright_screenshot", {"name": "page"})
+        self._end(guard, second, "playwright_screenshot", "saved")
+
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_get_visible_html")
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_TOOL_BUDGET)
+        self.assertEqual(guard.get_stats()["total_tool_calls"], 2)
+
+    def test_non_browser_tools_do_not_consume_budget(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=1)
+
+        run_id = self._start(guard, "start_codegen_session")
+        self._end(guard, run_id, "start_codegen_session")
+
+        self.assertEqual(guard.get_stats()["total_tool_calls"], 0)
+
+    def test_third_identical_interaction_is_stopped_before_execution(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        inputs = {"selector": "button.save"}
+        for _ in range(2):
+            run_id = self._start(guard, "playwright_click", inputs)
+            self._end(guard, run_id, "playwright_click", "Clicked")
+
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", inputs)
+
+        self.assertEqual(
+            raised.exception.error_kind,
+            MCP_ERROR_REPEATED_INTERACTION,
+        )
+        self.assertEqual(guard.get_stats()["total_tool_calls"], 2)
+
+    def test_read_only_page_checks_may_repeat(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=5)
+
+        for _ in range(3):
+            run_id = self._start(guard, "playwright_get_visible_text")
+            self._end(guard, run_id, "playwright_get_visible_text", "首页")
+
+        self.assertEqual(guard.get_stats()["total_tool_calls"], 3)
+        self.assertIsNone(guard.get_stats()["termination_reason"])
+
+    def test_three_consecutive_interaction_failures_stop_task(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+
+        for index in range(2):
+            run_id = self._start(
+                guard,
+                "playwright_click",
+                {"selector": f"button.missing-{index}"},
+            )
+            self._end(
+                guard,
+                run_id,
+                "playwright_click",
+                "Operation failed: Timeout 30000ms exceeded",
+            )
+
+        third_run = self._start(
+            guard,
+            "playwright_fill",
+            {"selector": "input.missing", "value": "x"},
+        )
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._end(
+                guard,
+                third_run,
+                "playwright_fill",
+                "Operation failed: waiting for locator",
+            )
+
+        self.assertEqual(
+            raised.exception.error_kind,
+            MCP_ERROR_INTERACTION_FAILURE,
+        )
+
+    def test_successful_interaction_resets_failure_counter(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        failed = self._start(
+            guard,
+            "playwright_click",
+            {"selector": "button.missing"},
+        )
+        self._end(
+            guard,
+            failed,
+            "playwright_click",
+            "Operation failed: Timeout 30000ms exceeded",
+        )
+        succeeded = self._start(
+            guard,
+            "playwright_click",
+            {"selector": "button.available"},
+        )
+        self._end(guard, succeeded, "playwright_click", "Clicked")
+
+        self.assertEqual(guard.consecutive_interaction_failures, 0)
+
+    def test_non_locator_tool_failure_does_not_increment_locator_failures(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        run_id = self._start(
+            guard,
+            "playwright_evaluate",
+            {"script": "throw new Error('probe')"},
+        )
+        self._end(
+            guard,
+            run_id,
+            "playwright_evaluate",
+            "Error executing tool: exception",
+        )
+
+        self.assertEqual(guard.consecutive_interaction_failures, 0)
+
+    def _submit_login(self, guard):
+        username = self._start(
+            guard,
+            "playwright_fill",
+            {"selector": 'input[placeholder="请输入用户名"]', "value": "user"},
+        )
+        self._end(guard, username, "playwright_fill", "Filled")
+        password = self._start(
+            guard,
+            "playwright_fill",
+            {"selector": 'input[placeholder="请输入密码"]', "value": "secret"},
+        )
+        self._end(guard, password, "playwright_fill", "Filled")
+        submit = self._start(
+            guard,
+            "playwright_click",
+            {"selector": 'button:has-text("登录")'},
+        )
+        self._end(guard, submit, "playwright_click", "Clicked")
+
+    def test_two_login_page_checks_stop_failed_login(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        self._submit_login(guard)
+        visible_text = "mall-admin-web 登录 获取体验账号"
+
+        first = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, first, "playwright_get_visible_text", visible_text)
+        second = self._start(guard, "playwright_get_visible_html")
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._end(
+                guard,
+                second,
+                "playwright_get_visible_html",
+                '<input placeholder="请输入用户名"><input type="password">登录',
+            )
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_LOGIN_FAILED)
+
+    def test_successful_post_login_page_check_marks_login_verified(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        self._submit_login(guard)
+
+        check = self._start(guard, "playwright_get_visible_text")
+        self._end(
+            guard,
+            check,
+            "playwright_get_visible_text",
+            "首页 权限 用户列表 角色列表",
+        )
+
+        self.assertTrue(guard.login_verified)
+        self.assertEqual(guard.login_checks_since_attempt, 0)
+
+    def test_second_login_submission_before_verification_is_stopped(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        self._submit_login(guard)
+
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(
+                guard,
+                "playwright_click",
+                {"selector": 'button:has-text("登录")'},
+            )
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_LOGIN_FAILED)
+
+    def test_guard_stats_log_contains_counts_without_inputs(self):
+        agent = WebUIPlaywrightAgent.__new__(WebUIPlaywrightAgent)
+        agent._mcp_tool_guard = MCPBrowserToolGuard(max_tool_calls=2)
+        run_id = self._start(
+            agent._mcp_tool_guard,
+            "playwright_fill",
+            {"selector": 'input[type="password"]', "value": "secret"},
+        )
+        self._end(agent._mcp_tool_guard, run_id, "playwright_fill", "Filled")
+
+        with patch("ai_core.webui_playwright_agent.logger.info") as logger_info:
+            agent._log_mcp_tool_guard_stats()
+
+        logged_args = logger_info.call_args.args
+        self.assertEqual(logged_args[1], 1)
+        self.assertEqual(logged_args[2], {"playwright_fill": 1})
+        self.assertNotIn("secret", str(logged_args))
 
 
 if __name__ == "__main__":

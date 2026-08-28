@@ -6,6 +6,7 @@
 """
 import json
 import logging
+import os
 import traceback
 import requests
 from typing import Dict, List, Any, Optional, Callable, Union
@@ -18,6 +19,22 @@ from .models import LLMConfiguration
 from common.websocket import websocket_message_service
 
 logger = logging.getLogger(__name__)
+
+
+def _get_default_llm_timeout() -> int:
+    """读取 LLM 默认请求超时，允许通过环境变量覆盖。"""
+    raw_timeout = os.getenv('AITS_LLM_TIMEOUT_SECONDS', '600')
+    try:
+        return max(1, int(raw_timeout))
+    except (TypeError, ValueError):
+        logger.warning(
+            "AITS_LLM_TIMEOUT_SECONDS 配置无效: %r，回退到600秒",
+            raw_timeout,
+        )
+        return 600
+
+
+DEFAULT_LLM_TIMEOUT = _get_default_llm_timeout()
 
 
 class ModelManager:
@@ -116,7 +133,7 @@ class ModelManager:
                 'model_provider': 'deepseek',
                 'api_key': self.config.get('api_key'),
                 'base_url': self.config.get('base_url'),  # 可选，支持自定义 base_url
-                'timeout': extra_config.get('timeout', 300),
+                'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
             self.llm_type = 'deepseek'
@@ -128,7 +145,7 @@ class ModelManager:
                 'model_provider': 'openai',  # 使用 OpenAI 兼容接口
                 'api_key': self.config.get('api_key'),
                 'base_url': self.config.get('base_url'),
-                'timeout': extra_config.get('timeout', 300),
+                'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
             self.llm_type = provider
@@ -138,7 +155,7 @@ class ModelManager:
             init_params.update({
                 'model_provider': 'anthropic',
                 'api_key': self.config.get('api_key'),
-                'timeout': extra_config.get('timeout', 300),
+                'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
             self.llm_type = 'anthropic'
@@ -148,7 +165,7 @@ class ModelManager:
             init_params.update({
                 'model_provider': 'google_genai',
                 'api_key': self.config.get('api_key'),
-                'timeout': extra_config.get('timeout', 300),
+                'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
             self.llm_type = 'google_genai'
@@ -160,7 +177,7 @@ class ModelManager:
                 'model_provider': 'openai',
                 'api_key': self.config.get('api_key'),
                 'base_url': self.config.get('base_url'),
-                'timeout': extra_config.get('timeout', 300),
+                'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
             self.llm_type = provider

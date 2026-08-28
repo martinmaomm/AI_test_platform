@@ -43,7 +43,7 @@ class WebUIPlaywrightAgentStabilityTests(unittest.TestCase):
 
         self.assertIs(result, mcp_agent.return_value)
         kwargs = mcp_agent.call_args.kwargs
-        self.assertEqual(MCP_MAX_STEPS, 30)
+        self.assertEqual(MCP_MAX_STEPS, 60)
         self.assertEqual(kwargs["max_steps"], MCP_MAX_STEPS)
         self.assertEqual(
             kwargs["additional_instructions"],

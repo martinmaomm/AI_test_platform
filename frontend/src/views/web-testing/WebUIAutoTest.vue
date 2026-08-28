@@ -12,8 +12,8 @@
               </el-icon>
             </div>
             <div class="header-text">
-              <h3>WebUI自动化测试智能体</h3>
-              <p>探索性智能自动化脚本生成工具 (草稿箱)</p>
+              <h3>探索网页生成</h3>
+              <p>通过 Playwright MCP 探索真实页面并生成 Python 脚本草稿</p>
             </div>
           </div>
           <div class="header-actions">

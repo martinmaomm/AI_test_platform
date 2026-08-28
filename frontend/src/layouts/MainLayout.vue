@@ -32,8 +32,17 @@
         active-text-color="var(--layout-sidebar-active)"
         @select="handleMenuSelect"
       >
-        <template v-for="item in dynamicMenus" :key="item.path">
-          <el-sub-menu v-if="item.children" :index="item.path">
+        <template v-for="item in dynamicMenus" :key="item.path || item.label">
+          <el-menu-item-group v-if="item.group" :title="item.label">
+            <el-menu-item
+              v-for="child in item.children"
+              :key="child.path"
+              :index="child.path"
+            >
+              {{ child.label }}
+            </el-menu-item>
+          </el-menu-item-group>
+          <el-sub-menu v-else-if="item.children" :index="item.path">
             <template #title>{{ item.label }}</template>
             <el-menu-item
               v-for="child in item.children"
@@ -211,16 +220,39 @@ const MENU_CONFIG = {
   web: {
     title: 'Web 测试',
     items: [
-      { path: '/web-testing/test-case-generator', label: '测试用例生成智能体' },
-      { path: '/web-testing/webui-auto-test', label: 'AI 脚本实验室' },
-      { path: '/web-testing/test-cases', label: '测试用例管理' },
-      { path: '/web-testing/test-suites', label: '测试套件管理' },
-      { path: '/web-testing/test-executions', label: '测试执行记录' },
-      { path: '/web-testing/scheduled-tasks', label: '定时任务' },
-      { path: '/web-testing/environments', label: '环境管理' },
-      { path: '/web-testing/page-objects', label: '元素库管理' },
-      { path: '/web-testing/knowledge-base', label: '知识库管理' },
-      { path: '/web-testing/notification-receivers', label: '通知接收管理' }
+      {
+        group: true,
+        label: '智能创建',
+        children: [
+          { path: '/web-testing/create', label: '新建自动化' }
+        ]
+      },
+      {
+        group: true,
+        label: '测试资产',
+        children: [
+          { path: '/web-testing/test-cases', label: '测试用例' },
+          { path: '/web-testing/page-objects', label: '页面与元素' },
+          { path: '/web-testing/test-suites', label: '测试套件' }
+        ]
+      },
+      {
+        group: true,
+        label: '测试执行',
+        children: [
+          { path: '/web-testing/test-executions', label: '执行记录' },
+          { path: '/web-testing/scheduled-tasks', label: '定时任务' }
+        ]
+      },
+      {
+        group: true,
+        label: '项目配置',
+        children: [
+          { path: '/web-testing/environments', label: '测试环境' },
+          { path: '/web-testing/knowledge-base', label: '知识库' },
+          { path: '/web-testing/notification-receivers', label: '通知设置' }
+        ]
+      }
     ]
   },
   app: {
@@ -399,7 +431,7 @@ const activeMenuIndex = computed(() => {
   if (/^\/project\/project-detail\/[^/]+/.test(p)) return '/project/project-list'
   // 模块基础路径 -> 默认子页
   if (p === '/api-testing') return '/api-testing/function-navigation'
-  if (p === '/web-testing') return '/web-testing/webui-auto-test'
+  if (p === '/web-testing' || p === '/web-testing/create' || p.startsWith('/web-testing/create/')) return '/web-testing/create'
   if (p === '/app-testing') return '/app-testing/pom-parser'
   if (p === '/perf-testing') return '/perf-testing/workspace'
   if (p === '/project') return '/project/project-list'

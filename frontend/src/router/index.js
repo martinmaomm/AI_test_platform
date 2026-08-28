@@ -142,9 +142,19 @@ const routes = [
     component: () => import('@/layouts/MainLayout.vue'),
     meta: { requiresAuth: true, layout: 'workspace', module: 'web', title: 'Web 测试' },
     children: [
-      { path: '', redirect: '/web-testing/webui-auto-test' },
-      { path: 'webui-auto-test', name: 'WebUIAutoTest', component: () => import('@/views/web-testing/WebUIAutoTest.vue'), meta: { title: 'AI 脚本实验室' } },
-      { path: 'test-case-generator', name: 'WebUITestCaseGenerator', component: () => import('@/views/web-testing/WebUITestCaseGenerator.vue'), meta: { title: '测试用例生成智能体' } },
+      { path: '', redirect: '/web-testing/create/requirements' },
+      {
+        path: 'create',
+        component: () => import('@/views/web-testing/SmartCreate.vue'),
+        meta: { title: '智能创建' },
+        children: [
+          { path: '', redirect: '/web-testing/create/requirements' },
+          { path: 'requirements', name: 'WebRequirementCreate', component: () => import('@/views/web-testing/WebUITestCaseGenerator.vue'), meta: { title: '智能创建' } },
+          { path: 'explore', name: 'WebExploreCreate', component: () => import('@/views/web-testing/WebUIAutoTest.vue'), meta: { title: '智能创建' } }
+        ]
+      },
+      { path: 'webui-auto-test', redirect: '/web-testing/create/explore' },
+      { path: 'test-case-generator', redirect: '/web-testing/create/requirements' },
       { path: 'test-cases', name: 'WebTestCases', component: () => import('@/views/web-testing/TestCases.vue'), meta: { title: '测试用例管理' } },
       { path: 'test-suites', name: 'WebTestSuites', component: () => import('@/views/web-testing/TestSuites.vue'), meta: { title: '测试套件管理' } },
       { path: 'test-executions', name: 'WebTestExecutions', component: () => import('@/views/web-testing/TestExecutions.vue'), meta: { title: '测试执行记录' } },

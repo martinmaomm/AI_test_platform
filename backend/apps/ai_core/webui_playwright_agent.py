@@ -28,8 +28,8 @@ from mcp_use import MCPClient, MCPAgent
 logger = logging.getLogger(__name__)
 
 _DEFAULT_POM_CONTEXT = "当前项目暂无收录的标准页面元素。"
-MCP_MAX_STEPS = 30
-MCP_BROWSER_TOOL_CALL_LIMIT = 12
+MCP_MAX_STEPS = 60
+MCP_BROWSER_TOOL_CALL_LIMIT = 24
 
 MCP_EXPLORATION_CONSTRAINTS = f"""- 调用 `playwright_navigate` 时必须显式传入 JSON 布尔值 `headless: true`，不得省略，也不得传字符串 `\"true\"`。
 - 所有浏览器工具调用合计最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次；仅在缺少必要页面结构、可见文本或定位器时调用工具。
@@ -863,6 +863,15 @@ async def run(page):
             # 发送开始生成的消息
             self._send_websocket_message(f"用户需求: {description}\n", "MCP智能体生成")
             self._send_websocket_message(f"目标URL: {target_url}\n", "MCP智能体生成")
+            logger.info(
+                "MCP脚本生成请求: target_url=%s, description_length=%s",
+                target_url,
+                len(description),
+            )
+            logger.info(
+                "MCP完整请求 Prompt 开始\n%s\nMCP完整请求 Prompt 结束",
+                mcp_prompt,
+            )
             
             # 调用MCP智能体生成脚本（异步调用）
             try:

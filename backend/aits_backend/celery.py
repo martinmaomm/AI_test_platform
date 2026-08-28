@@ -58,6 +58,16 @@ def configure_celery_logging(loglevel=None, logfile=None, **kwargs):
     }
 
     logging.config.dictConfig(logging_config)
+
+    # mcp-use 在导入时会自行挂载一个控制台 Handler，并且设置 propagate=True。
+    # 清理它后统一交给 Celery 根日志处理，避免同一条日志在终端输出两次，
+    # 同时保留 celery.log 文件记录和 WebUI 智能体的临时流式 Handler。
+    mcp_logger = logging.getLogger('mcp_use')
+    for handler in mcp_logger.handlers[:]:
+        mcp_logger.removeHandler(handler)
+        handler.close()
+    mcp_logger.propagate = True
+
     logging.getLogger(__name__).info(
         "Celery文件日志已启用: %s (最大20MB，保留5个备份)",
         log_path,

@@ -509,27 +509,6 @@
       </template>
     </el-dialog>
 
-    <!-- AI生成测试用例对话框 -->
-    <el-dialog v-model="dialogVisible" title="AI生成测试用例" width="600px" :close-on-click-modal="false">
-      <el-form :model="testCaseForm" :rules="formRules" ref="formRef" label-width="100px">
-        <el-form-item label="测试需求" prop="description">
-          <el-input v-model="testCaseForm.description" type="textarea" :rows="6"
-            placeholder="请描述您需要测试的功能，例如：测试用户登录功能，包括正常登录、错误密码、空用户名等场景" />
-        </el-form-item>
-
-        <el-form-item label="目标URL" prop="url">
-          <el-input v-model="testCaseForm.url" placeholder="请输入要测试的页面URL（可选）" />
-        </el-form-item>
-      </el-form>
-
-      <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="generateTestCase" :loading="generating">
-          {{ generating ? '生成中...' : '开始生成' }}
-        </el-button>
-      </template>
-    </el-dialog>
-
     <!-- Web UI测试用例详情组件 -->
     <WebUICaseEditDetail v-model="detailDialogVisible" :test-case="currentTestCase" :existing-test-cases="testCases"
       @run="handleRunTestCase" @update="handleTestCaseUpdate" />
@@ -661,7 +640,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 
 // 静默轮询：执行状态自动刷新
 let statusPollingTimer = null
@@ -678,7 +657,6 @@ import {
   getWebUITestCases,
   getWebUITestCase,
   deleteWebUITestCase,
-  generateWebUITestCases,
   executeWebUITestCase,
   generateTestCaseCode,
   batchGenerateTestCaseCode,
@@ -705,10 +683,6 @@ const searchKeyword = ref('')
 const currentPage = ref(1)
 const pageSize = ref(10)
 const totalCases = ref(0)
-const dialogVisible = ref(false)
-const isEdit = ref(false)
-const formRef = ref()
-const generating = ref(false)
 
 // 执行相关状态
 const executingTestCases = ref(new Set()) // 正在执行的测试用例ID集合
@@ -799,18 +773,6 @@ const currentProject = computed(() => projectStore.currentProject)
 // 检查测试用例是否正在执行
 const isTestCaseExecuting = (testCaseId) => {
   return executingTestCases.value.has(testCaseId)
-}
-
-// 表单数据
-const testCaseForm = reactive({
-  description: '',
-  url: ''
-})
-
-// 表单验证规则
-const formRules = {
-  description: [{ required: true, message: '请输入测试需求描述', trigger: 'blur' }],
-  url: [{ required: false, message: '请输入有效的URL', trigger: 'blur' }]
 }
 
 // 筛选变更时重新加载
@@ -1056,17 +1018,6 @@ const handleCurrentChange = (val) => {
   loadTestCases()
 }
 
-const createTestCase = () => {
-  if (!projectStore.currentProject?.id) {
-    ElMessage.warning('请先选择一个项目')
-    return
-  }
-
-  isEdit.value = false
-  resetForm()
-  dialogVisible.value = true
-}
-
 // 生成代码（单条）- 触发 AI 推理和生成逻辑
 const generateCode = async (row, framework = 'playwright') => {
   if (framework === 'selenium') {
@@ -1293,46 +1244,6 @@ const handleClone = async (row) => {
     console.error('克隆测试用例失败:', error)
     handleError('克隆测试用例失败')
   }
-}
-
-const generateTestCase = async () => {
-  if (!formRef.value) return
-
-  try {
-    await formRef.value.validate()
-
-    generating.value = true
-
-    const data = {
-      user_input: testCaseForm.description,
-      project_id: projectStore.currentProject.id,
-      url: testCaseForm.url || null
-    }
-
-    const response = await generateWebUITestCases(projectStore.currentProject.id, data)
-
-    if (response.success) {
-      ElMessage.success('测试用例生成任务已启动，请稍后查看结果')
-      dialogVisible.value = false
-      resetForm()
-      // 重新加载数据
-      loadTestCases()
-    } else {
-      handleError(response.message, '生成测试用例失败')
-    }
-  } catch (error) {
-    console.error('生成测试用例失败:', error)
-    handleError('生成测试用例失败')
-  } finally {
-    generating.value = false
-  }
-}
-
-const resetForm = () => {
-  Object.assign(testCaseForm, {
-    description: '',
-    url: ''
-  })
 }
 
 const runTestCase = async (testCase) => {

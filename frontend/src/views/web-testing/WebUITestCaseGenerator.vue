@@ -15,7 +15,7 @@
               </div>
                <div class="header-title">
                  <span v-if="currentStep">{{ getStepDisplayName(currentStep) }}</span>
-                 <span v-else>WebUI测试用例生成智能体</span>
+                 <span v-else>从需求生成测试用例</span>
                </div>
 
             </div>
@@ -42,8 +42,8 @@
               <div class="welcome-content">
                 <div class="welcome-header">
                   <el-icon class="robot-icon"><Platform /></el-icon>
-                  <h2>欢迎使用 WebUI 测试用例生成智能体</h2>
-                  <p class="subtitle">我已深度接入您的 <strong>项目需求知识库</strong> 与 <strong>页面资产库</strong>，将为您生成符合 POM 规范的业务测试用例。</p>
+                  <h2>从需求生成测试用例</h2>
+                  <p class="subtitle">根据业务模块、知识库和已维护的页面元素生成可编辑的结构化用例；本模式不会操作真实浏览器，也不会直接生成可执行脚本。</p>
                 </div>
 
                 <div class="intro-card">

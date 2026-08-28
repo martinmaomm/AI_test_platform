@@ -125,7 +125,7 @@ const loadProjects = async () => {
 const enterProject = async (project) => {
   try {
     await projectStore.setCurrentProject(project)
-    router.push('/web-testing/webui-auto-test')
+    router.push('/web-testing/create/requirements')
   } catch {
     ElMessage.error('设置项目失败，请重试')
   }

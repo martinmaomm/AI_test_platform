@@ -41,6 +41,11 @@ from .tasks import (
     fill_locators_from_html_task
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
+from .project_access import (
+    DELETE, EDIT, EXECUTE, READ, REPORT,
+    get_project_for_user, payload_project_mismatch, project_access_required,
+    validate_related_project,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,7 @@ from .constants import WEB_UI_ACTION_OPTIONS
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@project_access_required(READ)
 def get_web_ui_actions(request, project_id=None):
     """获取全局的 WebUI 动作配置字典"""
     return Response({
@@ -73,6 +79,7 @@ def get_web_ui_actions(request, project_id=None):
 
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
+@project_access_required(DELETE)
 def clear_project_web_assets(request, project_id):
     """【调试专用】一键清空当前项目下的所有测试模块、页面和元素"""
     try:
@@ -102,14 +109,34 @@ class WebPageViewSet(viewsets.ModelViewSet):
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return WebPage.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
         return WebPage.objects.filter(project_id=project_id).select_related('module').order_by('name')
 
     def perform_create(self, serializer):
         project_id = self.kwargs.get('project_id')
+        get_project_for_user(project_id, self.request.user, EDIT)
+        if payload_project_mismatch(self.request.data, project_id):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'project': '请求中的 project 必须与 URL project_id 一致'})
+        validate_related_project(WebUITestModule, serializer.validated_data.get('module'), project_id, 'module')
         serializer.save(project_id=project_id)
+
+    def perform_update(self, serializer):
+        project_id = self.kwargs.get('project_id')
+        get_project_for_user(project_id, self.request.user, EDIT)
+        if payload_project_mismatch(self.request.data, project_id):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'project': '请求中的 project 必须与 URL project_id 一致'})
+        validate_related_project(WebUITestModule, serializer.validated_data.get('module'), project_id, 'module')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        get_project_for_user(self.kwargs.get('project_id'), self.request.user, DELETE)
+        instance.delete()
 
     @action(detail=False, methods=['post'], url_path='batch-delete')
     def batch_delete(self, request, project_id=None):
+        get_project_for_user(project_id, request.user, DELETE)
         ids = request.data.get('ids', [])
         if not ids:
             return Response({"success": False, "message": "未提供要删除的ID列表"}, status=400)
@@ -124,6 +151,7 @@ class WebPageViewSet(viewsets.ModelViewSet):
         if not html_source:
             return Response({"success": False, "message": "未提供 HTML 源码"}, status=400)
 
+        get_project_for_user(project_id, request.user, EDIT)
         get_object_or_404(WebPage, id=pk, project_id=project_id)
 
         task = fill_locators_from_html_task.delay(project_id, int(pk), html_source)
@@ -138,6 +166,8 @@ class WebElementViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         project_id = self.kwargs.get('project_id')
+        if project_id:
+            get_project_for_user(project_id, self.request.user, READ)
         page_id = self.request.query_params.get('page_id')
         qs = WebElement.objects.select_related('page')
         if project_id:
@@ -146,8 +176,28 @@ class WebElementViewSet(viewsets.ModelViewSet):
             qs = qs.filter(page_id=page_id)
         return qs.order_by('page', 'name')
 
+    def _validate_page_project(self, page_id, capability=EDIT):
+        project_id = self.kwargs.get('project_id')
+        get_project_for_user(project_id, self.request.user, capability)
+        page = get_object_or_404(WebPage, pk=page_id, project_id=project_id)
+        return page
+
+    def perform_create(self, serializer):
+        self._validate_page_project(serializer.validated_data['page'].pk)
+        serializer.save()
+
+    def perform_update(self, serializer):
+        page = serializer.validated_data.get('page', serializer.instance.page)
+        self._validate_page_project(page.pk)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._validate_page_project(instance.page_id, DELETE)
+        instance.delete()
+
     @action(detail=False, methods=['post'], url_path='batch-delete')
     def batch_delete(self, request, project_id=None):
+        get_project_for_user(project_id, request.user, DELETE)
         ids = request.data.get('ids', [])
         if not ids:
             return Response({"success": False, "message": "未提供要删除的ID列表"}, status=400)
@@ -162,6 +212,7 @@ class CreateWebUITestScriptView(APIView):
     """创建WebUI测试脚本"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             data = request.data
@@ -214,6 +265,7 @@ class SaveGeneratedWebUITestScriptView(APIView):
     """保存 AI 脚本实验室生成的脚本为 WebUI 测试用例。"""
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         title = str(request.data.get('title', '')).strip()
         description = str(request.data.get('description', '')).strip()
@@ -235,14 +287,7 @@ class SaveGeneratedWebUITestScriptView(APIView):
         if not script_content:
             return response('error', message='脚本内容不能为空', status_code=status.HTTP_400_BAD_REQUEST)
 
-        project = Project.objects.filter(
-            Q(id=project_id),
-            Q(created_by=request.user) |
-            Q(owner=request.user) |
-            Q(members__user=request.user)
-        ).distinct().first()
-        if not project:
-            return response('error', message='项目不存在或无权限访问', status_code=status.HTTP_404_NOT_FOUND)
+        project = get_project_for_user(project_id, request.user, EDIT)
 
         try:
             with transaction.atomic():
@@ -286,6 +331,7 @@ class CreateWebUITestScriptFromTestCaseView(APIView):
     """基于测试用例创建WebUI测试脚本"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             data = request.data
@@ -299,8 +345,10 @@ class CreateWebUITestScriptFromTestCaseView(APIView):
             test_case_id = data['test_case_id']
             logger.info(f"CreateWebUITestScriptFromTestCaseView - test_case_id: {test_case_id}, 类型: {type(test_case_id)}")
             
-            # 验证测试用例是否存在且属于当前用户
-            test_case = get_object_or_404(WebUITestCase, id=test_case_id, user=request.user)
+            # 验证测试用例属于 URL 项目；项目成员可以协作使用同项目用例
+            test_case = get_object_or_404(
+                WebUITestCase, id=test_case_id, project_id=project_id
+            )
             
             # 从URL路径参数获取项目ID
             from projects.models import Project
@@ -339,6 +387,7 @@ class StopWebUITestScriptView(APIView):
     """停止WebUI测试脚本生成任务"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             data = request.data
@@ -370,6 +419,7 @@ class StopWebUITestScriptFromTestCaseView(APIView):
     """停止基于测试用例的WebUI测试脚本生成任务"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             data = request.data
@@ -407,6 +457,7 @@ class GenerateMidSceneScriptView(APIView):
     """
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             # 验证输入数据
@@ -416,28 +467,8 @@ class GenerateMidSceneScriptView(APIView):
             if not description:
                 return response(kind="error", message="请输入测试场景描述")
             
-            # 从用户偏好设置中获取项目ID
-            try:
-                from users.models import UserPreference
-                user_preference = UserPreference.objects.get(user=request.user)
-                project_id = user_preference.selected_project_id
-            except UserPreference.DoesNotExist:
-                return response(
-                    kind="error",
-                    message="用户偏好设置未找到，请先设置当前项目"
-                )
-            
-            if not project_id:
-                return response(
-                    kind="error",
-                    message="请先在用户设置中选择当前项目"
-                )
-            
-            try:
-                from projects.models import Project
-                project = Project.objects.get(id=project_id, created_by=request.user)
-            except Project.DoesNotExist:
-                return response(kind="error", message="项目不存在或无权限访问")
+            from projects.models import Project
+            project = get_project_for_user(project_id, request.user, EDIT)
             
             # 创建MidScene脚本记录
             script_name = f"MidScene脚本_{timezone.now().strftime('%Y%m%d_%H%M%S')}"
@@ -478,6 +509,7 @@ class GenerateMidSceneScriptView(APIView):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@project_access_required(REPORT)
 def get_midscene_script(request, project_id, script_id):
     """
     获取MidScene脚本详情
@@ -485,7 +517,7 @@ def get_midscene_script(request, project_id, script_id):
     try:
         script = MidSceneScript.objects.get(
             id=script_id,
-            created_by=request.user
+            project_id=project_id,
         )
         
         return response(
@@ -517,6 +549,7 @@ def get_midscene_script(request, project_id, script_id):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@project_access_required(READ)
 def list_midscene_scripts(request, project_id):
     """
     获取MidScene脚本列表
@@ -528,11 +561,7 @@ def list_midscene_scripts(request, project_id):
         page_size = int(request.GET.get('page_size', 10))
         
         # 构建查询
-        queryset = MidSceneScript.objects.filter(created_by=request.user)
-        
-        # 使用URL路径参数中的项目ID
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
+        queryset = MidSceneScript.objects.filter(project_id=project_id)
         
         if status:
             queryset = queryset.filter(status=status)
@@ -578,6 +607,7 @@ class TaskStatusView(APIView):
     """统一任务状态查询视图 - 支持智能场景生成和端点测试用例生成"""
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(READ)
     def get(self, request, project_id, task_id: str):
         """查询任务状态"""
         try:
@@ -656,22 +686,21 @@ class TaskStatusView(APIView):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@project_access_required(REPORT)
 def get_webui_test_execution_statistics(request, project_id):
     """
     获取WebUI测试执行统计信息
     """
     try:
-        user = request.user
-        
         # 统计各种状态的WebUI测试执行数量
         stats = {
-            'total': WebUITestExecution.objects.filter(executor=user, project_id=project_id).count(),
-            'pending': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='pending').count(),
-            'running': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='running').count(),
-            'passed': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='passed').count(),
-            'failed': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='failed').count(),
-            'error': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='error').count(),
-            'stopped': WebUITestExecution.objects.filter(executor=user, project_id=project_id, status='stopped').count(),
+            'total': WebUITestExecution.objects.filter(project_id=project_id).count(),
+            'pending': WebUITestExecution.objects.filter(project_id=project_id, status='pending').count(),
+            'running': WebUITestExecution.objects.filter(project_id=project_id, status='running').count(),
+            'passed': WebUITestExecution.objects.filter(project_id=project_id, status='passed').count(),
+            'failed': WebUITestExecution.objects.filter(project_id=project_id, status='failed').count(),
+            'error': WebUITestExecution.objects.filter(project_id=project_id, status='error').count(),
+            'stopped': WebUITestExecution.objects.filter(project_id=project_id, status='stopped').count(),
         }
         
         # 计算成功率
@@ -730,6 +759,7 @@ class WebUITestModuleListCreateView(generics.ListCreateAPIView):
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return WebUITestModule.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
         return WebUITestModule.objects.filter(project_id=project_id).order_by('order', 'id')
 
     def list(self, request, *args, **kwargs):
@@ -742,16 +772,16 @@ class WebUITestModuleListCreateView(generics.ListCreateAPIView):
             message="获取模块树成功"
         )
 
+    @project_access_required(EDIT)
     def create(self, request, *args, **kwargs):
         """创建模块"""
         try:
             project_id = kwargs.get('project_id')
-            from projects.models import Project
-            project = get_object_or_404(Project, id=project_id)
-            if not (project.owner == request.user or project.members.filter(user=request.user).exists()):
-                return response(kind="error", message="无权限访问该项目")
+            if payload_project_mismatch(request.data, project_id):
+                return response(kind="error", message="请求中的 project 必须与 URL project_id 一致", status_code=400)
             data = request.data.copy()
             data['project'] = project_id
+            validate_related_project(WebUITestModule, data.get('parent'), project_id, 'parent')
             serializer = self.get_serializer(data=data)
             if serializer.is_valid():
                 serializer.save()
@@ -774,6 +804,7 @@ class WebUITestModuleRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPI
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return WebUITestModule.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
         return WebUITestModule.objects.filter(project_id=project_id)
 
     def retrieve(self, request, *args, **kwargs):
@@ -787,8 +818,12 @@ class WebUITestModuleRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPI
             logger.error(f"获取模块详情失败: {e}", exc_info=True)
             return response(kind="error", message=f"获取模块详情失败: {str(e)}")
 
+    @project_access_required(EDIT)
     def update(self, request, *args, **kwargs):
         try:
+            if payload_project_mismatch(request.data, kwargs.get('project_id')):
+                return response(kind="error", message="请求中的 project 必须与 URL project_id 一致", status_code=400)
+            validate_related_project(WebUITestModule, request.data.get('parent'), kwargs.get('project_id'), 'parent')
             instance = self.get_object()
             serializer = self.get_serializer(instance, data=request.data, partial=kwargs.get('partial', False))
             if serializer.is_valid():
@@ -801,6 +836,7 @@ class WebUITestModuleRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPI
             logger.error(f"更新模块失败: {e}", exc_info=True)
             return response(kind="error", message=f"更新模块失败: {str(e)}")
 
+    @project_access_required(DELETE)
     def destroy(self, request, *args, **kwargs):
         try:
             instance = self.get_object()
@@ -823,6 +859,7 @@ class GenerateWebUITestCasesView(APIView):
     """
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             user = request.user
@@ -835,16 +872,7 @@ class GenerateWebUITestCasesView(APIView):
             # 验证参数
             if not user_input:
                 return response(kind="error", message="用户需求不能为空")
-            
-            # 验证项目权限
-            from projects.models import Project
-            try:
-                project = Project.objects.get(id=project_id)
-                # 检查用户是否有权限访问该项目（是项目所有者或成员）
-                if not (project.owner == user or project.members.filter(user=user).exists()):
-                    return response(kind="error", message="无权限访问该项目")
-            except Project.DoesNotExist:
-                return response(kind="error", message="项目不存在")
+            validate_related_project(WebUITestModule, module_id, project_id, 'module_id')
             
             logger.info(f"开始生成Web UI测试用例: 用户={user.id}, 项目={project_id}, 需求={user_input}")
             
@@ -880,16 +908,13 @@ class WebUITestCaseBatchDeleteView(APIView):
     """Web UI测试用例批量删除"""
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(DELETE)
     def post(self, request, project_id):
         try:
             case_ids = request.data.get('case_ids', [])
             if not case_ids:
                 return response(kind="error", message="case_ids 不能为空")
-            queryset = WebUITestCase.objects.filter(
-                id__in=case_ids,
-                user=request.user,
-                project_id=project_id
-            )
+            queryset = WebUITestCase.objects.filter(id__in=case_ids, project_id=project_id)
             count = queryset.count()
             queryset.delete()
             return response(kind="success", data={'deleted_count': count}, message=f"成功删除 {count} 个测试用例")
@@ -905,6 +930,7 @@ class WebUITestCaseBatchUpdateView(APIView):
     permission_classes = [IsAuthenticated]
     ALLOWED_FIELDS = {'priority', 'module_id'}
 
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         try:
             case_ids = request.data.get('case_ids', [])
@@ -923,11 +949,8 @@ class WebUITestCaseBatchUpdateView(APIView):
                     update_data[k] = v
             if not update_data:
                 return response(kind="error", message="请提供要更新的字段 (priority 或 module_id)")
-            queryset = WebUITestCase.objects.filter(
-                id__in=case_ids,
-                user=request.user,
-                project_id=project_id
-            )
+            validate_related_project(WebUITestModule, update_data.get('module_id'), project_id, 'module_id')
+            queryset = WebUITestCase.objects.filter(id__in=case_ids, project_id=project_id)
             count = queryset.update(**update_data)
             return response(kind="success", data={'updated_count': count}, message=f"成功更新 {count} 个测试用例")
         except Exception as e:
@@ -953,12 +976,11 @@ class WebUITestCaseListCreateView(generics.ListCreateAPIView):
     
     def get_queryset(self):
         """获取当前用户的测试用例"""
-        queryset = WebUITestCase.objects.filter(user=self.request.user)
-        
-        # 项目过滤（使用URL路径参数）
         project_id = self.kwargs.get('project_id')
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
+        if not project_id:
+            return WebUITestCase.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
+        queryset = WebUITestCase.objects.filter(project_id=project_id)
         
         # 模块过滤
         module_id = self.request.query_params.get('module_id')
@@ -991,13 +1013,20 @@ class WebUITestCaseListCreateView(generics.ListCreateAPIView):
         
         return queryset.order_by('-created_at')
 
+    @project_access_required(EDIT)
     def create(self, request, *args, **kwargs):
         """重写create方法以使用自定义响应格式"""
         try:
-            serializer = self.get_serializer(data=request.data)
+            project_id = kwargs.get('project_id')
+            if payload_project_mismatch(request.data, project_id):
+                return response(kind="error", message="请求中的 project 必须与 URL project_id 一致", status_code=400)
+            data = request.data.copy()
+            data['project'] = project_id
+            validate_related_project(WebUITestModule, data.get('module'), project_id, 'module')
+            serializer = self.get_serializer(data=data)
             if serializer.is_valid():
                 # 设置用户
-                serializer.save(user=request.user)
+                serializer.save(user=request.user, project_id=project_id)
                 
                 logger.info(f"测试用例创建成功: ID={serializer.instance.id}, 标题={serializer.instance.title}, 用户={request.user.id}")
                 return response(
@@ -1031,14 +1060,11 @@ class WebUITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIVi
     
     def get_queryset(self):
         """获取当前用户的测试用例"""
-        queryset = WebUITestCase.objects.filter(user=self.request.user)
-        
-        # 使用URL路径参数中的项目ID
         project_id = self.kwargs.get('project_id')
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
-        
-        return queryset
+        if not project_id:
+            return WebUITestCase.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
+        return WebUITestCase.objects.filter(project_id=project_id)
     
     def retrieve(self, request, *args, **kwargs):
         """重写retrieve方法以使用自定义响应格式"""
@@ -1057,9 +1083,14 @@ class WebUITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIVi
             logger.error(f"获取测试用例详情失败: {e}", exc_info=True)
             return response(kind="error", message=f"获取测试用例详情失败: {str(e)}")
     
+    @project_access_required(EDIT)
     def update(self, request, *args, **kwargs):
         """重写update方法以使用自定义响应格式"""
         try:
+            project_id = kwargs.get('project_id')
+            if payload_project_mismatch(request.data, project_id):
+                return response(kind="error", message="请求中的 project 必须与 URL project_id 一致", status_code=400)
+            validate_related_project(WebUITestModule, request.data.get('module'), project_id, 'module')
             instance = self.get_object()
             serializer = self.get_serializer(instance, data=request.data, partial=kwargs.get('partial', False))
             
@@ -1084,6 +1115,7 @@ class WebUITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIVi
             logger.error(f"更新测试用例失败: {e}", exc_info=True)
             return response(kind="error", message=f"更新测试用例失败: {str(e)}")
     
+    @project_access_required(DELETE)
     def destroy(self, request, *args, **kwargs):
         """重写destroy方法以使用自定义响应格式"""
         try:
@@ -1556,12 +1588,13 @@ class WebUITestCaseGenerateCodeView(APIView):
     """生成 Playwright 代码（单条）- 优先使用已有脚本，否则基于步骤+元素库生成"""
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(EDIT)
     def post(self, request, project_id, pk):
         framework = request.data.get('framework', 'playwright')
         if framework != 'playwright':
             return Response({"success": False, "message": "暂仅支持 Playwright 框架"}, status=400)
 
-        test_case = get_object_or_404(WebUITestCase, pk=pk, project_id=project_id, user=request.user)
+        test_case = get_object_or_404(WebUITestCase, pk=pk, project_id=project_id)
 
         # 1. 优先使用已有脚本内容
         code = (test_case.test_script_content or '').strip()
@@ -1621,6 +1654,7 @@ class WebUITestCaseSaveScriptView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(EDIT)
     def post(self, request, project_id, pk):
         script_content = request.data.get('script_content', '')
         page_classes = request.data.get('page_classes', [])
@@ -1629,7 +1663,6 @@ class WebUITestCaseSaveScriptView(APIView):
             WebUITestCase,
             pk=pk,
             project_id=project_id,
-            user=request.user
         )
 
         # 若提供了 page_classes，必须有 test_function（禁止只更新 WebPage 而用例仍含内联类）
@@ -1680,6 +1713,7 @@ class WebUITestCaseBatchGenerateCodeView(APIView):
     """批量生成 Playwright 代码"""
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         framework = request.data.get('framework', 'playwright')
         case_ids = request.data.get('case_ids', [])
@@ -1688,7 +1722,7 @@ class WebUITestCaseBatchGenerateCodeView(APIView):
         if not case_ids:
             return Response({"success": False, "message": "请选择要生成代码的测试用例"}, status=400)
 
-        cases = WebUITestCase.objects.filter(id__in=case_ids, project_id=project_id, user=request.user).order_by('id')
+        cases = WebUITestCase.objects.filter(id__in=case_ids, project_id=project_id).order_by('id')
         parts = []
         for tc in cases:
             code = (tc.test_script_content or '').strip()
@@ -1723,19 +1757,12 @@ class ExecuteWebUITestCaseView(APIView):
     """执行WebUI测试用例视图"""
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(EXECUTE)
     def post(self, request, project_id, pk):
         """执行WebUI测试用例"""
         try:
             # 获取测试用例
             test_case = get_object_or_404(WebUITestCase, pk=pk, project_id=project_id)
-            
-            # 检查权限
-            if not (test_case.project.created_by == request.user or 
-                    test_case.project.members.filter(user=request.user, can_execute_tests=True).exists()):
-                return response(
-                    kind="permission_denied",
-                    message="没有权限执行此测试用例"
-                )
             
             # 从请求数据中获取环境ID
             environment_id = request.data.get('environment_id')
@@ -1851,16 +1878,15 @@ class WebUITestSuiteListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         """获取当前用户的测试套件"""
-        return WebUITestSuite.objects.filter(user=self.request.user).prefetch_related('test_cases')
+        project_id = self.kwargs.get('project_id')
+        if not project_id:
+            return WebUITestSuite.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
+        return WebUITestSuite.objects.filter(project_id=project_id).prefetch_related('test_cases')
     
     def list(self, request, *args, **kwargs):
         """获取测试套件列表"""
         queryset = self.get_queryset()
-        
-        # 支持按项目过滤
-        project_id = request.GET.get('project_id')
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
         
         # 支持按状态过滤
         status = request.GET.get('status')
@@ -1887,10 +1913,16 @@ class WebUITestSuiteListCreateView(generics.ListCreateAPIView):
             message="获取测试套件列表成功"
         )
     
+    @project_access_required(EDIT)
     def create(self, request, *args, **kwargs):
         """创建测试套件"""
         try:
-            serializer = self.get_serializer(data=request.data, context={'request': request})
+            project_id = kwargs.get('project_id')
+            if payload_project_mismatch(request.data, project_id):
+                return response(kind="error", message="请求中的 project 必须与 URL project_id 一致", status_code=400)
+            data = request.data.copy()
+            data['project'] = project_id
+            serializer = self.get_serializer(data=data, context={'request': request})
             if serializer.is_valid():
                 test_suite = serializer.save()
                 result_serializer = WebUITestSuiteSerializer(test_suite)
@@ -1921,7 +1953,11 @@ class WebUITestSuiteRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIV
     
     def get_queryset(self):
         """获取当前用户的测试套件"""
-        return WebUITestSuite.objects.filter(user=self.request.user).prefetch_related('test_cases')
+        project_id = self.kwargs.get('project_id')
+        if not project_id:
+            return WebUITestSuite.objects.none()
+        get_project_for_user(project_id, self.request.user, READ)
+        return WebUITestSuite.objects.filter(project_id=project_id).prefetch_related('test_cases')
     
     def retrieve(self, request, *args, **kwargs):
         """获取测试套件详情"""
@@ -1939,9 +1975,12 @@ class WebUITestSuiteRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIV
             logger.error(f"获取测试套件详情失败: {e}", exc_info=True)
             return response(kind="error", message=f"获取测试套件详情失败: {str(e)}")
     
+    @project_access_required(EDIT)
     def update(self, request, *args, **kwargs):
         """更新测试套件"""
         try:
+            if payload_project_mismatch(request.data, kwargs.get('project_id')):
+                return response(kind="error", message="请求中的 project 必须与 URL project_id 一致", status_code=400)
             instance = self.get_object()
             serializer = self.get_serializer(instance, data=request.data, partial=True)
             if serializer.is_valid():
@@ -1964,6 +2003,7 @@ class WebUITestSuiteRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIV
             logger.error(f"更新测试套件失败: {e}", exc_info=True)
             return response(kind="error", message=f"更新测试套件失败: {str(e)}")
     
+    @project_access_required(DELETE)
     def destroy(self, request, *args, **kwargs):
         """删除测试套件"""
         try:
@@ -1985,6 +2025,7 @@ class WebUITestSuiteAddTestCaseView(APIView):
     """WebUI测试套件添加测试用例视图"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def post(self, request, project_id, pk):
         """添加测试用例到套件"""
         try:
@@ -1993,7 +2034,7 @@ class WebUITestSuiteAddTestCaseView(APIView):
             
             # 获取测试套件
             test_suite = get_object_or_404(
-                WebUITestSuite, pk=pk, project_id=project_id, user=request.user
+                WebUITestSuite, pk=pk, project_id=project_id
             )
             logger.info(f"找到测试套件: {test_suite.name}")
             
@@ -2018,7 +2059,9 @@ class WebUITestSuiteAddTestCaseView(APIView):
             with transaction.atomic():
                 for test_case_id in test_case_ids:
                     try:
-                        test_case = WebUITestCase.objects.get(id=test_case_id, user=request.user)
+                        test_case = WebUITestCase.objects.get(
+                            id=test_case_id, project_id=project_id
+                        )
                         logger.info(f"找到测试用例: {test_case.title}")
                         
                         # 检查是否已存在
@@ -2067,14 +2110,19 @@ class WebUITestSuiteRemoveTestCaseView(APIView):
     """WebUI测试套件移除测试用例视图"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EDIT)
     def delete(self, request, project_id, pk, test_case_id):
         """从套件中移除测试用例"""
         try:
             # 获取测试套件
-            test_suite = get_object_or_404(WebUITestSuite, pk=pk, user=request.user)
+            test_suite = get_object_or_404(
+                WebUITestSuite, pk=pk, project_id=project_id
+            )
             
             # 获取测试用例
-            test_case = get_object_or_404(WebUITestCase, pk=test_case_id, user=request.user)
+            test_case = get_object_or_404(
+                WebUITestCase, pk=test_case_id, project_id=project_id
+            )
             
             # 移除测试用例
             if not test_suite.test_cases.filter(id=test_case.id).exists():
@@ -2104,11 +2152,14 @@ class ExecuteWebUITestSuiteView(APIView):
     """执行WebUI测试套件视图"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(EXECUTE)
     def post(self, request, project_id, pk):
         """执行测试套件"""
         try:
             # 获取测试套件
-            test_suite = get_object_or_404(WebUITestSuite, pk=pk, user=request.user)
+            test_suite = get_object_or_404(
+                WebUITestSuite, pk=pk, project_id=project_id
+            )
             
             # 检查套件是否有测试用例
             if test_suite.test_cases.count() == 0:
@@ -2198,18 +2249,19 @@ class ExecuteWebUITestSuiteView(APIView):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@project_access_required(REPORT)
 def get_webui_test_suite_statistics(request, project_id):
     """获取WebUI测试套件统计信息"""
     try:
         user = request.user
         
         # 基础统计
-        suites = WebUITestSuite.objects.filter(user=user, project_id=project_id)
+        suites = WebUITestSuite.objects.filter(project_id=project_id)
         total_suites = suites.count()
         active_suites = suites.filter(status='active').count()
         
         # 执行统计
-        executions = WebUITestExecution.objects.filter(executor=user, project_id=project_id)
+        executions = WebUITestExecution.objects.filter(project_id=project_id)
         total_executions = executions.count()
         passed_executions = executions.filter(status='passed').count()
         failed_executions = executions.filter(status='failed').count()
@@ -2263,10 +2315,10 @@ class TestExecutionListView(generics.ListAPIView):
     
     def get_queryset(self):
         """获取当前用户的执行记录"""
-        user = self.request.user
         project_id = self.kwargs.get('project_id')
+        get_project_for_user(project_id, self.request.user, REPORT)
         queryset = WebUITestExecution.objects.filter(
-            executor=user, project_id=project_id
+            project_id=project_id
         ).select_related(
             'executor', 'environment', 'project'
         ).prefetch_related(
@@ -2311,17 +2363,15 @@ class TestCaseExecutionDetailView(APIView):
     """单用例执行详情视图"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(REPORT)
     def get(self, request, project_id, pk):
         """获取单用例执行详情"""
         try:
-            user = request.user
-            
             # 获取单用例执行详情记录
             case_detail = WebUITestCaseExecutionDetail.objects.select_related(
                 'execution', 'test_case'
             ).get(
                 execution_id=pk,  # 通过execution_id查找
-                execution__executor=user,
                 execution__project_id=project_id,
                 execution__exec_type='case'
             )
@@ -2352,11 +2402,10 @@ class TestSuiteExecutionDetailView(APIView):
     """套件执行详情视图"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(REPORT)
     def get(self, request, project_id, pk):
         """获取套件执行详情"""
         try:
-            user = request.user
-            
             # 获取套件执行详情记录
             suite_detail = WebUITestSuiteExecutionDetail.objects.select_related(
                 'execution', 'test_suite'
@@ -2364,7 +2413,6 @@ class TestSuiteExecutionDetailView(APIView):
                 'case_executions__test_case'
             ).get(
                 execution_id=pk,  # 通过execution_id查找
-                execution__executor=user,
                 execution__project_id=project_id,
                 execution__exec_type='suite'
             )
@@ -2395,6 +2443,7 @@ class TestExecutionCasesView(APIView):
     """执行记录子用例视图 - 如果是套件执行，返回子用例执行详情"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(REPORT)
     def get(self, request, project_id, pk):
         """获取套件执行的子用例执行详情"""
         try:
@@ -2402,7 +2451,6 @@ class TestExecutionCasesView(APIView):
             execution = get_object_or_404(
                 WebUITestExecution,
                 pk=pk,
-                executor=request.user,
                 project_id=project_id,
             )
             
@@ -2483,6 +2531,7 @@ class TestExecutionDeleteView(APIView):
     """执行记录删除视图 - 支持删除单用例和套件执行记录"""
     permission_classes = [IsAuthenticated]
     
+    @project_access_required(DELETE)
     def delete(self, request, project_id, pk):
         """删除执行记录"""
         try:
@@ -2493,7 +2542,6 @@ class TestExecutionDeleteView(APIView):
                 'case_execution_detail', 'suite_execution_detail'
             ).get(
                 pk=pk,
-                executor=user,
                 project_id=project_id
             )
             
@@ -2544,6 +2592,7 @@ class ExtractPomFromDocView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @project_access_required(EDIT)
     def post(self, request, project_id):
         file_id = request.data.get('file_id')
 
@@ -2551,9 +2600,6 @@ class ExtractPomFromDocView(APIView):
             return Response({"success": False, "message": "缺少必要的参数: file_id"}, status=400)
 
         try:
-            # 1. 验证项目存在
-            get_object_or_404(Project, id=project_id)
-
             # 2. 验证文档存在且有解析内容
             knowledge_file = get_object_or_404(
                 KnowledgeBaseFile,

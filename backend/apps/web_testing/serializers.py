@@ -13,17 +13,22 @@ from .script_contract import ScriptContractError, normalize_for_storage, store_s
 
 class WebPageSerializer(serializers.ModelSerializer):
     """Web页面 (POM) 序列化器"""
-    module_id = serializers.IntegerField(read_only=True, allow_null=True)
+    module_id = serializers.PrimaryKeyRelatedField(
+        queryset=WebUITestModule.objects.all(),
+        required=False,
+        allow_null=True,
+        source='module',
+    )
     module_name = serializers.SerializerMethodField()
 
     class Meta:
         model = WebPage
         fields = ['id', 'project', 'module_id', 'module_name', 'name', 'url_path', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+        extra_kwargs = {'project': {'required': False}}
 
     def get_module_name(self, obj):
         return obj.module.name if obj.module else None
-        read_only_fields = ['id', 'created_at', 'updated_at']
-        extra_kwargs = {'project': {'required': False}}
 
 
 class WebElementSerializer(serializers.ModelSerializer):
@@ -369,11 +374,10 @@ class WebUITestSuiteAddTestCaseSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("测试用例ID列表不能为空")
         
-        # 验证测试用例是否存在且属于当前用户
-        user = self.context['request'].user
+        # 项目归属由 URL project_id 对应的视图校验；这里仅校验 ID 存在，
+        # 避免把同项目其他成员创建的用例误判为私有资源。
         existing_cases = WebUITestCase.objects.filter(
-            id__in=value, 
-            user=user
+            id__in=value
         ).values_list('id', flat=True)
         
         missing_cases = set(value) - set(existing_cases)

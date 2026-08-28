@@ -1153,11 +1153,12 @@ async def run(page):
                 # 获取自定义用户模型
                 User = get_user_model()
                 user = User.objects.get(id=user_id)
+                from web_testing.project_access import EDIT, get_project_for_user
+                get_project_for_user(project_id, user, EDIT)
                 
                 # 获取测试用例并更新test_script_content字段
                 test_case = WebUITestCase.objects.get(
                     id=test_case_id,
-                    user=user,
                     project_id=project_id,
                 )
                 store_script_content(test_case, python_script, source='mcp_exploration')

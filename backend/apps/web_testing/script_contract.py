@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import ast
 import keyword
+import re
 import textwrap
 from dataclasses import dataclass
 from typing import Optional
+
+from .script_extraction import extract_playwright_metadata, redact_sensitive_text
 
 
 class ScriptContractError(ValueError):
@@ -33,6 +36,10 @@ SCRIPT_SOURCE_VALUES = {
     "legacy",
 }
 SCRIPT_FRAMEWORK = "playwright_python_async"
+_SENSITIVE_METADATA_KEY_RE = re.compile(
+    r"(?i)(password|passwd|token|secret|api[_ -]?key|authorization|credential|"
+    r"用户名|账号|帐号|密码|口令|令牌)"
+)
 
 
 def _parse(content: str) -> ast.Module:
@@ -173,14 +180,8 @@ def store_script_content(
     old_version = int(getattr(test_case, "script_version", 0) or 0)
     should_advance = bool(getattr(test_case, "pk", None)) and (has_content or bool(old_content))
 
-    test_case.test_script_content = normalized
-    test_case.script_source = source
-    test_case.script_status = "ready" if normalized else "none"
-    test_case.script_framework = SCRIPT_FRAMEWORK
-    test_case.script_validation_error = ""
-    test_case.generation_metadata = generation_metadata if isinstance(generation_metadata, dict) else {}
-    test_case.script_version = old_version + 1 if should_advance else old_version
-    test_case.save(update_fields=[
+    metadata = _sanitize_metadata(generation_metadata or {})
+    update_fields = [
         "test_script_content",
         "script_source",
         "script_status",
@@ -189,8 +190,54 @@ def store_script_content(
         "script_validation_error",
         "generation_metadata",
         "updated_at",
-    ])
+    ]
+
+    if source == "mcp_exploration" and normalized:
+        extracted = extract_playwright_metadata(normalized, description=test_case.description or "")
+        metadata.update({
+            key: extracted[key]
+            for key in (
+                "extracted_steps",
+                "locator_candidates",
+                "assertion_candidates",
+                "extraction_version",
+            )
+        })
+        test_case.steps = extracted["extracted_steps"]
+        test_case.expected_result = extracted["expected_result"]
+        update_fields.extend(["steps", "expected_result"])
+
+    test_case.test_script_content = normalized
+    test_case.script_source = source
+    test_case.script_status = "ready" if normalized else "none"
+    test_case.script_framework = SCRIPT_FRAMEWORK
+    test_case.script_validation_error = ""
+    test_case.generation_metadata = metadata
+    test_case.script_version = old_version + 1 if should_advance else old_version
+    test_case.save(update_fields=update_fields)
     return test_case
+
+
+def _sanitize_metadata(value):
+    """Recursively redact strings before metadata is persisted as JSON."""
+
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            sanitized[key_text] = (
+                '<redacted>'
+                if _SENSITIVE_METADATA_KEY_RE.search(key_text)
+                else _sanitize_metadata(item)
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_metadata(item) for item in value]
+    return value
 
 
 def normalize_script(content: str) -> NormalizedScript:

@@ -2,12 +2,35 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from types import SimpleNamespace
 from rest_framework.test import APIRequestFactory, force_authenticate
+from rest_framework.exceptions import PermissionDenied
+from django.http import Http404
+import json
+from unittest.mock import Mock, patch
 
-from projects.models import Project
+from projects.models import Project, ProjectMember
 
-from .models import WebUITestCase, WebUITestExecution
+from .models import (
+    WebPage,
+    WebUITestCase,
+    WebUITestCaseExecutionDetail,
+    WebUITestModule,
+    WebUITestExecution,
+    WebUITestSuite,
+)
+from .project_access import READ, get_project_for_user
 from .script_contract import ScriptContractError, store_script_content
-from .views import TestExecutionListView, get_webui_test_execution_statistics
+from .script_extraction import extract_playwright_metadata
+from .views import (
+    TestExecutionListView,
+    TestCaseExecutionDetailView,
+    TestExecutionDeleteView,
+    WebUITestCaseListCreateView,
+    WebUITestSuiteAddTestCaseView,
+    WebPageViewSet,
+    get_webui_test_execution_statistics,
+    get_webui_test_suite_statistics,
+)
+from .tasks import _execute_webui_script_generation_from_testcase
 
 
 class WebUIScriptMetadataTests(TestCase):
@@ -65,6 +88,221 @@ class WebUIScriptMetadataTests(TestCase):
         self.assertEqual(case.script_status, 'none')
         self.assertEqual(case.script_version, 3)
 
+    def test_mcp_script_populates_structured_metadata_and_redacts_credentials(self):
+        case = self.make_case()
+        case.description = '登录账号 admin 123456，验证密码字段'
+        case.save(update_fields=['description'])
+        script = """from playwright.async_api import expect
+
+async def run(page):
+    await page.goto('/login?token=supersecret')
+    await page.get_by_label('Password').fill('supersecret')
+    await page.get_by_role('button', name='Login').click()
+    await expect(page.get_by_label('Password')).to_have_value('supersecret')
+"""
+
+        store_script_content(
+            case,
+            script,
+            source='mcp_exploration',
+            generation_metadata={'nested': {'password': 'supersecret'}},
+        )
+        case.refresh_from_db()
+
+        serialized = json.dumps(
+            {
+                'steps': case.steps,
+                'expected_result': case.expected_result,
+                'metadata': case.generation_metadata,
+            },
+            ensure_ascii=False,
+        )
+        self.assertNotIn('supersecret', serialized)
+        self.assertNotIn('123456', serialized)
+        self.assertEqual(
+            [step['action'] for step in case.steps],
+            ['goto', 'fill', 'click'],
+        )
+        self.assertEqual(case.generation_metadata['extraction_version'], 'webui-playwright-ast-v1')
+        self.assertIn('目标元素应有指定值', case.expected_result)
+
+
+class WebUIProjectAccessTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            username='webui-project-owner', email='webui-project-owner@example.com', password='test-password'
+        )
+        self.member = User.objects.create_user(
+            username='webui-project-member', email='webui-project-member@example.com', password='test-password'
+        )
+        self.other = User.objects.create_user(
+            username='webui-project-other', email='webui-project-other@example.com', password='test-password'
+        )
+        self.project = Project.objects.create(
+            name='Collaborative WebUI project',
+            project_type='web',
+            owner=self.owner,
+            created_by=self.owner,
+        )
+        ProjectMember.objects.create(
+            project=self.project,
+            user=self.member,
+            role='editor',
+            can_edit=True,
+            can_delete=False,
+            can_execute_tests=False,
+            can_view_reports=True,
+        )
+
+    def test_member_can_access_resource_created_by_another_user(self):
+        WebUITestCase.objects.create(
+            title='owner case',
+            description='owner case',
+            expected_result='owner case passes',
+            user=self.owner,
+            project=self.project,
+        )
+        request = APIRequestFactory().get('/test-cases/')
+        force_authenticate(request, user=self.member)
+
+        result = WebUITestCaseListCreateView.as_view()(request, project_id=self.project.id)
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.data['results'][0]['title'], 'owner case')
+
+    def test_member_capability_is_enforced_and_nonmember_is_hidden(self):
+        self.assertEqual(
+            get_project_for_user(self.project.id, self.member, READ), self.project
+        )
+        with self.assertRaises(PermissionDenied):
+            get_project_for_user(self.project.id, self.member, 'execute')
+        with self.assertRaises(Http404):
+            get_project_for_user(self.project.id, self.other, READ)
+
+    def test_case_create_rejects_payload_project_different_from_url(self):
+        other_project = Project.objects.create(
+            name='Another WebUI project',
+            project_type='web',
+            owner=self.owner,
+            created_by=self.owner,
+        )
+        request = APIRequestFactory().post(
+            '/test-cases/',
+            {
+                'title': 'mismatched case',
+                'description': 'mismatched case',
+                'expected_result': 'must be rejected',
+                'project': other_project.id,
+            },
+            format='json',
+        )
+        force_authenticate(request, user=self.member)
+
+        result = WebUITestCaseListCreateView.as_view()(
+            request, project_id=self.project.id
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertFalse(
+            WebUITestCase.objects.filter(title='mismatched case').exists()
+        )
+
+    def test_pom_page_create_uses_url_project_when_payload_omits_project(self):
+        module = WebUITestModule.objects.create(
+            name='member module', project=self.project
+        )
+        request = APIRequestFactory().post(
+            '/pages/', {'name': 'member page', 'module_id': module.id}, format='json'
+        )
+        force_authenticate(request, user=self.member)
+
+        result = WebPageViewSet.as_view({'post': 'create'})(
+            request, project_id=self.project.id
+        )
+
+        self.assertEqual(result.status_code, 201)
+        self.assertTrue(
+            WebPage.objects.filter(name='member page', project=self.project).exists()
+        )
+        page = WebPage.objects.get(name='member page', project=self.project)
+        self.assertEqual(page.module_id, module.id)
+
+        update_request = APIRequestFactory().put(
+            f'/pages/{page.id}/',
+            {'name': 'updated member page', 'module_id': module.id},
+            format='json',
+        )
+        force_authenticate(update_request, user=self.member)
+
+        update_result = WebPageViewSet.as_view({'put': 'update'})(
+            update_request, project_id=self.project.id, pk=page.id
+        )
+
+        self.assertEqual(update_result.status_code, 200)
+        page.refresh_from_db()
+        self.assertEqual(page.name, 'updated member page')
+        self.assertEqual(page.module_id, module.id)
+
+
+class WebUISuiteProjectIsolationTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='webui-suite-owner', email='webui-suite-owner@example.com', password='test-password'
+        )
+        self.project_a = Project.objects.create(
+            name='Suite project A', project_type='web', owner=self.user, created_by=self.user
+        )
+        self.project_b = Project.objects.create(
+            name='Suite project B', project_type='web', owner=self.user, created_by=self.user
+        )
+        self.suite = WebUITestSuite.objects.create(
+            name='project A suite', user=self.user, project=self.project_a
+        )
+        self.case_b = WebUITestCase.objects.create(
+            title='project B case', description='case B', expected_result='pass',
+            user=self.user, project=self.project_b,
+        )
+
+    def test_suite_cannot_add_cross_project_case(self):
+        request = APIRequestFactory().post(
+            '/test-suites/add-test-cases/',
+            {'test_case_ids': [self.case_b.id]},
+            format='json',
+        )
+        force_authenticate(request, user=self.user)
+
+        result = WebUITestSuiteAddTestCaseView.as_view()(
+            request, project_id=self.project_a.id, pk=self.suite.id
+        )
+
+        self.assertEqual(result.status_code, 400)
+        self.assertFalse(self.suite.test_cases.filter(pk=self.case_b.id).exists())
+
+
+class WebUIScriptMetadataValidationTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='webui-validation-user',
+            email='webui-validation@example.com',
+            password='test-password',
+        )
+        self.project = Project.objects.create(
+            name='WebUI validation project',
+            project_type='web',
+            owner=self.user,
+            created_by=self.user,
+        )
+
+    def make_case(self):
+        return WebUITestCase.objects.create(
+            title='validation case',
+            description='validation case description',
+            expected_result='passed',
+            user=self.user,
+            project=self.project,
+        )
+
     def test_invalid_script_does_not_change_existing_metadata(self):
         case = self.make_case()
         store_script_content(
@@ -109,6 +347,243 @@ class WebUIScriptMetadataTests(TestCase):
         case = update_serializer.save()
         self.assertEqual(case.script_source, 'manual')
         self.assertEqual(case.script_version, 2)
+
+
+class WebUIExtractionTests(TestCase):
+    def test_ast_extraction_is_ordered_and_redacts_assertion_values(self):
+        script = """from playwright.async_api import expect
+
+async def run(page):
+    await page.goto('/login')
+    await page.get_by_label('Password').fill('supersecret')
+    await page.get_by_role('button', name='Login').click()
+    await expect(page.get_by_label('Password')).to_have_value('supersecret')
+"""
+
+        metadata = extract_playwright_metadata(script, '登录账号 admin 123456')
+
+        self.assertEqual(
+            [step['action'] for step in metadata['extracted_steps']],
+            ['goto', 'fill', 'click'],
+        )
+        self.assertEqual(metadata['extracted_steps'][1]['value'], '<redacted>')
+        self.assertEqual(metadata['assertion_candidates'][0]['expected'], '目标元素应有指定值：<redacted>')
+        self.assertNotIn('supersecret', json.dumps(metadata, ensure_ascii=False))
+        self.assertNotIn('123456', json.dumps(metadata, ensure_ascii=False))
+
+
+class WebUIReportPermissionTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            username='webui-report-owner',
+            email='webui-report-owner@example.com',
+            password='test-password',
+        )
+        self.member = User.objects.create_user(
+            username='webui-report-member',
+            email='webui-report-member@example.com',
+            password='test-password',
+        )
+        self.no_report_member = User.objects.create_user(
+            username='webui-no-report-member',
+            email='webui-no-report-member@example.com',
+            password='test-password',
+        )
+        self.project = Project.objects.create(
+            name='WebUI report project',
+            project_type='web',
+            owner=self.owner,
+            created_by=self.owner,
+        )
+        ProjectMember.objects.create(
+            project=self.project,
+            user=self.member,
+            role='viewer',
+            can_view_reports=True,
+            can_delete=True,
+        )
+        ProjectMember.objects.create(
+            project=self.project,
+            user=self.no_report_member,
+            role='viewer',
+            can_view_reports=False,
+        )
+        self.case = WebUITestCase.objects.create(
+            title='owner report case',
+            description='owner report case',
+            expected_result='passed',
+            user=self.owner,
+            project=self.project,
+        )
+        self.execution = WebUITestExecution.objects.create(
+            exec_type='case',
+            name='owner execution',
+            status='passed',
+            executor=self.owner,
+            project=self.project,
+        )
+        WebUITestCaseExecutionDetail.objects.create(
+            execution=self.execution,
+            test_case=self.case,
+            status='passed',
+        )
+        self.suite = WebUITestSuite.objects.create(
+            name='owner suite', user=self.owner, project=self.project
+        )
+        self.suite_execution = WebUITestExecution.objects.create(
+            exec_type='suite',
+            name='owner suite execution',
+            status='passed',
+            executor=self.owner,
+            project=self.project,
+        )
+
+    def request(self, method, user, path='/executions/'):
+        request = getattr(APIRequestFactory(), method.lower())(path)
+        force_authenticate(request, user=user)
+        return request
+
+    def test_report_member_can_list_view_and_count_owner_executions(self):
+        list_result = TestExecutionListView.as_view()(
+            self.request('GET', self.member), project_id=self.project.id
+        )
+        self.assertEqual(list_result.status_code, 200)
+        names = [item['name'] for item in list_result.data['data']['items']]
+        self.assertCountEqual(names, ['owner execution', 'owner suite execution'])
+
+        detail_result = TestCaseExecutionDetailView.as_view()(
+            self.request('GET', self.member),
+            project_id=self.project.id,
+            pk=self.execution.id,
+        )
+        self.assertEqual(detail_result.status_code, 200)
+        self.assertEqual(detail_result.data['data']['project_id'], self.project.id)
+
+        execution_stats = get_webui_test_execution_statistics(
+            self.request('GET', self.member, '/execution-statistics/'), self.project.id
+        )
+        self.assertEqual(execution_stats.data['data']['total'], 2)
+
+        suite_stats = get_webui_test_suite_statistics(
+            self.request('GET', self.member, '/test-suite-statistics/'), self.project.id
+        )
+        self.assertEqual(suite_stats.data['data']['total_executions'], 2)
+        self.assertEqual(suite_stats.data['data']['total_suite_executions'], 1)
+
+    def test_member_without_report_capability_gets_forbidden(self):
+        result = TestExecutionListView.as_view()(
+            self.request('GET', self.no_report_member), project_id=self.project.id
+        )
+        self.assertEqual(result.status_code, 403)
+
+    def test_delete_member_can_delete_owner_execution_in_project(self):
+        result = TestExecutionDeleteView.as_view()(
+            self.request('DELETE', self.member, '/executions/delete/'),
+            project_id=self.project.id,
+            pk=self.execution.id,
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(WebUITestExecution.objects.filter(pk=self.execution.id).exists())
+
+
+class WebUIGenerationTaskProjectAccessTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_user(
+            username='webui-generation-owner',
+            email='webui-generation-owner@example.com',
+            password='test-password',
+        )
+        self.member = User.objects.create_user(
+            username='webui-generation-member',
+            email='webui-generation-member@example.com',
+            password='test-password',
+        )
+        self.project = Project.objects.create(
+            name='WebUI generation project',
+            project_type='web',
+            owner=self.owner,
+            created_by=self.owner,
+        )
+        ProjectMember.objects.create(
+            project=self.project,
+            user=self.member,
+            role='editor',
+            can_edit=True,
+        )
+        self.case = WebUITestCase.objects.create(
+            title='owner generation case',
+            description='generate a script',
+            expected_result='the script is generated',
+            user=self.owner,
+            project=self.project,
+        )
+        self.task_instance = SimpleNamespace(
+            request=SimpleNamespace(id='generation-task-id')
+        )
+
+    def test_edit_member_can_generate_script_for_owner_case(self):
+        agent_instance = SimpleNamespace(
+            run=Mock(),
+        )
+        with patch('web_testing.tasks.update_task_progress'), patch(
+            'web_testing.tasks.update_task_success',
+            side_effect=lambda task, message, result: result,
+        ), patch(
+            'ai_core.webui_playwright_agent.WebUIPlaywrightAgent',
+            return_value=agent_instance,
+        ) as agent_class, patch(
+            'web_testing.tasks.asyncio.run',
+            return_value={'success': True, 'test_script': 'async def run(page):\n    pass\n'},
+        ):
+            result = _execute_webui_script_generation_from_testcase(
+                self.task_instance,
+                self.case.id,
+                self.member.id,
+                self.project.id,
+            )
+
+        self.assertTrue(result['success'])
+        agent_class.assert_called_once_with(user_id=self.member.id)
+
+    def test_revoked_edit_access_fails_before_agent_work(self):
+        ProjectMember.objects.filter(
+            project=self.project, user=self.member
+        ).update(can_edit=False)
+
+        with patch('web_testing.tasks.update_task_progress'), patch(
+            'ai_core.webui_playwright_agent.WebUIPlaywrightAgent'
+        ) as agent_class:
+            result = _execute_webui_script_generation_from_testcase(
+                self.task_instance,
+                self.case.id,
+                self.member.id,
+                self.project.id,
+            )
+
+        self.assertFalse(result['success'])
+        agent_class.assert_not_called()
+
+    def test_agent_save_node_allows_member_to_save_owner_case(self):
+        from ai_core.webui_playwright_agent import WebUIPlaywrightAgent
+
+        agent = WebUIPlaywrightAgent.__new__(WebUIPlaywrightAgent)
+        agent._send_node_start_notification = Mock()
+        agent._send_websocket_message = Mock()
+        agent._send_task_completed_notification = Mock()
+
+        result = agent._save_script_node({
+            'test_script': 'async def run(page):\n    await page.goto("/")\n',
+            'user_id': self.member.id,
+            'project_id': self.project.id,
+            'test_case_id': self.case.id,
+            'script_name': 'member script',
+        })
+
+        self.assertEqual(result['current_step'], 'saved')
+        self.case.refresh_from_db()
+        self.assertEqual(self.case.script_status, 'ready')
 
 
 class WebUIExecutionProjectIsolationTests(TestCase):

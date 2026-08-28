@@ -26,6 +26,7 @@ from .models import (
     WebPage, WebElement, WebUITestModule
 )
 from projects.models import Project
+from .project_access import EDIT, get_project_for_user
 
 # 导入智能体
 from ai_core.midscene_script_agent import create_midscene_agent
@@ -74,8 +75,8 @@ def _execute_webui_script_generation(task_instance, script_name: str, descriptio
     """执行WebUI测试脚本生成逻辑"""
     try:
         update_task_progress(task_instance, 10, '正在获取用户和项目信息...')
-        User.objects.get(id=user_id)
-        Project.objects.get(id=project_id)
+        user = User.objects.get(id=user_id)
+        get_project_for_user(project_id, user, EDIT)
         
         update_task_progress(task_instance, 20, '正在初始化WebUI智能体...')
         update_task_progress(task_instance, 50, '正在生成WebUI测试脚本...')
@@ -151,8 +152,8 @@ def _execute_webui_script_generation_from_testcase(task_instance, test_case_id: 
     try:
         update_task_progress(task_instance, 10, '正在获取用户、项目和测试用例信息...')
         user = User.objects.get(id=user_id)
-        project = Project.objects.get(id=project_id)
-        test_case = WebUITestCase.objects.get(id=test_case_id, user=user)
+        project = get_project_for_user(project_id, user, EDIT)
+        test_case = WebUITestCase.objects.get(id=test_case_id, project_id=project_id)
         
         environment_url = None
         if environment_id:
@@ -1340,12 +1341,13 @@ def _execute_midscene_script_generation(task_instance, script_id: int, user_id: 
     """
     执行MidScene脚本生成逻辑
     """
+    script = None
     try:
         # 步骤1: 获取用户、项目和脚本记录
         update_task_progress(task_instance, 10, '正在获取用户和项目信息...')
         user = User.objects.get(id=user_id)
-        project = Project.objects.get(id=project_id)
-        script = MidSceneScript.objects.get(id=script_id)
+        project = get_project_for_user(project_id, user, EDIT)
+        script = MidSceneScript.objects.get(id=script_id, project_id=project_id)
         
         # 更新任务状态
         script.task_id = task_instance.request.id
@@ -1429,10 +1431,10 @@ def _execute_midscene_script_generation(task_instance, script_id: int, user_id: 
         
         # 更新失败状态
         try:
-            script = MidSceneScript.objects.get(id=script_id)
-            script.status = 'failed'
-            script.execution_error = str(e)
-            script.save()
+            if script is not None:
+                script.status = 'failed'
+                script.execution_error = str(e)
+                script.save()
         except:
             pass
         
@@ -1583,6 +1585,8 @@ def _execute_webui_test_cases_generation(task_instance, user_input: str, project
     """
     try:
         logger.info(f"开始执行Web UI测试用例生成任务: 用户={user_id}, 项目={project_id}, 需求={user_input}")
+        user = User.objects.get(id=user_id)
+        get_project_for_user(project_id, user, EDIT)
         
         # 更新任务状态
         update_task_progress(task_instance, 10, '正在初始化智能体...')

@@ -12,6 +12,7 @@ backend/.idea/
 backend/httprunner_workspace/
 backend/playwright_workspace/
 backend/.playwright-browsers/
+backend/.python-playwright-browsers/
 backend/logs/
 backend/temp/
 backend/media/

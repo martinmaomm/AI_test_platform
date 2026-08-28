@@ -113,10 +113,24 @@ touch \
 在 `backend/.env` 中增加：
 
 ```dotenv
-PLAYWRIGHT_BROWSERS_PATH=.playwright-browsers
+MCP_PLAYWRIGHT_BROWSERS_PATH=.playwright-browsers
+PYTHON_PLAYWRIGHT_BROWSERS_PATH=
 ```
 
-后端会将这个相对路径解析为 `backend/.playwright-browsers` 的绝对路径，并传递给 MCP 进程。
+`MCP_PLAYWRIGHT_BROWSERS_PATH` 会被解析为 `backend/.playwright-browsers` 的绝对路径，并且只传递给 Node MCP 进程。`PYTHON_PLAYWRIGHT_BROWSERS_PATH` 留空时，Python Playwright 使用操作系统默认缓存目录；如果需要项目内缓存，请使用 `.python-playwright-browsers`，不要与 MCP 共用目录。
+
+Python Playwright 浏览器可按当前虚拟环境版本单独安装：
+
+```bash
+PLAYWRIGHT_BROWSERS_PATH="$PWD/.python-playwright-browsers" \
+  .venv/bin/python -m playwright install chromium
+```
+
+对应配置为：
+
+```dotenv
+PYTHON_PLAYWRIGHT_BROWSERS_PATH=.python-playwright-browsers
+```
 
 修改 `.env` 后需要重启 Celery Worker：
 

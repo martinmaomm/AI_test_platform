@@ -4,6 +4,7 @@ Playwright Python脚本运行器
 """
 
 import os
+import sys
 import tempfile
 import subprocess
 import logging
@@ -265,9 +266,19 @@ python_functions = test_*
         with open(pytest_ini, 'w', encoding='utf-8') as f:
             f.write(config_content)
 
+    def _resolve_python_browser_path(self) -> Optional[str]:
+        """解析 Python Playwright 独立缓存目录；未配置时使用其系统默认缓存。"""
+        browser_path = os.getenv('PYTHON_PLAYWRIGHT_BROWSERS_PATH', '').strip()
+        if not browser_path:
+            return None
+        browser_path = os.path.expanduser(browser_path)
+        if not os.path.isabs(browser_path):
+            browser_path = os.path.join(self.project_root, browser_path)
+        return os.path.abspath(browser_path)
+
     def _run_pytest_command(self, work_dir: str, config: ExecutionConfig) -> subprocess.CompletedProcess:
         """执行pytest命令"""
-        cmd = ["python", "-m", "pytest", "-v", "--tb=short"]
+        cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short"]
         
         if config.generate_allure:
             allure_results_dir = os.path.join(work_dir, "allure-results")
@@ -282,6 +293,16 @@ python_functions = test_*
             'PLAYWRIGHT_BASE_URL': config.base_url or '',
             'PYTHONIOENCODING': 'utf-8',  # 防止 Windows GBK 编码报错
         })
+
+        python_browser_path = self._resolve_python_browser_path()
+        if python_browser_path:
+            env['PLAYWRIGHT_BROWSERS_PATH'] = python_browser_path
+            logger.info("Python Playwright浏览器缓存目录: %s", python_browser_path)
+        else:
+            # Celery 可能为 Node MCP 配置了旧的通用变量；Python 子进程必须移除它，
+            # 否则相对路径会按临时 pytest 工作目录解析，并与 MCP 浏览器版本冲突。
+            env.pop('PLAYWRIGHT_BROWSERS_PATH', None)
+            logger.info("Python Playwright使用系统默认浏览器缓存目录")
 
         result = subprocess.run(
             cmd,

@@ -1,7 +1,11 @@
 import ast
+import os
 import shutil
+import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from .playwright_python_runner import ExecutionConfig, PlaywrightRunner
 from .script_contract import (
@@ -184,6 +188,51 @@ async def main(page):
         finally:
             shutil.rmtree(headed_dir, ignore_errors=True)
             shutil.rmtree(headless_dir, ignore_errors=True)
+
+    def test_runner_drops_legacy_mcp_browser_path_for_python_execution(self):
+        runner = PlaywrightRunner()
+        work_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        try:
+            with patch.dict(
+                os.environ,
+                {"PLAYWRIGHT_BROWSERS_PATH": ".playwright-browsers"},
+                clear=True,
+            ), patch(
+                "web_testing.playwright_python_runner.subprocess.run",
+                return_value=completed,
+            ) as run:
+                runner._run_pytest_command(work_dir, ExecutionConfig())
+
+            child_env = run.call_args.kwargs["env"]
+            self.assertNotIn("PLAYWRIGHT_BROWSERS_PATH", child_env)
+            self.assertEqual(run.call_args.args[0][0], sys.executable)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def test_runner_resolves_independent_python_browser_path_from_project_root(self):
+        runner = PlaywrightRunner()
+        work_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "PLAYWRIGHT_BROWSERS_PATH": ".playwright-browsers",
+                    "PYTHON_PLAYWRIGHT_BROWSERS_PATH": ".python-playwright-browsers",
+                },
+                clear=True,
+            ), patch(
+                "web_testing.playwright_python_runner.subprocess.run",
+                return_value=completed,
+            ) as run:
+                runner._run_pytest_command(work_dir, ExecutionConfig())
+
+            child_env = run.call_args.kwargs["env"]
+            expected = os.path.join(runner.project_root, ".python-playwright-browsers")
+            self.assertEqual(child_env["PLAYWRIGHT_BROWSERS_PATH"], expected)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     def test_materialized_script_owns_browser_and_uses_context_base_url(self):
         headed_materialized = materialize_script(

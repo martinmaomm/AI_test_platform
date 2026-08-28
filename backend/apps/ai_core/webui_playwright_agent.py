@@ -452,7 +452,7 @@ def _get_mcp_error_message(error: BaseException) -> str:
     if error_kind == MCP_ERROR_BROWSER:
         return (
             "Playwright浏览器启动失败或找不到可执行文件。请确认运行Celery的机器已安装"
-            "与当前MCP版本匹配的Chromium，并检查PLAYWRIGHT_BROWSERS_PATH后重启Celery。"
+            "与当前MCP版本匹配的Chromium，并检查MCP_PLAYWRIGHT_BROWSERS_PATH后重启Celery。"
         )
     if error_kind == MCP_ERROR_RATE_LIMIT:
         return (
@@ -971,13 +971,16 @@ class WebUIPlaywrightAgent:
 
                             # 支持将浏览器缓存放在项目目录，便于部署时复用。
                             # 相对路径统一按 backend 根目录解析，避免受 Celery 启动目录影响。
-                            browser_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH')
+                            browser_path = (
+                                os.getenv('MCP_PLAYWRIGHT_BROWSERS_PATH')
+                                or os.getenv('PLAYWRIGHT_BROWSERS_PATH')
+                            )
                             if browser_path:
                                 if not os.path.isabs(browser_path):
                                     browser_path = os.path.join(str(settings.BASE_DIR), browser_path)
                                 playwright_server_config['env']['PLAYWRIGHT_BROWSERS_PATH'] = os.path.abspath(browser_path)
                                 logger.info(
-                                    "Playwright浏览器缓存目录: %s",
+                                    "MCP Playwright浏览器缓存目录: %s",
                                     playwright_server_config['env']['PLAYWRIGHT_BROWSERS_PATH'],
                                 )
                             

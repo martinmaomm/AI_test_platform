@@ -197,8 +197,8 @@
     </el-card>
 
     <!-- 详情对话框 -->
-    <el-dialog v-model="detailDialogVisible" title="执行详情" width="90%" :close-on-click-modal="false" :show-close="true"
-      class="execution-detail-dialog">
+    <el-dialog v-model="detailDialogVisible" title="执行详情" width="90%" top="4vh" :close-on-click-modal="false"
+      :show-close="true" class="execution-detail-dialog">
       <!-- 套件执行详情 -->
       <WebUITestSuiteExecutionDetail v-if="selectedRun && selectedRun.exec_type === 'suite'" :execution="selectedRun"
         :visible="detailDialogVisible" @close="detailDialogVisible = false" />
@@ -943,8 +943,26 @@ onMounted(() => {
 }
 
 /* 详情对话框样式 */
+.execution-detail-dialog {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: 88vh;
+  min-height: min(560px, 80vh);
+  max-height: 92vh;
+  overflow: hidden;
+  resize: vertical;
+}
+
+.execution-detail-dialog :deep(.el-dialog__header) {
+  flex-shrink: 0;
+}
+
 .execution-detail-dialog :deep(.el-dialog__body) {
+  flex: 1;
+  min-height: 0;
   padding: 0;
+  overflow: auto;
 }
 
 

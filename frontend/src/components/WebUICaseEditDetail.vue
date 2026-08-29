@@ -296,15 +296,25 @@
       <div class="detail-section-edit">
         <div class="section-header-edit">
           <h4>测试脚本</h4>
+          <span class="script-resize-hint">可拖动编辑器右上角调整高度</span>
         </div>
         <div class="section-content-edit">
-          <div class="script-edit">
+          <div ref="scriptEditorContainer" class="script-edit" :style="scriptEditorStyle">
+            <button
+              type="button"
+              class="script-resize-handle"
+              title="上下拖动调整编辑器高度"
+              aria-label="上下拖动调整编辑器高度"
+              @pointerdown="startScriptResize"
+            >
+              ↕
+            </button>
             <MonacoEditor
               v-model:value="editForm.test_script_content"
               language="python"
               theme="vs-dark"
               :read-only="false"
-              height="400px"
+              height="100%"
               @change="handleScriptChange"
             />
           </div>
@@ -365,6 +375,44 @@ const props = defineProps({
 
 // Emits
 const emit = defineEmits(['update:modelValue', 'run', 'update'])
+
+const scriptEditorContainer = ref(null)
+const scriptEditorHeight = ref(null)
+const scriptEditorStyle = computed(() => (
+  scriptEditorHeight.value ? { height: `${scriptEditorHeight.value}px` } : undefined
+))
+
+const startScriptResize = (event) => {
+  if (event.button !== 0 || !scriptEditorContainer.value) return
+
+  event.preventDefault()
+  const handle = event.currentTarget
+  const pointerId = event.pointerId
+  const startY = event.clientY
+  const startHeight = scriptEditorContainer.value.getBoundingClientRect().height
+  const minHeight = Math.min(480, window.innerHeight * 0.5)
+  const maxHeight = Math.max(minHeight, window.innerHeight * 0.8)
+
+  handle.setPointerCapture?.(pointerId)
+
+  const handlePointerMove = (moveEvent) => {
+    const nextHeight = startHeight + moveEvent.clientY - startY
+    scriptEditorHeight.value = Math.round(Math.min(maxHeight, Math.max(minHeight, nextHeight)))
+  }
+
+  const stopResize = () => {
+    handle.removeEventListener('pointermove', handlePointerMove)
+    handle.removeEventListener('pointerup', stopResize)
+    handle.removeEventListener('pointercancel', stopResize)
+    if (handle.hasPointerCapture?.(pointerId)) {
+      handle.releasePointerCapture(pointerId)
+    }
+  }
+
+  handle.addEventListener('pointermove', handlePointerMove)
+  handle.addEventListener('pointerup', stopResize)
+  handle.addEventListener('pointercancel', stopResize)
+}
 
 // 项目store
 const projectStore = useProjectStore()
@@ -1467,7 +1515,45 @@ const getStepElementDisplay = (step) => {
 
 /* 脚本编辑样式 */
 .script-edit {
+  box-sizing: border-box;
+  height: 60vh;
+  min-height: 480px;
+  max-height: 80vh;
   margin-top: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.script-resize-handle {
+  align-items: center;
+  background: rgba(64, 158, 255, 0.9);
+  border: 0;
+  border-radius: 4px;
+  color: #ffffff;
+  cursor: ns-resize;
+  display: flex;
+  font-size: 16px;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  position: absolute;
+  right: 10px;
+  top: 8px;
+  touch-action: none;
+  user-select: none;
+  width: 28px;
+  z-index: 10;
+}
+
+.script-resize-handle:hover {
+  background: #409eff;
+}
+
+.script-resize-hint {
+  color: #909399;
+  font-size: 12px;
+  font-weight: 400;
 }
 
 

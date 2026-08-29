@@ -5,63 +5,86 @@
       <!-- 主内容区域 -->
       <div class="main-content">
         <div v-if="execution.error_message" class="execution-error">
-          <strong>执行失败：</strong>
-          <span>{{ execution.error_message }}</span>
+          <strong>失败摘要</strong>
+          <pre>{{ execution.error_message }}</pre>
         </div>
         <!-- 概览内容 -->
         <div class="overview-section">
           <div class="overview-grid">
             <div class="info-card overview-card">
               <div class="info-header">
-                <h3>Execution Information</h3>
+                <h3>执行信息</h3>
                 <el-tag :type="getStatusType(execution.status)" size="small" class="status-tag">
                   {{ getStatusText(execution.status) }}
                 </el-tag>
               </div>
               <div class="info-grid">
                 <div class="info-item">
-                  <span class="label">Test Record ID:</span>
-                  <span class="value">#{{ execution.id }}</span>
+                  <span class="label">执行记录：</span>
+                  <span class="value">#{{ execution.execution || execution.id }}</span>
                 </div>
                 <div class="info-item">
-                  <span class="label">Test Case:</span>
+                  <span class="label">测试用例：</span>
                   <span class="value">{{ execution.test_case_title || 'N/A' }}</span>
                 </div>
                 <div class="info-item">
-                  <span class="label">Description:</span>
+                  <span class="label">描述：</span>
                   <span class="value">{{ execution.test_case_description || 'N/A' }}</span>
                 </div>
                 <div class="info-item">
-                  <span class="label">Browser:</span>
+                  <span class="label">浏览器：</span>
                   <span class="value">Chrome</span>
                 </div>
                   <div class="info-item">
-                    <span class="label">Start Time:</span>
+                    <span class="label">开始时间：</span>
                     <span class="value">{{ formatTime(execution.start_time) }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Environment:</span>
+                    <span class="label">测试环境：</span>
                     <span class="value">{{ getEnvironmentText(execution.environment_name, execution.environment_base_url) }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Duration:</span>
+                    <span class="label">Base URL：</span>
+                    <span class="value value-url">{{ execution.environment_base_url || '未配置' }}</span>
+                  </div>
+                  <div class="info-item">
+                    <span class="label">执行时长：</span>
                     <span class="value">{{ formatDuration(execution.duration) }}</span>
                   </div>
               </div>
             </div>
 
+            <div v-if="execution.error_message" class="screenshot-card">
+              <div class="section-header">
+                <h3>失败现场</h3>
+                <span v-if="screenshotLoading" class="muted-text">正在加载截图…</span>
+              </div>
+              <el-image
+                v-if="screenshotUrl"
+                :src="screenshotUrl"
+                :preview-src-list="[screenshotUrl]"
+                fit="contain"
+                class="failure-screenshot"
+              />
+              <el-empty v-else-if="!screenshotLoading" description="未能生成失败截图" :image-size="70" />
+            </div>
+
             <!-- Execution Logs -->
             <div class="log-container chart-card">
               <div class="log-header">
-                <h3>Execution Logs</h3>
+                <h3>技术日志</h3>
                 <el-button size="small" @click="copyLogs" class="copy-btn">
                   <i class="el-icon-copy-document"></i>
-                  Copy
+                  复制
                 </el-button>
               </div>
-              <div class="log-content">
-                <pre>{{ execution.log || 'No logs available' }}</pre>
-              </div>
+              <el-collapse v-model="openLogSections">
+                <el-collapse-item title="查看原始 stdout / stderr / log" name="technical">
+                  <div class="log-content">
+                    <pre>{{ technicalLog || '暂无技术日志' }}</pre>
+                  </div>
+                </el-collapse-item>
+              </el-collapse>
             </div>
           </div>
         </div>
@@ -71,8 +94,9 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onBeforeUnmount, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { getWebUITestExecutionScreenshot } from '@/api/webTesting'
 
 const props = defineProps({
   execution: {
@@ -86,11 +110,43 @@ const props = defineProps({
   }
 })
 
-// 添加调试信息
-console.log('WebUITestSuiteExecutionDetail接收到的execution:', props.execution)
-console.log('allure_report_url字段值:', props.execution.allure_report_url)
-
 const emit = defineEmits(['close'])
+const screenshotUrl = ref('')
+const screenshotLoading = ref(false)
+const openLogSections = ref([])
+
+const technicalLog = computed(() => {
+  const parts = []
+  if (props.execution.stdout) parts.push(`--- stdout ---\n${props.execution.stdout}`)
+  if (props.execution.stderr) parts.push(`--- stderr ---\n${props.execution.stderr}`)
+  if (props.execution.log) parts.push(`--- log ---\n${props.execution.log}`)
+  return parts.join('\n\n')
+})
+
+const revokeScreenshotUrl = () => {
+  if (screenshotUrl.value) {
+    URL.revokeObjectURL(screenshotUrl.value)
+    screenshotUrl.value = ''
+  }
+}
+
+const loadScreenshot = async () => {
+  revokeScreenshotUrl()
+  if (!props.execution?.error_message || !props.execution?.screenshot_path) return
+  screenshotLoading.value = true
+  try {
+    const executionId = props.execution.execution || props.execution.id
+    const blob = await getWebUITestExecutionScreenshot(props.execution.project_id, executionId)
+    screenshotUrl.value = URL.createObjectURL(blob)
+  } catch (error) {
+    console.warn('加载失败截图失败:', error)
+  } finally {
+    screenshotLoading.value = false
+  }
+}
+
+watch(() => props.execution?.id, loadScreenshot, { immediate: true })
+onBeforeUnmount(revokeScreenshotUrl)
 
 // 方法
 const formatTime = (timeStr) => {
@@ -140,11 +196,11 @@ const getStatusText = (status) => {
 }
 
 const copyLogs = () => {
-  const logContent = props.execution.log || 'No logs available'
+  const logContent = technicalLog.value || '暂无技术日志'
   navigator.clipboard.writeText(logContent).then(() => {
-    ElMessage.success('Logs copied to clipboard')
+    ElMessage.success('日志已复制')
   }).catch(() => {
-    ElMessage.error('Failed to copy logs')
+    ElMessage.error('日志复制失败')
   })
 }
 
@@ -183,6 +239,50 @@ const copyLogs = () => {
   background: #fef3f2;
   border: 1px solid #fecdca;
   border-radius: 6px;
+}
+
+.execution-error pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.screenshot-card {
+  background: #fff;
+  border: 1px solid #e8eaed;
+  border-left: 4px solid #f56c6c;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.section-header h3 {
+  margin: 0;
+}
+
+.failure-screenshot {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  background: #f8f9fa;
+}
+
+.muted-text {
+  color: #909399;
+  font-size: 12px;
+}
+
+.value-url {
+  max-width: 70%;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 @keyframes fadeIn {

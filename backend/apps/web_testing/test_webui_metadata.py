@@ -34,9 +34,11 @@ from .views import (
     WebPageViewSet,
     get_webui_test_execution_statistics,
     get_webui_test_suite_statistics,
+    TestExecutionScreenshotView,
 )
 from .tasks import (
     _execute_webui_script_generation_from_testcase,
+    _execute_webui_test_case_logic,
     _execute_webui_test_suite_logic,
 )
 
@@ -536,6 +538,86 @@ class WebUIReportPermissionTests(TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertFalse(WebUITestExecution.objects.filter(pk=self.execution.id).exists())
 
+    def test_delete_execution_removes_controlled_screenshot_directory(self):
+        from django.conf import settings
+        import os
+
+        relative_path = f'webui_failure_screenshots/execution_{self.execution.id}/single_case.png'
+        absolute_path = os.path.join(str(settings.MEDIA_ROOT), relative_path)
+        os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+        with open(absolute_path, 'wb') as file:
+            file.write(b'PNG')
+        detail = self.execution.case_execution_detail
+        detail.screenshot_path = relative_path
+        detail.save(update_fields=['screenshot_path'])
+
+        result = TestExecutionDeleteView.as_view()(
+            self.request('DELETE', self.member, '/executions/delete/'),
+            project_id=self.project.id,
+            pk=self.execution.id,
+        )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(os.path.exists(os.path.dirname(absolute_path)))
+
+    def test_report_member_can_read_linked_screenshot_but_path_is_not_client_controlled(self):
+        from django.test import override_settings
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
+            relative_path = f'webui_failure_screenshots/execution_{self.execution.id}/single_case.png'
+            absolute_path = os.path.join(media_root, relative_path)
+            os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+            with open(absolute_path, 'wb') as file:
+                file.write(b'PNG')
+            detail = self.execution.case_execution_detail
+            detail.screenshot_path = relative_path
+            detail.save(update_fields=['screenshot_path'])
+
+            result = TestExecutionScreenshotView.as_view()(
+                self.request('GET', self.member),
+                project_id=self.project.id,
+                pk=self.execution.id,
+            )
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result['Content-Type'], 'image/png')
+
+            detail.screenshot_path = '../outside.png'
+            detail.save(update_fields=['screenshot_path'])
+            blocked = TestExecutionScreenshotView.as_view()(
+                self.request('GET', self.member),
+                project_id=self.project.id,
+                pk=self.execution.id,
+            )
+            self.assertEqual(blocked.status_code, 404)
+
+            other_execution = WebUITestExecution.objects.create(
+                exec_type='case',
+                name='other execution',
+                status='failed',
+                executor=self.owner,
+                project=self.project,
+            )
+            detail.screenshot_path = (
+                f'webui_failure_screenshots/execution_{other_execution.id}/single_case.png'
+            )
+            detail.save(update_fields=['screenshot_path'])
+            cross_execution = TestExecutionScreenshotView.as_view()(
+                self.request('GET', self.member),
+                project_id=self.project.id,
+                pk=self.execution.id,
+            )
+            self.assertEqual(cross_execution.status_code, 404)
+
+    def test_member_without_report_capability_cannot_read_screenshot(self):
+        result = TestExecutionScreenshotView.as_view()(
+            self.request('GET', self.no_report_member),
+            project_id=self.project.id,
+            pk=self.execution.id,
+        )
+        self.assertEqual(result.status_code, 403)
+
 
 class WebUIGenerationTaskProjectAccessTests(TestCase):
     def setUp(self):
@@ -798,10 +880,116 @@ class WebUIExecutionContractTests(TestCase):
         execution.refresh_from_db()
         self.assertFalse(result['success'])
         self.assertEqual(execution.status, 'failed')
-        self.assertEqual(
-            execution.error_message, 'RuntimeError: visible suite error'
-        )
+        self.assertIn('测试执行失败', execution.error_message)
+        self.assertNotIn('RuntimeError: visible suite error', execution.error_message)
+        self.assertIn('pytest error output', execution.suite_execution_detail.log)
         self.assertEqual(result['error'], execution.error_message)
+
+    @patch('web_testing.tasks._run_test_script')
+    @patch('web_testing.tasks.update_task_progress')
+    def test_case_failure_persists_friendly_summary_and_raw_logs(
+        self, _update_progress, run_script
+    ):
+        run_script.return_value = {
+            'success': False,
+            'error': 'playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.',
+            'result': {
+                'stdout': 'E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.',
+                'stderr': 'pytest stderr',
+                'screenshot_path': 'webui_failure_screenshots/execution_1/single_case.png',
+            },
+        }
+        execution = WebUITestExecution.objects.create(
+            exec_type='case',
+            name=self.case.title,
+            executor=self.user,
+            project=self.project,
+            environment=self.web_environment,
+        )
+        from .models import WebUITestCaseExecutionDetail
+        WebUITestCaseExecutionDetail.objects.create(
+            execution=execution, test_case=self.case, status='pending'
+        )
+        from django.conf import settings
+        import os
+        screenshot_relative = f'webui_failure_screenshots/execution_{execution.id}/single_case.png'
+        screenshot_absolute = os.path.join(str(settings.MEDIA_ROOT), screenshot_relative)
+        os.makedirs(os.path.dirname(screenshot_absolute), exist_ok=True)
+        with open(screenshot_absolute, 'wb') as file:
+            file.write(b'PNG')
+        task_instance = SimpleNamespace(request=SimpleNamespace(id='case-failure-task'))
+
+        result = _execute_webui_test_case_logic(
+            task_instance,
+            execution.id,
+            {'headed': False, 'timeout': 60},
+            self.case.test_script_content,
+            self.web_environment.config['base_url'],
+        )
+
+        execution.refresh_from_db()
+        self.case.refresh_from_db()
+        detail = execution.case_execution_detail
+        self.assertFalse(result['success'])
+        self.assertIn('点击元素超时', execution.error_message)
+        self.assertIn('点击元素超时', detail.error_message)
+        self.assertIn('点击元素超时', self.case.last_error_message)
+        self.assertIn('Locator.click', detail.log)
+        self.assertEqual(detail.screenshot_path, screenshot_relative)
+        import shutil
+        shutil.rmtree(
+            os.path.join(str(settings.MEDIA_ROOT), 'webui_failure_screenshots', f'execution_{execution.id}'),
+            ignore_errors=True,
+        )
+
+    @patch('web_testing.tasks._run_test_suite_script')
+    @patch('web_testing.tasks.update_task_progress')
+    def test_failed_suite_persists_each_failed_subcase_result(
+        self, _update_progress, run_suite
+    ):
+        second_case = WebUITestCase.objects.create(
+            title='second contract case', description='second', expected_result='passed',
+            test_script_content='async def run(page):\n    pass\n', script_status='ready',
+            user=self.user, project=self.project,
+        )
+        self.suite.test_cases.add(second_case)
+        execution = WebUITestExecution.objects.create(
+            exec_type='suite', name=self.suite.name, executor=self.user,
+            project=self.project, environment=self.web_environment,
+        )
+        suite_detail = WebUITestSuiteExecutionDetail.objects.create(
+            execution=execution, test_suite=self.suite, total_cases=2
+        )
+        screenshot_path = f'webui_failure_screenshots/execution_{execution.id}/case_{second_case.id}.png'
+        run_suite.return_value = {
+            'success': False,
+            'error': '测试套件执行失败',
+            'result': {
+                'stdout': 'test_case_1.py::test_case_1 PASSED\ntest_case_2.py::test_case_2 FAILED',
+                'stderr': 'raw suite stderr',
+                'case_results': [
+                    {'test_case_id': self.case.id, 'status': 'passed', 'stdout': 'case 1'},
+                    {'test_case_id': second_case.id, 'status': 'failed',
+                     'error_message': '点击元素超时',
+                     'stdout': 'case 2 raw',
+                     'log': 'case 2 technical log',
+                     'screenshot_path': screenshot_path},
+                ],
+            },
+        }
+        task_instance = SimpleNamespace(request=SimpleNamespace(id='suite-partial-failure-task'))
+
+        result = _execute_webui_test_suite_logic(
+            task_instance, execution.id, self.user.id, {'headed': False, 'timeout': 60}
+        )
+
+        self.assertFalse(result['success'])
+        records = list(suite_detail.case_executions.order_by('test_case_id'))
+        self.assertEqual(len(records), 2)
+        failed = next(record for record in records if record.test_case_id == second_case.id)
+        self.assertEqual(failed.status, 'failed')
+        self.assertEqual(failed.screenshot_path, screenshot_path)
+        self.assertEqual(failed.stdout, 'case 2 raw')
 
 
 class WebUIExecutionProjectIsolationTests(TestCase):

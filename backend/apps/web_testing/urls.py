@@ -58,6 +58,8 @@ urlpatterns = [
     path('executions/case/<int:pk>/', views.TestCaseExecutionDetailView.as_view(), name='test-case-execution-detail'),
     path('executions/suite/<int:pk>/', views.TestSuiteExecutionDetailView.as_view(), name='test-suite-execution-detail'),
     path('executions/<int:pk>/cases/', views.TestExecutionCasesView.as_view(), name='test-execution-cases'),
+    path('executions/<int:pk>/cases/<int:case_pk>/screenshot/', views.TestExecutionScreenshotView.as_view(), name='test-suite-case-screenshot'),
+    path('executions/<int:pk>/screenshot/', views.TestExecutionScreenshotView.as_view(), name='test-execution-screenshot'),
     path('executions/<int:pk>/delete/', views.TestExecutionDeleteView.as_view(), name='test-execution-delete'),
     
     # ============ 统计信息 ============

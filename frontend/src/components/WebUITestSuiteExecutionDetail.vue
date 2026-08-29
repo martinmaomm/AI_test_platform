@@ -14,71 +14,109 @@
       <!-- 主内容区域 -->
       <div class="main-content">
         <div v-if="execution.error_message" class="execution-error">
-          <strong>执行失败：</strong>
-          <span>{{ execution.error_message }}</span>
+          <strong>失败摘要</strong>
+          <pre>{{ execution.error_message }}</pre>
         </div>
         <!-- 概览标签页 -->
         <div v-show="activeTab === 'overview'" class="tab-content">
           <div class="overview-section">
             <div class="overview-grid">
               <div class="info-card overview-card">
-                <h3>Execution Information</h3>
+                <h3>执行信息</h3>
                 <div class="info-grid">
                   <div class="info-item">
-                    <span class="label">Test Record ID:</span>
-                    <span class="value">#{{ execution.id }}</span>
+                  <span class="label">执行记录：</span>
+                    <span class="value">#{{ execution.execution || execution.id }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Test Suite:</span>
+                  <span class="label">测试套件：</span>
                     <span class="value">{{ execution.test_suite_name || 'N/A' }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Browser:</span>
+                  <span class="label">浏览器：</span>
                     <span class="value">Chrome</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Start Time:</span>
+                  <span class="label">开始时间：</span>
                     <span class="value">{{ formatTime(execution.start_time) }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Environment:</span>
-                    <span class="value">{{ getEnvironmentText(execution.environment_name, execution.environment_base_url) }}</span>
-                  </div>
-                  <div class="info-item">
-                    <span class="label">Duration:</span>
+                  <span class="label">测试环境：</span>
+                  <span class="value">{{ getEnvironmentText(execution.environment_name, execution.environment_base_url) }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="label">Base URL：</span>
+                  <span class="value value-url">{{ execution.environment_base_url || '未配置' }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="label">执行时长：</span>
                     <span class="value">{{ formatDuration(execution.duration) }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="label">Pass Rate:</span>
+                    <span class="label">通过率：</span>
                     <span class="value">{{ execution.pass_rate || 0 }}%</span>
                   </div>
                 </div>
               </div>
 
               <div class="chart-card">
-                <h3>Execution Summary</h3>
+                <h3>执行汇总</h3>
                 <!-- 统计概览 -->
                 <div class="stats-overview">
                   <div class="stat-item">
                     <div class="stat-number">{{ execution.total_cases || 0 }}</div>
-                    <div class="stat-label">Total</div>
+                    <div class="stat-label">总数</div>
                   </div>
                   <div class="stat-item success">
                     <div class="stat-number">{{ execution.passed_cases || 0 }}</div>
-                    <div class="stat-label">Passed</div>
+                    <div class="stat-label">通过</div>
                   </div>
                   <div class="stat-item failed">
                     <div class="stat-number">{{ execution.failed_cases || 0 }}</div>
-                    <div class="stat-label">Failed</div>
+                    <div class="stat-label">失败</div>
                   </div>
                   <div class="stat-item error">
                     <div class="stat-number">{{ execution.skipped_cases || 0 }}</div>
-                    <div class="stat-label">Skipped</div>
+                    <div class="stat-label">跳过</div>
                   </div>
                 </div>
                 <div class="chart-container">
                   <v-chart :option="executionPieChartOption" style="height: 180px;" autoresize />
                 </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="suite-cases-card">
+            <div class="section-header">
+              <h3>子用例执行结果</h3>
+              <span v-if="casesLoading" class="muted-text">正在加载…</span>
+            </div>
+            <el-empty v-if="!casesLoading && !caseExecutions.length" description="暂无子用例执行结果" :image-size="70" />
+            <div v-else class="case-list">
+              <div v-for="caseItem in caseExecutions" :key="caseItem.id" class="case-item">
+                <div class="case-item-header">
+                  <span class="case-title">{{ caseItem.test_case_title || caseItem.name }}</span>
+                  <el-tag :type="getStatusType(caseItem.status)" size="small">
+                    {{ getStatusText(caseItem.status) }}
+                  </el-tag>
+                </div>
+                <pre v-if="caseItem.error_message" class="case-error">{{ caseItem.error_message }}</pre>
+                <div v-if="caseScreenshotUrls[caseItem.id]" class="case-screenshot-wrap">
+                  <el-image
+                    :src="caseScreenshotUrls[caseItem.id]"
+                    :preview-src-list="[caseScreenshotUrls[caseItem.id]]"
+                    fit="contain"
+                    class="case-screenshot"
+                  />
+                </div>
+                <el-collapse v-if="caseItem.log || caseItem.stdout" v-model="openCaseLogs[caseItem.id]">
+                  <el-collapse-item title="查看该子用例技术日志" name="technical">
+                    <div class="log-content case-log-content">
+                      <pre>{{ formatCaseLog(caseItem) }}</pre>
+                    </div>
+                  </el-collapse-item>
+                </el-collapse>
               </div>
             </div>
           </div>
@@ -90,15 +128,19 @@
           <div class="logs-section">
             <div class="log-container">
               <div class="log-header">
-                <h3>Execution Logs</h3>
+                <h3>技术日志</h3>
                 <el-button size="small" @click="copyLogs" class="copy-btn">
                   <i class="el-icon-copy-document"></i>
-                  Copy
+                  复制
                 </el-button>
               </div>
-              <div class="log-content">
-                <pre>{{ execution.log || 'No logs available' }}</pre>
-              </div>
+              <el-collapse v-model="openLogSections">
+                <el-collapse-item title="查看原始 stdout / stderr / log" name="technical">
+                  <div class="log-content">
+                    <pre>{{ execution.log || '暂无技术日志' }}</pre>
+                  </div>
+                </el-collapse-item>
+              </el-collapse>
             </div>
           </div>
         </div>
@@ -108,15 +150,15 @@
           <div class="report-section">
             <div v-if="execution.allure_report_url" class="report-container">
               <div class="report-header">
-                <h3>Allure Test Report</h3>
+                <h3>Allure 测试报告</h3>
                 <el-button type="primary" @click="openReportInNewTab" class="open-report-btn">
                   <i class="el-icon-view"></i>
-                  Open in New Tab
+                  新窗口打开
                 </el-button>
               </div>
             </div>
             <div v-else class="no-report">
-              <el-empty description="No test report available" />
+              <el-empty description="暂无测试报告" />
             </div>
           </div>
         </div>
@@ -126,8 +168,9 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
+import { getTestExecutionCases, getWebUITestExecutionScreenshot } from '@/api/webTesting'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { PieChart } from 'echarts/charts'
@@ -159,19 +202,74 @@ const props = defineProps({
   }
 })
 
-// 添加调试信息
-console.log('WebUITestSuiteExecutionDetail接收到的execution:', props.execution)
-console.log('allure_report_url字段值:', props.execution.allure_report_url)
-
 const emit = defineEmits(['close'])
 
 const activeTab = ref('overview')
+const caseExecutions = ref([])
+const casesLoading = ref(false)
+const caseScreenshotUrls = ref({})
+const openCaseLogs = ref({})
+const openLogSections = ref([])
+
+const revokeCaseScreenshotUrls = () => {
+  Object.values(caseScreenshotUrls.value).forEach((url) => {
+    if (url) URL.revokeObjectURL(url)
+  })
+  caseScreenshotUrls.value = {}
+}
+
+const loadCaseScreenshot = async (caseItem) => {
+  if (!caseItem.screenshot_path) return
+  try {
+    const executionId = props.execution.execution || props.execution.id
+    const blob = await getWebUITestExecutionScreenshot(
+      props.execution.project_id,
+      executionId,
+      caseItem.id
+    )
+    caseScreenshotUrls.value = {
+      ...caseScreenshotUrls.value,
+      [caseItem.id]: URL.createObjectURL(blob)
+    }
+  } catch (error) {
+    console.warn(`加载子用例 ${caseItem.id} 失败截图失败:`, error)
+  }
+}
+
+const loadCases = async () => {
+  const projectId = props.execution?.project_id
+  const executionId = props.execution?.execution || props.execution?.id
+  if (!projectId || !executionId || props.execution?.exec_type === 'case') return
+  casesLoading.value = true
+  revokeCaseScreenshotUrls()
+  try {
+    const response = await getTestExecutionCases(projectId, executionId)
+    const payload = response?.data || response || {}
+    caseExecutions.value = payload.cases || []
+    await Promise.all(caseExecutions.value.map(loadCaseScreenshot))
+  } catch (error) {
+    console.warn('加载套件子用例执行结果失败:', error)
+    caseExecutions.value = []
+  } finally {
+    casesLoading.value = false
+  }
+}
+
+const formatCaseLog = (caseItem) => {
+  const parts = []
+  if (caseItem.stdout) parts.push(`--- stdout ---\n${caseItem.stdout}`)
+  if (caseItem.log) parts.push(`--- log ---\n${caseItem.log}`)
+  return parts.join('\n\n')
+}
+
+watch(() => props.execution?.id, loadCases, { immediate: true })
+onBeforeUnmount(revokeCaseScreenshotUrls)
 
 // 标签页配置
 const tabs = [
-  { key: 'overview', label: 'Overview', icon: 'el-icon-data-board' },
-  { key: 'logs', label: 'Logs', icon: 'el-icon-document-copy' },
-  { key: 'report', label: 'Report', icon: 'el-icon-view' }
+  { key: 'overview', label: '概览', icon: 'el-icon-data-board' },
+  { key: 'logs', label: '日志', icon: 'el-icon-document-copy' },
+  { key: 'report', label: '报告', icon: 'el-icon-view' }
 ]
 
 // 方法
@@ -195,6 +293,26 @@ const getEnvironmentText = (name, baseUrl) => {
   }
   return name || baseUrl || 'N/A'
 }
+
+const getStatusType = (status) => ({
+  pending: 'info',
+  running: 'warning',
+  passed: 'success',
+  failed: 'danger',
+  error: 'danger',
+  skipped: 'info',
+  stopped: 'warning'
+}[status] || 'info')
+
+const getStatusText = (status) => ({
+  pending: '待执行',
+  running: '执行中',
+  passed: '执行通过',
+  failed: '执行失败',
+  error: '执行错误',
+  skipped: '已跳过',
+  stopped: '已停止'
+}[status] || '未知状态')
 
 const getSuccessRate = () => {
   if (!props.execution.total_cases || props.execution.total_cases === 0) return 0
@@ -246,8 +364,8 @@ const openReportInNewTab = () => {
     // 如果是相对路径，转换为完整的后端URL
     let reportUrl = props.execution.allure_report_url
     if (reportUrl.startsWith('/')) {
-      const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
-      reportUrl = `${apiBaseUrl}${reportUrl}`
+      const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || window.location.origin
+      reportUrl = `${apiBaseUrl.replace(/\/$/, '')}${reportUrl}`
     }
     window.open(reportUrl, '_blank')
   }
@@ -255,11 +373,11 @@ const openReportInNewTab = () => {
 
 
 const copyLogs = () => {
-  const logContent = props.execution.log || 'No logs available'
+  const logContent = props.execution.log || '暂无技术日志'
   navigator.clipboard.writeText(logContent).then(() => {
-    ElMessage.success('Logs copied to clipboard')
+    ElMessage.success('日志已复制')
   }).catch(() => {
-    ElMessage.error('Failed to copy logs')
+    ElMessage.error('日志复制失败')
   })
 }
 
@@ -387,6 +505,85 @@ const copyLogs = () => {
   background: #fef3f2;
   border: 1px solid #fecdca;
   border-radius: 6px;
+}
+
+.execution-error pre,
+.case-error {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.suite-cases-card {
+  margin-top: 16px;
+  padding: 20px;
+  background: #fff;
+  border: 1px solid #e8eaed;
+  border-radius: 8px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.section-header h3 {
+  margin: 0;
+}
+
+.case-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.case-item {
+  padding: 14px;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  background: #fafafa;
+}
+
+.case-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.case-title {
+  font-weight: 600;
+  color: #303133;
+  overflow-wrap: anywhere;
+}
+
+.case-screenshot-wrap {
+  margin-top: 12px;
+}
+
+.case-screenshot {
+  display: block;
+  width: 100%;
+  max-height: 280px;
+  background: #fff;
+}
+
+.case-log-content {
+  max-height: 220px;
+}
+
+.muted-text {
+  color: #909399;
+  font-size: 12px;
+}
+
+.value-url {
+  max-width: 70%;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .tab-content {

@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -288,6 +289,153 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
         self.assertIn('context_kwargs["base_url"]', headed_materialized)
         self.assertIn("asyncio.run(_run_with_managed_browser())", headed_materialized)
         self.assertNotIn("--base-url", headed_materialized)
+
+    def test_materialized_script_captures_failure_screenshot_before_closing_browser(self):
+        materialized = materialize_script(
+            "async def run(page):\n    await page.click('#missing')\n",
+            "test_failure",
+            headed=False,
+            base_url="http://example.test",
+            failure_screenshot_path="/controlled/execution_1/single_case.png",
+        )
+
+        screenshot_index = materialized.index("page.screenshot")
+        context_close_index = materialized.index("await context.close()")
+        self.assertLess(screenshot_index, context_close_index)
+        self.assertIn("full_page=False", materialized)
+        self.assertIn("/controlled/execution_1/single_case.png", materialized)
+        self.assertIn("raise", materialized)
+
+    def test_screenshot_failure_preserves_original_script_exception(self):
+        class FakePage:
+            def __init__(self):
+                self.screenshot_args = None
+
+            async def screenshot(self, **kwargs):
+                self.screenshot_args = kwargs
+                raise RuntimeError('screenshot unavailable')
+
+        class FakeContext:
+            def __init__(self, page):
+                self.page = page
+                self.closed = False
+
+            async def new_page(self):
+                return self.page
+
+            async def close(self):
+                self.closed = True
+
+        class FakeBrowser:
+            def __init__(self, context):
+                self.context = context
+                self.closed = False
+
+            async def new_context(self, **kwargs):
+                return self.context
+
+            async def close(self):
+                self.closed = True
+
+        page = FakePage()
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+
+        class BrowserType:
+            async def launch(self, **kwargs):
+                return browser
+
+        class Playwright:
+            chromium = BrowserType()
+
+        class PlaywrightContext:
+            async def __aenter__(self):
+                return Playwright()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        fake_module = types.ModuleType('playwright.async_api')
+        fake_module.async_playwright = lambda: PlaywrightContext()
+        materialized = materialize_script(
+            "async def run(page):\n    raise ValueError('original failure')\n",
+            "test_preserve_original",
+            failure_screenshot_path="/controlled/failure.png",
+        )
+        namespace = {}
+        with patch.dict(sys.modules, {'playwright': types.ModuleType('playwright'), 'playwright.async_api': fake_module}):
+            exec(materialized, namespace)
+            with self.assertRaisesRegex(ValueError, 'original failure'):
+                namespace['test_preserve_original']()
+
+        self.assertEqual(page.screenshot_args, {'path': '/controlled/failure.png', 'full_page': False})
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
+
+    def test_runner_writes_real_base_url_and_rejects_empty_or_multiline_values(self):
+        runner = PlaywrightRunner()
+        work_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
+        try:
+            runner._create_pytest_config(
+                work_dir, ExecutionConfig(base_url="https://web.example.test/root")
+            )
+            with open(os.path.join(work_dir, "pytest.ini"), encoding="utf-8") as file:
+                self.assertIn("base_url = https://web.example.test/root", file.read())
+
+            with self.assertRaisesRegex(ValueError, "基础 URL"):
+                runner._create_pytest_config(work_dir, ExecutionConfig(base_url=""))
+            with self.assertRaisesRegex(ValueError, "换行"):
+                runner._create_pytest_config(work_dir, ExecutionConfig(base_url="https://bad.test\nbase_url = evil"))
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def test_suite_result_parser_keeps_failure_details_and_screenshots_per_case(self):
+        runner = PlaywrightRunner()
+        screenshot_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
+        try:
+            for case_id in (11, 12):
+                with open(
+                    os.path.join(screenshot_dir, f'case_{case_id}.png'), 'wb'
+                ) as screenshot:
+                    screenshot.write(b'PNG')
+
+            stdout = '''
+test_case_11.py::test_case_11 FAILED
+test_case_12.py::test_case_12 FAILED
+
+_______________________________ test_case_11 ________________________________
+E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.
+E   waiting for get_by_role("button", name="登录")
+_______________________________ test_case_12 ________________________________
+E   playwright._impl._errors.TimeoutError: Locator.fill: Timeout 5000ms exceeded.
+E   waiting for get_by_label("用户名")
+=========================== short test summary info ============================
+FAILED test_case_11.py::test_case_11
+FAILED test_case_12.py::test_case_12
+'''
+            results = runner._parse_suite_test_results(
+                stdout,
+                [
+                    {'test_case_id': 11, 'test_case_title': '登录'},
+                    {'test_case_id': 12, 'test_case_title': '输入用户'},
+                ],
+                ExecutionConfig(
+                    base_url='https://web.example.test',
+                    failure_screenshot_dir=screenshot_dir,
+                ),
+            )
+
+            first, second = results
+            self.assertIn('点击元素超时', first['error_message'])
+            self.assertIn('按钮“登录”', first['error_message'])
+            self.assertNotIn('用户名', first['log'])
+            self.assertIn('输入元素超时', second['error_message'])
+            self.assertIn('标签为“用户名”的输入项', second['error_message'])
+            self.assertNotIn('按钮“登录”', second['log'])
+            self.assertTrue(first['screenshot_path'].endswith('case_11.png'))
+            self.assertTrue(second['screenshot_path'].endswith('case_12.png'))
+        finally:
+            shutil.rmtree(screenshot_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

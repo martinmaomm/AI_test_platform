@@ -262,6 +262,7 @@ def materialize_script(
     headed: bool = True,
     base_url: Optional[str] = None,
     suite_name: Optional[str] = None,
+    failure_screenshot_path: Optional[str] = None,
 ) -> str:
     """Create the pytest file content for one async business script.
 
@@ -289,6 +290,7 @@ def materialize_script(
         safe_name = f"test_{safe_name}"
     browser_literal = repr(WEBUI_BROWSER_ENGINE)
     base_url_literal = repr(base_url) if base_url else "None"
+    screenshot_path_literal = repr(failure_screenshot_path) if failure_screenshot_path else "None"
     suite_decorator = f"@allure.suite({suite_name!r})\n" if suite_name else ""
     allure_import = "import allure\n" if suite_name else ""
 
@@ -308,6 +310,7 @@ import asyncio
     wrapper = f'''
 
 import asyncio
+import logging
 import os
 from playwright.async_api import async_playwright
 {allure_import}
@@ -323,6 +326,15 @@ async def _run_with_managed_browser():
         page = await context.new_page()
         try:
             await run(page)
+        except Exception:
+            if {screenshot_path_literal}:
+                try:
+                    await page.screenshot(path={screenshot_path_literal}, full_page=False)
+                except Exception as screenshot_error:
+                    logging.getLogger(__name__).warning(
+                        "失败截图生成失败: %s", screenshot_error
+                    )
+            raise
         finally:
             await context.close()
             await browser.close()

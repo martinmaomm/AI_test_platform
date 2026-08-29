@@ -381,6 +381,15 @@ export const getWebUITestSuiteExecution = async (projectId, executionId) => {
   return response.data.data
 }
 
+// 获取失败截图二进制数据。api 实例会通过请求拦截器自动携带当前 JWT。
+export const getWebUITestExecutionScreenshot = async (projectId, executionId, caseExecutionId = null) => {
+  const path = caseExecutionId == null
+    ? `/projects/${projectId}/web-testing/executions/${executionId}/screenshot/`
+    : `/projects/${projectId}/web-testing/executions/${executionId}/cases/${caseExecutionId}/screenshot/`
+  const response = await api.get(path, { responseType: 'blob' })
+  return response.data
+}
+
 // 删除执行记录
 export const deleteTestExecution = async (projectId, executionId) => {
   const response = await api.delete(`/projects/${projectId}/web-testing/executions/${executionId}/delete/`)

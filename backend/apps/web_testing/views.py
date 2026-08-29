@@ -6,6 +6,8 @@ import logging
 import os
 import json
 import uuid
+from django.conf import settings
+from django.http import FileResponse, Http404
 from rest_framework import generics, status, viewsets
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.permissions import IsAuthenticated
@@ -39,9 +41,11 @@ from .tasks import (
     generate_midscene_script_task,
     execute_webui_test_suite_task,
     cancel_task,
-    fill_locators_from_html_task
+    fill_locators_from_html_task,
+    _remove_failure_screenshots,
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
+from .execution_diagnostics import safe_screenshot_relative_path
 from .constants import (
     WEB_UI_ACTION_OPTIONS,
     WEBUI_BROWSER_ENGINE,
@@ -2497,7 +2501,7 @@ class TestExecutionCasesView(APIView):
                     'duration': ce.duration,
                     'error_message': ce.error_message,
                     'log': ce.log,
-                    'screenshot_path': ce.screenshot_path,
+                    'screenshot_path': safe_screenshot_relative_path(ce.screenshot_path),
                     'video_path': ce.video_path,
                     'stdout': ce.stdout,
                 }
@@ -2534,6 +2538,48 @@ class TestExecutionCasesView(APIView):
             return response(kind="error", message=f"获取套件子用例执行详情失败: {str(e)}")
 
 
+def _resolve_screenshot_file(relative_path, execution_id=None):
+    normalized = safe_screenshot_relative_path(relative_path)
+    if not normalized:
+        raise Http404('截图不存在')
+    if execution_id is not None:
+        expected_prefix = f'webui_failure_screenshots/execution_{int(execution_id)}/'
+        if not normalized.startswith(expected_prefix):
+            raise Http404('截图不存在')
+    media_root = os.path.realpath(str(settings.MEDIA_ROOT))
+    candidate = os.path.realpath(os.path.join(media_root, normalized))
+    if os.path.commonpath([media_root, candidate]) != media_root or not os.path.isfile(candidate):
+        raise Http404('截图不存在')
+    return candidate
+
+
+class TestExecutionScreenshotView(APIView):
+    """读取执行失败截图；路径仅来自有权限的执行记录。"""
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(REPORT)
+    def get(self, request, project_id, pk, case_pk=None):
+        execution = get_object_or_404(
+            WebUITestExecution, pk=pk, project_id=project_id
+        )
+        if execution.exec_type == 'case':
+            detail = getattr(execution, 'case_execution_detail', None)
+            screenshot_path = detail.screenshot_path if detail else None
+        elif case_pk is not None:
+            case_execution = get_object_or_404(
+                WebUITestSuiteCaseExecution,
+                pk=case_pk,
+                suite_execution__execution=execution,
+            )
+            screenshot_path = case_execution.screenshot_path
+        else:
+            raise Http404('套件执行需要指定子用例截图')
+        return FileResponse(
+            open(_resolve_screenshot_file(screenshot_path, execution.id), 'rb'),
+            content_type='image/png',
+        )
+
+
 class TestExecutionDeleteView(APIView):
     """执行记录删除视图 - 支持删除单用例和套件执行记录"""
     permission_classes = [IsAuthenticated]
@@ -2555,6 +2601,8 @@ class TestExecutionDeleteView(APIView):
             # 记录执行信息用于日志
             exec_type = execution.exec_type
             exec_name = execution.name
+
+            _remove_failure_screenshots(execution.id)
             
             # 删除相关的执行详情记录
             if exec_type == 'case' and hasattr(execution, 'case_execution_detail'):

@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from celery import shared_task
 from django.core.cache import cache
+from django.conf import settings
 from typing import Dict, Any
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -25,6 +26,7 @@ from .models import (
 )
 from projects.models import Environment, Project
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
+from .execution_diagnostics import friendly_failure_summary
 from .project_access import EDIT, get_project_for_user
 
 # 导入智能体
@@ -42,6 +44,57 @@ from celery.result import AsyncResult
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+
+def _failure_screenshot_paths(execution_id: int, filename: str):
+    """Return a controlled absolute/relative PNG path for one execution."""
+    root = os.path.abspath(os.path.join(str(settings.MEDIA_ROOT), 'webui_failure_screenshots'))
+    execution_dir = os.path.join(root, f'execution_{int(execution_id)}')
+    os.makedirs(execution_dir, exist_ok=True)
+    safe_filename = filename if filename.endswith('.png') and os.path.basename(filename) == filename else 'failure.png'
+    absolute = os.path.join(execution_dir, safe_filename)
+    relative = os.path.relpath(absolute, str(settings.MEDIA_ROOT)).replace(os.sep, '/')
+    return absolute, relative
+
+
+def _normalize_persisted_screenshot_path(execution_id: int, value):
+    """Accept only generated paths below this execution's controlled directory."""
+    if not value:
+        return None
+    text = str(value).replace('\\', '/')
+    expected_prefix = f'webui_failure_screenshots/execution_{int(execution_id)}/'
+    if os.path.isabs(text):
+        media_root = os.path.abspath(str(settings.MEDIA_ROOT))
+        candidate = os.path.abspath(text)
+        if os.path.commonpath([media_root, candidate]) != media_root:
+            return None
+        text = os.path.relpath(candidate, media_root).replace(os.sep, '/')
+    if not text.startswith(expected_prefix) or not text.endswith('.png'):
+        return None
+    filename = text[len(expected_prefix):]
+    if not filename or '/' in filename or filename in {'.', '..'}:
+        return None
+    return text
+
+
+def _remove_failure_screenshots(execution_id: int):
+    root = os.path.abspath(os.path.join(str(settings.MEDIA_ROOT), 'webui_failure_screenshots', f'execution_{int(execution_id)}'))
+    try:
+        shutil.rmtree(root)
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.warning('删除执行 %s 的失败截图目录失败', execution_id, exc_info=True)
+
+
+def _suite_case_error_message(case_result: dict):
+    if case_result.get('status') not in {'failed', 'error'}:
+        return case_result.get('error_message')
+    return friendly_failure_summary(
+        case_result.get('stdout', ''),
+        case_result.get('stderr', ''),
+        case_result.get('error_message', ''),
+    )
 
 
 # ============ WebUI测试脚本生成任务 ============
@@ -254,6 +307,15 @@ def _run_test_suite_from_db_workspace(
         base_url_val = (base_url or '').rstrip('/')
         if not base_url_val:
             raise ValueError("WebUI测试环境缺少基础URL")
+        failure_screenshot_dir = (options or {}).get('failure_screenshot_dir')
+        config = ExecutionConfig(
+            headed=normalized_options['headed'],
+            timeout=normalized_options['timeout'],
+            generate_allure=True,
+            base_url=base_url_val,
+            suite_name=suite_name,
+            failure_screenshot_dir=failure_screenshot_dir,
+        )
         test_files, skipped_results = _build_suite_workspace_from_db(
             project_id=project_id,
             test_cases_data=test_cases_data,
@@ -261,6 +323,7 @@ def _run_test_suite_from_db_workspace(
             suite_name=suite_name,
             base_url=base_url_val,
             headed=normalized_options['headed'],
+            failure_screenshot_dir=failure_screenshot_dir,
         )
 
         # 3. 统计 .py 文件数量，若为 0 则直接返回错误
@@ -286,19 +349,13 @@ def _run_test_suite_from_db_workspace(
         logger.info(f"[套件执行] Pytest 启动前 workspace 内容: {all_entries}")
 
         # 5. 执行 Pytest（复用 PlaywrightRunner 的 pytest 逻辑）
-        config = ExecutionConfig(
-            headed=normalized_options['headed'],
-            timeout=normalized_options['timeout'],
-            generate_allure=True,
-            base_url=base_url,
-            suite_name=suite_name,
-        )
         runner = PlaywrightRunner()
+        runner._create_pytest_config(work_dir, config)
         result = runner._run_pytest_command(work_dir, config)
 
         # 6. 解析结果、生成 Allure 报告、清理
         allure_report_path = runner._generate_report(work_dir, config) if config.generate_allure else None
-        parsed_case_results = runner._parse_suite_test_results(result.stdout, test_cases_data)
+        parsed_case_results = runner._parse_suite_test_results(result.stdout, test_cases_data, config)
         all_case_results = skipped_results + parsed_case_results
         execution_result = runner._build_execution_result(
             result, work_dir, allure_report_path, config, all_case_results
@@ -311,8 +368,11 @@ def _run_test_suite_from_db_workspace(
             'stdout': execution_result.stdout,
             'stderr': execution_result.stderr,
             'error': (
-                extract_execution_error(execution_result.stdout, execution_result.stderr)
-                if not execution_result.success else None
+                friendly_failure_summary(
+                    execution_result.stdout,
+                    execution_result.stderr,
+                    extract_execution_error(execution_result.stdout, execution_result.stderr),
+                ) if not execution_result.success else None
             ),
             'return_code': execution_result.return_code,
             'allure_report': execution_result.allure_report,
@@ -399,7 +459,12 @@ def _run_test_suite_script(test_cases_data: list, base_url: str = None, options:
         }
 
 
-def _run_test_script(script_content: str, base_url: str = None, options: dict = None) -> Dict[str, Any]:
+def _run_test_script(
+    script_content: str,
+    base_url: str = None,
+    options: dict = None,
+    failure_screenshot_path: str = None,
+) -> Dict[str, Any]:
     """
     运行测试脚本（使用Playwright执行器）
     """
@@ -421,7 +486,8 @@ def _run_test_script(script_content: str, base_url: str = None, options: dict = 
             script_id=script_id,
             script_content=script_content,
             base_url=base_url,
-            options=execution_options
+            options=execution_options,
+            failure_screenshot_path=failure_screenshot_path,
         )
         
         if result.get('success'):
@@ -435,7 +501,8 @@ def _run_test_script(script_content: str, base_url: str = None, options: dict = 
                     'stderr': result.get('stderr', ''),
                     'test_file': result.get('test_file', ''),
                     'return_code': result.get('return_code', 0),
-                    'allure_report': result.get('allure_report', '')
+                    'allure_report': result.get('allure_report', ''),
+                    'screenshot_path': result.get('screenshot_path'),
                 },
                 'log': result.get('stdout', '') if result.get('stdout') else '测试执行完成'
             }
@@ -451,7 +518,8 @@ def _run_test_script(script_content: str, base_url: str = None, options: dict = 
                     'stderr': result.get('stderr', ''),
                     'test_file': result.get('test_file', ''),
                     'return_code': result.get('return_code', 1),
-                    'allure_report': result.get('allure_report', '')
+                    'allure_report': result.get('allure_report', ''),
+                    'screenshot_path': result.get('screenshot_path'),
                 },
                 'log': result.get('stderr', '') if result.get('stderr') else '测试执行失败'
             }
@@ -545,7 +613,15 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         
         project_id = test_case.project.id
         managed_script = _compose_script_for_execution(script_content, project_id)
-        execution_result = _run_test_script(managed_script, base_url, options)
+        screenshot_absolute, screenshot_relative = _failure_screenshot_paths(
+            execution.id, 'single_case.png'
+        )
+        execution_result = _run_test_script(
+            managed_script,
+            base_url,
+            options,
+            failure_screenshot_path=screenshot_absolute,
+        )
         
         # 步骤5: 保存执行结果
         update_task_progress(task_instance, 80, '正在保存执行结果...')
@@ -554,6 +630,8 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         end_time = timezone.now()
         duration = (end_time - execution.start_time).total_seconds()
         
+        result_data = execution_result.get('result', {})
+
         # 更新执行状态和结果
         if execution_result.get('success'):
             execution.status = 'passed'
@@ -565,12 +643,16 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
             test_case.save(update_fields=['last_execute_status', 'last_execute_time'])
         else:
             execution.status = 'failed'
-            execution.error_message = execution_result.get('error') or '测试执行失败'
+            execution.error_message = friendly_failure_summary(
+                result_data.get('stdout', ''),
+                result_data.get('stderr', ''),
+                execution_result.get('error', ''),
+            )
             case_detail.status = 'failed'
             # 回写 WebUITestCase 执行状态：执行失败
             test_case.last_execute_status = 'failed'
             test_case.last_execute_time = timezone.now()
-            test_case.last_error_message = (execution_result.get('error') or '')[-500:]
+            test_case.last_error_message = execution.error_message[:500]
             test_case.save(update_fields=['last_execute_status', 'last_execute_time', 'last_error_message'])
         
         # 更新执行记录
@@ -580,15 +662,21 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         # 更新用例详情
         case_detail.end_time = end_time
         case_detail.duration = duration
-        case_detail.error_message = execution_result.get('error')
-        case_detail.log = execution_result.get('result', {}).get('stdout', '')
-        case_detail.stdout = execution_result.get('result', {}).get('stdout', '')
-        case_detail.stderr = execution_result.get('result', {}).get('stderr', '')
+        case_detail.error_message = execution.error_message if not execution_result.get('success') else None
+        raw_stdout = result_data.get('stdout', '')
+        raw_stderr = result_data.get('stderr', '')
+        case_detail.log = (
+            ('--- 标准输出 ---\n' + raw_stdout + '\n') if raw_stdout else ''
+        ) + (
+            ('--- 错误输出 ---\n' + raw_stderr) if raw_stderr else ''
+        )
         
         # 设置路径信息
-        result_data = execution_result.get('result', {})
-        if result_data.get('screenshot_path'):
-            case_detail.screenshot_path = result_data.get('screenshot_path')
+        persisted_screenshot = _normalize_persisted_screenshot_path(
+            execution.id, result_data.get('screenshot_path')
+        ) or _normalize_persisted_screenshot_path(execution.id, screenshot_relative)
+        if persisted_screenshot and os.path.exists(os.path.join(str(settings.MEDIA_ROOT), persisted_screenshot)):
+            case_detail.screenshot_path = persisted_screenshot
         if result_data.get('video_path'):
             case_detail.video_path = result_data.get('video_path')
         
@@ -611,7 +699,7 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
             'execution_status': execution.status,  # 保留执行状态用于详细信息
             'result': execution_result.get('result', {}),
             'log': execution_result.get('log', ''),
-            'error': execution_result.get('error', '')
+            'error': execution.error_message if execution.status != 'passed' else ''
         }
         
         logger.info(f"_execute_webui_test_case_logic 成功返回: {final_result}")
@@ -639,7 +727,7 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
             test_case = case_detail.test_case
             test_case.last_execute_status = 'failed'
             test_case.last_execute_time = timezone.now()
-            test_case.last_error_message = str(e)[-500:]
+            test_case.last_error_message = str(e)[:500]
             test_case.save(update_fields=['last_execute_status', 'last_execute_time', 'last_error_message'])
         except Exception:
             pass  # 忽略回写失败，避免掩盖原始异常
@@ -732,6 +820,7 @@ def _build_suite_workspace_from_db(
     suite_name: str = None,
     base_url: str = None,
     headed: bool = True,
+    failure_screenshot_dir: str = None,
 ) -> tuple:
     """
     从数据库直接搬运代码资产到标准化目录结构，不调用代码生成器。
@@ -810,6 +899,10 @@ def _build_suite_workspace_from_db(
                 headed=headed,
                 base_url=base_url,
                 suite_name=suite_name,
+                failure_screenshot_path=(
+                    os.path.join(failure_screenshot_dir, f'case_{test_case_id}.png')
+                    if failure_screenshot_dir else None
+                ),
             )
 
             with open(test_file, 'w', encoding='utf-8') as f:
@@ -824,17 +917,6 @@ def _build_suite_workspace_from_db(
                 'status': 'skipped',
                 'error_message': f'脚本写入失败: {str(e)}'
             })
-
-    # 5. 创建 pytest.ini
-    pytest_ini = os.path.join(work_dir, 'pytest.ini')
-    with open(pytest_ini, 'w', encoding='utf-8') as f:
-        f.write("""[pytest]
-base_url = http://localhost:8000
-testpaths = .
-python_files = test_*.py
-python_classes = Test*
-python_functions = test_*
-""")
 
     logger.info(f"[套件搬运] 完成: 测试文件 {len(test_files)} 个, 跳过 {len(skipped_results)} 个")
     return test_files, skipped_results
@@ -1660,9 +1742,12 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         exec_options = dict(options or {})
         exec_options['project_id'] = test_suite.project_id
         exec_options['suite_name'] = test_suite.name
+        screenshot_dir, _ = _failure_screenshot_paths(execution.id, 'placeholder.png')
+        exec_options['failure_screenshot_dir'] = os.path.dirname(screenshot_dir)
         suite_result = _run_test_suite_script(test_cases_data, base_url, exec_options)
         execution_results = []
         allure_report = ''
+        result_data = suite_result.get('result', {})
         
         if suite_result.get('success'):
             logger.info("测试套件批量执行成功")
@@ -1709,13 +1794,18 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
                     test_case=test_case,
                     name=test_case.title,
                     status=status,
-                    error_message=case_result.get('error_message')
+                    error_message=_suite_case_error_message(case_result),
+                    log=case_result.get('log') or case_result.get('stdout') or '',
+                    stdout=case_result.get('stdout') or '',
+                    screenshot_path=_normalize_persisted_screenshot_path(
+                        execution.id, case_result.get('screenshot_path')
+                    ),
                 )
                 
                 # 更新统计
                 if status == 'passed':
                     passed_cases += 1
-                elif status == 'failed':
+                elif status in {'failed', 'error'}:
                     failed_cases += 1
                 elif status == 'skipped':
                     skipped_cases += 1
@@ -1724,7 +1814,7 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
                     'test_case_id': test_case.id,
                     'test_case_title': test_case.title,
                     'status': status,
-                    'error_message': case_result.get('error_message'),
+                    'error_message': _suite_case_error_message(case_result),
                     'result': case_result
                 })
             
@@ -1751,10 +1841,13 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         else:
             logger.error(f"测试套件批量执行失败: {suite_result.get('error')}")
             execution.status = 'failed'
-            execution.error_message = suite_result.get('error', '测试套件执行失败')
+            execution.error_message = friendly_failure_summary(
+                result_data.get('stdout', ''),
+                result_data.get('stderr', ''),
+                suite_result.get('error', '测试套件执行失败'),
+            )
             
             # 即使失败也保存日志
-            result_data = suite_result.get('result', {})
             stdout = result_data.get('stdout', '')
             stderr = result_data.get('stderr', '')
             execution_log = f"=== 测试套件执行日志 ===\n"
@@ -1772,9 +1865,24 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
                 # 如果有解析结果，更新统计
                 for case_result in case_results:
                     status = case_result.get('status')
+                    test_case_id = case_result.get('test_case_id')
+                    test_case = next((tc for tc in test_cases if tc.id == test_case_id), None)
+                    if test_case:
+                        WebUITestSuiteCaseExecution.objects.create(
+                            suite_execution=suite_detail,
+                            test_case=test_case,
+                            name=test_case.title,
+                            status=status,
+                            error_message=_suite_case_error_message(case_result),
+                            log=case_result.get('log') or case_result.get('stdout') or '',
+                            stdout=case_result.get('stdout') or '',
+                            screenshot_path=_normalize_persisted_screenshot_path(
+                                execution.id, case_result.get('screenshot_path')
+                            ),
+                        )
                     if status == 'passed':
                         passed_cases += 1
-                    elif status == 'failed':
+                    elif status in {'failed', 'error'}:
                         failed_cases += 1
                     elif status == 'skipped':
                         skipped_cases += 1
@@ -1901,8 +2009,8 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
             return {
                 'success': False,
                 'status': 'completed',  # 任务执行完成，只是结果失败
-                'message': f'测试套件执行失败: {suite_result.get("error", "未知错误")}',
-                'error': suite_result.get('error', '测试套件执行失败'),
+                'message': f'测试套件执行失败: {execution.error_message}',
+                'error': execution.error_message,
                 'execution_id': execution_id,
                 'total_cases': total_cases,
                 'passed_cases': passed_cases,
@@ -1951,8 +2059,8 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         elif not suite_execution_succeeded:
             execution.status = 'failed'
             execution.error_message = (
-                suite_result.get('error')
-                or execution.error_message
+                execution.error_message
+                or suite_result.get('error')
                 or '测试套件执行失败'
             )
             final_message = f"测试套件执行失败: {execution.error_message}"

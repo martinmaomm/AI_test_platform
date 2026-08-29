@@ -20,6 +20,7 @@ from .constants import (
     normalize_webui_execution_options,
 )
 from .script_contract import materialize_script
+from .execution_diagnostics import diagnose_failure
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class ExecutionConfig:
     generate_allure: bool = False
     base_url: Optional[str] = None
     suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
+    failure_screenshot_path: Optional[str] = None
+    failure_screenshot_dir: Optional[str] = None
 
 
 @dataclass
@@ -69,7 +72,7 @@ class PlaywrightRunner:
         
         try:
             self._create_test_file(work_dir, script_content, config)
-            self._create_pytest_config(work_dir)
+            self._create_pytest_config(work_dir, config)
             result = self._run_pytest_command(work_dir, config)
             allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
             execution_result = self._build_execution_result(result, work_dir, allure_report_path, config)
@@ -101,10 +104,10 @@ class PlaywrightRunner:
                 logger.error(f"[套件执行] {error_msg}，跳过 Pytest 启动")
                 return self._build_error_result(error_msg, work_dir, config)
 
-            self._create_pytest_config(work_dir)
+            self._create_pytest_config(work_dir, config)
             result = self._run_pytest_command(work_dir, config)
             allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
-            parsed_case_results = self._parse_suite_test_results(result.stdout, test_cases_data)
+            parsed_case_results = self._parse_suite_test_results(result.stdout, test_cases_data, config)
             
             # 合并跳过的用例结果
             all_case_results = skipped_results + parsed_case_results
@@ -136,6 +139,7 @@ class PlaywrightRunner:
                 "test_webui_case",
                 headed=config.headed,
                 base_url=config.base_url,
+                failure_screenshot_path=config.failure_screenshot_path,
             ))
         return test_file
     
@@ -180,6 +184,10 @@ class PlaywrightRunner:
                         headed=config.headed,
                         base_url=config.base_url,
                         suite_name=suite_name,
+                        failure_screenshot_path=(
+                            os.path.join(config.failure_screenshot_dir, f'case_{test_case_id}.png')
+                            if config.failure_screenshot_dir else None
+                        ),
                     ))
                 logger.info(
                     f"[脚本生成] 用例 #{idx + 1} (id={test_case_id}, title={test_case_title}): 成功写入 {os.path.basename(test_file)}"
@@ -258,11 +266,17 @@ class PlaywrightRunner:
         
         return script_content
     
-    def _create_pytest_config(self, work_dir: str) -> None:
+    def _create_pytest_config(self, work_dir: str, config: ExecutionConfig) -> None:
         """创建pytest配置文件"""
+        raw_base_url = config.base_url or ''
+        if '\n' in raw_base_url or '\r' in raw_base_url:
+            raise ValueError('基础 URL 不能包含换行')
+        base_url = raw_base_url.strip()
+        if not base_url:
+            raise ValueError('测试环境缺少基础 URL')
         pytest_ini = os.path.join(work_dir, "pytest.ini")
-        config_content = """[pytest]
-base_url = http://localhost:8000
+        config_content = f"""[pytest]
+base_url = {base_url}
 testpaths = .
 python_files = test_*.py
 python_classes = Test*
@@ -461,7 +475,12 @@ python_functions = test_*
         
         return summary
 
-    def _parse_suite_test_results(self, stdout: str, test_cases_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _parse_suite_test_results(
+        self,
+        stdout: str,
+        test_cases_data: List[Dict[str, Any]],
+        config: Optional[ExecutionConfig] = None,
+    ) -> List[Dict[str, Any]]:
         """解析测试套件执行结果"""
         case_results = []
         parsed_case_ids = set()
@@ -470,27 +489,23 @@ python_functions = test_*
             stdout = ""
             logger.warning("Pytest stdout 为空，可能是执行崩溃或被异常中断")
 
-        for line in stdout.split('\n'):
-            line = line.strip()
-            
-            if 'test_case_' not in line or not any(status in line for status in ['PASSED', 'FAILED', 'SKIPPED']):
-                continue
-            
+        status_entries = []
+        status_pattern = re.compile(
+            r'^(test_case_(\d+)\.py)::[^\s]+\s+(PASSED|FAILED|SKIPPED|ERROR)\b',
+            re.I,
+        )
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            match = status_pattern.match(line)
+            if match:
+                status_entries.append((line, match.group(2), match.group(3).upper()))
+
+        failed_case_count = sum(
+            1 for _, _, status in status_entries if status in {'FAILED', 'ERROR'}
+        )
+
+        for line, test_case_id_str, status_part in status_entries:
             try:
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                
-                test_file_part = parts[0]
-                status_part = parts[1].upper()
-                
-                if 'test_case_' not in test_file_part:
-                    continue
-                
-                # 提取test_case_4.py中的4
-                file_name = test_file_part.split('::')[0]
-                test_case_id_str = file_name.replace('test_case_', '').replace('.py', '')
-                
                 if not test_case_id_str or test_case_id_str in parsed_case_ids:
                     continue
                 
@@ -504,23 +519,88 @@ python_functions = test_*
                 if 'PASSED' in status_part:
                     status, error_message = 'passed', None
                 elif 'FAILED' in status_part:
-                    status, error_message = 'failed', '测试执行失败'
+                    status = 'failed'
+                    case_output = self._extract_suite_case_failure(
+                        stdout, test_case_id_str, allow_full_output=failed_case_count == 1
+                    )
+                    diagnostic = diagnose_failure(case_output)
+                    error_message = diagnostic.summary
                 elif 'SKIPPED' in status_part:
                     status, error_message = 'skipped', '测试用例被跳过'
+                elif 'ERROR' in status_part:
+                    status = 'error'
+                    case_output = self._extract_suite_case_failure(
+                        stdout, test_case_id_str, allow_full_output=failed_case_count == 1
+                    )
+                    diagnostic = diagnose_failure(case_output)
+                    error_message = diagnostic.summary
                 else:
                     continue
+
+                case_log = (
+                    case_output if status in {'failed', 'error'} else line
+                )
+                screenshot_file = (
+                    os.path.join(config.failure_screenshot_dir, f'case_{test_case_id_str}.png')
+                    if config and config.failure_screenshot_dir else None
+                )
                 
                 case_results.append({
                     'test_case_id': int(test_case_id_str),
                     'test_case_title': case_data.get('test_case_title', f'Test Case {test_case_id_str}'),
                     'status': status,
-                    'error_message': error_message
+                    'error_message': error_message,
+                    'log': case_log,
+                    'stdout': case_log,
+                    'screenshot_path': (
+                        os.path.abspath(screenshot_file)
+                        if status in {'failed', 'error'} and screenshot_file and os.path.exists(screenshot_file)
+                        else None
+                    ),
                 })
             except (IndexError, ValueError) as e:
                 logger.debug(f"解析测试用例结果失败: {line}, 错误: {e}")
                 continue
         
         return case_results
+
+    @staticmethod
+    def _extract_suite_case_failure(
+        stdout: str,
+        test_case_id: str,
+        *,
+        allow_full_output: bool = False,
+    ) -> str:
+        """提取一个 Pytest 子用例的失败段落，避免把其他用例错误错误归属。"""
+        escaped_id = re.escape(str(test_case_id))
+        failure_header = re.compile(
+            rf'^_+\s+.*\btest_case_{escaped_id}\b.*\s+_+\s*$',
+            re.I | re.M,
+        )
+        match = failure_header.search(stdout or '')
+        if match:
+            remainder = stdout[match.start():]
+            next_section = re.search(
+                r'(?m)^(?:_+\s+.*\s+_+|=+\s+short test summary info\s+=+)\s*$',
+                remainder[match.end() - match.start():],
+            )
+            end = (
+                match.end() - match.start() + next_section.start()
+                if next_section else len(remainder)
+            )
+            return remainder[:end].strip()
+
+        summary_match = re.search(
+            rf'(?m)^(?:FAILED|ERROR)\s+test_case_{escaped_id}\.py::[^\n]+$',
+            stdout or '',
+            re.I,
+        )
+        if summary_match:
+            return summary_match.group(0).strip()
+
+        if allow_full_output:
+            return stdout or ''
+        return f'test_case_{test_case_id}.py 执行失败，未提取到独立错误段落'
 
 
 # 全局运行器实例
@@ -558,19 +638,26 @@ def extract_execution_error(stdout: str = '', stderr: str = '') -> str:
     return '测试执行失败，未获取到具体错误'
 
 
-def playwright_runner(script_id: str, script_content: str, base_url: str = None, options: Dict[str, Any] = None) -> Dict[str, Any]:
+def playwright_runner(
+    script_id: str,
+    script_content: str,
+    base_url: str = None,
+    options: Dict[str, Any] = None,
+    failure_screenshot_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """使用pytest执行Playwright Python测试脚本"""
     normalized_options = normalize_webui_execution_options(options)
     config = ExecutionConfig(
         headed=normalized_options['headed'],
         timeout=normalized_options['timeout'],
         generate_allure=True,
-        base_url=base_url
+        base_url=base_url,
+        failure_screenshot_path=failure_screenshot_path,
     )
     
     result = _runner.run_single_test(script_id, script_content, config)
     
-    error = None if result.success else extract_execution_error(result.stdout, result.stderr)
+    error = None if result.success else diagnose_failure(result.stdout, result.stderr).summary
     return {
         'success': result.success,
         'error': error,
@@ -584,7 +671,12 @@ def playwright_runner(script_id: str, script_content: str, base_url: str = None,
         'headed': result.config.headed,
         'timeout': result.config.timeout,
         'status': 'passed' if result.success else 'failed',
-        'test_summary': result.test_summary
+        'test_summary': result.test_summary,
+        'screenshot_path': (
+            result.config.failure_screenshot_path
+            if result.config.failure_screenshot_path and os.path.exists(result.config.failure_screenshot_path)
+            else None
+        )
     }
 
 
@@ -596,13 +688,17 @@ def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]]
         timeout=normalized_options['timeout'],
         generate_allure=True,
         base_url=base_url,
-        suite_name=options.get('suite_name') if options else None
+        suite_name=options.get('suite_name') if options else None,
+        failure_screenshot_dir=(options or {}).get('failure_screenshot_dir'),
     )
     
     result = _runner.run_suite_test(suite_id, test_cases_data, config)
 
     # 失败时提供明确的 error 字段，便于上层展示
-    error_msg = extract_execution_error(result.stdout, result.stderr) if not result.success else None
+    error_msg = (
+        diagnose_failure(result.stdout, result.stderr).summary
+        if not result.success else None
+    )
 
     return {
         'success': result.success,

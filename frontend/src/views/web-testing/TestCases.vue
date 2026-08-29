@@ -225,9 +225,6 @@
             >
               <template #content>
                 <div><strong style="color: #f56c6c;">❌ 执行失败</strong></div>
-                <div v-if="row.expected_result" style="margin-top: 6px; color: #e6a23c;">
-                  🎯 校验规则: {{ row.expected_result }}
-                </div>
                 <div style="margin-top: 6px; max-width: 350px; white-space: pre-wrap; line-height: 1.4;">
                   {{ row.last_error_message || '未知错误，请查看执行详情' }}
                 </div>

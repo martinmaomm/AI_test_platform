@@ -9,6 +9,7 @@ from .models import (
     WebPage, WebElement
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
+from .execution_diagnostics import safe_screenshot_relative_path
 
 
 class WebPageSerializer(serializers.ModelSerializer):
@@ -396,6 +397,7 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
     environment_base_url = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
+    screenshot_path = serializers.SerializerMethodField()
     
     class Meta:
         model = WebUITestCaseExecutionDetail
@@ -414,6 +416,9 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
             return web_config.get('base_url', '') if web_config else ''
         return ''
 
+    def get_screenshot_path(self, obj):
+        return safe_screenshot_relative_path(obj.screenshot_path)
+
 
 class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
     """套件用例执行明细序列化器"""
@@ -428,3 +433,8 @@ class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
             'error_message', 'log', 'screenshot_path', 'video_path', 'stdout'
         ]
         read_only_fields = ['id', 'suite_execution']
+
+    screenshot_path = serializers.SerializerMethodField()
+
+    def get_screenshot_path(self, obj):
+        return safe_screenshot_relative_path(obj.screenshot_path)

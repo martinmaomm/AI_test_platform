@@ -465,7 +465,7 @@ class GenerateMidSceneScriptView(APIView):
     """
     permission_classes = [IsAuthenticated]
     
-    @project_access_required(EDIT)
+    @project_access_required(EDIT, expected_project_type='app')
     def post(self, request, project_id):
         try:
             # 验证输入数据
@@ -475,8 +475,12 @@ class GenerateMidSceneScriptView(APIView):
             if not description:
                 return response(kind="error", message="请输入测试场景描述")
             
-            from projects.models import Project
-            project = get_project_for_user(project_id, request.user, EDIT)
+            project = get_project_for_user(
+                project_id,
+                request.user,
+                EDIT,
+                expected_project_type='app',
+            )
             
             # 创建MidScene脚本记录
             script_name = f"MidScene脚本_{timezone.now().strftime('%Y%m%d_%H%M%S')}"
@@ -517,7 +521,7 @@ class GenerateMidSceneScriptView(APIView):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-@project_access_required(REPORT)
+@project_access_required(REPORT, expected_project_type='app')
 def get_midscene_script(request, project_id, script_id):
     """
     获取MidScene脚本详情
@@ -557,7 +561,7 @@ def get_midscene_script(request, project_id, script_id):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-@project_access_required(READ)
+@project_access_required(READ, expected_project_type='app')
 def list_midscene_scripts(request, project_id):
     """
     获取MidScene脚本列表

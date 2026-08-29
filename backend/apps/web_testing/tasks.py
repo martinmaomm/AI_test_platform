@@ -1,6 +1,6 @@
 """
 Web Testing Celery异步任务
-统一管理WebUI测试、MidScene脚本生成和执行等任务
+统一管理 WebUI 脚本生成、Python Playwright 测试执行和 MidScene 脚本生成等任务。
 """
 import json
 import logging
@@ -8,21 +8,19 @@ import asyncio
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from celery import shared_task
 from django.core.cache import cache
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
-from datetime import timedelta
 
 # 导入模型
 from .models import (
     MidSceneScript, WebUITestCase, WebUITestExecution,
-    WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
+    WebUITestSuiteCaseExecution,
     WebPage, WebElement, WebUITestModule
 )
 from projects.models import Environment, Project
@@ -227,130 +225,7 @@ def _execute_webui_script_generation_from_testcase(task_instance, test_case_id: 
         return build_error_result(None, error_msg)
 
 
-# ============ WebUI测试执行任务 ============
-
-@shared_task(bind=True, name='web_testing.execute_webui_test')
-def execute_webui_test_task(self, execution_id: int, user_id: int):
-    """
-    执行WebUI测试的异步任务
-    
-    Args:
-        execution_id: WebUI测试执行记录ID
-        user_id: 用户ID
-    
-    Returns:
-        Dict: 任务执行结果
-    """
-    return execute_async_task_with_websocket(
-        self,
-        'webui_test_execution',
-        _execute_webui_test_logic,
-        execution_id, user_id
-    )
-
-
-def _execute_webui_test_logic(task_instance, execution_id: int, user_id: int) -> Dict[str, Any]:
-    """
-    执行WebUI测试逻辑
-    """
-    try:
-        # 步骤1: 获取执行记录和脚本
-        update_task_progress(task_instance, 10, '正在获取测试信息...')
-        execution = WebUITestExecution.objects.get(id=execution_id)
-        script = execution.script
-        
-        # 更新执行状态
-        execution.task_id = task_instance.request.id
-        execution.status = 'running'
-        execution.started_at = timezone.now()
-        execution.save()
-        
-        # 步骤2: 执行测试脚本
-        update_task_progress(task_instance, 30, '正在执行WebUI测试...')
-        
-        # 使用Playwright执行器执行脚本
-        managed_script = _compose_script_for_execution(script.test_script_content, script.project_id)
-        execution_result = _run_test_script(managed_script, script.url)
-        
-        # 步骤3: 保存执行结果
-        update_task_progress(task_instance, 80, '正在保存执行结果...')
-        
-        # 获取执行结果详情
-        result_data = execution_result.get('result', {})
-        allure_report = result_data.get('allure_report', '')
-        stdout = result_data.get('stdout', '')
-        stderr = result_data.get('stderr', '')
-        
-        # 构建完整的执行日志
-        execution_log = f"=== 测试执行日志 ===\n"
-        if stdout:
-            execution_log += f"\n--- 标准输出 ---\n{stdout}\n"
-        if stderr:
-            execution_log += f"\n--- 错误输出 ---\n{stderr}\n"
-        
-        # 更新执行记录
-        execution.completed_at = timezone.now()
-        if execution.started_at:
-            duration = (execution.completed_at - execution.started_at).total_seconds()
-            execution.duration = duration
-        
-        # 保存日志和报告路径
-        if allure_report:
-            execution.report_path = allure_report
-        execution.log_path = result_data.get('test_file', '')  # 保存工作目录路径
-        
-        if execution_result.get('success'):
-            execution.status = 'passed'
-            execution.save()
-            
-            logger.info(f"WebUI测试执行完成: {task_instance.request.id}")
-            return {
-                'success': True,
-                'status': 'completed',
-                'message': 'WebUI测试执行成功',
-                'execution_id': execution_id,
-                'result': result_data,
-                'log': execution_log
-            }
-        else:
-            execution.status = 'failed'
-            execution.error_message = execution_result.get('error', '测试执行失败')
-            execution.save()
-            
-            logger.error(f"WebUI测试执行失败: {task_instance.request.id}, error: {execution_result.get('error')}")
-            return {
-                'success': False,
-                'status': 'completed',  # 任务执行完成，只是结果失败
-                'message': f'WebUI测试执行失败: {execution_result.get("error", "未知错误")}',
-                'error': execution_result.get('error', '未知错误'),
-                'execution_id': execution_id,
-                'result': result_data,
-                'log': execution_log
-            }
-            
-    except WebUITestExecution.DoesNotExist as e:
-        error_msg = f"测试执行记录不存在: {str(e)}"
-        logger.error(error_msg)
-        return build_error_result(None, error_msg)
-        
-    except Exception as e:
-        error_msg = f"WebUI测试执行任务异常: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        
-        # 更新失败状态
-        try:
-            execution = WebUITestExecution.objects.get(id=execution_id)
-            execution.status = 'failed'
-            execution.error_message = str(e)
-            execution.completed_at = timezone.now()
-            execution.save()
-        except:
-            pass
-        
-        return build_error_result(None, error_msg)
-
-
-
+# ============ Python Playwright测试执行辅助逻辑 ============
 
 def _run_test_suite_from_db_workspace(
     project_id: int,
@@ -1348,7 +1223,12 @@ def _execute_midscene_script_generation(task_instance, script_id: int, user_id: 
         # 步骤1: 获取用户、项目和脚本记录
         update_task_progress(task_instance, 10, '正在获取用户和项目信息...')
         user = User.objects.get(id=user_id)
-        project = get_project_for_user(project_id, user, EDIT)
+        project = get_project_for_user(
+            project_id,
+            user,
+            EDIT,
+            expected_project_type='app',
+        )
         script = MidSceneScript.objects.get(id=script_id, project_id=project_id)
         
         # 更新任务状态

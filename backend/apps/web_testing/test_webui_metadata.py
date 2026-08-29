@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from projects.models import Environment, Project, ProjectMember
 
 from .models import (
+    MidSceneScript,
     WebPage,
     WebUITestCase,
     WebUITestCaseExecutionDetail,
@@ -27,6 +28,7 @@ from .views import (
     TestExecutionDeleteView,
     ExecuteWebUITestCaseView,
     ExecuteWebUITestSuiteView,
+    GenerateMidSceneScriptView,
     WebUITestCaseListCreateView,
     WebUITestSuiteAddTestCaseView,
     WebPageViewSet,
@@ -185,6 +187,48 @@ class WebUIProjectAccessTests(TestCase):
             get_project_for_user(self.project.id, self.member, 'execute')
         with self.assertRaises(Http404):
             get_project_for_user(self.project.id, self.other, READ)
+
+    def test_api_project_is_hidden_from_webui_interface(self):
+        api_project = Project.objects.create(
+            name='API project must not expose WebUI APIs',
+            project_type='api',
+            owner=self.owner,
+            created_by=self.owner,
+        )
+        request = APIRequestFactory().get('/test-cases/')
+        force_authenticate(request, user=self.owner)
+
+        result = WebUITestCaseListCreateView.as_view()(
+            request, project_id=api_project.id
+        )
+
+        self.assertEqual(result.status_code, 404)
+
+    @patch('web_testing.views.generate_midscene_script_task.delay')
+    def test_midscene_generation_remains_available_for_app_project(self, delay):
+        delay.return_value = SimpleNamespace(id='midscene-task')
+        app_project = Project.objects.create(
+            name='App project keeps MidScene access',
+            project_type='app',
+            owner=self.owner,
+            created_by=self.owner,
+        )
+        request = APIRequestFactory().post(
+            '/midscene/generate/',
+            {'description': 'inspect the app screen', 'screenshot_b64': ''},
+            format='json',
+        )
+        force_authenticate(request, user=self.owner)
+
+        result = GenerateMidSceneScriptView.as_view()(
+            request, project_id=app_project.id
+        )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(result.data['success'])
+        self.assertTrue(
+            MidSceneScript.objects.filter(project=app_project).exists()
+        )
 
     def test_case_create_rejects_payload_project_different_from_url(self):
         other_project = Project.objects.create(

@@ -230,12 +230,6 @@ export const stopWebUITestScriptFromTestCase = async (projectId, taskId) => {
 
 // ============ WebUI测试执行管理 ============
 
-// 执行WebUI测试脚本
-export const executeWebUITest = async (projectId, scriptId) => {
-  const response = await api.post(`/projects/${projectId}/web-testing/scripts/${scriptId}/execute/`)
-  return response.data
-}
-
 // 执行WebUI测试用例
 export const executeWebUITestCase = async (projectId, testCaseId, data = {}) => {
   const response = await api.post(`/projects/${projectId}/web-testing/test-cases/${testCaseId}/execute/`, data)

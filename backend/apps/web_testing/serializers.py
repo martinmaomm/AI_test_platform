@@ -9,7 +9,6 @@ from .models import (
     WebPage, WebElement
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
-from .constants import WEBUI_BROWSER_ENGINE
 
 
 class WebPageSerializer(serializers.ModelSerializer):
@@ -387,31 +386,6 @@ class WebUITestSuiteAddTestCaseSerializer(serializers.Serializer):
             raise serializers.ValidationError(f"测试用例不存在或无权限访问: {list(missing_cases)}")
         
         return value
-
-
-class WebUITestExecutionCreateSerializer(serializers.ModelSerializer):
-    """WebUI测试执行创建序列化器"""
-    project_id = serializers.IntegerField(read_only=True)
-    
-    class Meta:
-        model = WebUITestExecution
-        fields = [
-            'exec_type', 'name', 'description', 'trigger_type', 'environment', 'browser', 'project_id'
-        ]
-        read_only_fields = ['project_id', 'browser']
-        extra_kwargs = {
-            'exec_type': {'required': True},
-            'name': {'required': True},
-            'description': {'required': False, 'allow_blank': True},
-            'trigger_type': {'required': False, 'default': 'manual'},
-            'environment': {'required': False}
-        }
-    
-    def create(self, validated_data):
-        # 自动设置执行者
-        validated_data['executor'] = self.context['request'].user
-        validated_data['browser'] = WEBUI_BROWSER_ENGINE
-        return super().create(validated_data)
 
 
 class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):

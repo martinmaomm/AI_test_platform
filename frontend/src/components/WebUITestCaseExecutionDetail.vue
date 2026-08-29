@@ -4,6 +4,10 @@
     <div class="report-content">
       <!-- 主内容区域 -->
       <div class="main-content">
+        <div v-if="execution.error_message" class="execution-error">
+          <strong>执行失败：</strong>
+          <span>{{ execution.error_message }}</span>
+        </div>
         <!-- 概览内容 -->
         <div class="overview-section">
           <div class="overview-grid">
@@ -29,7 +33,7 @@
                 </div>
                 <div class="info-item">
                   <span class="label">Browser:</span>
-                  <span class="value">{{ getBrowserText(execution.browser) }}</span>
+                  <span class="value">Chrome</span>
                 </div>
                   <div class="info-item">
                     <span class="label">Start Time:</span>
@@ -102,11 +106,6 @@ const formatDuration = (duration) => {
   return duration
 }
 
-const getBrowserText = (browser) => {
-  const texts = { chrome: 'Chrome', firefox: 'Firefox', safari: 'Safari', chromium: 'Chromium' }
-  return texts[browser] || browser || 'Unknown'
-}
-
 const getEnvironmentText = (name, baseUrl) => {
   if (!name && !baseUrl) return 'N/A'
   if (name && baseUrl) {
@@ -173,6 +172,17 @@ const copyLogs = () => {
   padding: 24px;
   height: 100%;
   overflow-y: auto;
+}
+
+.execution-error {
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  color: #b42318;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #fef3f2;
+  border: 1px solid #fecdca;
+  border-radius: 6px;
 }
 
 @keyframes fadeIn {

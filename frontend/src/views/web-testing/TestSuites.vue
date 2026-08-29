@@ -426,14 +426,11 @@
         </div>
 
         <div class="config-section">
-          <h4>浏览器配置</h4>
+          <h4>执行配置</h4>
           <el-form :model="executeForm" label-width="120px">
-            <el-form-item label="浏览器类型">
-              <el-select v-model="executeForm.browser" style="width: 200px">
-                <el-option label="Chromium" value="chromium" />
-                <el-option label="Firefox" value="firefox" />
-                <el-option label="WebKit" value="webkit" />
-              </el-select>
+            <el-form-item label="浏览器">
+              <el-tag type="success">Chrome</el-tag>
+              <span class="fixed-browser-tip">WebUI 自动化统一使用 Chrome</span>
             </el-form-item>
 
             <el-form-item label="显示模式">
@@ -629,7 +626,6 @@ const suiteForm = ref({
 })
 
 const executeForm = ref({
-  browser: 'chromium',
   headed: true,
   timeout: 300
 })
@@ -1146,7 +1142,10 @@ const confirmExecute = async () => {
     // 构建执行选项，包含环境配置
     const executionOptions = {
       environment_id: selectedEnvironment.value.id,
-      options: executeForm.value
+      options: {
+        headed: executeForm.value.headed,
+        timeout: executeForm.value.timeout
+      }
     }
 
     const response = await webTestingApi.executeTestSuite(selectedProject.value.id, selectedSuite.value.id, executionOptions)
@@ -1246,6 +1245,13 @@ const goToProjects = () => {
 
 // ============ 任务轮询相关方法 ============
 
+const escapeHtml = (value) => String(value || '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#039;')
+
 // 开始轮询任务状态
 const startTaskPolling = (taskId, executionId, testSuiteName, testSuiteId) => {
   // 存储任务信息
@@ -1317,6 +1323,7 @@ const checkTaskStatus = async (taskId) => {
 
         // 优化成功判断：要有总用例，且失败数为0
         const isSuccess = ['COMPLETED', 'SUCCESS'].includes(statusUpper) && total > 0 && failed === 0
+        const realError = taskResult.error || taskResult.message || result.data.error || message || '测试套件执行失败'
 
         // 3. 弹出右下角富文本通知
         ElNotification({
@@ -1325,6 +1332,7 @@ const checkTaskStatus = async (taskId) => {
             <p style="margin: 0 0 5px 0;"><strong>任务：</strong>${taskInfo.testSuiteName || '测试套件'}</p>
             <p style="margin: 0 0 5px 0;"><strong>结论：</strong><span style="color: ${isSuccess ? '#67C23A' : '#F56C6C'}">${isSuccess ? '测试通过' : '测试未通过'}</span></p>
             <p style="margin: 0 0 10px 0;"><strong>通过率：</strong>${passRate}% (${passed}/${total})</p>
+            ${isSuccess ? '' : `<p style="margin: 0 0 10px 0; color: #F56C6C;"><strong>错误：</strong>${escapeHtml(realError)}</p>`}
             <p style="margin: 0; font-size: 12px; color: #409EFF; cursor: pointer; text-decoration: underline;" onclick="document.getElementById('hidden-nav-btn')?.click()">点击前往「测试执行记录」查看详情</p>
           </div>`,
           dangerouslyUseHTMLString: true,
@@ -1825,6 +1833,12 @@ onUnmounted(() => {
 
 .test-case-info strong {
   color: #303133;
+}
+
+.fixed-browser-tip {
+  margin-left: 8px;
+  color: #909399;
+  font-size: 12px;
 }
 
 /* 环境选择器样式 */

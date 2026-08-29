@@ -18,12 +18,12 @@
             </el-icon>
           </div>
           <div class="header-text">
-            <h2>项目环境管理</h2>
-            <p>管理项目的不同环境配置，如开发、测试、生产环境</p>
+            <h2>{{ environmentCategoryLabel }}环境管理</h2>
+            <p>管理当前测试工作区的开发、测试、生产环境配置</p>
           </div>
         </div>
         <div class="header-actions">
-          <el-button type="primary" icon="Plus" @click="openCreateDialog" class="create-btn">
+          <el-button type="primary" icon="Plus" @click="openCreateDialog" :disabled="!hasLockedEnvironmentCategory" class="create-btn">
             新建环境
           </el-button>
         </div>
@@ -73,7 +73,7 @@
         <el-table-column prop="category_display" label="环境类型" width="120">
           <template #default="scope">
             <el-tag :type="getEnvironmentTypeTagType(scope.row.category)" size="small">
-              {{ scope.row.category_display }}
+              {{ environmentCategoryLabel }}
             </el-tag>
           </template>
         </el-table-column>
@@ -185,18 +185,23 @@
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="环境类型" prop="category">
-              <el-select v-model="environmentForm.category" placeholder="选择环境类型" @change="onEnvironmentTypeChange">
-                <el-option label="API测试环境" value="api" />
-                <el-option label="WebUI测试环境" value="web" />
-                <el-option label="App测试环境" value="app" />
-              </el-select>
+            <el-form-item label="环境类型">
+              <div class="locked-category">
+                <el-tag :type="getEnvironmentTypeTagType(environmentCategory)">
+                  {{ environmentCategoryLabel }}
+                </el-tag>
+                <span>由当前工作区锁定</span>
+              </div>
             </el-form-item>
           </el-col>
         </el-row>
 
         <el-form-item label="环境描述" prop="description">
           <el-input v-model="environmentForm.description" type="textarea" :rows="2" placeholder="输入环境描述" />
+        </el-form-item>
+
+        <el-form-item label="启用状态" prop="is_active">
+          <el-switch v-model="environmentForm.is_active" active-text="启用" inactive-text="停用" />
         </el-form-item>
 
         <!-- API 配置 -->
@@ -226,38 +231,12 @@
         <!-- WebUI 配置 -->
         <div v-if="environmentForm.category === 'web'">
           <el-divider content-position="left">WebUI 配置</el-divider>
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="基础URL" prop="config.base_url">
-                <el-input v-model="environmentForm.config.base_url" placeholder="如：https://web-dev.example.com" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="浏览器" prop="config.browser">
-                <el-select v-model="environmentForm.config.browser" placeholder="选择浏览器">
-                  <el-option label="Chrome" value="chrome" />
-                  <el-option label="Firefox" value="firefox" />
-                  <el-option label="Safari" value="safari" />
-                  <el-option label="Edge" value="edge" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-          </el-row>
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="隐式等待" prop="config.implicit_wait">
-                <el-input-number v-model="environmentForm.config.implicit_wait" :min="1" :max="60" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="页面加载超时" prop="config.page_load_timeout">
-                <el-input-number v-model="environmentForm.config.page_load_timeout" :min="1" :max="300" />
-              </el-form-item>
-            </el-col>
-          </el-row>
-          <el-form-item label="浏览器选项" prop="config.options">
-            <el-input v-model="environmentForm.config.options" type="textarea" :rows="3"
-              placeholder="JSON格式的浏览器选项，如：{'headless': false, 'window_size': '1920x1080'}" />
+          <el-form-item label="基础URL" prop="config.base_url">
+            <el-input v-model="environmentForm.config.base_url" placeholder="如：https://web-dev.example.com" />
+          </el-form-item>
+          <el-form-item label="环境变量" prop="config.variables">
+            <el-input v-model="environmentForm.config.variables" type="textarea" :rows="4"
+              placeholder="JSON格式的环境变量，如：{&quot;USERNAME&quot;: &quot;admin&quot;}" />
           </el-form-item>
         </div>
 
@@ -356,54 +335,110 @@ const currentPage = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
 
-// 默认环境配置
-const getDefaultEnvironmentConfig = () => ({
-  name: '',
-  description: '',
-  category: 'api',
-  is_active: true,
-  config: {
-    // API配置
-    base_url: '',
-    headers: '{}',
-    variables: '{}',
-    timeout: 30,
-    verify_ssl: true,
-    // WebUI配置
-    browser: 'chrome',
-    options: '{}',
-    implicit_wait: 10,
-    page_load_timeout: 30,
-    // App配置
-    platform: 'android',
-    device_name: '',
-    app_package: '',
-    app_activity: '',
-    capabilities: '{}',
-    appium_server_url: 'http://localhost:4723'
-  }
+// 计算属性
+const selectedProject = computed(() => projectStore.currentProject)
+
+// 环境类别由当前路由或项目类型决定，不允许在表单中跨类别切换。
+const normalizeEnvironmentCategory = (value) => {
+  const category = String(value || '').trim().toLowerCase().replace(/[-_]/g, '')
+  if (category === 'api') return 'api'
+  if (['web', 'webui'].includes(category)) return 'web'
+  if (category === 'app') return 'app'
+  return null
+}
+
+const environmentCategory = computed(() => {
+  const routeCategory = normalizeEnvironmentCategory(route.meta?.environmentCategory)
+  if (routeCategory) return routeCategory
+
+  // 兼容当前路由尚未配置 environmentCategory 的情况。
+  const routeModuleCategory = normalizeEnvironmentCategory(route.meta?.module)
+  if (routeModuleCategory) return routeModuleCategory
+
+  return normalizeEnvironmentCategory(selectedProject.value?.project_type)
 })
+
+const environmentCategoryLabel = computed(() => {
+  const labelMap = {
+    api: 'API测试',
+    web: 'WebUI测试',
+    app: 'App测试'
+  }
+  return labelMap[environmentCategory.value] || '项目'
+})
+
+const hasLockedEnvironmentCategory = computed(() => Boolean(environmentCategory.value))
+
+// 默认环境配置。表单只初始化当前类别实际会使用的字段。
+const getDefaultEnvironmentConfig = (category = environmentCategory.value || 'web') => {
+  const base = {
+    name: '',
+    description: '',
+    category,
+    is_active: true,
+    config: {
+      variables: '{}'
+    }
+  }
+
+  if (category === 'api') {
+    base.config = {
+      base_url: '',
+      headers: '{}',
+      variables: '{}',
+      timeout: 30,
+      verify_ssl: true
+    }
+  } else if (category === 'app') {
+    base.config = {
+      platform: 'android',
+      device_name: '',
+      app_package: '',
+      app_activity: '',
+      capabilities: '{}',
+      appium_server_url: 'http://localhost:4723',
+      variables: '{}'
+    }
+  } else {
+    base.config = {
+      base_url: '',
+      variables: '{}'
+    }
+  }
+
+  return base
+}
 
 // 表单
 const environmentForm = reactive(getDefaultEnvironmentConfig())
 
 const environmentFormRef = ref(null)
 
+const validateJson = (rule, value, callback) => {
+  if (!value || !String(value).trim()) {
+    callback()
+    return
+  }
+  try {
+    JSON.parse(value)
+    callback()
+  } catch (e) {
+    callback(new Error('请输入正确的JSON格式'))
+  }
+}
+
 const environmentRules = {
   name: [
     { required: true, message: '请输入环境名称', trigger: 'blur' },
     { min: 2, max: 100, message: '环境名称长度在 2 到 100 个字符', trigger: 'blur' }
   ],
-  category: [
-    { required: true, message: '请选择环境类型', trigger: 'change' }
-  ],
   'config.base_url': [
     {
       validator: (rule, value, callback) => {
-        if (environmentForm.category === 'api' || environmentForm.category === 'web') {
-          if (!value || !value.trim()) {
+        if (['api', 'web'].includes(environmentForm.category)) {
+          if (!value || !String(value).trim()) {
             callback(new Error(`${environmentForm.category === 'api' ? 'API' : 'WebUI'}环境必须配置基础URL`))
-          } else if (!/^https?:\/\/.+/.test(value)) {
+          } else if (!/^https?:\/\/.+/.test(String(value).trim())) {
             callback(new Error('请输入正确的URL格式'))
           } else {
             callback()
@@ -415,15 +450,14 @@ const environmentRules = {
       trigger: 'blur'
     }
   ],
+  'config.variables': [{ validator: validateJson, trigger: 'blur' }],
+  'config.headers': [{ validator: validateJson, trigger: 'blur' }],
+  'config.capabilities': [{ validator: validateJson, trigger: 'blur' }],
   'config.app_package': [
     {
       validator: (rule, value, callback) => {
-        if (environmentForm.category === 'app') {
-          if (!value || !value.trim()) {
-            callback(new Error('App环境必须配置包名'))
-          } else {
-            callback()
-          }
+        if (environmentForm.category === 'app' && (!value || !String(value).trim())) {
+          callback(new Error('App环境必须配置包名'))
         } else {
           callback()
         }
@@ -434,63 +468,8 @@ const environmentRules = {
   'config.app_activity': [
     {
       validator: (rule, value, callback) => {
-        if (environmentForm.category === 'app' && environmentForm.config.platform === 'android') {
-          if (!value || !value.trim()) {
-            callback(new Error('Android环境必须配置启动Activity'))
-          } else {
-            callback()
-          }
-        } else {
-          callback()
-        }
-      },
-      trigger: 'blur'
-    }
-  ],
-  'api_config.headers': [
-    {
-      validator: (rule, value, callback) => {
-        if (value && value.trim()) {
-          try {
-            JSON.parse(value)
-            callback()
-          } catch (e) {
-            callback(new Error('请输入正确的JSON格式'))
-          }
-        } else {
-          callback()
-        }
-      },
-      trigger: 'blur'
-    }
-  ],
-  'web_config.options': [
-    {
-      validator: (rule, value, callback) => {
-        if (value && value.trim()) {
-          try {
-            JSON.parse(value)
-            callback()
-          } catch (e) {
-            callback(new Error('请输入正确的JSON格式'))
-          }
-        } else {
-          callback()
-        }
-      },
-      trigger: 'blur'
-    }
-  ],
-  'app_config.capabilities': [
-    {
-      validator: (rule, value, callback) => {
-        if (value && value.trim()) {
-          try {
-            JSON.parse(value)
-            callback()
-          } catch (e) {
-            callback(new Error('请输入正确的JSON格式'))
-          }
+        if (environmentForm.category === 'app' && environmentForm.config.platform === 'android' && (!value || !String(value).trim())) {
+          callback(new Error('Android环境必须配置启动Activity'))
         } else {
           callback()
         }
@@ -500,9 +479,6 @@ const environmentRules = {
   ]
 }
 
-// 计算属性
-const selectedProject = computed(() => projectStore.currentProject)
-
 // 本地状态
 const environments = ref([])
 const envVarDrafts = reactive({})
@@ -510,7 +486,7 @@ const isSavingVar = ref(false)
 
 // 工具方法
 const getBaseUrl = (environment) => {
-  if (environment.config?.base_url) return environment.config.base_url
+  if (environment?.config?.base_url) return environment.config.base_url
   return null
 }
 
@@ -619,41 +595,114 @@ const deleteVar = async (environment, key) => {
 }
 
 const updateEnvironmentVariables = async (environment, variables) => {
-  const updateData = {
-    name: environment.name,
-    description: environment.description,
-    category: environment.category,
-    is_active: environment.is_active,
+  const updateData = buildEnvironmentPayload({
+    ...environment,
     config: {
       ...(environment.config || {}),
       variables
     }
-  }
+  })
   await updateProjectEnvironment(projectStore.currentProjectId, environment.id, updateData)
-  environment.config = {
-    ...(environment.config || {}),
-    variables
-  }
+  environment.category = updateData.category
+  environment.config = updateData.config
   ensureVarDrafts(environment)
 }
 
 // JSON字段处理工具函数
 const parseJsonField = (value, defaultValue = '{}') => {
-  if (!value || !value.trim()) return defaultValue
+  if (value === null || value === undefined) return defaultValue
+  if (typeof value === 'object') return value
+  if (!String(value).trim()) return defaultValue
   try {
-    return JSON.parse(value)
+    return JSON.parse(String(value))
   } catch (e) {
     return defaultValue
   }
 }
 
 const stringifyJsonField = (value, defaultValue = '{}') => {
-  if (!value) return defaultValue
+  if (value === null || value === undefined) return defaultValue
   if (typeof value === 'string') return value
   try {
     return JSON.stringify(value, null, 2)
   } catch (e) {
     return defaultValue
+  }
+}
+
+// 根据环境类别裁剪配置字段，避免编辑/保存时把其他工作区的字段带回后端。
+const getEnvironmentConfigPayload = (category, config = {}) => {
+  const variables = parseJsonField(config.variables, {})
+
+  if (category === 'api') {
+    return {
+      base_url: String(config.base_url || '').trim(),
+      headers: parseJsonField(config.headers, {}),
+      variables,
+      timeout: Number(config.timeout) || 30,
+      verify_ssl: config.verify_ssl !== false
+    }
+  }
+
+  if (category === 'app') {
+    return {
+      platform: config.platform || 'android',
+      device_name: config.device_name || '',
+      app_package: config.app_package || '',
+      app_activity: config.app_activity || '',
+      capabilities: parseJsonField(config.capabilities, {}),
+      appium_server_url: config.appium_server_url || 'http://localhost:4723',
+      variables
+    }
+  }
+
+  return {
+    base_url: String(config.base_url || '').trim(),
+    variables
+  }
+}
+
+const getEnvironmentFormConfig = (category, config = {}) => {
+  if (category === 'api') {
+    return {
+      base_url: config.base_url || '',
+      headers: stringifyJsonField(config.headers),
+      variables: stringifyJsonField(config.variables),
+      timeout: config.timeout || 30,
+      verify_ssl: config.verify_ssl !== false
+    }
+  }
+
+  if (category === 'app') {
+    return {
+      platform: config.platform || 'android',
+      device_name: config.device_name || '',
+      app_package: config.app_package || '',
+      app_activity: config.app_activity || '',
+      capabilities: stringifyJsonField(config.capabilities),
+      appium_server_url: config.appium_server_url || 'http://localhost:4723',
+      variables: stringifyJsonField(config.variables)
+    }
+  }
+
+  return {
+    base_url: config.base_url || '',
+    variables: stringifyJsonField(config.variables)
+  }
+}
+
+const buildEnvironmentPayload = (source) => {
+  const category = environmentCategory.value || normalizeEnvironmentCategory(source?.category)
+  if (!category) {
+    throw new Error('无法确定当前工作区的环境类型，请从对应测试工作区进入环境管理')
+  }
+
+  return {
+    name: String(source?.name || '').trim(),
+    description: String(source?.description || '').trim(),
+    category,
+    is_active: source?.is_active !== false,
+    config: getEnvironmentConfigPayload(category, source?.config)
   }
 }
 
@@ -666,18 +715,24 @@ const filteredEnvironments = computed(() => {
   }
 
   return envs.filter(env =>
-    env.name.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-    env.description?.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-    env.base_url.toLowerCase().includes(searchQuery.value.toLowerCase())
+    String(env.name || '').toLowerCase().includes(searchQuery.value.toLowerCase()) ||
+    String(env.description || '').toLowerCase().includes(searchQuery.value.toLowerCase()) ||
+    String(getBaseUrl(env) || '').toLowerCase().includes(searchQuery.value.toLowerCase())
   )
 })
 
 // 监听当前项目变化
-watch(() => projectStore.currentProject, (newProject) => {
+watch([
+  () => projectStore.currentProject,
+  () => route.meta?.environmentCategory,
+  () => route.meta?.module
+], ([newProject]) => {
   if (newProject) {
+    resetEnvironmentForm()
     loadEnvironments()
   } else {
     // 清空分页总数
+    environments.value = []
     total.value = 0
   }
 }, { immediate: false })
@@ -695,10 +750,9 @@ onMounted(async () => {
     // 如果store中没有当前项目，尝试初始化用户偏好设置
     if (!projectStore.currentProject) {
       await projectStore.initializeUserPreferences()
-    } else {
-      // 如果已经有当前项目，直接加载环境列表
-      loadEnvironments()
     }
+    // 初始化偏好设置后也要加载一次，避免 watch 未触发导致列表为空。
+    if (projectStore.currentProject) loadEnvironments()
   } catch (error) {
     ElMessage.error('初始化失败')
   }
@@ -713,6 +767,10 @@ const goToProjects = () => {
 
 // 打开新建环境对话框
 const openCreateDialog = () => {
+  if (!hasLockedEnvironmentCategory.value) {
+    ElMessage.warning('无法确定当前工作区的环境类型，请从对应测试工作区进入环境管理')
+    return
+  }
   resetEnvironmentForm()
   showCreateDialog.value = true
 }
@@ -721,19 +779,26 @@ const openCreateDialog = () => {
 const loadEnvironments = async () => {
   if (!selectedProject.value?.id) return
 
+  const category = environmentCategory.value
+  if (!category) {
+    environments.value = []
+    total.value = 0
+    return
+  }
+
   try {
     loading.value = true
 
-    // 直接调用环境API
-    const response = await getProjectEnvironments(selectedProject.value.id)
+    // 请求时带上类别，前端再做一次过滤，避免后端未过滤时混入其他工作区环境。
+    const response = await getProjectEnvironments(selectedProject.value.id, { category })
     
     // 处理分页数据结构
-    if (response && response.data) {
-      const items = response.data.items || response.data
-      environments.value = Array.isArray(items) ? items : []
-    } else {
-      environments.value = []
-    }
+    const responseData = response?.data ?? response
+    const items = responseData?.items || responseData?.results || responseData
+    const allEnvironments = Array.isArray(items) ? items : []
+    environments.value = allEnvironments.filter(
+      environment => normalizeEnvironmentCategory(environment.category) === category
+    )
 
     // 设置分页总数
     total.value = environments.value.length
@@ -763,58 +828,34 @@ const handleCurrentChange = (val) => {
 }
 
 const editEnvironment = (environment) => {
+  if (normalizeEnvironmentCategory(environment?.category) !== environmentCategory.value) {
+    ElMessage.warning('不能在当前工作区编辑其他类型的环境')
+    return
+  }
+
   editingEnvironment.value = environment
   Object.assign(environmentForm, {
     name: environment.name,
     description: environment.description,
-    category: environment.category,
-    config: {
-      // API配置
-      base_url: environment.config?.base_url || '',
-      headers: stringifyJsonField(environment.config?.headers),
-      variables: stringifyJsonField(environment.config?.variables),
-      timeout: environment.config?.timeout || 30,
-      verify_ssl: environment.config?.verify_ssl !== false,
-      // WebUI配置
-      browser: environment.config?.browser || 'chrome',
-      options: stringifyJsonField(environment.config?.options),
-      implicit_wait: environment.config?.implicit_wait || 10,
-      page_load_timeout: environment.config?.page_load_timeout || 30,
-      // App配置
-      platform: environment.config?.platform || 'android',
-      device_name: environment.config?.device_name || '',
-      app_package: environment.config?.app_package || '',
-      app_activity: environment.config?.app_activity || '',
-      capabilities: stringifyJsonField(environment.config?.capabilities),
-      appium_server_url: environment.config?.appium_server_url || 'http://localhost:4723'
-    }
+    category: environmentCategory.value,
+    is_active: environment.is_active !== false,
+    config: getEnvironmentFormConfig(environmentCategory.value, environment.config)
   })
   showCreateDialog.value = true
 }
 
 const saveEnvironment = async () => {
   try {
+    if (!hasLockedEnvironmentCategory.value) {
+      throw new Error('无法确定当前工作区的环境类型，请从对应测试工作区进入环境管理')
+    }
     await environmentFormRef.value.validate()
     saving.value = true
 
-    // 准备数据
-    const formData = { ...environmentForm }
-
-    // 处理JSON字段
-    const jsonFields = ['headers', 'variables', 'options', 'capabilities']
-    for (const field of jsonFields) {
-      if (formData.config[field]) {
-        formData.config[field] = parseJsonField(formData.config[field])
-      }
-    }
+    const formData = buildEnvironmentPayload(environmentForm)
 
     if (editingEnvironment.value) {
-      // 更新环境时保持原有状态
-      const updateData = {
-        ...formData,
-        is_active: editingEnvironment.value.is_active
-      }
-      await updateProjectEnvironment(projectStore.currentProjectId, editingEnvironment.value.id, updateData)
+      await updateProjectEnvironment(projectStore.currentProjectId, editingEnvironment.value.id, formData)
       ElMessage.success('环境更新成功')
     } else {
       // 创建环境
@@ -861,14 +902,8 @@ const toggleEnvironmentStatus = async (environment) => {
     // 设置加载状态
     environment.statusChanging = true
     
-    // 准备更新数据
-    const updateData = {
-      name: environment.name,
-      description: environment.description,
-      category: environment.category,
-      is_active: environment.is_active,
-      config: environment.config
-    }
+    // 状态更新也必须经过类别裁剪，避免把历史遗留字段再次写回。
+    const updateData = buildEnvironmentPayload(environment)
     
     // 调用更新API
     await updateProjectEnvironment(projectStore.currentProjectId, environment.id, updateData)
@@ -886,7 +921,7 @@ const toggleEnvironmentStatus = async (environment) => {
 
 const resetEnvironmentForm = () => {
   editingEnvironment.value = null
-  Object.assign(environmentForm, getDefaultEnvironmentConfig())
+  Object.assign(environmentForm, getDefaultEnvironmentConfig(environmentCategory.value || 'web'))
   // 清除表单验证状态
   if (environmentFormRef.value) {
     environmentFormRef.value.clearValidate()
@@ -895,33 +930,21 @@ const resetEnvironmentForm = () => {
 
 // 工具方法
 const getEnvironmentIcon = (environment) => {
-  if (environment.name.includes('生产') || environment.name.includes('prod')) return 'Monitor'
-  if (environment.name.includes('测试') || environment.name.includes('test')) return 'DataAnalysis'
+  const name = String(environment?.name || '').toLowerCase()
+  if (name.includes('生产') || name.includes('prod')) return 'Monitor'
+  if (name.includes('测试') || name.includes('test')) return 'DataAnalysis'
   return 'Connection'
 }
 
 const getEnvironmentIconClass = (environment) => {
-  if (environment.name.includes('生产') || environment.name.includes('prod')) return 'production-icon-wrapper'
-  if (environment.name.includes('测试') || environment.name.includes('test')) return 'test-icon-wrapper'
+  const name = String(environment?.name || '').toLowerCase()
+  if (name.includes('生产') || name.includes('prod')) return 'production-icon-wrapper'
+  if (name.includes('测试') || name.includes('test')) return 'test-icon-wrapper'
   return 'dev-icon-wrapper'
 }
 
 const formatDate = (dateStr) => {
   return dayjs(dateStr).format('YYYY-MM-DD HH:mm')
-}
-
-// 环境类型变化处理
-const onEnvironmentTypeChange = () => {
-  // 根据环境类型清空相关字段
-  if (environmentForm.category === 'api') {
-    environmentForm.config.app_package = ''
-    environmentForm.config.app_activity = ''
-  } else if (environmentForm.category === 'web') {
-    environmentForm.config.app_package = ''
-    environmentForm.config.app_activity = ''
-  } else if (environmentForm.category === 'app') {
-    // App环境不需要清空其他字段
-  }
 }
 
 // 获取环境类型标签类型
@@ -1067,6 +1090,14 @@ const getEnvironmentTypeTagType = (category) => {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+.locked-category {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #909399;
+  font-size: 12px;
 }
 
 /* 环境名称列样式 */

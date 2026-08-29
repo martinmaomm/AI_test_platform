@@ -7,7 +7,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from .playwright_python_runner import ExecutionConfig, PlaywrightRunner
+from .constants import normalize_webui_execution_options
+from .playwright_python_runner import (
+    ExecutionConfig,
+    PlaywrightRunner,
+    extract_execution_error,
+)
 from .script_contract import (
     ScriptContractError,
     materialize_script,
@@ -108,12 +113,12 @@ async def main(page):
         with self.assertRaisesRegex(ScriptContractError, r"main\(page\).*自行管理浏览器"):
             materialize_script(script, "legacy_page")
 
-    def test_materialize_validates_browser_and_identifier(self):
-        with self.assertRaisesRegex(ScriptContractError, "只支持 chromium"):
-            materialize_script("async def run(page):\n    pass\n", "1-case", browser="edge")
-
+    def test_materialize_uses_fixed_chrome_engine_and_valid_identifier(self):
         materialized = materialize_script("async def run(page):\n    pass\n", "1-case")
         self.assertIn("def test_1_case():", materialized)
+        self.assertIn("getattr(playwright, 'chromium')", materialized)
+        self.assertNotIn("firefox", materialized)
+        self.assertNotIn("webkit", materialized)
 
     def test_generated_steps_code_is_a_storage_valid_run_script(self):
         from django.conf import settings
@@ -234,18 +239,44 @@ async def main(page):
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    def test_execution_options_ignore_client_browser_and_unknown_fields(self):
+        options = normalize_webui_execution_options({
+            'browser': 'firefox',
+            'headed': False,
+            'timeout': 60,
+            'html_report': True,
+        })
+
+        self.assertEqual(options, {'headed': False, 'timeout': 60})
+
+    def test_execution_options_validate_types_and_timeout_range(self):
+        with self.assertRaisesRegex(ValueError, 'headed'):
+            normalize_webui_execution_options({'headed': 'false'})
+        with self.assertRaisesRegex(ValueError, '30 到 1800'):
+            normalize_webui_execution_options({'timeout': 10})
+
+    def test_execution_error_extracts_real_pytest_exception(self):
+        stdout = """
+test_playwright.py::test_webui_case FAILED
+E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.
+=========================== short test summary info ============================
+"""
+
+        self.assertEqual(
+            extract_execution_error(stdout),
+            'playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.',
+        )
+
     def test_materialized_script_owns_browser_and_uses_context_base_url(self):
         headed_materialized = materialize_script(
             "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('/')\n",
             "test_case_1",
-            browser="chromium",
             headed=True,
             base_url="http://example.test",
         )
         headless_materialized = materialize_script(
             "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('/')\n",
             "test_case_2",
-            browser="chromium",
             headed=False,
             base_url="http://example.test",
         )

@@ -286,6 +286,7 @@ class WebUITestExecution(models.Model):
     
     # 执行状态
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name="执行状态")
+    error_message = models.TextField(blank=True, default='', verbose_name="执行错误信息")
     
     # 触发信息
     trigger_type = models.CharField(max_length=20, choices=TRIGGER_TYPE_CHOICES, default='manual', verbose_name="触发方式")

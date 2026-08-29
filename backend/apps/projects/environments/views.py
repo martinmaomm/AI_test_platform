@@ -1,5 +1,6 @@
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
@@ -9,6 +10,17 @@ import time
 from ..models import Project, Environment
 from ..serializers import EnvironmentSerializer, EnvironmentCreateSerializer
 from common.api import response
+
+
+SUPPORTED_PROJECT_ENVIRONMENT_TYPES = {'api', 'web', 'app'}
+
+
+def get_project_environment_category(project):
+    """环境类型由项目类型决定，不允许在同一项目中混用。"""
+
+    if project.project_type not in SUPPORTED_PROJECT_ENVIRONMENT_TYPES:
+        return None
+    return project.project_type
 
 
 class EnvironmentListView(generics.ListCreateAPIView):
@@ -28,11 +40,13 @@ class EnvironmentListView(generics.ListCreateAPIView):
         if not project.members.filter(user=user, can_edit=True).exists():
             return Environment.objects.none()
         
-        # 支持按类型过滤
-        queryset = Environment.objects.filter(project=project)
-        category = self.request.query_params.get('category')
-        if category:
-            queryset = queryset.filter(category=category)
+        category = get_project_environment_category(project)
+        if category is None:
+            return Environment.objects.none()
+        requested_category = self.request.query_params.get('category')
+        if requested_category and requested_category != category:
+            return Environment.objects.none()
+        queryset = Environment.objects.filter(project=project, category=category)
         
         return queryset
 
@@ -52,7 +66,12 @@ class EnvironmentListView(generics.ListCreateAPIView):
         if not project.members.filter(user=self.request.user, can_edit=True).exists():
             raise ValueError("没有权限管理环境")
         
-        serializer.save(project=project)
+        expected_category = get_project_environment_category(project)
+        if expected_category is None:
+            raise ValidationError({'category': '当前项目类型暂不支持环境配置'})
+        if serializer.validated_data.get('category') != expected_category:
+            raise ValidationError({'category': '环境类型必须与项目类型一致'})
+        serializer.save(project=project, category=expected_category)
 
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
@@ -85,7 +104,21 @@ class EnvironmentDetailView(generics.RetrieveUpdateDestroyAPIView):
         # 检查用户是否有权限管理环境
         if not project.members.filter(user=user, can_edit=True).exists():
             return Environment.objects.none()
-        return Environment.objects.filter(project=project)
+        category = get_project_environment_category(project)
+        if category is None:
+            return Environment.objects.none()
+        return Environment.objects.filter(project=project, category=category)
 
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        project_id = self.kwargs.get('project_id')
+        project = get_object_or_404(Project, id=project_id)
+        expected_category = get_project_environment_category(project)
+        if expected_category is None:
+            raise ValidationError({'category': '当前项目类型暂不支持环境配置'})
+        requested_category = serializer.validated_data.get('category', serializer.instance.category)
+        if requested_category != expected_category:
+            raise ValidationError({'category': '环境类型必须与项目类型一致'})
+        serializer.save(category=expected_category)

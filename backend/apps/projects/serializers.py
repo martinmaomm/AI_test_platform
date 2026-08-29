@@ -56,6 +56,46 @@ class UploadedFileCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'file', 'file_hash', 'upload_status', 'created_at', 'updated_at']
 
 # 环境序列化器
+ENVIRONMENT_CONFIG_KEYS = {
+    Environment.EnvironmentCategory.API: {
+        'base_url', 'headers', 'variables', 'timeout', 'verify_ssl',
+    },
+    Environment.EnvironmentCategory.WEB: {
+        'base_url', 'variables',
+    },
+    Environment.EnvironmentCategory.APP: {
+        'platform', 'device_name', 'app_package', 'app_activity',
+        'capabilities', 'appium_server_url', 'variables',
+    },
+}
+
+
+def normalize_environment_config(category, config):
+    """按环境类型裁剪配置，防止 API、WebUI、App 字段相互污染。"""
+
+    if not isinstance(config, dict):
+        raise serializers.ValidationError({'config': '环境配置必须是对象'})
+    allowed_keys = ENVIRONMENT_CONFIG_KEYS.get(category)
+    if allowed_keys is None:
+        raise serializers.ValidationError({'category': '不支持的环境类型'})
+    return {key: config[key] for key in allowed_keys if key in config}
+
+
+def validate_environment_attrs(attrs, instance=None):
+    category = attrs.get('category', getattr(instance, 'category', None))
+    config = attrs.get('config', getattr(instance, 'config', {}))
+    config = normalize_environment_config(category, config)
+
+    temp_env = Environment(category=category, config=config)
+    errors = temp_env.validate_config()
+    if errors:
+        raise serializers.ValidationError({'config': errors})
+
+    attrs['category'] = category
+    attrs['config'] = config
+    return attrs
+
+
 class EnvironmentSerializer(serializers.ModelSerializer):
     """环境序列化器"""
     category_display = serializers.CharField(source='get_category_display', read_only=True)
@@ -79,6 +119,9 @@ class EnvironmentSerializer(serializers.ModelSerializer):
         """获取配置示例"""
         return obj.get_config_example()
 
+    def validate(self, attrs):
+        return validate_environment_attrs(attrs, self.instance)
+
 
 # 环境创建序列化器
 class EnvironmentCreateSerializer(serializers.ModelSerializer):
@@ -91,19 +134,7 @@ class EnvironmentCreateSerializer(serializers.ModelSerializer):
     
     def validate(self, attrs):
         """验证环境配置"""
-        category = attrs.get('category')
-        config = attrs.get('config', {})
-        
-        # 创建临时对象进行验证
-        temp_env = Environment(category=category, config=config)
-        errors = temp_env.validate_config()
-        
-        if errors:
-            raise serializers.ValidationError({
-                'config': errors
-            })
-        
-        return attrs
+        return validate_environment_attrs(attrs, self.instance)
 
 
 class ProjectMemberSerializer(serializers.ModelSerializer):

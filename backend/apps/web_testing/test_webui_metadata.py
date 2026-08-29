@@ -7,7 +7,7 @@ from django.http import Http404
 import json
 from unittest.mock import Mock, patch
 
-from projects.models import Project, ProjectMember
+from projects.models import Environment, Project, ProjectMember
 
 from .models import (
     WebPage,
@@ -16,6 +16,7 @@ from .models import (
     WebUITestModule,
     WebUITestExecution,
     WebUITestSuite,
+    WebUITestSuiteExecutionDetail,
 )
 from .project_access import READ, get_project_for_user
 from .script_contract import ScriptContractError, store_script_content
@@ -24,13 +25,18 @@ from .views import (
     TestExecutionListView,
     TestCaseExecutionDetailView,
     TestExecutionDeleteView,
+    ExecuteWebUITestCaseView,
+    ExecuteWebUITestSuiteView,
     WebUITestCaseListCreateView,
     WebUITestSuiteAddTestCaseView,
     WebPageViewSet,
     get_webui_test_execution_statistics,
     get_webui_test_suite_statistics,
 )
-from .tasks import _execute_webui_script_generation_from_testcase
+from .tasks import (
+    _execute_webui_script_generation_from_testcase,
+    _execute_webui_test_suite_logic,
+)
 
 
 class WebUIScriptMetadataTests(TestCase):
@@ -584,6 +590,174 @@ class WebUIGenerationTaskProjectAccessTests(TestCase):
         self.assertEqual(result['current_step'], 'saved')
         self.case.refresh_from_db()
         self.assertEqual(self.case.script_status, 'ready')
+
+
+class WebUIExecutionContractTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='webui-contract-user',
+            email='webui-contract@example.com',
+            password='test-password',
+        )
+        self.project = Project.objects.create(
+            name='WebUI contract project',
+            project_type='web',
+            owner=self.user,
+            created_by=self.user,
+        )
+        self.case = WebUITestCase.objects.create(
+            title='contract case',
+            description='contract case',
+            expected_result='passed',
+            test_script_content='async def run(page):\n    await page.goto("/")\n',
+            script_status='ready',
+            user=self.user,
+            project=self.project,
+        )
+        self.suite = WebUITestSuite.objects.create(
+            name='contract suite', user=self.user, project=self.project
+        )
+        self.suite.test_cases.add(self.case)
+        self.web_environment = Environment.objects.create(
+            project=self.project,
+            name='web environment',
+            category=Environment.EnvironmentCategory.WEB,
+            config={'base_url': 'https://web.example.test'},
+        )
+        self.api_environment = Environment.objects.create(
+            project=self.project,
+            name='wrong API environment',
+            category=Environment.EnvironmentCategory.API,
+            config={'base_url': 'https://api.example.test'},
+        )
+
+    def request(self, path, payload):
+        request = APIRequestFactory().post(path, payload, format='json')
+        force_authenticate(request, user=self.user)
+        return request
+
+    def test_case_rejects_non_web_environment(self):
+        result = ExecuteWebUITestCaseView.as_view()(
+            self.request('/execute/', {'environment_id': self.api_environment.id}),
+            project_id=self.project.id,
+            pk=self.case.id,
+        )
+
+        self.assertFalse(result.data['success'])
+        self.assertFalse(WebUITestExecution.objects.exists())
+
+    def test_suite_requires_web_environment(self):
+        result = ExecuteWebUITestSuiteView.as_view()(
+            self.request('/execute-suite/', {}),
+            project_id=self.project.id,
+            pk=self.suite.id,
+        )
+
+        self.assertFalse(result.data['success'])
+        self.assertIn('WebUI', result.data['message'])
+        self.assertFalse(WebUITestExecution.objects.exists())
+
+    @patch('web_testing.tasks.execute_webui_test_case_task.delay')
+    def test_case_ignores_client_browser_and_uses_fixed_chrome_engine(self, delay):
+        delay.return_value = SimpleNamespace(id='webui-execution-task')
+        result = ExecuteWebUITestCaseView.as_view()(
+            self.request(
+                '/execute/',
+                {
+                    'environment_id': self.web_environment.id,
+                    'options': {
+                        'browser': 'firefox',
+                        'headed': False,
+                        'timeout': 60,
+                        'html_report': True,
+                    },
+                },
+            ),
+            project_id=self.project.id,
+            pk=self.case.id,
+        )
+
+        self.assertTrue(result.data['success'])
+        execution = WebUITestExecution.objects.get()
+        self.assertEqual(execution.browser, 'chromium')
+        passed_options = delay.call_args.args[1]
+        self.assertEqual(passed_options, {'headed': False, 'timeout': 60})
+
+    @patch('web_testing.views.execute_webui_test_suite_task.delay')
+    def test_suite_ignores_client_browser_and_uses_fixed_chrome_engine(self, delay):
+        delay.return_value = SimpleNamespace(id='webui-suite-task')
+        result = ExecuteWebUITestSuiteView.as_view()(
+            self.request(
+                '/execute-suite/',
+                {
+                    'environment_id': self.web_environment.id,
+                    'options': {
+                        'browser': 'webkit',
+                        'headed': True,
+                        'timeout': 90,
+                        'html_report': False,
+                    },
+                },
+            ),
+            project_id=self.project.id,
+            pk=self.suite.id,
+        )
+
+        self.assertTrue(result.data['success'])
+        execution = WebUITestExecution.objects.get()
+        self.assertEqual(execution.browser, 'chromium')
+        passed_options = delay.call_args.args[2]
+        self.assertEqual(
+            passed_options,
+            {'headed': True, 'timeout': 90, 'suite_name': self.suite.name},
+        )
+
+    @patch('web_testing.tasks.update_task_progress')
+    @patch('web_testing.tasks._run_test_suite_script')
+    def test_suite_runner_failure_remains_failed_and_persists_real_error(
+        self, run_suite, _update_progress
+    ):
+        run_suite.return_value = {
+            'success': False,
+            'error': 'RuntimeError: visible suite error',
+            'result': {
+                'stdout': 'pytest output',
+                'stderr': 'pytest error output',
+                'test_files': [],
+                'case_results': [],
+                'allure_report': '',
+            },
+        }
+        execution = WebUITestExecution.objects.create(
+            exec_type='suite',
+            name=self.suite.name,
+            executor=self.user,
+            project=self.project,
+            environment=self.web_environment,
+        )
+        WebUITestSuiteExecutionDetail.objects.create(
+            execution=execution,
+            test_suite=self.suite,
+            total_cases=1,
+        )
+        task_instance = SimpleNamespace(
+            request=SimpleNamespace(id='webui-suite-failure-task')
+        )
+
+        result = _execute_webui_test_suite_logic(
+            task_instance,
+            execution.id,
+            self.user.id,
+            {'headed': False, 'timeout': 60},
+        )
+
+        execution.refresh_from_db()
+        self.assertFalse(result['success'])
+        self.assertEqual(execution.status, 'failed')
+        self.assertEqual(
+            execution.error_message, 'RuntimeError: visible suite error'
+        )
+        self.assertEqual(result['error'], execution.error_message)
 
 
 class WebUIExecutionProjectIsolationTests(TestCase):

@@ -4,14 +4,21 @@ Playwright Python脚本运行器
 """
 
 import os
+import re
 import sys
 import tempfile
 import subprocess
 import logging
 import shutil
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .constants import (
+    WEBUI_BROWSER_ENGINE,
+    WEBUI_DEFAULT_HEADED,
+    WEBUI_DEFAULT_TIMEOUT,
+    normalize_webui_execution_options,
+)
 from .script_contract import materialize_script
 
 logger = logging.getLogger(__name__)
@@ -26,9 +33,9 @@ PYTEST_TIMEOUT_BUFFER = 30
 @dataclass
 class ExecutionConfig:
     """执行配置类"""
-    browser: str = 'chromium'
-    headed: bool = True
-    timeout: int = 300
+    browser: str = field(default=WEBUI_BROWSER_ENGINE, init=False)
+    headed: bool = WEBUI_DEFAULT_HEADED
+    timeout: int = WEBUI_DEFAULT_TIMEOUT
     generate_allure: bool = False
     base_url: Optional[str] = None
     suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
@@ -127,7 +134,6 @@ class PlaywrightRunner:
             f.write(materialize_script(
                 script_content,
                 "test_webui_case",
-                browser=config.browser,
                 headed=config.headed,
                 base_url=config.base_url,
             ))
@@ -171,7 +177,6 @@ class PlaywrightRunner:
                     f.write(materialize_script(
                         script_content,
                         f"test_case_{test_case_id}",
-                        browser=config.browser,
                         headed=config.headed,
                         base_url=config.base_url,
                         suite_name=suite_name,
@@ -522,20 +527,53 @@ python_functions = test_*
 _runner = PlaywrightRunner()
 
 
+def extract_execution_error(stdout: str = '', stderr: str = '') -> str:
+    """从 Pytest 输出中提取适合页面展示的首个真实错误。"""
+
+    lines = (stdout or '').splitlines()
+    preferred = []
+    fallback = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('E   '):
+            message = stripped[4:].strip()
+            if message and not re.fullmatch(r'[╔╗╚╝═║─-╿\s]+', message):
+                fallback.append(message)
+                if re.search(r'(Error|Exception|AssertionError|TimeoutError):', message):
+                    preferred.append(message)
+
+    if preferred:
+        return preferred[0][:1000]
+    if fallback:
+        return fallback[0][:1000]
+
+    stderr_text = (stderr or '').strip()
+    if stderr_text:
+        return stderr_text.splitlines()[-1][:1000]
+
+    for line in reversed(lines):
+        stripped = line.strip()
+        if stripped.startswith('FAILED '):
+            return stripped[:1000]
+    return '测试执行失败，未获取到具体错误'
+
+
 def playwright_runner(script_id: str, script_content: str, base_url: str = None, options: Dict[str, Any] = None) -> Dict[str, Any]:
     """使用pytest执行Playwright Python测试脚本"""
+    normalized_options = normalize_webui_execution_options(options)
     config = ExecutionConfig(
-        browser=options.get('browser', 'chromium') if options else 'chromium',
-        headed=options.get('headed', True) if options else True,
-        timeout=options.get('timeout', 300) if options else 300,
-        generate_allure=options.get('generate_allure', False) if options else False,
+        headed=normalized_options['headed'],
+        timeout=normalized_options['timeout'],
+        generate_allure=True,
         base_url=base_url
     )
     
     result = _runner.run_single_test(script_id, script_content, config)
     
+    error = None if result.success else extract_execution_error(result.stdout, result.stderr)
     return {
         'success': result.success,
+        'error': error,
         'return_code': result.return_code,
         'stdout': result.stdout,
         'stderr': result.stderr,
@@ -552,11 +590,11 @@ def playwright_runner(script_id: str, script_content: str, base_url: str = None,
 
 def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]], base_url: str = None, options: Dict[str, Any] = None) -> Dict[str, Any]:
     """使用pytest批量执行多个Playwright Python测试脚本并生成Allure报告"""
+    normalized_options = normalize_webui_execution_options(options)
     config = ExecutionConfig(
-        browser=options.get('browser', 'chromium') if options else 'chromium',
-        headed=options.get('headed', True) if options else True,
-        timeout=options.get('timeout', 300) if options else 300,
-        generate_allure=options.get('generate_allure', True) if options else True,
+        headed=normalized_options['headed'],
+        timeout=normalized_options['timeout'],
+        generate_allure=True,
         base_url=base_url,
         suite_name=options.get('suite_name') if options else None
     )
@@ -564,7 +602,7 @@ def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]]
     result = _runner.run_suite_test(suite_id, test_cases_data, config)
 
     # 失败时提供明确的 error 字段，便于上层展示
-    error_msg = result.stderr if not result.success else None
+    error_msg = extract_execution_error(result.stdout, result.stderr) if not result.success else None
 
     return {
         'success': result.success,

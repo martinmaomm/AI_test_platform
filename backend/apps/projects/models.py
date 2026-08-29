@@ -147,10 +147,7 @@ class Environment(models.Model):
         
         return {
             'base_url': self.config.get('base_url', ''),
-            'browser': self.config.get('browser', 'chrome'),
-            'options': self.config.get('options', {}),
-            'implicit_wait': self.config.get('implicit_wait', 10),
-            'page_load_timeout': self.config.get('page_load_timeout', 30)
+            'variables': self.config.get('variables', {}),
         }
 
     def get_app_config(self):
@@ -208,10 +205,7 @@ class Environment(models.Model):
         elif self.category == self.EnvironmentCategory.WEB:
             return {
                 "base_url": "https://web.xxx.com",
-                "browser": "chrome",
-                "options": {"headless": True, "resolution": "1920x1080"},
-                "implicit_wait": 10,
-                "page_load_timeout": 30
+                "variables": {"env": "test"}
             }
         elif self.category == self.EnvironmentCategory.APP:
             return {

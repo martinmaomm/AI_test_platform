@@ -601,14 +601,11 @@
         </div>
 
         <div class="config-section">
-          <h4>浏览器配置</h4>
+          <h4>执行配置</h4>
           <el-form :model="playwrightOptions" label-width="120px">
-            <el-form-item label="浏览器类型">
-              <el-select v-model="playwrightOptions.browser" style="width: 200px">
-                <el-option label="Chromium" value="chromium" />
-                <el-option label="Firefox" value="firefox" />
-                <el-option label="WebKit" value="webkit" />
-              </el-select>
+            <el-form-item label="浏览器">
+              <el-tag type="success">Chrome</el-tag>
+              <span class="fixed-browser-tip">WebUI 自动化统一使用 Chrome</span>
             </el-form-item>
 
             <el-form-item label="显示模式">
@@ -699,10 +696,8 @@ const currentTestCase = ref(null)
 const configDialogVisible = ref(false)
 const selectedTestCase = ref(null)
 const playwrightOptions = ref({
-  browser: 'chromium',
   headed: true,
-  timeout: 300,
-  html_report: true
+  timeout: 300
 })
 
 // 环境相关状态
@@ -991,10 +986,9 @@ const loadEnvironments = async () => {
       // 根据实际返回的数据结构处理，只显示启用的环境
       const allEnvironments = response.data.items || []
       environments.value = allEnvironments.filter(env => env.is_active === true)
-      // 如果有环境且没有选中环境，默认选择第一个
-      if (environments.value.length > 0 && !selectedEnvironment.value) {
-        selectedEnvironment.value = environments.value[0]
-      }
+      // 环境列表刷新后按 ID 重新匹配，避免切换项目后沿用旧环境。
+      const matchedEnvironment = environments.value.find(env => env.id === selectedEnvironment.value?.id)
+      selectedEnvironment.value = matchedEnvironment || environments.value[0] || null
     } else {
       console.warn('加载环境列表失败:', response.message)
       environments.value = []
@@ -1285,7 +1279,10 @@ const confirmRunTestCase = async () => {
     // 构建执行选项，包含环境配置
     const executionOptions = {
       environment_id: selectedEnvironment.value.id,
-      options: playwrightOptions.value
+      options: {
+        headed: playwrightOptions.value.headed,
+        timeout: playwrightOptions.value.timeout
+      }
     }
 
     // 调用执行API，传递配置选项
@@ -1385,18 +1382,35 @@ const checkTaskStatus = async (taskId) => {
       const statusUpper = status.toUpperCase()
 
       if (['COMPLETED', 'SUCCESS'].includes(statusUpper)) {
-        // 任务完成
-        ElMessage.success(`测试任务完成: ${taskInfo.testCaseName}`)
+        // Celery 进程成功结束不等于测试通过，必须以业务执行结果为准。
+        const taskResult = result.data.result || {}
+        const isPassed = taskResult.success !== false && taskResult.execution_status === 'passed'
+        if (isPassed) {
+          ElMessage.success(`测试通过: ${taskInfo.testCaseName}`)
+        } else {
+          const realError = taskResult.error || taskResult.message || result.data.error || message || '测试执行失败'
+          ElMessage.error({
+            message: `测试失败: ${realError}`,
+            duration: 8000,
+            showClose: true
+          })
+        }
         stopTaskPolling(taskId)
 
         // 清理执行状态
         if (taskInfo.testCaseId) {
           executingTestCases.value.delete(taskInfo.testCaseId)
         }
+        loadTestCases(true)
 
       } else if (['FAILED', 'FAILURE'].includes(statusUpper)) {
         // 任务失败
-        ElMessage.error(`测试任务失败: ${taskInfo.testCaseName}`)
+        const realError = result.data.error || message || '测试执行失败'
+        ElMessage.error({
+          message: `测试失败: ${realError}`,
+          duration: 8000,
+          showClose: true
+        })
         stopTaskPolling(taskId)
 
         // 清理执行状态
@@ -2205,6 +2219,12 @@ onUnmounted(() => {
 .execute-button .el-loading-spinner .circular {
   width: 14px;
   height: 14px;
+}
+
+.fixed-browser-tip {
+  margin-left: 8px;
+  color: #909399;
+  font-size: 12px;
 }
 
 /* 环境选择器样式 */

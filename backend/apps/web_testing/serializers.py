@@ -9,6 +9,7 @@ from .models import (
     WebPage, WebElement
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
+from .constants import WEBUI_BROWSER_ENGINE
 
 
 class WebPageSerializer(serializers.ModelSerializer):
@@ -216,7 +217,7 @@ class WebUITestExecutionListSerializer(serializers.ModelSerializer):
         model = WebUITestExecution
         fields = [
             'id', 'exec_type', 'name', 'description',
-            'status', 'trigger_type',
+            'status', 'error_message', 'trigger_type',
             'executor_name', 'environment_name',
             'project_id',
             'browser', 'task_id', 'start_time', 'end_time', 'duration',
@@ -237,6 +238,7 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
     pass_rate = serializers.FloatField(read_only=True)
     allure_report_url = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
+    error_message = serializers.CharField(source='execution.error_message', read_only=True)
     
     class Meta:
         model = WebUITestSuiteExecutionDetail
@@ -245,7 +247,7 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',
             'pass_rate', 'browser', 'environment_name', 'environment_base_url',
             'start_time', 'end_time', 'duration', 'allure_report', 'allure_report_url',
-            'log'
+            'error_message', 'log'
         ]
         read_only_fields = ['id', 'execution']
     
@@ -396,19 +398,19 @@ class WebUITestExecutionCreateSerializer(serializers.ModelSerializer):
         fields = [
             'exec_type', 'name', 'description', 'trigger_type', 'environment', 'browser', 'project_id'
         ]
-        read_only_fields = ['project_id']
+        read_only_fields = ['project_id', 'browser']
         extra_kwargs = {
             'exec_type': {'required': True},
             'name': {'required': True},
             'description': {'required': False, 'allow_blank': True},
             'trigger_type': {'required': False, 'default': 'manual'},
-            'environment': {'required': False},
-            'browser': {'required': False, 'default': 'chromium'}
+            'environment': {'required': False}
         }
     
     def create(self, validated_data):
         # 自动设置执行者
         validated_data['executor'] = self.context['request'].user
+        validated_data['browser'] = WEBUI_BROWSER_ENGINE
         return super().create(validated_data)
 
 

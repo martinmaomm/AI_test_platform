@@ -14,6 +14,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Optional
 
+from .constants import WEBUI_BROWSER_ENGINE
 from .script_extraction import extract_playwright_metadata, redact_sensitive_text
 
 
@@ -258,7 +259,6 @@ def materialize_script(
     content: str,
     test_name: str,
     *,
-    browser: str = "chromium",
     headed: bool = True,
     base_url: Optional[str] = None,
     suite_name: Optional[str] = None,
@@ -284,12 +284,10 @@ def materialize_script(
             "旧版 main(page) 同时自行管理浏览器，无法安全兼容；请改为仅保留 async def run(page)"
         )
     normalized = normalize_script(content)
-    if browser not in {"chromium", "firefox", "webkit"}:
-        raise ScriptContractError("browser 只支持 chromium、firefox 或 webkit")
     safe_name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(test_name)) or "webui_test"
     if safe_name[0].isdigit() or keyword.iskeyword(safe_name) or not safe_name.isidentifier():
         safe_name = f"test_{safe_name}"
-    browser_literal = repr(browser)
+    browser_literal = repr(WEBUI_BROWSER_ENGINE)
     base_url_literal = repr(base_url) if base_url else "None"
     suite_decorator = f"@allure.suite({suite_name!r})\n" if suite_name else ""
     allure_import = "import allure\n" if suite_name else ""

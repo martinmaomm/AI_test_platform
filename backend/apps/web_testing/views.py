@@ -18,6 +18,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from common.api import response
+from projects.models import Environment
 from .models import (
     MidSceneScript, WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
@@ -41,6 +42,11 @@ from .tasks import (
     fill_locators_from_html_task
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
+from .constants import (
+    WEB_UI_ACTION_OPTIONS,
+    WEBUI_BROWSER_ENGINE,
+    normalize_webui_execution_options,
+)
 from .project_access import (
     DELETE, EDIT, EXECUTE, READ, REPORT,
     get_project_for_user, payload_project_mismatch, project_access_required,
@@ -62,9 +68,6 @@ class StandardResultsSetPagination(PageNumberPagination):
 
 
 # ============ POM 页面对象管理 ============
-
-from .constants import WEB_UI_ACTION_OPTIONS
-
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -216,7 +219,7 @@ class CreateWebUITestScriptView(APIView):
     def post(self, request, project_id):
         try:
             data = request.data
-            
+
             # 验证必需字段
             required_fields = ['description', 'url']
             for field in required_fields:
@@ -357,8 +360,13 @@ class CreateWebUITestScriptFromTestCaseView(APIView):
             # 获取环境变量ID
             environment_id = data.get('environment_id')
             if environment_id:
-                from projects.models import Environment
-                environment = get_object_or_404(Environment, id=environment_id, project=project)
+                environment = get_object_or_404(
+                    Environment,
+                    id=environment_id,
+                    project=project,
+                    category=Environment.EnvironmentCategory.WEB,
+                    is_active=True,
+                )
                 logger.info(f"CreateWebUITestScriptFromTestCaseView - 使用环境: {environment.name}")
             else:
                 environment = None
@@ -1775,11 +1783,11 @@ class ExecuteWebUITestCaseView(APIView):
             
             # 获取环境
             try:
-                from projects.models import Environment
                 environment = Environment.objects.get(
                     id=environment_id,
                     project=test_case.project,
-                    is_active=True
+                    category=Environment.EnvironmentCategory.WEB,
+                    is_active=True,
                 )
             except Environment.DoesNotExist:
                 return response(
@@ -1787,10 +1795,13 @@ class ExecuteWebUITestCaseView(APIView):
                     message="指定的测试环境不存在或已被禁用"
                 )
             
-            # 获取配置选项
-            options = request.data.get('options', {})
+            # 只接受平台实际支持的显示模式和超时时间；浏览器由服务端固定。
+            try:
+                options = normalize_webui_execution_options(request.data.get('options'))
+            except ValueError as exc:
+                return response(kind="error", message=str(exc))
             logger.info(f"执行测试用例 {pk}，配置选项: {options}")
-            logger.info(f"浏览器参数: {options.get('browser', '未设置')}")
+            logger.info("浏览器固定为: %s", WEBUI_BROWSER_ENGINE)
             
             # 获取测试脚本内容
             script_content = test_case.test_script_content
@@ -1801,11 +1812,9 @@ class ExecuteWebUITestCaseView(APIView):
                 )
             
             # 获取基础URL
-            base_url = test_case.url  # 默认使用测试用例的URL
-            if environment and environment.config:
-                env_config = environment.config
-                if env_config.get('base_url'):
-                    base_url = env_config['base_url']
+            base_url = (environment.config or {}).get('base_url')
+            if not base_url:
+                return response(kind="error", message="WebUI测试环境缺少基础URL")
             
             logger.info(f"测试脚本长度: {len(script_content) if script_content else 0}")
             logger.info(f"基础URL: {base_url}")
@@ -1822,11 +1831,7 @@ class ExecuteWebUITestCaseView(APIView):
                 'trigger_type': 'manual'
             }
             
-            # 设置浏览器类型
-            if options and 'browser' in options:
-                execution_data['browser'] = options['browser']
-            else:
-                execution_data['browser'] = 'chromium'  # 默认浏览器
+            execution_data['browser'] = WEBUI_BROWSER_ENGINE
             
             execution = WebUITestExecution.objects.create(**execution_data)
             logger.info(f"创建执行记录成功，ID: {execution.id}，浏览器: {execution.browser}")
@@ -2167,23 +2172,25 @@ class ExecuteWebUITestSuiteView(APIView):
             
             # 获取环境
             environment_id = request.data.get('environment_id')
-            environment = None
-            if environment_id:
-                try:
-                    from projects.models import Environment
-                    environment = Environment.objects.get(
-                        id=environment_id,
-                        project=test_suite.project,
-                        is_active=True
-                    )
-                except Environment.DoesNotExist:
-                    return response(
-                        kind="error",
-                        message="指定的测试环境不存在或已被禁用"
-                    )
-            
-            # 获取配置选项
-            options = request.data.get('options', {})
+            if not environment_id:
+                return response(kind="error", message="必须指定WebUI测试环境")
+            try:
+                environment = Environment.objects.get(
+                    id=environment_id,
+                    project=test_suite.project,
+                    category=Environment.EnvironmentCategory.WEB,
+                    is_active=True,
+                )
+            except Environment.DoesNotExist:
+                return response(
+                    kind="error",
+                    message="指定的WebUI测试环境不存在或已被禁用"
+                )
+
+            try:
+                options = normalize_webui_execution_options(request.data.get('options'))
+            except ValueError as exc:
+                return response(kind="error", message=str(exc))
             
             # 创建执行记录
             execution_data = {
@@ -2197,11 +2204,7 @@ class ExecuteWebUITestSuiteView(APIView):
                 'trigger_type': 'manual'
             }
             
-            # 设置浏览器类型
-            if options and 'browser' in options:
-                execution_data['browser'] = options['browser']
-            else:
-                execution_data['browser'] = 'chromium'  # 默认浏览器
+            execution_data['browser'] = WEBUI_BROWSER_ENGINE
             
             execution = WebUITestExecution.objects.create(**execution_data)
             

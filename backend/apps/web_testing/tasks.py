@@ -25,7 +25,8 @@ from .models import (
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
     WebPage, WebElement, WebUITestModule
 )
-from projects.models import Project
+from projects.models import Environment, Project
+from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .project_access import EDIT, get_project_for_user
 
 # 导入智能体
@@ -157,8 +158,12 @@ def _execute_webui_script_generation_from_testcase(task_instance, test_case_id: 
         
         environment_url = None
         if environment_id:
-            from projects.models import Environment
-            environment = Environment.objects.get(id=environment_id, project=project)
+            environment = Environment.objects.get(
+                id=environment_id,
+                project=project,
+                category=Environment.EnvironmentCategory.WEB,
+                is_active=True,
+            )
             environment_url = environment.get_web_config()['base_url']
         
         update_task_progress(task_instance, 20, '正在初始化WebUI智能体...')
@@ -369,17 +374,18 @@ def _run_test_suite_from_db_workspace(
         work_dir = tempfile.mkdtemp(prefix=f'playwright_suite_{suite_id}_', dir=temp_base)
 
         # 2. 搬运 POM + 测试脚本到标准化目录（注入 base_url 用于动态替换 goto）
+        normalized_options = normalize_webui_execution_options(options)
         suite_name = (options or {}).get('suite_name', '')
-        base_url_val = base_url or "http://mall.lemonban.com:3344"
-        base_url_val = (base_url_val or '').rstrip('/') or "http://mall.lemonban.com:3344"
+        base_url_val = (base_url or '').rstrip('/')
+        if not base_url_val:
+            raise ValueError("WebUI测试环境缺少基础URL")
         test_files, skipped_results = _build_suite_workspace_from_db(
             project_id=project_id,
             test_cases_data=test_cases_data,
             work_dir=work_dir,
             suite_name=suite_name,
             base_url=base_url_val,
-            browser=(options or {}).get('browser', 'chromium'),
-            headed=(options or {}).get('headed', True),
+            headed=normalized_options['headed'],
         )
 
         # 3. 统计 .py 文件数量，若为 0 则直接返回错误
@@ -406,9 +412,8 @@ def _run_test_suite_from_db_workspace(
 
         # 5. 执行 Pytest（复用 PlaywrightRunner 的 pytest 逻辑）
         config = ExecutionConfig(
-            browser=(options or {}).get('browser', 'chromium'),
-            headed=(options or {}).get('headed', True),
-            timeout=(options or {}).get('timeout', 300),
+            headed=normalized_options['headed'],
+            timeout=normalized_options['timeout'],
             generate_allure=True,
             base_url=base_url,
             suite_name=suite_name,
@@ -425,11 +430,15 @@ def _run_test_suite_from_db_workspace(
         )
         runner._cleanup_work_dir(work_dir, execution_result.allure_report)
 
+        from .playwright_python_runner import extract_execution_error
         return {
             'success': execution_result.success,
             'stdout': execution_result.stdout,
             'stderr': execution_result.stderr,
-            'error': execution_result.stderr if not execution_result.success else None,
+            'error': (
+                extract_execution_error(execution_result.stdout, execution_result.stderr)
+                if not execution_result.success else None
+            ),
             'return_code': execution_result.return_code,
             'allure_report': execution_result.allure_report,
             'case_results': execution_result.case_results,
@@ -529,19 +538,9 @@ def _run_test_script(script_content: str, base_url: str = None, options: dict = 
         # 执行Playwright脚本
         logger.info(f"开始执行Playwright测试: {script_id}")
         
-        # 构建执行选项
-        execution_options = {
-            'headed': True,  # 默认使用有头模式
-            'browser': 'chromium',
-            'timeout': 300,
-            'generate_allure': True  # 单用例执行时也生成Allure报告
-        }
+        execution_options = normalize_webui_execution_options(options)
         
-        # 如果传递了选项，则覆盖默认值
-        if options:
-            execution_options.update(options)
-        
-        logger.info(f"执行选项: {execution_options}")
+        logger.info("执行选项: browser=%s, options=%s", WEBUI_BROWSER_ENGINE, execution_options)
         
         result = playwright_runner(
             script_id=script_id,
@@ -636,17 +635,15 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         # 更新执行状态
         execution.task_id = task_instance.request.id
         execution.status = 'running'
+        execution.error_message = ''
         execution.start_time = timezone.now()
         
         # 更新用例详情状态
         case_detail.status = 'running'
         case_detail.start_time = timezone.now()
         
-        # 设置浏览器类型
-        if options and 'browser' in options:
-            execution.browser = options['browser']
-        else:
-            execution.browser = 'chromium'  # 默认浏览器
+        options = normalize_webui_execution_options(options)
+        execution.browser = WEBUI_BROWSER_ENGINE
         
         execution.save()
         case_detail.save()
@@ -685,6 +682,7 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         # 更新执行状态和结果
         if execution_result.get('success'):
             execution.status = 'passed'
+            execution.error_message = ''
             case_detail.status = 'passed'
             # 回写 WebUITestCase 执行状态：执行成功
             test_case.last_execute_status = 'passed'
@@ -692,6 +690,7 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
             test_case.save(update_fields=['last_execute_status', 'last_execute_time'])
         else:
             execution.status = 'failed'
+            execution.error_message = execution_result.get('error') or '测试执行失败'
             case_detail.status = 'failed'
             # 回写 WebUITestCase 执行状态：执行失败
             test_case.last_execute_status = 'failed'
@@ -721,10 +720,6 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         execution.save()
         case_detail.save()
         
-        
-        # 更新完成时间
-        execution.completed_at = timezone.now()
-        execution.save()
         
         # 重新从数据库读取以验证保存结果
         execution.refresh_from_db()
@@ -757,7 +752,16 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
         # 回写 WebUITestCase 执行状态：异常时尝试更新（若已获取到 test_case）
         try:
             execution = WebUITestExecution.objects.get(id=execution_id)
-            test_case = execution.case_execution_detail.test_case
+            execution.status = 'failed'
+            execution.error_message = error_msg
+            execution.end_time = timezone.now()
+            execution.save(update_fields=['status', 'error_message', 'end_time', 'updated_at'])
+            case_detail = execution.case_execution_detail
+            case_detail.status = 'failed'
+            case_detail.error_message = error_msg
+            case_detail.end_time = timezone.now()
+            case_detail.save(update_fields=['status', 'error_message', 'end_time'])
+            test_case = case_detail.test_case
             test_case.last_execute_status = 'failed'
             test_case.last_execute_time = timezone.now()
             test_case.last_error_message = str(e)[-500:]
@@ -851,8 +855,7 @@ def _build_suite_workspace_from_db(
     test_cases_data: list,
     work_dir: str,
     suite_name: str = None,
-    base_url: str = "http://mall.lemonban.com:3344",
-    browser: str = "chromium",
+    base_url: str = None,
     headed: bool = True,
 ) -> tuple:
     """
@@ -929,7 +932,6 @@ def _build_suite_workspace_from_db(
             content = materialize_script(
                 script_content,
                 f"test_case_{test_case_id}",
-                browser=browser,
                 headed=headed,
                 base_url=base_url,
                 suite_name=suite_name,
@@ -1671,16 +1673,14 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         # 更新执行状态
         execution.task_id = task_instance.request.id
         execution.status = 'running'
+        execution.error_message = ''
         execution.start_time = timezone.now()
         
         # 更新套件详情状态
         suite_detail.start_time = timezone.now()
         
-        # 设置浏览器类型
-        if options and 'browser' in options:
-            execution.browser = options['browser']
-        else:
-            execution.browser = 'chromium'  # 默认浏览器
+        options = normalize_webui_execution_options(options)
+        execution.browser = WEBUI_BROWSER_ENGINE
         
         # 确保options存在并包含suite_name
         if not options:
@@ -1712,20 +1712,17 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         # 步骤3: 准备环境配置（获取 Base URL 用于动态注入脚本）
         update_task_progress(task_instance, 30, '正在准备环境配置...')
 
-        # 默认 fallback 域名（防止未配置环境时报错）
-        base_url = "http://mall.lemonban.com:3344"
-        if execution.environment_id:
-            try:
-                from projects.models import Environment
-                environment = Environment.objects.get(id=execution.environment_id)
-                if hasattr(environment, 'config') and isinstance(environment.config, dict):
-                    base_url = environment.config.get('base_url', base_url)
-                elif hasattr(environment, 'base_url') and environment.base_url:
-                    base_url = environment.base_url
-            except Exception as e:
-                logger.warning(f"获取环境配置失败: {e}")
-        # 确保 base_url 不以斜杠结尾，方便统一拼接
-        base_url = (base_url or '').rstrip('/') or "http://mall.lemonban.com:3344"
+        if not execution.environment_id:
+            raise ValueError("执行WebUI测试套件必须指定测试环境")
+        environment = Environment.objects.get(
+            id=execution.environment_id,
+            project_id=test_suite.project_id,
+            category=Environment.EnvironmentCategory.WEB,
+            is_active=True,
+        )
+        base_url = (environment.config.get('base_url') or '').rstrip('/')
+        if not base_url:
+            raise ValueError("WebUI测试环境缺少基础URL")
         
         # 步骤4: 准备测试用例数据（直接使用数据库字段，不调用代码生成器）
         update_task_progress(task_instance, 40, f'正在准备 {total_cases} 个测试用例...')
@@ -1785,6 +1782,7 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         exec_options['suite_name'] = test_suite.name
         suite_result = _run_test_suite_script(test_cases_data, base_url, exec_options)
         execution_results = []
+        allure_report = ''
         
         if suite_result.get('success'):
             logger.info("测试套件批量执行成功")
@@ -2065,11 +2063,33 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         logger.info(f"套件执行详情已更新: total={suite_detail.total_cases}, passed={suite_detail.passed_cases}, failed={suite_detail.failed_cases}, skipped={suite_detail.skipped_cases}, pass_rate={suite_detail.pass_rate}")
         
         # 确定最终状态
-        if failed_cases == 0:
+        suite_execution_succeeded = bool(suite_result.get('success'))
+        if suite_execution_succeeded and failed_cases == 0:
             execution.status = 'passed'
+            execution.error_message = ''
             final_message = f"测试套件执行完成: 通过 {passed_cases}/{total_cases} 个测试用例"
+        elif not suite_execution_succeeded:
+            execution.status = 'failed'
+            execution.error_message = (
+                suite_result.get('error')
+                or execution.error_message
+                or '测试套件执行失败'
+            )
+            final_message = f"测试套件执行失败: {execution.error_message}"
         else:
             execution.status = 'failed'
+            execution.error_message = (
+                execution.error_message
+                or next(
+                    (
+                        item.get('error_message')
+                        for item in execution_results
+                        if item.get('error_message')
+                    ),
+                    '',
+                )
+                or '测试套件执行失败'
+            )
             final_message = f"测试套件执行完成: 通过 {passed_cases}/{total_cases} 个测试用例，失败 {failed_cases} 个"
 
         # --- 报告搬运与路径回填（持久化存储，解决 404）---
@@ -2181,7 +2201,7 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         logger.info(f"测试套件执行完成: {final_message}, allure_report: {allure_report}")
         
         return {
-            'success': True,
+            'success': execution.status == 'passed',
             'status': 'completed',
             'message': final_message,
             'execution_id': execution.id,
@@ -2192,6 +2212,7 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
             'pass_rate': execution.pass_rate,
             'execution_results': execution_results,
             'allure_report': allure_report,  # 添加allure_report字段
+            'error': execution.error_message,
             'result': {
                 'allure_report': allure_report,
                 'stdout': result_data.get('stdout', ''),

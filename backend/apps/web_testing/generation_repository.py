@@ -40,7 +40,7 @@ def create_generation(**kwargs: Any) -> WebUIScriptGeneration:
 
 def get_generation_for_project(generation_id: Any, project_id: int) -> WebUIScriptGeneration:
     return WebUIScriptGeneration.objects.select_related(
-        'project', 'user', 'environment', 'test_case'
+        'project', 'user', 'environment', 'test_case', 'module'
     ).get(pk=generation_id, project_id=project_id)
 
 

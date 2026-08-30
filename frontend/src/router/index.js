@@ -142,25 +142,13 @@ const routes = [
     component: () => import('@/layouts/MainLayout.vue'),
     meta: { requiresAuth: true, layout: 'workspace', module: 'web', title: 'Web 测试' },
     children: [
-      { path: '', redirect: '/web-testing/create/requirements' },
-      {
-        path: 'create',
-        component: () => import('@/views/web-testing/SmartCreate.vue'),
-        meta: { title: '智能创建' },
-        children: [
-          { path: '', redirect: '/web-testing/create/requirements' },
-          { path: 'requirements', name: 'WebRequirementCreate', component: () => import('@/views/web-testing/WebUITestCaseGenerator.vue'), meta: { title: '智能创建' } },
-          { path: 'explore', name: 'WebExploreCreate', component: () => import('@/views/web-testing/WebUIAutoTest.vue'), meta: { title: 'AI 脚本生成' } }
-        ]
-      },
-      { path: 'webui-auto-test', redirect: '/web-testing/create/explore' },
-      { path: 'test-case-generator', redirect: '/web-testing/create/requirements' },
+      { path: '', redirect: '/web-testing/create' },
+      { path: 'create', name: 'WebScriptCreate', component: () => import('@/views/web-testing/WebUIAutoTest.vue'), meta: { title: 'AI 脚本生成' } },
       { path: 'test-cases', name: 'WebTestCases', component: () => import('@/views/web-testing/TestCases.vue'), meta: { title: '测试用例管理' } },
       { path: 'test-suites', name: 'WebTestSuites', component: () => import('@/views/web-testing/TestSuites.vue'), meta: { title: '测试套件管理' } },
       { path: 'test-executions', name: 'WebTestExecutions', component: () => import('@/views/web-testing/TestExecutions.vue'), meta: { title: '测试执行记录' } },
       { path: 'scheduled-tasks', name: 'WebScheduledTasks', component: () => import('@/views/scheduledTasks/ScheduledTasksPage.vue'), meta: { title: '定时任务' } },
       { path: 'environments', name: 'WebEnvironments', component: () => import('@/views/project/ProjectEnvironments.vue'), meta: { title: '环境管理' } },
-      { path: 'page-objects', name: 'PageObjects', component: () => import('@/views/web-testing/PageObjects.vue'), meta: { title: '元素库管理' } },
       { path: 'notification-receivers', name: 'WebNotificationReceivers', component: () => import('@/views/project/NotificationReceivers.vue'), meta: { title: '通知接收管理' } },
       { path: 'knowledge-base', name: 'WebKnowledgeBase', component: () => import('@/views/project/KnowledgeBase.vue'), meta: { title: '知识库管理' } }
     ]

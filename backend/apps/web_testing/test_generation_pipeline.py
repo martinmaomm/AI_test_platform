@@ -304,7 +304,6 @@ class MCPPageExplorerTests(TestCase):
         explorer = MCPPageExplorer(
             llm_model=object(),
             mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}},
-            pom_context='无 POM',
         )
         with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
             'web_testing.mcp_page_explorer.MCPAgent', FakeAgent
@@ -324,7 +323,6 @@ class MCPPageExplorerTests(TestCase):
         explorer = MCPPageExplorer(
             llm_model=object(),
             mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}},
-            pom_context='无 POM',
         )
         scenario = ScenarioSpec.model_validate(scenario_payload(
             discovery_targets=['打开新增表单并读取字段'],
@@ -381,7 +379,7 @@ class MCPPageExplorerTests(TestCase):
                 raise RuntimeError("browser executable doesn't exist")
 
         explorer = MCPPageExplorer(
-            llm_model=object(), mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}}, pom_context='无 POM'
+            llm_model=object(), mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}}
         )
         with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
             'web_testing.mcp_page_explorer.MCPAgent', FailingAgent
@@ -395,7 +393,7 @@ class MCPPageExplorerTests(TestCase):
 
     def test_temporary_credentials_are_only_in_memory_prompt_not_platform_logs(self):
         explorer = MCPPageExplorer(
-            llm_model=object(), mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}}, pom_context='无 POM'
+            llm_model=object(), mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}}
         )
         with patch('web_testing.mcp_page_explorer.logger') as explorer_logger:
             prompt = explorer._build_prompt(
@@ -565,8 +563,6 @@ async def run(page):
             'web_testing.generation_orchestrator.get_llm_manager',
             return_value=SimpleNamespace(current_llm=object()),
         ), patch(
-            'web_testing.generation_orchestrator._load_project_pom_context', return_value='POM'
-        ), patch(
             'web_testing.generation_orchestrator.MCPPageExplorer', FakeExplorer
         ), patch(
             'web_testing.generation_orchestrator.ScriptGenerator', GeneratorMustNotRun
@@ -594,7 +590,7 @@ async def run(page):
         parameters = list(inspect.signature(generate_webui_script_generation_v2_task.run).parameters)
         self.assertEqual(parameters, ['generation_id'])
 
-    def test_orchestrator_classifies_normalizer_rate_limit_and_pom_failure(self):
+    def test_orchestrator_classifies_normalizer_rate_limit(self):
         generation = self.make_generation()
         with patch(
             'web_testing.generation_orchestrator.normalize_requirement',
@@ -602,22 +598,6 @@ async def run(page):
         ):
             result = run_v2_generation(str(generation.pk))
         self.assertEqual(result['error_code'], 'MODEL_RATE_LIMITED')
-
-        generation = self.make_generation()
-        fake_manager = SimpleNamespace(current_llm=object())
-        with patch(
-            'web_testing.generation_orchestrator.normalize_requirement',
-            return_value=ScenarioSpec.model_validate(scenario_payload()),
-        ), patch(
-            'web_testing.generation_orchestrator.get_llm_manager',
-            return_value=fake_manager,
-        ), patch(
-            'web_testing.generation_orchestrator._load_project_pom_context',
-            side_effect=RuntimeError('database unavailable'),
-        ):
-            result = run_v2_generation(str(generation.pk))
-        self.assertEqual(result['error_code'], 'TRANSIENT_SERVICE_ERROR')
-
 
 class GenerationModelLockAPITests(GenerationPipelineBase):
     def test_api_locks_default_active_model_and_dispatches_only_generation_id(self):

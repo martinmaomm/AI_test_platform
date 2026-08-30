@@ -222,9 +222,9 @@ const MENU_CONFIG = {
     items: [
       {
         group: true,
-        label: '智能创建',
+        label: '脚本生成',
         children: [
-          { path: '/web-testing/create', label: '新建自动化' }
+          { path: '/web-testing/create', label: 'AI 脚本生成' }
         ]
       },
       {
@@ -232,7 +232,6 @@ const MENU_CONFIG = {
         label: '测试资产',
         children: [
           { path: '/web-testing/test-cases', label: '测试用例' },
-          { path: '/web-testing/page-objects', label: '页面与元素' },
           { path: '/web-testing/test-suites', label: '测试套件' }
         ]
       },

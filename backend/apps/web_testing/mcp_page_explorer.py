@@ -109,12 +109,10 @@ class MCPPageExplorer:
         *,
         llm_model: Any,
         mcp_config: dict[str, Any],
-        pom_context: str,
         cancel_check: Callable[[], bool] | None = None,
     ):
         self.llm_model = llm_model
         self.mcp_config = mcp_config
-        self.pom_context = pom_context
         self.cancel_check = cancel_check or (lambda: False)
         self.guard = ReadOnlyMCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
 
@@ -225,7 +223,6 @@ class MCPPageExplorer:
                 *scenario.discovery_targets,
                 *scenario.ambiguities,
             ])),
-            'project_pom_candidates': self.pom_context,
             'login_context': login_context,
             'instruction': '先自行探索并补齐页面可观察信息；只把探索后仍无法确定且必须由用户决策的问题放入 unresolved_questions。',
         }, ensure_ascii=False)
@@ -256,7 +253,6 @@ class MCPPageExplorer:
                 *scenario.discovery_targets,
                 *scenario.ambiguities,
             ])),
-            'project_pom_candidates': self.pom_context,
             'login_context': login_context,
             'instruction': '只补充 requested_step_ids 的页面证据；不要重新探索完整流程，不要执行写操作。',
         }, ensure_ascii=False)

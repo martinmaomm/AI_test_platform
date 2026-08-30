@@ -9,7 +9,6 @@ from typing import Any
 from django.core.cache import cache
 
 from ai_core.model_manager import get_llm_manager
-from ai_core.webui_playwright_agent import _load_project_pom_context
 
 from .generation_contracts import (
     GenerationContractError,
@@ -296,20 +295,12 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
         if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
-        # ORM/POM/MCP configuration work stays here, before entering asyncio.
+        # Resolve the locked model before entering the browser exploration loop.
         try:
             model_manager = get_llm_manager(config_id=generation.model_info['config_id'])
         except Exception as exc:
             error_code, message = _model_failure(exc)
             return _safe_fail_generation(str(generation.pk), error_code, message)
-        try:
-            pom_context = _load_project_pom_context(generation.project_id)
-        except Exception:
-            return _safe_fail_generation(
-                str(generation.pk),
-                'TRANSIENT_SERVICE_ERROR',
-                '页面元素信息暂时无法读取，请稍后重试。',
-            )
         environment_variables = (generation.environment.config or {}).get('variables') or {}
         explorer_credentials = credentials or _environment_credentials(environment_variables)
         generation = transition_generation(
@@ -322,7 +313,6 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
         explorer = MCPPageExplorer(
             llm_model=model_manager.current_llm,
             mcp_config=preflight.mcp_config or {},
-            pom_context=pom_context,
             cancel_check=lambda: bool(celery_task_id and cache.get(f'celery:cancel:{celery_task_id}')),
         )
         snapshot = asyncio.run(explorer.explore(
@@ -384,7 +374,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
         publish_stage_changed(generation, '根据页面证据生成脚本')
         generator = ScriptGenerator(model_manager.current_llm)
         try:
-            script = generator.generate(scenario=scenario, snapshot=snapshot, pom_context=pom_context)
+            script = generator.generate(scenario=scenario, snapshot=snapshot)
         except Exception as exc:
             error_code, message = _model_failure(exc)
             return _safe_fail_generation(str(generation.pk), error_code, message)
@@ -451,7 +441,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
                 return {'generation_id': str(generation.pk), 'status': 'cancelled'}
             try:
-                script = generator.generate(scenario=scenario, snapshot=snapshot, pom_context=pom_context)
+                script = generator.generate(scenario=scenario, snapshot=snapshot)
             except Exception as exc:
                 error_code, message = _model_failure(exc)
                 return _safe_fail_generation(str(generation.pk), error_code, message)
@@ -484,7 +474,6 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                     issues=blocker_issues(report),
                     scenario=scenario,
                     snapshot=snapshot,
-                    pom_context=pom_context,
                 )
             except Exception as exc:
                 error_code, message = _model_failure(exc)

@@ -31,10 +31,7 @@ class NormalizedScript:
 
 SCRIPT_SOURCE_VALUES = {
     "manual",
-    "requirement_ai",
     "mcp_exploration",
-    "step_generator",
-    "legacy",
 }
 SCRIPT_FRAMEWORK = "playwright_python_async"
 _SENSITIVE_METADATA_KEY_RE = re.compile(
@@ -204,9 +201,6 @@ def store_script_content(
                 "extraction_version",
             )
         })
-        test_case.steps = extracted["extracted_steps"]
-        test_case.expected_result = extracted["expected_result"]
-        update_fields.extend(["steps", "expected_result"])
 
     test_case.test_script_content = normalized
     test_case.script_source = source

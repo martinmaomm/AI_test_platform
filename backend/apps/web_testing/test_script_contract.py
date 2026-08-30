@@ -121,28 +121,6 @@ async def main(page):
         self.assertNotIn("firefox", materialized)
         self.assertNotIn("webkit", materialized)
 
-    def test_generated_steps_code_is_a_storage_valid_run_script(self):
-        from django.conf import settings
-        if not settings.configured:
-            self.skipTest("step generator test requires Django settings")
-        from types import SimpleNamespace
-        from .views import _force_inject_playwright_rules, _generate_playwright_from_steps
-
-        test_case = SimpleNamespace(
-            steps=[{"step_id": "step-1", "action": "click", "description": "点击按钮"}],
-            expected_result="首页显示成功",
-            url="/",
-        )
-        result = _generate_playwright_from_steps(test_case, project_id=999999)
-        final_code = _force_inject_playwright_rules(result["full_code"], test_case)
-
-        ast.parse(final_code)
-        self.assertIn("from playwright.async_api import expect", final_code)
-        self.assertIn("async def run(page)", final_code)
-        self.assertNotIn("async def main", final_code)
-        self.assertNotIn("launch(", final_code)
-        normalize_for_storage(final_code)
-
     def test_storage_validation_rejects_legacy_and_browser_entries(self):
         invalid_scripts = [
             "async def main():\n    pass",

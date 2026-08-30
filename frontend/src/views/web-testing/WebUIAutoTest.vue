@@ -6,7 +6,7 @@
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
     <div class="generation-layout">
-      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :model-configs="modelConfigs" :loading-environments="loadingEnvironments" :loading-models="loadingModels" :busy="isActive || submitting" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" :credential-clear-version="credentialClearVersion" @submit="handleCreate" @cancel="handleCancel" />
+      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :modules="modules" :model-configs="modelConfigs" :loading-environments="loadingEnvironments" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="isActive || submitting" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" :credential-clear-version="credentialClearVersion" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
         <GenerationResultPanel v-if="generation" :generation="generation" :saving="saving" :resolving="resolving" @resolve="handleResolve" @cancel="handleCancel" @save="handleSave" @open-test-case="router.push('/web-testing/test-cases')" />
@@ -25,6 +25,7 @@ import { useProjectStore } from '@/stores/project'
 import { useAuthStore } from '@/stores/auth'
 import { getProjectEnvironments } from '@/api/projects'
 import { getLLMConfigurations } from '@/api/aiConfig'
+import { getWebUITestModules } from '@/api/webTesting'
 import { WebSocketManager } from '@/config/websocket'
 import { useWebUIScriptGeneration } from '@/composables/useWebUIScriptGeneration'
 import GenerationInputPanel from '@/components/webui-generation/GenerationInputPanel.vue'
@@ -38,8 +39,10 @@ const selectedProject = computed(() => projectStore.currentProject)
 const projectId = computed(() => selectedProject.value?.id || null)
 const userId = computed(() => authStore.user?.id || authStore.user?.username || null)
 const environments = ref([])
+const modules = ref([])
 const modelConfigs = ref([])
 const loadingEnvironments = ref(false)
+const loadingModules = ref(false)
 const loadingModels = ref(false)
 const isConnected = ref(false)
 const credentialClearVersion = ref(0)
@@ -65,6 +68,11 @@ const loadModels = async () => {
   loadingModels.value = true
   try { modelConfigs.value = asList(await getLLMConfigurations()).filter(item => item.is_active && item.model_type === 'llm') } catch { modelConfigs.value = []; ElMessage.error('加载可用模型失败') } finally { loadingModels.value = false }
 }
+const loadModules = async () => {
+  if (!projectId.value) { modules.value = []; return }
+  loadingModules.value = true
+  try { modules.value = asList(await getWebUITestModules(projectId.value)) } catch { modules.value = []; ElMessage.error('加载业务模块失败') } finally { loadingModules.value = false }
+}
 const closeWebSocket = () => { websocketManager?.closeWebSocket(); websocketManager = null; isConnected.value = false }
 const initWebSocket = () => {
   closeWebSocket()
@@ -83,7 +91,7 @@ const handleCancel = async () => {
 const handleResolve = async (payload) => { try { await resolveGeneration(payload); ElMessage.success('补充信息已提交，任务正在继续。') } catch { ElMessage.error(lastError.value || '提交补充信息失败') } }
 const handleSave = async (title) => { try { const result = await save(title); ElMessage.success(result?.created ? '已创建并保存到测试用例' : '已保存到测试用例') } catch { ElMessage.error(lastError.value || '保存失败') } }
 
-watch(projectId, () => { loadEnvironments(); loadModels() }, { immediate: true })
+watch(projectId, () => { loadEnvironments(); loadModules(); loadModels() }, { immediate: true })
 watch(() => authStore.accessToken, initWebSocket)
 onMounted(initWebSocket)
 onUnmounted(closeWebSocket)

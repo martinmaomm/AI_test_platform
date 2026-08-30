@@ -94,7 +94,7 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         llm.invoke.return_value = VALID_SCRIPT
         scenario = ScenarioSpec.model_validate(scenario_payload())
         snapshot = ExplorationSnapshot.model_validate(snapshot_payload())
-        script = ScriptGenerator(llm).generate(scenario=scenario, snapshot=snapshot, pom_context='页面：用户列表')
+        script = ScriptGenerator(llm).generate(scenario=scenario, snapshot=snapshot)
         self.assertEqual(script, VALID_SCRIPT.strip())
         prompt = str(llm.invoke.call_args)
         self.assertIn('不得调用 MCP', prompt)
@@ -115,9 +115,9 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         generator = ScriptGenerator(llm)
         scenario = ScenarioSpec.model_validate(scenario_payload())
         snapshot = ExplorationSnapshot.model_validate(snapshot_payload())
-        self.assertEqual(generator.generate(scenario=scenario, snapshot=snapshot, pom_context='POM'), VALID_SCRIPT.strip())
+        self.assertEqual(generator.generate(scenario=scenario, snapshot=snapshot), VALID_SCRIPT.strip())
         self.assertEqual(
-            generator.repair(script='bad', issues=[], scenario=scenario, snapshot=snapshot, pom_context='POM'),
+            generator.repair(script='bad', issues=[], scenario=scenario, snapshot=snapshot),
             VALID_SCRIPT.strip(),
         )
 
@@ -210,7 +210,7 @@ class OrchestratorPhase45Tests(Phase45Base):
     def _run_with(self, generation, explorer_class, generator_class):
         with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
             'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object())
-        ), patch('web_testing.generation_orchestrator._load_project_pom_context', return_value='POM'), patch(
+        ), patch(
             'web_testing.generation_orchestrator.MCPPageExplorer', explorer_class
         ), patch('web_testing.generation_orchestrator.ScriptGenerator', generator_class), patch(
             'web_testing.generation_orchestrator.publish_stage_changed'
@@ -294,29 +294,11 @@ class SaveAndRunnerTests(Phase45Base):
         case.refresh_from_db()
         self.assertEqual(case.script_version, 1)
 
-    def test_save_updates_the_original_test_case_when_generation_started_from_a_case(self):
-        existing = WebUITestCase.objects.create(
-            title='原始用例', description='原始描述', expected_result='原始结果', user=self.user, project=self.project,
-        )
-        generation = self.generation(
-            test_case=existing, source_mode=WebUIScriptGeneration.SourceMode.TEST_CASE,
-            status=WebUIScriptGeneration.Status.READY, current_stage=WebUIScriptGeneration.Stage.COMPLETED,
-            scenario_spec=scenario_payload(), script_draft=VALID_SCRIPT, quality_report={'status': 'ready'},
-        )
-        request = self.factory.post('/save/', {}, format='json')
-        force_authenticate(request, user=self.user)
-        response = WebUIScriptGenerationSaveView.as_view()(request, project_id=self.project.id, generation_id=generation.pk)
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertTrue(response.data['data']['generation']['is_saved'])
-        existing.refresh_from_db()
-        self.assertEqual(existing.test_script_content, VALID_SCRIPT.strip())
-        self.assertEqual(WebUITestCase.objects.filter(project=self.project).count(), 1)
-
     def test_is_saved_requires_this_generation_marker_not_only_test_case_relation(self):
         existing = WebUITestCase.objects.create(
-            title='原始用例', description='原始描述', expected_result='原始结果', user=self.user, project=self.project,
+            title='原始用例', description='原始描述', user=self.user, project=self.project,
         )
-        generation = self.generation(test_case=existing, source_mode=WebUIScriptGeneration.SourceMode.TEST_CASE)
+        generation = self.generation(test_case=existing)
         self.assertFalse(WebUIScriptGenerationSerializer(generation).data['is_saved'])
         existing.generation_metadata = {'generation_ref': generation_reference(generation.pk)}
         existing.save(update_fields=['generation_metadata', 'updated_at'])

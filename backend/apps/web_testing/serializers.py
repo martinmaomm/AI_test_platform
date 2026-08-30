@@ -8,7 +8,7 @@ from ai_core.models import LLMConfiguration, ModelType
 from .models import (
     WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
-    WebPage, WebElement, WebUIScriptGeneration, WebUITestCaseGeneration
+    WebUIScriptGeneration,
 )
 from .generation_repository import create_generation
 from .generation_preflight import exploration_requires_write_confirmation
@@ -26,34 +26,7 @@ from .generation_security import (
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 from .execution_diagnostics import safe_screenshot_relative_path
-
-
-class WebPageSerializer(serializers.ModelSerializer):
-    """Web页面 (POM) 序列化器"""
-    module_id = serializers.PrimaryKeyRelatedField(
-        queryset=WebUITestModule.objects.all(),
-        required=False,
-        allow_null=True,
-        source='module',
-    )
-    module_name = serializers.SerializerMethodField()
-
-    class Meta:
-        model = WebPage
-        fields = ['id', 'project', 'module_id', 'module_name', 'name', 'url_path', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at']
-        extra_kwargs = {'project': {'required': False}}
-
-    def get_module_name(self, obj):
-        return obj.module.name if obj.module else None
-
-
-class WebElementSerializer(serializers.ModelSerializer):
-    """Web元素 (POM) 序列化器"""
-    class Meta:
-        model = WebElement
-        fields = ['id', 'page', 'name', 'locator_type', 'locator_value', 'action_type', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at']
+from .execution_variables import ExecutionVariableError, normalize_variable_definitions
 
 
 class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
@@ -62,6 +35,8 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
     environment_id = serializers.IntegerField(read_only=True)
     environment_name = serializers.CharField(source='environment.name', read_only=True)
     test_case_id = serializers.IntegerField(read_only=True, allow_null=True)
+    module_id = serializers.IntegerField(read_only=True, allow_null=True)
+    module_name = serializers.CharField(source='module.name', read_only=True, allow_null=True)
     is_saved = serializers.SerializerMethodField()
 
     def get_is_saved(self, obj):
@@ -70,8 +45,9 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebUIScriptGeneration
         fields = [
-            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id', 'is_saved',
-            'source_mode', 'celery_task_id', 'status', 'current_stage', 'progress',
+            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id',
+            'module_id', 'module_name', 'is_saved',
+            'celery_task_id', 'status', 'current_stage', 'progress',
             'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
@@ -80,8 +56,9 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id', 'is_saved',
-            'source_mode', 'celery_task_id', 'status', 'current_stage', 'progress',
+            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id',
+            'module_id', 'module_name', 'is_saved',
+            'celery_task_id', 'status', 'current_stage', 'progress',
             'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
@@ -98,11 +75,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
     environment_id = serializers.IntegerField(min_value=1)
     start_path = serializers.CharField(max_length=500, required=False, allow_blank=False)
     url = serializers.CharField(max_length=1000, required=False, allow_blank=False, write_only=True)
-    source_mode = serializers.ChoiceField(
-        choices=WebUIScriptGeneration.SourceMode.choices,
-        default=WebUIScriptGeneration.SourceMode.MANUAL_PROMPT,
-    )
-    test_case_id = serializers.IntegerField(min_value=1, required=False)
+    module_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     model_config_id = serializers.IntegerField(min_value=1, required=False, write_only=True)
     temporary_credentials = serializers.DictField(required=False, write_only=True)
 
@@ -153,15 +126,13 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
         except GenerationInputSecurityError as exc:
             raise serializers.ValidationError({'start_path': str(exc)}) from exc
 
-        test_case = None
-        test_case_id = attrs.get('test_case_id')
-        if test_case_id is not None:
-            try:
-                test_case = WebUITestCase.objects.get(pk=test_case_id, project=project)
-            except WebUITestCase.DoesNotExist as exc:
-                raise serializers.ValidationError({'test_case_id': '测试用例必须属于当前项目'}) from exc
-        if attrs['source_mode'] == WebUIScriptGeneration.SourceMode.TEST_CASE and test_case is None:
-            raise serializers.ValidationError({'test_case_id': '测试用例入口必须提供 test_case_id'})
+        module = None
+        if attrs.get('module_id') is not None:
+            module = WebUITestModule.objects.filter(pk=attrs['module_id'], project=project).first()
+            if module is None:
+                raise serializers.ValidationError({'module_id': '业务模块不存在或不属于当前项目'})
+        if module is None:
+            module = WebUITestModule.ensure_default(project.id)
 
         requested_model_id = attrs.get('model_config_id')
         model_query = LLMConfiguration.objects.filter(model_type=ModelType.LLM, is_active=True)
@@ -175,7 +146,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError({field: '没有可用的启用 LLM 配置'})
 
         attrs['environment'] = environment
-        attrs['test_case'] = test_case
+        attrs['module'] = module
         attrs['normalized_start_path'] = start_path
         attrs['base_url'] = base_url
         attrs['model_config'] = model_config
@@ -186,12 +157,12 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
         user = self.context['request'].user
         credentials = validated_data.pop('temporary_credentials', None)
         environment = validated_data.pop('environment')
-        test_case = validated_data.pop('test_case')
+        module = validated_data.pop('module')
         start_path = validated_data.pop('normalized_start_path')
         base_url = validated_data.pop('base_url')
         model_config = validated_data.pop('model_config')
         validated_data.pop('environment_id', None)
-        validated_data.pop('test_case_id', None)
+        validated_data.pop('module_id', None)
         validated_data.pop('url', None)
         validated_data.pop('model_config_id', None)
         description = validated_data.pop('description')
@@ -202,8 +173,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
                 project=project,
                 user=user,
                 environment=environment,
-                test_case=test_case,
-                source_mode=validated_data['source_mode'],
+                module=module,
                 start_path=start_path,
                 target_url_safe=build_safe_target_url(base_url, start_path),
                 description_safe=redact_text(description),
@@ -344,10 +314,10 @@ class WebUITestModuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebUITestModule
         fields = [
-            'id', 'name', 'description', 'business_rules', 'parent', 'order',
+            'id', 'name', 'parent', 'order', 'is_default',
             'project', 'children', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'is_default', 'created_at', 'updated_at']
         extra_kwargs = {'project': {'required': False}}
 
     def get_children(self, obj):
@@ -356,121 +326,10 @@ class WebUITestModuleSerializer(serializers.ModelSerializer):
         return WebUITestModuleSerializer(children, many=True).data
 
 
-class WebUITestCaseGenerationSerializer(serializers.ModelSerializer):
-    """需求用例生成记录的安全持久化视图。"""
-
-    project_id = serializers.IntegerField(read_only=True)
-    module_id = serializers.IntegerField(read_only=True)
-    module_name = serializers.CharField(source='module.name', read_only=True)
-    model_config_id = serializers.IntegerField(read_only=True, allow_null=True)
-    model_name = serializers.CharField(source='model_config.model_name', read_only=True, allow_null=True)
-    task_id = serializers.CharField(source='celery_task_id', read_only=True, allow_null=True)
-    status_label = serializers.CharField(source='get_status_display', read_only=True)
-    imported_test_cases = serializers.SerializerMethodField()
-
-    def get_imported_test_cases(self, obj):
-        return [
-            {'id': item.id, 'title': item.title}
-            for item in obj.imported_test_cases.all().order_by('id')
-        ]
-
-    class Meta:
-        model = WebUITestCaseGeneration
-        fields = [
-            'id', 'project_id', 'module_id', 'module_name', 'model_config_id', 'model_name',
-            'celery_task_id', 'task_id', 'client_request_id', 'status', 'status_label', 'request_text', 'generation_scope',
-            'case_categories', 'target_case_count', 'context_snapshot',
-            'draft_test_cases', 'validation_report', 'created_case_ids',
-            'imported_test_cases',
-            'error_code', 'error_message', 'started_at', 'completed_at',
-            'created_at', 'updated_at',
-        ]
-        read_only_fields = fields
-
-
-class WebUITestCaseGenerationCreateSerializer(serializers.Serializer):
-    """Validate one requirement-generation request before creating a task record."""
-
-    module_id = serializers.IntegerField(min_value=1)
-    model_config_id = serializers.IntegerField(min_value=1)
-    client_request_id = serializers.UUIDField(required=False, allow_null=True)
-    description = serializers.CharField(
-        max_length=2000,
-        required=False,
-        allow_blank=True,
-        trim_whitespace=True,
-        default='',
-    )
-    generation_scope = serializers.ChoiceField(
-        choices=WebUITestCaseGeneration.Scope.choices,
-        default=WebUITestCaseGeneration.Scope.CORE,
-    )
-    case_categories = serializers.ListField(
-        child=serializers.ChoiceField(choices=['functional', 'negative', 'boundary']),
-        min_length=1,
-        max_length=3,
-        default=['functional', 'negative', 'boundary'],
-    )
-    target_case_count = serializers.IntegerField(min_value=1, max_value=10, default=6)
-
-    def validate(self, attrs):
-        project_id = self.context['project_id']
-        user = self.context['request'].user
-        module = WebUITestModule.objects.filter(
-            id=attrs['module_id'],
-            project_id=project_id,
-        ).first()
-        if not module:
-            raise serializers.ValidationError({'module_id': '业务模块不存在或不属于当前项目。'})
-        model_config = LLMConfiguration.objects.filter(
-            id=attrs['model_config_id'],
-            created_by=user,
-            model_type=ModelType.LLM,
-            is_active=True,
-        ).first()
-        if not model_config:
-            raise serializers.ValidationError({'model_config_id': '模型不存在、已停用或不属于当前账号。'})
-        description = attrs.get('description') or ''
-        if attrs['generation_scope'] == WebUITestCaseGeneration.Scope.SPECIFIED and not description:
-            raise serializers.ValidationError({'description': '选择“指定场景”时必须填写场景描述。'})
-        if find_suspected_credentials(description):
-            raise serializers.ValidationError({'description': '场景描述不能包含账号、密码、Token 或密钥。'})
-
-        attrs['case_categories'] = list(dict.fromkeys(attrs['case_categories']))
-        attrs['description'] = redact_text(description)
-        attrs['module'] = module
-        attrs['model_config'] = model_config
-        return attrs
-
-
-class WebUITestCaseGenerationDraftsSerializer(serializers.Serializer):
-    """User-edited draft collection used by validate and import endpoints."""
-
-    draft_test_cases = serializers.ListField(
-        child=serializers.DictField(),
-        min_length=1,
-        max_length=10,
-    )
-
-
-class WebUITestCaseGenerationImportSerializer(WebUITestCaseGenerationDraftsSerializer):
-    selected_draft_keys = serializers.ListField(
-        child=serializers.CharField(max_length=80, trim_whitespace=True),
-        min_length=1,
-        max_length=10,
-    )
-
-    def validate_selected_draft_keys(self, value):
-        if len(value) != len(set(value)):
-            raise serializers.ValidationError('选中的草稿标识不能重复。')
-        return value
-
-
 class WebUITestCaseSerializer(serializers.ModelSerializer):
-    """WebUI测试用例列表序列化器 - 用于列表页面"""
+    """Compact list representation for one executable script."""
     created_by_username = serializers.CharField(source='user.username', read_only=True)
-    priority_display = serializers.CharField(source='get_priority_display', read_only=True)
-    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    module_name = serializers.CharField(source='module.name', read_only=True, allow_null=True)
     module_id = serializers.PrimaryKeyRelatedField(
         queryset=WebUITestModule.objects.all(), required=False, allow_null=True, source='module'
     )
@@ -479,17 +338,11 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebUITestCase
         fields = [
-            # 基本信息
-            'id', 'title', 'description', 'expected_result', 'created_by_username',
-            # 测试属性
-            'priority', 'priority_display', 'category', 'category_display',
-            # 模块与脚本
-            'module_id', 'has_script',
+            'id', 'title', 'description', 'created_by_username',
+            'module_id', 'module_name', 'has_script', 'variables',
             'script_source', 'script_status', 'script_framework', 'script_version',
             'script_validation_error', 'generation_metadata',
-            # 时间信息
             'created_at', 'updated_at',
-            # 执行状态记录
             'last_execute_status', 'last_execute_time', 'last_error_message',
         ]
         read_only_fields = [
@@ -501,10 +354,9 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
 
 
 class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
-    """WebUI测试用例详情序列化器 - 用于详情页面和编辑组件"""
+    """Editable script, description, classification and variables."""
     created_by_username = serializers.CharField(source='user.username', read_only=True)
-    priority_display = serializers.CharField(source='get_priority_display', read_only=True)
-    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    module_name = serializers.CharField(source='module.name', read_only=True, allow_null=True)
     module_id = serializers.PrimaryKeyRelatedField(
         queryset=WebUITestModule.objects.all(), required=False, allow_null=True, source='module'
     )
@@ -517,24 +369,21 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
             return normalize_for_storage(value)
         except ScriptContractError as exc:
             raise serializers.ValidationError(str(exc))
+
+    def validate_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
     
     class Meta:
         model = WebUITestCase
         fields = [
-            # 基本信息
-            'id', 'title', 'description', 'url', 'created_by_username',
-            # 测试属性
-            'priority', 'priority_display', 'category', 'category_display',
-            # 模块与脚本
-            'module_id', 'has_script',
-            # 测试内容
-            'preconditions', 'steps', 'expected_result',
-            # 脚本信息
+            'id', 'title', 'description', 'created_by_username',
+            'module_id', 'module_name', 'has_script', 'variables',
             'test_script_content', 'script_source', 'script_status', 'script_framework',
             'script_version', 'script_validation_error', 'generation_metadata',
-            # 时间信息
             'created_at', 'updated_at',
-            # 执行状态记录
             'last_execute_status', 'last_execute_time', 'last_error_message',
         ]
         read_only_fields = [
@@ -547,6 +396,11 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         has_script_content = 'test_script_content' in validated_data
         script_content = validated_data.pop('test_script_content', None)
+        if 'module' in validated_data and validated_data['module'] is None:
+            validated_data['module'] = WebUITestModule.ensure_default(instance.project_id)
+        module = validated_data.get('module')
+        if module is not None and module.project_id != instance.project_id:
+            raise serializers.ValidationError({'module_id': '业务模块必须属于当前项目'})
         instance = super().update(instance, validated_data)
         if has_script_content:
             try:
@@ -561,33 +415,22 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
 
 
 class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
-    """WebUI测试用例创建序列化器"""
+    """Create one manually authored independent script."""
     
     class Meta:
         model = WebUITestCase
         fields = [
-            # 基本信息
-            'title', 'description', 'url',
-            # 关联信息
-            'project', 'module',
-            # 测试属性
-            'priority', 'category',
-            # 测试内容
-            'preconditions', 'steps', 'expected_result',
-            # 脚本信息
+            'title', 'description', 'project', 'module', 'variables',
             'test_script_content', 'script_source', 'script_status', 'script_framework',
             'script_version', 'script_validation_error', 'generation_metadata'
         ]
         extra_kwargs = {
             'title': {'required': True},
             'description': {'required': True},
-            'expected_result': {'required': True},
-            'url': {'required': False, 'allow_blank': True},
             'project': {'required': True},
-            'priority': {'required': False, 'default': 'medium'},
-            'category': {'required': False, 'default': 'functional'},
-            'preconditions': {'required': False, 'default': list},
-            'steps': {'required': False, 'default': list},
+            'module': {'required': False, 'allow_null': True},
+            'variables': {'required': False, 'default': list},
+            'test_script_content': {'required': True, 'allow_blank': False},
         }
         read_only_fields = [
             'script_status', 'script_framework', 'script_version',
@@ -595,16 +438,24 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
         ]
     
     def create(self, validated_data):
-        # 自动设置用户
         validated_data['user'] = self.context['request'].user
         script_content = validated_data.pop('test_script_content', None)
         script_source = validated_data.pop('script_source', 'manual')
+        if validated_data.get('module') is None:
+            validated_data['module'] = WebUITestModule.ensure_default(validated_data['project'].id)
         test_case = super().create(validated_data)
         try:
             return store_script_content(test_case, script_content, source=script_source)
         except ScriptContractError as exc:
             test_case.delete()
             raise serializers.ValidationError({'test_script_content': str(exc)})
+
+    def validate(self, attrs):
+        project = attrs.get('project')
+        module = attrs.get('module')
+        if project is not None and module is not None and module.project_id != project.id:
+            raise serializers.ValidationError({'module': '业务模块必须属于当前项目'})
+        return attrs
 
     def validate_test_script_content(self, value):
         if value in (None, ''):
@@ -613,6 +464,12 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
             return normalize_for_storage(value)
         except ScriptContractError as exc:
             raise serializers.ValidationError(str(exc))
+
+    def validate_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
 
 class WebUITestExecutionListSerializer(serializers.ModelSerializer):
@@ -641,7 +498,7 @@ class WebUITestExecutionListSerializer(serializers.ModelSerializer):
 
 class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
     """WebUI测试套件执行详情序列化器 - 用于套件执行详情页面"""
-    test_suite_name = serializers.CharField(source='test_suite.name', read_only=True)
+    test_suite_name = serializers.CharField(source='execution.name', read_only=True)
     browser = serializers.CharField(source='execution.browser', read_only=True)
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
     environment_base_url = serializers.SerializerMethodField()
@@ -710,7 +567,7 @@ class WebUITestSuiteSerializer(serializers.ModelSerializer):
             # 关联信息
             'user', 'user_name', 'project', 'project_name',
             # 套件属性
-            'status', 'status_display', 'tags',
+            'status', 'status_display', 'tags', 'variables',
             # 统计信息
             'test_cases_count', 'active_test_cases_count', 'test_cases',
             # 时间信息
@@ -721,17 +578,16 @@ class WebUITestSuiteSerializer(serializers.ModelSerializer):
         ]
     
     def get_test_cases(self, obj):
-        """获取测试用例列表"""
-        test_cases = obj.test_cases.all()
+        memberships = obj.case_memberships.select_related('test_case').order_by('order', 'id')
         return [
             {
-                'id': tc.id,
-                'title': tc.title,
-                'description': tc.description,
-                'priority': tc.priority,
-                'category': tc.category
+                'id': item.test_case.id,
+                'title': item.test_case.title,
+                'description': item.test_case.description,
+                'order': item.order,
+                'script_status': item.test_case.script_status,
             }
-            for tc in test_cases
+            for item in memberships
         ]
 
 
@@ -741,15 +597,22 @@ class WebUITestSuiteCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebUITestSuite
         fields = [
-            'name', 'description', 'project', 'status', 'tags'
+            'name', 'description', 'project', 'status', 'tags', 'variables'
         ]
         extra_kwargs = {
             'name': {'required': True},
             'description': {'required': False, 'allow_blank': True},
             'project': {'required': True},
             'status': {'required': False, 'default': 'active'},
-            'tags': {'required': False, 'default': list}
+            'tags': {'required': False, 'default': list},
+            'variables': {'required': False, 'default': list},
         }
+
+    def validate_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
     
     def create(self, validated_data):
         # 自动设置用户
@@ -763,14 +626,21 @@ class WebUITestSuiteUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebUITestSuite
         fields = [
-            'name', 'description', 'status', 'tags'
+            'name', 'description', 'status', 'tags', 'variables'
         ]
         extra_kwargs = {
             'name': {'required': False},
             'description': {'required': False, 'allow_blank': True},
             'status': {'required': False},
-            'tags': {'required': False}
+            'tags': {'required': False},
+            'variables': {'required': False},
         }
+
+    def validate_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
 
 class WebUITestSuiteAddTestCaseSerializer(serializers.Serializer):
@@ -801,8 +671,8 @@ class WebUITestSuiteAddTestCaseSerializer(serializers.Serializer):
 
 class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     """单用例执行详情序列化器 - 用于单用例执行详情页面"""
-    test_case_title = serializers.CharField(source='test_case.title', read_only=True)
-    test_case_description = serializers.CharField(source='test_case.description', read_only=True)
+    test_case_title = serializers.CharField(source='execution.name', read_only=True)
+    test_case_description = serializers.CharField(source='execution.description', read_only=True)
     browser = serializers.CharField(source='execution.browser', read_only=True)
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
     environment_base_url = serializers.SerializerMethodField()
@@ -832,7 +702,7 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
 
 class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
     """套件用例执行明细序列化器"""
-    test_case_title = serializers.CharField(source='test_case.title', read_only=True)
+    test_case_title = serializers.CharField(source='name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     
     class Meta:

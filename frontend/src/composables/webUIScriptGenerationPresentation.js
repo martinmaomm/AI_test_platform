@@ -53,11 +53,10 @@ export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has
 const GENERATION_FIELD_LABELS = {
   description: '测试描述',
   environment_id: 'WebUI 测试环境',
+  module_id: '业务模块',
   start_path: '起始相对路径',
   model_config_id: '本次使用模型',
   temporary_credentials: '本次探索登录信息',
-  source_mode: '生成来源',
-  test_case_id: '测试用例',
   non_field_errors: '生成配置'
 }
 

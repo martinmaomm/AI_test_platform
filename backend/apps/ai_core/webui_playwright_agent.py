@@ -16,7 +16,6 @@ import threading
 from collections import Counter, deque
 from typing import TypedDict, Dict, Any, Optional
 from datetime import datetime
-from channels.db import database_sync_to_async
 from django.conf import settings
 from django.core.cache import cache
 from .models import MCPConfiguration
@@ -30,7 +29,6 @@ from mcp_use import MCPClient, MCPAgent
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_POM_CONTEXT = "当前项目暂无收录的标准页面元素。"
 MCP_MAX_STEPS = 60
 MCP_BROWSER_TOOL_CALL_LIMIT = 50
 
@@ -467,24 +465,6 @@ def _get_mcp_error_message(error: BaseException) -> str:
 def _get_non_retryable_mcp_error_message(error: BaseException) -> str:
     """兼容旧调用方：返回已分类的 MCP 错误提示。"""
     return _get_mcp_error_message(error)
-
-
-def _load_project_pom_context(project_id: int) -> str:
-    """同步读取项目POM元素，供异步节点通过database_sync_to_async调用。"""
-    from web_testing.models import WebElement
-
-    elements = list(
-        WebElement.objects.filter(page__project_id=project_id).select_related('page')
-    )
-    if not elements:
-        return _DEFAULT_POM_CONTEXT
-
-    return "\n".join(
-        f"- 页面【{element.page.name}】| 元素: {element.name} | "
-        f"定位器: {element.locator_type}={element.locator_value} | "
-        f"推荐操作: {element.action_type or '自动识别'}"
-        for element in elements
-    )
 
 
 def _enforce_script_guarantees(script: str, description: str = '') -> str:
@@ -1110,16 +1090,6 @@ class WebUIPlaywrightAgent:
             description = state['description']
             target_url = state['url']
 
-            # 获取当前项目已定义的标准元素库 (POM)
-            elements_context = _DEFAULT_POM_CONTEXT
-            if state.get("project_id"):
-                try:
-                    elements_context = await database_sync_to_async(
-                        _load_project_pom_context
-                    )(state["project_id"])
-                except Exception as e:
-                    logger.error(f"提取项目 POM 元素库失败: {e}")
-
             # 构建MCP调用提示词 - 直接生成playwright Python脚本
             mcp_prompt = f"""
 你是一个 Playwright 自动化测试专家，请根据以下信息生成测试脚本：
@@ -1131,19 +1101,15 @@ class WebUIPlaywrightAgent:
 以下约束必须在本次任务中执行，并与系统级指令保持一致：
 {MCP_EXPLORATION_CONSTRAINTS}
 
-【核心准则：标准元素库 (POM) 优先】
-在生成脚本时，必须优先使用以下已定义的标准元素定位器。如果库中存在匹配业务语义的元素，严禁自行"脑补"其他选择器：
-{elements_context}
-
 【代码编写规范】
 1. 必须使用 Python Playwright 异步 API；文件头部导入 `expect`（如需）。
 2. 只能输出一个业务入口：`async def run(page)`，不要输出 `def test_xxx`、pytest fixture 或其他测试入口。
 3. 不得在代码内部创建或关闭 browser/context/page，不得调用 `async_playwright()`、`launch()` 或 `new_page()`。
-4. 若标准元素库中不存在所需元素，请遵循 Playwright 最佳实践，优先使用稳定选择器（`get_by_role`, `get_by_label`, `get_by_placeholder` 等）。
+4. 请遵循 Playwright 最佳实践，优先使用稳定选择器（`get_by_role`, `get_by_label`, `get_by_placeholder` 等）。
 5. 测试脚本必须包含至少一个断言，使用 `expect(...)` 进行验证。
 6. 必须使用相对路径访问页面，例如 `page.goto("/")`，以便支持外部传入的 base_url。
 7. 脚本必须为包含 `async def run(page)` 的 Python 代码，严禁包含任何解释、说明文字或 Markdown 格式标记。
-8. 严禁包含注释或未使用的 import。
+8. 每个关键业务动作前添加简短中文注释，帮助用户理解脚本流程；不要保留未使用的 import。
 
 【操作类型严格区分 - 必须遵守】
 - 输入类操作（fill/输入）：需要传入文本参数，如 `page.get_by_placeholder("手机号").fill("13800138000")`。
@@ -1157,14 +1123,10 @@ class WebUIPlaywrightAgent:
 
 【智能断言规范 - 死命令 - 必须遵守】
 - 你生成的 run(page) 必须以 `await expect(...)` 结尾。
-- 严禁将断言逻辑写在 POM 页面类的方法内部，必须写在 run(page) 的最后一行，直接操作 page 对象进行校验。
+- 断言必须直接写在 `run(page)` 中，并清楚说明正在验证什么。
 - 动态提取关键词：分析 expected_result/预期结果，提取 4-10 个核心业务字符，忽略引导词（系统显示、用户看到、应该、弹出等）。
 - 优先使用 `await expect(page.get_by_text("关键词")).to_be_visible()`，默认不开启 exact=True。
 - 若预期涉及 URL 跳转，使用 `await expect(page).to_have_url(re.compile(r"..."))`。
-
-【POM 职责分离 - 必须遵守】
-- POM 类的方法仅负责元素操作（点击、输入、选择、悬停），不负责页面跳转。
-- 所有的页面跳转（goto）必须由 run(page) 主动发起，严禁在 POM 方法内部调用 page.goto。
 
 【代码示例（参考形态）】
 ```python

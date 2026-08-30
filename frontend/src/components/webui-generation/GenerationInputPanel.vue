@@ -14,6 +14,12 @@
         </el-select>
         <div class="base-url">Base URL：{{ selectedEnvironmentBaseUrl || '该环境未配置 Base URL' }}</div>
       </el-form-item>
+      <el-form-item label="业务模块">
+        <el-select v-model="form.moduleId" :loading="loadingModules" :disabled="busy || paused" placeholder="未选择时保存到默认模块" clearable>
+          <el-option v-for="module in flatModules" :key="module.id" :label="module.label" :value="module.id" />
+        </el-select>
+        <div class="field-help">业务模块只用于分类，不参与页面探索、元素定位或脚本复用。</div>
+      </el-form-item>
       <el-form-item label="起始相对路径" required>
         <el-input v-model.trim="form.startPath" :disabled="busy || paused" placeholder="/" maxlength="500" />
         <div class="field-help">只填写环境内路径，例如 <code>/permission/users</code>；不需要填写完整域名。</div>
@@ -61,16 +67,25 @@ const EXAMPLE_DESCRIPTION = `目标：验证“权限 > 用户列表”的新增
 - 探索阶段只查看页面和打开表单，不提交新增、编辑或删除；
 - 登录密码不得写入脚本、日志、截图或报告。`
 
-const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, loadingEnvironments: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean, credentialClearVersion: { type: Number, default: 0 } })
+const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modules: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, loadingEnvironments: Boolean, loadingModules: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean, credentialClearVersion: { type: Number, default: 0 } })
 const emit = defineEmits(['submit', 'cancel'])
-const form = reactive({ environmentId: null, startPath: '/', description: '', username: '', password: '', modelConfigId: null })
+const form = reactive({ environmentId: null, moduleId: null, startPath: '/', description: '', username: '', password: '', modelConfigId: null })
+const flattenModules = (items, depth = 0) => items.flatMap(item => [
+  { ...item, label: `${'　'.repeat(depth)}${item.name}${item.is_default ? '（默认）' : ''}` },
+  ...flattenModules(item.children || [], depth + 1)
+])
+const flatModules = computed(() => flattenModules(props.modules))
 const selectedEnvironment = computed(() => props.environments.find(item => item.id === form.environmentId) || null)
 const selectedEnvironmentBaseUrl = computed(() => selectedEnvironment.value?.config?.base_url || selectedEnvironment.value?.base_url || '')
 const formValid = computed(() => form.environmentId !== null && form.modelConfigId !== null && Number.isInteger(Number(form.environmentId)) && form.startPath.startsWith('/') && form.description.trim().length > 0 && form.description.length <= 2000 && Number.isInteger(Number(form.modelConfigId)))
 const modelLabel = (model) => `${model.provider || 'LLM'} · ${model.model_name || '未命名模型'}`
 watch(() => props.environments, (items) => { if (!items.some(item => item.id === form.environmentId)) form.environmentId = items[0]?.id || null }, { immediate: true, deep: true })
 watch(() => props.modelConfigs, (items) => { if (!items.some(item => item.id === form.modelConfigId)) form.modelConfigId = items[0]?.id || null }, { immediate: true, deep: true })
-watch(() => props.projectId, () => { form.environmentId = null; form.username = ''; form.password = '' })
+watch(() => props.modules, (items) => {
+  const all = flattenModules(items)
+  if (!all.some(item => item.id === form.moduleId)) form.moduleId = all.find(item => item.is_default)?.id || null
+}, { immediate: true, deep: true })
+watch(() => props.projectId, () => { form.environmentId = null; form.moduleId = null; form.username = ''; form.password = '' })
 watch(() => props.credentialClearVersion, () => { form.username = ''; form.password = '' })
 const insertExample = () => { form.description = EXAMPLE_DESCRIPTION }
 const submit = () => {
@@ -78,7 +93,7 @@ const submit = () => {
   if (!formValid.value) return ElMessage.warning('请先选择启用的 WebUI 环境和模型，并填写测试描述。')
   if ((form.username && !form.password) || (!form.username && form.password)) return ElMessage.warning('如需登录探索，请同时填写用户名和密码。')
   const temporaryCredentials = form.username && form.password ? { username: form.username, password: form.password } : undefined
-  emit('submit', { description: form.description.trim(), environment_id: Number(form.environmentId), start_path: form.startPath, model_config_id: Number(form.modelConfigId), ...(temporaryCredentials ? { temporary_credentials: temporaryCredentials } : {}) })
+  emit('submit', { description: form.description.trim(), environment_id: Number(form.environmentId), ...(form.moduleId ? { module_id: Number(form.moduleId) } : {}), start_path: form.startPath, model_config_id: Number(form.modelConfigId), ...(temporaryCredentials ? { temporary_credentials: temporaryCredentials } : {}) })
 }
 </script>
 

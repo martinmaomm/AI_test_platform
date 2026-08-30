@@ -73,12 +73,10 @@ class ScriptGenerator:
         *,
         scenario: ScenarioSpec,
         snapshot: ExplorationSnapshot,
-        pom_context: str,
     ) -> str:
         payload = {
             'scenario': scenario.model_dump(mode='json'),
             'exploration_snapshot': snapshot.model_dump(mode='json'),
-            'project_pom_context': redact_text(pom_context),
         }
         return self._invoke(GENERATOR_SYSTEM_PROMPT, payload)
 
@@ -89,14 +87,12 @@ class ScriptGenerator:
         issues: list[dict[str, Any]],
         scenario: ScenarioSpec,
         snapshot: ExplorationSnapshot,
-        pom_context: str,
     ) -> str:
         payload = {
             'script': redact_text(script),
             'quality_issues': redact_metadata(issues),
             'scenario': scenario.model_dump(mode='json'),
             'exploration_evidence': snapshot.model_dump(mode='json'),
-            'project_pom_context': redact_text(pom_context),
         }
         return self._invoke(REPAIR_SYSTEM_PROMPT, payload)
 

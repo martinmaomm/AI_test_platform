@@ -22,7 +22,6 @@ from langchain_core.documents import Document
 from .knowledge.models import KnowledgeBaseFile
 
 # 串联触发 WebUI 三维资产提取
-from web_testing.tasks import extract_pom_from_doc_task
 
 logger = logging.getLogger(__name__)
 

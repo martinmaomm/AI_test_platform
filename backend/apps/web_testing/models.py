@@ -4,7 +4,7 @@ Web Testing Models
 """
 import uuid
 
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth import get_user_model
 from projects.models import Project, Environment
 
@@ -14,7 +14,9 @@ User = get_user_model()
 # ============ WebUI测试模块树 ============
 
 class WebUITestModule(models.Model):
-    """WebUI测试模块 - 用于组织测试用例的树状结构"""
+    """WebUI 测试用例的纯分类目录。"""
+    DEFAULT_NAME = '默认模块'
+
     project = models.ForeignKey(Project, on_delete=models.CASCADE, verbose_name="所属项目", related_name='webui_test_modules')
     name = models.CharField(max_length=100, verbose_name="模块名称")
     parent = models.ForeignKey(
@@ -26,8 +28,7 @@ class WebUITestModule(models.Model):
         verbose_name="父模块"
     )
     order = models.IntegerField(default=0, verbose_name="排序")
-    description = models.TextField(blank=True, null=True, verbose_name='模块描述')
-    business_rules = models.JSONField(default=list, blank=True, null=True, verbose_name='业务约束规则')
+    is_default = models.BooleanField(default=False, verbose_name='是否默认模块')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
 
@@ -43,39 +44,37 @@ class WebUITestModule(models.Model):
     def __str__(self):
         return f"{self.name} ({self.project.name})"
 
+    @classmethod
+    def ensure_default(cls, project_id):
+        """Return the project's default classification, creating it when absent."""
+        with transaction.atomic():
+            current = cls.objects.filter(project_id=project_id, is_default=True).order_by('id').first()
+            if current:
+                return current
+            module, _ = cls.objects.get_or_create(
+                project_id=project_id,
+                parent=None,
+                name=cls.DEFAULT_NAME,
+                defaults={'order': 0, 'is_default': True},
+            )
+            if not module.is_default:
+                module.is_default = True
+                module.save(update_fields=['is_default', 'updated_at'])
+            return module
+
 
 # ============ WebUI测试用例 ============
 
 class WebUITestCase(models.Model):
-    """WebUI单个测试用例模型"""
-    
-    PRIORITY_CHOICES = [
-        ('high', '高'),
-        ('medium', '中'),
-        ('low', '低'),
-    ]
-    
-    CATEGORY_CHOICES = [
-        ('functional', '功能测试'),
-        ('negative', '异常测试'),
-        ('boundary', '边界测试'),
-        ('security', '安全测试'),
-        ('performance', '性能测试'),
-        ('ui', '界面测试'),
-        ('integration', '集成测试'),
-    ]
+    """One independently executable Python Playwright script."""
 
     SCRIPT_SOURCE_CHOICES = [
         ('manual', '手工编写'),
-        ('requirement_ai', '需求 AI'),
         ('mcp_exploration', 'MCP 探索'),
-        ('step_generator', '步骤生成器'),
-        ('legacy', '历史脚本'),
     ]
     SCRIPT_STATUS_CHOICES = [
         ('none', '无脚本'),
         ('ready', '可执行'),
-        ('legacy', '旧格式'),
         ('invalid', '无效'),
     ]
     SCRIPT_FRAMEWORK_CHOICES = [
@@ -85,16 +84,7 @@ class WebUITestCase(models.Model):
     # 基本信息
     title = models.CharField(max_length=200, verbose_name="测试用例标题")
     description = models.TextField(verbose_name="测试用例描述")
-    url = models.URLField(max_length=500, blank=True, null=True, verbose_name="目标URL")
-    
-    # 测试用例属性
-    priority = models.CharField(max_length=10, choices=PRIORITY_CHOICES, default='medium', verbose_name="优先级")
-    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='functional', verbose_name="测试类别")
-    
-    # 测试步骤和预期结果
-    preconditions = models.JSONField(default=list, blank=True, verbose_name="前置条件")
-    steps = models.JSONField(default=list, blank=True, verbose_name="测试步骤")
-    expected_result = models.TextField(verbose_name="预期结果")
+    variables = models.JSONField(default=list, blank=True, verbose_name='用例变量')
     
     # 测试脚本内容
     test_script_content = models.TextField(blank=True, null=True, verbose_name="测试脚本内容")
@@ -125,21 +115,6 @@ class WebUITestCase(models.Model):
         related_name='test_cases',
         verbose_name="所属模块"
     )
-    source_requirement_generation = models.ForeignKey(
-        'WebUITestCaseGeneration',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='imported_test_cases',
-        verbose_name='需求生成记录',
-    )
-    source_draft_key = models.CharField(
-        max_length=80,
-        null=True,
-        blank=True,
-        verbose_name='需求草稿幂等键',
-    )
-    
     # 时间信息
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
@@ -170,70 +145,11 @@ class WebUITestCase(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['user', 'project']),
-            models.Index(fields=['category', 'priority']),
             models.Index(fields=['created_at']),
-        ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=['source_requirement_generation', 'source_draft_key'],
-                name='unique_webui_requirement_draft',
-            ),
         ]
     
     def __str__(self):
-        return f"{self.title} - {self.get_priority_display()}"
-    
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
-    
-    @property
-    def steps_list(self):
-        """获取测试步骤列表"""
-        return self.steps if isinstance(self.steps, list) else []
-    
-    @property
-    def preconditions_list(self):
-        """获取前置条件列表"""
-        return self.preconditions if isinstance(self.preconditions, list) else []
-    
-    def get_step_by_number(self, step_number):
-        """根据步骤号获取测试步骤"""
-        for step in self.steps_list:
-            if step.get('step_id') == step_number:
-                return step
-        return None
-    
-    def add_step(self, step_data):
-        """添加测试步骤"""
-        if not isinstance(self.steps, list):
-            self.steps = []
-        
-        # 自动分配步骤ID
-        if 'step_id' not in step_data:
-            step_data['step_id'] = len(self.steps) + 1
-        
-        self.steps.append(step_data)
-        self.save(update_fields=['steps'])
-    
-    def update_step(self, step_id, step_data):
-        """更新测试步骤"""
-        for i, step in enumerate(self.steps_list):
-            if step.get('step_id') == step_id:
-                self.steps[i].update(step_data)
-                self.save(update_fields=['steps'])
-                return True
-        return False
-    
-    def remove_step(self, step_id):
-        """删除测试步骤"""
-        original_steps = self.steps_list.copy()
-        self.steps = [step for step in original_steps if step.get('step_id') != step_id]
-        
-        # 重新分配步骤ID
-        for i, step in enumerate(self.steps):
-            step['step_id'] = i + 1
-        
-        self.save(update_fields=['steps'])
+        return self.title
     
     # 脚本相关方法
     @property
@@ -273,10 +189,6 @@ class WebUITestCase(models.Model):
 
 class WebUIScriptGeneration(models.Model):
     """WebUI AI 脚本生成的可恢复、无敏感数据任务记录。"""
-
-    class SourceMode(models.TextChoices):
-        MANUAL_PROMPT = 'manual_prompt', 'AI 脚本实验室'
-        TEST_CASE = 'test_case', '测试用例'
 
     class Status(models.TextChoices):
         CREATED = 'created', '已创建'
@@ -332,11 +244,13 @@ class WebUIScriptGeneration(models.Model):
         related_name='script_generations',
         verbose_name='关联测试用例',
     )
-    source_mode = models.CharField(
-        max_length=30,
-        choices=SourceMode.choices,
-        default=SourceMode.MANUAL_PROMPT,
-        verbose_name='生成入口',
+    module = models.ForeignKey(
+        WebUITestModule,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='script_generations',
+        verbose_name='目标业务模块',
     )
     celery_task_id = models.CharField(
         max_length=100,
@@ -396,113 +310,6 @@ class WebUIScriptGeneration(models.Model):
 
     def __str__(self):
         return f'{self.project.name} - {self.get_status_display()} ({self.pk})'
-
-
-# ============ WebUI 需求用例生成记录 ============
-
-class WebUITestCaseGeneration(models.Model):
-    """可恢复的 WebUI 需求用例草稿生成记录。"""
-
-    class Status(models.TextChoices):
-        CREATED = 'created', '已创建'
-        CONTEXT_BUILDING = 'context_building', '准备资料中'
-        GENERATING = 'generating', '生成草稿中'
-        VALIDATING = 'validating', '校验草稿中'
-        REPAIRING = 'repairing', '修复草稿中'
-        NEEDS_REVIEW = 'needs_review', '待人工审核'
-        IMPORTING = 'importing', '导入中'
-        IMPORTED = 'imported', '已导入'
-        FAILED = 'failed', '生成失败'
-        CANCELLED = 'cancelled', '已取消'
-
-    class Scope(models.TextChoices):
-        CORE = 'core', '核心流程'
-        SPECIFIED = 'specified', '指定场景'
-        MODULE_COVERAGE = 'module_coverage', '模块覆盖'
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    project = models.ForeignKey(
-        Project,
-        on_delete=models.CASCADE,
-        related_name='webui_test_case_generations',
-        verbose_name='所属项目',
-    )
-    user = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='webui_test_case_generations',
-        verbose_name='发起用户',
-    )
-    module = models.ForeignKey(
-        WebUITestModule,
-        on_delete=models.PROTECT,
-        related_name='requirement_generations',
-        verbose_name='锁定业务模块',
-    )
-    model_config = models.ForeignKey(
-        'ai_core.LLMConfiguration',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='webui_test_case_generations',
-        verbose_name='使用模型',
-    )
-    celery_task_id = models.CharField(
-        max_length=100,
-        null=True,
-        blank=True,
-        unique=True,
-        verbose_name='Celery 任务 ID',
-    )
-    client_request_id = models.UUIDField(
-        null=True,
-        blank=True,
-        unique=True,
-        verbose_name='客户端幂等请求 ID',
-    )
-    status = models.CharField(
-        max_length=30,
-        choices=Status.choices,
-        default=Status.CREATED,
-        db_index=True,
-        verbose_name='生成状态',
-    )
-    request_text = models.TextField(blank=True, default='', verbose_name='脱敏场景描述')
-    generation_scope = models.CharField(
-        max_length=30,
-        choices=Scope.choices,
-        default=Scope.CORE,
-        verbose_name='生成范围',
-    )
-    case_categories = models.JSONField(
-        default=list,
-        blank=True,
-        verbose_name='用例类型',
-    )
-    target_case_count = models.PositiveSmallIntegerField(default=6, verbose_name='目标用例数量')
-    context_snapshot = models.JSONField(default=dict, blank=True, verbose_name='脱敏上下文快照')
-    draft_test_cases = models.JSONField(default=list, blank=True, verbose_name='测试用例草稿')
-    validation_report = models.JSONField(default=dict, blank=True, verbose_name='草稿校验报告')
-    created_case_ids = models.JSONField(default=list, blank=True, verbose_name='已导入用例 ID')
-    error_code = models.CharField(max_length=64, blank=True, default='', verbose_name='稳定错误码')
-    error_message = models.TextField(blank=True, default='', verbose_name='用户可读错误信息')
-    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
-    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
-
-    class Meta:
-        db_table = 'webui_test_case_generations'
-        verbose_name = 'WebUI 需求用例生成记录'
-        verbose_name_plural = 'WebUI 需求用例生成记录'
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['project', '-created_at'], name='webui_req_project_created'),
-            models.Index(fields=['user', 'status'], name='webui_req_user_status'),
-        ]
-
-    def __str__(self):
-        return f'{self.project.name} - {self.module.name} - {self.get_status_display()}'
 
 
 # ============ WebUI测试执行记录 ============
@@ -635,7 +442,13 @@ class WebUITestCaseExecutionDetail(models.Model):
     execution = models.OneToOneField(WebUITestExecution, on_delete=models.CASCADE, related_name='case_execution_detail', verbose_name="执行记录")
     
     # 关联测试用例
-    test_case = models.ForeignKey(WebUITestCase, on_delete=models.CASCADE, verbose_name="测试用例")
+    test_case = models.ForeignKey(
+        WebUITestCase,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="测试用例",
+    )
     
     # 执行详情
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name="执行状态")
@@ -669,7 +482,13 @@ class WebUITestSuiteExecutionDetail(models.Model):
     execution = models.OneToOneField(WebUITestExecution, on_delete=models.CASCADE, related_name='suite_execution_detail', verbose_name="执行记录")
     
     # 关联测试套件
-    test_suite = models.ForeignKey('WebUITestSuite', on_delete=models.CASCADE, verbose_name="测试套件")
+    test_suite = models.ForeignKey(
+        'WebUITestSuite',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="测试套件",
+    )
     
     # 统计信息
     total_cases = models.PositiveIntegerField(default=0, verbose_name="总用例数")
@@ -720,7 +539,13 @@ class WebUITestSuiteCaseExecution(models.Model):
     suite_execution = models.ForeignKey(WebUITestSuiteExecutionDetail, on_delete=models.CASCADE, related_name='case_executions', verbose_name="套件执行详情")
     
     # 关联测试用例
-    test_case = models.ForeignKey(WebUITestCase, on_delete=models.CASCADE, verbose_name="测试用例")
+    test_case = models.ForeignKey(
+        WebUITestCase,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="测试用例",
+    )
     
     # 执行信息
     name = models.CharField(max_length=200, verbose_name="用例名称")
@@ -816,62 +641,6 @@ class MidSceneScript(models.Model):
         super().save(*args, **kwargs)
 
 
-# ============ POM 标准元素库 ============
-
-
-class WebPage(models.Model):
-    """Web 页面 - POM 中的页面维度"""
-    project = models.ForeignKey(Project, on_delete=models.CASCADE, verbose_name="所属项目", related_name='web_pages')
-    module = models.ForeignKey('WebUITestModule', on_delete=models.SET_NULL, null=True, blank=True, related_name='pages', verbose_name='所属模块')
-    name = models.CharField(max_length=200, verbose_name="页面名称")
-    url_path = models.CharField(max_length=500, blank=True, default="/", verbose_name="URL路径")
-    generated_class_code = models.TextField(blank=True, null=True, verbose_name="生成的 Page 类代码（Page 库，兼容旧版）")
-    pom_code = models.TextField(blank=True, null=True, verbose_name="POM 页面类代码（库级持久化）")
-    page_class_name = models.CharField(max_length=100, blank=True, null=True, verbose_name="Page 类名")
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
-
-    class Meta:
-        db_table = 'webui_web_pages'
-        verbose_name = 'Web页面'
-        verbose_name_plural = 'Web页面'
-        ordering = ['name']
-
-    def __str__(self):
-        return f"{self.name} ({self.project.name})"
-
-    def refresh_pom_code(self):
-        """
-        根据当前页面下所有 WebElement 重新生成 Page 类代码并存入 pom_code。
-        实现 POM 单点维护：修改定位器后自动同步。
-        """
-        from .pom_code_generator import generate_pom_code_from_page
-        class_name, code = generate_pom_code_from_page(self)
-        self.pom_code = code
-        self.page_class_name = class_name
-        self.save(update_fields=['pom_code', 'page_class_name', 'updated_at'])
-
-
-class WebElement(models.Model):
-    """Web 元素 - POM 中的标准元素定位器"""
-    page = models.ForeignKey(WebPage, on_delete=models.CASCADE, verbose_name="所属页面", related_name='elements')
-    name = models.CharField(max_length=100, verbose_name="元素名称")
-    locator_type = models.CharField(max_length=50, verbose_name="定位器类型", default="css")
-    locator_value = models.CharField(max_length=500, verbose_name="定位器值")
-    action_type = models.CharField(max_length=50, blank=True, null=True, verbose_name="推荐操作类型")
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
-
-    class Meta:
-        db_table = 'webui_web_elements'
-        verbose_name = 'Web元素'
-        verbose_name_plural = 'Web元素'
-        ordering = ['page', 'name']
-
-    def __str__(self):
-        return f"{self.name} ({self.page.name})"
-
-
 # ============ WebUI测试套件 ============
 
 class WebUITestSuite(models.Model):
@@ -890,14 +659,16 @@ class WebUITestSuite(models.Model):
     # 套件属性
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active', verbose_name="状态")
     tags = models.JSONField(default=list, blank=True, verbose_name="标签")
+    variables = models.JSONField(default=list, blank=True, verbose_name='套件变量')
     
     # 关联信息
     user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="创建用户")
     project = models.ForeignKey(Project, on_delete=models.CASCADE, verbose_name="所属项目")
     
-    # 测试用例关联（直接使用ManyToManyField）
+    # 测试用例互相独立，套件只保存执行顺序。
     test_cases = models.ManyToManyField(
-        WebUITestCase, 
+        WebUITestCase,
+        through='WebUITestSuiteCase',
         related_name='test_suites',
         verbose_name="测试用例",
         blank=True
@@ -933,11 +704,18 @@ class WebUITestSuite(models.Model):
     
     def get_test_cases(self):
         """获取所有测试用例"""
-        return self.test_cases.all()
+        return self.test_cases.order_by('suite_memberships__order', 'suite_memberships__id')
     
-    def add_test_case(self, test_case):
+    def add_test_case(self, test_case, order=None):
         """添加测试用例到套件"""
-        self.test_cases.add(test_case)
+        if order is None:
+            last = self.case_memberships.order_by('-order').values_list('order', flat=True).first()
+            order = (last or 0) + 1
+        WebUITestSuiteCase.objects.get_or_create(
+            suite=self,
+            test_case=test_case,
+            defaults={'order': order},
+        )
     
     def remove_test_case(self, test_case):
         """从套件中移除测试用例"""
@@ -948,21 +726,26 @@ class WebUITestSuite(models.Model):
         self.test_cases.clear()
 
 
-# WebUITestSuiteCase 模型已删除，使用 ManyToManyField 直接关联测试用例
+class WebUITestSuiteCase(models.Model):
+    """Ordered membership of an independent test case in a suite."""
+    suite = models.ForeignKey(
+        WebUITestSuite,
+        on_delete=models.CASCADE,
+        related_name='case_memberships',
+        verbose_name='测试套件',
+    )
+    test_case = models.ForeignKey(
+        WebUITestCase,
+        on_delete=models.CASCADE,
+        related_name='suite_memberships',
+        verbose_name='测试用例',
+    )
+    order = models.PositiveIntegerField(default=0, verbose_name='执行顺序')
 
-
-# ==========================================
-# 信号监听：数据驱动的 POM 代码自动重塑
-# ==========================================
-from django.db.models.signals import post_save, post_delete
-from django.dispatch import receiver
-
-
-@receiver(post_save, sender=WebElement)
-@receiver(post_delete, sender=WebElement)
-def trigger_pom_regeneration(sender, instance, **kwargs):
-    """拦截元素的保存和删除动作，静默重新生成所属页面的 POM 代码"""
-    if instance.page_id:
-        # 采用局部导入，防止与 models 的初始化产生循环依赖
-        from .pom_code_generator import generate_page_class_code
-        generate_page_class_code(instance.page_id)
+    class Meta:
+        db_table = 'webui_test_suite_cases'
+        ordering = ['order', 'id']
+        constraints = [
+            models.UniqueConstraint(fields=['suite', 'test_case'], name='unique_webui_suite_case'),
+        ]
+        indexes = [models.Index(fields=['suite', 'order'])]

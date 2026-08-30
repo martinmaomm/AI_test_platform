@@ -197,8 +197,24 @@
     </el-card>
 
     <!-- 详情对话框 -->
-    <el-dialog v-model="detailDialogVisible" title="执行详情" width="90%" top="4vh" :close-on-click-modal="false"
-      :show-close="true" class="execution-detail-dialog">
+    <el-dialog v-model="detailDialogVisible" title="执行详情" width="90%"
+      :top="detailDialogExpanded ? '4vh' : '12vh'" :close-on-click-modal="false" :show-close="true"
+      :style="detailDialogStyle" class="execution-detail-dialog" @closed="resetDetailDialogSize">
+      <template #header>
+        <div class="execution-dialog-header">
+          <span class="execution-dialog-title">执行详情</span>
+          <button
+            type="button"
+            class="execution-dialog-resize-handle"
+            :title="detailDialogExpanded ? '恢复默认窗口' : '放大窗口'"
+            :aria-label="detailDialogExpanded ? '恢复默认窗口' : '放大窗口'"
+            @click="toggleDetailDialogSize"
+          >
+            {{ detailDialogExpanded ? '↙' : '⛶' }}
+          </button>
+        </div>
+      </template>
+
       <!-- 套件执行详情 -->
       <WebUITestSuiteExecutionDetail v-if="selectedRun && selectedRun.exec_type === 'suite'" :execution="selectedRun"
         :visible="detailDialogVisible" @close="detailDialogVisible = false" />
@@ -237,6 +253,7 @@ const currentPage = ref(1)
 const pageSize = ref(20)
 const totalRuns = ref(0)
 const detailDialogVisible = ref(false)
+const detailDialogExpanded = ref(false)
 const selectedRun = ref(null)
 const router = useRouter()
 const projectStore = useProjectStore()
@@ -245,6 +262,17 @@ const projectStore = useProjectStore()
 // 计算属性
 const selectedProject = computed(() => projectStore.currentProject)
 const currentProject = computed(() => projectStore.currentProject)
+const detailDialogStyle = computed(() => ({
+  height: detailDialogExpanded.value ? '88vh' : '72vh'
+}))
+
+const toggleDetailDialogSize = () => {
+  detailDialogExpanded.value = !detailDialogExpanded.value
+}
+
+const resetDetailDialogSize = () => {
+  detailDialogExpanded.value = false
+}
 
 // 统计数据
 const stats = reactive({
@@ -951,18 +979,52 @@ onMounted(() => {
   min-height: min(560px, 80vh);
   max-height: 92vh;
   overflow: hidden;
-  resize: vertical;
 }
 
 .execution-detail-dialog :deep(.el-dialog__header) {
   flex-shrink: 0;
 }
 
+.execution-dialog-header {
+  align-items: center;
+  display: flex;
+  min-height: 24px;
+  padding-right: 38px;
+}
+
+.execution-dialog-title {
+  color: #303133;
+  font-size: 18px;
+  line-height: 24px;
+}
+
+.execution-dialog-resize-handle {
+  align-items: center;
+  background: rgba(64, 158, 255, 0.9);
+  border: 0;
+  border-radius: 4px;
+  color: #ffffff;
+  cursor: pointer;
+  display: flex;
+  font-size: 16px;
+  height: 24px;
+  justify-content: center;
+  line-height: 1;
+  margin-left: auto;
+  padding: 0;
+  user-select: none;
+  width: 28px;
+}
+
+.execution-dialog-resize-handle:hover {
+  background: #409eff;
+}
+
 .execution-detail-dialog :deep(.el-dialog__body) {
   flex: 1;
   min-height: 0;
   padding: 0;
-  overflow: auto;
+  overflow: hidden;
 }
 
 

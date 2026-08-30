@@ -2,6 +2,8 @@
 Web Testing Models
 统一管理Web UI自动化测试相关的数据模型
 """
+import uuid
+
 from django.db import models
 from django.contrib.auth import get_user_model
 from projects.models import Project, Environment
@@ -245,6 +247,132 @@ class WebUITestCase(models.Model):
             'script_validation_error': self.script_validation_error,
             'generation_metadata': self.generation_metadata,
         }
+
+
+# ============ WebUI 脚本生成记录 ============
+
+class WebUIScriptGeneration(models.Model):
+    """WebUI AI 脚本生成的可恢复、无敏感数据任务记录。"""
+
+    class SourceMode(models.TextChoices):
+        MANUAL_PROMPT = 'manual_prompt', 'AI 脚本实验室'
+        TEST_CASE = 'test_case', '测试用例'
+
+    class Status(models.TextChoices):
+        CREATED = 'created', '已创建'
+        NORMALIZING = 'normalizing', '理解需求中'
+        PREFLIGHTING = 'preflighting', '安全预检中'
+        EXPLORING = 'exploring', '探索页面中'
+        GENERATING = 'generating', '生成脚本中'
+        VALIDATING = 'validating', '检查脚本中'
+        REPAIRING = 'repairing', '修复脚本中'
+        NEEDS_INPUT = 'needs_input', '需要补充输入'
+        NEEDS_CONFIRMATION = 'needs_confirmation', '需要确认'
+        NEEDS_CREDENTIALS = 'needs_credentials', '需要登录信息'
+        NEEDS_REVIEW = 'needs_review', '需要人工检查'
+        READY = 'ready', '生成完成'
+        READY_WITH_WARNINGS = 'ready_with_warnings', '生成完成（有警告）'
+        CANCELLED = 'cancelled', '已取消'
+        FAILED = 'failed', '生成失败'
+
+    class Stage(models.TextChoices):
+        CREATED = 'created', '已创建'
+        NORMALIZING = 'normalizing', '理解需求'
+        PREFLIGHTING = 'preflighting', '安全预检'
+        EXPLORING = 'exploring', '探索页面'
+        GENERATING = 'generating', '生成脚本'
+        VALIDATING = 'validating', '检查脚本'
+        REPAIRING = 'repairing', '修复脚本'
+        COMPLETED = 'completed', '已完成'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name='webui_script_generations',
+        verbose_name='所属项目',
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='webui_script_generations',
+        verbose_name='发起用户',
+    )
+    environment = models.ForeignKey(
+        Environment,
+        on_delete=models.PROTECT,
+        related_name='webui_script_generations',
+        verbose_name='WebUI 环境',
+    )
+    test_case = models.ForeignKey(
+        WebUITestCase,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='script_generations',
+        verbose_name='关联测试用例',
+    )
+    source_mode = models.CharField(
+        max_length=30,
+        choices=SourceMode.choices,
+        default=SourceMode.MANUAL_PROMPT,
+        verbose_name='生成入口',
+    )
+    celery_task_id = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        unique=True,
+        verbose_name='Celery 任务 ID',
+    )
+    status = models.CharField(
+        max_length=30,
+        choices=Status.choices,
+        default=Status.CREATED,
+        verbose_name='生成状态',
+    )
+    current_stage = models.CharField(
+        max_length=30,
+        choices=Stage.choices,
+        default=Stage.CREATED,
+        verbose_name='当前阶段',
+    )
+    progress = models.PositiveSmallIntegerField(default=0, verbose_name='进度百分比')
+    start_path = models.CharField(max_length=500, default='/', verbose_name='环境内起始路径')
+    target_url_safe = models.TextField(blank=True, default='', verbose_name='脱敏目标地址')
+    description_safe = models.TextField(blank=True, default='', verbose_name='脱敏场景描述')
+    scenario_spec = models.JSONField(default=dict, blank=True, verbose_name='规范化场景')
+    exploration_snapshot = models.JSONField(default=dict, blank=True, verbose_name='探索证据')
+    script_draft = models.TextField(blank=True, default='', verbose_name='脚本草稿')
+    quality_report = models.JSONField(default=dict, blank=True, verbose_name='质量报告')
+    warnings = models.JSONField(default=list, blank=True, verbose_name='用户可见警告')
+    model_info = models.JSONField(default=dict, blank=True, verbose_name='模型信息')
+    tool_stats = models.JSONField(default=dict, blank=True, verbose_name='工具统计')
+    repair_count = models.PositiveSmallIntegerField(default=0, verbose_name='已修复次数')
+    credentials_required = models.BooleanField(default=False, verbose_name='是否需要登录信息')
+    credentials_provided = models.BooleanField(default=False, verbose_name='是否已提供临时登录信息')
+    credentials_expired = models.BooleanField(default=False, verbose_name='临时登录信息是否已失效')
+    error_code = models.CharField(max_length=64, blank=True, default='', verbose_name='稳定错误码')
+    error_message = models.TextField(blank=True, default='', verbose_name='用户可读错误信息')
+    cancel_requested_at = models.DateTimeField(null=True, blank=True, verbose_name='取消请求时间')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'webui_script_generations'
+        verbose_name = 'WebUI 脚本生成记录'
+        verbose_name_plural = 'WebUI 脚本生成记录'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['project', '-created_at'], name='webui_gen_project_created'),
+            models.Index(fields=['user', 'status'], name='webui_gen_user_status'),
+            models.Index(fields=['status', 'updated_at'], name='webui_gen_status_updated'),
+        ]
+
+    def __str__(self):
+        return f'{self.project.name} - {self.get_status_display()} ({self.pk})'
 
 
 # ============ WebUI测试执行记录 ============

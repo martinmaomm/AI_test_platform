@@ -208,7 +208,8 @@ const copyLogs = () => {
 
 <style scoped>
 .test-report-container {
-  height: 470px;
+  height: 100%;
+  min-height: 0;
   background: #fafbfc;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
@@ -218,15 +219,19 @@ const copyLogs = () => {
 
 /* 主要内容区域 */
 .report-content {
+  display: flex;
+  flex-direction: column;
   height: 100%;
   overflow: hidden;
 }
 
 /* 主内容区域 */
 .main-content {
+  box-sizing: border-box;
+  flex: 1;
+  min-height: 0;
   background: #ffffff;
   padding: 24px;
-  height: 100%;
   overflow-y: auto;
 }
 
@@ -456,6 +461,8 @@ const copyLogs = () => {
 
 /* 日志部分 */
 .log-container {
+  grid-column: 1 / -1;
+  min-width: 0;
   overflow: hidden;
 }
 
@@ -476,10 +483,12 @@ const copyLogs = () => {
 }
 
 .log-content {
+  box-sizing: border-box;
   background: #1e1e1e;
   color: #d4d4d4;
   padding: 15px;
   height: 300px;
+  width: 100%;
   overflow-y: auto;
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 12px;

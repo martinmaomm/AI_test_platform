@@ -150,7 +150,7 @@ const routes = [
         children: [
           { path: '', redirect: '/web-testing/create/requirements' },
           { path: 'requirements', name: 'WebRequirementCreate', component: () => import('@/views/web-testing/WebUITestCaseGenerator.vue'), meta: { title: '智能创建' } },
-          { path: 'explore', name: 'WebExploreCreate', component: () => import('@/views/web-testing/WebUIAutoTest.vue'), meta: { title: '智能创建' } }
+          { path: 'explore', name: 'WebExploreCreate', component: () => import('@/views/web-testing/WebUIAutoTest.vue'), meta: { title: 'AI 脚本生成' } }
         ]
       },
       { path: 'webui-auto-test', redirect: '/web-testing/create/explore' },

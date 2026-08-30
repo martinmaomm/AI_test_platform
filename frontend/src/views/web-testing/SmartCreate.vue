@@ -19,8 +19,7 @@
           <template #label>
             <span class="mode-label">
               <el-icon><Compass /></el-icon>
-              探索网页生成
-              <el-tag size="small" type="warning" effect="plain">实验</el-tag>
+              AI 脚本生成
             </span>
           </template>
         </el-tab-pane>
@@ -31,7 +30,7 @@
           根据业务需求、知识库和已维护的页面元素，生成可编辑的结构化测试用例。
         </template>
         <template v-else>
-          使用 Playwright MCP 探索真实页面并生成 Python 脚本草稿，保存前需要人工检查。
+          AI 先理解测试场景，再通过 Playwright MCP 只读探索页面并生成 Python 脚本。
         </template>
       </div>
     </div>

@@ -65,14 +65,6 @@
               <span>已选择 {{ selectedTestCases.length }} 个用例</span>
             </div>
             <div class="batch-buttons">
-              <el-button
-                type="success"
-                size="small"
-                @click="batchGenerateCode"
-              >
-                <el-icon><Files /></el-icon>
-                批量生成脚本
-              </el-button>
               <el-button type="default" size="small" @click="handleBatchAddToSuite">
                 <el-icon><Collection /></el-icon>
                 添加到套件
@@ -101,15 +93,6 @@
               <h3>用例列表</h3>
             </div>
             <div class="card-header-right">
-              <el-button
-                type="success"
-                size="small"
-                :disabled="selectedTestCases.length === 0"
-                @click="batchGenerateCode"
-              >
-                <el-icon><Files /></el-icon>
-                批量生成脚本
-              </el-button>
               <div class="card-header-filters">
                 <el-select v-model="hasScriptFilter" placeholder="脚本状态" clearable style="width: 120px;" @change="handleFilterChange">
                   <el-option label="全部" value="" />
@@ -277,8 +260,8 @@
                   type="primary"
                   link
                   size="small"
-                  :loading="generatingId === scope.row.id"
-                  @click="generateCode(scope.row)"
+                  :loading="scriptGenerationSubmitting && scriptGenerationCase?.id === scope.row.id"
+                  @click="openScriptGenerationConfig(scope.row)"
                 >
                   <el-icon><Refresh /></el-icon>
                 </el-button>
@@ -510,6 +493,43 @@
     <WebUICaseEditDetail v-model="detailDialogVisible" :test-case="currentTestCase" :existing-test-cases="testCases"
       @run="handleRunTestCase" @update="handleTestCaseUpdate" />
 
+    <el-dialog
+      v-model="scriptGenerationDialogVisible"
+      title="AI 脚本生成配置"
+      width="620px"
+      :close-on-click-modal="false"
+      @closed="clearScriptGenerationCredentials"
+    >
+      <el-form label-position="top">
+        <el-alert title="平台会读取当前测试用例的标题、步骤和预期结果；本窗口只配置探索环境，不会把账号密码写入用例或生成记录。" type="info" :closable="false" show-icon class="script-generation-tip" />
+        <el-form-item label="WebUI 测试环境" required>
+          <el-select v-model="scriptGenerationForm.environmentId" :loading="loadingScriptGenerationEnvironments" placeholder="请选择启用的 WebUI 环境">
+            <el-option v-for="environment in scriptGenerationEnvironments" :key="environment.id" :label="environment.name" :value="environment.id" />
+          </el-select>
+          <div class="generation-base-url">Base URL：{{ scriptGenerationBaseUrl || '该环境未配置 Base URL' }}</div>
+        </el-form-item>
+        <el-form-item label="起始相对路径" required>
+          <el-input v-model.trim="scriptGenerationForm.startPath" maxlength="500" placeholder="/" />
+          <div class="generation-field-help">仅填写环境内路径，例如 <code>/permission/users</code>。</div>
+        </el-form-item>
+        <el-form-item label="本次使用模型" required>
+          <el-select v-model="scriptGenerationForm.modelConfigId" :loading="loadingScriptGenerationModels" placeholder="请选择启用的 LLM">
+            <el-option v-for="model in scriptGenerationModels" :key="model.id" :label="formatModelLabel(model)" :value="model.id" />
+          </el-select>
+        </el-form-item>
+        <el-collapse>
+          <el-collapse-item title="本次探索登录信息（可选）" name="credentials">
+            <el-alert title="仅用于本次只读页面探索；提交后会立即从浏览器内存清除。" type="warning" :closable="false" show-icon />
+            <div class="script-generation-credentials"><el-input v-model="scriptGenerationForm.username" autocomplete="off" placeholder="用户名" /><el-input v-model="scriptGenerationForm.password" type="password" show-password autocomplete="new-password" placeholder="密码" /></div>
+          </el-collapse-item>
+        </el-collapse>
+      </el-form>
+      <template #footer>
+        <el-button @click="scriptGenerationDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="scriptGenerationSubmitting" :disabled="!scriptGenerationFormValid" @click="startTestCaseScriptGeneration">分析并生成脚本</el-button>
+      </template>
+    </el-dialog>
+
     <!-- Playwright 脚本预览弹窗 -->
     <el-dialog v-model="codeDialogVisible" title="Playwright 脚本预览" width="800px">
       <div class="code-container" style="background: #1e1e1e; padding: 15px; border-radius: 8px;">
@@ -634,7 +654,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 
 // 静默轮询：执行状态自动刷新
 let statusPollingTimer = null
@@ -645,15 +665,14 @@ const stopStatusPolling = () => {
   }
 }
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox, ElLoading } from 'element-plus'
-import { Plus, Right, Upload, Download, Search, Refresh, Document, Folder, Loading, Warning, Edit, VideoPlay, Delete, Close, Rank, DocumentCopy, Files, Check, View, CircleCheck, CircleClose, Minus, Aim, Collection } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Plus, Right, Upload, Download, Search, Refresh, Document, Folder, Loading, Warning, Edit, VideoPlay, Delete, Close, Rank, DocumentCopy, Check, View, CircleCheck, CircleClose, Minus, Aim, Collection } from '@element-plus/icons-vue'
 import {
   getWebUITestCases,
   getWebUITestCase,
   deleteWebUITestCase,
   executeWebUITestCase,
-  generateTestCaseCode,
-  batchGenerateTestCaseCode,
+  createWebUIScriptGeneration,
   saveTestCaseScript,
   getTaskStatus,
   getWebUITestModules,
@@ -665,8 +684,11 @@ import {
   addTestCasesToSuite
 } from '@/api/webTesting'
 import { getProjectEnvironments } from '@/api/projects'
+import { getLLMConfigurations } from '@/api/aiConfig'
 import { useProjectStore } from '@/stores/project'
+import { useAuthStore } from '@/stores/auth'
 import WebUICaseEditDetail from '@/components/WebUICaseEditDetail.vue'
+import { generationStorageKey } from '@/composables/webUIScriptGenerationPresentation'
 import dayjs from 'dayjs'
 
 const router = useRouter()
@@ -717,20 +739,10 @@ const addModuleFormRef = ref(null)
 const addingModule = ref(false)
 const addModuleRules = { name: [{ required: true, message: '请输入模块名称', trigger: 'blur' }] }
 
-// 代码预览弹窗
+// 已有脚本预览与手工保存
 const codeDialogVisible = ref(false)
 const generatedCode = ref('')
-
-// 生成代码按钮 loading 状态（单条）
-const generatingId = ref(null)
-
-// 保存脚本时的用例 ID（单条生成时为 row.id，批量时为第一个选中用例）
 const currentCaseId = ref(null)
-
-// 上次生成结果（用于保存时发送 test_function + page_classes，实现 POM 单点维护）
-const lastGenerateResult = ref(null)
-
-// 保存脚本 loading
 const isSaving = ref(false)
 
 // 批量操作弹窗
@@ -753,6 +765,23 @@ const tableRef = ref(null)
 
 // 项目store
 const projectStore = useProjectStore()
+const authStore = useAuthStore()
+
+// V2 AI 脚本生成配置。临时凭据仅保存在此组件内存中。
+const scriptGenerationDialogVisible = ref(false)
+const scriptGenerationCase = ref(null)
+const scriptGenerationEnvironments = ref([])
+const scriptGenerationModels = ref([])
+const loadingScriptGenerationEnvironments = ref(false)
+const loadingScriptGenerationModels = ref(false)
+const scriptGenerationSubmitting = ref(false)
+const scriptGenerationForm = reactive({
+  environmentId: null,
+  startPath: '/',
+  modelConfigId: null,
+  username: '',
+  password: ''
+})
 
 // 测试用例数据
 const testCases = ref([])
@@ -761,6 +790,19 @@ const selectedTestCases = ref([])
 // 计算属性
 const selectedProject = computed(() => projectStore.currentProject)
 const currentProject = computed(() => projectStore.currentProject)
+const selectedScriptGenerationEnvironment = computed(() => (
+  scriptGenerationEnvironments.value.find(item => item.id === scriptGenerationForm.environmentId) || null
+))
+const scriptGenerationBaseUrl = computed(() => (
+  selectedScriptGenerationEnvironment.value?.config?.base_url
+  || selectedScriptGenerationEnvironment.value?.base_url
+  || ''
+))
+const scriptGenerationFormValid = computed(() => (
+  Boolean(scriptGenerationForm.environmentId)
+  && Boolean(scriptGenerationForm.modelConfigId)
+  && scriptGenerationForm.startPath.startsWith('/')
+))
 
 // 检查测试用例是否正在执行
 const isTestCaseExecuting = (testCaseId) => {
@@ -1009,40 +1051,119 @@ const handleCurrentChange = (val) => {
   loadTestCases()
 }
 
-// 生成代码（单条）- 触发 AI 推理和生成逻辑
-const generateCode = async (row, framework = 'playwright') => {
-  if (framework === 'selenium') {
-    ElMessage.info('Selenium 框架适配开发中，敬请期待！')
+const responseItems = (response) => {
+  const payload = response?.data ?? response ?? {}
+  if (Array.isArray(payload)) return payload
+  if (Array.isArray(payload?.items)) return payload.items
+  if (Array.isArray(payload?.results)) return payload.results
+  if (Array.isArray(payload?.data)) return payload.data
+  if (Array.isArray(payload?.data?.items)) return payload.data.items
+  if (Array.isArray(payload?.data?.results)) return payload.data.results
+  return []
+}
+
+const clearScriptGenerationCredentials = () => {
+  scriptGenerationForm.username = ''
+  scriptGenerationForm.password = ''
+}
+
+const formatModelLabel = (model) => {
+  const provider = model.provider || model.provider_name || 'LLM'
+  const name = model.model_name || model.name || `模型 #${model.id}`
+  return `${provider} / ${name}`
+}
+
+const loadScriptGenerationEnvironments = async () => {
+  const projectId = projectStore.currentProject?.id
+  if (!projectId) return
+  loadingScriptGenerationEnvironments.value = true
+  try {
+    const response = await getProjectEnvironments(projectId, { category: 'web' })
+    scriptGenerationEnvironments.value = responseItems(response).filter(item => item.is_active === true)
+    if (!scriptGenerationEnvironments.value.some(item => item.id === scriptGenerationForm.environmentId)) {
+      scriptGenerationForm.environmentId = scriptGenerationEnvironments.value[0]?.id || null
+    }
+  } catch (error) {
+    scriptGenerationEnvironments.value = []
+    scriptGenerationForm.environmentId = null
+    ElMessage.error('加载启用的 WebUI 环境失败')
+  } finally {
+    loadingScriptGenerationEnvironments.value = false
+  }
+}
+
+const loadScriptGenerationModels = async () => {
+  loadingScriptGenerationModels.value = true
+  try {
+    const response = await getLLMConfigurations()
+    scriptGenerationModels.value = responseItems(response).filter(item => (
+      item.is_active === true && item.model_type === 'llm'
+    ))
+    if (!scriptGenerationModels.value.some(item => item.id === scriptGenerationForm.modelConfigId)) {
+      scriptGenerationForm.modelConfigId = scriptGenerationModels.value[0]?.id || null
+    }
+  } catch (error) {
+    scriptGenerationModels.value = []
+    scriptGenerationForm.modelConfigId = null
+    ElMessage.error('加载启用的 LLM 模型失败')
+  } finally {
+    loadingScriptGenerationModels.value = false
+  }
+}
+
+const openScriptGenerationConfig = async (row) => {
+  if (scriptGenerationSubmitting.value) return
+  scriptGenerationCase.value = row
+  scriptGenerationForm.startPath = '/'
+  clearScriptGenerationCredentials()
+  scriptGenerationDialogVisible.value = true
+  await Promise.all([loadScriptGenerationEnvironments(), loadScriptGenerationModels()])
+}
+
+const startTestCaseScriptGeneration = async () => {
+  const projectId = projectStore.currentProject?.id
+  const testCase = scriptGenerationCase.value
+  const username = scriptGenerationForm.username.trim()
+  const password = scriptGenerationForm.password
+
+  if (!projectId || !testCase || scriptGenerationSubmitting.value) return
+  if (!scriptGenerationForm.startPath.startsWith('/')) {
+    ElMessage.warning('起始路径必须以 / 开头，不能填写完整 URL')
     return
   }
-  generatingId.value = row.id
-  const loading = ElLoading.service({
-    lock: true,
-    text: '🧠 大模型正在进行语义对齐并生成 Playwright 脚本...',
-    background: 'rgba(0, 0, 0, 0.7)'
-  })
+  if (Boolean(username) !== Boolean(password)) {
+    ElMessage.warning('如需本次探索登录，请同时填写用户名和密码')
+    return
+  }
+
+  scriptGenerationSubmitting.value = true
   try {
-    const res = await generateTestCaseCode(projectStore.currentProject.id, row.id, framework)
-    if (res?.success && res?.code != null) {
-      // 优先展示 test_function（import 形式），实现 POM 单点维护预览
-      const toShow = res.test_function || res.code
-      generatedCode.value = toShow
-      currentCaseId.value = row.id
-      lastGenerateResult.value = {
-        page_classes: res.page_classes || [],
-        test_function: res.test_function || '',
-        script_source: res.script_source || 'manual'
-      }
-      codeDialogVisible.value = true
-      ElMessage.success('✨ 脚本语义匹配成功！')
-    } else {
-      handleError(res?.message || '获取代码失败')
+    const temporaryCredentials = username ? { username, password } : undefined
+    const response = await createWebUIScriptGeneration(projectId, {
+      description: '根据已有测试用例生成可执行 WebUI 脚本。',
+      environment_id: scriptGenerationForm.environmentId,
+      start_path: scriptGenerationForm.startPath,
+      model_config_id: scriptGenerationForm.modelConfigId,
+      source_mode: 'test_case',
+      test_case_id: testCase.id,
+      ...(temporaryCredentials ? { temporary_credentials: temporaryCredentials } : {})
+    })
+    const generation = response?.data ?? response
+    if (response?.success === false || !generation?.id) {
+      throw new Error(response?.message || '创建 AI 脚本生成任务失败')
     }
-  } catch (e) {
-    handleError(e?.response?.data?.message || '生成失败，请检查网络或用例步骤')
+
+    const userId = authStore.user?.id || authStore.user?.username
+    if (!userId) throw new Error('当前登录状态已失效，请重新登录后再试')
+    localStorage.setItem(generationStorageKey(userId, projectId), String(generation.id))
+    clearScriptGenerationCredentials()
+    scriptGenerationDialogVisible.value = false
+    ElMessage.success('已创建 AI 脚本生成任务，正在跳转到生成页面')
+    await router.push('/web-testing/create/explore')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || error?.message || '创建 AI 脚本生成任务失败')
   } finally {
-    loading.close()
-    generatingId.value = null
+    scriptGenerationSubmitting.value = false
   }
 }
 
@@ -1062,7 +1183,6 @@ const openPreviewDialog = async (row) => {
       }
       generatedCode.value = script
       currentCaseId.value = row.id
-      lastGenerateResult.value = null  // 预览已有脚本时无生成结果
       codeDialogVisible.value = true
     } else {
       handleError(res?.message || '获取脚本失败')
@@ -1072,54 +1192,20 @@ const openPreviewDialog = async (row) => {
   }
 }
 
-// 批量生成代码
-const batchGenerateCode = async (framework = 'playwright') => {
-  if (framework === 'selenium') {
-    ElMessage.info('Selenium 框架适配开发中，敬请期待！')
-    return
-  }
-  if (selectedTestCases.value.length === 0) {
-    ElMessage.warning('请先选择要生成代码的测试用例')
-    return
-  }
-  try {
-    const caseIds = selectedTestCases.value.map(c => c.id)
-    const res = await batchGenerateTestCaseCode(projectStore.currentProject.id, caseIds, framework)
-    if (res?.success && res?.code != null) {
-      generatedCode.value = res.code
-      currentCaseId.value = selectedTestCases.value[0]?.id ?? null
-      codeDialogVisible.value = true
-    } else {
-      handleError(res?.message || '批量生成代码失败')
-    }
-  } catch (e) {
-    handleError(e?.response?.data?.message || '批量生成代码失败')
-  }
-}
-
-// 保存生成的脚本到用例（POM 单点维护：只存 run+import，Page 类存 WebPage.pom_code）
+// 保存预览中手工修改后的脚本到用例。
 const saveGeneratedCode = async () => {
   if (currentCaseId.value == null) return
   try {
     isSaving.value = true
-    const payload = lastGenerateResult.value?.test_function
-      ? {
-          test_function: lastGenerateResult.value.test_function,
-          page_classes: lastGenerateResult.value.page_classes || [],
-          script_content: '',
-          script_source: lastGenerateResult.value.script_source || 'manual'
-        }
-      : generatedCode.value
     const res = await saveTestCaseScript(
       projectStore.currentProject.id,
       currentCaseId.value,
-      payload,
+      generatedCode.value,
       'playwright'
     )
     if (res?.success) {
       ElMessage.success('🚀 脚本已成功保存，用例状态已更新！')
       codeDialogVisible.value = false
-      lastGenerateResult.value = null
       // 刷新列表使 has_script 即时变为已生成
       loadTestCases()
     } else {
@@ -2427,5 +2513,35 @@ onUnmounted(() => {
   font-size: 12px;
   color: #909399;
   line-height: 1.2;
+}
+
+.script-generation-tip {
+  margin-bottom: 16px;
+}
+
+.generation-base-url,
+.generation-field-help {
+  margin-top: 6px;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.generation-base-url {
+  color: #606266;
+}
+
+.script-generation-credentials {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  margin-top: 12px;
+}
+
+@media (max-width: 640px) {
+  .script-generation-credentials {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

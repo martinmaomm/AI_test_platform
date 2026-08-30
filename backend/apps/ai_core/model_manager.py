@@ -40,7 +40,7 @@ DEFAULT_LLM_TIMEOUT = _get_default_llm_timeout()
 class ModelManager:
     """多模型兼容管理器（支持LLM和视觉模型）"""
     
-    def __init__(self, model_type: str = 'llm'):
+    def __init__(self, model_type: str = 'llm', config_id: Optional[int] = None):
         """
         初始化模型管理器
         
@@ -48,6 +48,7 @@ class ModelManager:
             model_type: 模型类型，'llm' 或 'vision'
         """
         self.model_type = model_type
+        self.config_id = config_id
         self._initialized = False
         
         if model_type not in ['llm', 'vision']:
@@ -61,6 +62,22 @@ class ModelManager:
     
     def _load_config(self) -> Dict[str, Any]:
         """从数据库加载配置"""
+        if self.config_id is not None:
+            selected_config = LLMConfiguration.objects.filter(
+                id=self.config_id,
+                model_type=self.model_type,
+                is_active=True,
+            ).first()
+            if not selected_config:
+                raise ValueError(f"配置 {self.config_id} 不存在、已停用或模型类型不匹配")
+            logger.info(
+                "按配置 ID 加载%s模型: %s - %s",
+                self.model_type,
+                selected_config.provider,
+                selected_config.model_name,
+            )
+            return self._config_from_db(selected_config)
+
         active_config = LLMConfiguration.objects.filter(
             model_type=self.model_type, is_active=True
         ).order_by('-created_at').first()
@@ -81,6 +98,7 @@ class ModelManager:
     def _config_from_db(self, config: 'LLMConfiguration') -> Dict[str, Any]:
         """从数据库配置对象创建配置字典"""
         return {
+            'config_id': config.id,
             'provider': config.provider,
             'enabled': True,
             'api_key': config.api_key,
@@ -429,14 +447,14 @@ class ModelManager:
 
 
 # 移除全局实例，改为按需创建
-def get_llm_manager() -> ModelManager:
+def get_llm_manager(config_id: Optional[int] = None) -> ModelManager:
     """获取LLM管理器实例（向后兼容）"""
-    return ModelManager(model_type='llm')
+    return ModelManager(model_type='llm', config_id=config_id)
 
-def get_vision_manager() -> ModelManager:
+def get_vision_manager(config_id: Optional[int] = None) -> ModelManager:
     """获取视觉模型管理器实例"""
-    return ModelManager(model_type='vision')
+    return ModelManager(model_type='vision', config_id=config_id)
 
-def get_model_manager(model_type: str = 'llm') -> ModelManager:
+def get_model_manager(model_type: str = 'llm', config_id: Optional[int] = None) -> ModelManager:
     """获取模型管理器实例"""
-    return ModelManager(model_type=model_type)
+    return ModelManager(model_type=model_type, config_id=config_id)

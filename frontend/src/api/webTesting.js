@@ -198,6 +198,28 @@ export const batchUpdateWebUITestCases = async (projectId, caseIds, updateData) 
 
 // ============ WebUI测试脚本管理 ============
 
+// V2 可恢复 AI 脚本生成记录。旧 scripts/ 接口仍保留给兼容入口，
+// 新页面统一使用下面四个接口作为唯一数据源。
+export const createWebUIScriptGeneration = async (projectId, data) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/script-generations/`, data)
+  return response.data
+}
+
+export const getWebUIScriptGeneration = async (projectId, generationId) => {
+  const response = await api.get(`/projects/${projectId}/web-testing/script-generations/${generationId}/`)
+  return response.data
+}
+
+export const cancelWebUIScriptGeneration = async (projectId, generationId) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/script-generations/${generationId}/cancel/`)
+  return response.data
+}
+
+export const saveWebUIScriptGeneration = async (projectId, generationId, data = {}) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/script-generations/${generationId}/save/`, data)
+  return response.data
+}
+
 // 创建WebUI测试脚本
 export const createWebUITestScript = async (projectId, data) => {
   const response = await api.post(`/projects/${projectId}/web-testing/scripts/`, data)

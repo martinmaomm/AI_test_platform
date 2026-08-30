@@ -42,6 +42,7 @@ class ExecutionConfig:
     suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
     failure_screenshot_path: Optional[str] = None
     failure_screenshot_dir: Optional[str] = None
+    environment_variables: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -295,6 +296,28 @@ python_functions = test_*
             browser_path = os.path.join(self.project_root, browser_path)
         return os.path.abspath(browser_path)
 
+    @staticmethod
+    def _safe_environment_variables(values: Dict[str, Any] | None) -> Dict[str, str]:
+        """Allow user test variables without allowing process/runtime overrides."""
+        protected_prefixes = ('PYTHON', 'PLAYWRIGHT_', 'PYTEST_', 'DJANGO_', 'CELERY_', 'LD_')
+        protected_names = {
+            'PATH', 'HOME', 'SHELL', 'VIRTUAL_ENV', 'PWD', 'TMPDIR',
+            'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+            'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE',
+            'CURL_CA_BUNDLE', 'NODE_OPTIONS',
+        }
+        safe: Dict[str, str] = {}
+        for key, value in (values or {}).items():
+            name = str(key)
+            if (
+                not re.fullmatch(r'[A-Z_][A-Z0-9_]{0,127}', name)
+                or name in protected_names
+                or name.startswith(protected_prefixes)
+            ):
+                continue
+            safe[name] = str(value)
+        return safe
+
     def _run_pytest_command(self, work_dir: str, config: ExecutionConfig) -> subprocess.CompletedProcess:
         """执行pytest命令"""
         cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short"]
@@ -312,6 +335,8 @@ python_functions = test_*
             'PLAYWRIGHT_BASE_URL': config.base_url or '',
             'PYTHONIOENCODING': 'utf-8',  # 防止 Windows GBK 编码报错
         })
+        # Values intentionally never appear in command arguments or logs.
+        env.update(self._safe_environment_variables(config.environment_variables))
 
         python_browser_path = self._resolve_python_browser_path()
         if python_browser_path:
@@ -644,6 +669,7 @@ def playwright_runner(
     base_url: str = None,
     options: Dict[str, Any] = None,
     failure_screenshot_path: Optional[str] = None,
+    environment_variables: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     """使用pytest执行Playwright Python测试脚本"""
     normalized_options = normalize_webui_execution_options(options)
@@ -653,6 +679,7 @@ def playwright_runner(
         generate_allure=True,
         base_url=base_url,
         failure_screenshot_path=failure_screenshot_path,
+        environment_variables=environment_variables or {},
     )
     
     result = _runner.run_single_test(script_id, script_content, config)
@@ -680,7 +707,7 @@ def playwright_runner(
     }
 
 
-def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]], base_url: str = None, options: Dict[str, Any] = None) -> Dict[str, Any]:
+def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]], base_url: str = None, options: Dict[str, Any] = None, environment_variables: Dict[str, str] | None = None) -> Dict[str, Any]:
     """使用pytest批量执行多个Playwright Python测试脚本并生成Allure报告"""
     normalized_options = normalize_webui_execution_options(options)
     config = ExecutionConfig(
@@ -690,6 +717,7 @@ def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]]
         base_url=base_url,
         suite_name=options.get('suite_name') if options else None,
         failure_screenshot_dir=(options or {}).get('failure_screenshot_dir'),
+        environment_variables=environment_variables or {},
     )
     
     result = _runner.run_suite_test(suite_id, test_cases_data, config)

@@ -14,6 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
 from django.db import transaction, models
 from django.db.models import Q
@@ -24,7 +25,7 @@ from projects.models import Environment
 from .models import (
     MidSceneScript, WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
-    WebPage, WebElement
+    WebPage, WebElement, WebUIScriptGeneration
 )
 from .serializers import (
     WebUITestCaseSerializer, WebUITestCaseDetailSerializer, WebUITestCaseCreateSerializer,
@@ -32,10 +33,21 @@ from .serializers import (
     WebUITestExecutionListSerializer, WebUITestCaseExecutionDetailSerializer, WebUITestSuiteExecutionDetailSerializer,
     WebUITestSuiteSerializer, WebUITestSuiteCreateSerializer, WebUITestSuiteUpdateSerializer,
     WebUITestSuiteAddTestCaseSerializer,
-    WebPageSerializer, WebElementSerializer
+    WebPageSerializer, WebElementSerializer,
+    WebUIScriptGenerationCreateSerializer, WebUIScriptGenerationSerializer,
+    WebUIScriptGenerationSaveSerializer,
 )
+from .generation_repository import (
+    attach_celery_task,
+    cancel_generation,
+    get_generation_for_project,
+    transition_generation,
+)
+from .generation_events import publish_terminal
+from .generation_save_state import generation_reference, is_generation_saved
 from .pom_code_generator import _to_page_class_name, _to_locator_var_name, _get_action_config
 from .tasks import (
+    generate_webui_script_generation_v2_task,
     generate_webui_test_script_task,
     generate_webui_test_script_from_testcase_task,
     generate_midscene_script_task,
@@ -214,6 +226,175 @@ class WebElementViewSet(viewsets.ModelViewSet):
 
 
 # ============ WebUI测试脚本相关API ============
+
+class WebUIScriptGenerationCreateView(APIView):
+    """Create a durable V2 generation record without placing secrets in Celery."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        serializer = WebUIScriptGenerationCreateSerializer(
+            data=request.data,
+            context={'request': request, 'project': project},
+        )
+        serializer.is_valid(raise_exception=True)
+        generation = serializer.save()
+        try:
+            task = generate_webui_script_generation_v2_task.delay(str(generation.pk))
+            generation = attach_celery_task(generation.pk, task.id)
+        except Exception:
+            logger.exception('WebUI V2 生成任务调度失败: generation_id=%s', generation.pk)
+            generation = transition_generation(
+                generation.pk,
+                WebUIScriptGeneration.Status.FAILED,
+                error_code='TRANSIENT_SERVICE_ERROR',
+                error_message='脚本生成任务暂时无法调度，请稍后重试。',
+            )
+            return Response({
+                'success': False,
+                'message': generation.error_message,
+                'data': WebUIScriptGenerationSerializer(generation).data,
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({
+            'success': True,
+            'message': '脚本生成记录已创建，等待 V2 编排任务启动。',
+            'data': WebUIScriptGenerationSerializer(generation).data,
+        }, status=status.HTTP_201_CREATED)
+
+
+class WebUIScriptGenerationDetailView(APIView):
+    """Read a persisted V2 generation record after refresh or reconnect."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(READ)
+    def get(self, request, project_id, generation_id):
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
+
+
+class WebUIScriptGenerationCancelView(APIView):
+    """Cancel a V2 generation record and revoke its id-only task when present."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+
+        is_project_owner = project.owner_id == request.user.id or project.created_by_id == request.user.id
+        if generation.user_id != request.user.id and not is_project_owner:
+            raise PermissionDenied('只能取消自己创建的生成记录')
+
+        celery_task_id = generation.celery_task_id
+        generation = cancel_generation(generation.pk)
+        publish_terminal(generation)
+        if celery_task_id:
+            # ``solo`` workers cannot process a queued cancellation while a long
+            # generation task occupies the only worker slot.  Run the existing
+            # cooperative cancellation action in this request instead.
+            cancel_task(celery_task_id)
+        return Response({
+            'success': True,
+            'message': '脚本生成任务已取消',
+            'data': WebUIScriptGenerationSerializer(generation).data,
+        })
+
+
+class WebUIScriptGenerationSaveView(APIView):
+    """Save one approved V2 draft once, without persisting temporary credentials."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        serializer = WebUIScriptGenerationSaveSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        generation_ref = generation_reference(generation_id)
+        try:
+            with transaction.atomic():
+                try:
+                    generation = WebUIScriptGeneration.objects.select_for_update().select_related(
+                        'test_case', 'project', 'user'
+                    ).get(pk=generation_id, project_id=project_id)
+                except WebUIScriptGeneration.DoesNotExist as exc:
+                    raise Http404('生成记录不存在') from exc
+                is_project_owner = project.owner_id == request.user.id or project.created_by_id == request.user.id
+                if generation.user_id != request.user.id and not is_project_owner:
+                    raise PermissionDenied('只能保存自己创建的生成记录')
+                if generation.status not in {
+                    WebUIScriptGeneration.Status.READY,
+                    WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
+                }:
+                    return Response({'success': False, 'message': '当前脚本尚未通过质量检查，不能保存。'}, status=409)
+
+                # Validate before creating or updating any database object.  The
+                # storage helper validates again as a defence against races.
+                normalized_script = normalize_for_storage(generation.script_draft)
+                test_case = generation.test_case
+                created = False
+                already_saved = is_generation_saved(generation)
+                if test_case is None:
+                    scenario = generation.scenario_spec or {}
+                    test_case = WebUITestCase.objects.create(
+                        title=serializer.validated_data.get('title') or scenario.get('title') or 'AI 生成的 WebUI 用例',
+                        description=generation.description_safe,
+                        priority='medium',
+                        category='functional',
+                        preconditions=scenario.get('preconditions') or [],
+                        steps=[],
+                        expected_result='等待脚本元数据提取。',
+                        user=generation.user,
+                        project=project,
+                    )
+                    generation.test_case = test_case
+                    generation.save(update_fields=['test_case', 'updated_at'])
+                    created = True
+                elif serializer.validated_data.get('title'):
+                    test_case.title = serializer.validated_data['title']
+                    test_case.save(update_fields=['title', 'updated_at'])
+
+                if not already_saved:
+                    safe_metadata = {
+                        'generation_ref': generation_ref,
+                        'source_mode': generation.source_mode,
+                        'model': {
+                            'provider': (generation.model_info or {}).get('provider', ''),
+                            'model_name': (generation.model_info or {}).get('model_name', ''),
+                        },
+                        'quality_status': (generation.quality_report or {}).get('status', ''),
+                        'repair_count': generation.repair_count,
+                        'unresolved_step_count': len((generation.exploration_snapshot or {}).get('unresolved_steps') or []),
+                    }
+                    store_script_content(
+                        test_case,
+                        normalized_script,
+                        source='mcp_exploration',
+                        generation_metadata=safe_metadata,
+                    )
+        except ScriptContractError as exc:
+            return Response({'success': False, 'message': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'success': True,
+            'message': '脚本已保存到测试用例。',
+            'data': {
+                'generation': WebUIScriptGenerationSerializer(generation).data,
+                'test_case_id': test_case.pk,
+                'created': created,
+            },
+        })
+
 
 class CreateWebUITestScriptView(APIView):
     """创建WebUI测试脚本"""

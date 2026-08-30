@@ -3,10 +3,24 @@ Web Testing Serializers
 用于Web UI自动化测试的序列化器
 """
 from rest_framework import serializers
+from projects.models import Environment
+from ai_core.models import LLMConfiguration, ModelType
 from .models import (
     WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
-    WebPage, WebElement
+    WebPage, WebElement, WebUIScriptGeneration
+)
+from .generation_repository import create_generation
+from .generation_save_state import is_generation_saved
+from .generation_security import (
+    GenerationInputSecurityError,
+    build_safe_target_url,
+    clear_temporary_credentials,
+    find_suspected_credentials,
+    normalize_start_path,
+    redact_text,
+    store_temporary_credentials,
+    validate_temporary_credentials,
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 from .execution_diagnostics import safe_screenshot_relative_path
@@ -38,6 +52,171 @@ class WebElementSerializer(serializers.ModelSerializer):
         model = WebElement
         fields = ['id', 'page', 'name', 'locator_type', 'locator_value', 'action_type', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
+    """Safe, persistent view of one WebUI script-generation task."""
+
+    environment_id = serializers.IntegerField(read_only=True)
+    environment_name = serializers.CharField(source='environment.name', read_only=True)
+    test_case_id = serializers.IntegerField(read_only=True, allow_null=True)
+    is_saved = serializers.SerializerMethodField()
+
+    def get_is_saved(self, obj):
+        return is_generation_saved(obj)
+
+    class Meta:
+        model = WebUIScriptGeneration
+        fields = [
+            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id', 'is_saved',
+            'source_mode', 'celery_task_id', 'status', 'current_stage', 'progress',
+            'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
+            'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
+            'model_info', 'tool_stats', 'repair_count', 'credentials_required',
+            'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
+            'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id', 'is_saved',
+            'source_mode', 'celery_task_id', 'status', 'current_stage', 'progress',
+            'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
+            'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
+            'model_info', 'tool_stats', 'repair_count', 'credentials_required',
+            'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
+            'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
+        ]
+
+
+class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
+    """Validate a new V2 generation request without persisting secret values."""
+
+    description = serializers.CharField(max_length=2000, trim_whitespace=True)
+    environment_id = serializers.IntegerField(min_value=1)
+    start_path = serializers.CharField(max_length=500, required=False, allow_blank=False)
+    url = serializers.CharField(max_length=1000, required=False, allow_blank=False, write_only=True)
+    source_mode = serializers.ChoiceField(
+        choices=WebUIScriptGeneration.SourceMode.choices,
+        default=WebUIScriptGeneration.SourceMode.MANUAL_PROMPT,
+    )
+    test_case_id = serializers.IntegerField(min_value=1, required=False)
+    model_config_id = serializers.IntegerField(min_value=1, required=False, write_only=True)
+    temporary_credentials = serializers.DictField(required=False, write_only=True)
+
+    def validate_temporary_credentials(self, value):
+        try:
+            return validate_temporary_credentials(value)
+        except GenerationInputSecurityError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate(self, attrs):
+        project = self.context['project']
+        description = attrs['description']
+        findings = find_suspected_credentials(description)
+        if findings:
+            raise serializers.ValidationError({
+                'description': '场景描述中疑似包含账号或密码，请改用 temporary_credentials 单独提交。'
+            })
+
+        supplied_start = attrs.get('start_path')
+        supplied_url = attrs.get('url')
+        if supplied_start and supplied_url and supplied_start != supplied_url:
+            raise serializers.ValidationError('start_path 与 url 不能同时传入不同值')
+        raw_target = supplied_start or supplied_url
+
+        try:
+            environment = project.environments.get(pk=attrs['environment_id'])
+        except Environment.DoesNotExist as exc:
+            raise serializers.ValidationError({'environment_id': 'WebUI 环境必须属于当前项目'}) from exc
+        if not environment.is_web_environment:
+            raise serializers.ValidationError({'environment_id': '请选择 WebUI 类型的环境'})
+        if not environment.is_active:
+            raise serializers.ValidationError({'environment_id': '所选 WebUI 环境已停用'})
+        base_url = (environment.config or {}).get('base_url', '')
+        try:
+            start_path = normalize_start_path(raw_target, base_url)
+        except GenerationInputSecurityError as exc:
+            raise serializers.ValidationError({'start_path': str(exc)}) from exc
+
+        test_case = None
+        test_case_id = attrs.get('test_case_id')
+        if test_case_id is not None:
+            try:
+                test_case = WebUITestCase.objects.get(pk=test_case_id, project=project)
+            except WebUITestCase.DoesNotExist as exc:
+                raise serializers.ValidationError({'test_case_id': '测试用例必须属于当前项目'}) from exc
+        if attrs['source_mode'] == WebUIScriptGeneration.SourceMode.TEST_CASE and test_case is None:
+            raise serializers.ValidationError({'test_case_id': '测试用例入口必须提供 test_case_id'})
+
+        requested_model_id = attrs.get('model_config_id')
+        model_query = LLMConfiguration.objects.filter(model_type=ModelType.LLM, is_active=True)
+        model_config = (
+            model_query.filter(pk=requested_model_id).first()
+            if requested_model_id is not None
+            else model_query.order_by('-created_at').first()
+        )
+        if model_config is None:
+            field = 'model_config_id' if requested_model_id is not None else 'non_field_errors'
+            raise serializers.ValidationError({field: '没有可用的启用 LLM 配置'})
+
+        attrs['environment'] = environment
+        attrs['test_case'] = test_case
+        attrs['normalized_start_path'] = start_path
+        attrs['base_url'] = base_url
+        attrs['model_config'] = model_config
+        return attrs
+
+    def create(self, validated_data):
+        project = self.context['project']
+        user = self.context['request'].user
+        credentials = validated_data.pop('temporary_credentials', None)
+        environment = validated_data.pop('environment')
+        test_case = validated_data.pop('test_case')
+        start_path = validated_data.pop('normalized_start_path')
+        base_url = validated_data.pop('base_url')
+        model_config = validated_data.pop('model_config')
+        validated_data.pop('environment_id', None)
+        validated_data.pop('test_case_id', None)
+        validated_data.pop('url', None)
+        validated_data.pop('model_config_id', None)
+        description = validated_data.pop('description')
+
+        generation = None
+        try:
+            generation = create_generation(
+                project=project,
+                user=user,
+                environment=environment,
+                test_case=test_case,
+                source_mode=validated_data['source_mode'],
+                start_path=start_path,
+                target_url_safe=build_safe_target_url(base_url, start_path),
+                description_safe=redact_text(description),
+                credentials_provided=credentials is not None,
+                model_info={
+                    'config_id': model_config.id,
+                    'provider': model_config.provider,
+                    'model_name': model_config.model_name,
+                },
+            )
+            if credentials is not None:
+                store_temporary_credentials(generation.pk, credentials)
+            return generation
+        except Exception:
+            if generation is not None:
+                clear_temporary_credentials(generation.pk)
+                generation.delete()
+            raise
+
+
+class WebUIScriptGenerationSaveSerializer(serializers.Serializer):
+    """Optional user-visible title for saving a quality-approved V2 draft."""
+
+    title = serializers.CharField(max_length=200, required=False, allow_blank=False, trim_whitespace=True)
+
+    def validate_title(self, value):
+        if find_suspected_credentials(value):
+            raise serializers.ValidationError('标题不能包含账号、密码或密钥。')
+        return redact_text(value)
 
 
 class WebUITestModuleSerializer(serializers.ModelSerializer):

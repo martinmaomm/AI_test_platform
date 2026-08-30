@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from typing import Any, Optional
 
 
@@ -97,6 +99,25 @@ def _assertion_expected(method: str, call: ast.Call) -> str:
     return label
 
 
+def _comment_lines(content: str) -> dict[int, str]:
+    comments: dict[int, str] = {}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(content).readline):
+            if token.type == tokenize.COMMENT:
+                comments[token.start[0]] = token.string.lstrip('#').strip()
+    except tokenize.TokenError:
+        return comments
+    return comments
+
+
+def _nearest_readable_comment(comments: dict[int, str], line: int, prefixes: tuple[str, ...]) -> str | None:
+    for current in range(line - 1, max(0, line - 5), -1):
+        comment = comments.get(current, '')
+        if comment.startswith(prefixes):
+            return comment
+    return None
+
+
 def extract_playwright_metadata(content: str, description: str = '') -> dict[str, Any]:
     """Extract steps and assertions without executing or inferring business data."""
 
@@ -110,6 +131,7 @@ def extract_playwright_metadata(content: str, description: str = '') -> dict[str
     locator_candidates: list[dict[str, Any]] = []
     assertion_candidates: list[dict[str, Any]] = []
     seen_locators: set[str] = set()
+    comments = _comment_lines(content)
 
     awaited_nodes = sorted(
         (
@@ -132,6 +154,9 @@ def extract_playwright_metadata(content: str, description: str = '') -> dict[str
                 'action': method,
                 'target': locator or 'page',
             }
+            readable_name = _nearest_readable_comment(comments, node.lineno, ('步骤', '清理'))
+            if readable_name:
+                step['readable_name'] = redact_sensitive_text(readable_name)
             if locator and locator not in seen_locators:
                 locator_candidates.append({'expression': locator, 'source': 'ast'})
                 seen_locators.add(locator)
@@ -150,6 +175,9 @@ def extract_playwright_metadata(content: str, description: str = '') -> dict[str
                 'target': target,
                 'expected': _assertion_expected(method, call),
             })
+            readable_name = _nearest_readable_comment(comments, node.lineno, ('断言',))
+            if readable_name:
+                assertion_candidates[-1]['readable_name'] = redact_sensitive_text(readable_name)
 
     if assertion_candidates:
         expected_result = '；'.join(item['expected'] for item in assertion_candidates)

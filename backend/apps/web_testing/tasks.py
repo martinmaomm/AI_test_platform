@@ -99,6 +99,13 @@ def _suite_case_error_message(case_result: dict):
 
 # ============ WebUI测试脚本生成任务 ============
 
+@shared_task(bind=True, name='web_testing.generate_webui_script_generation_v2')
+def generate_webui_script_generation_v2_task(self, generation_id: str):
+    """V2 pipeline task: payload intentionally contains only ``generation_id``."""
+    from .generation_orchestrator import run_v2_generation
+
+    return run_v2_generation(str(generation_id), celery_task_id=self.request.id)
+
 @shared_task(bind=True, name='web_testing.generate_webui_test_script')
 def generate_webui_test_script_task(self, script_name: str, description: str, url: str, user_id: int, project_id: int, mcp_config: dict = None):
     """
@@ -285,6 +292,7 @@ def _run_test_suite_from_db_workspace(
     test_cases_data: list,
     base_url: str = None,
     options: dict = None,
+    environment_variables: dict | None = None,
 ) -> Dict[str, Any]:
     """
     从数据库搬运代码到标准化目录，然后执行 Pytest。
@@ -315,6 +323,7 @@ def _run_test_suite_from_db_workspace(
             base_url=base_url_val,
             suite_name=suite_name,
             failure_screenshot_dir=failure_screenshot_dir,
+            environment_variables=environment_variables or {},
         )
         test_files, skipped_results = _build_suite_workspace_from_db(
             project_id=project_id,
@@ -387,7 +396,7 @@ def _run_test_suite_from_db_workspace(
         }
 
 
-def _run_test_suite_script(test_cases_data: list, base_url: str = None, options: dict = None) -> Dict[str, Any]:
+def _run_test_suite_script(test_cases_data: list, base_url: str = None, options: dict = None, environment_variables: dict | None = None) -> Dict[str, Any]:
     """
     运行测试套件脚本（批量执行多个测试用例并生成Allure报告）
     已重构为直接搬运数据库资产，不调用代码生成器。
@@ -414,6 +423,7 @@ def _run_test_suite_script(test_cases_data: list, base_url: str = None, options:
             test_cases_data=test_cases_data,
             base_url=base_url,
             options=options,
+            environment_variables=environment_variables,
         )
 
         suite_id = str((options or {}).get('suite_id', ''))
@@ -464,6 +474,7 @@ def _run_test_script(
     base_url: str = None,
     options: dict = None,
     failure_screenshot_path: str = None,
+    environment_variables: dict | None = None,
 ) -> Dict[str, Any]:
     """
     运行测试脚本（使用Playwright执行器）
@@ -488,6 +499,7 @@ def _run_test_script(
             base_url=base_url,
             options=execution_options,
             failure_screenshot_path=failure_screenshot_path,
+            environment_variables=environment_variables,
         )
         
         if result.get('success'):
@@ -621,6 +633,7 @@ def _execute_webui_test_case_logic(task_instance, execution_id: int, options: di
             base_url,
             options,
             failure_screenshot_path=screenshot_absolute,
+            environment_variables=(getattr(execution.environment, 'config', None) or {}).get('variables') or {},
         )
         
         # 步骤5: 保存执行结果
@@ -1744,7 +1757,12 @@ def _execute_webui_test_suite_logic(task_instance, execution_id: int, user_id: i
         exec_options['suite_name'] = test_suite.name
         screenshot_dir, _ = _failure_screenshot_paths(execution.id, 'placeholder.png')
         exec_options['failure_screenshot_dir'] = os.path.dirname(screenshot_dir)
-        suite_result = _run_test_suite_script(test_cases_data, base_url, exec_options)
+        suite_result = _run_test_suite_script(
+            test_cases_data,
+            base_url,
+            exec_options,
+            environment_variables=(environment.config or {}).get('variables') or {},
+        )
         execution_results = []
         allure_report = ''
         result_data = suite_result.get('result', {})

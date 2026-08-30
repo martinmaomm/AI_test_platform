@@ -25,7 +25,7 @@ from projects.models import Environment
 from .models import (
     MidSceneScript, WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
-    WebPage, WebElement, WebUIScriptGeneration
+    WebPage, WebElement, WebUIScriptGeneration, WebUITestCaseGeneration,
 )
 from .serializers import (
     WebUITestCaseSerializer, WebUITestCaseDetailSerializer, WebUITestCaseCreateSerializer,
@@ -36,6 +36,8 @@ from .serializers import (
     WebPageSerializer, WebElementSerializer,
     WebUIScriptGenerationCreateSerializer, WebUIScriptGenerationSerializer,
     WebUIScriptGenerationResolveSerializer, WebUIScriptGenerationSaveSerializer,
+    WebUITestCaseGenerationSerializer, WebUITestCaseGenerationCreateSerializer,
+    WebUITestCaseGenerationDraftsSerializer, WebUITestCaseGenerationImportSerializer,
 )
 from .generation_repository import (
     GenerationResolutionConflict,
@@ -70,6 +72,13 @@ from .project_access import (
     DELETE, EDIT, EXECUTE, READ, REPORT,
     get_project_for_user, payload_project_mismatch, project_access_required,
     validate_related_project,
+)
+from .requirement_context import build_requirement_generation_context
+from .requirement_case_validator import sanitize_requirement_drafts, validate_requirement_drafts
+from .requirement_generation_repository import (
+    RUNNING_STATUSES,
+    create_or_reuse_requirement_generation,
+    get_requirement_generation,
 )
 
 logger = logging.getLogger(__name__)
@@ -1126,6 +1135,375 @@ class WebUITestModuleRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPI
             return response(kind="error", message=f"删除模块失败: {str(e)}")
 
 
+# ============ Web UI需求用例生成 V2 ============
+
+class WebUITestCaseGenerationContextView(APIView):
+    """返回需求生成所需的模块、页面、知识库和模型准备情况。"""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(READ)
+    def get(self, request, project_id):
+        module_id = request.query_params.get('module_id')
+        if module_id in (None, ''):
+            return response(
+                kind='validation_error',
+                message='请选择业务模块',
+                errors={'module_id': ['该字段为必填项。']},
+            )
+        try:
+            module_id = int(module_id)
+        except (TypeError, ValueError):
+            return response(
+                kind='validation_error',
+                message='业务模块参数无效',
+                errors={'module_id': ['必须是有效的整数。']},
+            )
+
+        try:
+            context = build_requirement_generation_context(
+                project_id=project_id,
+                module_id=module_id,
+                user=request.user,
+            )
+            return response(
+                kind='success',
+                data=context,
+                message='需求生成上下文预检完成',
+            )
+        except WebUITestModule.DoesNotExist:
+            return response(
+                kind='not_found',
+                resource='业务模块',
+                message='业务模块不存在或不属于当前项目',
+            )
+        except Exception as exc:
+            logger.error('需求生成上下文预检失败: %s', exc, exc_info=True)
+            return response(kind='server_error', message='需求生成上下文预检失败，请稍后重试')
+
+
+class WebUITestCaseGenerationListCreateView(APIView):
+    """Create a persistent requirement generation and start its Celery task."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id):
+        serializer = WebUITestCaseGenerationCreateSerializer(
+            data=request.data,
+            context={'request': request, 'project_id': project_id},
+        )
+        if not serializer.is_valid():
+            return response(
+                kind='validation_error',
+                message='生成配置校验失败',
+                errors=serializer.errors,
+            )
+
+        values = dict(serializer.validated_data)
+        module = values.pop('module')
+        model_config = values.pop('model_config')
+        description = values.pop('description', '')
+        client_request_id = values.pop('client_request_id', None)
+        project = get_project_for_user(project_id, request.user, EDIT)
+        generation, reused = create_or_reuse_requirement_generation(
+            project=project,
+            user=request.user,
+            values={
+                'module': module,
+                'model_config': model_config,
+                'client_request_id': client_request_id,
+                'request_text': description,
+                **values,
+            },
+        )
+
+        should_start = (
+            generation.status == WebUITestCaseGeneration.Status.CREATED
+            and not generation.celery_task_id
+        )
+        if should_start:
+            try:
+                from .tasks import generate_webui_requirement_drafts_task
+
+                task = generate_webui_requirement_drafts_task.delay(
+                    generation_id=str(generation.id),
+                    user_id=request.user.id,
+                )
+                generation.celery_task_id = task.id
+                generation.save(update_fields=['celery_task_id', 'updated_at'])
+            except Exception:
+                logger.error(
+                    '启动 WebUI 需求生成任务失败 generation_id=%s',
+                    generation.id,
+                    exc_info=True,
+                )
+                generation.status = WebUITestCaseGeneration.Status.FAILED
+                generation.error_code = 'TASK_DISPATCH_FAILED'
+                generation.error_message = '生成任务启动失败，请确认 Celery 服务可用后重试。'
+                generation.completed_at = timezone.now()
+                generation.save(update_fields=[
+                    'status', 'error_code', 'error_message', 'completed_at', 'updated_at',
+                ])
+                return response(kind='server_error', message=generation.error_message)
+
+        result = WebUITestCaseGenerationSerializer(generation).data
+        result['reused'] = reused
+        return response(
+            kind='success',
+            data=result,
+            message='已恢复相同生成任务' if reused else '测试用例草稿生成任务已启动',
+        )
+
+
+class WebUITestCaseGenerationDetailView(APIView):
+    """Database-backed source of truth for refresh and task recovery."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(READ)
+    def get(self, request, project_id, generation_id):
+        try:
+            generation = get_requirement_generation(
+                generation_id=generation_id,
+                project_id=project_id,
+                user=request.user,
+            )
+        except WebUITestCaseGeneration.DoesNotExist:
+            return response(kind='not_found', resource='生成记录', message='生成记录不存在或无权访问')
+        return response(
+            kind='success',
+            data=WebUITestCaseGenerationSerializer(generation).data,
+            message='获取生成记录成功',
+        )
+
+
+class WebUITestCaseGenerationValidateView(APIView):
+    """Persist user edits after rerunning deterministic validation."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        input_serializer = WebUITestCaseGenerationDraftsSerializer(data=request.data)
+        if not input_serializer.is_valid():
+            return response(
+                kind='validation_error', message='草稿数据校验失败', errors=input_serializer.errors,
+            )
+        try:
+            with transaction.atomic():
+                generation = get_requirement_generation(
+                    generation_id=generation_id,
+                    project_id=project_id,
+                    user=request.user,
+                    for_update=True,
+                )
+                if generation.status != WebUITestCaseGeneration.Status.NEEDS_REVIEW:
+                    return response(
+                        kind='error',
+                        status_code=409,
+                        message='当前生成记录不在可审核状态，请刷新后重试。',
+                    )
+                drafts = input_serializer.validated_data['draft_test_cases']
+                report = validate_requirement_drafts(
+                    drafts,
+                    generation=generation,
+                    context=generation.context_snapshot,
+                )
+                generation.draft_test_cases = sanitize_requirement_drafts(drafts)
+                generation.validation_report = report
+                generation.save(update_fields=['draft_test_cases', 'validation_report', 'updated_at'])
+        except WebUITestCaseGeneration.DoesNotExist:
+            return response(kind='not_found', resource='生成记录', message='生成记录不存在或无权访问')
+
+        return response(
+            kind='success',
+            data=WebUITestCaseGenerationSerializer(generation).data,
+            message='草稿重新校验完成',
+        )
+
+
+class WebUITestCaseGenerationImportView(APIView):
+    """Atomically import selected, validated drafts into the official case library."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        input_serializer = WebUITestCaseGenerationImportSerializer(data=request.data)
+        if not input_serializer.is_valid():
+            return response(
+                kind='validation_error', message='导入数据校验失败', errors=input_serializer.errors,
+            )
+        drafts = input_serializer.validated_data['draft_test_cases']
+        selected_keys = input_serializer.validated_data['selected_draft_keys']
+
+        try:
+            with transaction.atomic():
+                generation = get_requirement_generation(
+                    generation_id=generation_id,
+                    project_id=project_id,
+                    user=request.user,
+                    for_update=True,
+                )
+                if generation.status == WebUITestCaseGeneration.Status.IMPORTED:
+                    imported = list(generation.imported_test_cases.all().order_by('id'))
+                    return response(
+                        kind='success',
+                        data={
+                            'generation': WebUITestCaseGenerationSerializer(generation).data,
+                            'created_case_ids': generation.created_case_ids,
+                            'created_count': 0,
+                            'skipped_count': len(imported),
+                            'imported_test_cases': [
+                                {'id': item.id, 'title': item.title} for item in imported
+                            ],
+                        },
+                        message='本次草稿已经导入，不会重复创建用例。',
+                    )
+                if generation.status != WebUITestCaseGeneration.Status.NEEDS_REVIEW:
+                    return response(
+                        kind='error', status_code=409,
+                        message='当前生成记录不在可导入状态，请刷新后重试。',
+                    )
+
+                draft_by_key = {
+                    str(item.get('draft_key') or ''): item
+                    for item in drafts
+                    if isinstance(item, dict) and item.get('draft_key')
+                }
+                if len(draft_by_key) != len(drafts):
+                    return response(
+                        kind='validation_error',
+                        message='草稿标识缺失或重复，请重新校验。',
+                        errors={'draft_test_cases': ['每条草稿必须具有唯一 draft_key。']},
+                    )
+                missing_keys = [key for key in selected_keys if key not in draft_by_key]
+                if missing_keys:
+                    return response(
+                        kind='validation_error',
+                        message='选中的草稿不存在，请刷新后重试。',
+                        errors={'selected_draft_keys': missing_keys},
+                    )
+                selected_drafts = [draft_by_key[key] for key in selected_keys]
+                report = validate_requirement_drafts(
+                    selected_drafts,
+                    generation=generation,
+                    context=generation.context_snapshot,
+                )
+                if report.get('blockers'):
+                    return response(
+                        kind='validation_error',
+                        message='选中的草稿仍有阻断项，修改并重新校验后才能导入。',
+                        errors={'validation_report': report},
+                    )
+
+                generation.status = WebUITestCaseGeneration.Status.IMPORTING
+                generation.save(update_fields=['status', 'updated_at'])
+                created = []
+                skipped = []
+                for draft in selected_drafts:
+                    draft_key = draft['draft_key']
+                    existing = WebUITestCase.objects.filter(
+                        source_requirement_generation=generation,
+                        source_draft_key=draft_key,
+                    ).first()
+                    if existing:
+                        skipped.append(existing)
+                        continue
+                    created.append(WebUITestCase.objects.create(
+                        title=str(draft.get('title') or '').strip(),
+                        description=str(draft.get('description') or '').strip(),
+                        priority=draft.get('priority'),
+                        category=draft.get('category'),
+                        preconditions=draft.get('preconditions') or [],
+                        steps=draft.get('steps') or [],
+                        expected_result=str(draft.get('expected_result') or '').strip(),
+                        user=request.user,
+                        project_id=project_id,
+                        module=generation.module,
+                        source_requirement_generation=generation,
+                        source_draft_key=draft_key,
+                    ))
+
+                all_imported = created + skipped
+                generation.status = WebUITestCaseGeneration.Status.IMPORTED
+                generation.draft_test_cases = sanitize_requirement_drafts(drafts)
+                generation.validation_report = report
+                generation.created_case_ids = [item.id for item in all_imported]
+                generation.completed_at = timezone.now()
+                generation.save(update_fields=[
+                    'status', 'draft_test_cases', 'validation_report', 'created_case_ids',
+                    'completed_at', 'updated_at',
+                ])
+        except WebUITestCaseGeneration.DoesNotExist:
+            return response(kind='not_found', resource='生成记录', message='生成记录不存在或无权访问')
+        except Exception:
+            logger.error('事务导入 WebUI 需求草稿失败 generation_id=%s', generation_id, exc_info=True)
+            return response(kind='server_error', message='测试用例导入失败，已回滚本次操作。')
+
+        logger.info(
+            'WebUI 需求草稿导入完成 generation_id=%s created=%s skipped=%s',
+            generation.id,
+            len(created),
+            len(skipped),
+        )
+        return response(
+            kind='success',
+            data={
+                'generation': WebUITestCaseGenerationSerializer(generation).data,
+                'created_case_ids': generation.created_case_ids,
+                'created_count': len(created),
+                'skipped_count': len(skipped),
+                'imported_test_cases': [
+                    {'id': item.id, 'title': item.title} for item in created + skipped
+                ],
+            },
+            message=f'成功导入 {len(created)} 条测试用例。',
+        )
+
+
+class WebUITestCaseGenerationCancelView(APIView):
+    """Cancel a running generation without force-killing the worker process."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        try:
+            with transaction.atomic():
+                generation = get_requirement_generation(
+                    generation_id=generation_id,
+                    project_id=project_id,
+                    user=request.user,
+                    for_update=True,
+                )
+                if generation.status in {
+                    WebUITestCaseGeneration.Status.IMPORTED,
+                    WebUITestCaseGeneration.Status.FAILED,
+                    WebUITestCaseGeneration.Status.CANCELLED,
+                }:
+                    return response(
+                        kind='success',
+                        data=WebUITestCaseGenerationSerializer(generation).data,
+                        message='生成任务已结束，无需重复取消。',
+                    )
+                if generation.celery_task_id and generation.status in RUNNING_STATUSES:
+                    from celery.result import AsyncResult
+
+                    AsyncResult(generation.celery_task_id).revoke(terminate=False)
+                generation.status = WebUITestCaseGeneration.Status.CANCELLED
+                generation.completed_at = timezone.now()
+                generation.save(update_fields=['status', 'completed_at', 'updated_at'])
+        except WebUITestCaseGeneration.DoesNotExist:
+            return response(kind='not_found', resource='生成记录', message='生成记录不存在或无权访问')
+        return response(
+            kind='success',
+            data=WebUITestCaseGenerationSerializer(generation).data,
+            message='生成任务已取消。',
+        )
+
+
 # ============ Web UI测试用例生成相关视图 ============
 
 class GenerateWebUITestCasesView(APIView):
@@ -1144,13 +1522,27 @@ class GenerateWebUITestCasesView(APIView):
             # 获取参数
             user_input = data.get('user_input', '').strip()
             module_id = data.get('module_id')
+            description = str(data.get('description', '') or '').strip()
 
             # 验证参数
             if not user_input:
                 return response(kind="error", message="用户需求不能为空")
+            if module_id in (None, ''):
+                return response(kind='error', message='请选择业务模块')
+            if len(description) > MAX_WEBUI_TEST_DESCRIPTION_LENGTH:
+                return response(
+                    kind='error',
+                    message=f'场景描述不能超过 {MAX_WEBUI_TEST_DESCRIPTION_LENGTH} 字',
+                )
             validate_related_project(WebUITestModule, module_id, project_id, 'module_id')
-            
-            logger.info(f"开始生成Web UI测试用例: 用户={user.id}, 项目={project_id}, 需求={user_input}")
+
+            logger.info(
+                '开始生成 WebUI 测试用例: user_id=%s project_id=%s module_id=%s description_length=%s',
+                user.id,
+                project_id,
+                module_id,
+                len(description),
+            )
             
             # 在后台任务中运行智能体
             from .tasks import generate_webui_test_cases_task
@@ -1281,6 +1673,10 @@ class WebUITestCaseListCreateView(generics.ListCreateAPIView):
         category = self.request.query_params.get('category')
         if category:
             queryset = queryset.filter(category=category)
+
+        requirement_generation = self.request.query_params.get('requirement_generation')
+        if requirement_generation:
+            queryset = queryset.filter(source_requirement_generation_id=requirement_generation)
         
         # 搜索过滤
         search = self.request.query_params.get('search')

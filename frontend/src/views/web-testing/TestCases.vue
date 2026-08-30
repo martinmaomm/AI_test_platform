@@ -125,6 +125,19 @@
             </div>
           </div>
 
+          <el-alert
+            v-if="requirementGenerationId"
+            class="requirement-generation-filter"
+            type="success"
+            :closable="false"
+            show-icon
+          >
+            <template #title>
+              {{ requirementGenerationHint }}
+              <el-button link type="primary" @click="clearRequirementGenerationFilter">清除筛选</el-button>
+            </template>
+          </el-alert>
+
           <div class="list-container" style="flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0;">
             <div class="table-area" style="flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0;">
               <el-table ref="tableRef" :data="testCases" style="width: 100%; flex: 1;" v-loading="loading"
@@ -664,7 +677,7 @@ const stopStatusPolling = () => {
     statusPollingTimer = null
   }
 }
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Right, Upload, Download, Search, Refresh, Document, Folder, Loading, Warning, Edit, VideoPlay, Delete, Close, Rank, DocumentCopy, Check, View, CircleCheck, CircleClose, Minus, Aim, Collection } from '@element-plus/icons-vue'
 import {
@@ -692,6 +705,7 @@ import { generationStorageKey } from '@/composables/webUIScriptGenerationPresent
 import dayjs from 'dayjs'
 
 const router = useRouter()
+const route = useRoute()
 
 // 状态管理
 const loading = ref(false)
@@ -728,6 +742,10 @@ const loadingEnvironments = ref(false)
 const priorityFilter = ref('')
 const categoryFilter = ref('')
 const hasScriptFilter = ref('')
+const requirementGenerationId = computed(() => route.query.requirement_generation || '')
+const requirementGenerationHint = computed(() => route.query.next === 'generate_script'
+  ? '已筛选本次导入的用例，请选择目标用例后点击“生成脚本”。'
+  : '仅显示本次从需求生成后导入的用例')
 
 // 模块树相关
 const moduleTreeData = ref([])
@@ -813,6 +831,13 @@ const isTestCaseExecuting = (testCaseId) => {
 const handleFilterChange = () => {
   currentPage.value = 1
   loadTestCases()
+}
+
+const clearRequirementGenerationFilter = () => {
+  const query = { ...route.query }
+  delete query.requirement_generation
+  delete query.next
+  router.replace({ query })
 }
 
 // 选择全部用例（清空模块过滤）
@@ -963,6 +988,7 @@ const loadTestCases = async (silent = false) => {
     if (priorityFilter.value) params.priority = priorityFilter.value
     if (categoryFilter.value) params.category = categoryFilter.value
     if (searchKeyword.value) params.search = searchKeyword.value
+    if (requirementGenerationId.value) params.requirement_generation = requirementGenerationId.value
 
     const res = await getWebUITestCases(projectStore.currentProject.id, params)
 
@@ -1788,6 +1814,11 @@ watch(() => projectStore.currentProject?.id, (newId) => {
   }
 })
 
+watch(() => route.query.requirement_generation, () => {
+  currentPage.value = 1
+  loadTestCases()
+})
+
 onMounted(() => {
   loadTestCases()
   loadModules()
@@ -2517,6 +2548,16 @@ onUnmounted(() => {
 
 .script-generation-tip {
   margin-bottom: 16px;
+}
+
+.requirement-generation-filter {
+  margin: 0 0 12px;
+}
+
+.requirement-generation-filter :deep(.el-alert__title) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .generation-base-url,

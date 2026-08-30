@@ -8,7 +8,7 @@ from ai_core.models import LLMConfiguration, ModelType
 from .models import (
     WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
-    WebPage, WebElement, WebUIScriptGeneration
+    WebPage, WebElement, WebUIScriptGeneration, WebUITestCaseGeneration
 )
 from .generation_repository import create_generation
 from .generation_preflight import exploration_requires_write_confirmation
@@ -312,7 +312,10 @@ class WebUITestModuleSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = WebUITestModule
-        fields = ['id', 'name', 'parent', 'order', 'project', 'children', 'created_at', 'updated_at']
+        fields = [
+            'id', 'name', 'description', 'business_rules', 'parent', 'order',
+            'project', 'children', 'created_at', 'updated_at',
+        ]
         read_only_fields = ['id', 'created_at', 'updated_at']
         extra_kwargs = {'project': {'required': False}}
 
@@ -320,6 +323,116 @@ class WebUITestModuleSerializer(serializers.ModelSerializer):
         """递归获取子模块"""
         children = obj.children.all().order_by('order', 'id')
         return WebUITestModuleSerializer(children, many=True).data
+
+
+class WebUITestCaseGenerationSerializer(serializers.ModelSerializer):
+    """需求用例生成记录的安全持久化视图。"""
+
+    project_id = serializers.IntegerField(read_only=True)
+    module_id = serializers.IntegerField(read_only=True)
+    module_name = serializers.CharField(source='module.name', read_only=True)
+    model_config_id = serializers.IntegerField(read_only=True, allow_null=True)
+    model_name = serializers.CharField(source='model_config.model_name', read_only=True, allow_null=True)
+    task_id = serializers.CharField(source='celery_task_id', read_only=True, allow_null=True)
+    status_label = serializers.CharField(source='get_status_display', read_only=True)
+    imported_test_cases = serializers.SerializerMethodField()
+
+    def get_imported_test_cases(self, obj):
+        return [
+            {'id': item.id, 'title': item.title}
+            for item in obj.imported_test_cases.all().order_by('id')
+        ]
+
+    class Meta:
+        model = WebUITestCaseGeneration
+        fields = [
+            'id', 'project_id', 'module_id', 'module_name', 'model_config_id', 'model_name',
+            'celery_task_id', 'task_id', 'client_request_id', 'status', 'status_label', 'request_text', 'generation_scope',
+            'case_categories', 'target_case_count', 'context_snapshot',
+            'draft_test_cases', 'validation_report', 'created_case_ids',
+            'imported_test_cases',
+            'error_code', 'error_message', 'started_at', 'completed_at',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+
+class WebUITestCaseGenerationCreateSerializer(serializers.Serializer):
+    """Validate one requirement-generation request before creating a task record."""
+
+    module_id = serializers.IntegerField(min_value=1)
+    model_config_id = serializers.IntegerField(min_value=1)
+    client_request_id = serializers.UUIDField(required=False, allow_null=True)
+    description = serializers.CharField(
+        max_length=2000,
+        required=False,
+        allow_blank=True,
+        trim_whitespace=True,
+        default='',
+    )
+    generation_scope = serializers.ChoiceField(
+        choices=WebUITestCaseGeneration.Scope.choices,
+        default=WebUITestCaseGeneration.Scope.CORE,
+    )
+    case_categories = serializers.ListField(
+        child=serializers.ChoiceField(choices=['functional', 'negative', 'boundary']),
+        min_length=1,
+        max_length=3,
+        default=['functional', 'negative', 'boundary'],
+    )
+    target_case_count = serializers.IntegerField(min_value=1, max_value=10, default=6)
+
+    def validate(self, attrs):
+        project_id = self.context['project_id']
+        user = self.context['request'].user
+        module = WebUITestModule.objects.filter(
+            id=attrs['module_id'],
+            project_id=project_id,
+        ).first()
+        if not module:
+            raise serializers.ValidationError({'module_id': '业务模块不存在或不属于当前项目。'})
+        model_config = LLMConfiguration.objects.filter(
+            id=attrs['model_config_id'],
+            created_by=user,
+            model_type=ModelType.LLM,
+            is_active=True,
+        ).first()
+        if not model_config:
+            raise serializers.ValidationError({'model_config_id': '模型不存在、已停用或不属于当前账号。'})
+        description = attrs.get('description') or ''
+        if attrs['generation_scope'] == WebUITestCaseGeneration.Scope.SPECIFIED and not description:
+            raise serializers.ValidationError({'description': '选择“指定场景”时必须填写场景描述。'})
+        if find_suspected_credentials(description):
+            raise serializers.ValidationError({'description': '场景描述不能包含账号、密码、Token 或密钥。'})
+
+        attrs['case_categories'] = list(dict.fromkeys(attrs['case_categories']))
+        attrs['description'] = redact_text(description)
+        attrs['module'] = module
+        attrs['model_config'] = model_config
+        return attrs
+
+
+class WebUITestCaseGenerationDraftsSerializer(serializers.Serializer):
+    """User-edited draft collection used by validate and import endpoints."""
+
+    draft_test_cases = serializers.ListField(
+        child=serializers.DictField(),
+        min_length=1,
+        max_length=10,
+    )
+
+
+class WebUITestCaseGenerationImportSerializer(WebUITestCaseGenerationDraftsSerializer):
+    selected_draft_keys = serializers.ListField(
+        child=serializers.CharField(max_length=80, trim_whitespace=True),
+        min_length=1,
+        max_length=10,
+    )
+
+    def validate_selected_draft_keys(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError('选中的草稿标识不能重复。')
+        return value
 
 
 class WebUITestCaseSerializer(serializers.ModelSerializer):

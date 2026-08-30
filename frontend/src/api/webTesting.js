@@ -145,6 +145,47 @@ export const generateWebUITestCases = async (projectId, data) => {
   return response.data
 }
 
+// 获取“从需求生成”所需的模块、页面、知识库和模型准备情况
+export const getWebUITestCaseGenerationContext = async (projectId, moduleId) => {
+  const response = await api.get(`/projects/${projectId}/web-testing/test-case-generations/context/`, {
+    params: { module_id: moduleId }
+  })
+  return response.data
+}
+
+// ============ 从需求生成 WebUI 测试用例 ============
+
+export const createWebUITestCaseGeneration = async (projectId, data) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/test-case-generations/`, data)
+  return response.data
+}
+
+export const getWebUITestCaseGeneration = async (projectId, generationId) => {
+  const response = await api.get(`/projects/${projectId}/web-testing/test-case-generations/${generationId}/`)
+  return response.data
+}
+
+export const validateWebUITestCaseGeneration = async (projectId, generationId, draftTestCases) => {
+  const response = await api.post(
+    `/projects/${projectId}/web-testing/test-case-generations/${generationId}/validate/`,
+    { draft_test_cases: draftTestCases }
+  )
+  return response.data
+}
+
+export const importWebUITestCaseGeneration = async (projectId, generationId, data) => {
+  const response = await api.post(
+    `/projects/${projectId}/web-testing/test-case-generations/${generationId}/import/`,
+    data
+  )
+  return response.data
+}
+
+export const cancelWebUITestCaseGeneration = async (projectId, generationId) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/test-case-generations/${generationId}/cancel/`)
+  return response.data
+}
+
 // 获取WebUI测试用例列表
 export const getWebUITestCases = async (projectId, params = {}) => {
   const response = await api.get(`/projects/${projectId}/web-testing/test-cases/`, { params })

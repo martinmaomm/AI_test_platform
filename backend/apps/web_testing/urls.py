@@ -35,6 +35,12 @@ urlpatterns = [
     path('task-status/<str:task_id>/', views.TaskStatusView.as_view(), name='task-status'),
     
     # ============ Web UI测试用例生成 ============
+    path('test-case-generations/context/', views.WebUITestCaseGenerationContextView.as_view(), name='webui-test-case-generation-context'),
+    path('test-case-generations/', views.WebUITestCaseGenerationListCreateView.as_view(), name='webui-test-case-generation-create'),
+    path('test-case-generations/<uuid:generation_id>/', views.WebUITestCaseGenerationDetailView.as_view(), name='webui-test-case-generation-detail'),
+    path('test-case-generations/<uuid:generation_id>/validate/', views.WebUITestCaseGenerationValidateView.as_view(), name='webui-test-case-generation-validate'),
+    path('test-case-generations/<uuid:generation_id>/import/', views.WebUITestCaseGenerationImportView.as_view(), name='webui-test-case-generation-import'),
+    path('test-case-generations/<uuid:generation_id>/cancel/', views.WebUITestCaseGenerationCancelView.as_view(), name='webui-test-case-generation-cancel'),
     path('test-cases/generate/', views.GenerateWebUITestCasesView.as_view(), name='generate-webui-test-cases'),
 
     # ============ Web UI测试模块树管理 ============

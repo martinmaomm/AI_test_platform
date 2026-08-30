@@ -125,6 +125,20 @@ class WebUITestCase(models.Model):
         related_name='test_cases',
         verbose_name="所属模块"
     )
+    source_requirement_generation = models.ForeignKey(
+        'WebUITestCaseGeneration',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='imported_test_cases',
+        verbose_name='需求生成记录',
+    )
+    source_draft_key = models.CharField(
+        max_length=80,
+        null=True,
+        blank=True,
+        verbose_name='需求草稿幂等键',
+    )
     
     # 时间信息
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
@@ -158,6 +172,12 @@ class WebUITestCase(models.Model):
             models.Index(fields=['user', 'project']),
             models.Index(fields=['category', 'priority']),
             models.Index(fields=['created_at']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['source_requirement_generation', 'source_draft_key'],
+                name='unique_webui_requirement_draft',
+            ),
         ]
     
     def __str__(self):
@@ -376,6 +396,113 @@ class WebUIScriptGeneration(models.Model):
 
     def __str__(self):
         return f'{self.project.name} - {self.get_status_display()} ({self.pk})'
+
+
+# ============ WebUI 需求用例生成记录 ============
+
+class WebUITestCaseGeneration(models.Model):
+    """可恢复的 WebUI 需求用例草稿生成记录。"""
+
+    class Status(models.TextChoices):
+        CREATED = 'created', '已创建'
+        CONTEXT_BUILDING = 'context_building', '准备资料中'
+        GENERATING = 'generating', '生成草稿中'
+        VALIDATING = 'validating', '校验草稿中'
+        REPAIRING = 'repairing', '修复草稿中'
+        NEEDS_REVIEW = 'needs_review', '待人工审核'
+        IMPORTING = 'importing', '导入中'
+        IMPORTED = 'imported', '已导入'
+        FAILED = 'failed', '生成失败'
+        CANCELLED = 'cancelled', '已取消'
+
+    class Scope(models.TextChoices):
+        CORE = 'core', '核心流程'
+        SPECIFIED = 'specified', '指定场景'
+        MODULE_COVERAGE = 'module_coverage', '模块覆盖'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name='webui_test_case_generations',
+        verbose_name='所属项目',
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='webui_test_case_generations',
+        verbose_name='发起用户',
+    )
+    module = models.ForeignKey(
+        WebUITestModule,
+        on_delete=models.PROTECT,
+        related_name='requirement_generations',
+        verbose_name='锁定业务模块',
+    )
+    model_config = models.ForeignKey(
+        'ai_core.LLMConfiguration',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='webui_test_case_generations',
+        verbose_name='使用模型',
+    )
+    celery_task_id = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        unique=True,
+        verbose_name='Celery 任务 ID',
+    )
+    client_request_id = models.UUIDField(
+        null=True,
+        blank=True,
+        unique=True,
+        verbose_name='客户端幂等请求 ID',
+    )
+    status = models.CharField(
+        max_length=30,
+        choices=Status.choices,
+        default=Status.CREATED,
+        db_index=True,
+        verbose_name='生成状态',
+    )
+    request_text = models.TextField(blank=True, default='', verbose_name='脱敏场景描述')
+    generation_scope = models.CharField(
+        max_length=30,
+        choices=Scope.choices,
+        default=Scope.CORE,
+        verbose_name='生成范围',
+    )
+    case_categories = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name='用例类型',
+    )
+    target_case_count = models.PositiveSmallIntegerField(default=6, verbose_name='目标用例数量')
+    context_snapshot = models.JSONField(default=dict, blank=True, verbose_name='脱敏上下文快照')
+    draft_test_cases = models.JSONField(default=list, blank=True, verbose_name='测试用例草稿')
+    validation_report = models.JSONField(default=dict, blank=True, verbose_name='草稿校验报告')
+    created_case_ids = models.JSONField(default=list, blank=True, verbose_name='已导入用例 ID')
+    error_code = models.CharField(max_length=64, blank=True, default='', verbose_name='稳定错误码')
+    error_message = models.TextField(blank=True, default='', verbose_name='用户可读错误信息')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'webui_test_case_generations'
+        verbose_name = 'WebUI 需求用例生成记录'
+        verbose_name_plural = 'WebUI 需求用例生成记录'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['project', '-created_at'], name='webui_req_project_created'),
+            models.Index(fields=['user', 'status'], name='webui_req_user_status'),
+        ]
+
+    def __str__(self):
+        return f'{self.project.name} - {self.module.name} - {self.get_status_display()}'
 
 
 # ============ WebUI测试执行记录 ============

@@ -1604,6 +1604,239 @@ def _execute_webui_test_cases_generation(task_instance, user_input: str, project
         return build_error_result(None, error_msg)
 
 
+@shared_task(bind=True, name='web_testing.generate_webui_requirement_drafts')
+def generate_webui_requirement_drafts_task(self, *, generation_id: str, user_id: int):
+    """Generate reviewable requirement drafts without creating test cases."""
+
+    return execute_async_task_with_websocket(
+        self,
+        'webui_test_generation',
+        _execute_webui_requirement_drafts_generation,
+        generation_id,
+        user_id=user_id,
+    )
+
+
+def _execute_webui_requirement_drafts_generation(
+    task_instance,
+    generation_id: str,
+    *,
+    user_id: int,
+) -> Dict[str, Any]:
+    """Persistent build-context → generate → validate → repair-once workflow."""
+
+    from .models import WebUITestCaseGeneration
+    from .requirement_case_generator import (
+        RequirementCaseGenerator,
+        RequirementDraftGenerationError,
+    )
+    from .requirement_case_validator import (
+        sanitize_requirement_drafts,
+        validate_requirement_drafts,
+    )
+    from .requirement_context import (
+        build_requirement_generation_prompt_context,
+        build_requirement_generation_snapshot,
+    )
+    from .requirement_generation_repository import (
+        RUNNING_STATUSES,
+        RequirementGenerationStateError,
+        generation_is_cancelled,
+        transition_requirement_generation,
+    )
+
+    task_id = str(task_instance.request.id or '')
+    try:
+        generation = WebUITestCaseGeneration.objects.select_related(
+            'project', 'user', 'module', 'model_config',
+        ).get(id=generation_id, user_id=user_id)
+        if generation.status == WebUITestCaseGeneration.Status.CANCELLED:
+            return {
+                'success': False,
+                'status': 'completed',
+                'cancelled': True,
+                'generation_id': str(generation.id),
+                'task_id': task_id,
+                'message': '生成任务已取消。',
+            }
+        if generation.status != WebUITestCaseGeneration.Status.CREATED:
+            raise RequirementGenerationStateError('生成任务已经启动或结束，不能重复执行。')
+
+        if not generation.celery_task_id:
+            generation.celery_task_id = task_id
+            generation.save(update_fields=['celery_task_id', 'updated_at'])
+
+        update_task_progress(task_instance, 10, '正在准备模块、页面和知识资料...')
+        transition_requirement_generation(
+            generation.id,
+            target_status=WebUITestCaseGeneration.Status.CONTEXT_BUILDING,
+            expected_statuses={WebUITestCaseGeneration.Status.CREATED},
+        )
+        prompt_context = build_requirement_generation_prompt_context(
+            project_id=generation.project_id,
+            module_id=generation.module_id,
+            user=generation.user,
+            request_text=generation.request_text,
+        )
+        snapshot = build_requirement_generation_snapshot(
+            prompt_context,
+            generation_config={
+                'scope': generation.generation_scope,
+                'case_categories': generation.case_categories,
+                'target_case_count': generation.target_case_count,
+                'description': generation.request_text,
+            },
+            model_config=generation.model_config,
+        )
+        if generation_is_cancelled(generation.id):
+            return {
+                'success': False, 'status': 'completed', 'cancelled': True,
+                'generation_id': str(generation.id), 'task_id': task_id,
+                'message': '生成任务已取消。',
+            }
+
+        update_task_progress(task_instance, 35, '正在生成结构化测试用例草稿...')
+        transition_requirement_generation(
+            generation.id,
+            target_status=WebUITestCaseGeneration.Status.GENERATING,
+            expected_statuses={WebUITestCaseGeneration.Status.CONTEXT_BUILDING},
+            updates={'context_snapshot': snapshot},
+        )
+        generator = RequirementCaseGenerator(generation.model_config_id)
+        drafts, repair_used = generator.generate(generation=generation, context=prompt_context)
+        if generation_is_cancelled(generation.id):
+            return {
+                'success': False, 'status': 'completed', 'cancelled': True,
+                'generation_id': str(generation.id), 'task_id': task_id,
+                'message': '生成任务已取消。',
+            }
+
+        update_task_progress(task_instance, 70, '正在执行确定性校验...')
+        transition_requirement_generation(
+            generation.id,
+            target_status=WebUITestCaseGeneration.Status.VALIDATING,
+            expected_statuses={WebUITestCaseGeneration.Status.GENERATING},
+        )
+        report = validate_requirement_drafts(
+            drafts,
+            generation=generation,
+            context=prompt_context,
+        )
+
+        sensitive_blocker = any(
+            issue.get('code') == 'SENSITIVE_VALUE_DETECTED'
+            for issue in report.get('blockers') or []
+        )
+        if report.get('blockers') and not repair_used and not sensitive_blocker:
+            update_task_progress(task_instance, 82, '正在按校验结果修复一次草稿...')
+            transition_requirement_generation(
+                generation.id,
+                target_status=WebUITestCaseGeneration.Status.REPAIRING,
+                expected_statuses={WebUITestCaseGeneration.Status.VALIDATING},
+            )
+            repaired_input = sanitize_requirement_drafts(drafts)
+            drafts = generator.repair(
+                drafts=repaired_input,
+                report=report,
+                generation=generation,
+                context=prompt_context,
+            )
+            transition_requirement_generation(
+                generation.id,
+                target_status=WebUITestCaseGeneration.Status.VALIDATING,
+                expected_statuses={WebUITestCaseGeneration.Status.REPAIRING},
+            )
+            report = validate_requirement_drafts(
+                drafts,
+                generation=generation,
+                context=prompt_context,
+            )
+
+        if generation_is_cancelled(generation.id):
+            return {
+                'success': False, 'status': 'completed', 'cancelled': True,
+                'generation_id': str(generation.id), 'task_id': task_id,
+                'message': '生成任务已取消。',
+            }
+
+        safe_drafts = sanitize_requirement_drafts(drafts)
+        transition_requirement_generation(
+            generation.id,
+            target_status=WebUITestCaseGeneration.Status.NEEDS_REVIEW,
+            expected_statuses={WebUITestCaseGeneration.Status.VALIDATING},
+            updates={
+                'draft_test_cases': safe_drafts,
+                'validation_report': report,
+                'error_code': '',
+                'error_message': '',
+            },
+        )
+        update_task_progress(task_instance, 100, '草稿已生成，请审核后确认导入。')
+        summary = report.get('summary') or {}
+        logger.info(
+            'WebUI 需求草稿生成完成 generation_id=%s task_id=%s drafts=%s blockers=%s warnings=%s',
+            generation.id,
+            task_id,
+            summary.get('draft_count', 0),
+            summary.get('blocker_count', 0),
+            summary.get('warning_count', 0),
+        )
+        return {
+            'success': True,
+            'status': 'completed',
+            'generation_id': str(generation.id),
+            'task_id': task_id,
+            'generation_status': WebUITestCaseGeneration.Status.NEEDS_REVIEW,
+            'validation_summary': summary,
+            'message': '测试用例草稿已生成，请审核后确认导入。',
+        }
+    except RequirementGenerationStateError as exc:
+        if generation_is_cancelled(generation_id):
+            return {
+                'success': False, 'status': 'completed', 'cancelled': True,
+                'generation_id': str(generation_id), 'task_id': task_id,
+                'message': '生成任务已取消。',
+            }
+        logger.warning('WebUI 需求生成状态冲突 generation_id=%s: %s', generation_id, exc)
+        return build_error_result(task_id, '生成任务状态已变化，请刷新页面查看最新结果。')
+    except Exception as exc:
+        error_code = (
+            'MODEL_OUTPUT_INVALID'
+            if isinstance(exc, RequirementDraftGenerationError)
+            else 'REQUIREMENT_GENERATION_FAILED'
+        )
+        error_message = (
+            '模型返回的用例结构无法解析，请更换模型或调整描述后重试。'
+            if error_code == 'MODEL_OUTPUT_INVALID'
+            else '测试用例草稿生成失败，请稍后重试。'
+        )
+        logger.error(
+            'WebUI 需求草稿生成失败 generation_id=%s task_id=%s error_type=%s',
+            generation_id,
+            task_id,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        try:
+            if not generation_is_cancelled(generation_id):
+                current_status = WebUITestCaseGeneration.objects.values_list(
+                    'status', flat=True,
+                ).get(id=generation_id)
+                if current_status in RUNNING_STATUSES:
+                    transition_requirement_generation(
+                        generation_id,
+                        target_status=WebUITestCaseGeneration.Status.FAILED,
+                        expected_statuses=RUNNING_STATUSES,
+                        updates={
+                            'error_code': error_code,
+                            'error_message': error_message,
+                        },
+                    )
+        except Exception:
+            logger.error('保存需求生成失败状态时发生异常 generation_id=%s', generation_id, exc_info=True)
+        return build_error_result(task_id, error_message)
+
+
 # ============ WebUI测试套件执行任务 ============
 
 @shared_task(bind=True)

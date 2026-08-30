@@ -5,36 +5,37 @@
       <p>选择环境并描述业务场景。页面探索默认只读，不会提交业务数据。</p>
     </div>
     <el-alert title="正式脚本不会保存本次密码；需要登录时仅会引用环境变量，例如 UI_TEST_USERNAME 和 UI_TEST_PASSWORD。" type="info" :closable="false" show-icon />
+    <el-alert v-if="paused" title="当前任务已暂停，请先在右侧“需要你处理”区域补充信息。" type="warning" :closable="false" show-icon class="paused-alert" />
 
     <el-form class="generation-form" label-position="top" @submit.prevent="submit">
       <el-form-item label="WebUI 测试环境" required>
-        <el-select v-model="form.environmentId" :loading="loadingEnvironments" :disabled="busy" placeholder="请选择启用的 WebUI 环境">
+        <el-select v-model="form.environmentId" :loading="loadingEnvironments" :disabled="busy || paused" placeholder="请选择启用的 WebUI 环境">
           <el-option v-for="environment in environments" :key="environment.id" :label="environment.name" :value="environment.id" />
         </el-select>
         <div class="base-url">Base URL：{{ selectedEnvironmentBaseUrl || '该环境未配置 Base URL' }}</div>
       </el-form-item>
       <el-form-item label="起始相对路径" required>
-        <el-input v-model.trim="form.startPath" :disabled="busy" placeholder="/" maxlength="500" />
+        <el-input v-model.trim="form.startPath" :disabled="busy || paused" placeholder="/" maxlength="500" />
         <div class="field-help">只填写环境内路径，例如 <code>/permission/users</code>；不需要填写完整域名。</div>
       </el-form-item>
       <el-form-item label="测试描述" required>
-        <div class="description-actions"><span>请写清目标、主要步骤、成功标准和清理约束。</span><el-button text type="primary" :disabled="busy" @click="insertExample">插入示例</el-button></div>
-        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy" placeholder="例如：验证用户列表中的新增、查询、编辑、删除流程。" />
+        <div class="description-actions"><span>请写清目标、主要步骤、成功标准和清理约束。</span><el-button text type="primary" :disabled="busy || paused" @click="insertExample">插入示例</el-button></div>
+        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy || paused" placeholder="例如：验证用户列表中的新增、查询、编辑、删除流程。" />
       </el-form-item>
       <el-collapse class="input-collapse">
         <el-collapse-item title="编写提示" name="tips"><ol><li>说明测试目标和要进入的页面。</li><li>按顺序列出主要操作，并写明每一步如何判断成功。</li><li>涉及创建数据时，说明唯一数据和清理要求。</li><li>明确探索阶段不得提交的操作，例如新增、编辑或删除。</li></ol></el-collapse-item>
         <el-collapse-item title="本次探索登录信息（按需填写）" name="credentials">
           <el-alert type="warning" :closable="false" show-icon title="仅供本次页面探索使用；提交后立即从页面内存清除，不会写入脚本、生成记录或本地存储。" />
-          <div class="credential-grid"><el-input v-model="form.username" autocomplete="off" placeholder="用户名" :disabled="busy" /><el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="密码" :disabled="busy" /></div>
+          <div class="credential-grid"><el-input v-model="form.username" autocomplete="off" placeholder="用户名" :disabled="busy || paused" /><el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="密码" :disabled="busy || paused" /></div>
         </el-collapse-item>
       </el-collapse>
       <el-form-item label="本次使用模型">
-        <el-select v-model="form.modelConfigId" :loading="loadingModels" :disabled="busy" placeholder="请选择启用的 LLM">
+        <el-select v-model="form.modelConfigId" :loading="loadingModels" :disabled="busy || paused" placeholder="请选择启用的 LLM">
           <el-option v-for="model in modelConfigs" :key="model.id" :label="modelLabel(model)" :value="model.id" />
         </el-select>
         <div class="field-help">只显示已启用的语言模型；平台会锁定本次选择，生成中不会自动切换模型。</div>
       </el-form-item>
-      <div class="form-actions"><el-button v-if="!busy" type="primary" size="large" :disabled="!formValid" :loading="submitting" native-type="submit">分析并生成脚本</el-button><el-button v-else type="danger" size="large" :loading="cancelling" :disabled="cancelling" @click="emit('cancel')">取消生成</el-button></div>
+      <div class="form-actions"><el-button v-if="paused" type="warning" size="large" disabled>请先处理当前暂停任务</el-button><el-button v-else-if="!busy" type="primary" size="large" :disabled="!formValid" :loading="submitting" native-type="submit">分析并生成脚本</el-button><el-button v-else type="danger" size="large" :loading="cancelling" :disabled="cancelling" @click="emit('cancel')">取消生成</el-button></div>
     </el-form>
   </section>
 </template>
@@ -60,7 +61,7 @@ const EXAMPLE_DESCRIPTION = `目标：验证“权限 > 用户列表”的新增
 - 探索阶段只查看页面和打开表单，不提交新增、编辑或删除；
 - 登录密码不得写入脚本、日志、截图或报告。`
 
-const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, loadingEnvironments: Boolean, loadingModels: Boolean, busy: Boolean, submitting: Boolean, cancelling: Boolean })
+const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, loadingEnvironments: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean })
 const emit = defineEmits(['submit', 'cancel'])
 const form = reactive({ environmentId: null, startPath: '/', description: '', username: '', password: '', modelConfigId: null })
 const selectedEnvironment = computed(() => props.environments.find(item => item.id === form.environmentId) || null)
@@ -86,7 +87,7 @@ const submit = () => {
 .generation-card { padding: 20px; background: var(--page-content-bg); border: 1px solid var(--app-border); border-radius: 10px; }
 .card-heading h4 { margin: 0; color: var(--app-text-primary); font-size: 16px; }
 .card-heading p, .field-help, .base-url, .description-actions { color: var(--app-text-secondary); font-size: 13px; }
-.card-heading p { margin: 6px 0 16px; }.generation-form { margin-top: 18px; }.base-url, .field-help { margin-top: 7px; word-break: break-all; }
+.card-heading p { margin: 6px 0 16px; }.paused-alert { margin-top: 12px; }.generation-form { margin-top: 18px; }.base-url, .field-help { margin-top: 7px; word-break: break-all; }
 .description-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; margin-bottom: 6px; }.input-collapse { margin: 4px 0 18px; }
 .input-collapse ol { margin: 0; padding-left: 20px; line-height: 1.8; color: var(--app-text-secondary); }.credential-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }.form-actions { display: flex; justify-content: flex-end; padding-top: 4px; }
 @media (max-width: 700px) { .credential-grid { grid-template-columns: 1fr; }.description-actions { align-items: flex-start; flex-direction: column; }.form-actions :deep(.el-button) { width: 100%; } }

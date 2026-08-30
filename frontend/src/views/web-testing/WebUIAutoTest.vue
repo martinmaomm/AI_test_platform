@@ -6,10 +6,10 @@
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
     <div class="generation-layout">
-      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :model-configs="modelConfigs" :loading-environments="loadingEnvironments" :loading-models="loadingModels" :busy="isActive || submitting" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
+      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :model-configs="modelConfigs" :loading-environments="loadingEnvironments" :loading-models="loadingModels" :busy="isActive || submitting" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
-        <GenerationResultPanel v-if="generation" :generation="generation" :saving="saving" @save="handleSave" @open-test-case="router.push('/web-testing/test-cases')" />
+        <GenerationResultPanel v-if="generation" :generation="generation" :saving="saving" :resolving="resolving" @resolve="handleResolve" @cancel="handleCancel" @save="handleSave" @open-test-case="router.push('/web-testing/test-cases')" />
         <el-empty v-else :image-size="96" description="填写场景后开始生成。生成记录会在刷新页面后自动恢复。" class="empty-result" />
       </div>
     </div>
@@ -44,7 +44,7 @@ const loadingModels = ref(false)
 const isConnected = ref(false)
 let websocketManager = null
 
-const { generation, submitting, saving, cancelling, lastError, isActive, create, cancel, save, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
+const { generation, submitting, saving, cancelling, resolving, lastError, isActive, isPaused, create, cancel, resolve: resolveGeneration, save, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
 
 const asList = (response) => {
   const body = response?.data ?? response ?? {}
@@ -79,6 +79,7 @@ const handleCreate = async (payload) => { try { await create(payload); ElMessage
 const handleCancel = async () => {
   try { await ElMessageBox.confirm('确定取消当前脚本生成吗？已保存的阶段结果仍可查看。', '取消生成', { type: 'warning', confirmButtonText: '取消生成', cancelButtonText: '继续等待' }); await cancel(); ElMessage.success('已请求取消生成任务') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '取消失败') }
 }
+const handleResolve = async (payload) => { try { await resolveGeneration(payload); ElMessage.success('补充信息已提交，任务正在继续。') } catch { ElMessage.error(lastError.value || '提交补充信息失败') } }
 const handleSave = async (title) => { try { const result = await save(title); ElMessage.success(result?.created ? '已创建并保存到测试用例' : '已保存到测试用例') } catch { ElMessage.error(lastError.value || '保存失败') } }
 
 watch(projectId, () => { loadEnvironments(); loadModels() }, { immediate: true })

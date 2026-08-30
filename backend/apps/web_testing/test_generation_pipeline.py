@@ -425,6 +425,57 @@ class MCPPageExplorerTests(TestCase):
 
 
 class GenerationOrchestratorTests(GenerationPipelineBase):
+    def test_normalization_receives_persisted_clarification_answers(self):
+        generation = self.make_generation(
+            status=WebUIScriptGeneration.Status.NORMALIZING,
+            current_stage=WebUIScriptGeneration.Stage.NORMALIZING,
+            clarifications=[{
+                'answers': [{
+                    'question': '编辑后的昵称如何生成？',
+                    'answer': '使用唯一名称加 _edited 后缀。',
+                }],
+            }],
+        )
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement',
+            return_value=ScenarioSpec.model_validate(scenario_payload()),
+        ) as normalizer, patch(
+            'web_testing.generation_orchestrator.run_safety_preflight',
+            return_value=SimpleNamespace(
+                outcome='failed', error_code='MCP_CONFIG_MISSING',
+                message='没有可用的 Playwright MCP 配置。', warnings=[],
+            ),
+        ):
+            run_v2_generation(str(generation.pk), celery_task_id='resume-normalize-task')
+
+        prompt = normalizer.call_args.args[0]
+        self.assertIn('编辑后的昵称如何生成', prompt)
+        self.assertIn('_edited', prompt)
+
+    def test_preflight_resume_reuses_saved_scenario_without_normalizing_again(self):
+        generation = self.make_generation(
+            status=WebUIScriptGeneration.Status.PREFLIGHTING,
+            current_stage=WebUIScriptGeneration.Stage.PREFLIGHTING,
+            progress=25,
+            scenario_spec=scenario_payload(),
+        )
+        preflight_result = SimpleNamespace(
+            outcome='failed',
+            error_code='MCP_CONFIG_MISSING',
+            message='没有可用的 Playwright MCP 配置。',
+            warnings=[],
+        )
+        with patch('web_testing.generation_orchestrator.normalize_requirement') as normalizer, patch(
+            'web_testing.generation_orchestrator.run_safety_preflight',
+            return_value=preflight_result,
+        ):
+            result = run_v2_generation(str(generation.pk), celery_task_id='resume-preflight-task')
+
+        normalizer.assert_not_called()
+        self.assertEqual(result['error_code'], 'MCP_CONFIG_MISSING')
+        generation.refresh_from_db()
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+
     def test_orchestrator_persists_scenario_snapshot_and_quality_approved_script(self):
         generation = self.make_generation()
 

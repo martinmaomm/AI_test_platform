@@ -18,6 +18,7 @@ urlpatterns = [
     path('script-generations/', views.WebUIScriptGenerationCreateView.as_view(), name='webui-script-generation-create'),
     path('script-generations/<uuid:generation_id>/', views.WebUIScriptGenerationDetailView.as_view(), name='webui-script-generation-detail'),
     path('script-generations/<uuid:generation_id>/cancel/', views.WebUIScriptGenerationCancelView.as_view(), name='webui-script-generation-cancel'),
+    path('script-generations/<uuid:generation_id>/resolve/', views.WebUIScriptGenerationResolveView.as_view(), name='webui-script-generation-resolve'),
     path('script-generations/<uuid:generation_id>/save/', views.WebUIScriptGenerationSaveView.as_view(), name='webui-script-generation-save'),
     path('scripts/', views.CreateWebUITestScriptView.as_view(), name='create-webui-test-script'),
     path('scripts/save/', views.SaveGeneratedWebUITestScriptView.as_view(), name='save-generated-webui-test-script'),

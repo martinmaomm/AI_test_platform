@@ -3,6 +3,7 @@ import {
   cancelWebUIScriptGeneration,
   createWebUIScriptGeneration,
   getWebUIScriptGeneration,
+  resolveWebUIScriptGeneration,
   saveWebUIScriptGeneration
 } from '@/api/webTesting'
 import {
@@ -27,6 +28,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const submitting = ref(false)
   const saving = ref(false)
   const cancelling = ref(false)
+  const resolving = ref(false)
   const lastError = ref('')
   let pollingTimer = null
   let refreshPromise = null
@@ -77,6 +79,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     submitting.value = false
     saving.value = false
     cancelling.value = false
+    resolving.value = false
   }
   const isCurrentScope = (requestScope, requestProjectId) => (
     requestScope === scopeVersion && String(currentProjectId.value || '') === String(requestProjectId || '')
@@ -194,6 +197,30 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     }
   }
 
+  const resolve = async (payload) => {
+    if (!generation.value?.id || resolving.value) return null
+    const requestProjectId = currentProjectId.value
+    const generationId = generation.value.id
+    const requestScope = scopeVersion
+    resolving.value = true
+    lastError.value = ''
+    try {
+      const response = await resolveWebUIScriptGeneration(requestProjectId, generationId, payload)
+      if (!isCurrentScope(requestScope, requestProjectId)) return null
+      const record = apiData(response)
+      if (response?.success === false) throw new Error(response?.message || '提交补充信息失败')
+      return applyGeneration(record)
+    } catch (error) {
+      if (!isCurrentScope(requestScope, requestProjectId)) return null
+      const latest = error?.response?.data?.data
+      if (latest?.id) applyGeneration(latest)
+      lastError.value = error?.response?.data?.message || error?.message || '提交补充信息失败'
+      throw error
+    } finally {
+      if (isCurrentScope(requestScope, requestProjectId)) resolving.value = false
+    }
+  }
+
   // WebSocket only wakes an API refresh. It never mutates the durable state.
   const handleWebSocketEvent = (message) => {
     const record = generation.value
@@ -206,9 +233,9 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   onUnmounted(stopPolling)
 
   return {
-    generation, loading, submitting, saving, cancelling, lastError,
+    generation, loading, submitting, saving, cancelling, resolving, lastError,
     isActive, isPaused, isTerminal,
-    create, refresh, restore, cancel, save, stopPolling, handleWebSocketEvent,
+    create, refresh, restore, cancel, resolve, save, stopPolling, handleWebSocketEvent,
     clearStoredGeneration, storageKey
   }
 }

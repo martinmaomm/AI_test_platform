@@ -31,6 +31,7 @@ from .views import (
     WebUIScriptGenerationCancelView,
     WebUIScriptGenerationCreateView,
     WebUIScriptGenerationDetailView,
+    WebUIScriptGenerationResolveView,
 )
 
 
@@ -102,6 +103,9 @@ class WebUIScriptGenerationModelAndStateTests(WebUIScriptGenerationV2BaseTestCas
         self.assertEqual(generation.target_url_safe, 'https://web.example.test:9443/admin/users?tab=all')
         self.assertFalse(generation.credentials_provided)
         self.assertEqual(generation.script_draft, '')
+        self.assertEqual(generation.revision, 0)
+        self.assertEqual(generation.resume_count, 0)
+        self.assertEqual(generation.clarifications, [])
 
     def test_state_transition_rejects_skips_and_is_idempotent(self):
         generation_id = self.create_generation().data['data']['id']
@@ -185,6 +189,23 @@ class WebUIScriptGenerationSecurityTests(TestCase):
 
 
 class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
+    def pause_generation(self, *, status, error_code, scenario_spec=None, warnings=None):
+        generation_id = self.create_generation().data['data']['id']
+        WebUIScriptGeneration.objects.filter(pk=generation_id).update(
+            status=status,
+            current_stage=(
+                WebUIScriptGeneration.Stage.NORMALIZING
+                if status == WebUIScriptGeneration.Status.NEEDS_INPUT
+                else WebUIScriptGeneration.Stage.PREFLIGHTING
+            ),
+            progress=25,
+            error_code=error_code,
+            error_message='需要用户处理。',
+            scenario_spec=scenario_spec or {},
+            warnings=warnings or [],
+        )
+        return WebUIScriptGeneration.objects.get(pk=generation_id)
+
     def test_create_query_and_cancel_are_project_scoped_and_secret_free(self):
         response = self.create_generation(temporary_credentials={'username': 'admin', 'password': 'super-secret'})
         payload = response.data['data']
@@ -381,3 +402,130 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
 
         self.assertFalse(WebUIScriptGeneration.objects.filter(project=self.project).exists())
         clear_credentials_mock.assert_called_once()
+
+    def test_ambiguous_generation_accepts_all_answers_and_resumes_same_record(self):
+        questions = ['新增用户还有哪些必填字段？', '编辑后的昵称如何生成？']
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+            error_code='INPUT_AMBIGUOUS',
+            scenario_spec={'ambiguities': questions},
+            warnings=questions,
+        )
+        request = self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
+            'expected_status': generation.status,
+            'expected_revision': generation.revision,
+            'clarification_answers': [
+                {'question': questions[0], 'answer': '初始密码使用环境变量，角色选择普通用户。'},
+                {'question': questions[1], 'answer': '使用原唯一名称加 _edited 后缀。'},
+            ],
+        })
+        task_result = type('TaskResult', (), {'id': 'v2-resumed-task-id'})()
+        with patch(
+            'web_testing.views.generate_webui_script_generation_v2_task.delay',
+            return_value=task_result,
+        ) as delay_mock:
+            response = WebUIScriptGenerationResolveView.as_view()(
+                request,
+                project_id=self.project.id,
+                generation_id=generation.pk,
+            )
+
+        self.assertEqual(response.status_code, 202, response.data)
+        generation.refresh_from_db()
+        self.assertEqual(str(generation.pk), response.data['data']['id'])
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.NORMALIZING)
+        self.assertEqual(generation.revision, 1)
+        self.assertEqual(generation.resume_count, 1)
+        self.assertEqual(generation.celery_task_id, 'v2-resumed-task-id')
+        self.assertEqual(len(generation.clarifications), 1)
+        self.assertEqual(generation.clarifications[0]['answers'][1]['answer'], '使用原唯一名称加 _edited 后缀。')
+        delay_mock.assert_called_once_with(str(generation.pk))
+
+    def test_credentials_resolution_resumes_at_preflight_without_exposing_secret(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+            error_code='CREDENTIALS_REQUIRED',
+            scenario_spec={'title': '需要登录的场景'},
+        )
+        with patch(
+            'web_testing.views.generate_webui_script_generation_v2_task.delay',
+            return_value=type('TaskResult', (), {'id': 'v2-credential-resume-task'})(),
+        ):
+            response = WebUIScriptGenerationResolveView.as_view()(
+                self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
+                    'expected_status': generation.status,
+                    'expected_revision': generation.revision,
+                    'temporary_credentials': {'username': 'admin', 'password': 'super-secret'},
+                }),
+                project_id=self.project.id,
+                generation_id=generation.pk,
+            )
+
+        self.assertEqual(response.status_code, 202, response.data)
+        self.assertNotIn('super-secret', str(response.data))
+        generation.refresh_from_db()
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.PREFLIGHTING)
+        self.assertTrue(generation.credentials_provided)
+        self.assertFalse(generation.credentials_expired)
+        self.assertEqual(get_temporary_credentials(generation.pk)['password'], 'super-secret')
+
+    def test_resolution_rejects_stale_revision_without_dispatch(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_INPUT,
+            error_code='SCENARIO_CONTRACT_INVALID',
+        )
+        with patch('web_testing.views.generate_webui_script_generation_v2_task.delay') as delay_mock:
+            response = WebUIScriptGenerationResolveView.as_view()(
+                self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
+                    'expected_status': generation.status,
+                    'expected_revision': generation.revision + 1,
+                    'description': '目标：查询用户列表。步骤：进入列表。成功标准：列表可见。',
+                }),
+                project_id=self.project.id,
+                generation_id=generation.pk,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['data']['revision'], 0)
+        delay_mock.assert_not_called()
+
+    def test_write_risk_must_be_revised_to_read_only_before_resume(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+            error_code='EXPLORATION_WRITE_CONFIRMATION_REQUIRED',
+        )
+        response = WebUIScriptGenerationResolveView.as_view()(
+            self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
+                'expected_status': generation.status,
+                'expected_revision': generation.revision,
+                'description': '探索阶段请提交新增用户并查看结果。',
+            }),
+            project_id=self.project.id,
+            generation_id=generation.pk,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('description', response.data['error']['details'])
+
+    def test_resume_limit_moves_paused_generation_to_review_without_dispatch(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_INPUT,
+            error_code='SCENARIO_CONTRACT_INVALID',
+        )
+        WebUIScriptGeneration.objects.filter(pk=generation.pk).update(resume_count=3)
+        generation.refresh_from_db()
+        with patch('web_testing.views.generate_webui_script_generation_v2_task.delay') as delay_mock:
+            response = WebUIScriptGenerationResolveView.as_view()(
+                self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
+                    'expected_status': generation.status,
+                    'expected_revision': generation.revision,
+                    'description': '目标：查询用户列表。步骤：进入列表。成功标准：列表可见。',
+                }),
+                project_id=self.project.id,
+                generation_id=generation.pk,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['data']['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
+        self.assertEqual(response.data['data']['error_code'], 'RESUME_LIMIT_REACHED')
+        delay_mock.assert_not_called()

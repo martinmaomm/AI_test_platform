@@ -432,6 +432,7 @@ ALLOWED_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
         WebUIScriptGeneration.Status.NEEDS_INPUT,
         WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
         WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+        WebUIScriptGeneration.Status.NEEDS_REVIEW,
         WebUIScriptGeneration.Status.CANCELLED,
         WebUIScriptGeneration.Status.FAILED,
     }),
@@ -440,6 +441,7 @@ ALLOWED_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
         WebUIScriptGeneration.Status.NEEDS_INPUT,
         WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
         WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+        WebUIScriptGeneration.Status.NEEDS_REVIEW,
         WebUIScriptGeneration.Status.CANCELLED,
         WebUIScriptGeneration.Status.FAILED,
     }),
@@ -471,14 +473,18 @@ ALLOWED_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     }),
     WebUIScriptGeneration.Status.NEEDS_INPUT: frozenset({
         WebUIScriptGeneration.Status.NORMALIZING,
+        WebUIScriptGeneration.Status.NEEDS_REVIEW,
         WebUIScriptGeneration.Status.CANCELLED,
     }),
     WebUIScriptGeneration.Status.NEEDS_CONFIRMATION: frozenset({
+        WebUIScriptGeneration.Status.NORMALIZING,
         WebUIScriptGeneration.Status.PREFLIGHTING,
+        WebUIScriptGeneration.Status.NEEDS_REVIEW,
         WebUIScriptGeneration.Status.CANCELLED,
     }),
     WebUIScriptGeneration.Status.NEEDS_CREDENTIALS: frozenset({
         WebUIScriptGeneration.Status.PREFLIGHTING,
+        WebUIScriptGeneration.Status.NEEDS_REVIEW,
         WebUIScriptGeneration.Status.CANCELLED,
     }),
 }

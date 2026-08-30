@@ -50,6 +50,46 @@ export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(sta
 export const isPausedGeneration = (status) => PAUSED_GENERATION_STATUSES.has(status)
 export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has(status)
 
+export const generationActionRequired = (generation) => {
+  const status = generation?.status
+  if (!isPausedGeneration(status)) return null
+  const errorCode = generation?.error_code || ''
+  const scenarioQuestions = Array.isArray(generation?.scenario_spec?.ambiguities)
+    ? generation.scenario_spec.ambiguities.filter(Boolean)
+    : []
+  const warningQuestions = Array.isArray(generation?.warnings) ? generation.warnings.filter(Boolean) : []
+  const questions = scenarioQuestions.length ? scenarioQuestions : warningQuestions
+  const remainingAttempts = Math.max(0, 3 - Number(generation?.resume_count || 0))
+
+  if (status === 'needs_credentials') {
+    return {
+      kind: 'credentials', title: '需要本次探索登录信息',
+      description: generation?.error_message || '登录信息缺失或已过期，请重新提供后继续。',
+      questions: [], primaryLabel: '提交登录信息并继续', remainingAttempts
+    }
+  }
+  if (status === 'needs_input') {
+    return {
+      kind: 'description', title: '场景信息不足',
+      description: generation?.error_message || '请补充完整步骤、成功标准和清理约束。',
+      questions: [], primaryLabel: '重新分析并继续', remainingAttempts
+    }
+  }
+  if (errorCode === 'INPUT_AMBIGUOUS') {
+    return {
+      kind: 'clarifications', title: `还需要确认 ${questions.length || 1} 项信息`,
+      description: generation?.error_message || '请逐项回答后继续生成。',
+      questions: questions.length ? questions : ['请补充当前场景中无法安全确定的内容。'],
+      primaryLabel: '提交答案并继续', remainingAttempts
+    }
+  }
+  return {
+    kind: 'description', title: '需要调整探索约束',
+    description: generation?.error_message || '请修订描述并明确探索阶段只读。',
+    questions: [], primaryLabel: '修订后继续', remainingAttempts
+  }
+}
+
 /** A WebSocket event can only wake polling when it explicitly identifies this generation. */
 export const matchesGenerationWebSocketEvent = (message, generation) => {
   if (!generation) return false
@@ -77,6 +117,7 @@ export const buildGenerationTimeline = (generation) => {
         ? 'wait'
         : ['failed', 'needs_review'].includes(generation.status) ? 'error' : 'success'
     } else if (stage === currentStage) {
+      if (isPausedGeneration(generation?.status)) displayLabel = `${displayLabel}（等待处理）`
       state = generation.status === 'failed' ? 'error' : 'process'
     } else if (index < currentIndex && (stage !== 'repairing' || repairTriggered)) {
       state = 'success'

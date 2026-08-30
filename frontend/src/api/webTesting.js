@@ -215,6 +215,11 @@ export const cancelWebUIScriptGeneration = async (projectId, generationId) => {
   return response.data
 }
 
+export const resolveWebUIScriptGeneration = async (projectId, generationId, data) => {
+  const response = await api.post(`/projects/${projectId}/web-testing/script-generations/${generationId}/resolve/`, data)
+  return response.data
+}
+
 export const saveWebUIScriptGeneration = async (projectId, generationId, data = {}) => {
   const response = await api.post(`/projects/${projectId}/web-testing/script-generations/${generationId}/save/`, data)
   return response.data

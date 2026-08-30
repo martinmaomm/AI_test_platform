@@ -11,6 +11,7 @@ from .models import (
     WebPage, WebElement, WebUIScriptGeneration
 )
 from .generation_repository import create_generation
+from .generation_preflight import exploration_requires_write_confirmation
 from .generation_save_state import is_generation_saved
 from .generation_security import (
     GenerationInputSecurityError,
@@ -73,6 +74,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
+            'revision', 'resume_count', 'clarifications',
             'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
             'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
         ]
@@ -82,6 +84,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
+            'revision', 'resume_count', 'clarifications',
             'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
             'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
         ]
@@ -217,6 +220,90 @@ class WebUIScriptGenerationSaveSerializer(serializers.Serializer):
         if find_suspected_credentials(value):
             raise serializers.ValidationError('标题不能包含账号、密码或密钥。')
         return redact_text(value)
+
+
+class WebUIScriptGenerationClarificationAnswerSerializer(serializers.Serializer):
+    question = serializers.CharField(max_length=500, trim_whitespace=True)
+    answer = serializers.CharField(max_length=1000, trim_whitespace=True)
+
+
+class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
+    """Validate one user response to a paused generation without storing secrets."""
+
+    expected_status = serializers.ChoiceField(choices=[
+        WebUIScriptGeneration.Status.NEEDS_INPUT,
+        WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+        WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+    ])
+    expected_revision = serializers.IntegerField(min_value=0)
+    description = serializers.CharField(
+        max_length=2000,
+        required=False,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    clarification_answers = WebUIScriptGenerationClarificationAnswerSerializer(
+        many=True,
+        required=False,
+    )
+    temporary_credentials = serializers.DictField(required=False, write_only=True)
+
+    def validate_temporary_credentials(self, value):
+        try:
+            return validate_temporary_credentials(value)
+        except GenerationInputSecurityError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    @staticmethod
+    def _questions(generation):
+        scenario_questions = (generation.scenario_spec or {}).get('ambiguities') or []
+        questions = [str(item).strip() for item in (scenario_questions or generation.warnings or []) if str(item).strip()]
+        return questions or ['请补充当前场景中无法安全确定的内容。']
+
+    def validate(self, attrs):
+        generation = self.context['generation']
+        description = attrs.get('description')
+        answers = attrs.get('clarification_answers') or []
+        credentials = attrs.get('temporary_credentials')
+
+        if description and find_suspected_credentials(description):
+            raise serializers.ValidationError({
+                'description': '修订描述中疑似包含账号或密码，请改用 temporary_credentials 单独提交。'
+            })
+        for index, item in enumerate(answers):
+            if find_suspected_credentials(item['question']) or find_suspected_credentials(item['answer']):
+                raise serializers.ValidationError({
+                    'clarification_answers': f'第 {index + 1} 项疑似包含账号、密码或密钥。'
+                })
+
+        if generation.status == WebUIScriptGeneration.Status.NEEDS_INPUT:
+            if not description:
+                raise serializers.ValidationError({'description': '请补充完整的测试描述。'})
+        elif generation.status == WebUIScriptGeneration.Status.NEEDS_CREDENTIALS:
+            if not credentials:
+                raise serializers.ValidationError({'temporary_credentials': '请提供本次探索登录信息。'})
+        elif generation.status == WebUIScriptGeneration.Status.NEEDS_CONFIRMATION:
+            if generation.error_code == 'INPUT_AMBIGUOUS':
+                expected_questions = self._questions(generation)
+                submitted = {item['question']: item['answer'] for item in answers}
+                if len(submitted) != len(answers):
+                    raise serializers.ValidationError({'clarification_answers': '待确认项不能重复。'})
+                if set(submitted) != set(expected_questions):
+                    raise serializers.ValidationError({'clarification_answers': '请逐项回答当前全部待确认问题。'})
+            else:
+                if not description:
+                    raise serializers.ValidationError({'description': '请修订测试描述后继续。'})
+                if generation.error_code == 'EXPLORATION_WRITE_CONFIRMATION_REQUIRED' and exploration_requires_write_confirmation(description):
+                    raise serializers.ValidationError({
+                        'description': '探索阶段必须保持只读，请移除提交、新增、编辑或删除要求。'
+                    })
+
+        attrs['safe_description'] = redact_text(description) if description else None
+        attrs['safe_answers'] = [
+            {'question': redact_text(item['question']), 'answer': redact_text(item['answer'])}
+            for item in answers
+        ]
+        return attrs
 
 
 class WebUITestModuleSerializer(serializers.ModelSerializer):

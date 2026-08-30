@@ -35,15 +35,18 @@ from .serializers import (
     WebUITestSuiteAddTestCaseSerializer,
     WebPageSerializer, WebElementSerializer,
     WebUIScriptGenerationCreateSerializer, WebUIScriptGenerationSerializer,
-    WebUIScriptGenerationSaveSerializer,
+    WebUIScriptGenerationResolveSerializer, WebUIScriptGenerationSaveSerializer,
 )
 from .generation_repository import (
+    GenerationResolutionConflict,
     attach_celery_task,
     cancel_generation,
     get_generation_for_project,
+    prepare_generation_resolution,
     transition_generation,
 )
 from .generation_events import publish_terminal
+from .generation_security import store_temporary_credentials
 from .generation_save_state import generation_reference, is_generation_saved
 from .pom_code_generator import _to_page_class_name, _to_locator_var_name, _get_action_config
 from .tasks import (
@@ -308,6 +311,82 @@ class WebUIScriptGenerationCancelView(APIView):
             'message': '脚本生成任务已取消',
             'data': WebUIScriptGenerationSerializer(generation).data,
         })
+
+
+class WebUIScriptGenerationResolveView(APIView):
+    """Resolve one paused V2 generation and safely schedule its next stage."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+
+        is_project_owner = project.owner_id == request.user.id or project.created_by_id == request.user.id
+        if generation.user_id != request.user.id and not is_project_owner:
+            raise PermissionDenied('只能处理自己创建的生成记录')
+
+        serializer = WebUIScriptGenerationResolveSerializer(
+            data=request.data or {},
+            context={'generation': generation},
+        )
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        try:
+            generation, should_schedule = prepare_generation_resolution(
+                generation.pk,
+                expected_status=values['expected_status'],
+                expected_revision=values['expected_revision'],
+                user_id=request.user.id,
+                description_safe=values.get('safe_description'),
+                clarification_answers=values.get('safe_answers'),
+                credentials_provided=bool(values.get('temporary_credentials')),
+            )
+        except GenerationResolutionConflict as exc:
+            return Response({
+                'success': False,
+                'message': str(exc),
+                'data': WebUIScriptGenerationSerializer(exc.generation).data,
+            }, status=status.HTTP_409_CONFLICT)
+
+        if not should_schedule:
+            publish_terminal(generation)
+            return Response({
+                'success': False,
+                'message': generation.error_message,
+                'data': WebUIScriptGenerationSerializer(generation).data,
+            }, status=status.HTTP_409_CONFLICT)
+
+        credentials = values.get('temporary_credentials')
+        try:
+            if credentials:
+                store_temporary_credentials(generation.pk, credentials)
+            task = generate_webui_script_generation_v2_task.delay(str(generation.pk))
+            generation = attach_celery_task(generation.pk, task.id)
+        except Exception:
+            logger.exception('WebUI V2 暂停任务恢复失败: generation_id=%s', generation.pk)
+            generation = transition_generation(
+                generation.pk,
+                WebUIScriptGeneration.Status.FAILED,
+                error_code='TRANSIENT_SERVICE_ERROR',
+                error_message='脚本生成任务暂时无法恢复，请稍后重试。',
+            )
+            publish_terminal(generation)
+            return Response({
+                'success': False,
+                'message': generation.error_message,
+                'data': WebUIScriptGenerationSerializer(generation).data,
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response({
+            'success': True,
+            'message': '补充信息已提交，正在继续生成。',
+            'data': WebUIScriptGenerationSerializer(generation).data,
+        }, status=status.HTTP_202_ACCEPTED)
 
 
 class WebUIScriptGenerationSaveView(APIView):

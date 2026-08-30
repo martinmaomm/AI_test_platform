@@ -2,19 +2,20 @@
   <section class="generation-card timeline-card">
     <div class="timeline-header"><div><h4>生成进度</h4><p>{{ generationStatusLabel(generation?.status) }}</p></div><div class="timeline-meta"><el-tag :type="statusTagType" effect="plain">{{ generation?.progress || 0 }}%</el-tag><span v-if="modelName">{{ modelName }}</span></div></div>
     <el-progress :percentage="Number(generation?.progress || 0)" :status="progressStatus" :stroke-width="8" />
-    <el-steps :active="activeIndex" :process-status="progressStatus" finish-status="success" align-center class="generation-steps"><el-step v-for="item in timeline" :key="item.stage" :title="item.label" :status="item.state" /></el-steps>
+    <el-steps :active="activeIndex" :process-status="stepProcessStatus" finish-status="success" align-center class="generation-steps"><el-step v-for="item in timeline" :key="item.stage" :title="item.label" :status="item.state" /></el-steps>
   </section>
 </template>
 
 <script setup>
 import { computed } from 'vue'
-import { buildGenerationTimeline, generationStatusLabel } from '@/composables/webUIScriptGenerationPresentation'
+import { buildGenerationTimeline, generationStatusLabel, isPausedGeneration } from '@/composables/webUIScriptGenerationPresentation'
 const props = defineProps({ generation: { type: Object, default: null } })
 const timeline = computed(() => buildGenerationTimeline(props.generation))
 const activeIndex = computed(() => Math.max(0, timeline.value.findIndex(item => item.state === 'process')))
 const modelName = computed(() => { const model = props.generation?.model_info || {}; return model.model_name ? `${model.provider || 'LLM'} · ${model.model_name}` : '' })
-const progressStatus = computed(() => props.generation?.status === 'failed' ? 'exception' : props.generation?.status === 'cancelled' ? 'warning' : '')
-const statusTagType = computed(() => props.generation?.status === 'failed' ? 'danger' : ['ready_with_warnings', 'needs_review'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'ready' ? 'success' : 'info')
+const progressStatus = computed(() => props.generation?.status === 'failed' ? 'exception' : props.generation?.status === 'cancelled' || isPausedGeneration(props.generation?.status) ? 'warning' : '')
+const stepProcessStatus = computed(() => props.generation?.status === 'failed' ? 'error' : 'process')
+const statusTagType = computed(() => props.generation?.status === 'failed' ? 'danger' : ['ready_with_warnings', 'needs_review'].includes(props.generation?.status) || isPausedGeneration(props.generation?.status) ? 'warning' : props.generation?.status === 'ready' ? 'success' : 'info')
 </script>
 
 <style scoped>

@@ -4,7 +4,8 @@
       <div><h4>生成结果</h4><p>{{ statusLabel }}</p></div>
       <div class="result-actions"><el-button v-if="canSave" type="success" :loading="saving" :disabled="Boolean(generation?.is_saved)" @click="requestSave">{{ generation?.is_saved ? '已保存到测试用例' : '保存到测试用例' }}</el-button><el-button v-if="generation?.is_saved" type="primary" plain @click="emit('open-test-case')">进入用例管理</el-button></div>
     </div>
-    <el-alert v-if="resolutionHint" :title="resolutionHint" :type="hintType" :closable="false" show-icon class="resolution-hint" />
+    <GenerationActionRequired v-if="paused" :generation="generation" :resolving="resolving" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
+    <el-alert v-else-if="resolutionHint" :title="resolutionHint" :type="hintType" :closable="false" show-icon class="resolution-hint" />
     <el-tabs v-model="activeTab">
       <el-tab-pane label="场景摘要" name="scenario"><GenerationScenarioSummary :scenario="generation?.scenario_spec" /></el-tab-pane>
       <el-tab-pane label="最终脚本" name="script"><div v-if="generation?.script_draft" class="script-pane"><div class="script-actions"><el-button size="small" @click="copyScript">复制脚本</el-button></div><MonacoEditor :value="generation.script_draft" language="python" theme="vs-dark" :read-only="true" height="460px" /></div><el-empty v-else description="尚未生成脚本" :image-size="70" /></el-tab-pane>
@@ -19,14 +20,16 @@
 import { computed, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MonacoEditor from '@/components/MonacoEditor.vue'
-import { generationResolutionHint, generationStatusLabel } from '@/composables/webUIScriptGenerationPresentation'
+import { generationResolutionHint, generationStatusLabel, isPausedGeneration } from '@/composables/webUIScriptGenerationPresentation'
 import GenerationScenarioSummary from './GenerationScenarioSummary.vue'
 import GenerationEvidence from './GenerationEvidence.vue'
 import GenerationQualityReport from './GenerationQualityReport.vue'
+import GenerationActionRequired from './GenerationActionRequired.vue'
 
-const props = defineProps({ generation: { type: Object, default: null }, saving: Boolean })
-const emit = defineEmits(['save', 'open-test-case'])
+const props = defineProps({ generation: { type: Object, default: null }, saving: Boolean, resolving: Boolean })
+const emit = defineEmits(['resolve', 'cancel', 'save', 'open-test-case'])
 const activeTab = ref('scenario')
+const paused = computed(() => isPausedGeneration(props.generation?.status))
 const statusLabel = computed(() => generationStatusLabel(props.generation?.status))
 const resolutionHint = computed(() => generationResolutionHint(props.generation))
 const hintType = computed(() => ['failed', 'needs_review', 'needs_confirmation', 'needs_credentials', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')

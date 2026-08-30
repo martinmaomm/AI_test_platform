@@ -13,12 +13,16 @@ from ai_core.webui_playwright_agent import _load_project_pom_context
 
 from .generation_contracts import (
     GenerationContractError,
+    ScenarioSpec,
+    is_terminal_status,
     merge_exploration_snapshots,
     validate_snapshot_against_scenario,
 )
 from .generation_events import publish_stage_changed, publish_terminal
 from .generation_preflight import run_safety_preflight
 from .generation_repository import (
+    MAX_GENERATION_RESUME_COUNT,
+    PAUSED_GENERATION_STATUSES,
     attach_celery_task,
     cancel_generation,
     get_generation_temporary_credentials,
@@ -32,6 +36,55 @@ from .script_generator import ScriptGenerator
 from .script_quality import blocker_issues, evaluate_script, has_missing_evidence
 
 logger = logging.getLogger(__name__)
+
+
+def _normalization_description(generation: WebUIScriptGeneration) -> str:
+    """Build model input from the safe description and persisted clarifications."""
+    sections = [generation.description_safe]
+    for item in generation.clarifications or []:
+        answers = item.get('answers') or []
+        if not answers:
+            continue
+        lines = ['用户补充确认：']
+        for answer in answers:
+            question = str(answer.get('question') or '').strip()
+            value = str(answer.get('answer') or '').strip()
+            if question and value:
+                lines.append(f'- {question}：{value}')
+        if len(lines) > 1:
+            sections.append('\n'.join(lines))
+    return '\n\n'.join(section for section in sections if section)
+
+
+def _pause_or_require_review(
+    generation: WebUIScriptGeneration,
+    target_status: str,
+    *,
+    progress: int,
+    error_code: str,
+    error_message: str,
+    warnings: list[str] | None = None,
+) -> WebUIScriptGeneration:
+    """Pause once, or stop an exhausted clarification loop for review."""
+    if target_status in PAUSED_GENERATION_STATUSES and generation.resume_count >= MAX_GENERATION_RESUME_COUNT:
+        reviewed = transition_generation(
+            generation.pk,
+            WebUIScriptGeneration.Status.NEEDS_REVIEW,
+            progress=progress,
+            error_code='RESUME_LIMIT_REACHED',
+            error_message='多次补充后仍无法安全确定场景，请人工检查描述后重新发起。',
+            updates={'warnings': warnings or []},
+        )
+        publish_terminal(reviewed)
+        return reviewed
+    return transition_generation(
+        generation.pk,
+        target_status,
+        progress=progress,
+        error_code=error_code,
+        error_message=error_message,
+        updates={'warnings': warnings or []},
+    )
 
 
 def _is_rate_limited_error(error: BaseException) -> bool:
@@ -141,46 +194,74 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
     if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
         return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
+    if generation.status in PAUSED_GENERATION_STATUSES or is_terminal_status(generation.status):
+        return {
+            'generation_id': str(generation.pk),
+            'status': generation.status,
+            'error_code': generation.error_code,
+        }
+
     try:
-        generation = transition_generation(
-            generation.pk,
+        if generation.status in {
+            WebUIScriptGeneration.Status.CREATED,
             WebUIScriptGeneration.Status.NORMALIZING,
-            progress=10,
-        )
-        publish_stage_changed(generation, '理解测试场景')
-        try:
-            scenario = normalize_requirement(
-                generation.description_safe,
-                generation.model_info['config_id'],
-                _test_case_context(generation),
-            )
-        except GenerationContractError:
+        }:
             generation = transition_generation(
                 generation.pk,
-                WebUIScriptGeneration.Status.NEEDS_INPUT,
-                error_code='SCENARIO_CONTRACT_INVALID',
-                error_message='场景描述缺少可验证的步骤、断言或清理信息，请补充后重试。',
+                WebUIScriptGeneration.Status.NORMALIZING,
+                progress=10,
             )
-            return {
-                'generation_id': str(generation.pk),
-                'status': generation.status,
-                'error_code': generation.error_code,
-            }
-        except Exception as exc:
-            error_code, message = _model_failure(exc)
-            return _safe_fail_generation(str(generation.pk), error_code, message)
-        if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-            return {'generation_id': str(generation.pk), 'status': 'cancelled'}
+            publish_stage_changed(generation, '理解测试场景')
+            try:
+                scenario = normalize_requirement(
+                    _normalization_description(generation),
+                    generation.model_info['config_id'],
+                    _test_case_context(generation),
+                )
+            except GenerationContractError:
+                generation = _pause_or_require_review(
+                    generation,
+                    WebUIScriptGeneration.Status.NEEDS_INPUT,
+                    progress=10,
+                    error_code='SCENARIO_CONTRACT_INVALID',
+                    error_message='场景描述缺少可验证的步骤、断言或清理信息，请补充后继续。',
+                )
+                return {
+                    'generation_id': str(generation.pk),
+                    'status': generation.status,
+                    'error_code': generation.error_code,
+                }
+            except Exception as exc:
+                error_code, message = _model_failure(exc)
+                return _safe_fail_generation(str(generation.pk), error_code, message)
+            if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
+                return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
-        generation = transition_generation(
-            generation.pk,
-            WebUIScriptGeneration.Status.PREFLIGHTING,
-            progress=25,
-            updates={
-                'scenario_spec': scenario.model_dump(mode='json'),
-                'credentials_required': scenario.credentials_required,
-            },
-        )
+            generation = transition_generation(
+                generation.pk,
+                WebUIScriptGeneration.Status.PREFLIGHTING,
+                progress=25,
+                updates={
+                    'scenario_spec': scenario.model_dump(mode='json'),
+                    'credentials_required': scenario.credentials_required,
+                },
+            )
+        elif generation.status == WebUIScriptGeneration.Status.PREFLIGHTING:
+            try:
+                scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
+            except Exception:
+                return _safe_fail_generation(
+                    str(generation.pk),
+                    'SCENARIO_CONTRACT_INVALID',
+                    '已保存的场景信息无法继续，请重新发起生成。',
+                )
+        else:
+            return _safe_fail_generation(
+                str(generation.pk),
+                'TRANSIENT_SERVICE_ERROR',
+                '当前生成阶段不能从暂停处理继续，请刷新后重试。',
+            )
+
         publish_stage_changed(generation, '检查风险与登录条件')
         credentials = get_generation_temporary_credentials(generation.pk)
         preflight = run_safety_preflight(
@@ -194,15 +275,15 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 'needs_credentials': WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
                 'failed': WebUIScriptGeneration.Status.FAILED,
             }[preflight.outcome]
-            generation = transition_generation(
-                generation.pk,
+            generation = _pause_or_require_review(
+                generation,
                 target_status,
                 progress=25,
                 error_code=preflight.error_code,
                 error_message=preflight.message,
-                updates={'warnings': preflight.warnings},
+                warnings=preflight.warnings,
             )
-            if target_status == WebUIScriptGeneration.Status.FAILED:
+            if generation.status == WebUIScriptGeneration.Status.FAILED:
                 publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': generation.error_code}
 

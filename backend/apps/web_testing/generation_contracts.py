@@ -140,10 +140,11 @@ class ScenarioSpec(_StrictContract):
     cleanup: list[ScenarioCleanup] = Field(default_factory=list, max_length=20)
     forbidden_actions: list[str] = Field(default_factory=list, max_length=30)
     credentials_required: bool = False
+    discovery_targets: list[str] = Field(default_factory=list, max_length=20)
     ambiguities: list[str] = Field(default_factory=list, max_length=20)
     risk_level: Literal['low', 'medium', 'high'] = 'low'
 
-    @field_validator('preconditions', 'forbidden_actions', 'ambiguities', mode='before')
+    @field_validator('preconditions', 'forbidden_actions', 'discovery_targets', 'ambiguities', mode='before')
     @classmethod
     def sanitize_text_list(cls, value):
         values = value or []
@@ -262,6 +263,7 @@ class ExplorationSnapshot(_StrictContract):
     navigation_paths: list[NavigationPath] = Field(default_factory=list, max_length=100)
     step_evidence: dict[str, StepEvidence] = Field(default_factory=dict)
     unresolved_steps: list[str] = Field(default_factory=list, max_length=30)
+    unresolved_questions: list[str] = Field(default_factory=list, max_length=20)
     warnings: list[str] = Field(default_factory=list, max_length=50)
     tool_stats: ExplorationToolStats
 
@@ -447,6 +449,7 @@ ALLOWED_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     }),
     WebUIScriptGeneration.Status.EXPLORING: frozenset({
         WebUIScriptGeneration.Status.GENERATING,
+        WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
         WebUIScriptGeneration.Status.NEEDS_REVIEW,
         WebUIScriptGeneration.Status.CANCELLED,
         WebUIScriptGeneration.Status.FAILED,

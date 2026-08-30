@@ -50,6 +50,38 @@ export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(sta
 export const isPausedGeneration = (status) => PAUSED_GENERATION_STATUSES.has(status)
 export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has(status)
 
+const GENERATION_FIELD_LABELS = {
+  description: '测试描述',
+  environment_id: 'WebUI 测试环境',
+  start_path: '起始相对路径',
+  model_config_id: '本次使用模型',
+  temporary_credentials: '本次探索登录信息',
+  source_mode: '生成来源',
+  test_case_id: '测试用例',
+  non_field_errors: '生成配置'
+}
+
+const collectErrorDetails = (value, field = '') => {
+  if (Array.isArray(value)) {
+    return value.flatMap(item => collectErrorDetails(item, field))
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value).flatMap(([key, item]) => collectErrorDetails(item, key))
+  }
+  if (value === null || value === undefined || value === '') return []
+  const label = GENERATION_FIELD_LABELS[field] || field
+  return [`${label ? `${label}：` : ''}${String(value)}`]
+}
+
+/** Prefer actionable field validation over Axios' generic HTTP error text. */
+export const generationApiErrorMessage = (error, fallback) => {
+  const body = error?.response?.data
+  const details = body?.error?.details ?? body?.errors
+  const detailMessages = collectErrorDetails(details)
+  if (detailMessages.length) return detailMessages.slice(0, 3).join('；')
+  return body?.message || body?.error?.message || error?.message || fallback
+}
+
 export const generationActionRequired = (generation) => {
   const status = generation?.status
   if (!isPausedGeneration(status)) return null
@@ -75,10 +107,17 @@ export const generationActionRequired = (generation) => {
       questions: [], primaryLabel: '重新分析并继续', remainingAttempts
     }
   }
+  if (errorCode === 'INPUT_AMBIGUOUS' && generation?.current_stage === 'preflighting') {
+    return {
+      kind: 'auto_explore', title: '这些信息可以通过页面探索补全',
+      description: '平台会先只读打开菜单和表单，自动确认字段、入口、路径与可见状态；只有探索后仍无法确定的业务问题才会再次询问。',
+      questions: [], primaryLabel: '继续自动探索', remainingAttempts
+    }
+  }
   if (errorCode === 'INPUT_AMBIGUOUS') {
     return {
-      kind: 'clarifications', title: `还需要确认 ${questions.length || 1} 项信息`,
-      description: generation?.error_message || '请逐项回答后继续生成。',
+      kind: 'clarifications', title: `探索后仍需确认 ${questions.length || 1} 项信息`,
+      description: generation?.error_message || '这些问题无法从页面证据确定，请逐项回答后继续生成。',
       questions: questions.length ? questions : ['请补充当前场景中无法安全确定的内容。'],
       primaryLabel: '提交答案并继续', remainingAttempts
     }

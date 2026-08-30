@@ -7,6 +7,7 @@ import {
   saveWebUIScriptGeneration
 } from '@/api/webTesting'
 import {
+  generationApiErrorMessage,
   generationStorageKey,
   isActiveGeneration,
   isPausedGeneration,
@@ -104,7 +105,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       } catch (error) {
         if (!isCurrentScope(requestScope, requestProjectId)) return null
         if ([403, 404].includes(error?.response?.status)) { clearStoredGeneration(); generation.value = null; stopPolling(); return null }
-        lastError.value = error?.response?.data?.message || error?.message || '读取生成记录失败'
+        lastError.value = generationApiErrorMessage(error, '读取生成记录失败')
         return null
       } finally {
         if (refreshPromise === request) {
@@ -144,7 +145,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       return applyGeneration(record)
     } catch (error) {
       if (!isCurrentScope(requestScope, requestProjectId)) return null
-      lastError.value = error?.response?.data?.message || error?.message || '创建生成任务失败'
+      lastError.value = generationApiErrorMessage(error, '创建生成任务失败')
       throw error
     } finally {
       if (isCurrentScope(requestScope, requestProjectId)) submitting.value = false
@@ -167,7 +168,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       return applyGeneration(record)
     } catch (error) {
       if (!isCurrentScope(requestScope, requestProjectId)) return null
-      lastError.value = error?.response?.data?.message || error?.message || '取消失败'
+      lastError.value = generationApiErrorMessage(error, '取消失败')
       throw error
     } finally {
       if (isCurrentScope(requestScope, requestProjectId)) cancelling.value = false
@@ -190,7 +191,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       return data
     } catch (error) {
       if (!isCurrentScope(requestScope, requestProjectId)) return null
-      lastError.value = error?.response?.data?.message || error?.message || '保存失败'
+      lastError.value = generationApiErrorMessage(error, '保存失败')
       throw error
     } finally {
       if (isCurrentScope(requestScope, requestProjectId)) saving.value = false
@@ -214,7 +215,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       if (!isCurrentScope(requestScope, requestProjectId)) return null
       const latest = error?.response?.data?.data
       if (latest?.id) applyGeneration(latest)
-      lastError.value = error?.response?.data?.message || error?.message || '提交补充信息失败'
+      lastError.value = generationApiErrorMessage(error, '提交补充信息失败')
       throw error
     } finally {
       if (isCurrentScope(requestScope, requestProjectId)) resolving.value = false

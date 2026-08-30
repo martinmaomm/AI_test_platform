@@ -33,7 +33,9 @@ EXPLORER_CONSTRAINTS = f"""你只负责只读页面探索，绝对不要生成 P
 允许打开页面、读取可见文本、打开菜单/Tab/查询条件/表单弹窗；如提供登录信息，只能用于本次登录。
 禁止提交新增、编辑、删除、审批、付款、发布、上传、下载等任何业务写操作。
 不得输出用户名、密码、Token、Cookie、HTML、截图 Base64 或完整 URL。
-最终只输出一个 JSON 对象，字段必须是 start_url_path、visited_paths、page_states、elements、navigation_paths、step_evidence、unresolved_steps、warnings、tool_stats。"""
+优先通过页面导航、打开菜单和打开表单解决 discovery_targets；不得因为探索前不知道字段、入口、提示或路径就要求用户回答。
+只有完成只读探索后仍无法从页面证据确定的问题，才写入 unresolved_questions。
+最终只输出一个 JSON 对象，字段必须是 start_url_path、visited_paths、page_states、elements、navigation_paths、step_evidence、unresolved_steps、unresolved_questions、warnings、tool_stats。"""
 
 _WRITE_ACTION_MARKERS = (
     '提交', '保存', '确认删除', '删除', '审批', '付款', '支付', '发布', '上传',
@@ -219,8 +221,13 @@ class MCPPageExplorer:
             'navigation_target_url': target_url_safe,
             'start_url_path': start_path,
             'scenario': scenario.model_dump(mode='json'),
+            'discovery_targets': list(dict.fromkeys([
+                *scenario.discovery_targets,
+                *scenario.ambiguities,
+            ])),
             'project_pom_candidates': self.pom_context,
             'login_context': login_context,
+            'instruction': '先自行探索并补齐页面可观察信息；只把探索后仍无法确定且必须由用户决策的问题放入 unresolved_questions。',
         }, ensure_ascii=False)
 
     def _build_supplemental_prompt(
@@ -245,6 +252,10 @@ class MCPPageExplorer:
             'start_url_path': start_path,
             'requested_step_ids': step_ids,
             'requested_steps': steps,
+            'discovery_targets': list(dict.fromkeys([
+                *scenario.discovery_targets,
+                *scenario.ambiguities,
+            ])),
             'project_pom_candidates': self.pom_context,
             'login_context': login_context,
             'instruction': '只补充 requested_step_ids 的页面证据；不要重新探索完整流程，不要执行写操作。',

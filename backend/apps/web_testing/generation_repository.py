@@ -162,9 +162,16 @@ def prepare_generation_resolution(
             source_status = generation.status
             source_error_code = generation.error_code
             previous_task_id = generation.celery_task_id
+            auto_explore_resume = (
+                source_status == WebUIScriptGeneration.Status.NEEDS_CONFIRMATION
+                and source_error_code == 'INPUT_AMBIGUOUS'
+                and generation.current_stage == WebUIScriptGeneration.Stage.PREFLIGHTING
+                and not clarification_answers
+                and description_safe is None
+            )
             target_status = (
                 WebUIScriptGeneration.Status.PREFLIGHTING
-                if source_status == WebUIScriptGeneration.Status.NEEDS_CREDENTIALS
+                if source_status == WebUIScriptGeneration.Status.NEEDS_CREDENTIALS or auto_explore_resume
                 else WebUIScriptGeneration.Status.NORMALIZING
             )
             validate_transition(source_status, target_status)

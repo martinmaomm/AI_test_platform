@@ -238,11 +238,12 @@ class GenerationPreflightTests(GenerationPipelineBase):
         self.assertEqual(result.outcome, 'needs_credentials')
         self.assertEqual(result.error_code, 'CREDENTIALS_REQUIRED')
 
-    def test_preflight_rejects_missing_mcp_model_and_ambiguity(self):
+    def test_preflight_checks_dependencies_but_sends_ambiguities_to_exploration(self):
         generation = self.make_generation()
         spec = ScenarioSpec.model_validate(scenario_payload(ambiguities=['无法确定保存按钮名称']))
         ambiguous = run_safety_preflight(generation, spec, credentials_available=False)
-        self.assertEqual(ambiguous.outcome, 'needs_confirmation')
+        self.assertEqual(ambiguous.outcome, 'continue')
+        self.assertIn('自动确认 1 项信息', ambiguous.warnings[-1])
 
         self.mcp.is_active = False
         self.mcp.save(update_fields=['is_active'])
@@ -315,8 +316,28 @@ class MCPPageExplorerTests(TestCase):
             ))
         self.assertIsInstance(snapshot, ExplorationSnapshot)
         self.assertEqual(snapshot.tool_stats.total_tool_calls, 0)
-        self.assertEqual(json.loads(FakeAgent.received_prompt)['navigation_target_url'], 'https://web.example.test/')
+        prompt = json.loads(FakeAgent.received_prompt)
+        self.assertEqual(prompt['navigation_target_url'], 'https://web.example.test/')
         self.assertNotIn('https://', json.dumps(snapshot.model_dump(mode='json')))
+
+    def test_explorer_receives_page_discovery_targets_instead_of_blocking_questions(self):
+        explorer = MCPPageExplorer(
+            llm_model=object(),
+            mcp_config={'mcpServers': {'playwright': {'command': 'npx'}}},
+            pom_context='无 POM',
+        )
+        scenario = ScenarioSpec.model_validate(scenario_payload(
+            discovery_targets=['打开新增表单并读取字段'],
+            ambiguities=['确认用户列表菜单路径'],
+        ))
+
+        prompt = json.loads(explorer._build_prompt(scenario, '/', 'https://web.example.test/', None))
+
+        self.assertEqual(
+            prompt['discovery_targets'],
+            ['打开新增表单并读取字段', '确认用户列表菜单路径'],
+        )
+        self.assertIn('先自行探索', prompt['instruction'])
 
     def test_raw_mcp_query_logging_is_suppressed(self):
         mcp_loggers = [logging.getLogger(name) for name in ('mcp_use', 'mcpagent')]
@@ -518,6 +539,45 @@ async def run(page):
         self.assertTrue(generation.exploration_snapshot)
         self.assertIn('async def run(page)', generation.script_draft)
         self.assertNotIn('https://', json.dumps(generation.exploration_snapshot))
+
+    def test_orchestrator_only_asks_questions_remaining_after_page_exploration(self):
+        generation = self.make_generation()
+        unresolved_question = '页面中存在两个同名用户模块，无法确定业务归属。'
+
+        class FakeExplorer:
+            def __init__(self, **kwargs):
+                pass
+
+            async def explore(self, **kwargs):
+                return ExplorationSnapshot.model_validate(snapshot_payload(
+                    unresolved_questions=[unresolved_question],
+                ))
+
+        class GeneratorMustNotRun:
+            def __init__(self, _model):
+                raise AssertionError('探索后仍有问题时不能生成脚本')
+
+        scenario = ScenarioSpec.model_validate(scenario_payload(
+            discovery_targets=['读取新增用户表单字段'],
+            ambiguities=['确认权限菜单路径'],
+        ))
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=scenario), patch(
+            'web_testing.generation_orchestrator.get_llm_manager',
+            return_value=SimpleNamespace(current_llm=object()),
+        ), patch(
+            'web_testing.generation_orchestrator._load_project_pom_context', return_value='POM'
+        ), patch(
+            'web_testing.generation_orchestrator.MCPPageExplorer', FakeExplorer
+        ), patch(
+            'web_testing.generation_orchestrator.ScriptGenerator', GeneratorMustNotRun
+        ), patch('web_testing.generation_orchestrator.publish_stage_changed'):
+            result = run_v2_generation(str(generation.pk), celery_task_id='post-exploration-question-task')
+
+        generation.refresh_from_db()
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_CONFIRMATION)
+        self.assertEqual(generation.current_stage, WebUIScriptGeneration.Stage.EXPLORING)
+        self.assertEqual(generation.scenario_spec['ambiguities'], [unresolved_question])
+        self.assertEqual(generation.exploration_snapshot['unresolved_questions'], [unresolved_question])
 
     def test_orchestrator_honours_cancel_before_model_or_mcp_work(self):
         generation = self.make_generation()

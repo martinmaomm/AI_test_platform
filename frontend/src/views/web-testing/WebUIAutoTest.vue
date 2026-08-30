@@ -6,7 +6,7 @@
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
     <div class="generation-layout">
-      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :model-configs="modelConfigs" :loading-environments="loadingEnvironments" :loading-models="loadingModels" :busy="isActive || submitting" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
+      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :model-configs="modelConfigs" :loading-environments="loadingEnvironments" :loading-models="loadingModels" :busy="isActive || submitting" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" :credential-clear-version="credentialClearVersion" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
         <GenerationResultPanel v-if="generation" :generation="generation" :saving="saving" :resolving="resolving" @resolve="handleResolve" @cancel="handleCancel" @save="handleSave" @open-test-case="router.push('/web-testing/test-cases')" />
@@ -42,6 +42,7 @@ const modelConfigs = ref([])
 const loadingEnvironments = ref(false)
 const loadingModels = ref(false)
 const isConnected = ref(false)
+const credentialClearVersion = ref(0)
 let websocketManager = null
 
 const { generation, submitting, saving, cancelling, resolving, lastError, isActive, isPaused, create, cancel, resolve: resolveGeneration, save, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
@@ -75,7 +76,7 @@ const initWebSocket = () => {
     onMessage: (event) => { try { handleWebSocketEvent(JSON.parse(event.data)) } catch { /* Ignore malformed notification. */ } }
   })
 }
-const handleCreate = async (payload) => { try { await create(payload); ElMessage.success('已创建生成记录，正在按阶段处理。') } catch { ElMessage.error(lastError.value || '创建生成任务失败') } }
+const handleCreate = async (payload) => { try { await create(payload); credentialClearVersion.value += 1; ElMessage.success('已创建生成记录，正在按阶段处理。') } catch { ElMessage.error(lastError.value || '创建生成任务失败') } }
 const handleCancel = async () => {
   try { await ElMessageBox.confirm('确定取消当前脚本生成吗？已保存的阶段结果仍可查看。', '取消生成', { type: 'warning', confirmButtonText: '取消生成', cancelButtonText: '继续等待' }); await cancel(); ElMessage.success('已请求取消生成任务') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '取消失败') }
 }

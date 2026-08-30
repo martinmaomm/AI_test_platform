@@ -123,6 +123,26 @@ def find_suspected_credentials(value: str) -> list[str]:
     return findings
 
 
+def extract_inline_login_credentials(value: str) -> dict[str, str] | None:
+    """Extract one complete login pair without persisting it with the description."""
+    if not value:
+        return None
+    matches = list(LOGIN_PAIR_RE.finditer(str(value)))
+    if not matches:
+        return None
+    pairs = [
+        {
+            'username': match.group('username').strip(),
+            'password': match.group('password').strip(),
+        }
+        for match in matches
+    ]
+    first = pairs[0]
+    if any(item != first for item in pairs[1:]):
+        raise GenerationInputSecurityError('测试描述中只能指定一组被测环境登录账号和密码')
+    return validate_temporary_credentials(first)
+
+
 def normalize_start_path(raw_value: str, base_url: str) -> str:
     """Accept a relative path or a full URL on the environment's exact origin."""
     if not raw_value:

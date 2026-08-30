@@ -17,6 +17,7 @@ from .generation_security import (
     GenerationInputSecurityError,
     build_safe_target_url,
     clear_temporary_credentials,
+    extract_inline_login_credentials,
     find_suspected_credentials,
     normalize_start_path,
     redact_text,
@@ -115,10 +116,22 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
         project = self.context['project']
         description = attrs['description']
         findings = find_suspected_credentials(description)
-        if findings:
+        unsupported_findings = set(findings) - {'login_pair'}
+        if unsupported_findings:
             raise serializers.ValidationError({
-                'description': '场景描述中疑似包含账号或密码，请改用 temporary_credentials 单独提交。'
+                'description': '场景描述中包含无法安全识别的密码、令牌或密钥，请仅使用“登录账号 用户名 密码”格式指定被测环境登录信息。'
             })
+        try:
+            inline_credentials = extract_inline_login_credentials(description)
+        except GenerationInputSecurityError as exc:
+            raise serializers.ValidationError({'description': str(exc)}) from exc
+        explicit_credentials = attrs.get('temporary_credentials')
+        if inline_credentials and explicit_credentials and inline_credentials != explicit_credentials:
+            raise serializers.ValidationError({
+                'temporary_credentials': '测试描述与登录信息输入框中的账号密码不一致，请只保留一组。'
+            })
+        if inline_credentials:
+            attrs['temporary_credentials'] = inline_credentials
 
         supplied_start = attrs.get('start_path')
         supplied_url = attrs.get('url')
@@ -266,10 +279,23 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
         answers = attrs.get('clarification_answers') or []
         credentials = attrs.get('temporary_credentials')
 
-        if description and find_suspected_credentials(description):
-            raise serializers.ValidationError({
-                'description': '修订描述中疑似包含账号或密码，请改用 temporary_credentials 单独提交。'
-            })
+        if description:
+            unsupported_findings = set(find_suspected_credentials(description)) - {'login_pair'}
+            if unsupported_findings:
+                raise serializers.ValidationError({
+                    'description': '修订描述中包含无法安全识别的密码、令牌或密钥，请仅使用“登录账号 用户名 密码”格式。'
+                })
+            try:
+                inline_credentials = extract_inline_login_credentials(description)
+            except GenerationInputSecurityError as exc:
+                raise serializers.ValidationError({'description': str(exc)}) from exc
+            if inline_credentials and credentials and inline_credentials != credentials:
+                raise serializers.ValidationError({
+                    'temporary_credentials': '修订描述与登录信息输入框中的账号密码不一致，请只保留一组。'
+                })
+            if inline_credentials:
+                attrs['temporary_credentials'] = inline_credentials
+                credentials = inline_credentials
         for index, item in enumerate(answers):
             if find_suspected_credentials(item['question']) or find_suspected_credentials(item['answer']):
                 raise serializers.ValidationError({
@@ -284,12 +310,17 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
                 raise serializers.ValidationError({'temporary_credentials': '请提供本次探索登录信息。'})
         elif generation.status == WebUIScriptGeneration.Status.NEEDS_CONFIRMATION:
             if generation.error_code == 'INPUT_AMBIGUOUS':
-                expected_questions = self._questions(generation)
-                submitted = {item['question']: item['answer'] for item in answers}
-                if len(submitted) != len(answers):
-                    raise serializers.ValidationError({'clarification_answers': '待确认项不能重复。'})
-                if set(submitted) != set(expected_questions):
-                    raise serializers.ValidationError({'clarification_answers': '请逐项回答当前全部待确认问题。'})
+                auto_explore = (
+                    generation.current_stage == WebUIScriptGeneration.Stage.PREFLIGHTING
+                    and not answers
+                )
+                if not auto_explore:
+                    expected_questions = self._questions(generation)
+                    submitted = {item['question']: item['answer'] for item in answers}
+                    if len(submitted) != len(answers):
+                        raise serializers.ValidationError({'clarification_answers': '待确认项不能重复。'})
+                    if set(submitted) != set(expected_questions):
+                        raise serializers.ValidationError({'clarification_answers': '请逐项回答页面探索后仍未解决的全部问题。'})
             else:
                 if not description:
                     raise serializers.ValidationError({'description': '请修订测试描述后继续。'})

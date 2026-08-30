@@ -64,16 +64,22 @@ def _pause_or_require_review(
     error_code: str,
     error_message: str,
     warnings: list[str] | None = None,
+    updates: dict[str, Any] | None = None,
 ) -> WebUIScriptGeneration:
     """Pause once, or stop an exhausted clarification loop for review."""
+    persisted_updates = {**(updates or {}), 'warnings': warnings or []}
     if target_status in PAUSED_GENERATION_STATUSES and generation.resume_count >= MAX_GENERATION_RESUME_COUNT:
+        review_updates = {
+            key: value for key, value in persisted_updates.items()
+            if key != 'current_stage'
+        }
         reviewed = transition_generation(
             generation.pk,
             WebUIScriptGeneration.Status.NEEDS_REVIEW,
             progress=progress,
             error_code='RESUME_LIMIT_REACHED',
             error_message='多次补充后仍无法安全确定场景，请人工检查描述后重新发起。',
-            updates={'warnings': warnings or []},
+            updates=review_updates,
         )
         publish_terminal(reviewed)
         return reviewed
@@ -83,7 +89,7 @@ def _pause_or_require_review(
         progress=progress,
         error_code=error_code,
         error_message=error_message,
-        updates={'warnings': warnings or []},
+        updates=persisted_updates,
     )
 
 
@@ -310,6 +316,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             generation.pk,
             WebUIScriptGeneration.Status.EXPLORING,
             progress=40,
+            updates={'warnings': list(preflight.warnings)},
         )
         publish_stage_changed(generation, '只读探索页面')
         explorer = MCPPageExplorer(
@@ -335,11 +342,40 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
         if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
+        unresolved_questions = list(dict.fromkeys(snapshot.unresolved_questions))
+        if unresolved_questions:
+            scenario = scenario.model_copy(update={'ambiguities': unresolved_questions})
+            generation = _pause_or_require_review(
+                generation,
+                WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+                progress=50,
+                error_code='INPUT_AMBIGUOUS',
+                error_message='页面已完成只读探索，但仍有少量业务信息无法从页面证据确定。',
+                warnings=unresolved_questions,
+                updates={
+                    'current_stage': WebUIScriptGeneration.Stage.EXPLORING,
+                    'scenario_spec': scenario.model_dump(mode='json'),
+                    'exploration_snapshot': snapshot.model_dump(mode='json'),
+                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
+                },
+            )
+            return {
+                'generation_id': str(generation.pk),
+                'status': generation.status,
+                'error_code': generation.error_code,
+            }
+
+        # Exploration has resolved every pre-exploration question.  Keep the
+        # discovery targets as evidence context, but do not leak stale prompts
+        # into script generation or the user-action panel.
+        scenario = scenario.model_copy(update={'ambiguities': []})
+
         generation = transition_generation(
             generation.pk,
             WebUIScriptGeneration.Status.GENERATING,
             progress=60,
             updates={
+                'scenario_spec': scenario.model_dump(mode='json'),
                 'exploration_snapshot': snapshot.model_dump(mode='json'),
                 'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
                 'warnings': list(generation.warnings),

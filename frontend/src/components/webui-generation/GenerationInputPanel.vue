@@ -61,7 +61,7 @@ const EXAMPLE_DESCRIPTION = `目标：验证“权限 > 用户列表”的新增
 - 探索阶段只查看页面和打开表单，不提交新增、编辑或删除；
 - 登录密码不得写入脚本、日志、截图或报告。`
 
-const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, loadingEnvironments: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean })
+const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, loadingEnvironments: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean, credentialClearVersion: { type: Number, default: 0 } })
 const emit = defineEmits(['submit', 'cancel'])
 const form = reactive({ environmentId: null, startPath: '/', description: '', username: '', password: '', modelConfigId: null })
 const selectedEnvironment = computed(() => props.environments.find(item => item.id === form.environmentId) || null)
@@ -71,6 +71,7 @@ const modelLabel = (model) => `${model.provider || 'LLM'} · ${model.model_name 
 watch(() => props.environments, (items) => { if (!items.some(item => item.id === form.environmentId)) form.environmentId = items[0]?.id || null }, { immediate: true, deep: true })
 watch(() => props.modelConfigs, (items) => { if (!items.some(item => item.id === form.modelConfigId)) form.modelConfigId = items[0]?.id || null }, { immediate: true, deep: true })
 watch(() => props.projectId, () => { form.environmentId = null; form.username = ''; form.password = '' })
+watch(() => props.credentialClearVersion, () => { form.username = ''; form.password = '' })
 const insertExample = () => { form.description = EXAMPLE_DESCRIPTION }
 const submit = () => {
   if (!form.startPath.startsWith('/')) return ElMessage.warning('起始路径必须以 / 开头，不能填写完整 URL。')
@@ -78,8 +79,6 @@ const submit = () => {
   if ((form.username && !form.password) || (!form.username && form.password)) return ElMessage.warning('如需登录探索，请同时填写用户名和密码。')
   const temporaryCredentials = form.username && form.password ? { username: form.username, password: form.password } : undefined
   emit('submit', { description: form.description.trim(), environment_id: Number(form.environmentId), start_path: form.startPath, model_config_id: Number(form.modelConfigId), ...(temporaryCredentials ? { temporary_credentials: temporaryCredentials } : {}) })
-  form.username = ''
-  form.password = ''
 }
 </script>
 

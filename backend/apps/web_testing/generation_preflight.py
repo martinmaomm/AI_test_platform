@@ -171,18 +171,14 @@ def run_safety_preflight(generation, scenario: ScenarioSpec, *, credentials_avai
             'EXPLORATION_WRITE_CONFIRMATION_REQUIRED',
             '描述要求探索阶段提交写操作，需要人工确认后才能继续。',
         )
-    if scenario.ambiguities:
-        return PreflightResult(
-            'needs_confirmation',
-            'INPUT_AMBIGUOUS',
-            '场景存在无法安全确定的内容，需要补充或确认。',
-            warnings=list(scenario.ambiguities),
-        )
-
     mcp_config_id, mcp_config = mcp_selection
+    discovery_count = len({*scenario.discovery_targets, *scenario.ambiguities})
+    warnings = ['探索阶段仅查看页面和打开表单，不会提交业务写操作。']
+    if discovery_count:
+        warnings.append(f'将通过页面探索自动确认 {discovery_count} 项信息。')
     return PreflightResult(
         'continue',
-        warnings=['探索阶段仅查看页面和打开表单，不会提交业务写操作。'],
+        warnings=warnings,
         mcp_config_id=mcp_config_id,
         mcp_config=mcp_config,
     )

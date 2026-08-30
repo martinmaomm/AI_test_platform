@@ -16,6 +16,7 @@ from .generation_repository import (
 )
 from .generation_security import (
     clear_temporary_credentials,
+    extract_inline_login_credentials,
     GenerationInputSecurityError,
     find_suspected_credentials,
     get_temporary_credentials,
@@ -150,6 +151,10 @@ class WebUIScriptGenerationSecurityTests(TestCase):
         self.assertNotIn('123456', redacted)
         self.assertNotIn('top-secret', redacted)
         self.assertEqual(find_suspected_credentials(description), ['secret_assignment', 'login_pair'])
+        self.assertEqual(
+            extract_inline_login_credentials('登录账号 admin 123456，然后查询列表。'),
+            {'username': 'admin', 'password': '123456'},
+        )
         self.assertEqual(find_suspected_credentials('登录后查询列表，密码字段应隐藏。'), [])
 
         url_description = '打开 https://web.example.test/login?token=super-secret 后登录。'
@@ -247,17 +252,24 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
         cancel_task_mock.assert_called_once_with('active-generation-task')
         self.assertFalse(cancel_task_mock.delay.called)
 
-    def test_create_rejects_inline_credentials_and_wrong_environment_scope(self):
-        inline = WebUIScriptGenerationCreateView.as_view()(
-            self.request('POST', '/script-generations/', {
-                'description': '登录账号 admin 123456，然后查询列表。',
-                'environment_id': self.environment.id,
-                'start_path': '/',
-            }),
-            project_id=self.project.id,
+    def test_create_extracts_inline_credentials_without_persisting_or_returning_them(self):
+        inline = self.create_generation(
+            description='登录账号 inline-user inline-secret-123，然后查询列表。',
         )
-        self.assertEqual(inline.status_code, 400)
-        self.assertIn('description', inline.data['error']['details'])
+        generation_id = inline.data['data']['id']
+        generation = WebUIScriptGeneration.objects.get(pk=generation_id)
+
+        self.assertTrue(inline.data['data']['credentials_provided'])
+        self.assertNotIn('inline-user', str(inline.data))
+        self.assertNotIn('inline-secret-123', str(inline.data))
+        self.assertNotIn('inline-user', generation.description_safe)
+        self.assertNotIn('inline-secret-123', generation.description_safe)
+        self.assertEqual(
+            get_temporary_credentials(generation_id),
+            {'username': 'inline-user', 'password': 'inline-secret-123'},
+        )
+
+    def test_create_rejects_wrong_environment_scope(self):
 
         other_project = Project.objects.create(
             name='Other generation project', project_type='web', owner=self.user, created_by=self.user
@@ -441,6 +453,32 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
         self.assertEqual(generation.clarifications[0]['answers'][1]['answer'], '使用原唯一名称加 _edited 后缀。')
         delay_mock.assert_called_once_with(str(generation.pk))
 
+    def test_pre_exploration_ambiguity_resumes_directly_without_manual_answers(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+            error_code='INPUT_AMBIGUOUS',
+            scenario_spec={'ambiguities': ['缺少新增表单字段', '缺少用户列表菜单路径']},
+        )
+        with patch(
+            'web_testing.views.generate_webui_script_generation_v2_task.delay',
+            return_value=type('TaskResult', (), {'id': 'v2-auto-explore-task-id'})(),
+        ) as delay_mock:
+            response = WebUIScriptGenerationResolveView.as_view()(
+                self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
+                    'expected_status': generation.status,
+                    'expected_revision': generation.revision,
+                }),
+                project_id=self.project.id,
+                generation_id=generation.pk,
+            )
+
+        self.assertEqual(response.status_code, 202, response.data)
+        generation.refresh_from_db()
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.PREFLIGHTING)
+        self.assertEqual(generation.current_stage, WebUIScriptGeneration.Stage.PREFLIGHTING)
+        self.assertEqual(generation.clarifications[-1]['answers'], [])
+        delay_mock.assert_called_once_with(str(generation.pk))
+
     def test_credentials_resolution_resumes_at_preflight_without_exposing_secret(self):
         generation = self.pause_generation(
             status=WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
@@ -455,7 +493,7 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
                 self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
                     'expected_status': generation.status,
                     'expected_revision': generation.revision,
-                    'temporary_credentials': {'username': 'admin', 'password': 'super-secret'},
+                    'description': '登录账号 admin super-secret，然后进入用户列表。',
                 }),
                 project_id=self.project.id,
                 generation_id=generation.pk,

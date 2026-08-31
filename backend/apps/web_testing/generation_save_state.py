@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 
@@ -21,4 +22,26 @@ def is_generation_saved(generation: Any) -> bool:
     except Exception:
         return False
     metadata = getattr(test_case, 'generation_metadata', None)
-    return isinstance(metadata, dict) and metadata.get('generation_ref') == generation_reference(generation)
+    if not isinstance(metadata, dict) or metadata.get('generation_ref') != generation_reference(generation):
+        return False
+    fingerprint = metadata.get('content_fingerprint')
+    if not fingerprint:
+        # Legacy clients omitted workspace revisions; do not let that bypass a new workspace lock.
+        return not getattr(generation, 'workspace', None) and int(getattr(generation, 'revision', 0) or 0) == 0
+    script = getattr(generation, 'script_draft', '') or ''
+    if fingerprint != hashlib.sha256(script.strip().encode('utf-8')).hexdigest():
+        return False
+    from .generation_workspace import normalize_workspace
+    workspace = normalize_workspace(getattr(generation, 'workspace', None), script=script)
+    if metadata.get('workspace_revision') != workspace.get('revision', 0):
+        return False
+    variables = workspace.get('variables', [])
+    variable_fingerprint = hashlib.sha256(
+        json.dumps(variables, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+    return (
+        metadata.get('variables_fingerprint') == variable_fingerprint
+        and metadata.get('variables_fingerprint') == hashlib.sha256(
+            json.dumps(getattr(test_case, 'variables', []) or [], ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        ).hexdigest()
+    )

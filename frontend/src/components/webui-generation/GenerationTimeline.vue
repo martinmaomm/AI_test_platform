@@ -1,6 +1,6 @@
 <template>
   <section class="generation-card timeline-card">
-    <div class="timeline-header"><div><h4>生成进度</h4><p>{{ generationStatusLabel(generation?.status) }}</p></div><div class="timeline-meta"><el-tag :type="statusTagType" effect="plain">{{ generation?.progress || 0 }}%</el-tag><span v-if="modelName">{{ modelName }}</span></div></div>
+    <div class="timeline-header"><div><h4>生成流程</h4><p>{{ generationStatusLabel(generation?.status) }}。流程阶段完成不代表脚本已实际调试通过。</p></div><div class="timeline-meta"><el-tag :type="statusTagType" effect="plain">{{ generation?.progress || 0 }}%</el-tag><span v-if="modelName">{{ modelName }}</span></div></div>
     <el-progress :percentage="Number(generation?.progress || 0)" :status="progressStatus" :stroke-width="8" />
     <el-steps :active="activeIndex" :process-status="stepProcessStatus" finish-status="success" align-center class="generation-steps"><el-step v-for="item in timeline" :key="item.stage" :title="item.label" :status="item.state" /></el-steps>
   </section>

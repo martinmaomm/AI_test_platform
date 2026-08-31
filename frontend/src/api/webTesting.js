@@ -59,6 +59,15 @@ export const cancelWebUIScriptGeneration = async (projectId, generationId) =>
 export const resolveWebUIScriptGeneration = async (projectId, generationId, data) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/resolve/`, data)).data
 
+export const updateWebUIScriptGenerationDraft = async (projectId, generationId, data) =>
+  (await api.patch(`${base(projectId)}/script-generations/${generationId}/draft/`, data)).data
+
+export const debugWebUIScriptGeneration = async (projectId, generationId, data) =>
+  (await api.post(`${base(projectId)}/script-generations/${generationId}/debug/`, data)).data
+
+export const repairWebUIScriptGeneration = async (projectId, generationId, data) =>
+  (await api.post(`${base(projectId)}/script-generations/${generationId}/repair/`, data)).data
+
 export const saveWebUIScriptGeneration = async (projectId, generationId, data = {}) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/save/`, data)).data
 

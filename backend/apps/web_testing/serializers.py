@@ -27,6 +27,7 @@ from .generation_security import (
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 from .execution_diagnostics import safe_screenshot_relative_path
 from .execution_variables import ExecutionVariableError, normalize_variable_definitions
+from .generation_workspace import workspace_for_response
 
 
 class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
@@ -38,9 +39,13 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
     module_id = serializers.IntegerField(read_only=True, allow_null=True)
     module_name = serializers.CharField(source='module.name', read_only=True, allow_null=True)
     is_saved = serializers.SerializerMethodField()
+    workspace = serializers.SerializerMethodField()
 
     def get_is_saved(self, obj):
         return is_generation_saved(obj)
+
+    def get_workspace(self, obj):
+        return workspace_for_response(obj)
 
     class Meta:
         model = WebUIScriptGeneration
@@ -50,6 +55,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'celery_task_id', 'status', 'current_stage', 'progress',
             'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
+            'workspace',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
             'revision', 'resume_count', 'clarifications',
             'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
@@ -61,6 +67,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'celery_task_id', 'status', 'current_stage', 'progress',
             'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
+            'workspace',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
             'revision', 'resume_count', 'clarifications',
             'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
@@ -198,11 +205,56 @@ class WebUIScriptGenerationSaveSerializer(serializers.Serializer):
     """Optional user-visible title for saving a quality-approved V2 draft."""
 
     title = serializers.CharField(max_length=200, required=False, allow_blank=False, trim_whitespace=True)
+    mode = serializers.ChoiceField(choices=['draft', 'verified'], required=False)
+    expected_revision = serializers.IntegerField(min_value=0, required=False)
 
     def validate_title(self, value):
         if find_suspected_credentials(value):
             raise serializers.ValidationError('标题不能包含账号、密码或密钥。')
         return redact_text(value)
+
+    def validate(self, attrs):
+        if attrs.get('mode') and 'expected_revision' not in attrs:
+            raise serializers.ValidationError({'expected_revision': '保存工作区脚本必须提供当前 revision。'})
+        return attrs
+
+
+class WebUIScriptGenerationDraftSerializer(serializers.Serializer):
+    script_draft = serializers.CharField(allow_blank=False, trim_whitespace=False, max_length=200000)
+    variables = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    expected_revision = serializers.IntegerField(min_value=0)
+
+    def validate_script_draft(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('草稿不能为空；可以保存尚未修正的代码。')
+        return value
+
+    def validate_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+
+class WebUIScriptGenerationDebugSerializer(serializers.Serializer):
+    expected_revision = serializers.IntegerField(min_value=0)
+    confirm_execution = serializers.BooleanField()
+    runtime_variables = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+    def validate_confirm_execution(self, value):
+        if value is not True:
+            raise serializers.ValidationError('调试会实际执行脚本，必须明确确认 confirm_execution=true。')
+        return value
+
+    def validate_runtime_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+
+class WebUIScriptGenerationRepairSerializer(serializers.Serializer):
+    expected_revision = serializers.IntegerField(min_value=0)
 
 
 class WebUIScriptGenerationClarificationAnswerSerializer(serializers.Serializer):
@@ -396,6 +448,7 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         has_script_content = 'test_script_content' in validated_data
         script_content = validated_data.pop('test_script_content', None)
+        variables_changed = 'variables' in validated_data and validated_data['variables'] != instance.variables
         if 'module' in validated_data and validated_data['module'] is None:
             validated_data['module'] = WebUITestModule.ensure_default(instance.project_id)
         module = validated_data.get('module')
@@ -411,6 +464,14 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
                 )
             except ScriptContractError as exc:
                 raise serializers.ValidationError({'test_script_content': str(exc)})
+        if variables_changed:
+            instance.last_execute_status = 'untested'
+            instance.last_execute_time = None
+            instance.last_error_message = ''
+            metadata = dict(instance.generation_metadata or {})
+            metadata.pop('verification', None)
+            instance.generation_metadata = metadata
+            instance.save(update_fields=['last_execute_status', 'last_execute_time', 'last_error_message', 'generation_metadata', 'updated_at'])
         return instance
 
 

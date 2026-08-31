@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, Callable
@@ -25,10 +26,12 @@ from .exploration_output import (
     parse_exploration_output,
 )
 from .generation_contracts import (
+    ExplorationToolStats,
     ExplorationSnapshot,
     GenerationContractError,
     parse_exploration_snapshot_json,
 )
+from .exploration_completion import assess_exploration_completion
 from .generation_preflight import (
     prepare_playwright_mcp_output_config,
     validate_generation_output_id,
@@ -48,7 +51,7 @@ EXPLORER_CONSTRAINTS = f"""你只负责只读页面探索，绝对不要生成 P
 不得输出用户名、密码、Token、Cookie、HTML、截图 Base64 或完整 URL。
 优先通过页面导航、打开菜单和打开表单解决 discovery_targets；不得因为探索前不知道字段、入口、提示或路径就要求用户回答。
 只有完成只读探索后仍无法从页面证据确定的问题，才写入 unresolved_questions。
-最终只输出一个 JSON 对象，字段必须是 start_url_path、visited_paths、page_states、elements、navigation_paths、step_evidence、unresolved_steps、unresolved_questions、warnings、tool_stats。"""
+最终只输出一个 JSON 对象，字段必须是 start_url_path、visited_paths、page_states、elements、navigation_paths、step_evidence、unresolved_steps、unresolved_questions、warnings；不要输出 tool_stats、checkpoints 或任何计数，这些仅由平台 callback 记录。"""
 
 _WRITE_ACTION_MARKERS = (
     '提交', '保存', '确认删除', '删除', '审批', '付款', '支付', '发布', '上传',
@@ -62,9 +65,36 @@ READ_ONLY_DISABLED_TOOL_MESSAGES = {
     'playwright_close': '只读探索不允许关闭浏览器。浏览器会话将在探索结束后由平台统一清理。',
 }
 
+EXPLORATION_TOTAL_MODEL_STEPS = MCP_MAX_STEPS
+
+
+def exploration_total_timeout_seconds() -> float:
+    """Use the established LLM timeout unless the WebUI override is configured."""
+    raw_value = (
+        os.getenv('WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS')
+        or os.getenv('AITS_LLM_TIMEOUT_SECONDS')
+        or '600'
+    )
+    try:
+        return float(min(1800, max(60, int(raw_value))))
+    except (TypeError, ValueError):
+        logger.warning('Invalid exploration timeout configuration; using 600 seconds.')
+        return 600.0
+
 
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
     """Keep legacy budgets while blocking definite business-write actions."""
+
+    def __init__(self, max_tool_calls: int = MCP_BROWSER_TOOL_CALL_LIMIT):
+        super().__init__(max_tool_calls)
+        self._safe_checkpoints: list[dict[str, Any]] = []
+        self.model_call_count = 0
+
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        # Count actual model invocations across both exploration rounds. The
+        # prompt never supplies this value and it is not derived from output.
+        with self._lock:
+            self.model_call_count += 1
 
     def on_tool_start(self, serialized, input_str, *, inputs=None, **kwargs):
         tool_name = str((serialized or {}).get('name') or '').strip().lower()
@@ -98,6 +128,32 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
                 )
         return super().on_tool_start(serialized, input_str, inputs=inputs, **kwargs)
 
+    def on_tool_end(self, output, *, run_id=None, **kwargs):
+        super().on_tool_end(output, run_id=run_id, **kwargs)
+        self._record_safe_checkpoint()
+
+    def on_tool_error(self, error, *, run_id=None, **kwargs):
+        super().on_tool_error(error, run_id=run_id, **kwargs)
+        self._record_safe_checkpoint()
+
+    def _record_safe_checkpoint(self):
+        """Persist only completed operation metadata, never input or output."""
+        stats = self.get_stats()
+        operation = stats.get('last_operation')
+        if not isinstance(operation, dict) or operation.get('status') not in {'succeeded', 'failed'}:
+            return
+        checkpoint = {
+            'tool_name': str(operation.get('tool_name') or 'browser_tool'),
+            'call_index': int(operation.get('call_index') or 0),
+            'status': str(operation['status']),
+        }
+        if checkpoint['call_index'] > 0 and checkpoint not in self._safe_checkpoints:
+            self._safe_checkpoints.append(checkpoint)
+
+    def safe_checkpoints(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._safe_checkpoints]
+
     @staticmethod
     def _read_only_input_text(inputs: Any, input_str: str) -> str:
         if isinstance(inputs, dict):
@@ -111,9 +167,17 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
 class MCPPageExplorerError(RuntimeError):
     """A safe explorer failure carrying failure-only tool statistics."""
 
-    def __init__(self, error_code: str, message: str, *, tool_stats: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        error_code: str,
+        message: str,
+        *,
+        tool_stats: dict[str, Any] | None = None,
+        snapshot: ExplorationSnapshot | None = None,
+    ):
         self.error_code = error_code
         self.tool_stats = dict(tool_stats or {})
+        self.snapshot = snapshot
         super().__init__(message)
 
 
@@ -148,6 +212,7 @@ class MCPPageExplorer:
         self.generation_id = generation_id
         self.output_generation_id = validate_generation_output_id(generation_id)
         self.guard = ReadOnlyMCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
+        self._active_start_path = '/'
 
     async def explore(
         self,
@@ -159,7 +224,7 @@ class MCPPageExplorer:
     ) -> ExplorationSnapshot:
         if self.cancel_check():
             raise self._failure('TASK_CANCELLED', '用户已取消任务。', 0)
-
+        self.guard = ReadOnlyMCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
         return await self._explore_with_prompt(
             self._build_prompt(scenario, start_path, target_url_safe, temporary_credentials),
             start_path,
@@ -187,34 +252,138 @@ class MCPPageExplorer:
             return existing_snapshot
         prompt = self._build_supplemental_prompt(
             scenario, start_path, target_url_safe, requested_steps, temporary_credentials,
+            existing_snapshot=existing_snapshot,
         )
+        self.guard = ReadOnlyMCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
         return await self._explore_with_prompt(prompt, start_path)
 
-    async def _explore_with_prompt(self, prompt: str, start_path: str) -> ExplorationSnapshot:
-        # The directed supplement has its own bounded budget.  It is invoked at
-        # most once by the orchestrator and never retries an MCP failure.
+    async def explore_until_complete(
+        self,
+        *,
+        scenario,
+        start_path: str,
+        target_url_safe: str,
+        temporary_credentials: dict[str, str] | None = None,
+    ) -> ExplorationSnapshot:
+        """Run primary plus at most one targeted supplement in one MCP session."""
+        if self.cancel_check():
+            raise self._failure('TASK_CANCELLED', '用户已取消任务。', 0)
         self.guard = ReadOnlyMCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT)
+        self._active_start_path = start_path
+        deadline = time.monotonic() + exploration_total_timeout_seconds()
         client = None
-        started_at = time.monotonic()
         try:
-            runtime_mcp_config = prepare_playwright_mcp_output_config(
-                self.mcp_config,
-                self.output_generation_id,
-            )
-            client = MCPClient.from_dict(runtime_mcp_config)
-            await client.create_all_sessions()
+            try:
+                async with asyncio.timeout_at(deadline):
+                    runtime_mcp_config = prepare_playwright_mcp_output_config(
+                        self.mcp_config, self.output_generation_id,
+                    )
+                    client = MCPClient.from_dict(runtime_mcp_config)
+                    await client.create_all_sessions()
+                    snapshot = await self._explore_with_prompt(
+                        self._build_prompt(scenario, start_path, target_url_safe, temporary_credentials),
+                        start_path,
+                        client=client,
+                        max_steps=EXPLORATION_TOTAL_MODEL_STEPS,
+                        deadline=deadline,
+                    )
+                    snapshot = assess_exploration_completion(scenario, snapshot)
+                    if snapshot.completion.status != 'needs_targeted_exploration':
+                        return snapshot
+                    remaining_model_calls = EXPLORATION_TOTAL_MODEL_STEPS - self.guard.model_call_count
+                    if (
+                        self.guard.get_stats()['total_tool_calls'] >= MCP_BROWSER_TOOL_CALL_LIMIT
+                        or time.monotonic() >= deadline
+                        or remaining_model_calls <= 0
+                    ):
+                        return assess_exploration_completion(
+                            scenario, snapshot, targeted_rounds=0, budget_exhausted=True,
+                        )
+                    requested_steps = [item.id for item in scenario.steps if item.id in snapshot.unresolved_steps]
+                    # A discovery-target-only gap has no unresolved step yet.
+                    # Revisit the known scenario steps in the same session so
+                    # the page can expose the target through its navigation.
+                    if not requested_steps:
+                        requested_steps = [item.id for item in scenario.steps]
+                    supplemental = await self._explore_with_prompt(
+                        self._build_supplemental_prompt(
+                            scenario, start_path, target_url_safe, requested_steps, temporary_credentials,
+                            existing_snapshot=snapshot,
+                        ),
+                        start_path,
+                        client=client,
+                        max_steps=remaining_model_calls,
+                        deadline=deadline,
+                    )
+                    supplemental = self._with_delta_tool_stats(
+                        supplemental,
+                        previous=snapshot.tool_stats,
+                    )
+                    from .generation_contracts import merge_exploration_snapshots
+                    snapshot = merge_exploration_snapshots(
+                        snapshot, supplemental, scenario=scenario, target_step_ids=set(requested_steps),
+                    )
+                    actual_budget_exhausted = (
+                        self.guard.get_stats()['total_tool_calls'] >= MCP_BROWSER_TOOL_CALL_LIMIT
+                        or self.guard.model_call_count >= EXPLORATION_TOTAL_MODEL_STEPS
+                        or time.monotonic() >= deadline
+                    )
+                    return assess_exploration_completion(
+                        scenario,
+                        snapshot,
+                        targeted_rounds=1,
+                        budget_exhausted=actual_budget_exhausted,
+                        supplement_round_limit_reached=not actual_budget_exhausted,
+                    )
+            except TimeoutError:
+                raise self._failure(
+                    'exploration_timeout', '只读探索已达到总时限，未继续重试。', 0,
+                ) from None
+        finally:
+            if client is not None:
+                try:
+                    # Cleanup is bounded independently from the exploration
+                    # deadline so an expired task budget cannot leak its
+                    # browser process/session.
+                    async with asyncio.timeout(10):
+                        await client.close_all_sessions()
+                except TimeoutError:
+                    logger.warning('V2 MCP 会话清理达到独立清理时限')
+                except Exception:
+                    logger.warning('V2 MCP 会话清理失败', exc_info=True)
+
+    async def _explore_with_prompt(
+        self,
+        prompt: str,
+        start_path: str,
+        *,
+        client=None,
+        max_steps: int = MCP_MAX_STEPS,
+        deadline: float | None = None,
+    ) -> ExplorationSnapshot:
+        """Run one bounded prompt, optionally in a caller-owned browser session."""
+        owns_client = client is None
+        started_at = time.monotonic()
+        self._active_start_path = start_path
+        try:
+            if client is None:
+                runtime_mcp_config = prepare_playwright_mcp_output_config(
+                    self.mcp_config, self.output_generation_id,
+                )
+                client = MCPClient.from_dict(runtime_mcp_config)
+                await client.create_all_sessions()
             agent = MCPAgent(
                 llm=self.llm_model,
                 client=client,
-                max_steps=MCP_MAX_STEPS,
+                max_steps=max(1, max_steps),
                 additional_instructions=EXPLORER_CONSTRAINTS,
                 disallowed_tools=list(READ_ONLY_DISABLED_TOOL_MESSAGES),
                 callbacks=[self.guard],
             )
             with suppress_mcp_raw_query_logs():
-                output = await self._run_with_cancel(agent, prompt)
+                output = await self._run_with_cancel(agent, prompt, deadline=deadline)
             return await self._parse_snapshot_with_repair(
-                output, start_path, time.monotonic() - started_at,
+                output, start_path, time.monotonic() - started_at, deadline=deadline,
             )
         except MCPPageExplorerError as exc:
             error = self._failure(exc.error_code, str(exc), time.monotonic() - started_at)
@@ -234,11 +403,34 @@ class MCPPageExplorer:
             self._log_failure(error)
             raise error from exc
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 try:
                     await client.close_all_sessions()
                 except Exception:
                     logger.warning('V2 MCP 会话清理失败', exc_info=True)
+
+    @staticmethod
+    def _with_delta_tool_stats(
+        snapshot: ExplorationSnapshot,
+        *,
+        previous: ExplorationToolStats,
+    ) -> ExplorationSnapshot:
+        """Convert same-session cumulative counters into one round's delta."""
+        current = snapshot.tool_stats
+        counts = {
+            name: max(0, count - previous.tool_counts.get(name, 0))
+            for name, count in current.tool_counts.items()
+        }
+        payload = snapshot.model_dump(mode='json')
+        payload['tool_stats'] = ExplorationToolStats(
+            total_tool_calls=max(0, current.total_tool_calls - previous.total_tool_calls),
+            tool_counts={name: count for name, count in counts.items() if count},
+            failed_tool_calls=max(0, current.failed_tool_calls - previous.failed_tool_calls),
+            termination_reason=current.termination_reason,
+            duration_seconds=current.duration_seconds,
+            model_calls=max(0, current.model_calls - previous.model_calls),
+        ).model_dump(mode='json')
+        return ExplorationSnapshot.model_validate(payload)
 
     def _failure(self, error_code: str, message: str, duration_seconds: float) -> MCPPageExplorerError:
         stats = self.guard.get_stats()
@@ -248,6 +440,7 @@ class MCPPageExplorer:
             'failed_tool_calls': stats['failed_tool_calls'],
             'termination_reason': stats['termination_reason'] or error_code,
             'duration_seconds': round(max(0, duration_seconds), 3),
+            'model_calls': self.guard.model_call_count,
         }
         if stats['last_operation'] is not None:
             safe_stats['last_operation'] = stats['last_operation']
@@ -255,7 +448,15 @@ class MCPPageExplorer:
             safe_stats['blocked_tool_calls'] = stats['blocked_tool_calls']
         if stats['last_blocked_operation'] is not None:
             safe_stats['last_blocked_operation'] = stats['last_blocked_operation']
-        return MCPPageExplorerError(error_code, message, tool_stats=safe_stats)
+        snapshot = ExplorationSnapshot.model_validate({
+            'start_url_path': self._active_start_path,
+            'tool_stats': {
+                key: safe_stats[key]
+                for key in ('total_tool_calls', 'tool_counts', 'failed_tool_calls', 'termination_reason', 'duration_seconds', 'model_calls')
+            },
+            'checkpoints': self.guard.safe_checkpoints(),
+        })
+        return MCPPageExplorerError(error_code, message, tool_stats=safe_stats, snapshot=snapshot)
 
     def _guard_failure(self, duration_seconds: float) -> MCPPageExplorerError | None:
         terminal_error = self.guard.terminal_error
@@ -277,7 +478,7 @@ class MCPPageExplorer:
         except (asyncio.CancelledError, Exception):
             pass
 
-    async def _run_with_cancel(self, agent, prompt: str) -> str:
+    async def _run_with_cancel(self, agent, prompt: str, *, deadline: float | None = None) -> str:
         run_task = asyncio.create_task(self._initialize_and_run(agent, prompt))
         started_at = time.monotonic()
         try:
@@ -292,6 +493,9 @@ class MCPPageExplorer:
                     if guard_failure is not None:
                         raise guard_failure
                     raise self._failure('TASK_CANCELLED', '用户已取消任务。', time.monotonic() - started_at)
+                if deadline is not None and time.monotonic() >= deadline:
+                    await self._cancel_and_await(run_task)
+                    raise self._failure('exploration_timeout', '只读探索已达到总时限，未继续重试。', time.monotonic() - started_at)
                 if run_task.done():
                     try:
                         output = await run_task
@@ -338,7 +542,7 @@ class MCPPageExplorer:
             'navigation_target_url': target_url_safe,
             'start_url_path': start_path,
             'scenario': scenario.model_dump(mode='json'),
-            'output_schema': ExplorationSnapshot.model_json_schema(),
+            'output_schema': self._model_output_schema(),
             'discovery_targets': list(dict.fromkeys([
                 *scenario.discovery_targets,
                 *scenario.ambiguities,
@@ -354,6 +558,8 @@ class MCPPageExplorer:
         target_url_safe: str,
         step_ids: list[str],
         credentials: dict[str, str] | None,
+        *,
+        existing_snapshot: ExplorationSnapshot | None = None,
     ) -> str:
         steps = [step.model_dump(mode='json') for step in scenario.steps if step.id in step_ids]
         login_context = '无临时登录信息；如页面要求登录，请仅记录未确认项。'
@@ -369,14 +575,35 @@ class MCPPageExplorer:
             'start_url_path': start_path,
             'requested_step_ids': step_ids,
             'requested_steps': steps,
-            'output_schema': ExplorationSnapshot.model_json_schema(),
+            'missing_targets': [
+                item.model_dump(mode='json')
+                for item in existing_snapshot.completion.missing_targets
+            ] if existing_snapshot else [],
+            'already_observed_pages': [
+                {'name': page.name, 'path': page.path, 'key_regions': page.key_regions}
+                for page in existing_snapshot.page_states
+            ] if existing_snapshot else [],
+            'output_schema': self._model_output_schema(),
             'discovery_targets': list(dict.fromkeys([
                 *scenario.discovery_targets,
                 *scenario.ambiguities,
             ])),
             'login_context': login_context,
-            'instruction': '只补充 requested_step_ids 的页面证据；不要重新探索完整流程，不要执行写操作。',
+            'instruction': '只补充 missing_targets 和 requested_step_ids 的页面证据；先观察当前浏览器页面，不要无故重新登录或重新探索完整流程。不要执行写操作。',
         }, ensure_ascii=False)
+
+    @staticmethod
+    def _model_output_schema() -> dict[str, Any]:
+        """Hide callback-owned fields so a model never fabricates counters."""
+        schema = ExplorationSnapshot.model_json_schema()
+        properties = schema.get('properties') or {}
+        for field in ('tool_stats', 'checkpoints'):
+            properties.pop(field, None)
+        schema['required'] = [
+            field for field in schema.get('required', [])
+            if field not in {'tool_stats', 'checkpoints'}
+        ]
+        return schema
 
     def _check_output_active(self, duration_seconds: float):
         guard_failure = self._guard_failure(duration_seconds)
@@ -416,7 +643,9 @@ class MCPPageExplorer:
             'failed_tool_calls': stats['failed_tool_calls'],
             'termination_reason': stats['termination_reason'],
             'duration_seconds': round(duration_seconds, 3),
+            'model_calls': self.guard.model_call_count,
         }
+        payload['checkpoints'] = self.guard.safe_checkpoints()
         try:
             return parse_exploration_snapshot_json(json.dumps(redact_exploration_metadata(payload), ensure_ascii=False))
         except GenerationContractError as exc:
@@ -461,7 +690,23 @@ class MCPPageExplorer:
         return snapshot
 
     async def _parse_snapshot_with_repair(
-        self, raw_output, start_path: str, duration_seconds: float,
+        self,
+        raw_output,
+        start_path: str,
+        duration_seconds: float,
+        *,
+        deadline: float | None = None,
     ) -> ExplorationSnapshot:
-        """Keep the async integration boundary; all format handling is now local."""
-        return self._parse_snapshot(raw_output, start_path, duration_seconds)
+        """Bound local format recovery by the same task-wide deadline."""
+        if deadline is None:
+            return self._parse_snapshot(raw_output, start_path, duration_seconds)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._failure('exploration_timeout', '只读探索已达到总时限，未继续重试。', duration_seconds)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._parse_snapshot, raw_output, start_path, duration_seconds),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise self._failure('exploration_timeout', '只读探索已达到总时限，未继续重试。', duration_seconds) from None

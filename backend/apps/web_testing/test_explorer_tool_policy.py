@@ -13,7 +13,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 from mcp_use.client.connectors.base import BaseConnector
 from pydantic import Field
 
-from .generation_contracts import ScenarioSpec
+from .generation_contracts import ExplorationSnapshot, ScenarioSpec
 from .mcp_page_explorer import (
     MCPPageExplorer,
     MCPPageExplorerError,
@@ -172,7 +172,7 @@ class ExplorerToolPolicyTests(SimpleTestCase):
             if supplemental:
                 return await explorer.explore_missing_evidence(
                     **kwargs,
-                    existing_snapshot=SimpleNamespace(unresolved_steps=['S1'], step_evidence={}),
+                    existing_snapshot=ExplorationSnapshot(start_url_path='/', unresolved_steps=['S1'], step_evidence={}, tool_stats={'total_tool_calls': 0}),
                 )
             return await explorer.explore(**kwargs)
 
@@ -238,8 +238,8 @@ class ExplorerToolPolicyTests(SimpleTestCase):
                     else:
                         asyncio.run(explorer.explore_missing_evidence(
                             scenario=scenario(),
-                            existing_snapshot=SimpleNamespace(
-                                unresolved_steps=['S1'], step_evidence={},
+                            existing_snapshot=ExplorationSnapshot(
+                                start_url_path='/', unresolved_steps=['S1'], step_evidence={}, tool_stats={'total_tool_calls': 0},
                             ),
                             start_path='/',
                             target_url_safe='https://example.invalid/',

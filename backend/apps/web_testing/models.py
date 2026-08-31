@@ -278,6 +278,7 @@ class WebUIScriptGeneration(models.Model):
     scenario_spec = models.JSONField(default=dict, blank=True, verbose_name='规范化场景')
     exploration_snapshot = models.JSONField(default=dict, blank=True, verbose_name='探索证据')
     script_draft = models.TextField(blank=True, default='', verbose_name='脚本草稿')
+    workspace = models.JSONField(default=dict, blank=True, verbose_name='编辑与调试工作区')
     quality_report = models.JSONField(default=dict, blank=True, verbose_name='质量报告')
     warnings = models.JSONField(default=list, blank=True, verbose_name='用户可见警告')
     model_info = models.JSONField(default=dict, blank=True, verbose_name='模型信息')

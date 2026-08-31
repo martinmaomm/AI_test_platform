@@ -40,7 +40,7 @@
 
     <div class="action-footer">
       <el-button :disabled="resolving" @click="emit('cancel')">放弃本次生成</el-button>
-      <el-button type="primary" :loading="resolving" :disabled="action.remainingAttempts <= 0" @click="submit">{{ action.primaryLabel }}</el-button>
+      <el-button v-if="action.primaryLabel" type="primary" :loading="resolving" :disabled="action.remainingAttempts <= 0" @click="submit">{{ action.primaryLabel }}</el-button>
     </div>
   </section>
 </template>

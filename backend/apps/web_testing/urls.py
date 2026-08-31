@@ -11,6 +11,9 @@ urlpatterns = [
     path('script-generations/<uuid:generation_id>/', views.WebUIScriptGenerationDetailView.as_view(), name='script-generation-detail'),
     path('script-generations/<uuid:generation_id>/cancel/', views.WebUIScriptGenerationCancelView.as_view(), name='script-generation-cancel'),
     path('script-generations/<uuid:generation_id>/resolve/', views.WebUIScriptGenerationResolveView.as_view(), name='script-generation-resolve'),
+    path('script-generations/<uuid:generation_id>/draft/', views.WebUIScriptGenerationDraftView.as_view(), name='script-generation-draft'),
+    path('script-generations/<uuid:generation_id>/debug/', views.WebUIScriptGenerationDebugView.as_view(), name='script-generation-debug'),
+    path('script-generations/<uuid:generation_id>/repair/', views.WebUIScriptGenerationRepairView.as_view(), name='script-generation-repair'),
     path('script-generations/<uuid:generation_id>/save/', views.WebUIScriptGenerationSaveView.as_view(), name='script-generation-save'),
 
     # App automation remains isolated from the Web UI flow.

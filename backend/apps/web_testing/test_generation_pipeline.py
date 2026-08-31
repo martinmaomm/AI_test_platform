@@ -75,10 +75,10 @@ def snapshot_payload(**overrides):
     payload = {
         'start_url_path': '/',
         'visited_paths': ['/'],
-        'page_states': [{'name': '首页', 'title': '首页', 'path': '/', 'key_regions': ['导航']}],
-        'elements': [{'page_name': '首页', 'role': 'link', 'visible_name': '权限', 'stable_attributes': {}, 'candidate_locators': ['get_by_text("权限")']}],
+        'page_states': [{'name': '权限菜单中的用户列表', 'title': '用户列表', 'path': '/', 'key_regions': ['用户列表']}],
+        'elements': [{'page_name': '权限菜单中的用户列表', 'role': 'heading', 'visible_name': '权限菜单中的用户列表', 'stable_attributes': {}, 'candidate_locators': ['get_by_role("heading", name="用户列表")']}],
         'navigation_paths': [],
-        'step_evidence': {'S1': {'status': 'confirmed', 'paths': ['/'], 'element_names': ['权限'], 'reason': '导航可见'}},
+        'step_evidence': {'S1': {'status': 'confirmed', 'paths': ['/'], 'element_names': ['权限菜单中的用户列表'], 'reason': '目标页面可见'}},
         'unresolved_steps': [], 'warnings': [],
         'tool_stats': {'total_tool_calls': 1, 'tool_counts': {'playwright_navigate': 1}, 'failed_tool_calls': 0, 'termination_reason': None, 'duration_seconds': 0.1},
     }
@@ -1015,8 +1015,7 @@ async def run(page):
                 raise AssertionError('探索后仍有问题时不能生成脚本')
 
         scenario = ScenarioSpec.model_validate(scenario_payload(
-            discovery_targets=['读取新增用户表单字段'],
-            ambiguities=['确认权限菜单路径'],
+            ambiguities=[unresolved_question],
         ))
         with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=scenario), patch(
             'web_testing.generation_orchestrator.get_llm_manager',

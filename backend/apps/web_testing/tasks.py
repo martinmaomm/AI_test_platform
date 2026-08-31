@@ -28,6 +28,8 @@ from .execution_diagnostics import friendly_failure_summary
 from .execution_variables import merge_execution_variables, pop_runtime_variables
 from .models import (
     MidSceneScript,
+    WebUIScriptGeneration,
+    WebUITestCaseExecutionDetail,
     WebUITestExecution,
     WebUITestSuiteCaseExecution,
 )
@@ -297,6 +299,186 @@ def _execute_webui_test_case_logic(
                 update_fields=['last_execute_status', 'last_execute_time', 'last_error_message']
             )
         return build_error_result(None, error_message)
+
+
+@shared_task(bind=True, name='web_testing.debug_webui_script_generation')
+def debug_webui_script_generation_task(
+    self,
+    generation_id: str,
+    execution_id: int,
+    locked_revision: int,
+    locked_hash: str,
+):
+    """Run an explicitly approved draft without creating a WebUITestCase."""
+    from .generation_workspace import (
+        base_url_fingerprint, environment_fingerprint, finish_debug, mark_debug_running, redact_runtime_values, script_hash,
+    )
+
+    execution = None
+    detail = None
+    runtime_variables = []
+    try:
+        generation = mark_debug_running(
+            generation_id, execution_id=execution_id,
+            locked_revision=locked_revision, locked_hash=locked_hash, task_id=self.request.id,
+        )
+        execution = WebUITestExecution.objects.select_related('environment').get(
+            pk=execution_id, exec_type='case', project_id=WebUIScriptGeneration.objects.get(pk=generation_id).project_id,
+        )
+        detail = execution.case_execution_detail
+        if generation is None:
+            return build_error_result(self.request.id, '调试任务重复或已过期，未再次执行。')
+
+        environment = Environment.objects.get(
+            id=generation.environment_id, project_id=generation.project_id,
+            category=Environment.EnvironmentCategory.WEB, is_active=True,
+        )
+        verification = (generation.workspace or {}).get('verification') or {}
+        if (
+            verification.get('environment_fingerprint') != environment_fingerprint(environment.config)
+            or verification.get('base_url_fingerprint') != base_url_fingerprint(environment.config)
+        ):
+            raise ValueError('调试环境配置已变化，过期调试任务未执行。')
+        base_url = ((environment.config or {}).get('base_url') or '').rstrip('/')
+        if not base_url:
+            raise ValueError('WebUI 测试环境缺少基础 URL')
+        script = (generation.script_draft or '').strip()
+        if script_hash(script) != locked_hash:
+            raise ValueError('草稿内容已变化，过期调试任务未执行')
+        from .script_contract import normalize_for_storage
+        normalize_for_storage(script)
+
+        execution.task_id = self.request.id
+        execution.status = 'running'
+        execution.error_message = ''
+        execution.browser = WEBUI_BROWSER_ENGINE
+        execution.start_time = timezone.now()
+        execution.save(update_fields=['task_id', 'status', 'error_message', 'browser', 'start_time', 'updated_at'])
+        detail.status = 'running'
+        detail.start_time = execution.start_time
+        detail.save(update_fields=['status', 'start_time'])
+        runtime_variables = pop_runtime_variables(execution.id)
+        if verification.get('runtime_variables_present') and not runtime_variables:
+            raise ValueError('一次性运行变量已过期，调试任务未执行。')
+        screenshot_absolute, screenshot_relative = _failure_screenshot_paths(execution.id, 'generation_draft.png')
+        result = _run_test_script(
+            script, base_url, {}, failure_screenshot_path=screenshot_absolute,
+            environment_variables=merge_execution_variables(
+                (environment.config or {}).get('variables') or {},
+                generation.workspace.get('variables') if isinstance(generation.workspace, dict) else [],
+                runtime_variables,
+            ),
+        )
+        result = redact_runtime_values(result, runtime_variables)
+        result_data = result.get('result') or {}
+        end_time = timezone.now()
+        succeeded = bool(result.get('success'))
+        error_message = '' if succeeded else friendly_failure_summary(
+            result_data.get('stdout', ''), result_data.get('stderr', ''), result.get('error', ''),
+        )
+        execution.status = 'passed' if succeeded else 'failed'
+        execution.error_message = error_message
+        execution.end_time = end_time
+        execution.duration = (end_time - execution.start_time).total_seconds()
+        execution.log_path = result_data.get('test_file') or ''
+        execution.report_path = result_data.get('allure_report') or ''
+        execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'log_path', 'report_path', 'updated_at'])
+        detail.status = execution.status
+        detail.end_time = end_time
+        detail.duration = execution.duration
+        detail.error_message = error_message or None
+        detail.log = _raw_execution_log(result_data)
+        persisted = _normalize_persisted_screenshot_path(execution.id, result_data.get('screenshot_path') or screenshot_relative)
+        if persisted and os.path.exists(os.path.join(str(settings.MEDIA_ROOT), persisted)):
+            detail.screenshot_path = persisted
+        detail.save()
+        finish_debug(
+            generation_id, execution_id=execution.id, locked_revision=locked_revision, locked_hash=locked_hash,
+            status='passed' if succeeded else 'failed',
+            diagnostics=[] if succeeded else [{'code': 'RUNTIME_FAILURE', 'message': error_message}],
+            task_id=self.request.id,
+        )
+        return {'success': succeeded, 'execution_id': execution.id, 'execution_status': execution.status}
+    except Exception as exc:
+        message = f'生成草稿调试失败: {redact_runtime_values(str(exc), runtime_variables)}'
+        logger.error('%s', message)
+        ended_at = timezone.now()
+        if execution is not None:
+            execution.status = 'error'
+            execution.error_message = message
+            execution.end_time = ended_at
+            execution.save(update_fields=['status', 'error_message', 'end_time', 'updated_at'])
+        if detail is not None:
+            detail.status = 'error'
+            detail.error_message = message
+            detail.end_time = ended_at
+            detail.save(update_fields=['status', 'error_message', 'end_time'])
+        try:
+            finish_debug(
+                generation_id, execution_id=execution_id, locked_revision=locked_revision, locked_hash=locked_hash,
+                status='error', diagnostics=[{'code': 'RUNTIME_FAILURE', 'message': message}],
+                task_id=self.request.id,
+            )
+        except Exception:
+            logger.warning('回填生成草稿调试失败状态失败: generation_id=%s', generation_id, exc_info=True)
+        return build_error_result(self.request.id, message)
+
+
+@shared_task(bind=True, name='web_testing.repair_webui_script_generation')
+def repair_webui_script_generation_task(self, generation_id: str, locked_revision: int, locked_hash: str):
+    """Generate a conservative candidate only; a user must review and debug it."""
+    from ai_core.model_manager import get_llm_manager
+    from .generation_contracts import ExplorationSnapshot, ScenarioSpec
+    from .generation_workspace import (
+        accept_repair_candidate, finish_repair_failure, mark_repair_running,
+    )
+    from .script_contract import ScriptContractError, normalize_for_storage
+    from .script_generator import ScriptGenerator
+    from .script_quality import blocker_issues, evaluate_script
+    from .script_repair_policy import validate_targeted_repair
+
+    generation = mark_repair_running(generation_id, locked_revision=locked_revision, locked_hash=locked_hash, task_id=self.request.id)
+    if generation is None:
+        return build_error_result(self.request.id, '草稿已变化，过期修复任务未执行。')
+    try:
+        workspace = generation.workspace if isinstance(generation.workspace, dict) else {}
+        verification = workspace.get('verification') if isinstance(workspace.get('verification'), dict) else {}
+        issues = verification.get('diagnostics') or []
+        if not issues:
+            raise ValueError('缺少运行失败诊断，需要人工补充证据或重新调试。')
+        scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
+        snapshot = ExplorationSnapshot.model_validate(generation.exploration_snapshot or {})
+        manager = get_llm_manager(config_id=(generation.model_info or {}).get('config_id'))
+        candidate = ScriptGenerator(manager.current_llm).repair(
+            script=generation.script_draft, issues=issues, scenario=scenario, snapshot=snapshot,
+        )
+        try:
+            normalize_for_storage(candidate)
+        except ScriptContractError as exc:
+            raise ValueError(f'修复候选未通过脚本契约：{exc}') from exc
+        report = evaluate_script(candidate, scenario=scenario, snapshot=snapshot)
+        quality_blockers = blocker_issues(report)
+        policy_blockers = validate_targeted_repair(generation.script_draft, candidate, snapshot)
+        blockers = [*quality_blockers, *policy_blockers]
+        if blockers:
+            finish_repair_failure(
+                generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
+                message='修复候选未通过静态或保守变更检查，已保留原稿。', blockers=blockers, task_id=self.request.id,
+            )
+            return {'success': False, 'generation_id': generation_id, 'blockers': blockers}
+        if not accept_repair_candidate(
+            generation_id, locked_revision=locked_revision, locked_hash=locked_hash, candidate_script=candidate, task_id=self.request.id,
+        ):
+            return build_error_result(self.request.id, '草稿已变化，修复候选未写入。')
+        return {'success': True, 'generation_id': generation_id, 'status': 'ready_for_review'}
+    except Exception as exc:
+        logger.error('生成草稿修复失败: generation_id=%s', generation_id)
+        finish_repair_failure(
+            generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
+            message='修复服务未能生成可安全接受的候选，请人工审核或补充探索。', task_id=self.request.id,
+            blockers=[{'severity': 'blocker', 'code': 'REPAIR_EVIDENCE_INSUFFICIENT', 'message': '修复证据不足或候选不可安全接受，请人工审核或补充探索。'}],
+        )
+        return build_error_result(self.request.id, '生成草稿修复失败，请人工审核或补充探索证据。')
 
 
 @shared_task(bind=True, name='web_testing.generate_midscene_script')

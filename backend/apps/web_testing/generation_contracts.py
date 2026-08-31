@@ -401,6 +401,43 @@ class ExplorationToolStats(_StrictContract):
     failed_tool_calls: int = Field(default=0, ge=0)
     termination_reason: str | None = Field(default=None, max_length=100)
     duration_seconds: float = Field(default=0, ge=0)
+    model_calls: int = Field(default=0, ge=0)
+
+
+class ExplorationCheckpoint(_StrictContract):
+    """A persistable, content-free record of one completed browser operation."""
+
+    tool_name: str = Field(pattern=r'^(?:playwright_[a-z0-9_]+|browser_console_logs)$')
+    call_index: int = Field(ge=1)
+    status: Literal['succeeded', 'failed']
+
+
+class ExplorationMissingTarget(_StrictContract):
+    """A structured reason why exploration cannot yet allow script generation."""
+
+    target: str = Field(min_length=1, max_length=300)
+    kind: Literal['observable', 'business_decision', 'permission_scope', 'data_scope']
+    step_ids: list[str] = Field(default_factory=list, max_length=30)
+    reason: str = Field(default='', max_length=500)
+    user_question: str = Field(default='', max_length=500)
+
+    @field_validator('step_ids')
+    @classmethod
+    def verify_step_ids(cls, value):
+        if any(not re.fullmatch(r'S[1-9][0-9]*', item) for item in value):
+            raise ValueError('missing target 的步骤 ID 必须是 ScenarioSpec 步骤 ID')
+        return value
+
+
+class ExplorationCompletion(_StrictContract):
+    """Additive completion state. It is recomputed from evidence before use."""
+
+    status: Literal['complete', 'needs_targeted_exploration', 'needs_user_decision', 'blocked'] = 'needs_targeted_exploration'
+    missing_targets: list[ExplorationMissingTarget] = Field(default_factory=list, max_length=50)
+    user_questions: list[str] = Field(default_factory=list, max_length=20)
+    targeted_rounds: int = Field(default=0, ge=0, le=3)
+    budget_exhausted: bool = False
+    supplement_round_limit_reached: bool = False
 
 
 class ExplorationSnapshot(_StrictContract):
@@ -414,6 +451,8 @@ class ExplorationSnapshot(_StrictContract):
     unresolved_questions: list[str] = Field(default_factory=list, max_length=20)
     warnings: list[str] = Field(default_factory=list, max_length=50)
     tool_stats: ExplorationToolStats
+    checkpoints: list[ExplorationCheckpoint] = Field(default_factory=list, max_length=100)
+    completion: ExplorationCompletion = Field(default_factory=ExplorationCompletion)
 
     @field_validator('visited_paths')
     @classmethod
@@ -482,7 +521,7 @@ def merge_exploration_snapshots(
         raise GenerationContractError('定向补充探索包含无效步骤')
     payload = current.model_dump(mode='json')
     supplement = supplemental.model_dump(mode='json')
-    for name in ('visited_paths', 'page_states', 'elements', 'navigation_paths', 'warnings'):
+    for name in ('visited_paths', 'page_states', 'elements', 'navigation_paths', 'warnings', 'checkpoints'):
         seen: set[str] = set()
         merged = []
         for item in [*payload.get(name, []), *supplement.get(name, [])]:
@@ -501,6 +540,14 @@ def merge_exploration_snapshots(
         step_id for step_id, item in evidence.items()
         if item.get('status') == 'unresolved'
     )
+    # Completion and page questions are per-round assessments. Retaining an
+    # observable gap from the first round would make successful supplements
+    # permanently fail the pre-generation gate.
+    payload['completion'] = supplement.get('completion') or {}
+    payload['unresolved_questions'] = list(dict.fromkeys([
+        question for question in payload.get('unresolved_questions') or []
+        if question in scenario.ambiguities
+    ] + list(supplement.get('unresolved_questions') or [])))
     previous_stats = payload.get('tool_stats') or {}
     extra_stats = supplement.get('tool_stats') or {}
     counts = dict(previous_stats.get('tool_counts') or {})
@@ -512,6 +559,7 @@ def merge_exploration_snapshots(
         'failed_tool_calls': int(previous_stats.get('failed_tool_calls', 0)) + int(extra_stats.get('failed_tool_calls', 0)),
         'termination_reason': extra_stats.get('termination_reason') or previous_stats.get('termination_reason'),
         'duration_seconds': float(previous_stats.get('duration_seconds', 0)) + float(extra_stats.get('duration_seconds', 0)),
+        'model_calls': int(previous_stats.get('model_calls', 0)) + int(extra_stats.get('model_calls', 0)),
     }
     result = ExplorationSnapshot.model_validate(payload)
     validate_snapshot_against_scenario(scenario, result)

@@ -29,7 +29,11 @@ GENERATOR_SYSTEM_PROMPT = """你是 Python Playwright 异步测试脚本生成�
 
 REPAIR_SYSTEM_PROMPT = """你是 Python Playwright 脚本静态修复器。只修复给定质量问题，不能调用 MCP 或浏览器，
 不得新增未提供的页面事实、定位器、业务字段或敏感值。只输出完整 Python 源码。仍必须保留 async def run(page)、
-模块 docstring、步骤/断言/清理中文注释、相对 URL 和环境变量凭据读取。"""
+模块 docstring、步骤/断言/清理中文注释、相对 URL 和环境变量凭据读取。
+运行失败不代表原断言错误：禁止删除或弱化断言、修改预期值、吞掉异常、跳过步骤、扩大数据操作范围，或删除 finally 清理。
+定位问题只能使用已提供证据中的定位器；缺少证据时保留原稿，不得编造替代定位器。业务结果不符、账号错误、
+环境不可达、运行变量缺失不能通过改写测试目标修复。修复稿仍需用户检查并主动调试，不能宣称已运行通过。
+当问题 code 为 RUNTIME_FAILURE 时仅允许补充必要标准库 import、注释和有证据的定位器；不得改写控制流或业务参数。"""
 
 
 def _response_text(value: Any) -> str:

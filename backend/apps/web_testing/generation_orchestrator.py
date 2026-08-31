@@ -14,9 +14,9 @@ from .generation_contracts import (
     GenerationContractError,
     ScenarioSpec,
     is_terminal_status,
-    merge_exploration_snapshots,
     validate_snapshot_against_scenario,
 )
+from .exploration_completion import assess_exploration_completion, can_request_user_decision
 from .generation_events import publish_stage_changed, publish_terminal
 from .generation_preflight import run_safety_preflight
 from .generation_repository import (
@@ -32,7 +32,7 @@ from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 from .models import WebUIScriptGeneration
 from .requirement_normalizer import normalize_requirement
 from .script_generator import ScriptGenerator
-from .script_quality import blocker_issues, evaluate_script, has_missing_evidence
+from .script_quality import blocker_issues, evaluate_script
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +148,13 @@ def _test_case_context(generation) -> dict[str, Any] | None:
     test_case = generation.test_case
     if test_case is None:
         return None
+    # WebUITestCase is now an independent-script model. Do not read the
+    # removed structured-step fields when regenerating from an existing case.
     return {
         'title': test_case.title,
         'description': test_case.description,
-        'steps': test_case.steps_list,
-        'expected_result': test_case.expected_result,
+        'script_version': int(getattr(test_case, 'script_version', 0) or 0),
+        'has_script': bool(getattr(test_case, 'test_script_content', '') or ''),
     }
 
 
@@ -167,6 +169,7 @@ def _terminal_cancel_if_requested(generation_id: str, task_id: str | None):
 def _map_explorer_error(error: MCPPageExplorerError) -> tuple[str, str]:
     mappings = {
         'browser': 'BROWSER_UNAVAILABLE',
+        'tool_parameter': 'MCP_CONFIGURATION_INVALID',
         'tool_budget': 'EXPLORATION_LIMIT_REACHED',
         'repeated_interaction': 'REPEATED_INTERACTION',
         'interaction_failure': 'LOCATOR_FAILURE_LIMIT',
@@ -178,6 +181,8 @@ def _map_explorer_error(error: MCPPageExplorerError) -> tuple[str, str]:
         'EVIDENCE_INSUFFICIENT': 'EVIDENCE_INSUFFICIENT',
         'SCRIPT_FORMAT_INVALID': 'EVIDENCE_INSUFFICIENT',
         'read_only_violation': 'EXPLORATION_WRITE_BLOCKED',
+        'exploration_timeout': 'EXPLORATION_TIMEOUT',
+        'permission': 'EXPLORATION_PERMISSION_DENIED',
     }
     return mappings.get(error.error_code, 'TRANSIENT_SERVICE_ERROR'), str(error)
 
@@ -202,6 +207,7 @@ def _merge_explorer_failure_stats(
         'duration_seconds': round(
             float(previous.get('duration_seconds', 0)) + float(extra.get('duration_seconds', 0)), 3,
         ),
+        'model_calls': int(previous.get('model_calls', 0)) + int(extra.get('model_calls', 0)),
     }
     # These are failure-only summaries from MCPPageExplorerError; never copy
     # tool input, selector, output text, URL, or credential-bearing metadata.
@@ -237,9 +243,15 @@ def _cancel_with_explorer_stats(
 ) -> WebUIScriptGeneration:
     generation = cancel_generation(generation_id)
     stats = _merge_explorer_failure_stats(previous_stats or generation.tool_stats, failure)
+    updates = []
     if stats and generation.tool_stats != stats:
         generation.tool_stats = stats
-        generation.save(update_fields=['tool_stats', 'updated_at'])
+        updates.append('tool_stats')
+    if failure.snapshot is not None:
+        generation.exploration_snapshot = failure.snapshot.model_dump(mode='json')
+        updates.append('exploration_snapshot')
+    if updates:
+        generation.save(update_fields=[*updates, 'updated_at'])
     return generation
 
 
@@ -397,12 +409,18 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             cancel_check=lambda: bool(celery_task_id and cache.get(f'celery:cancel:{celery_task_id}')),
             generation_id=str(generation.pk),
         )
-        snapshot = asyncio.run(explorer.explore(
+        explore_until_complete = getattr(explorer, 'explore_until_complete', None)
+        if explore_until_complete is None:
+            # Keep the historical explorer interface compatible with callers
+            # that have not yet implemented the same-session method.
+            explore_until_complete = explorer.explore
+        snapshot = asyncio.run(explore_until_complete(
             scenario=scenario,
             start_path=generation.start_path,
             target_url_safe=generation.target_url_safe,
             temporary_credentials=explorer_credentials,
         ))
+        snapshot = assess_exploration_completion(scenario, snapshot)
         try:
             validate_snapshot_against_scenario(scenario, snapshot)
         except GenerationContractError:
@@ -419,8 +437,8 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
-        unresolved_questions = list(dict.fromkeys(snapshot.unresolved_questions))
-        if unresolved_questions:
+        if can_request_user_decision(snapshot):
+            unresolved_questions = snapshot.completion.user_questions
             scenario = scenario.model_copy(update={'ambiguities': unresolved_questions})
             generation = _pause_or_require_review(
                 generation,
@@ -441,6 +459,26 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 'status': generation.status,
                 'error_code': generation.error_code,
             }
+
+        if snapshot.completion.status != 'complete':
+            error_code = (
+                'EXPLORATION_LIMIT_REACHED'
+                if snapshot.completion.budget_exhausted
+                else 'EVIDENCE_INSUFFICIENT'
+            )
+            return _safe_fail_generation(
+                str(generation.pk),
+                error_code,
+                '页面可观察目标未完成，未生成脚本；请缩短范围或检查页面访问权限。',
+                updates={
+                    'exploration_snapshot': snapshot.model_dump(mode='json'),
+                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
+                    'warnings': [
+                        item.target for item in snapshot.completion.missing_targets
+                        if item.kind == 'observable'
+                    ],
+                },
+            )
 
         # Exploration has resolved every pre-exploration question.  Keep the
         # discovery targets as evidence context, but do not leak stale prompts
@@ -477,79 +515,9 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
         publish_stage_changed(generation, '检查脚本质量')
         report = evaluate_script(script, scenario=scenario, snapshot=snapshot)
 
-        # A supplement is allowed only for a deterministic MISSING_EVIDENCE gate
-        # result.  It is intentionally one-shot and never used to retry MCP
-        # login, repeated interaction, tool-budget or browser errors.
-        supplement_attempted = False
-        if has_missing_evidence(report):
-            supplement_attempted = True
-            if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-                return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-            try:
-                supplemental_snapshot = asyncio.run(explorer.explore_missing_evidence(
-                    scenario=scenario,
-                    existing_snapshot=snapshot,
-                    start_path=generation.start_path,
-                    target_url_safe=generation.target_url_safe,
-                    temporary_credentials=explorer_credentials,
-                ))
-                target_ids = set(snapshot.unresolved_steps) or {
-                    step.id for step in scenario.steps if step.id not in snapshot.step_evidence
-                }
-                snapshot = merge_exploration_snapshots(
-                    snapshot,
-                    supplemental_snapshot,
-                    scenario=scenario,
-                    target_step_ids=target_ids,
-                )
-            except (MCPPageExplorerError, GenerationContractError) as exc:
-                if isinstance(exc, MCPPageExplorerError):
-                    code, message = _map_explorer_error(exc)
-                else:
-                    code, message = 'EVIDENCE_INSUFFICIENT', '定向补充页面证据未成功，请人工检查后再保存。'
-                if code == 'TASK_CANCELLED':
-                    generation = _cancel_with_explorer_stats(
-                        generation.pk,
-                        exc,
-                        previous_stats=snapshot.tool_stats.model_dump(mode='json'),
-                    )
-                    publish_terminal(generation)
-                    return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-                generation = transition_generation(
-                    generation.pk,
-                    WebUIScriptGeneration.Status.NEEDS_REVIEW,
-                    progress=85,
-                    error_code=code,
-                    error_message=message,
-                    updates={
-                        'script_draft': script,
-                        'quality_report': report,
-                        'tool_stats': _merge_explorer_failure_stats(
-                            snapshot.tool_stats.model_dump(mode='json'), exc,
-                        ),
-                        'warnings': [*list(generation.warnings), '定向补充探索未完成，未进行重复探索。'],
-                    },
-                )
-                publish_terminal(generation)
-                return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': code}
-            if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-                return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-            try:
-                script = generator.generate(scenario=scenario, snapshot=snapshot)
-            except Exception as exc:
-                error_code, message = _model_failure(exc)
-                return _safe_fail_generation(str(generation.pk), error_code, message)
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.VALIDATING,
-                progress=78,
-                updates={
-                    'exploration_snapshot': snapshot.model_dump(mode='json'),
-                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                    'script_draft': script,
-                },
-            )
-            report = evaluate_script(script, scenario=scenario, snapshot=snapshot)
+        # Exploration completion is a pre-generation gate. Quality validation
+        # must never reopen a browser session or compensate for missing evidence.
+        supplement_attempted = snapshot.completion.targeted_rounds > 0
 
         repair_count = 0
         while blocker_issues(report) and repair_count < 2:
@@ -615,10 +583,10 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             generation = _cancel_with_explorer_stats(generation.pk, exc)
             publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-        return _safe_fail_generation(
-            str(generation.pk), code, message,
-            updates={'tool_stats': _merge_explorer_failure_stats(generation.tool_stats, exc)},
-        )
+        updates = {'tool_stats': _merge_explorer_failure_stats(generation.tool_stats, exc)}
+        if exc.snapshot is not None:
+            updates['exploration_snapshot'] = exc.snapshot.model_dump(mode='json')
+        return _safe_fail_generation(str(generation.pk), code, message, updates=updates)
     except Exception:
         logger.error(
             'WebUI V2 orchestration failed without exposing raw details: generation_id=%s',

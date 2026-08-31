@@ -42,8 +42,8 @@ def scenario_payload(**overrides):
 def snapshot_payload(*, unresolved=False):
     return {
         'start_url_path': '/', 'visited_paths': ['/'],
-        'page_states': [{'name': '首页', 'title': '首页', 'path': '/', 'key_regions': ['内容']}],
-        'elements': [{'page_name': '首页', 'role': 'heading', 'visible_name': '用户列表', 'stable_attributes': {}, 'candidate_locators': ['page.get_by_role("heading")']}],
+        'page_states': [{'name': '用户列表', 'title': '用户列表', 'path': '/', 'key_regions': ['用户列表']}],
+        'elements': [{'page_name': '用户列表', 'role': 'heading', 'visible_name': '用户列表', 'stable_attributes': {}, 'candidate_locators': ['page.get_by_role("heading")']}],
         'navigation_paths': [],
         'step_evidence': {'S1': {'status': 'unresolved' if unresolved else 'confirmed', 'paths': ['/'], 'element_names': ['用户列表'], 'reason': '待确认' if unresolved else '已确认'}},
         'unresolved_steps': ['S1'] if unresolved else [], 'warnings': [],
@@ -233,19 +233,17 @@ class OrchestratorPhase45Tests(Phase45Base):
         ):
             return run_v2_generation(str(generation.pk), celery_task_id='phase45-task')
 
-    def test_missing_evidence_performs_only_one_directed_supplement_then_regenerates(self):
+    def test_pre_generation_targeted_exploration_returns_one_completed_snapshot(self):
         generation = self.generation()
 
         class Explorer:
             explore_calls = 0
-            supplement_calls = 0
             def __init__(self, **kwargs): pass
-            async def explore(self, **kwargs):
+            async def explore_until_complete(self, **kwargs):
                 type(self).explore_calls += 1
-                return ExplorationSnapshot.model_validate(snapshot_payload(unresolved=True))
-            async def explore_missing_evidence(self, **kwargs):
-                type(self).supplement_calls += 1
-                return ExplorationSnapshot.model_validate(snapshot_payload(unresolved=False))
+                payload = snapshot_payload(unresolved=False)
+                payload['completion'] = {'status': 'complete', 'targeted_rounds': 1}
+                return ExplorationSnapshot.model_validate(payload)
 
         class Generator:
             generate_calls = 0
@@ -260,8 +258,7 @@ class OrchestratorPhase45Tests(Phase45Base):
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.READY_WITH_WARNINGS)
         self.assertTrue(result['supplement_attempted'])
         self.assertEqual(Explorer.explore_calls, 1)
-        self.assertEqual(Explorer.supplement_calls, 1)
-        self.assertEqual(Generator.generate_calls, 2)
+        self.assertEqual(Generator.generate_calls, 1)
         self.assertEqual(generation.exploration_snapshot['unresolved_steps'], [])
 
     def test_quality_repair_has_a_hard_two_attempt_limit(self):

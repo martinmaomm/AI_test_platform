@@ -176,7 +176,8 @@ def store_script_content(
     normalized = normalize_for_storage(content) if has_content else None
     old_content = getattr(test_case, "test_script_content", None)
     old_version = int(getattr(test_case, "script_version", 0) or 0)
-    should_advance = bool(getattr(test_case, "pk", None)) and (has_content or bool(old_content))
+    # Re-saving byte-identical content updates provenance but not the executable version.
+    should_advance = bool(getattr(test_case, "pk", None)) and normalized != old_content
 
     metadata = _sanitize_metadata(generation_metadata or {})
     update_fields = [
@@ -209,6 +210,12 @@ def store_script_content(
     test_case.script_validation_error = ""
     test_case.generation_metadata = metadata
     test_case.script_version = old_version + 1 if should_advance else old_version
+    if should_advance:
+        # Execution records retain history; a changed script has not run yet.
+        test_case.last_execute_status = 'untested'
+        test_case.last_execute_time = None
+        test_case.last_error_message = ''
+        update_fields.extend(['last_execute_status', 'last_execute_time', 'last_error_message'])
     test_case.save(update_fields=update_fields)
     return test_case
 

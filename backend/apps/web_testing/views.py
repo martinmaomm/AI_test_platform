@@ -26,6 +26,7 @@ from .execution_diagnostics import safe_screenshot_relative_path
 from .execution_variables import (
     ExecutionVariableError,
     normalize_variable_definitions,
+    pop_runtime_variables,
     store_runtime_variables,
 )
 from .generation_events import publish_terminal
@@ -39,6 +40,21 @@ from .generation_repository import (
 )
 from .generation_save_state import generation_reference, is_generation_saved
 from .generation_security import store_temporary_credentials
+from .generation_workspace import (
+    ACTIVE_GENERATION_STATUSES,
+    BUSY_REPAIR_STATUSES,
+    BUSY_VERIFICATION_STATUSES,
+    base_url_fingerprint,
+    environment_fingerprint,
+    WorkspaceConflict,
+    attach_debug_task,
+    attach_repair_task,
+    prepare_debug,
+    prepare_repair,
+    script_hash,
+    update_draft,
+    workspace_for_generation,
+)
 from .models import (
     MidSceneScript,
     WebUIScriptGeneration,
@@ -65,6 +81,9 @@ from .project_access import (
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 from .serializers import (
     WebUIScriptGenerationCreateSerializer,
+    WebUIScriptGenerationDebugSerializer,
+    WebUIScriptGenerationDraftSerializer,
+    WebUIScriptGenerationRepairSerializer,
     WebUIScriptGenerationResolveSerializer,
     WebUIScriptGenerationSaveSerializer,
     WebUIScriptGenerationSerializer,
@@ -83,9 +102,11 @@ from .serializers import (
 from .tasks import (
     _remove_failure_screenshots,
     cancel_task,
+    debug_webui_script_generation_task,
     execute_webui_test_suite_task,
     generate_midscene_script_task,
     generate_webui_script_generation_v2_task,
+    repair_webui_script_generation_task,
 )
 
 logger = logging.getLogger(__name__)
@@ -265,6 +286,159 @@ class WebUIScriptGenerationResolveView(APIView):
         )
 
 
+class WebUIScriptGenerationDraftView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def patch(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能编辑自己创建的生成记录')
+        serializer = WebUIScriptGenerationDraftSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            generation = update_draft(
+                generation.pk,
+                expected_revision=serializer.validated_data['expected_revision'],
+                script_draft=serializer.validated_data['script_draft'],
+                variables=serializer.validated_data['variables'],
+            )
+        except WorkspaceConflict as exc:
+            return Response(
+                {'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
+
+
+class WebUIScriptGenerationDebugView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能调试自己创建的生成记录')
+        serializer = WebUIScriptGenerationDebugSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            # Invalid work-in-progress is durable, but never reaches the executor.
+            normalize_for_storage(generation.script_draft)
+        except ScriptContractError as exc:
+            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_400_BAD_REQUEST)
+        environment = Environment.objects.filter(
+            id=generation.environment_id,
+            project_id=project_id,
+            category=Environment.EnvironmentCategory.WEB,
+            is_active=True,
+        ).first()
+        if environment is None or not ((environment.config or {}).get('base_url') or '').strip():
+            return Response({'success': False, 'message': '所选 WebUI 环境不可用或未配置 Base URL。', 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            with transaction.atomic():
+                execution = WebUITestExecution.objects.create(
+                    exec_type='case', name='生成草稿调试', description=generation.description_safe,
+                    executor=request.user, project=project, environment=environment,
+                    browser=WEBUI_BROWSER_ENGINE, status='pending', trigger_type='manual',
+                )
+                WebUITestCaseExecutionDetail.objects.create(execution=execution, test_case=None, status='pending')
+                generation, locked_hash = prepare_debug(
+                    generation.pk,
+                    expected_revision=serializer.validated_data['expected_revision'],
+                    execution_id=execution.id,
+                    runtime_variables_present=bool(serializer.validated_data['runtime_variables']),
+                )
+        except WorkspaceConflict as exc:
+            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
+
+        # Only this cache entry carries runtime values; Celery receives IDs and a digest only.
+        try:
+            store_runtime_variables(execution.id, serializer.validated_data['runtime_variables'])
+            task = debug_webui_script_generation_task.delay(
+                str(generation.pk), execution.id, serializer.validated_data['expected_revision'], locked_hash,
+            )
+            execution.task_id = task.id
+            execution.save(update_fields=['task_id', 'updated_at'])
+            generation = attach_debug_task(
+                generation.pk, execution_id=execution.id,
+                locked_revision=serializer.validated_data['expected_revision'], locked_hash=locked_hash,
+                task_id=task.id,
+            )
+        except Exception:
+            logger.exception('生成草稿调试任务调度失败: generation_id=%s execution_id=%s', generation.pk, execution.id)
+            try:
+                pop_runtime_variables(execution.id)
+            except Exception:
+                logger.warning('无法清理调试临时变量，将等待缓存过期: execution_id=%s', execution.id)
+            execution.status = 'error'
+            execution.error_message = '调试任务暂时无法调度，请稍后重试。'
+            execution.end_time = timezone.now()
+            execution.save(update_fields=['status', 'error_message', 'end_time', 'updated_at'])
+            detail = execution.case_execution_detail
+            detail.status = 'error'
+            detail.error_message = execution.error_message
+            detail.end_time = execution.end_time
+            detail.save(update_fields=['status', 'error_message', 'end_time'])
+            from .generation_workspace import finish_debug
+            finish_debug(
+                generation.pk, execution_id=execution.id,
+                locked_revision=serializer.validated_data['expected_revision'], locked_hash=locked_hash,
+                status='error', diagnostics=[{'code': 'DISPATCH_FAILED', 'message': execution.error_message}],
+            )
+            generation.refresh_from_db()
+            return Response({'success': False, 'message': execution.error_message, 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_202_ACCEPTED)
+
+
+class WebUIScriptGenerationRepairView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能修复自己创建的生成记录')
+        serializer = WebUIScriptGenerationRepairSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            generation, locked_hash = prepare_repair(
+                generation.pk, expected_revision=serializer.validated_data['expected_revision'],
+            )
+        except WorkspaceConflict as exc:
+            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
+        try:
+            task = repair_webui_script_generation_task.delay(
+                str(generation.pk), serializer.validated_data['expected_revision'], locked_hash,
+            )
+            generation = attach_repair_task(
+                generation.pk, locked_revision=serializer.validated_data['expected_revision'],
+                locked_hash=locked_hash, task_id=task.id,
+            )
+        except Exception:
+            logger.exception('生成草稿修复任务调度失败: generation_id=%s', generation.pk)
+            from .generation_workspace import finish_repair_failure
+            finish_repair_failure(
+                generation.pk, locked_revision=serializer.validated_data['expected_revision'], locked_hash=locked_hash,
+                message='修复任务暂时无法调度，请稍后重试。',
+                blockers=[{'severity': 'blocker', 'code': 'DISPATCH_FAILED', 'message': '修复任务暂时无法调度。'}],
+            )
+            generation.refresh_from_db()
+            return Response({'success': False, 'message': '修复任务暂时无法调度，请稍后重试。', 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_202_ACCEPTED)
+
+
 class WebUIScriptGenerationSaveView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -284,18 +458,74 @@ class WebUIScriptGenerationSaveView(APIView):
                     raise Http404('生成记录不存在') from exc
                 if not _is_generation_owner(project, generation, request.user):
                     raise PermissionDenied('只能保存自己创建的生成记录')
-                if generation.status not in {
+                requested_mode = serializer.validated_data.get('mode')
+                legacy_save = requested_mode is None
+                workspace = workspace_for_generation(generation)
+                if requested_mode and workspace['revision'] != serializer.validated_data['expected_revision']:
+                    return Response(
+                        {'success': False, 'message': '工作区版本已变化，请刷新后重试。', 'data': WebUIScriptGenerationSerializer(generation).data},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                if (
+                    generation.status in ACTIVE_GENERATION_STATUSES
+                    or workspace['verification'].get('status') in BUSY_VERIFICATION_STATUSES
+                    or workspace['repair'].get('status') in BUSY_REPAIR_STATUSES
+                ):
+                    return Response(
+                        {'success': False, 'message': '生成、调试或修复进行中，不能保存工作区草稿。', 'data': WebUIScriptGenerationSerializer(generation).data},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                if legacy_save and workspace['revision'] > 0:
+                    return Response(
+                        {'success': False, 'message': '该草稿已经编辑，请使用当前工作区版本保存。'},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                if legacy_save and generation.status not in {
                     WebUIScriptGeneration.Status.READY,
                     WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
                 }:
+                    return Response({'success': False, 'message': '当前脚本尚未通过质量检查，不能保存。'}, status=status.HTTP_409_CONFLICT)
+                normalized_script = normalize_for_storage(generation.script_draft)
+                verification = workspace['verification']
+                if requested_mode == 'verified' and not (
+                    verification.get('status') == 'passed'
+                    and generation.environment.is_active
+                    and verification.get('script_hash') == script_hash(normalized_script)
+                    and verification.get('environment_id') == generation.environment_id
+                    and verification.get('locked_revision') == workspace['revision']
+                    and verification.get('environment_fingerprint') == environment_fingerprint(generation.environment.config)
+                    and verification.get('base_url_fingerprint') == base_url_fingerprint(generation.environment.config)
+                ):
                     return Response(
-                        {'success': False, 'message': '当前脚本尚未通过质量检查，不能保存。'},
+                        {'success': False, 'message': '当前脚本尚无同版本、同环境的实际调试通过记录。', 'data': WebUIScriptGenerationSerializer(generation).data},
                         status=status.HTTP_409_CONFLICT,
                     )
-                normalized_script = normalize_for_storage(generation.script_draft)
                 test_case = generation.test_case
                 created = False
-                already_saved = is_generation_saved(generation)
+                if test_case is not None:
+                    # Lock the case before inspecting provenance so a concurrent case-page edit cannot be overwritten.
+                    test_case = WebUITestCase.objects.select_for_update().get(pk=test_case.pk)
+                    metadata = test_case.generation_metadata if isinstance(test_case.generation_metadata, dict) else {}
+                    stored_fingerprint = metadata.get('content_fingerprint')
+                    stored_variables_fingerprint = metadata.get('variables_fingerprint')
+                    if metadata.get('generation_ref') != generation_ref or not stored_fingerprint or not stored_variables_fingerprint:
+                        return Response(
+                            {'success': False, 'message': '关联用例缺少可确认的生成来源或旧版指纹，已拒绝覆盖；请先人工确认。'},
+                            status=status.HTTP_409_CONFLICT,
+                        )
+                    if stored_fingerprint != script_hash(test_case.test_script_content):
+                        return Response(
+                            {'success': False, 'message': '关联用例脚本已在用例页独立修改，已拒绝覆盖。'},
+                            status=status.HTTP_409_CONFLICT,
+                        )
+                    current_variables_fingerprint = script_hash(__import__('json').dumps(
+                        test_case.variables or [], ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                    ))
+                    if stored_variables_fingerprint != current_variables_fingerprint:
+                        return Response(
+                            {'success': False, 'message': '关联用例变量已在用例页独立修改，已拒绝覆盖。'},
+                            status=status.HTTP_409_CONFLICT,
+                        )
                 if test_case is None:
                     scenario = generation.scenario_spec or {}
                     test_case = WebUITestCase.objects.create(
@@ -313,30 +543,34 @@ class WebUIScriptGenerationSaveView(APIView):
                     generation.test_case = test_case
                     generation.save(update_fields=['test_case', 'updated_at'])
                     created = True
-                elif serializer.validated_data.get('title'):
+                if serializer.validated_data.get('title'):
                     test_case.title = serializer.validated_data['title']
                     test_case.save(update_fields=['title', 'updated_at'])
-                if not already_saved:
-                    store_script_content(
-                        test_case,
-                        normalized_script,
-                        source='mcp_exploration',
-                        generation_metadata={
-                            'generation_ref': generation_ref,
-                            'model': {
-                                'provider': (generation.model_info or {}).get('provider', ''),
-                                'model_name': (generation.model_info or {}).get('model_name', ''),
-                            },
-                            'quality_status': (generation.quality_report or {}).get('status', ''),
-                            'repair_count': generation.repair_count,
-                            'unresolved_step_count': len(
-                                (generation.exploration_snapshot or {}).get('unresolved_steps') or []
-                            ),
-                        },
-                    )
+                metadata = {
+                    'generation_ref': generation_ref,
+                    'content_fingerprint': script_hash(normalized_script),
+                    'workspace_revision': workspace['revision'],
+                    'variables_fingerprint': script_hash(__import__('json').dumps(workspace['variables'], ensure_ascii=False, sort_keys=True, separators=(',', ':'))),
+                    'model': {
+                        'provider': (generation.model_info or {}).get('provider', ''),
+                        'model_name': (generation.model_info or {}).get('model_name', ''),
+                    },
+                    'quality_status': (generation.quality_report or {}).get('status', ''),
+                    'repair_count': (workspace['repair'] or {}).get('count', 0),
+                    'verification': {
+                        'status': 'passed' if requested_mode == 'verified' else 'unverified',
+                        'script_hash': script_hash(normalized_script),
+                        'environment_id': generation.environment_id if requested_mode == 'verified' else None,
+                        'execution_id': verification.get('execution_id') if requested_mode == 'verified' else None,
+                    },
+                    'unresolved_step_count': len((generation.exploration_snapshot or {}).get('unresolved_steps') or []),
+                }
+                store_script_content(test_case, normalized_script, source='mcp_exploration', generation_metadata=metadata)
+                test_case.variables = workspace['variables']
+                test_case.save(update_fields=['variables', 'updated_at'])
         except ScriptContractError as exc:
             return Response(
-                {'success': False, 'message': str(exc)},
+                {'success': False, 'message': f'{exc}；无效草稿仍保留在生成工作区，不能保存为测试用例。'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(

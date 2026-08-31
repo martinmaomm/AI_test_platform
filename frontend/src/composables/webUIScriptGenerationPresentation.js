@@ -1,13 +1,10 @@
 /** Pure, presentation-only helpers for the V2 WebUI generation page. */
 
 export const GENERATION_STAGES = [
-  ['normalizing', '理解测试场景'],
-  ['preflighting', '检查风险与登录条件'],
-  ['exploring', '探索页面'],
-  ['generating', '生成 Python 脚本'],
-  ['validating', '检查脚本质量'],
-  ['repairing', '自动修复脚本'],
-  ['completed', '整理生成结果']
+  ['normalizing', '理解目标'],
+  ['exploring', '只读探索页面'],
+  ['generating', '生成并检查草稿'],
+  ['completed', '进入可编辑工作区']
 ]
 
 export const ACTIVE_GENERATION_STATUSES = new Set([
@@ -31,7 +28,7 @@ const STATUS_LABELS = {
   validating: '正在检查脚本质量',
   repairing: '正在自动修复脚本',
   needs_input: '需要补充场景信息',
-  needs_confirmation: '需要确认探索风险',
+  needs_confirmation: '需要确认业务约束',
   needs_credentials: '需要本次探索登录信息',
   needs_review: '需要人工检查',
   ready: '脚本已生成',
@@ -49,6 +46,26 @@ export const generationStorageKey = (userId, projectId) => (
 export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(status)
 export const isPausedGeneration = (status) => PAUSED_GENERATION_STATUSES.has(status)
 export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has(status)
+
+const WORKSPACE_ACTIVITY_STATUSES = new Set(['pending', 'running'])
+export const workspaceVerificationLabel = (status) => ({
+  unverified: '尚未实际调试', pending: '等待调试', running: '正在真实调试',
+  passed: '本版调试通过', failed: '本版调试失败', error: '调试异常'
+})[status] || '调试状态未知'
+export const workspaceVerificationTagType = (status) => ({
+  unverified: 'info', pending: 'warning', running: 'warning', passed: 'success', failed: 'danger', error: 'danger'
+})[status] || 'info'
+export const isWorkspaceActive = (workspace) => (
+  WORKSPACE_ACTIVITY_STATUSES.has(workspace?.verification?.status) ||
+  WORKSPACE_ACTIVITY_STATUSES.has(workspace?.repair?.status)
+)
+export const isCurrentRevisionVerified = (workspace, revision, environmentId = undefined) => {
+  const verification = workspace?.verification || {}
+  const verifiedRevision = verification.locked_revision ?? verification.revision ?? verification.verified_revision
+  return verification.status === 'passed' && Number(verifiedRevision) === Number(revision) && (
+    environmentId === undefined || Number(verification.environment_id) === Number(environmentId)
+  )
+}
 
 const GENERATION_FIELD_LABELS = {
   description: '测试描述',
@@ -85,11 +102,13 @@ export const generationActionRequired = (generation) => {
   const status = generation?.status
   if (!isPausedGeneration(status)) return null
   const errorCode = generation?.error_code || ''
-  const scenarioQuestions = Array.isArray(generation?.scenario_spec?.ambiguities)
-    ? generation.scenario_spec.ambiguities.filter(Boolean)
-    : []
-  const warningQuestions = Array.isArray(generation?.warnings) ? generation.warnings.filter(Boolean) : []
-  const questions = scenarioQuestions.length ? scenarioQuestions : warningQuestions
+  const completion = generation?.exploration_snapshot?.completion || {}
+  const businessQuestions = [
+    ...(Array.isArray(completion.user_questions) ? completion.user_questions : []),
+    ...(Array.isArray(completion.missing_targets) ? completion.missing_targets
+      .filter(item => item?.kind === 'business_decision')
+      .map(item => item.user_question || item.reason) : [])
+  ].map(item => String(item || '').trim()).filter(Boolean)
   const remainingAttempts = Math.max(0, 3 - Number(generation?.resume_count || 0))
 
   if (status === 'needs_credentials') {
@@ -106,19 +125,26 @@ export const generationActionRequired = (generation) => {
       questions: [], primaryLabel: '重新分析并继续', remainingAttempts
     }
   }
-  if (errorCode === 'INPUT_AMBIGUOUS' && generation?.current_stage === 'preflighting') {
+  if (status === 'needs_confirmation' && generation?.current_stage === 'preflighting') {
     return {
-      kind: 'auto_explore', title: '这些信息可以通过页面探索补全',
-      description: '平台会先只读打开菜单和表单，自动确认字段、入口、路径与可见状态；只有探索后仍无法确定的业务问题才会再次询问。',
-      questions: [], primaryLabel: '继续自动探索', remainingAttempts
+      kind: 'auto_explore', title: '需要确认探索风险',
+      description: '继续后平台仅以只读方式打开页面、菜单和表单，不会提交新增、编辑、删除或支付等业务写操作。只有探索后仍影响业务含义的问题才会要求回答。',
+      questions: [], primaryLabel: '确认仅只读探索并继续', remainingAttempts
     }
   }
-  if (errorCode === 'INPUT_AMBIGUOUS') {
+  if (status === 'needs_confirmation' && businessQuestions.length) {
     return {
-      kind: 'clarifications', title: `探索后仍需确认 ${questions.length || 1} 项信息`,
-      description: generation?.error_message || '这些问题无法从页面证据确定，请逐项回答后继续生成。',
-      questions: questions.length ? questions : ['请补充当前场景中无法安全确定的内容。'],
+      kind: 'clarifications', title: `仍需确认 ${businessQuestions.length} 项业务信息`,
+      description: generation?.error_message || '这些问题会影响业务语义，无法仅通过页面证据确定，请逐项回答后继续生成。',
+      questions: businessQuestions,
       primaryLabel: '提交答案并继续', remainingAttempts
+    }
+  }
+  if (['EVIDENCE_INSUFFICIENT', 'EXPLORATION_INCOMPLETE'].includes(errorCode) || completion.status === 'needs_targeted_exploration') {
+    return {
+      kind: 'exploration_issue', title: '页面探索未完成',
+      description: generation?.error_message || '当前页面证据不足，不能要求你填写 DOM 或定位器。请查看探索证据并修订业务目标后重新发起。',
+      questions: [], primaryLabel: '', remainingAttempts
     }
   }
   return {
@@ -141,33 +167,29 @@ export const matchesGenerationWebSocketEvent = (message, generation) => {
 
 export const buildGenerationTimeline = (generation) => {
   const currentStage = generation?.current_stage || 'created'
-  const currentIndex = GENERATION_STAGES.findIndex(([stage]) => stage === currentStage)
+  const stageIndex = { created: 0, normalizing: 0, preflighting: 0, exploring: 1, generating: 2, validating: 2, repairing: 2, completed: 3 }
+  const currentIndex = stageIndex[currentStage] ?? 0
   const terminal = isTerminalGeneration(generation?.status)
-  const repairTriggered = Number(generation?.repair_count || 0) > 0 || currentStage === 'repairing'
 
   return GENERATION_STAGES.map(([stage, label], index) => {
     let state = 'wait'
-    let displayLabel = label
-    if (stage === 'repairing' && !repairTriggered) {
-      displayLabel = `${label}（未触发）`
-    } else if (stage === 'completed' && terminal) {
+    if (stage === 'completed' && terminal) {
       state = generation.status === 'cancelled'
         ? 'wait'
         : ['failed', 'needs_review'].includes(generation.status) ? 'error' : 'success'
-    } else if (stage === currentStage) {
-      if (isPausedGeneration(generation?.status)) displayLabel = `${displayLabel}（等待处理）`
+    } else if (index === currentIndex) {
       state = generation.status === 'failed' ? 'error' : 'process'
-    } else if (index < currentIndex && (stage !== 'repairing' || repairTriggered)) {
+    } else if (index < currentIndex) {
       state = 'success'
     }
-    return { stage, label: displayLabel, state }
+    return { stage, label, state }
   })
 }
 
 export const generationResolutionHint = (generation) => {
   const status = generation?.status
   if (status === 'needs_input') return '请补充可验证的操作步骤、成功标准和清理要求后重新发起。'
-  if (status === 'needs_confirmation') return '场景要求探索阶段执行写操作或存在高风险约束，请调整描述后重新发起。'
+  if (status === 'needs_confirmation') return '请先处理探索风险或仍待确认的业务信息；页面元素、DOM 和定位器不需要人工填写。'
   if (status === 'needs_credentials') return '请在“本次探索登录信息”中填写临时账号和密码后重新发起。'
   if (status === 'needs_review') return '脚本和证据已保留，请根据阻断项或未确认项人工调整后再创建新的生成任务。'
   if (status === 'failed') return generation?.error_message || '请检查模型、Playwright MCP、登录信息或页面可访问性后重试。'

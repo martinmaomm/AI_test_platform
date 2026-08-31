@@ -1,5 +1,6 @@
 <template>
-  <div v-if="report && Object.keys(report).length" class="quality-content">
+  <el-alert v-if="report?.status === 'stale'" type="info" :closable="false" show-icon :title="report.message || '草稿已修改，原静态检查结果已失效。'" />
+  <div v-else-if="report && Object.keys(report).length" class="quality-content">
     <div class="quality-summary"><el-statistic title="通过" :value="summary.passed || 0" /><el-statistic title="警告" :value="summary.warning || 0" /><el-statistic title="阻断" :value="summary.blocker || 0" /></div>
     <p v-if="summary.message" class="summary-message">{{ summary.message }}</p>
     <el-tabs v-model="activeName"><el-tab-pane label="通过项" name="pass"><check-list :items="grouped.pass" type="success" empty-text="暂无通过项" /></el-tab-pane><el-tab-pane :label="`警告 (${grouped.warning.length})`" name="warning"><check-list :items="grouped.warning" type="warning" empty-text="暂无警告" /></el-tab-pane><el-tab-pane :label="`阻断 (${grouped.blocker.length})`" name="blocker"><check-list :items="grouped.blocker" type="danger" empty-text="暂无阻断项" /></el-tab-pane></el-tabs>

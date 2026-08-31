@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from langgraph.errors import GraphRecursionError
+from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langchain_core.messages import ToolMessage
 
 from ai_core.webui_playwright_agent import (
@@ -73,6 +74,15 @@ class WebUIPlaywrightAgentStabilityTests(unittest.TestCase):
         message = _get_mcp_error_message(error)
         self.assertNotIn("Chromium", message)
         self.assertIn("最大执行步数", message)
+
+    def test_real_model_call_limit_keeps_legacy_limit_error_and_does_not_retry(self):
+        error = ModelCallLimitExceededError(
+            thread_count=60, run_count=60, thread_limit=None, run_limit=60,
+        )
+
+        self.assertEqual(_classify_mcp_error(error), MCP_ERROR_GRAPH_RECURSION)
+        self.assertTrue(_is_non_retryable_mcp_error(error))
+        self.assertIn("最大执行步数", _get_mcp_error_message(error))
 
     def test_browser_startup_error_has_browser_message_and_does_not_retry(self):
         error = RuntimeError(

@@ -16,7 +16,8 @@ from ai_core.webui_playwright_agent import (
     _classify_mcp_error,
     _get_mcp_error_message,
 )
-from mcp_use import MCPAgent, MCPClient
+from ai_core.mcp_agent_budget import BudgetedMCPAgent as MCPAgent
+from mcp_use import MCPClient
 
 from .exploration_output import (
     ExplorationOutputError,
@@ -43,6 +44,7 @@ EXPLORER_CONSTRAINTS = f"""你只负责只读页面探索，绝对不要生成 P
 切换页面或打开、关闭弹窗后，使用 playwright_get_visible_text 或 playwright_get_visible_html 确认新的页面状态；不要在未观察到变化时反复执行相同交互。
 工具可用性以当前只读探索能力为准：通过 playwright_get_visible_text 或 playwright_get_visible_html 正常读取，无法确认的内容记录为未确认，不得用 JavaScript 绕过。
 禁止提交新增、编辑、删除、审批、付款、发布、上传、下载等任何业务写操作。
+禁止调用 playwright_close；浏览器会话由平台在本次探索结束时统一清理。
 不得输出用户名、密码、Token、Cookie、HTML、截图 Base64 或完整 URL。
 优先通过页面导航、打开菜单和打开表单解决 discovery_targets；不得因为探索前不知道字段、入口、提示或路径就要求用户回答。
 只有完成只读探索后仍无法从页面证据确定的问题，才写入 unresolved_questions。
@@ -57,6 +59,7 @@ _WRITE_ACTION_MARKERS = (
 READ_ONLY_DISABLED_TOOL_MESSAGES = {
     'playwright_evaluate': '只读探索不允许执行页面 JavaScript。请通过页面读取工具获取证据，无法确认的内容请记录为未确认。',
     'playwright_upload_file': '只读探索不允许上传文件。请在后续脚本执行阶段处理该操作。',
+    'playwright_close': '只读探索不允许关闭浏览器。浏览器会话将在探索结束后由平台统一清理。',
 }
 
 
@@ -275,7 +278,7 @@ class MCPPageExplorer:
             pass
 
     async def _run_with_cancel(self, agent, prompt: str) -> str:
-        run_task = asyncio.create_task(agent.run(prompt))
+        run_task = asyncio.create_task(self._initialize_and_run(agent, prompt))
         started_at = time.monotonic()
         try:
             while True:
@@ -308,6 +311,14 @@ class MCPPageExplorer:
             if guard_failure is not None:
                 raise guard_failure
             raise
+
+    async def _initialize_and_run(self, agent, prompt: str) -> str:
+        # Sessions are owned by this Explorer so its finally block closes them
+        # exactly once for normal, error, and cancellation paths. Keeping this
+        # lifecycle in the monitored task also makes adapter initialization
+        # cancellable before any browser tool can run.
+        await agent.initialize()
+        return await agent.run(prompt, manage_connector=False)
 
     def _build_prompt(
         self,

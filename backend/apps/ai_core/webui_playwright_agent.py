@@ -21,12 +21,14 @@ from django.conf import settings
 from django.core.cache import cache
 from .models import MCPConfiguration
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langgraph.graph import StateGraph, END
 from langgraph.errors import GraphRecursionError
 from common.websocket import websocket_message_service, send_node_start_notification_helper
 from common.parsers import extract_python_from_output
 from .model_manager import get_llm_manager
-from mcp_use import MCPClient, MCPAgent
+from mcp_use import MCPClient
+from .mcp_agent_budget import BudgetedMCPAgent as MCPAgent
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +493,7 @@ def _classify_mcp_error(error: BaseException) -> str:
         if isinstance(candidate, MCPToolGuardError):
             return candidate.error_kind
     if any(
-        isinstance(candidate, GraphRecursionError)
+        isinstance(candidate, (GraphRecursionError, ModelCallLimitExceededError))
         for candidate in _iter_exception_chain(error)
     ):
         return MCP_ERROR_GRAPH_RECURSION

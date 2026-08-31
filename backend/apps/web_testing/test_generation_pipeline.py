@@ -388,7 +388,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 type(self).received_prompt = prompt
                 return json.dumps(snapshot_payload(), ensure_ascii=False)
 
@@ -422,7 +425,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 pass
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 return json.dumps(snapshot_payload(), ensure_ascii=False)
 
         original = {'mcpServers': {'playwright': {'command': 'npx', 'args': ['-y', 'other-mcp']}}}
@@ -498,7 +504,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 pass
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 raise RuntimeError("browser executable doesn't exist")
 
         explorer = MCPPageExplorer(
@@ -586,7 +595,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 self.guard = kwargs['callbacks'][0]
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 for index in range(2):
                     run_id = f'click-{index}'
                     self.guard.on_tool_start(
@@ -632,7 +644,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 self.guard = kwargs['callbacks'][0]
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 for index in range(2):
                     run_id = f'click-{index}'
                     self.guard.on_tool_start({'name': 'playwright_click'}, '', run_id=run_id, inputs={'selector': 'button.loop'})
@@ -677,7 +692,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 self.guard = kwargs['callbacks'][0]
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 self.guard.on_tool_start(
                     {'name': 'playwright_click'}, '', run_id='failed',
                     inputs={'selector': 'input[type=password]', 'value': 'super-secret'},
@@ -724,7 +742,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 pass
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 try:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
@@ -756,6 +777,59 @@ class MCPPageExplorerTests(TestCase):
         self.assertTrue(WaitingAgent.cleaned)
         self.assertTrue(FakeClient.closed)
 
+    def test_cancellation_during_agent_initialization_closes_platform_sessions(self):
+        class FakeClient:
+            closed = False
+
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                type(self).closed = True
+
+        class InitializingAgent:
+            cancelled = False
+            run_called = False
+
+            def __init__(self, **kwargs):
+                pass
+
+            async def initialize(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    type(self).cancelled = True
+                    raise
+
+            async def run(self, prompt, **kwargs):
+                type(self).run_called = True
+                return json.dumps(snapshot_payload(), ensure_ascii=False)
+
+        checks = {'count': 0}
+
+        def cancel_check():
+            checks['count'] += 1
+            return checks['count'] >= 3
+
+        explorer = MCPPageExplorer(
+            llm_model=object(), mcp_config={'mcpServers': {}}, cancel_check=cancel_check,
+        )
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+            'web_testing.mcp_page_explorer.MCPAgent', InitializingAgent,
+        ):
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                asyncio.run(asyncio.wait_for(
+                    explorer.explore(
+                        scenario=ScenarioSpec.model_validate(scenario_payload()),
+                        start_path='/', target_url_safe='https://web.example.test/',
+                    ),
+                    timeout=2,
+                ))
+        self.assertEqual(raised.exception.error_code, 'TASK_CANCELLED')
+        self.assertTrue(InitializingAgent.cancelled)
+        self.assertFalse(InitializingAgent.run_called)
+        self.assertTrue(FakeClient.closed)
+
     def test_success_snapshot_keeps_nonterminal_failed_tool_count(self):
         class FakeClient:
             async def create_all_sessions(self):
@@ -768,7 +842,10 @@ class MCPPageExplorerTests(TestCase):
             def __init__(self, **kwargs):
                 self.guard = kwargs['callbacks'][0]
 
-            async def run(self, prompt):
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
                 self.guard.on_tool_start({'name': 'playwright_screenshot'}, '', run_id='failed-read')
                 self.guard.on_tool_end({'isError': True}, run_id='failed-read', name='playwright_screenshot')
                 return json.dumps(snapshot_payload(), ensure_ascii=False)

@@ -128,7 +128,7 @@ class ExplorerRecoveryTests(SimpleTestCase):
         def factory(**kwargs):
             guard = kwargs['callbacks'][0]
 
-            async def run(_prompt):
+            async def run(_prompt, **kwargs):
                 guard.on_tool_start({'name': 'playwright_click'}, '', run_id='failed', inputs={'selector': '.test'})
                 guard.on_tool_end({'isError': True}, run_id='failed', name='playwright_click')
                 guard.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id='read')

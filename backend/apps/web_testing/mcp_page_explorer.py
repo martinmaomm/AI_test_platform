@@ -41,6 +41,7 @@ EXPLORER_CONSTRAINTS = f"""你只负责只读页面探索，绝对不要生成 P
 浏览器工具总数最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。
 允许打开页面、读取可见文本、打开菜单/Tab/查询条件/表单弹窗；如提供登录信息，只能用于本次登录。
 切换页面或打开、关闭弹窗后，使用 playwright_get_visible_text 或 playwright_get_visible_html 确认新的页面状态；不要在未观察到变化时反复执行相同交互。
+工具可用性以当前只读探索能力为准：通过 playwright_get_visible_text 或 playwright_get_visible_html 正常读取，无法确认的内容记录为未确认，不得用 JavaScript 绕过。
 禁止提交新增、编辑、删除、审批、付款、发布、上传、下载等任何业务写操作。
 不得输出用户名、密码、Token、Cookie、HTML、截图 Base64 或完整 URL。
 优先通过页面导航、打开菜单和打开表单解决 discovery_targets；不得因为探索前不知道字段、入口、提示或路径就要求用户回答。
@@ -53,6 +54,11 @@ _WRITE_ACTION_MARKERS = (
     'download',
 )
 
+READ_ONLY_DISABLED_TOOL_MESSAGES = {
+    'playwright_evaluate': '只读探索不允许执行页面 JavaScript。请通过页面读取工具获取证据，无法确认的内容请记录为未确认。',
+    'playwright_upload_file': '只读探索不允许上传文件。请在后续脚本执行阶段处理该操作。',
+}
+
 
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
     """Keep legacy budgets while blocking definite business-write actions."""
@@ -61,10 +67,11 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
         tool_name = str((serialized or {}).get('name') or '').strip().lower()
         input_text = self._read_only_input_text(inputs, input_str)
         with self._lock:
-            if tool_name in {'playwright_upload_file', 'playwright_evaluate'}:
+            disabled_message = READ_ONLY_DISABLED_TOOL_MESSAGES.get(tool_name)
+            if disabled_message is not None:
                 self._raise_guard(
                     'read_only_violation',
-                    '只读探索不允许上传文件或执行页面脚本。请在后续脚本执行阶段处理该操作。',
+                    disabled_message,
                     blocked_before_execution=True,
                     tool_name=tool_name,
                 )
@@ -198,6 +205,7 @@ class MCPPageExplorer:
                 client=client,
                 max_steps=MCP_MAX_STEPS,
                 additional_instructions=EXPLORER_CONSTRAINTS,
+                disallowed_tools=list(READ_ONLY_DISABLED_TOOL_MESSAGES),
                 callbacks=[self.guard],
             )
             with suppress_mcp_raw_query_logs():

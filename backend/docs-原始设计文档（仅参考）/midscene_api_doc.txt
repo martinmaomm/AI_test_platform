@@ -1,0 +1,5819 @@
+---
+url: /zh/api.md
+---
+
+# API 参考
+
+> 在以下文档中，你可能会看到带有 `agent.` 前缀的函数调用。如果你在 Playwright 中，这些调用是不带 `agent.` 前缀的，如 `async ({ ai, aiQuery }) => { /* ... */}`。这只是解构语法的区别。
+
+## 构造器
+
+Midscene 中每个 Agent 都有自己的构造函数。
+
+- 在 Puppeteer 中，使用 [PuppeteerAgent](./integrate-with-puppeteer)
+- 在桥接模式（Bridge Mode）中，使用 [AgentOverChromeBridge](./bridge-mode-by-chrome-extension#constructor)
+- 在 Android 中，使用 [AndroidAgent](./integrate-with-android)
+
+这些 Agent 有一些相同的构造参数：
+
+- `generateReport: boolean`: 如果为 true，则生成报告文件。默认值为 true。
+- `reportFileName: string`: 报告文件的名称，默认值由 midscene 内部生成。
+- `autoPrintReportMsg: boolean`: 如果为 true，则打印报告消息。默认值为 true。
+- `cacheId: string | undefined`: 如果配置，则使用此 cacheId 保存或匹配缓存。默认值为 undefined，也就是不启用缓存。
+- `actionContext: string`: 调用 `agent.aiAction()` 时，发送给 AI 模型的背景知识，比如 '有 cookie 对话框时先关闭它'，默认值为空。
+
+在 Playwright 和 Puppeteer 中，有以下共同的参数：
+
+- `forceSameTabNavigation: boolean`: 如果为 true，则限制页面在当前 tab 打开。默认值为 true。
+- `waitForNavigationTimeout: number`: 在页面跳转后等待页面加载完成的超时时间，默认值为 5000ms，设置为 0 则不做等待。
+
+在 Puppeteer 中，还有以下参数：
+
+- `waitForNetworkIdleTimeout: number`: 在执行每个操作后等待网络空闲的超时时间，默认值为 2000ms，设置为 0 则不做等待。
+
+## 交互方法
+
+这些是 Midscene 中各类 Agent 的主要 API。
+
+:::info 自动规划 v.s. 即时操作
+
+在 Midscene 中，你可以选择使用自动规划（Auto Planning）或即时操作（Instant Action）。
+
+- `agent.ai()` 是自动规划（Auto Planning）：Midscene 会自动规划操作步骤并执行。它更智能，更像流行的 AI Agent 风格，但可能较慢，且效果依赖于 AI 模型的质量。
+- `agent.aiTap()`, `agent.aiHover()`, `agent.aiInput()`, `agent.aiKeyboardPress()`, `agent.aiScroll()`, `agent.aiDoubleClick()`, `agent.aiRightClick()` 是即时操作（Instant Action）：Midscene 会直接执行指定的操作，而 AI 模型只负责底层任务，如定位元素等。这种接口形式更快、更可靠。当你完全确定自己想要执行的操作时，推荐使用这种接口形式。
+
+:::
+
+### `agent.aiAction()` 或 `.ai()`
+
+这个方法允许你通过自然语言描述一系列 UI 操作步骤。Midscene 会自动规划这些步骤并执行。
+
+- 类型
+
+```typescript
+function aiAction(
+  prompt: string,
+  opt?: {
+    cacheable?: boolean;
+  },
+): Promise<void>;
+function ai(prompt: string): Promise<void>; // 简写形式
+```
+
+- 参数：
+
+  - `prompt: string` - 用自然语言描述的操作内容
+  - `opt?: Object` - 可选，一个配置对象，包含：
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+
+- 返回值：
+
+  - 返回一个 Promise。当所有步骤执行完成时解析为 void；若执行失败，则抛出错误。
+
+- 示例：
+
+```typescript
+// 基本用法
+await agent.aiAction('在搜索框中输入 "JavaScript"，然后点击搜索按钮');
+
+// 使用 .ai 简写形式
+await agent.ai(
+  '点击页面顶部的登录按钮，然后在用户名输入框中输入 "test@example.com"',
+);
+
+// 使用 ui-tars 模型时，可以使用更目标驱动的提示词
+await agent.aiAction('发布一条微博，内容为 "Hello World"');
+```
+
+:::tip
+
+在实际运行时，Midscene 会将用户指令规划（Planning）成多个步骤，然后逐步执行。如果 Midscene 认为无法执行，将抛出一个错误。
+
+为了获得最佳效果，请尽可能提供清晰、详细的步骤描述。具体可以参考这篇文档：[编写提示词的技巧](./prompting-tips)
+
+关联文档：
+
+- [选择 AI 模型](./choose-a-model)
+
+:::
+
+### `agent.aiTap()`
+
+点击某个元素。
+
+- 类型
+
+```typescript
+function aiTap(locate: string | Object, options?: Object): Promise<void>;
+```
+
+- 参数：
+  - `locate: string | Object` - 用自然语言描述的元素定位，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiTap('页面顶部的登录按钮');
+
+// 使用 deepThink 功能精确定位元素
+await agent.aiTap('页面顶部的登录按钮', { deepThink: true });
+```
+
+### `agent.aiHover()`
+
+> 仅在 web 页面中可用，在 Android 下不可用
+
+鼠标悬停某个元素上。
+
+- 类型
+
+```typescript
+function aiHover(locate: string | Object, options?: Object): Promise<void>;
+```
+
+- 参数：
+  - `locate: string | Object` - 用自然语言描述的元素定位，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiHover('页面顶部的登录按钮');
+```
+
+### `agent.aiInput()`
+
+在某个元素中输入文本。
+
+- 类型
+
+```typescript
+function aiInput(
+  text: string,
+  locate: string | Object,
+  options?: Object,
+): Promise<void>;
+```
+
+- 参数：
+
+  - `text: string` - 要输入的文本内容。使用空字符串可以清空输入框。
+  - `locate: string | Object` - 用自然语言描述的元素定位，，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+    - `autoDismissKeyboard?: boolean` - 如果为 true，则键盘会在输入文本后自动关闭，仅在 Android 中有效。默认值为 true。
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiInput('Hello World', '搜索框');
+```
+
+### `agent.aiKeyboardPress()`
+
+按下键盘上的某个键。
+
+- 类型
+
+```typescript
+function aiKeyboardPress(
+  key: string,
+  locate?: string | Object,
+  options?: Object,
+): Promise<void>;
+```
+
+- 参数：
+
+  - `key: string` - 要按下的键，如 `Enter`、`Tab`、`Escape` 等。不支持组合键。
+  - `locate?: string | Object` - 用自然语言描述的元素定位，，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiKeyboardPress('Enter', '搜索框');
+```
+
+### `agent.aiScroll()`
+
+滚动页面或某个元素。
+
+- 类型
+
+```typescript
+function aiScroll(
+  scrollParam: PlanningActionParamScroll,
+  locate?: string | Object,
+  options?: Object,
+): Promise<void>;
+```
+
+- 参数：
+
+  - `scrollParam: PlanningActionParamScroll` - 滚动参数
+    - `direction: 'up' | 'down' | 'left' | 'right'` - 滚动方向。不论是 Android 还是 Web，这里的滚动方向都是指页面哪个方向的内容会进入屏幕。比如当滚动方向是 `down` 时，页面下方被隐藏的内容会从屏幕底部开始逐渐向上露出。
+    - `scrollType: 'once' | 'untilBottom' | 'untilTop' | 'untilRight' | 'untilLeft'` - 滚动类型
+    - `distance: number` - 滚动距离，单位为像素。
+  - `locate?: string | Object` - 用自然语言描述的元素定位，或[使用图片作为提示词](#使用图片作为提示词)。如果未传入，Midscene 会在当前鼠标位置滚动。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiScroll(
+  { direction: 'up', distance: 100, scrollType: 'once' },
+  '表单区域',
+);
+```
+
+### `agent.aiDoubleClick()`
+
+双击某个元素。
+
+- 类型
+
+```typescript
+function aiDoubleClick(locate: string | Object, options?: Object): Promise<void>;
+```
+
+- 参数：
+
+  - `locate: string | Object` - 用自然语言描述的元素定位，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiDoubleClick('页面顶部的文件名称');
+
+// 使用 deepThink 功能精确定位元素
+await agent.aiDoubleClick('页面顶部的文件名称', { deepThink: true });
+```
+
+### `agent.aiRightClick()`
+
+> 仅在 web 页面中可用，在 Android 下不可用
+
+右键点击某个元素。请注意，Midscene 在右键点击后无法与浏览器原生上下文菜单交互。这个接口通常用于已经监听了右键点击事件的元素。
+
+- 类型
+
+```typescript
+function aiRightClick(locate: string | Object, options?: Object): Promise<void>;
+```
+
+- 参数：
+
+  - `locate: string | Object` - 用自然语言描述的元素定位，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.aiRightClick('页面顶部的文件名称');
+
+// 使用 deepThink 功能精确定位元素
+await agent.aiRightClick('页面顶部的文件名称', { deepThink: true });
+```
+
+:::tip 关于 `deepThink` （深度思考）特性
+
+`deepThink` 是一个强大的特性，它允许 Midscene 调用 AI 模型两次以精确定位元素。这在目标元素面积较小、难以和周围元素区分时非常有用。
+
+:::
+
+## 数据提取
+
+### `agent.aiAsk()`
+
+使用此方法，你可以针对当前页面，直接向 AI 模型发起提问，并获得字符串形式的回答。
+
+- 类型
+
+```typescript
+function aiAsk(prompt: string | Object, options?: Object): Promise<string>;
+```
+
+- 参数：
+
+  - `prompt: string | Object` - 用自然语言描述的询问内容，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `domIncluded?: boolean | 'visible-only'` - 是否向模型发送精简后的 DOM 信息，一般用于提取 UI 中不可见的属性，比如图片的链接。如果设置为 `'visible-only'`，则只发送可见的元素。默认值为 false。
+    - `screenshotIncluded?: boolean` - 是否向模型发送截图。默认值为 true。
+
+- 返回值：
+
+  - 返回一个 Promise。返回 AI 模型的回答。
+
+- 示例：
+
+```typescript
+const result = await agent.aiAsk('当前页面的应该怎么进行测试？');
+console.log(result); // 输出 AI 模型的回答
+```
+
+除了 `aiAsk` 方法，你还可以使用 `aiQuery` 方法，直接从 UI 提取结构化的数据。
+
+### `agent.aiQuery()`
+
+使用此方法，你可以直接从 UI 提取结构化的数据。只需在 `dataDemand` 中描述期望的数据格式（如字符串、数字、JSON、数组等），Midscene 即返回相应结果。
+
+- 类型
+
+```typescript
+function aiQuery<T>(dataDemand: string | Object, options?: Object): Promise<T>;
+```
+
+- 参数：
+
+  - `dataDemand: T`: 描述预期的返回值和格式。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `domIncluded?: boolean | 'visible-only'` - 是否向模型发送精简后的 DOM 信息，一般用于提取 UI 中不可见的属性，比如图片的链接。如果设置为 `'visible-only'`，则只发送可见的元素。默认值为 false。
+    - `screenshotIncluded?: boolean` - 是否向模型发送截图。默认值为 true。
+
+- 返回值：
+
+  - 返回值可以是任何合法的基本类型，比如字符串、数字、JSON、数组等。
+  - 你只需在 `dataDemand` 中描述它，Midscene 就会给你满足格式的返回。
+
+- 示例：
+
+```typescript
+const dataA = await agent.aiQuery({
+  time: '左上角展示的日期和时间，string',
+  userInfo: '用户信息，{name: string}',
+  tableFields: '表格的字段名，string[]',
+  tableDataRecord: '表格中的数据记录，{id: string, [fieldName]: string}[]',
+});
+
+// 你也可以用纯字符串描述预期的返回值格式：
+
+// dataB 将是一个字符串数组
+const dataB = await agent.aiQuery('string[]，列表中的任务名称');
+
+// dataC 将是一个包含对象的数组
+const dataC = await agent.aiQuery(
+  '{name: string, age: string}[], 表格中的数据记录',
+);
+
+// 使用 domIncluded 功能提取 UI 中不可见的属性
+const dataD = await agent.aiQuery(
+  '{name: string, age: string, avatarUrl: string}[], 表格中的数据记录',
+  { domIncluded: true },
+);
+```
+
+此外，我们还提供了 `aiBoolean()`, `aiNumber()`, `aiString()` 三个便捷方法，用于直接提取布尔值、数字和字符串。
+
+### `agent.aiBoolean()`
+
+从 UI 中提取一个布尔值。
+
+- 类型
+
+```typescript
+function aiBoolean(prompt: string | Object, options?: Object): Promise<boolean>;
+```
+
+- 参数：
+
+  - `prompt: string` - 用自然语言描述的期望值，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `domIncluded?: boolean | 'visible-only'` - 是否向模型发送精简后的 DOM 信息，一般用于提取 UI 中不可见的属性，比如图片的链接。如果设置为 `'visible-only'`，则只发送可见的元素。默认值为 false。
+    - `screenshotIncluded?: boolean` - 是否向模型发送截图。默认值为 true。
+
+- 返回值：
+
+  - 返回一个 Promise。当 AI 返回结果时解析为布尔值。
+
+- 示例：
+
+```typescript
+const boolA = await agent.aiBoolean('是否存在登录对话框');
+
+// 使用 domIncluded 功能提取 UI 中不可见的属性
+const boolB = await agent.aiBoolean('忘记密码按钮是否存在链接', {
+  domIncluded: true,
+});
+```
+
+### `agent.aiNumber()`
+
+从 UI 中提取一个数字。
+
+- 类型
+
+```typescript
+function aiNumber(prompt: string | Object, options?: Object): Promise<number>;
+```
+
+- 参数：
+
+  - `prompt: string | Object` - 用自然语言描述的期望值，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `domIncluded?: boolean | 'visible-only'` - 是否向模型发送精简后的 DOM 信息，一般用于提取 UI 中不可见的属性，比如图片的链接。如果设置为 `'visible-only'`，则只发送可见的元素。默认值为 false。
+    - `screenshotIncluded?: boolean` - 是否向模型发送截图。默认值为 true。
+
+- 返回值：
+
+  - 返回一个 Promise。当 AI 返回结果时解析为数字。
+
+- 示例：
+
+```typescript
+const numberA = await agent.aiNumber('账户剩余的积分');
+
+// 使用 domIncluded 功能提取 UI 中不可见的属性
+const numberB = await agent.aiNumber('账户剩余的积分元素的 value 值', {
+  domIncluded: true,
+});
+```
+
+### `agent.aiString()`
+
+从 UI 中提取一个字符串。
+
+- 类型
+
+```typescript
+function aiString(prompt: string | Object, options?: Object): Promise<string>;
+```
+
+- 参数：
+
+  - `prompt: string | Object` - 用自然语言描述的期望值，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `domIncluded?: boolean | 'visible-only'` - 是否向模型发送精简后的 DOM 信息，一般用于提取 UI 中不可见的属性，比如图片的链接。如果设置为 `'visible-only'`，则只发送可见的元素。默认值为 false。
+    - `screenshotIncluded?: boolean` - 是否向模型发送截图。默认值为 true。
+
+- 返回值：
+
+  - 返回一个 Promise。当 AI 返回结果时解析为字符串。
+
+- 示例：
+
+```typescript
+const stringA = await agent.aiString('当前列表的第一条记录的名称');
+
+// 使用 domIncluded 功能提取 UI 中不可见的属性
+const stringB = await agent.aiString('当前列表的第一条记录的跳转链接', {
+  domIncluded: true,
+});
+```
+
+## 更多方法
+
+### `agent.aiAssert()`
+
+通过自然语言描述一个断言条件，让 AI 判断该条件是否为真。当条件不满足时，SDK 会抛出错误，并在错误信息中追加 AI 返回的详细原因。
+
+- 类型
+
+```typescript
+function aiAssert(
+  assertion: string | Object, 
+  errorMsg?: string, 
+  options?: Object
+): Promise<void>;
+```
+
+- 参数：
+
+  - assertion: string | Object - 用自然语言描述的断言条件，或[使用图片作为提示词](#使用图片作为提示词)。
+  - errorMsg?: string - 当断言失败时附加的可选错误提示信息。
+  - options?: Object - 可选，一个配置对象，包含：
+    - `domIncluded?: boolean | 'visible-only'` - 是否向模型发送精简后的 DOM 信息，一般用于提取 UI 中不可见的属性，比如图片的链接。如果设置为 `'visible-only'`，则只发送可见的元素。默认值为 false。
+    - `screenshotIncluded?: boolean` - 是否向模型发送截图。默认值为 true。
+
+- 返回值：
+
+  - 返回一个 Promise。当断言成功时解析为 void；若断言失败，则抛出一个错误，错误信息包含 `errorMsg` 以及 AI 生成的原因。
+
+- 示例：
+
+```typescript
+await agent.aiAssert('"Sauce Labs Onesie" 的价格是 7.99');
+```
+
+:::tip
+断言在测试脚本中非常重要。为了降低因 AI 幻觉导致错误断言的风险（例如遗漏错误），你也可以使用 `.aiQuery` 加上常规的 JavaScript 断言来替代 `.aiAssert`。
+
+例如，你可以这样替代上面的断言代码：
+
+```typescript
+const items = await agent.aiQuery(
+  '"{name: string, price: number}[], 返回商品名称和价格列表',
+);
+const onesieItem = items.find((item) => item.name === 'Sauce Labs Onesie');
+expect(onesieItem).toBeTruthy();
+expect(onesieItem.price).toBe(7.99);
+```
+
+:::
+
+### `agent.aiLocate()`
+
+通过自然语言描述一个元素的定位。
+
+- 类型
+
+```typescript
+function aiLocate(
+  locate: string | Object,
+  options?: {
+    cacheable?: boolean;
+  },
+): Promise<{
+  rect: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+  center: [number, number];
+  scale: number; // device pixel ratio
+}>;
+```
+
+- 参数：
+
+  - `locate: string | Object` - 用自然语言描述的元素定位，或[使用图片作为提示词](#使用图片作为提示词)。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `deepThink?: boolean` - 是否开启深度思考。如果为 true，Midscene 会调用 AI 模型两次以精确定位元素。默认值为 false
+    - `xpath?: string` - 目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+    - `cacheable?: boolean` - 当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 true
+
+- 返回值：
+
+  - 返回一个 Promise。当元素定位成功时解析为元素定位信息。
+
+- 示例：
+
+```typescript
+const locateInfo = await agent.aiLocate('页面顶部的登录按钮');
+console.log(locateInfo);
+```
+
+### `agent.aiWaitFor()`
+
+等待某个条件达成。考虑到 AI 服务的成本，检查间隔不会超过 `checkIntervalMs` 毫秒。
+
+- 类型
+
+```typescript
+function aiWaitFor(
+  assertion: string,
+  options?: {
+    timeoutMs?: number;
+    checkIntervalMs?: number;
+  },
+): Promise<void>;
+```
+
+- 参数：
+
+  - `assertion: string` - 用自然语言描述的断言条件
+  - `options?: object` - 可选的配置对象
+    - `timeoutMs?: number` - 超时时间（毫秒），默认为 15000
+    - `checkIntervalMs?: number` - 检查间隔（毫秒），默认为 3000
+
+- 返回值：
+
+  - 返回一个 Promise。当断言成功时解析为 void；若超时，则抛出错误。
+
+- 示例：
+
+```typescript
+// 基本用法
+await agent.aiWaitFor('界面上至少有一个耳机的信息');
+
+// 使用自定义配置
+await agent.aiWaitFor('购物车图标显示数量为 2', {
+  timeoutMs: 30000, // 等待 30 秒
+  checkIntervalMs: 5000, // 每 5 秒检查一次
+});
+```
+
+:::tip
+考虑到 AI 服务的时间消耗，`.aiWaitFor` 并不是一个特别高效的方法。使用一个普通的 `sleep` 可能是替代 `waitFor` 的另一种方式。
+:::
+
+### `agent.runYaml()`
+
+执行一个 YAML 格式的自动化脚本。脚本中的 `tasks` 部分会被执行，并返回所有 `.aiQuery` 调用的结果。
+
+- 类型
+
+```typescript
+function runYaml(yamlScriptContent: string): Promise<{ result: any }>;
+```
+
+- 参数：
+
+  - `yamlScriptContent: string` - YAML 格式的脚本内容
+
+- 返回值：
+
+  - 返回一个包含 `result` 属性的对象，其中包含所有 `aiQuery` 调用的结果
+
+- 示例：
+
+```typescript
+const { result } = await agent.runYaml(`
+tasks:
+  - name: search weather
+    flow:
+      - ai: input 'weather today' in input box, click search button
+      - sleep: 3000
+
+  - name: query weather
+    flow:
+      - aiQuery: "the result shows the weather info, {description: string}"
+`);
+console.log(result);
+```
+
+:::tip
+更多关于 YAML 脚本的信息，请参考 [Automate with Scripts in YAML](./automate-with-scripts-in-yaml)。
+:::
+
+### `agent.setAIActionContext()`
+
+设置在调用 `agent.aiAction()` 或 `agent.ai()` 时，发送给 AI 模型的背景知识。这个设置会覆盖之前的设置。
+
+对于即时操作类型的 API，比如 `aiTap()`，这个设置不会生效。
+
+- 类型
+
+```typescript
+function setAIActionContext(actionContext: string): void;
+```
+
+- 参数：
+
+  - `actionContext: string` - 要发送给 AI 模型的背景知识。
+
+- 示例：
+
+```typescript
+await agent.setAIActionContext('如果 “使用cookie” 对话框存在，先关闭它');
+```
+
+### `agent.evaluateJavaScript()`
+
+> 仅在 web 页面中可用，在 Android 下不可用
+
+这个方法允许你在 web 页面上下文中执行一段 JavaScript 代码，并返回执行结果。
+
+- 类型
+
+```typescript
+function evaluateJavaScript(script: string): Promise<any>;
+```
+
+- 参数：
+
+  - `script: string` - 要执行的 JavaScript 代码。
+
+- 返回值：
+
+  - 返回执行结果。
+
+- 示例：
+
+```typescript
+const result = await agent.evaluateJavaScript('document.title');
+console.log(result);
+```
+
+### `agent.logScreenshot()`
+
+在报告文件中记录当前截图，并添加描述。
+
+- 类型
+
+```typescript
+function logScreenshot(title?: string, options?: Object): Promise<void>;
+```
+
+- 参数：
+
+  - `title?: string` - 可选，截图的标题，如果未提供，则标题为 'untitled'。
+  - `options?: Object` - 可选，一个配置对象，包含：
+    - `content?: string` - 截图的描述。
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+await agent.logScreenshot('登录页面', {
+  content: '用户 A',
+});
+```
+
+### `agent.freezePageContext()`
+
+冻结当前页面上下文，使后续所有的操作都复用同一个页面快照，避免多次重复获取页面状态。在执行大量并发操作时，它可以显著提升性能。
+
+一些注意点：
+* 通常情况下，你不需要使用这个方法，除非你确定“页面状态获取”是脚本性能瓶颈。
+* 需要及时调用 `agent.unfreezePageContext()` 来恢复实时页面状态。
+* 不要在交互类操作中使用这个方法，它会让 AI 模型无法感知到页面的最新状态，产生令人困惑的错误。
+
+- 类型
+
+```typescript
+function freezePageContext(): Promise<void>;
+```
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+// 冻结页面上下文，确保多个操作看到相同的页面状态
+await agent.freezePageContext();
+
+// 执行一些操作...
+const results = await Promise.all([
+  await agent.aiQuery('Username input box value'),
+  await agent.aiQuery('Password input box value'),
+  await agent.aiLocate('Login button'),
+]);
+console.log(results);
+
+// 解冻页面上下文
+await agent.unfreezePageContext();
+```
+
+:::tip
+在报告中，使用冻结上下文的操作会在 Insight tab 中显示 🧊 图标。
+:::
+
+### `agent.unfreezePageContext()`
+
+解冻页面上下文，恢复使用实时的页面状态。
+
+- 类型
+
+```typescript
+function unfreezePageContext(): Promise<void>;
+```
+
+- 返回值：
+
+  - `Promise<void>`
+
+### `agent._unstableLogContent()`
+
+从报告文件中获取日志内容。日志内容的结构可能会在未来发生变化。
+
+- 类型
+
+```typescript
+function _unstableLogContent(): Object;
+```
+
+- 返回值：
+
+  - 返回一个对象，包含日志内容。
+
+- 示例：
+
+```typescript
+const logContent = agent._unstableLogContent();
+console.log(logContent);
+```
+
+## 属性
+
+### `.reportFile`
+
+报告文件的路径。
+
+## 更多配置
+
+### 在运行时设置环境变量
+
+你可以通过 `overrideAIConfig` 方法在运行时设置环境变量。
+
+```typescript
+import { overrideAIConfig } from '@midscene/web/puppeteer'; // 或其他的 Agent
+
+overrideAIConfig({
+  OPENAI_BASE_URL: '...',
+  OPENAI_API_KEY: '...',
+  MIDSCENE_MODEL_NAME: '...',
+});
+```
+
+### 打印 AI 性能信息
+
+设置 `DEBUG=midscene:ai:profile:stats` 环境变量，你可以看到每次调用 AI 的时间和 token 数量。
+
+```bash
+export DEBUG=midscene:ai:profile:stats
+```
+
+### 自定义运行产物目录
+
+设置 `MIDSCENE_RUN_DIR` 变量，你可以自定义运行产物目录。
+
+```bash
+export MIDSCENE_RUN_DIR=midscene_run # 默认值为当前运行目录下的 midscene_run 目录，支持设置为绝对路径或者相对于当前目录的相对路径
+```
+
+### 自定义重新规划循环限制
+
+设置 `MIDSCENE_REPLANNING_CYCLE_LIMIT` 变量，你可以自定义在执行操作(`aiAction`)时允许的最大重新规划循环次数。
+
+```bash
+export MIDSCENE_REPLANNING_CYCLE_LIMIT=10 # 默认值为 10。当 AI 需要重新规划超过这个限制时，会抛出错误建议将任务拆分为多个步骤
+```
+
+### 使用 LangSmith
+
+LangSmith 是一个用于调试大语言模型的平台。想要集成 LangSmith，请按以下步骤操作：
+
+```bash
+# 设置环境变量
+
+# 启用调试标志
+export MIDSCENE_LANGSMITH_DEBUG=1
+
+# LangSmith 配置
+export LANGSMITH_TRACING_V2=true
+export LANGSMITH_ENDPOINT="https://api.smith.langchain.com"
+export LANGSMITH_API_KEY="your_key_here"
+export LANGSMITH_PROJECT="your_project_name_here"
+```
+
+启动 Midscene 后，你应该会看到类似如下的日志：
+
+```log
+DEBUGGING MODE: langsmith wrapper enabled
+```
+
+## 高级功能
+
+### 使用图片作为提示词
+
+你可以在提示词中使用图片作为补充，来描述无法通过自然语言表达的内容。
+
+使用图片作为提示词时，提示词的参数格式如下：
+
+```javascript
+{
+  // 提示词文本，其中可提及需要使用的图片
+  prompt: string,
+  // 提示词中提到的图片
+  images?: {
+    // 图片名称，需要和提示词文本中提到的图片名称对应
+    name: string,
+    // 图片 url，可以是本地图片路径、Base64 字符串，或者图片的 http 链接
+    url: string
+  }[]
+  // 开启该选项后，http 格式的图片链接会被转化为 Base64 编码发送给大模型，适用于图片链接不是公开可访问的情况。
+  convertHttpImage2Base64?: boolean
+}
+```
+
+- 示例一：使用图片描述点击位置
+
+```javascript
+await agent.aiTap({
+  prompt: '指定 logo',
+  images: [
+    {
+      name: '指定 logo',
+      url: 'https://github.githubassets.com/assets/GitHub-Mark-ea2971cee799.png',
+    },
+  ],
+});
+```
+
+- 示例二：使用图片进行页面断言
+
+```javascript
+await agent.aiAssert({
+  prompt: '页面上是否存在指定 logo',
+  images: [
+    {
+      name: '指定 logo',
+      url: 'https://github.githubassets.com/assets/GitHub-Mark-ea2971cee799.png',
+    },
+  ],
+});
+```
+
+**图片尺寸的注意事项**
+
+在提示词中使用图片时，可能需要关注模型提供商对图片体积和尺寸的要求，过大（比如超过 10M）或过小（比如小于 10 像素）的图片都有可能导致模型调用时出现报错，具体的限制请以你所使用模型提供商的文档为准。
+
+
+
+---
+url: /zh/automate-with-scripts-in-yaml.md
+---
+
+
+
+# 使用 YAML 格式的自动化脚本
+
+在大多数情况下，开发者编写自动化脚本只是为了执行一些简单流程，比如检查某些内容是否出现，或者验证某个关键用户路径是否可用。此时维护一个大型测试项目会显得毫无必要。
+
+⁠Midscene 提供了一种基于 `.yaml` 文件的自动化测试方法，这有助于你专注于编写流程，而不是测试框架。
+
+这里有一个示例，通过阅读它的内容，你应该已经理解了它的工作原理。
+
+```yaml
+web:
+  url: https://www.bing.com
+
+tasks:
+  - name: 搜索天气
+    flow:
+      - ai: 搜索 "今日天气"
+      - sleep: 3000
+
+  - name: 检查结果
+    flow:
+      - aiAssert: 结果中展示了天气信息
+```
+
+:::info 样例项目
+
+你可以在这里找到使用 YAML 脚本做自动化的样例项目
+
+- [Web](https://github.com/web-infra-dev/midscene-example/tree/main/yaml-scripts-demo)
+- [Android](https://github.com/web-infra-dev/midscene-example/tree/main/android/yaml-scripts-demo)
+
+:::
+
+## 配置 AI 模型服务
+
+将你的模型配置写入环境变量。更多信息请查看 [选择 AI 模型](../choose-a-model)。
+
+```bash
+# 替换为你的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 可能需要更多配置，如模型名称、接入点等，请参考 《选择 AI 模型》文档
+export OPENAI_BASE_URL="..."
+```
+
+
+或使用当前命令运行目录下的 `.env` 文件存储配置，Midscene 命令行工具在运行 yaml 脚本时会自动加载它
+
+```ini filename=.env
+OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+```
+
+## 使用命令行工具
+
+全局安装 `@midscene/cli`
+
+```bash
+npm i -g @midscene/cli
+# 或在项目中安装
+npm i @midscene/cli --save-dev
+```
+
+编写一个名为 `bing-search.yaml` 的文件来驱动 web 浏览器的自动化任务
+
+```yaml
+web:
+  url: https://www.bing.com
+
+tasks:
+  - name: 搜索天气
+    flow:
+      - ai: 搜索 "今日天气"
+      - sleep: 3000
+      - aiAssert: 结果显示天气信息
+```
+
+或者驱动安卓设备的自动化任务（需要使用 adb 连接安卓设备）
+
+```yaml
+android:
+  # launch: https://www.bing.com
+  deviceId: s4ey59
+
+tasks:
+  - name: 搜索天气
+    flow:
+      - ai: 打开浏览器并导航到 bing.com
+      - ai: 搜索 "今日天气"
+      - sleep: 3000
+      - aiAssert: 结果显示天气信息
+```
+
+运行脚本
+
+```bash
+midscene ./bing-search.yaml
+# 或者如果你在项目中安装了 midscene
+npx midscene ./bing-search.yaml
+```
+
+你将会看到脚本的执行进度和可视化运行报告文件。
+
+## 脚本文件结构
+
+脚本文件使用 YAML 格式来描述自动化任务。它定义了要操作的目标（如网页或安卓应用）以及一系列要执行的步骤。
+
+一个标准的 `.yaml` 脚本文件包含 `web` 或 `android` 部分配置环境，以及一个 `tasks` 部分来定义自动化任务。
+
+```yaml
+web:
+  url: https://www.bing.com
+
+# tasks 部分定义了要执行的一系列步骤
+tasks:
+  - name: 搜索天气
+    flow:
+      - ai: 搜索 "今日天气"
+      - sleep: 3000
+      - aiAssert: 结果显示天气信息
+```
+
+### `web` 部分
+
+```yaml
+web:
+  # 访问的 URL，必填。如果提供了 `serve` 参数，则提供相对路径
+  url: <url>
+
+  # 在本地路径下启动一个静态服务，可选
+  serve: <root-directory>
+
+  # 浏览器 UA，可选
+  userAgent: <ua>
+
+  # 浏览器视口宽度，可选，默认 1280
+  viewportWidth: <width>
+
+  # 浏览器视口高度，可选，默认 960
+  viewportHeight: <height>
+
+  # 浏览器设备像素比，可选，默认 1
+  deviceScaleFactor: <scale>
+
+  # JSON 格式的浏览器 Cookie 文件路径，可选
+  cookie: <path-to-cookie-file>
+
+  # 等待网络空闲的策略，可选
+  waitForNetworkIdle:
+    # 等待超时时间，可选，默认 2000ms
+    timeout: <ms>
+    # 是否在等待超时后继续，可选，默认 true
+    continueOnNetworkIdleError: <boolean>
+
+  # 输出 aiQuery/aiAssert 结果的 JSON 文件路径，可选
+  output: <path-to-output-file>
+
+  # 是否保存日志内容到 JSON 文件，可选，默认 `false`。如果为 true，保存到 `unstableLogContent.json` 文件中。如果为字符串，则保存到该字符串指定的路径中。日志内容的结构可能会在未来发生变化。
+  unstableLogContent: <boolean | path-to-unstable-log-file>
+
+  # 是否限制页面在当前 tab 打开，可选，默认 true
+  forceSameTabNavigation: <boolean>
+
+  # 桥接模式，可选，默认 false，可以为 'newTabWithUrl' 或 'currentTab'。更多详情请参阅后文
+  bridgeMode: false | 'newTabWithUrl' | 'currentTab'
+
+  # 是否在桥接断开时关闭新创建的标签页，可选，默认 false
+  closeNewTabsAfterDisconnect: <boolean>
+
+  # 是否忽略 HTTPS 证书错误，可选，默认 false
+  acceptInsecureCerts: <boolean>
+
+  # 在调用 aiAction 时发送给 AI 模型的背景知识，可选
+  aiActionContext: <string>
+```
+
+### `android` 部分
+
+```yaml
+android:
+  # 设备 ID，可选，默认使用第一个连接的设备
+  deviceId: <device-id>
+
+  # 启动 URL，可选，默认使用设备当前页面
+  launch: <url>
+
+  # 输出 aiQuery/aiAssert 结果的 JSON 文件路径，可选
+  output: <path-to-output-file>
+```
+
+### `tasks` 部分
+
+`tasks` 部分是一个数组，定义了脚本执行的步骤。记得在每个步骤前添加 `-` 符号，表明这些步骤是个数组。
+
+`flow` 部分的接口与 [API](./api.html) 几乎相同，除了一些参数的嵌套层级。
+
+```yaml
+tasks:
+  - name: <name>
+    continueOnError: <boolean> # 可选，错误时是否继续执行下一个任务，默认 false
+    flow:
+      # 自动规划(Auto Planning, .ai)
+      # ----------------
+
+      # 执行一个交互，`ai` 是 `aiAction` 的简写方式
+      - ai: <prompt>
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 这种用法与 `ai` 相同
+      - aiAction: <prompt>
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 即时操作(Instant Action, .aiTap, .aiHover, .aiInput, .aiKeyboardPress, .aiScroll)
+      # ----------------
+
+      # 点击一个元素，用 prompt 描述元素位置
+      - aiTap: <prompt>
+        deepThink: <boolean> # 可选，是否使用深度思考（deepThink）来精确定位元素。默认值为 False
+        xpath: <xpath> # 可选，目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 鼠标悬停一个元素，用 prompt 描述元素位置
+      - aiHover: <prompt>
+        deepThink: <boolean> # 可选，是否使用深度思考（deepThink）来精确定位元素。默认值为 False
+        xpath: <xpath> # 可选，目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 输入文本到一个元素，用 prompt 描述元素位置
+      - aiInput: <输入框的最终文本内容>
+        locate: <prompt>
+        deepThink: <boolean> # 可选，是否使用深度思考（deepThink）来精确定位元素。默认值为 False
+        xpath: <xpath> # 可选，目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 在元素上按下某个按键（如 Enter，Tab，Escape 等），用 prompt 描述元素位置
+      - aiKeyboardPress: <按键>
+        locate: <prompt>
+        deepThink: <boolean> # 可选，是否使用深度思考（deepThink）来精确定位元素。默认值为 False
+        xpath: <xpath> # 可选，目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 全局滚动，或滚动 prompt 描述的元素
+      - aiScroll:
+        direction: 'up' # 或 'down' | 'left' | 'right'
+        scrollType: 'once' # 或 'untilTop' | 'untilBottom' | 'untilLeft' | 'untilRight'
+        distance: <number> # 可选，滚动距离，单位为像素
+        locate: <prompt> # 可选，执行滚动的元素
+        deepThink: <boolean> # 可选，是否使用深度思考（deepThink）来精确定位元素。默认值为 False
+        xpath: <xpath> # 可选，目标元素的 xpath 路径，用于执行当前操作。如果提供了这个 xpath，Midscene 会优先使用该 xpath 来找到元素，然后依次使用缓存和 AI 模型。默认值为空
+
+        cacheable: <boolean> # 可选，当启用 [缓存功能](./caching.mdx) 时，是否允许缓存当前 API 调用结果。默认值为 True
+
+      # 在报告文件中记录当前截图，并添加描述
+      - logScreenshot: <title> # 可选，截图的标题，如果未提供，则标题为 'untitled'
+        content: <content> # 可选，截图的描述
+
+      # 数据提取
+      # ----------------
+
+      # 执行一个查询，返回一个 JSON 对象
+      - aiQuery: <prompt> # 记得在提示词中描述输出结果的格式
+        name: <name> # 查询结果在 JSON 输出中的 key
+
+      # 更多 API
+      # ----------------
+
+      # 等待某个条件满足，并设置超时时间(ms，可选，默认 30000)
+      - aiWaitFor: <prompt>
+        timeout: <ms>
+
+      # 执行一个断言
+      - aiAssert: <prompt>
+        errorMessage: <error-message> # 可选，当断言失败时打印的错误信息。
+        name: <name> # 可选，给断言一个名称，会在 JSON 输出中作为 key 使用
+
+      # 等待一定时间
+      - sleep: <ms>
+
+      # 在 web 页面上下文中执行一段 JavaScript 代码
+      - javascript: <javascript>
+        name: <name> # 可选，给返回值一个名称，会在 JSON 输出中作为 key 使用
+
+  - name: <name>
+    flow:
+      # ...
+```
+
+## 命令行工具的高级用法
+
+`@midscene/cli` 提供了灵活的方式来运行你的自动化脚本。
+
+### 运行一个或多个脚本
+
+你可以直接向 `midscene` 命令传递一个 `.yaml` 脚本文件或使用通配符模式来匹配多个 `.yaml`。这是 `--files` 参数的简写方式。
+
+```bash
+# 运行单个脚本
+midscene ./bing-search.yaml
+
+# 使用通配符模式运行所有匹配的脚本
+midscene './scripts/**/*.yaml'
+```
+
+### 命令行选项
+
+命令行工具提供了一些选项来控制脚本的执行行为。
+
+- `--files <file1> <file2> ...`: 指定要执行的脚本文件列表，文件将按顺序执行。支持通配符模式，遵循 [glob](https://www.npmjs.com/package/glob) 支持的语法。
+- `--concurrent <number>`: 设置并发执行的数量。默认为 `1`。
+- `--continue-on-error`: 如果设置了此选项，即使有脚本文件执行失败，也会继续运行余下的脚本文件。默认关闭。
+- `--share-browser-context`: 在所有脚本之间共享同一个浏览器上下文（例如 Cookies 和 `localStorage`）。这对于需要登录状态的连续测试非常有用，默认关闭。
+- `--summary <filename>`: 指定生成的 JSON 格式汇总报告文件的路径。
+- `--headed`: 在有图形界面的浏览器中运行脚本，而不是在无头模式下。
+- `--keep-window`: 脚本执行结束后保持浏览器窗口打开。此选项会自动启用 `--headed` 参数。
+- `--config <filename>`: 指定配置文件，配置文件中的参数将作为命令行参数的默认值。
+- `--web.userAgent <ua>`: 设置浏览器 UA，这将覆盖所有脚本文件中的 `web.userAgent` 参数。
+- `--web.viewportWidth <width>`: 设置浏览器视口宽度，这将覆盖所有脚本文件中的 `web.viewportWidth` 参数。
+- `--web.viewportHeight <height>`: 设置浏览器视口高度，这将覆盖所有脚本文件中的 `web.viewportHeight` 参数。
+- `--android.deviceId <device-id>`: 设置安卓设备 ID，这将覆盖所有脚本文件中的 `android.deviceId` 参数。
+- `--dotenv-debug`: 设置 dotenv 的 debug 日志，默认关闭。
+- `--dotenv-override`: 设置 dotenv 是否覆盖同名的全局环境变量，默认关闭。
+
+举例：
+
+使用 `--files` 参数来指定文件顺序，并行执行
+
+```bash
+midscene --files ./login.yaml ./buy/*.yaml ./checkout.yaml
+```
+
+以 4 个并发数运行所有脚本，并在任一文件出错时继续
+
+```bash
+midscene --files './scripts/**/*.yaml' --concurrent 4 --continue-on-error
+```
+
+### 以文件形式编写命令行参数
+
+你可以编写 YAML 格式的配置文件，然后通过 `--config` 来引用它。调用命令行工具时，命令行参数的优先级高于配置文件。
+
+```yaml
+files:
+  - './scripts/login.yaml'
+  - './scripts/search.yaml'
+  - './scripts/**/*.yaml'
+
+concurrent: 4
+continueOnError: true
+shareBrowserContext: true
+```
+
+使用方法：
+
+```bash
+midscene --config ./config.yaml
+```
+
+## 更多特性
+
+### 在 `.yaml` 文件中使用环境变量
+
+你可以在 `.yaml` 文件中使用环境变量，通过 `${variable-name}` 的方式。
+
+例如，如果你有一个 `.env` 文件，内容如下：
+
+```ini filename=.env
+topic=weather today
+```
+
+你可以在 `.yaml` 文件中使用环境变量，如下所示：
+
+```yaml
+#...
+- ai: type ${topic} in input box
+#...
+```
+
+### 运行在有界面(Headed)模式下
+
+> 仅 `web` 场景下支持
+
+'headed' 模式意味着浏览器窗口是可见的。默认情况下，脚本会在无界面模式下运行。
+
+如果你想运行在有界面模式下，你可以使用 `--headed` 选项。此外，如果你想在脚本运行结束后保持浏览器窗口打开，你可以使用 `--keep-window` 选项。`--keep-window` 选项会自动开启 `--headed` 模式。
+
+headed 模式会消耗更多资源，所以建议你仅在本地使用。
+
+```bash
+# 运行在有界面模式下
+midscene /path/to/yaml --headed
+
+# 运行在有界面模式下，并在结束后保持浏览器窗口打开
+midscene /path/to/yaml --keep-window
+```
+
+### 使用桥接模式
+
+> 仅 `web` 场景下支持
+
+通过使用桥接模式，你可以利用 YAML 脚本在已有的桌面浏览器上执行自动化。这对于需要复用 Cookies、插件和页面状态，或者需要人工与自动化脚本交互的情况非常有用。
+
+使用桥接模式，你需要先安装 Chrome 扩展，然后在 `target` 部分使用以下配置：
+
+```diff
+web:
+  url: https://www.bing.com
++ bridgeMode: newTabWithUrl
+```
+
+请参阅 [通过 Chrome 扩展桥接模式](./bridge-mode-by-chrome-extension) 了解更多详细信息。
+
+### 使用 JavaScript 运行 YAML 脚本
+
+你也可以使用 JavaScript 运行 YAML 脚本，调用 Agent 上的 [`runYaml`](./api.html#runyaml) 方法即可。注意，这种方法只会执行 YAML 脚本中的 `tasks` 部分。
+
+### 分析命令行工具的运行结果
+
+执行完成后，会在输出目录中生成以下文件：
+
+- 由 `--summary` 选项指定的文件路径（默认是 `index.json`），包含所有文件的执行状态和统计信息
+- 各个 YAML 文件的独立执行结果（JSON 格式）
+- 各个文件的可视化报告（HTML 格式）
+
+## 配置 dotenv 的默认行为
+
+Midscene 使用 [`dotenv`](https://github.com/motdotla/dotenv) 加载 `.env` 文件中的环境变量。
+
+### 关闭 dotenv 的 debug 日志
+
+默认情况下，Midscene 会打印 dotenv 的 debug 信息，如果你不想看到这些信息，你可以使用 `--dotenv-debug` 选项关闭。
+
+```bash
+midscene /path/to/yaml --dotenv-debug=false
+```
+
+### 使用 .env 中的环境变量覆盖同名的全局环境变量
+
+默认情况下，`dotenv` 不会覆盖`.env` 文件中同名的全局环境变量。如果希望覆盖，你可以使用 `--dotenv-override` 选项。
+
+```bash
+midscene /path/to/yaml --dotenv-override=true
+```
+
+## FAQ
+
+**如何从 Chrome 中获取 JSON 格式的 Cookies？**
+
+你可以使用这个 [Chrome 扩展](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) 来导出 Cookies 为 JSON 格式。
+
+**如何打开 dotenv 的 debug 日志？**
+
+Midscene 使用 `dotenv` 加载 `.env` 文件中的环境变量。你可以使用 `--dotenv-debug` 选项来打开 dotenv 的 debug 日志。
+
+```bash
+midscene /path/to/yaml --dotenv-debug=true
+```
+
+## 更多
+
+你可能还想了解 [提示词技巧](./prompting-tips)
+
+
+
+---
+url: /zh/awesome-midscene.md
+---
+
+# Awesome Midscene
+
+基于 Midscene.js 开发的社区项目精选列表，涵盖不同平台和编程语言的扩展功能。
+
+## 社区项目
+
+### iOS 自动化
+- **[midscene-ios](https://github.com/lhuanyu/midscene-ios)** - iOS Mirror 应用的自动化支持工具
+  - 支持 iOS 应用程序的自动化测试和交互
+  - 将 Midscene 的跨平台能力扩展到苹果移动生态系统
+
+### Python SDK
+- **[Midscene-Python](https://github.com/Python51888/Midscene-Python)** - Python 版本的 Midscene SDK
+  - 为 Python 开发者提供 Midscene 的 AI 驱动自动化能力
+  - 支持与现有 Python 测试和自动化工作流程的集成
+
+## 如何贡献
+
+创建了扩展 Midscene.js 功能的项目？我们很乐意在这里展示！
+
+要将你的项目添加到这个列表，请在 [Midscene 仓库](https://github.com/web-infra-dev/midscene) 中提交 issue，告知我们你的 awesome midscene 项目。
+
+## 收录标准
+
+Awesome Midscene 应当满足：
+- 扩展或集成 Midscene.js 功能
+- 积极维护中
+- 有清晰的文档和使用示例
+- 为 Midscene 社区提供价值
+
+---
+
+*没有看到你喜欢的平台或语言支持？考虑创建一个社区项目或为现有项目贡献代码！*
+
+
+---
+url: /zh/blog-introducing-instant-actions-and-deep-think.md
+---
+
+# 即时操作和深度思考
+
+从 Midscene v0.14.0 开始，我们引入了两个新功能：即时操作（Instant Actions）和深度思考（Deep Think）。
+
+## 即时操作（Instant Actions）- 让交互表现更稳定
+
+你可能已经熟悉我们的 `.ai` 接口。它是一个自动规划接口，用于与网页进行交互。例如，当进行搜索时，你可以这样做：
+
+```typescript
+await agent.ai('在搜索框中输入 "Headphones"，按下回车键');
+```
+
+在接口的背后，Midscene 会调用 LLM 来规划步骤并执行它们。你可以在报告中看到整个过程。这是一个非常常见的 AI Agent 运行模式。
+
+![](/blog/report-planning.png)
+
+与此同时，许多测试工程师希望有一个更快的方式来执行 UI 操作。当在 AI 模型中使用复杂 prompt 时，一些 LLM 模型可能规划出错误的步骤，或者返回元素的坐标不准确。这些不可预测的过程时常常会让人感受到挫败。
+
+为了解决这个问题，我们引入了 `aiTap()`, `aiHover()`, `aiInput()`, `aiKeyboardPress()`, `aiScroll()` 接口。这些接口会直接执行指定的操作，而 AI 模型只负责底层任务，如定位元素等。使用这些接口后，整个过程可以明显更快和更可靠。
+
+例如，上面的搜索操作可以重写为：
+
+```typescript
+await agent.aiInput('耳机', '搜索框');
+await agent.aiKeyboardPress('Enter');
+```
+
+在报告中，你会看到现在已经没有了规划 (Planning) 过程：
+
+![](/blog/report-instant-action.png)
+
+使用这些接口的脚本看起来有点冗余（或者不太“智能”），但请相信，使用这些结构化的接口确实是一个节省时间的好方法，尤其是在操作已经非常明确的时候。
+
+## 深度思考（Deep Think）- 让元素定位更准确
+
+当使用 Midscene 与一些复杂的 UI 控件交互时，LLM 可能很难定位目标元素。我们引入了一个新的选项 `deepThink`（深度思考）到即时操作接口中。
+
+启用 `deepThink` 的即时操作函数签名如下：
+
+```typescript
+await agent.aiTap('target', { deepThink: true });
+```
+
+`deepThink` 是一种策略。它会首先找到一个包含目标元素的区域，然后“聚焦”在这个区域中再次搜索元素。通过这种方式，目标元素的坐标会更准确。
+
+让我们以 Coze.com 的工作流编辑页面为例。这个页面有许多自定义的图标在侧边栏。这对于 LLM 来说很难区分目标元素和它的周围元素。
+
+![](/blog/coze-sidebar.png)
+
+在即时操作中使用 `deepThink` 后，脚本会变成这样（当然，你也可以使用 javascript 接口）：
+
+```yaml
+tasks:
+  - name: edit input panel
+    flow:
+      - aiTap: the triangle icon on the left side of the text "Input"
+        deepThink: true
+      - aiTap: the first checkbox in the Input form
+        deepThink: true
+      - aiTap: the expand button on the second row of the Input form (on the right of the checkbox)
+        deepThink: true
+      - aiTap: the delete button on the second last row of the Input form
+        deepThink: true
+      - aiTap: the add button on the last row of the Input form （second button from the right）
+        deepThink: true
+```
+
+通过查看报告文件，你会看到 Midscene 已经找到了页面中的每个目标元素。
+
+![](/blog/report-coze-deep-think.png)
+
+就像上面的例子一样，`deepThink` 的提示词需要遵循 [编写提示词的技巧](./prompting-tips)。这是确保结果稳定的关键。
+
+`deepThink` 只适用于支持视觉定位的模型，如 qwen2.5-vl。如果你使用的是像 gpt-4o 这样的模型，`deepThink` 将无法发挥作用。
+
+
+---
+url: /zh/blog-programming-practice-using-structured-api.md
+---
+
+# 使用 JavaScript 优化 AI 自动化代码
+
+许多开发者喜欢使用 `aiAction` 接口来汇聚自动化任务，甚至将所有复杂逻辑描述在一个自然语言指令中。虽然这看起来很"智能"，但在实际使用中可能遇到一系列问题，甚至陷入 Prompt 反复调优的怪圈中。
+
+最常见的典型场景是编写大段逻辑风暴，如：
+
+```javascript
+aiAction(`
+1. 点击第一个用户
+2. 点击主页右侧的聊天气泡
+3. 如果我曾经给他发过消息，就返回上一级
+4. 如果我没有发过消息，就输入一段打招呼文本，并点击发送
+`)
+```
+
+另一个常见场景是，企图使用 `aiAction` 方法做复杂的流程控制。和传统的 JavaScript 相比，这些复杂 Prompt 的可靠性可能非常差。例如：
+
+```javascript
+aiAction('逐条点击所有记录，如果一个记录包含“已完成”，则跳过')
+```
+
+## 优化路径：使用 JavaScript 和结构化 API 编写自动化脚本
+
+从 v0.16.10 开始，Midscene 提供了数据提取方法，如 `aiBoolean` `aiString` `aiNumber`，可以用于控制流程。
+
+结合这些方法和即时操作方法，如 `aiTap` `aiInput` `aiScroll` `aiHover` 等，可以将复杂逻辑拆分为多个步骤，以提升自动化代码的稳定性。
+
+让我们以第一个错误案例为例，将 `.aiAction` 方法转换为结构化 API 调用：
+
+原始提示：
+
+```txt
+逐条点击所有记录，如果一个记录包含“已完成”，则跳过
+```
+
+转换后的代码：
+
+```javascript
+const recordList = await agent.aiQuery('string[], the record list')
+for (const record of recordList) {
+  const hasCompleted = await agent.aiBoolean(`check if the record ${record}" contains the text "completed"`)
+  if (!hasCompleted) {
+    await agent.aiTap(record)
+  }
+}
+```
+
+修改代码风格后，整个过程可以更可靠和易于维护。
+
+## 一个更复杂的例子
+
+以下是修改前的代码：
+
+```javascript
+aiAction(`
+1. 点击第一个未关注用户，进入用户主页
+2. 点击关注按钮
+3. 返回上一级
+4. 如果所有用户都已关注，则向下滚动一屏
+5. 重复上述步骤，直到所有用户都已关注
+`)
+```
+
+使用结构化 API 后，开发者可以轻松地进行审阅和单步调试：
+
+```javascript
+let user = await agent.aiQuery('string[], 列表中所有未关注用户')
+let currentUserIndex = 0
+
+while (user.length > 0) {
+  console.log('当前用户是', user[currentUserIndex])
+  await agent.aiTap(user[currentUserIndex])
+  try {
+    await agent.aiTap('关注按钮')
+  } catch (e) {
+    // 忽略错误
+  }
+  // 返回上一级
+  await agent.aiTap('返回按钮')
+  
+  currentUserIndex++
+
+  // 检查是否已经遍历了当前列表中的所有用户
+  if (currentUserIndex >= user.length) {
+    // 向下滚动一屏
+    await agent.aiScroll({
+      direction: 'down',
+      scrollType: 'once',
+    })
+    
+    // 获取更新后的用户列表
+    user = await agent.aiQuery('string[], 列表中所有未关注用户')
+    currentUserIndex = 0
+  }
+}
+```
+
+## 常用的结构化 API 方法
+
+### `aiBoolean` - 条件决策
+
+* 适用场景：条件判断、状态检测
+* 优势：将模糊描述转换为明确的布尔值
+
+举例：
+```javascript
+const hasAlreadyChat = await agent.aiBoolean('当前聊天页面上，我是否给他发过消息');
+if (hasAlreadyChat) {
+   // ...
+}
+```
+
+### `aiString` - 文本提取 
+
+* 适用场景：文本内容获取
+* 优势：规避自然语言描述的歧义性
+
+举例：
+```javascript
+const username = await agent.aiString('用户列表里的第一个用户昵称');
+console.log('username is', username);
+```
+
+### `aiNumber` - 数值提取
+
+* 适用场景：计数、数值比较、循环控制
+* 优势：保证返回标准数字类型
+
+举例：
+```javascript
+const unreadCount = await agent.aiNumber('消息图标上的未读数字');
+for (let i = 0; i < unreadCount; i++) {
+   // ...
+}
+``` 
+
+### `aiQuery` - 通用数据提取
+
+* 适用场景：提取任意数据类型
+* 优势：灵活的数据类型处理
+
+举例：
+```javascript
+const userList = await agent.aiQuery('string[], 用户列表');
+```
+
+### 即时操作方法
+
+Midscene 提供了一些即时操作方法，如 `aiTap` `aiInput` `aiScroll` `aiHover` 等，它们也常用于自动化代码中。你可以在 [API](./api.mdx) 页面查看。
+
+## 想要轻松编写结构化代码？
+
+如果你觉得上述 javascript 代码很难写，那么现在是时候使用 AI IDE 了。
+
+使用你的 AI IDE 索引以下文档：
+
+- https://midscenejs.com/blog-programming-practice-using-structured-api.md
+- https://midscenejs.com/api.md
+
+:::tip
+如何将 Midscene 文档添加到 AI IDE？
+
+请参考 [这篇文章](./llm-txt.mdx#usage)。
+:::
+
+接着使用以下提示词：
+
+```
+根据 @Use JavaScript to Optimize the Midscene Al Automation Code 和 @Midscene API 文档中的提示和 API 说明，
+
+请帮我将以下指令转换为结构化 javascript 代码：
+
+<你的提示词>
+```
+
+![](/blog/ai-ide-convert-prompt.png)
+
+输入你的提示词后，AI IDE 会自动将你的提示词转换为结构化 javascript 代码：
+
+![](/blog/ai-ide-convert-prompt-result.png)
+
+快去试试吧！
+
+## 选用 `aiAction` 与结构化代码，哪个才是最优解？
+
+没有标准答案。这取决于模型的能力、实际业务的复杂度。一般来说，如果出现了以下现象，你应该考虑放弃 `aiAction` 方法：
+
+- `aiAction` 在多次重放后，成功率不满足需求
+- 反复调优 `aiAction` 的 prompt 已经让你感到疲惫、耗费了太多时间
+- 需要对脚本进行单步调试
+
+## 接下来做什么？
+
+为了获得更好的性能，你可以检查 [Midscene 缓存功能](./caching) 来缓存规划和 xpath 定位结果。
+
+要了解更多关于结构化 API 的信息，请查看 [API 参考](./api.mdx)。
+
+
+
+---
+url: /zh/blog-support-android-automation.md
+---
+
+# 支持 Android 自动化
+
+我们很高兴地宣布：从 Midscene v0.15 开始，我们开始支持 Android 自动化。AI 驱动的 Android 自动化时代已经到来！
+
+## 案例展示
+
+### 地图导航到景点
+
+打开地图 App，搜索目的地，然后发起导航。
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/android-maps.mp4" controls/>
+
+### Twitter 自动点赞
+
+打开 Twitter，自动点赞 [@midscene_ai](https://x.com/midscene_ai) 的第一个推文。
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/android-twitter.mp4" controls/>
+
+## 适配所有的应用
+
+对于我们的开发者来说，你只需要 adb 和一个视觉语言（visual language, VL）模型服务。所有的准备工作就做好了！
+
+在运行期，我们利用 VL 模型的视觉定位能力来定位屏幕上的目标元素。因此，无论是原生 App ，[Lynx](https://github.com/lynx-family/lynx) 页面还是 Hybrid App 中的 webview，它都无关紧要。开发者可以编写自动化脚本，而无需担心 App 本身的技术栈。
+
+## 引入 Midscene 的全部特性
+
+当使用 Midscene 进行 Web 自动化时，我们的用户喜欢使用我们的 Playground 和运行报告能力。现在，我们已经将这些特性引入到 Android 自动化中！
+
+### 使用 Playground 来试用 Android 自动化，而不需要写任何代码
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/android-playground-lark-en.mp4" poster="/blog/android-playground-lark-poster-cn.png" controls/>
+
+### 使用报告重放整个过程
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/android-ebay.mp4" controls/>
+
+### 使用 YAML 文件编写自动化脚本
+
+```yaml 
+# search headphone on ebay, extract the items info into a json file, and assert the shopping cart icon
+
+android:
+  deviceId: s4ey59
+
+tasks:
+  - name: search headphones
+    flow:
+      - aiAction: open browser and navigate to ebay.com
+      - aiAction: type 'Headphones' in ebay search box, hit Enter
+      - sleep: 5000
+      - aiAction: scroll down the page for 800px
+
+  - name: extract headphones info
+    flow:
+      - aiQuery: >
+          {name: string, price: number, subTitle: string}[], return item name, price and the subTitle on the lower right corner of each item
+        name: headphones
+
+  - name: assert Filter button
+    flow:
+      - aiAssert: There is a Filter button on the page
+```
+
+### 使用 JavaScript SDK 来编写自动化脚本
+
+```ts 
+import { AndroidAgent, AndroidDevice, getConnectedDevices } from '@midscene/android';
+import "dotenv/config"; // read environment variables from .env file
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+Promise.resolve(
+  (async () => {
+    const devices = await getConnectedDevices();
+    const page = new AndroidDevice(devices[0].udid);
+
+    // 👀 init Midscene agent
+    const agent = new AndroidAgent(page,{
+      aiActionContext:
+        'If any location, permission, user agreement, etc. popup, click agree. If login page pops up, close it.',
+    });
+    await page.connect();
+    await page.launch('https://www.ebay.com');
+
+    await sleep(5000);
+
+    // 👀 type keywords, perform a search
+    await agent.aiAction('type "Headphones" in search box, hit Enter');
+
+    // 👀 wait for the loading
+    await agent.aiWaitFor("there is at least one headphone item on page");
+    // or you may use a plain sleep:
+    // await sleep(5000);
+
+    // 👀 understand the page content, find the items
+    const items = await agent.aiQuery(
+      "{itemTitle: string, price: Number}[], find item in list and corresponding price"
+    );
+    console.log("headphones in stock", items);
+
+    // 👀 assert by AI
+    await agent.aiAssert("There is a category filter on the left");
+  })()
+);
+
+```
+
+### 使用两种风格的 API 来执行交互
+
+自动规划（Auto-planning）风格：
+
+```javascript
+await agent.ai('input "Headphones" in search box, hit Enter');
+```
+
+即时操作（Instant Actions）风格：
+
+```javascript
+await agent.aiInput('Headphones', 'search box');
+await agent.aiKeyboardPress('Enter');
+```
+
+## 快速开始
+
+你可以使用 Playground 工具来零代码快速体验 Android 自动化的过程，详情参阅 [使用 Android Playground 快速体验](./quick-experience-with-android)。
+
+在体验完成后，你可以通过 Javascript 代码与 Android 设备进行集成，请参阅 [与 Android(adb) 集成](./integrate-with-android)。
+
+如果你更偏爱 Yaml 文件形式的自动化脚本，请参阅 [使用 YAML 格式的自动化脚本](./automate-with-scripts-in-yaml)。
+
+### 示例项目
+
+我们准备了一个示例项目，供开发者参考：
+
+[JavaScript 示例项目](https://github.com/web-infra-dev/midscene-example/blob/main/android/javascript-sdk-demo)
+
+如果你想要使用自动化进行测试，你可以使用 JavaScript 和 vitest。我们为你准备了一个示例项目，来看看它是如何工作的：
+
+[Vitest demo project](https://github.com/web-infra-dev/midscene-example/blob/main/android/vitest-demo)
+
+此外，你也可以使用 yaml 文件来编写自动化脚本：
+
+[YAML 示例项目](https://github.com/web-infra-dev/midscene-example/blob/main/android/yaml-scripts-demo)
+
+## 限制
+
+1. 不支持元素定位缓存（因为没有 XPath 支持）。但是完全支持 planning 缓存（针对 `.ai` 和 `.aiAction` 方法）以提高执行效率。
+2. 目前只支持一些已知的 VL 模型。如果你想要引入其他 VL 模型，请让我们知道。
+3. 运行性能还不够好。我们还在努力改进它。
+4. VL 模型在 `.aiQuery` 和 `.aiAssert` 中表现不佳。我们将在未来提供一种方法来切换模型以适应不同的任务。
+5. 由于某些安全限制，你可能会在密码输入时得到一个空白截图，Midscene 此时将无法工作。
+
+## 致谢
+
+我们想要感谢以下项目：
+
+- [scrcpy](https://github.com/Genymobile/scrcpy) 和 [yume-chan](https://github.com/yume-chan) 允许我们使用浏览器控制 Android 设备。
+- [appium-adb](https://github.com/appium/appium-adb) 为 adb 提供了 javascript 桥接。
+- [YADB](https://github.com/ysbing/YADB) 为文本输入提供了性能提升。
+
+
+
+---
+url: /zh/bridge-mode-by-chrome-extension.md
+---
+
+# Chrome 桥接模式（Bridge Mode）
+
+import { PackageManagerTabs } from '@theme';
+
+使用 Midscene 的 Chrome 插件桥接模式（Bridge Mode），你可以用本地脚本控制桌面版本的 Chrome。你的脚本可以连接到新标签页或当前已激活的标签页。
+
+使用桌面版本的 Chrome 可以让你复用已有的 cookie、插件、页面状态等。你可以使用自动化脚本与操作者互动，来完成你的任务。
+
+![bridge mode](/midscene-bridge-mode.jpg)
+
+:::info Demo Project
+查看桥接模式（Bridge Mode）的样例项目：: [https://github.com/web-infra-dev/midscene-example/blob/main/bridge-mode-demo](https://github.com/web-infra-dev/midscene-example/blob/main/bridge-mode-demo)
+:::
+
+## 准备工作
+
+1. 配置 OpenAI API Key，或 [自定义模型和服务商](./model-provider)
+
+```bash
+# 更新为你自己的 Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+```
+
+2. 在 Chrome 应用商店安装 [Midscene 浏览器插件](https://chromewebstore.google.com/detail/midscene/gbldofcpkknbggpkmbdaefngejllnief)
+
+## 第一步：安装依赖
+
+<PackageManagerTabs command="install @midscene/web tsx --save-dev" />
+
+## 第二步：编写脚本
+
+编写并保存以下代码为 `./demo-new-tab.ts`。
+
+```typescript
+import { AgentOverChromeBridge } from "@midscene/web/bridge-mode";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+Promise.resolve(
+  (async () => {
+    const agent = new AgentOverChromeBridge();
+
+    // 这个方法将连接到你的桌面 Chrome 的新标签页
+    // 记得启动你的 Chrome 插件，并点击 'allow connection' 按钮。否则你会得到一个 timeout 错误
+    await agent.connectNewTabWithUrl("https://www.bing.com");
+
+    // 这些方法与普通 Midscene agent 相同
+    await agent.ai('type "AI 101" and hit Enter');
+    await sleep(3000);
+
+    await agent.aiAssert("there are some search results");
+    await agent.destroy();
+  })()
+);
+```
+
+## 第三步：启动 Chrome 插件
+
+启动你的桌面 Chrome 和 Midscene 插件，并切换到 'Bridge Mode' 标签页。点击 "Allow connection"。
+
+<p align="center">
+  <img src="/bridge_in_extension.jpg" alt="bridge in extension" width="400"/>
+</p>
+
+## 第四步：运行脚本
+
+运行你的脚本
+
+```bash
+tsx demo-new-tab.ts
+```
+
+执行脚本后，你应该看到 Chrome 插件的状态展示切换为 'connected'，并且新标签页已打开。现在这个标签页由你的脚本控制。
+
+:::info
+执行脚本和点击插件中的 'Allow connection' 按钮没有顺序要求。
+:::
+
+## 构造器
+
+```typescript
+import { AgentOverChromeBridge } from "@midscene/web/bridge-mode";
+
+const agent = new AgentOverChromeBridge();
+```
+
+除了 [普通 Agent 构造器](./api.mdx) 的参数，`AgentOverChromeBridge` 还接受以下参数：
+
+* `closeNewTabsAfterDisconnect?: boolean`: 如果为 true，当桥接断开时，所有新创建的标签页都将被自动关闭。默认值为 false。
+
+## 方法
+
+除了 [普通的 Agent 接口](./api.mdx)，`AgentOverChromeBridge` 还提供了一些额外的接口来控制桌面 Chrome。
+
+:::info
+你应该在执行其他操作前，先调用 `connectCurrentTab` 或 `connectNewTabWithUrl`。
+
+每个 agent 实例只能连接到一个标签页实例，并且一旦被销毁就无法重新连接，需要重新创建 agent 实例。
+:::
+
+### `connectCurrentTab()`
+
+连接到当前已激活的标签页。
+
+* 类型
+
+```typescript
+function connectCurrentTab(options?: { 
+  forceSameTabNavigation?: boolean 
+}): Promise<void>;
+```
+
+* 参数：
+  * `options?: object` - 可选配置对象
+    * `forceSameTabNavigation?: boolean` - 如果为 true（默认值），限制页面打开新的标签页，让新的页面始终在旧的标签页中打开避免人为切换标签页导致 AI 操作失败，正常情况下都不需要更改此配置
+
+* 返回值：
+  * 返回一个 Promise。连接成功时解析为 void；若连接失败则抛出错误
+
+* 示例：
+
+```typescript
+try {
+  await agent.connectCurrentTab();
+  console.log('成功连接到当前标签页');
+} catch (err) {
+  console.error('连接失败:', err.message);
+}
+```
+
+### `connectNewTabWithUrl()`
+
+创建一个新标签页，并立即连接到它。
+
+* 类型
+
+```typescript
+function connectNewTabWithUrl(
+  url: string,
+  options?: { 
+    forceSameTabNavigation?: boolean 
+  }
+): Promise<void>;
+```
+
+* 参数：
+  * `url: string` - 新标签页要打开的 URL
+  * `options?: object` - 可选配置对象（参数同 connectCurrentTab）
+
+* 返回值：
+  * 返回一个 Promise。连接成功时解析为 void；若连接失败则抛出错误
+
+* 示例：
+
+```typescript
+// 打开 Bing 并等待连接
+await agent.connectNewTabWithUrl(
+  "https://www.bing.com",
+  { forceSameTabNavigation: false }
+);
+```
+
+### `destroy()`
+
+销毁连接并释放资源。
+
+* 类型
+
+```typescript
+function destroy(closeNewTabsAfterDisconnect?: boolean): Promise<void>;
+```
+
+* 参数：
+  * `closeNewTabsAfterDisconnect?: boolean` - 如果为 true，当桥接断开时，所有新创建的标签页都将被自动关闭。默认值为 false。这个参数将覆盖构造器中的 `closeNewTabsAfterDisconnect` 参数。
+
+* 返回值：
+  * 返回一个 Promise，销毁完成后解析为 void
+
+* 示例：
+
+```typescript
+// 完成操作后销毁连接
+await agent.ai('执行最终操作...');
+await agent.destroy();
+```
+
+### 更多接口
+
+Agent 中的常用接口（如 `aiAction`，`aiQuery` 等）请阅读 [API 参考](./api.mdx)。
+
+## 在 YAML 自动化脚本中使用桥接模式
+
+[Yaml 格式的自动化脚本](./automate-with-scripts-in-yaml) 是 Midscene 提供给开发者的一种编写自动化脚本的方式。通过使用 yaml 格式，脚本会变得易于阅读和编写。
+
+在 Yaml 脚本中使用桥接模式时，需要配置 `target` 中的 `bridgeMode` 属性。如果想要使用当前标签页，设置为 `currentTab`，否则设置为 `newTabWithUrl`。
+
+例如，以下脚本将会通过 Chrome 插件的桥接模式打开一个新的标签页：
+
+```diff
+target:
+  url: https://www.bing.com
++ bridgeMode: newTabWithUrl
+tasks:
+```
+
+运行脚本：
+
+```bash
+midscene ./bing.yaml
+```
+
+在运行脚本后，记得要启动 Chrome 插件，并点击 'Allow connection' 按钮。
+
+### 不支持的选项
+
+在桥接模式下，以下选项将不会生效（它们将遵循桌面浏览器的设置）：
+- userAgent
+- viewportWidth
+- viewportHeight
+- viewportScale
+- waitForNetworkIdle
+- cookie
+
+
+## FAQ
+
+* 我应该在哪里配置 `OPENAI_API_KEY`，在浏览器里还是命令行里？
+
+当你使用桥接模式时，你应该在命令行里配置 `OPENAI_API_KEY`。
+
+
+
+---
+url: /zh/caching.md
+---
+
+# 缓存
+
+Midscene 支持缓存 Plan 的步骤与匹配到的 DOM 元素信息，减少 AI 模型的调用次数，从而大幅提升执行效率。
+
+Android 自动化任务支持 planning 缓存，但不支持元素定位缓存（因为没有 XPath 支持）。
+
+**效果**
+
+通过引入缓存后，用例的执行时间大幅降低了，例如在如下案例中，执行耗时从51秒降低到了28秒。
+
+* **before**
+
+![](/cache/no-cache-time.png)
+
+* **after**
+
+![](/cache/use-cache-time.png)
+
+## 使用方式
+
+想要启用缓存特性，有两个关键点：
+
+1. 设置 `MIDSCENE_CACHE=1` 环境变量，用以启用缓存匹配
+2. 设置 `cacheId` 来指定缓存文件名。在 Playwright 和 Yaml 模式下，`cacheId` 会自动设置为测试文件名，在 Javascript 模式下，需要手动设置 `cacheId`。
+
+### Playwright
+
+在 Playwright 模式下，只需要设置 `MIDSCENE_CACHE=1` 环境变量即可。
+
+`cacheId` 会自动设置为测试文件名。
+
+```diff
+- playwright test --config=playwright.config.ts
++ MIDSCENE_CACHE=1 playwright test --config=playwright.config.ts
+```
+
+### Javascript agent, 例如 PuppeteerAgent, AgentOverChromeBridge
+
+在 Javascript 模式下，需要设置 `MIDSCENE_CACHE=1` 环境变量，并且需要手动设置 `cacheId`。
+
+```diff
+- tsx demo.ts 
++ MIDSCENE_CACHE=1 tsx demo.ts
+```
+
+```javascript
+const mid = new PuppeteerAgent(originPage, {
+  cacheId: 'puppeteer-swag-sab', // 增加缓存标识
+});
+```
+
+### Yaml
+
+在 Yaml 模式下，需要设置 `MIDSCENE_CACHE=1` 环境变量。
+
+`cacheId` 会自动设置为 yaml 文件名。
+
+```diff
+- npx midscene ./bing-search.yaml
++ # 增加缓存标识, cacheId 为 yaml 文件名
++ MIDSCENE_CACHE=1 npx midscene ./bing-search.yaml
+```
+
+## 缓存策略
+
+缓存内容会保存到 `./midscene_run/cache` 目录下，以 `.cache.yaml` 为扩展名。
+
+缓存内容分为两类：
+
+1. 任务规划结果，例如 `ai` 和 `aiAction` 方法的结果
+2. 元素定位后的 XPath 数据，例如 `.aiLocate`, `.aiTap` 等方法的结果
+
+查询类方法，例如 `aiBoolean`, `aiQuery`, `aiAssert` 的内容不会被缓存。
+
+如果缓存未命中，Midscene 将会重新调用 AI 模型，并更新缓存文件。
+
+## 常见问题
+
+### 如何检查缓存是否命中？
+
+你可以查看报告文件。如果缓存命中，你将看到 `cache` 提示，并且执行时间大幅降低。
+
+### 为什么在 CI 中无法命中缓存？
+
+你需要在 CI 中将缓存文件提交到仓库中，并再次检查缓存命中的条件。
+
+### 如果有了缓存，是否就不需要 AI 服务了？
+
+不是的。
+
+缓存是加速脚本执行的手段，但它不是确保脚本长期稳定执行的工具。我们注意到，当页面发生变化时，缓存可能会失效（例如当元素 DOM 结构发生变化时）。在缓存失效时，Midscene 仍然需要调用 AI 服务来重新执行任务。
+
+### 如何手动删除缓存？
+
+你可以删除缓存文件，或者编辑缓存文件的内容。
+
+### 如果我想禁用单个 API 的缓存，怎么办？
+
+你可以使用 `cacheable` 选项来禁用单个 API 的缓存。
+
+具体用法请参考对应 [API](./api.mdx) 的文档。
+
+### 使用 XPath 缓存元素定位信息的局限性
+
+Midscene 使用 [XPath](https://developer.mozilla.org/en-US/docs/Web/XML/XPath) 来缓存元素定位信息。我们使用相对严格的策略来防止误匹配。在以下情况下，缓存不会命中：
+
+1. 新元素在相同的 XPath 下的文本内容与缓存元素不同。
+2. 页面的 DOM 结构与缓存时的结构不同。
+
+当缓存未命中时，Midscene 将回退到继续使用 AI 服务来查找元素。
+
+### 获取缓存相关的调试日志
+
+在环境变量中配置 `DEBUG=midscene:cache:*`，你可以看到缓存相关的调试日志。
+
+
+---
+url: /zh/changelog.md
+---
+
+# 更新日志
+
+> 完整更新日志请参考：[Midscene Releases](https://github.com/web-infra-dev/midscene/releases)
+
+## v0.27 - 🧠 核心模块重构，断言与报告功能全面升级
+
+### ⚠️ 核心模块重构
+
+在 v0.26 引入 [Rslib](https://github.com/web-infra-dev/rslib) 提升开发体验、降低贡献门槛的基础上，v0.27 更进一步，对核心模块进行了大规模重构。这使得扩展新设备、添加新 AI 操作的成本变得极低，我们诚挚地欢迎社区开发者踊跃贡献！
+
+**由于本次重构涉及面较广，升级后如遇到任何问题，请随时向我们反馈，我们将第一时间跟进处理。**
+
+### 🌐 接口优化
+- **`aiAssert` 功能全面增强**
+  - 新增 `name` 字段，允许为不同的断言任务命名，方便在 JSON 格式的输出结果中进行识别和解析
+  - 新增 `domIncluded` 和 `screenshotIncluded` 选项，可在断言中灵活控制是否向 AI 发送 DOM 快照和页面截图
+
+### 🤖 Chrome 扩展 Playground 升级
+
+- 所有 Agent API 都能在 Playground 上直接调试和运行！交互、提取、验证三大类方法全覆盖，可视化操作和验证，让你的自动化开发效率飙升
+
+### 📊 报告功能优化
+- **新增标记浮层开关**：报告播放器增加了隐藏标记浮层的开关，方便用户在回放时查看无遮挡的原始页面视图
+
+### 🐞 问题修复
+- 修复了 `aiWaitFor` 在偶现错误导致报告未生成问题
+- 降低 Playwright 插件的内存消耗
+
+## v0.26 - 🚀 工具链全面接入 [Rslib](https://github.com/web-infra-dev/rslib)，大幅提高开发体验、降低贡献门槛
+
+### 🌐 Web 集成优化
+- 支持冻结页面上下文（[freezePageContext](./api.mdx#agentfreezepagecontext)/[unfreezePageContext](./api.mdx#agentunfreezepagecontext)），使后续所有的操作都复用同一个页面快照，避免多次重复获取页面状态
+- 为 Playwright fixture 补全所有 agent api ，简化测试脚本编写，解决使用 agentForPage 无法生成报告的问题
+
+### 📱 Android 自动化增强
+- 新增隐藏键盘策略（[keyboardDismissStrategy](./integrate-with-android.html#androiddevice-的构造函数)），允许指定自动隐藏键盘的方式
+  
+### 📊 报告功能优化
+- 报告内容引入懒解析，解决大体积报告的崩溃问题
+- 报告播放器新增自动缩放开关，方便查看全局视角的回放
+- 支持 aiAssert / aiQuery 等任务在报告中播放，以完整展示整个页面变动过程
+- 修复断言失败时的侧栏状态未显示为失败图标的问题
+- 修复报告中下拉筛选器不能切换筛选的问题
+  
+### 🚀 构建与工程化
+- 构建工具迁移至 [Rslib](https://github.com/web-infra-dev/rslib) 库开发工具，提升构建效率和开发体验
+- 全仓库开启源码跳转，方便开发者查看源码
+- MCP npm 包产物体积优化，从 56M 减少到 30M，大幅提高加载速度
+  
+### 🐞 问题修复
+- CLI 在 keepWindow 为 true 时将自动开启 headed 模式
+- 修复 getGlobalConfig 的实现问题，解决环境变量初始化异常问题
+- 确保 base64 编码中的 mime-type 正确
+- 修复 aiAssert 任务返回值类型
+
+## v0.25 - 🚀 支持使用图像作为 AI prompt 输入
+
+### 🎯 核心功能增强
+- 新增运行环境，支持运行在 Worker 环境
+- 支持使用图像作为 AI prompt 输入，详见 [使用图片作为提示词](./api.mdx#%E4%BD%BF%E7%94%A8%E5%9B%BE%E7%89%87%E4%BD%9C%E4%B8%BA%E6%8F%90%E7%A4%BA%E8%AF%8D)
+- 图像处理升级，采用 Photon & Sharp 进行高效图片裁剪
+
+### 🌐 Web 集成优化
+- 通过坐标获取 XPath，提高缓存可复现性
+- 缓存文件将 plan 模块提到最前面，增加可读性
+- Chrome Recorder 支持导出所有事件到 markdown 文档
+- agent 支持指定 HTML 报告名称，详见 [reportFileName](./api.mdx)
+
+### 📱 Android 自动化增强
+- 长按手势支持
+- 下拉刷新支持
+
+### 🐞 问题修复
+  - 使用全局配置处理环境变量，避免因多打包导致环境无法覆盖的问题
+  - 当错误对象序列化失败时，手动构造错误信息
+  - 修复 playwright 报告类型依赖声明顺序问题
+  - 修复 MCP 打包问题
+
+### 📚 文档 AI 友好
+- [LLMs.txt](./llm-txt.mdx) 区分中文与英文，方便 AI 理解
+- 每篇文档顶部新增按钮，支持复制为 markdown，方便喂给 AI 使用
+
+### 🤖 其它功能增强
+- Chrome Recorder 支持 aiScroll 功能
+- 重构 aiAssert 使其与 aiBoolean 实现一致
+
+## v0.24 - 🤖 Android 自动化支持 MCP 调用
+
+### 🚀 Android 自动化支持 MCP 调用
+- Android 自动化已全面支持 MCP 调用，为 Android 开发者提供更完善的自动化工具集。详情请参考：[MCP 服务](./mcp-android.mdx)
+
+### 🌐 优化输入清空机制
+- 针对 Mac 平台的 Puppeteer 增加了双重输入清空机制，保证输入之前清空输入框
+
+### 🔧 开发体验
+- 简化本地构建 `htmlElement.js` 的方式，避免循环依赖导致的报告模板构建问题
+- 优化了开发工作流，只需要执行 `npm run dev` 即可进入 Midscene 工程开发
+
+
+## v0.23 - 📊 全新报告样式与 YAML 脚本能力增强
+
+### 🎨 报告系统升级
+
+#### 全新报告样式
+- 重新设计的测试报告界面，提供更清晰、更美观的测试结果展示
+- 优化报告布局和视觉效果，提升用户阅读体验
+- 增强报告的可读性和信息层次结构
+
+![](https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/new%20report.png)
+
+### ⚙️ YAML 脚本能力增强
+
+#### 支持多 YAML 文件批量执行
+- 新增配置模式，支持配置 Yaml 文件运行顺序、浏览器复用策略、并行度
+- 支持获取 JSON 格式的运行结果
+
+![](https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/Tuji_20250722_161353.338.png)
+
+### 🧪 测试覆盖提升
+
+####  Android 测试增强
+
+- 新增 Android 平台相关测试用例，提升代码质量和稳定性
+- 完善测试覆盖率，确保 Android 功能的可靠性
+
+## v0.22 - 🎬 Chrome 扩展录制功能上线
+
+### 🌐 Web集成增强
+
+#### 1️⃣ 全新的录制功能
+- Chrome 扩展新增录制功能，可以记录用户在页面上的操作并生成自动化脚本
+- 支持录制点击、输入、滚动等常见操作，大大降低自动化脚本编写门槛
+- 录制的操作可以直接在 Playground 中回放和调试
+
+#### 2️⃣ 存储升级到 IndexedDB
+- Chrome 扩展的 Playground 和 Bridge 改为使用 IndexedDB 进行数据存储
+- 相比之前的存储方案，提供更大的存储容量和更好的性能
+- 支持存储更复杂的数据结构，为未来功能扩展奠定基础
+
+#### 3️⃣ 自定义重新规划循环限制
+- 设置 `MIDSCENE_REPLANNING_CYCLE_LIMIT` 环境变量，可以自定义在执行操作(aiAction)时允许的最大重新规划循环次数
+- 默认值为 10，当 AI 需要重新规划超过这个限制时，会抛出错误建议将任务拆分
+- 提供更灵活的任务执行控制，适应不同复杂度的自动化场景
+```bash
+export MIDSCENE_REPLANNING_CYCLE_LIMIT=10 # 默认值为 10
+```
+
+### 📱 Android 功能增强
+
+#### 1️⃣ 截图路径区分
+
+- 为每个截图生成唯一的文件路径，避免文件覆盖问题
+- 提升了并发测试场景下的稳定性
+
+## v0.21 - 🎨 Chrome 扩展界面升级
+
+### 🌐 Web集成增强
+
+#### 1️⃣ 全新的 Chrome 扩展界面
+- 全新的聊天式用户界面设计，提供更好的使用体验
+- 界面布局优化，操作更加直观便捷
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/recording_2025-07-07_08-16-16.mp4" controls/>
+
+#### 2️⃣ 超时配置灵活性提升
+- 支持从测试 fixture 中覆盖超时设置，提供更灵活的超时控制
+- 适用场景：不同测试用例需要不同超时时间的场景
+
+#### 3️⃣ 统一 Puppeteer 和 Playwright 配置
+- 为 Playwright 新增 `waitForNavigationTimeout` 和 `waitForNetworkIdleTimeout` 参数
+- 统一了 Puppeteer 和 Playwright 的 timeout 选项配置，提供一致的 API 体验，降低学习成本
+
+#### 4️⃣ 新增数据导出回调机制
+- 新增 `agent.onDumpUpdate` 回调函数，可在数据导出时获得实时通知
+- 重构了任务结束后的处理流程，确保异步操作的正确执行
+- 适用场景：需要监控或处理导出数据的场景
+
+### 📱 Android 交互优化
+#### 1️⃣ 输入体验改进
+- 将点击输入改为滑动操作，提升交互响应性和稳定性
+- 减少因点击不准确导致的操作失败
+
+## v0.20 - 支持传入 XPath 定位元素
+
+### 🌐 Web集成增强
+#### 1️⃣ 新增 aiAsk 方法
+- 可直接向 AI 模型提问，获取当前页面的字符串形式答案
+- 适用场景：页面内容问答、信息提取等需要 AI 推理的任务
+- 示例：
+
+```typescript
+await agent.aiAsk('问题描述')
+```
+
+####   2️⃣ 支持传入 XPath 定位元素
+- 定位优先级：指定的 XPath > 缓存 > AI 大模型定位
+- 适用场景：已知元素 XPath，需要跳过 AI 大模型定位
+- 示例：
+
+```typescript
+await agent.aiTap('提交按钮', { xpath: '//button[@id="submit"]' })
+```
+
+### 📱 Android 改进
+#### 1️⃣ Playground 任务可取消
+- 支持中断正在执行的自动化任务，提升调试效率
+
+#### 2️⃣ aiLocate API 增强
+- 返回设备像素比（Device Pixel Ratio），通常用于计算元素真实坐标
+
+### 📈 报告生成优化
+改进报告生成机制，从批量存储改为单次追加，有效降低内存占用，避免用例数量大时造成的内存溢出
+
+## v0.19 - 支持获取完整的执行过程数据
+
+### 新增 API 获取 Midscene 执行过程数据
+
+为 agent 添加 `_unstableLogContent` API，即可获取 Midscene 执行过程数据，比如每个步骤的耗时、AI Tokens 消耗情况、页面截图等！
+
+对了，Midscene 的报告就是根据这份数据生成了，也就是说，使用这份数据，你甚至可以定制一个属于你自己的报告！
+
+详情请参考：[API 文档](./api.mdx#agent_unstablelogcontent)
+
+### CLI 新增参数支持调整 Midscene 环境变量优先级
+
+默认情况下，`dotenv` 不会覆盖 `.env` 文件中同名的全局环境变量。如果希望覆盖，你可以使用 `--dotenv-override` 选项。
+
+详情请参考：[使用 YAML 格式的自动化脚本](./automate-with-scripts-in-yaml.mdx#%E4%BD%BF%E7%94%A8-env-%E4%B8%AD%E7%9A%84%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E8%A6%86%E7%9B%96%E5%90%8C%E5%90%8D%E7%9A%84%E5%85%A8%E5%B1%80%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F)
+
+### 大幅减少报告文件大小
+
+裁剪生成的报告中冗余的数据，大幅减少复杂页面的报告文件大小，用户的典型复杂页面报告大小从 47.6M 减小到 15.6M！
+
+## v0.18 - 回放报告功能增强
+
+🚀 Midscene 又有更新啦！为你带来高质量的 UI 自动化体验。
+
+### 在报告中增加自定义节点
+
+* 为 agent 添加 `logScreenshot` API，将当前页面的截图作为报告节点。支持设置节点标题和描述，使报告内容更加丰富。适用于关键步骤截图记录、错误状态捕获、UI 验证等。
+
+![](/blog/logScreenshot-api.png)
+
+* 示例：
+
+```typescript
+test('login github', async ({ ai, aiAssert, aiInput, logScreenshot }) => {
+  if (CACHE_TIME_OUT) {
+    test.setTimeout(200 * 1000);
+  }
+  await ai('Click the "Sign in" button');
+  await aiInput('quanru', 'username');
+  await aiInput('123456', 'password');
+
+  // 自定义记录
+  await logScreenshot('Login page', {
+    content: 'Username is quanru, password is 123456',
+  });
+
+  await ai('Click the "Sign in" button');
+  await aiAssert('Login success');
+});
+```
+
+
+
+### 支持将报告下载为视频
+
+* 支持从报告播放器直接导出视频，点击播放器界面的下载按钮即可保存。
+
+![](/blog/export-video.png)
+
+* 适用场景：分享测试结果、存档重现步骤、演示问题复现
+
+
+
+### Android 暴露更多配置
+
+* 支持使用远程 adb 主机，配置键盘策略
+
+  * `autoDismissKeyboard?: boolean` - 可选参数，是否在输入文本后自动关闭键盘
+
+  * `androidAdbPath?: string` - 可选参数，用于指定 adb 可执行文件的路径
+
+  * `remoteAdbHost?: string` - 可选参数，用于指定远程 adb 主机
+
+  * `remoteAdbPort?: number` - 可选参数，用于指定远程 adb 端口
+
+* 示例：
+
+```typescript
+await agent.aiInput('搜索框', '测试内容', { autoDismissKeyboard: true })
+```
+
+```typescript
+const agent = await agentFromAdbDevice('s4ey59', {
+    autoDismissKeyboard: false, // 可选参数，是否在输入文本后自动关闭键盘。默认值为 true。
+    androidAdbPath: '/usr/bin/adb', // 可选参数，用于指定 adb 可执行文件的路径
+    remoteAdbHost: '192.168.10.1', // 可选参数，用于指定远程 adb 主机
+    remoteAdbPort: '5037' // 可选参数，用于指定远程 adb 端口
+})
+```
+
+立即升级版本，体验这些强大新功能！
+
+* [自定义报告节点 API 文档](/zh/api.mdx#agentlogscreenshot)
+* [Android 更多配置项 API 文档](/zh/integrate-with-android.mdx#androiddevice-%E7%9A%84%E6%9E%84%E9%80%A0%E5%87%BD%E6%95%B0)
+
+
+## v0.17 - 让 AI 看见页面 DOM
+
+### 数据查询 API 全面增强
+
+为满足更多自动化和数据提取场景，以下 API 新增了 options 参数，支持更灵活的 DOM 信息和截图传递：
+
+- `agent.aiQuery(dataDemand, options)`
+- `agent.aiBoolean(prompt, options)`
+- `agent.aiNumber(prompt, options)`
+- `agent.aiString(prompt, options)`
+
+#### 新增 `options` 参数
+
+- `domIncluded`：是否向模型发送精简后的 DOM 信息，默认值为 false。一般用于提取 UI 中不可见的属性，比如图片的链接。
+- `screenshotIncluded`：是否向模型发送截图。默认值为 true。
+
+#### 代码示例
+
+```typescript
+// 提取通讯录中所有联系人的完整信息（包含隐藏的头像链接）
+const contactsData = await agent.aiQuery(
+  "{name: string, id: number, company: string, department: string, avatarUrl: string}[], extract all contact information including hidden avatarUrl attributes",
+  { domIncluded: true }
+);
+
+// 检查通讯录中第一个联系人的 id 属性是否为 1
+const isId1 = await agent.aiBoolean(
+  "Is the first contact's id is 1?",
+  { domIncluded: true }
+);
+
+// 获取第一个联系人的 ID（隐藏属性）
+const firstContactId = await agent.aiNumber("First contact's id?", { domIncluded: true });
+
+// 获取第一个联系人的头像 URL（页面上不可见的属性）
+const avatarUrl = await agent.aiString(
+  "What is the Avatar URL of the first contact?",
+  { domIncluded: true }
+);
+```
+
+### 新增右键点击能力
+
+你有没有遇到过需要自动化右键操作的场景？现在，Midscene 支持了全新的 `agent.aiRightClick()` 方法！
+
+#### 功能
+
+使用右键点击页面元素，适用于那些自定义了右键事件的场景。注意：Midscene 无法与浏览器原生菜单交互。
+
+#### 参数说明
+
+- `locate`: 用自然语言描述你要操作的元素
+- `options`: 可选，支持 `deepThink`（AI精细定位）、`cacheable`（结果缓存）
+
+#### 示例
+
+```typescript
+// 在通讯录应用中右键点击联系人，触发自定义上下文菜单
+await agent.aiRightClick("Alice Johnson", { deepThink: true });
+
+// 然后可以点击菜单中的选项
+await agent.aiTap("Copy Info"); // 复制联系人信息到剪贴板
+```
+
+
+### 示例及其报告
+
+#### 示例页面
+
+<iframe src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/contacts3.html" width="100%" height="800"></iframe>
+
+#### 示例报告
+
+<iframe src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/puppeteer-2025-06-04_20-41-45-be8ibktz.html" width="100%" height="800"></iframe>
+
+
+### 一个完整示例
+
+在下面的报告文件中，我们展示了一个完整的示例，展示了如何使用新的 `aiRightClick` API 和新的查询参数来提取包含隐藏属性的联系人数据。
+
+报告文件：[puppeteer-2025-06-04_20-41-45-be8ibktz.html](https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/puppeteer-2025-06-04_20-41-45-be8ibktz.html)
+
+对应代码可以参考我们的示例仓库：[puppeteer-demo/extract-data.ts](https://github.com/web-infra-dev/midscene-example/blob/main/puppeteer-demo/extract-data.ts)
+
+### 重构缓存能力
+
+使用 xpath 缓存，而不是基于坐标，提高缓存命中概率。
+
+缓存文件格式使用 yaml 替换 json，提高可读性。
+
+## v0.16 - 支持 MCP
+
+### Midscene MCP
+
+🤖 使用 Cursor / Trae 帮助编写测试用例。
+🕹️ 快速实现浏览器操作，媲美 Manus 平台。
+🔧 快速集成 Midscene 能力，融入你的平台和工具。
+
+了解详情: [MCP](./web-mcp.mdx)
+
+### 支持结构化 API 
+
+APIs: `aiBoolean`, `aiNumber`, `aiString`, `aiLocate`
+
+了解详情: [使用结构化 API 优化自动化代码](./blog-programming-practice-using-structured-api.md)
+
+## v0.15 - Android 自动化上线！
+
+### Android 自动化上线！
+
+🤖 AI 调试：自然语言调试
+📱 支持原生、Lynx 和 WebView 应用
+🔁 可回放运行
+🛠️ YAML 或 JS SDK
+⚡ 自动规划 & 即时操作 API
+
+### 更多功能
+
+* 支持自定义 midscene_run 目录
+* 增强报告文件名生成，支持唯一标识符和分段模式
+* 增强超时配置和日志记录，支持网络空闲和导航超时
+* 适配 gemini-2.5-pro
+
+了解详情: [支持 Android 自动化](./blog-support-android-automation.mdx)
+
+## v0.14 - 即时操作 API
+
+### 即时操作 API
+
+* 新增即时操作 API，增强 AI 操作的准确性
+
+了解详情: [即时操作 API](./blog-introducing-instant-actions-and-deep-think.md)
+
+## v0.13 - 深度思考模式
+
+### 原子 AI 交互方法
+
+* 支持 aiTap, aiInput, aiHover, aiScroll, aiKeyboardPress 等原子操作
+
+### 深度思考模式
+
+* 增强点击准确性，提供更深层次的上下文理解
+
+![](/blog/0.13.jpeg)
+
+## v0.12 - 集成 Qwen 2.5 VL
+
+### 集成 Qwen 2.5 VL 的本地能力
+
+* 保持输出准确性
+* 支持更多元素交互
+* 成本降低 80% 以上
+
+## v0.11.0 - UI-TARS 模型缓存
+
+### **✨ UI-TARS 模型支持缓存**
+
+* 通过文档开启缓存 👉 ： [开启缓存](./caching.mdx)
+
+* 开启效果
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/antd-form-cache.mp4" controls/>
+
+
+![](/blog/0.11.0.png)
+
+### **✨ 优化 DOM 树提取策略**
+
+* 优化了 dom 树的信息能力，加速了 GPT 4o 等模型的推理过程
+
+![](/blog/0.11.0-2.png)
+
+
+## v0.10.0 - UI-TARS 模型上线
+
+UI-TARS 是由 **Seed** 团队开源的 Native GUI agent 模型。UI-TARS 起名源之[星际穿越](https://zh.wikipedia.org/zh-cn/%E6%98%9F%E9%99%85%E7%A9%BF%E8%B6%8A)电影中的 [TARS 机器人](https://interstellarfilm.fandom.com/wiki/TARS)，它具备高度的智能和自主思考能力。 UI-TARS **将图片和人类指令作为输入信息**，可以正确的感知下一步的行动，从而逐渐接近人类指令的目标，在 GUI 自动化任务的各项基准测试中均领先于各类开源模型、闭源商业模型。
+
+![](/blog/0.10.0.png)
+
+UI-TARS:Pioneering Automated GUI Interaction with Native Agents - Figure 1
+
+![](/blog/0.10.0-2.png)
+
+UI-TARS:Pioneering Automated GUI Interaction with Native - Figure 4
+
+### **✨**模型优势
+
+UI-TARS 模型在 GUI 任务中有以下优势：
+
+
+* **目标驱动**
+
+* **推理速度快**
+
+* **Native GUI agent 模型**
+
+* **模型开源**
+
+* **公司内部私有化部署无数据安全问题**
+
+
+## v0.9.0 - 桥接模式上线！
+
+通过 Midscene 浏览器插件，你可以用脚本联动桌面浏览器进行自动化操作了！
+
+我们把它命名为“桥接模式”（Bridge Mode）。
+
+
+相比于之前各种 CI 环境调试，优势在于：
+
+1. 可以复用桌面浏览器，尤其是 Cookie、登录态、前置界面状态等 ，即刻开启自动化，而不用操心环境搭建
+
+2. 支持人工与脚本配合操作界面，提升自动化工具的灵活性
+
+3. 简单的业务回归，Bridge Mode 本地跑一下就行
+
+![](/blog/0.9.0.png)
+
+文档：[通过 Chrome 插件快速体验](./bridge-mode-by-chrome-extension.mdx)
+
+## v0.8.0 - Chrome 插件
+
+### **✨ 新增  Chrome 插件，任意页面随时运行 Midscene**
+
+通过 Chrome 插件，你可以零代码、任意页面随时运行 Midscene，体验它的 Action \ Query \ Assert 等能力。
+
+体验方式：[ 使用 Chrome 插件体验 Midscene](./quick-experience.mdx)
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/Midscene_extension.mov" controls/>
+
+
+## v0.7.0 - Playground 能力
+
+### **✨ 新增 Playground 能力，随时发起调试**
+
+再也不用频繁重跑脚本调试 Prompt 了！
+
+在全新的测试报告页上，你可以随时对 AI 执行结果进行调试，包括页面操作、页面信息提取、页面断言。
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/midscene-playground.mov" controls/>
+
+
+## v0.6.0 - 支持字节豆包模型
+
+### **✨ 模型：**支持字节豆包模型
+
+全新支持调用豆包模型调用，参考下方环境变量即可体验。
+
+```bash
+MIDSCENE_OPENAI_INIT_CONFIG_JSON='{"baseURL":"https://xxx.net/api/v3","apiKey":"xxx"}'
+MIDSCENE_MODEL_NAME='ep-20240925111815-mpfz8'
+MIDSCENE_MODEL_TEXT_ONLY='true'
+```
+
+总结目前豆包模型的可用性：
+
+* 目前豆包只有纯文本模型，也就是“看”不到图片。在纯粹通过界面文本进行推理的场景中表现尚可。
+
+* 如果用例需要结合分析界面 UI ，它完全不可用
+
+
+
+举例：
+
+✅ 多肉葡萄的价格 (可以通过界面文字的顺序猜出来)
+
+✅ 切换语言文本按钮(可以是:中文，英文文本) (可以通过界面文字内容猜出来)
+
+❌ 左下角播放按钮 (需要图像理解，失败)
+
+
+
+### ✨ 模型：支持 GPT-4o 结构化输出、成本继续下降
+
+通过使用 gpt-4o-2024-08-06 模型，Midscene 已支持结构化输出（structured-output）特性，确保了稳定性增强、成本下降了 40%+。
+
+Midscene 现已支持命中 GPT-4o prompt caching 特性，待公司 GPT 平台跟进部署后，AI 调用成本将继续下降。
+
+
+
+### ✨ 测试报告：支持动画回放
+
+现在你可以在测试报告中查看每个步骤的动画回放，快速调试自己的运行脚本
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/midscene-play-all.mp4" controls/>
+
+
+
+### ✨ 提速：合并执行流程， 响应提速 30%
+
+新版本中，我们将 Plan 和 Locate 操作在 prompt 执行上进行一定程度合并，使得 AI 响应速度提升  30%
+
+> Before
+
+![](/blog/0.6.0.png)
+
+> after
+
+![](/blog/0.6.0-2.png)
+
+
+
+### ✨ 测评报告：不同模型在 Midscene 场景下的表现
+
+* GPT 4o 系列模型，接近 100% 正确率
+
+* doubao-pro-4k 纯文本模型，接近可用状态
+
+![](/blog/0.6.0-3.png)
+
+![](/blog/0.6.0-4.png)
+
+
+
+### **🐞**问题修复
+
+优化了页面信息提取，避免遮挡元素被收集，以此优化成功率、速度、AI 调用成本 🚀
+
+> before
+
+![](/blog/0.6.0-5.png)
+
+> after
+
+![](/blog/0.6.0-6.png)
+
+
+## v0.5.0 - 支持 GPT-4o 结构化输出
+
+### 新功能 **✨**
+
+* 支持了 gpt-4o-2024-08-06 模型提供 100% JSON 格式限制，降低了 Midscene 任务规划时的幻觉行为
+
+![](/blog/0.5.0.png)
+
+* 支持了 Playwright AI 行为实时可视化，提升排查问题的效率
+
+![](/blog/0.5.0-2.png)
+
+* 缓存通用化，缓存能力不再仅仅局限于 playwright，pagepass、puppeteer 都可以使用缓存
+
+```diff
+- playwright test --config=playwright.config.ts
+# 开启缓存
++ MIDSCENE_CACHE=true playwright test --config=playwright.config.ts
+```
+
+* 支持了  azure openAI 的调用方式
+
+* 支持了 AI 对于 Input 现有基础之上的增删改行为
+
+### 问题修复 **🐞**
+
+* 优化了对于非文本、input、图片元素的识别，提升 AI 任务正确性
+
+* 在 AI 交互过程中裁剪了不必要的属性字段，降低了 token 消耗
+
+* 优化了 KeyboardPress、Input 事件在任务规划时容易出现幻觉的情况
+
+* 针对 pagepass 通过 Midscene 执行过程中出现的闪烁行为，提供了优化方案
+
+```javascript
+// 目前 pagepagepsss 依赖的 puppeteer 版本太低，截图可能会导致界面闪动、光标丢失，通过下面方式可以解决
+const originScreenshot = puppeteerPage.screenshot;
+puppeteerPage.screenshot = async (options) => {
+  return await originScreenshot.call(puppeteerPage, {
+    ...options,
+    captureBeyondViewport: false
+  });
+};
+```
+
+## v0.4.0 - 支持使用 Cli
+
+### 新功能 **✨**
+
+* Midscene 支持 Cli 的使用方式，降低 Midscene 使用门槛
+
+```bash
+# headed 模式（即可见浏览器）访问 baidu.com 并搜索“天气”
+npx @midscene/cli --headed --url https://www.baidu.com --action "输入 '天气', 敲回车" --sleep 3000
+
+# 访问 Github 状态页面并将状态保存到 ./status.json
+npx @midscene/cli --url https://www.githubstatus.com/ \
+  --query-output status.json \
+  --query '{serviceName: string, status: string}[], github 页面的服务状态，返回服务名称'
+```
+
+* 支持 AI 执行等待能力，让 AI 等到到某个时候继续后续任务执行
+
+* Playwright AI 任务报告展示整体耗时，并按测试组进行聚合 AI 任务
+
+### 问题修复 **🐞**
+
+* 修复 AI 在连续性任务时容易出现幻觉导致任务规划失败
+
+
+
+## v0.3.0 - 支持 AI HTML 报告
+
+### 新功能 **✨**
+
+* AI 报告 html 化，将测试报告按测试组聚合，方便测试报告分发
+
+### 问题修复 **🐞**
+
+* 修复 AI 报告滚动预览问题
+
+
+
+## v0.2.0 - 通过自然语言控制 puppeteer
+
+### 新功能 **✨**
+
+* 支持通过自然语言控制 puppeteer 实现页面操作自动化🗣️💻
+
+* 在 playwright 框架中提供 AI 缓存能力，提高稳定性和执行效率
+
+* AI 报告可视化按照测试组进行合并，优化聚合展示
+
+* 支持 AI 断言能力，让 AI 判断页面是否满足某种条件
+
+
+
+
+
+## v0.1.0 - 通过自然语言控制 playwright
+
+### 新功能 **✨**
+
+* 通过自然语言控制 playwright 实现页面操作自动化 🗣️💻
+
+* 通过自然语言提取页面信息 🔍🗂️
+
+* AI 报告，AI 行为、思考可视化 🛠️👀
+
+* 直接使用 GPT-4o 模型，无需任何训练 🤖🔧
+
+
+
+
+---
+url: /zh/choose-a-model.md
+---
+
+# 选择 AI 模型
+
+在这篇文章中，我们将讨论如何为 Midscene.js 选择 AI 模型，以及这些模型各自的特点。
+
+
+## 快速配置
+
+选择一个模型、获取 API 密钥并完成配置，你就可以开始使用 Midscene.js 了。如果你是刚开始使用，选择最容易获得的模型服务即可。
+
+如果你想了解更多关于模型服务的配置项，请查看 [配置模型和服务商](./model-provider)。
+
+### GPT-4o （无法在 Android 自动化中使用）
+
+```bash
+OPENAI_API_KEY="......"
+OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" # 可选，如果你想要使用一个不同于 OpenAI 官方的接入点
+MIDSCENE_MODEL_NAME="gpt-4o-2024-11-20" # 可选，默认是 "gpt-4o"。
+```
+
+### 阿里云或 openrouter.ai 上的 Qwen-2.5-VL
+
+在[阿里云](https://aliyun.com)或 [openrouter.ai](https://openrouter.ai) 上申请 API 密钥后，你可以使用以下配置：
+
+```bash
+# openrouter.ai
+OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+OPENAI_API_KEY="......"
+MIDSCENE_MODEL_NAME="qwen/qwen2.5-vl-72b-instruct"
+MIDSCENE_USE_QWEN_VL=1
+
+# 或使用阿里云的 OpenAI 兼容接入点
+OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+OPENAI_API_KEY="......"
+MIDSCENE_MODEL_NAME="qwen-vl-max-latest"
+MIDSCENE_USE_QWEN_VL=1
+```
+
+### 火山引擎上的 Doubao-1.5-thinking-vision-pro
+
+你可以在[火山引擎](https://volcengine.com)上使用 `Doubao-1.5-thinking-vision-pro` 模型，在火山引擎上申请 API 密钥后，你可以使用以下配置：
+
+```bash
+OPENAI_BASE_URL="https://ark.cn-beijing.volces.com/api/v3" 
+OPENAI_API_KEY="...."
+MIDSCENE_MODEL_NAME="ep-..." # 火山引擎模型名称或推理接入点 ID
+MIDSCENE_USE_DOUBAO_VISION=1
+```
+
+### 火山引擎上的 UI-TARS
+
+你可以在[火山引擎](https://volcengine.com)上使用 `doubao-1.5-ui-tars` 模型，在火山引擎上申请 API 密钥后，你可以使用以下配置：
+
+```bash
+OPENAI_BASE_URL="https://ark.cn-beijing.volces.com/api/v3" 
+OPENAI_API_KEY="...."
+MIDSCENE_MODEL_NAME="ep-2025..." # 火山引擎模型名称或推理接入点 ID
+MIDSCENE_USE_VLM_UI_TARS=DOUBAO
+```
+
+### Google 提供的 Gemini 2.5 Pro
+
+在 Google Cloud 上申请 API 密钥后，你可以使用以下配置：
+
+```bash
+OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENAI_API_KEY="...."
+MIDSCENE_MODEL_NAME="gemini-2.5-pro-preview-05-06"
+MIDSCENE_USE_GEMINI=1
+```
+
+## 模型选择详解
+
+Midscene.js 支持两种类型的 AI 模型：
+
+1. 通用多模态 LLM：接受文本和图像输入的模型。*GPT-4o* 是这种类型模型的代表。
+2. 支持视觉定位的 VL 模型：除了接受文本和图像输入外，这些模型还可以给出指定元素的坐标信息（Visual Grounding）。Midscene 已经适配了 *Qwen-2.5-VL*, *Gemini-2.5-Pro* 和 *UI-TARS* 作为这种类型的模型。
+
+在 Midscene.js 中，我们主要关注模型的两个特性：
+
+1. 理解截图和 *规划* 操作步骤的能力。
+2. 给出指定元素的坐标信息（Visual Grounding）的能力。
+
+不同模型的主要区别在于它们在处理视觉定位（Visual Grounding）上的方案。
+
+在使用 LLM 模型时，视觉定位是通过模型对 UI 层级树和截图中的标记（markup）的理解来实现的，这会消耗更多的 token ，并且不一定总能得到准确的结果。相比之下，使用 VL 模型时，视觉定位是通过模型的原生视觉定位能力来实现的，这在复杂情况下提供了更原生和可靠的解决方案。
+
+在 Android 自动化场景中，我们决定使用 VL 模型，因为现实场景中的 Android 应用的 UI 结构非常复杂，我们不想再在应用的 UI 技术栈上做适配工作。VL 模型可以提供更可靠的结果，并且应该是一种更好的解决方案。
+
+## 推荐模型
+
+### GPT-4o
+
+GPT-4o 是 OpenAI 提供的通用 LLM 模型，支持图像输入。这是 Midscene.js 的默认模型。
+
+我们推荐在 GPT-4o 中使用逐步指令（step-by-step）的提示词。
+
+**特性**
+
+- **易于上手**：OpenAI 提供了非常友好的 API 接入，你只需要获取 API 密钥即可。
+- **表现平稳**：它在交互（Action）、断言（Assertion）和查询（Query）方面表现均比较良好。
+
+**在 Midscene.js 中使用时的限制**
+
+- **成本较高**：Midscene 需要将截图和 DOM 树一起发送给模型，这会导致 token 消耗较高。例如，在 1280x800 分辨率下，eBay 首页需要 6000 个 token 输入，搜索结果页面则需要 9000 个 token 输入。因此，它的成本会显著高于其他模型。
+- **内容限制**：它无法处理跨域的 `<iframe />` 或 `<canvas />` 标签中的内容。
+- **分辨率限制**：它无法处理分辨率超过 2000x768 的图像。超尺寸输入会导致输出质量下降。
+- **小图标识别能力较差**：它可能无法准确定位小图标。
+- **不支持 Android 自动化**：它不支持 Android 自动化。
+
+**配置**
+
+```bash
+OPENAI_API_KEY="......"
+OPENAI_BASE_URL="https://custom-endpoint.com/compatible-mode/v1" # 可选，如果你想要使用一个不同于 OpenAI 官方的接入点
+MIDSCENE_MODEL_NAME="gpt-4o-2024-11-20" # 可选，默认是 "gpt-4o"。
+```
+
+### Qwen-2.5-VL
+
+从 0.12.0 版本开始，Midscene.js 支持千问 Qwen-2.5-VL 模型。
+
+Qwen-2.5-VL 是一个专为图像识别设计的开源模型，由阿里巴巴开发。它提供了视觉定位（Visual Grounding）的能力，可以准确返回指定元素的坐标信息。无论是交互、断言还是查询，Qwen-2.5-VL 在 Midscene 的综合表现比较优秀。我们推荐使用 72B 版本。
+
+Qwen-2.5-VL 具备操作规划（action planning）能力，可以自主控制应用程序，但我们仍然推荐开发者使用详细的提示词来驱动，以获得更稳定和可靠的结果。
+
+**特性**
+
+- **低成本**：Qwen-2.5-VL 支持视觉定位（Visual Grounding），不需要发送 DOM 树给模型。和 `gpt-4o` 相比，它可以节省 30% 到 50% 的 token 数量。在阿里云官方部署版本中，费用消耗可以下降 80% 以上。
+- **高分辨率支持**：Qwen-2.5-VL 支持更高的分辨率输入，足以满足大多数情况。
+- **开源**：这是一个开源模型，因此你可以选择使用云提供商已经部署好的版本，或者自己部署到你自己的服务器上。
+
+**在 Midscene.js 中使用时的限制**
+
+- **小图标识别能力较差**：为了准确识别小图标、小元素，你可能需要[开启 `deepThink` 参数](./blog-introducing-instant-actions-and-deep-think)并调优描述，否则识别效果无法保证。
+- **断言能力不足**：在某些情况下，Qwen-2.5-VL 的断言能力不如 `gpt-4o`。
+
+**配置**
+
+除了常规配置，你还需要包含 `MIDSCENE_USE_QWEN_VL=1` 配置来启用 Qwen 2.5 模式。否则，它将使用默认的 `gpt-4o` 模式（这将使用更多的 token）。
+
+```bash
+OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1" # 或任何其他提供商的接入点。
+OPENAI_API_KEY="......"
+MIDSCENE_MODEL_NAME="qwen-vl-max-latest"
+MIDSCENE_USE_QWEN_VL=1 # 别忘了配置这项，用于启用 Qwen 2.5 模式！
+```
+
+**特别注意：关于阿里云上的模型版本**
+
+虽然开源版本的 Qwen-2.5-VL (72B) 被命名为 `qwen2.5-vl-72b-instruct`，但阿里云平台实际还部署了更稳定的增强版本，名为 `qwen-vl-max-latest`。在使用后者时，输入 token 单价仅为开源版本的 19%，可以大幅缩减成本。
+
+所以，如果你在阿里云平台使用 Qwen-2.5-VL 模型，请使用 `qwen-vl-max-latest` 作为模型名称。
+
+另外，使用 "接口转发平台" 调用阿里云的 VL 模型时，可能造成定位精度大幅下降。
+
+**资源**
+
+- [Qwen 2.5 on 🤗 HuggingFace](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct)
+- [Qwen 2.5 on Github](https://github.com/QwenLM/Qwen2.5-VL)
+- [Qwen 2.5 - 阿里云百炼](https://bailian.console.aliyun.com/#/model-market/detail/qwen-vl-max-latest)
+- [Qwen 2.5 - openrouter.ai](https://openrouter.ai/models/Qwen/Qwen2.5-VL-72B-Instruct)
+
+### Doubao-1.5-thinking-vision-pro
+
+Doubao-1.5-thinking-vision-pro 是火山引擎提供的模型。它在视觉定位（Visual Grounding）和断言（Assertion）方面表现较好。
+
+**资源**
+
+- [Doubao-1.5-thinking-vision-pro on Volcano Engine](https://www.volcengine.com/docs/82379/1536428)
+
+
+### UI-TARS
+
+UI-TARS 是一个专为 UI 自动化设计的开源模型。它仅以截图作为输入，并执行人类常用的交互（如键盘和鼠标操作），在 10 多个 GUI 基准测试中取得了顶尖性能。UI-TARS 是一个开源模型，并提供了不同大小的版本。
+
+我们推荐在 UI-TARS 中使用目标驱动的提示词（target-driven prompt），如“使用用户名 foo 和密码 bar 登录”，它会逐步完成动作规划并执行。
+
+**特性**
+
+- **适用于探索性场景**：UI-TARS 在开放性任务场景中表现出色，例如 “帮我发一条微博”，它能多次进行尝试，直到找到正确的操作步骤。
+- **速度**：以火山引擎部署的 `doubao-1.5-ui-tars` 作为基准，它的返回速度快于其他模型。
+- **原生图像识别**：UI-TARS 有视觉定位（Visual Grounding）的能力，和 Qwen-2.5-VL 一样，在使用 UI-TARS 时， Midscene.js 不需要发送 DOM 树。
+- **开源**：UI-TARS 是一个开源模型，因此你可以选择部署到你自己的服务器上，你的数据将不再发送到云端。
+
+**在 Midscene.js 中使用时的限制**
+
+- **断言能力较差**：在某些情况下，UI-TARS 的断言能力可能不如 `gpt-4o`。
+- **无法固定操作路径**：UI-TARS 具备较强的探索能力，它可能会主动多次尝试不同的操作路径，继而导致每次调用时操作路径不固定。
+
+**配置**
+
+除了常规配置，你还需要包含 `MIDSCENE_USE_VLM_UI_TARS` 参数来指定 UI-TARS 版本，支持的值为 `1.0` `1.5` `DOUBAO`（火山引擎版本）。否则，你会遇到一些 JSON 解析错误。
+
+```bash
+OPENAI_BASE_URL="....."
+OPENAI_API_KEY="......" 
+MIDSCENE_MODEL_NAME="ui-tars-72b-sft"
+MIDSCENE_USE_VLM_UI_TARS=1 # 别忘了配置这项用于 UI-TARS 模式！
+```
+
+**使用火山引擎提供的版本**
+
+在火山引擎平台上，有一个已经部署完成的 `doubao-1.5-ui-tars` 模型，开发者可以通过 API 调用、按使用量付费。模型文档帮助：https://www.volcengine.com/docs/82379/1536429
+
+在使用火山引擎版本模型时，可能需要创建推理接入点（形如 `ep-2025...`）。集齐 API Key 和推理点信息后，配置文件类似如下：
+
+```bash
+# 注意 URL 最后填写到 /v3 结束即可
+OPENAI_BASE_URL="https://ark.cn-beijing.volces.com/api/v3" 
+OPENAI_API_KEY="...."
+MIDSCENE_MODEL_NAME="ep-2025..."
+MIDSCENE_USE_VLM_UI_TARS=DOUBAO
+```
+
+**资源**
+
+- [UI-TARS on 🤗 HuggingFace](https://huggingface.co/bytedance-research/UI-TARS-72B-SFT)
+- [UI-TARS on Github](https://github.com/bytedance/ui-tars)
+- [UI-TARS - 模型部署指南](https://juniper-switch-f10.notion.site/UI-TARS-Model-Deployment-Guide-17b5350241e280058e98cea60317de71)
+
+
+### Gemini-2.5-Pro
+
+Gemini-2.5-Pro 是 Google Cloud 提供的模型。它和 Qwen-2.5-VL 类似，但它是闭源的。
+
+Midscene.js 从 v0.15.1 版本开始支持 Gemini-2.5-Pro 模型。
+
+**配置**
+
+```bash
+OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENAI_API_KEY="...."
+MIDSCENE_MODEL_NAME="gemini-2.5-pro-preview-05-06"
+MIDSCENE_USE_GEMINI=1
+```
+
+**资源**
+
+- [Gemini 2.5 on Google Cloud](https://cloud.google.com/gemini-api/docs/gemini-25-overview)
+
+## 选择其他通用 LLM 模型
+
+Midscene 也支持其他通用 LLM 模型。Midscene 会使用和 `gpt-4o` 模式下相同的提示词和策略来驱动这些模型。如果你想要选用其他模型，请按照以下步骤操作：
+1. 必须使用多模态模型，也就是支持图像输入的模型。
+1. 模型越大，效果表现越好。当然，这也意味着需要更多的 GPU 资源（或更贵的 API 服务）。
+1. 找出如何使用与 OpenAI SDK 兼容的方式调用它，服务商一般都会提供这样的接入点，你需要配置的是 `OPENAI_BASE_URL`, `OPENAI_API_KEY` 和 `MIDSCENE_MODEL_NAME`。
+1. 如果发现使用新模型后效果不佳，可以尝试使用一些简短且清晰的提示词（或回滚到之前的模型）。更多详情请参阅 [编写提示词（指令）的技巧](./prompting-tips)。
+1. 请遵守各模型和服务商的使用条款。
+1. 不要包含 `MIDSCENE_USE_VLM_UI_TARS` 和 `MIDSCENE_USE_QWEN_VL` 配置，除非你知道自己在做什么。
+
+### 配置
+
+```bash
+MIDSCENE_MODEL_NAME="....."
+OPENAI_BASE_URL="......"
+OPENAI_API_KEY="......"
+```
+
+更多详情请参阅 [配置模型和服务商](./model-provider)。
+
+## 常见问题
+
+### 如何确认模型的 token 使用情况？
+
+通过设置 `DEBUG=midscene:ai:profile:stats` 环境变量，你可以打印模型的使用情况和响应时间。
+
+## 更多
+
+* [配置模型和服务商](./model-provider)
+* [Github - UI-TARS](https://github.com/bytedance/ui-tars)
+
+
+
+---
+url: /zh/common/prepare-android.md
+---
+
+## 准备工作
+
+### 安装 Node.js
+
+安装 [Node.js 18 或以上版本](https://nodejs.org/en/download/)。
+
+### 准备 API Key
+
+准备一个视觉语言（VL）模型的 API Key。
+
+你可以在 [选择 AI 模型](../choose-a-model) 文档中查看 Midscene.js 支持的模型和配置。
+
+### 安装 adb
+
+`adb` 是一个命令行工具，允许你与 Android 设备通信。有两种安装 `adb` 的方法：
+
+- 方法 1：使用 [Android Studio](https://developer.android.com/studio?hl=zh-cn) 安装
+- 方法 2：使用 [Android 命令行工具](https://developer.android.com/studio#command-line-tools-only) 安装
+
+验证 `adb` 是否安装成功：
+
+```bash
+adb --version
+```
+
+当你看到以下输出时，表示 `adb` 安装成功：
+
+```log
+Android Debug Bridge version 1.0.41
+Version 34.0.4-10411341
+Installed as /usr/local/bin//adb
+Running on Darwin 24.3.0 (arm64) 
+```
+
+### 设置环境 ANDROID_HOME 变量
+
+参考[Android 环境变量](https://developer.android.com/tools/variables?hl=zh-cn)，设置环境变量 `ANDROID_HOME`。
+
+验证 `ANDROID_HOME` 变量是否设置成功：
+
+```bash
+echo $ANDROID_HOME
+```
+
+当上述命令有输出时，表示 `ANDROID_HOME` 变量设置成功：
+
+```log
+/Users/your_username/Library/Android/sdk
+```
+
+### 连接 Android 设备
+
+在 Android 设备的开发者选项中，启用 'USB 调试'，如果存在 'USB 调试（安全设置）'，也启用它，然后使用 USB 线连接 Android 设备。
+
+
+<p align="center">
+  <img src="/android-usb-debug-en.png" alt="android usb debug" width="400"/>
+</p>
+
+验证连接：
+
+```bash
+adb devices -l
+```
+
+当看到以下输出时，表示连接成功：
+
+```log
+List of devices attached
+s4ey59	device usb:34603008X product:cezanne model:M2006J device:cezan transport_id:3
+```
+
+
+
+---
+url: /zh/common/prepare-key-for-further-use.md
+---
+
+准备你想要使用的 AI 模型及其 API Key。你可以在 [选择模型](../choose-a-model) 文档中查看 Midscene.js 支持的模型。
+
+
+---
+url: /zh/common/setup-env.md
+---
+
+## 配置 AI 模型服务
+
+将你的模型配置写入环境变量。更多信息请查看 [选择 AI 模型](../choose-a-model)。
+
+```bash
+# 替换为你的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 可能需要更多配置，如模型名称、接入点等，请参考 《选择 AI 模型》文档
+export OPENAI_BASE_URL="..."
+```
+
+
+
+---
+url: /zh/common/start-experience.md
+---
+
+## 开始体验
+
+配置完成后，你可以立即开始使用 Midscene。它一共有三个关键操作 Tab：
+
+- **Action**: 与网页进行交互，这就是所谓的自动规划（Auto Planning）。比如
+```
+在搜索框中输入 Midscene
+点击登录按钮
+```
+
+- **Query**: 从界面中提取 JSON 数据
+```
+提取页面中的用户 ID，返回 \{ id: string \}
+```
+
+- **Assert**: 验证页面
+
+```
+页面标题是 Midscene
+```
+
+- **Tap**: 在某个元素上点击，这就是所谓的即时操作（Instant Action）。
+```
+登录按钮
+```
+
+快来试试吧！
+
+> 关于自动规划（Auto Planning）和即时操作（Instant Action）的区别，请参考 [API](../api.mdx) 文档。
+
+## 想将 Midscene 集成到代码？
+
+插件体验结束后，你可能想将 Midscene 集成到代码中。这里有几种不同集成形式的文档：
+
+* [使用 YAML 格式的自动化脚本](../automate-with-scripts-in-yaml)
+
+
+
+---
+url: /zh/data-privacy.md
+---
+
+# 数据隐私
+
+Midscene.js 是一个开源项目（GitHub: [Midscene](https://github.com/web-infra-dev/midscene/))，遵循 MIT 许可证。你可以在公开仓库中查看到所有代码。
+
+当使用 Midscene.js 时，你的页面数据（包括截图）将直接发送到你配置的 AI 模型提供商。没有第三方平台会访问这些数据。你需要关注的是模型提供商的数据隐私政策。
+
+如果你希望在你自己的环境中构建 Midscene.js 和它的 Chrome 扩展（而不是使用我们已发布的版本），你可以参考 [贡献指南](https://github.com/web-infra-dev/midscene/blob/main/CONTRIBUTING.md) 以找到构建说明。
+
+
+
+
+---
+url: /zh/faq.md
+---
+
+# FAQ
+
+## Midscene 能否根据一句话指令实现智能规划？比如执行 "发一条微博"
+
+我们只建议你在使用 *UI-TARS* 等 GUI Agent 模型时使用这种目标导向的 Prompt。
+
+## 业界的 AI Agent 都在演示“自主规划”，为什么 Midscene 还要开发者提供详细操作步骤？这是一种落后的做法吗？
+
+Midscene 有相当多的工具类、测试类开发者，他们更关注 UI 自动化工具的稳定性和性能。为了确保 Agent 能够在复杂系统中精准运行，准确清晰的 Prompt 依然是眼下的最优解。
+
+为了进一步提高稳定性，我们还提供了即时操作接口（Instant Action）、回放报告、Playground 等工具。他们虽然看似有些“传统”、不太“AI”，但在大量实践后，我们有信心这些实用工具才是提升效率的利器。
+
+如果你对“智能 GUI Agent”感兴趣，不妨看看 [UI-TARS](https://github.com/bytedance/ui-tars) 模型，Midscene 也内置了对它的支持。
+
+相关文档: 
+* [选择 AI 模型](./choose-a-model)
+* [编写提示词的技巧](./prompting-tips)
+
+## 局限性
+
+Midscene 存在一些局限性，我们仍在努力改进。
+
+1. 交互类型有限：目前仅支持点击、拖拽(只在 UI-TARS 模型中支持)、输入、键盘和滚动操作。
+2. 稳定性风险：AI 模型的返回值不是 100% 准确的。遵循 [编写提示词的技巧](./prompting-tips) 可以帮助提高 SDK 稳定性。
+3. 使用 GPT-4o 时，无法与跨域 iframe 、canvas 元素交互。使用 Qwen 、UI-TARS 模型时无此问题。
+4. 无法访问 Chrome 原生元素：无法访问右键菜单、文件上传对话框等。
+5. 无法绕过验证码：有些 LLM 服务会拒绝涉及验证码解决的请求（例如 OpenAI），而有些验证码页面的 DOM 无法通过常规的网页抓取方法访问。因此，使用 Midscene 绕过验证码不是一个可靠的方法。
+
+## 支持哪些 AI 模型
+
+你可以按需[选择 AI 模型](./choose-a-model)。
+
+## 会有哪些信息发送到 AI 模型？
+
+Midscene 会发送页面截图到 AI 模型。在使用了 GPT-4o 时，你的页面 DOM 信息也会被发送。
+
+如果你担心数据隐私问题，请参阅 [数据隐私](./data-privacy)。
+
+## 脚本运行偏慢？
+
+在 Midscene.js 中使用通用大模型时，由于每次进行规划（Planning）和查询（Query）时都会调用 AI，其运行耗时可能比传统 Playwright 用例增加 3 到 10 倍，比如从 5 秒变成 20秒。为了让结果更可靠，token 和时间成本是不可避免的。
+
+有几种方法可以提高运行效率：
+1. 使用即时操作接口，如 `agent.aiTap('Login Button')` 代替 `agent.ai('Click Login Button')`。更多详情请参阅 [API](./api.mdx)。
+2. 使用专用的模型并自行部署，比如 UI-TARS。这是推荐的做法。更多详情请参阅 [选择 AI 模型](./choose-a-model)。
+3. 使用较低的分辨率。
+4. 使用缓存来加速调试过程。更多详情请参阅 [缓存](./caching)。
+
+## 浏览器界面持续闪动
+
+一般是 viewport `deviceScaleFactor` 参数与系统环境不匹配造成的。如果你在 Mac 系统下运行，可以把它设成 2 来解决。
+
+```typescript
+await page.setViewport({
+  deviceScaleFactor: 2,
+});
+```
+
+## 如何了解 Midscene 的运行原理？
+
+在运行脚本后，通过查看报告文件，你可以了解 Midscene 的大致运行原理。
+
+## 自定义网络超时
+
+当在网页上执行某个操作后，Midscene 会自动等待网络空闲。这是为了确保自动化过程的稳定性。如果等待超时，不会发生任何事情。
+
+默认的超时时间配置如下：
+
+1. 如果是页面跳转，则等待页面加载完成，默认超时时间为 5000ms
+2. 如果是点击、输入等操作，则等待网络空闲，默认超时时间为 2000ms
+
+当然，你可以通过配置参数修改默认超时时间，或者关闭这个功能：
+
+- 使用 [Agent](/zh/api.html#%E6%9E%84%E9%80%A0%E5%99%A8) 上的 `waitForNetworkIdleTimeout` 和 `waitForNavigationTimeout` 参数
+- 使用 [Yaml](/zh/automate-with-scripts-in-yaml.html#web-%E9%83%A8%E5%88%86) 脚本和 [PlaywrightAiFixture](/zh/integrate-with-playwright.html#%E7%AC%AC%E4%BA%8C%E6%AD%A5%E6%89%A9%E5%B1%95-test-%E5%AE%9E%E4%BE%8B) 中的 `waitForNetworkIdle` 参数
+
+
+---
+url: /zh/index.md
+---
+
+# Midscene.js - AI 驱动，带来愉悦的 UI 自动化体验
+
+开源的 AI 操作助手，适用于 Web、移动端、自动化和测试
+
+## 功能特性
+
+### 用自然语言编写自动化脚本
+- 描述你的目标和步骤，Midscene 会为你规划和操作用户界面。
+- 使用 Javascript SDK 或 YAML 格式编写自动化脚本。
+
+### 网页或移动应用
+- **网页自动化**：可以[与 Puppeteer 集成](https://midscenejs.com/integrate-with-puppeteer.html)，[与 Playwright 集成](https://midscenejs.com/integrate-with-playwright.html)或使用[桥接模式](https://midscenejs.com/bridge-mode-by-chrome-extension.html)来控制桌面浏览器。
+- **Android 自动化**：使用 [Javascript SDK](https://midscenejs.com/integrate-with-android.html) 配合 adb 来控制本地 Android 设备。
+
+### 工具
+- **用于调试的可视化报告**: 通过我们的测试报告和 Playground，你可以轻松理解、回放和调试整个过程。
+- [**使用缓存，提高执行效率**](https://midscenejs.com/zh/caching.html): 使用缓存能力重放脚本，提高执行效率。
+- **MCP**: 允许其他 MCP Client 直接使用 Midscene 的能力。[**Web MCP**](https://midscenejs.com/zh/web-mcp.html) [**Android MCP**](https://midscenejs.com/zh/mcp-android.html)。
+
+### 三种 API 类型
+
+- [**交互 API**](https://midscenejs.com/zh/api.html#interaction-methods): 与用户界面交互。
+- [**数据提取 API**](https://midscenejs.com/zh/api.html#data-extraction): 从用户界面和 DOM 中提取数据。
+- [**实用 API**](https://midscenejs.com/zh/api.html#more-apis): 实用函数，如 `aiAssert()` （断言）, `aiLocate()` （定位）, `aiWaitFor()` （等待）。
+
+## 演示案例
+
+我们准备了一些演示案例供你学习 Midscene.js 的使用。
+
+1. 使用 JS 代码驱动任务编排，收集周杰伦演唱会信息，并写入 Google Docs（使用 UI-TARS 模型）
+
+<video src="https://github.com/user-attachments/assets/75474138-f51f-4c54-b3cf-46d61d059999" height="300" controls />
+
+2. 控制 Android 上的地图应用（使用 Qwen-2.5-VL 模型）
+
+<video src="https://github.com/user-attachments/assets/1f5bab0e-4c28-44e1-b378-a38809b05a00" height="300" controls />
+
+3. 使用 midscene mcp 浏览页面 ( https://www.saucedemo.com/ )，执行登录、添加产品、下订单，最后基于 mcp 执行步骤和 playwright 示例生成测试用例
+
+<video src="https://github.com/user-attachments/assets/a95ca353-e50c-4091-85ba-e542f576b6be" height="300" controls />
+
+## 零代码快速体验
+
+- **[Chrome 插件](https://midscenejs.com/quick-experience.html)**：通过 [Chrome 插件](https://midscenejs.com/quick-experience.html) 立即开始浏览器内体验，无需编写任何代码。
+- **[Android Playground](https://midscenejs.com/quick-experience-with-android.html)**：使用 Android playground 来控制你的本地 Android 设备。
+
+## 模型选择
+
+Midscene.js 支持多模态 LLM 模型，如 `gpt-4o`，以及视觉语言模型，如 `Qwen2.5-VL`、`Doubao-1.5-thinking-vision-pro`、`gemini-2.5-pro` 和 `UI-TARS`。
+
+推荐使用视觉语言模型进行 UI 自动化。
+
+了解更多关于[选择 AI 模型](https://midscenejs.com/choose-a-model)
+
+## 两种自动化风格
+
+### 自动规划
+
+Midscene 将自动规划步骤并执行。这可能会比较慢，并且严重依赖 AI 模型的质量。
+
+```javascript
+await aiAction('逐一点击所有记录。如果某个记录包含文本"completed"，则跳过它');
+```
+
+### 工作流风格
+
+将复杂逻辑拆分为多个步骤，以提高自动化代码的稳定性。
+
+```javascript
+const recordList = await agent.aiQuery('string[], the record list')
+for (const record of recordList) {
+  const hasCompleted = await agent.aiBoolean(`check if the record ${record}" contains the text "completed"`)
+  if (!hasCompleted) {
+    await agent.aiTap(record)
+  }
+}
+```
+
+> 有关工作流风格的更多详细信息，请参阅 [Blog - 使用 JavaScript 优化 AI 自动化代码
+](https://midscenejs.com/zh/blog-programming-practice-using-structured-api.html)
+
+
+## 与其他工具比较
+
+* **调试体验**: 你很快就会发现，调试和维护自动化脚本才是真正的痛点。无论模型多么强大，你仍然需要调试过程以确保其保持长期稳定。Midscene.js 提供了可视化报告、内置的 Playground 和 Chrome 插件，以调试整个运行过程。这是大多数开发者真正需要的特性，我们也在持续努力改进调试体验。
+
+* **开源、免费、部署灵活**: Midscene.js 是一个开源项目。它与云服务和模型提供商解耦，你可以选择公共或私有部署。总会有一个适合你的方案。
+
+* **与 Javascript 集成**: 你可以永远相信 Javascript 😎
+
+## 资源
+
+* 主页和文档：[https://midscenejs.com](https://midscenejs.com/)
+* 示例项目：[https://github.com/web-infra-dev/midscene-example](https://github.com/web-infra-dev/midscene-example)
+* API 参考：[https://midscenejs.com/api.html](https://midscenejs.com/api.html)
+* GitHub：[https://github.com/web-infra-dev/midscene](https://github.com/web-infra-dev/midscene)
+
+## 社区
+
+* [Discord](https://discord.gg/2JyBHxszE4)
+* [在 X 上关注我们](https://x.com/midscene_ai)
+* [飞书交流群](https://applink.larkoffice.com/client/chat/chatter/add_by_link?link_token=291q2b25-e913-411a-8c51-191e59aab14d)
+
+## 致谢
+
+我们要感谢以下项目：
+
+- [Rsbuild](https://github.com/web-infra-dev/rsbuild) 和 [Rslib](https://github.com/web-infra-dev/rslib) 提供构建工具。
+- [UI-TARS](https://github.com/bytedance/ui-tars) 提供开源智能体模型 UI-TARS。
+- [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL) 提供开源 VL 模型 Qwen2.5-VL。
+- [scrcpy](https://github.com/Genymobile/scrcpy) 和 [yume-chan](https://github.com/yume-chan) 让我们能够用浏览器控制 Android 设备。
+- [appium-adb](https://github.com/appium/appium-adb) 提供 adb 的 javascript 桥接。
+- [YADB](https://github.com/ysbing/YADB) 提供 yadb 工具，提升文本输入性能。
+- [Puppeteer](https://github.com/puppeteer/puppeteer) 提供浏览器自动化和控制。
+- [Playwright](https://github.com/microsoft/playwright) 提供浏览器自动化、控制和测试。
+
+## License
+
+Midscene.js 使用 [MIT 许可协议](https://github.com/web-infra-dev/midscene/blob/main/LICENSE)。
+
+
+
+---
+url: /zh/integrate-with-android.md
+---
+
+
+
+
+# 与 Android(adb) 集成
+
+在使用 adb 连接 Android 设备后，你可以使用 Midscene javascript SDK 来控制 Android 设备。
+
+import { PackageManagerTabs } from '@theme';
+
+:::info 样例项目
+使用 javascript SDK 控制 Android 设备：[https://github.com/web-infra-dev/midscene-example/blob/main/android/javascript-sdk-demo](https://github.com/web-infra-dev/midscene-example/blob/main/android/javascript-sdk-demo)
+
+与 Vitest 集成和测试：[https://github.com/web-infra-dev/midscene-example/tree/main/android/vitest-demo](https://github.com/web-infra-dev/midscene-example/tree/main/android/vitest-demo)
+:::
+
+## 准备工作
+
+### 安装 Node.js
+
+安装 [Node.js 18 或以上版本](https://nodejs.org/en/download/)。
+
+### 准备 API Key
+
+准备一个视觉语言（VL）模型的 API Key。
+
+你可以在 [选择 AI 模型](../choose-a-model) 文档中查看 Midscene.js 支持的模型和配置。
+
+### 安装 adb
+
+`adb` 是一个命令行工具，允许你与 Android 设备通信。有两种安装 `adb` 的方法：
+
+- 方法 1：使用 [Android Studio](https://developer.android.com/studio?hl=zh-cn) 安装
+- 方法 2：使用 [Android 命令行工具](https://developer.android.com/studio#command-line-tools-only) 安装
+
+验证 `adb` 是否安装成功：
+
+```bash
+adb --version
+```
+
+当你看到以下输出时，表示 `adb` 安装成功：
+
+```log
+Android Debug Bridge version 1.0.41
+Version 34.0.4-10411341
+Installed as /usr/local/bin//adb
+Running on Darwin 24.3.0 (arm64) 
+```
+
+### 设置环境 ANDROID_HOME 变量
+
+参考[Android 环境变量](https://developer.android.com/tools/variables?hl=zh-cn)，设置环境变量 `ANDROID_HOME`。
+
+验证 `ANDROID_HOME` 变量是否设置成功：
+
+```bash
+echo $ANDROID_HOME
+```
+
+当上述命令有输出时，表示 `ANDROID_HOME` 变量设置成功：
+
+```log
+/Users/your_username/Library/Android/sdk
+```
+
+### 连接 Android 设备
+
+在 Android 设备的开发者选项中，启用 'USB 调试'，如果存在 'USB 调试（安全设置）'，也启用它，然后使用 USB 线连接 Android 设备。
+
+
+<p align="center">
+  <img src="/android-usb-debug-en.png" alt="android usb debug" width="400"/>
+</p>
+
+验证连接：
+
+```bash
+adb devices -l
+```
+
+当看到以下输出时，表示连接成功：
+
+```log
+List of devices attached
+s4ey59	device usb:34603008X product:cezanne model:M2006J device:cezan transport_id:3
+```
+
+
+## 配置 AI 模型服务
+
+将你的模型配置写入环境变量。更多信息请查看 [选择 AI 模型](../choose-a-model)。
+
+```bash
+# 替换为你的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 可能需要更多配置，如模型名称、接入点等，请参考 《选择 AI 模型》文档
+export OPENAI_BASE_URL="..."
+```
+
+
+## 第一步：安装依赖
+
+<PackageManagerTabs command="install @midscene/android --save-dev" />
+
+## 第二步：编写脚本
+
+这里以使用安卓浏览器搜索耳机为例。(当然，你也可以使用设备上的其他任何应用)
+
+编写下方代码，保存为 `./demo.ts`
+
+```typescript title="./demo.ts"
+import {
+  AndroidAgent,
+  AndroidDevice,
+  getConnectedDevices,
+} from '@midscene/android';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+Promise.resolve(
+  (async () => {
+    const devices = await getConnectedDevices();
+    const page = new AndroidDevice(devices[0].udid);
+
+    // 👀 初始化 Midscene agent
+    const agent = new AndroidAgent(page, {
+      aiActionContext:
+        '如果出现位置、权限、用户协议等弹窗，点击同意。如果出现登录页面，关闭它。',
+    });
+    await page.connect();
+
+    // 👀 打开浏览器并导航到 ebay.com（请确保当前页面有浏览器 App 喔）
+    await agent.aiAction('open browser and navigate to ebay.com');
+
+    await sleep(5000);
+
+    // 👀 输入关键词，执行搜索
+    await agent.aiAction('在搜索框输入 "Headphones" ，敲回车');
+
+    // 👀 等待加载完成
+    await agent.aiWaitFor('页面中至少有一个耳机商品');
+    // 或者你也可以使用一个普通的 sleep:
+    // await sleep(5000);
+
+    // 👀 理解页面内容，提取数据
+    const items = await agent.aiQuery(
+      '{itemTitle: string, price: Number}[], 找到列表里的商品标题和价格',
+    );
+    console.log('耳机商品信息', items);
+
+    // 👀 用 AI 断言
+    await agent.aiAssert('界面左侧有类目筛选功能');
+  })(),
+);
+```
+
+## 第三步：运行
+
+使用 `tsx` 来运行
+
+```bash
+# run
+npx tsx demo.ts
+```
+
+稍等片刻，你会看到如下输出：
+
+```log
+[
+ {
+   itemTitle: 'JBL Tour Pro 2 - True wireless Noise Cancelling earbuds with Smart Charging Case',
+   price: 551.21
+ },
+ {
+   itemTitle: 'Soundcore Space One无线耳机40H ANC播放时间2XStronger语音还原',
+   price: 543.94
+ }
+]
+```
+
+## 第四步：查看运行报告
+
+当上面的命令执行成功后，会在控制台输出：`Midscene - report file updated: /path/to/report/some_id.html`， 通过浏览器打开该文件即可看到报告。
+
+## `AndroidDevice` 的构造函数
+
+AndroidDevice 的构造函数支持以下参数：
+
+- `deviceId: string` - 设备 id
+- `opts?: AndroidDeviceOpt` - 可选参数，用于初始化 AndroidDevice 的配置
+  - `autoDismissKeyboard?: boolean` - 可选参数，是否在输入文本后自动关闭键盘。默认值为 true。
+  - `keyboardDismissStrategy?: 'esc-first' | 'back-first'` - 可选参数，关闭键盘的策略。'esc-first' 优先尝试 ESC 键，如果键盘仍存在则尝试返回键。'back-first' 优先尝试返回键，如果键盘仍存在则尝试 ESC 键。默认值为 'esc-first'。
+  - `androidAdbPath?: string` - 可选参数，用于指定 adb 可执行文件的路径。
+  - `remoteAdbHost?: string` - 可选参数，用于指定远程 adb 主机。
+  - `remoteAdbPort?: number` - 可选参数，用于指定远程 adb 端口。
+  - `imeStrategy?: 'always-yadb' | 'yadb-for-non-ascii'` - 可选参数，控制 Midscene 何时调用 [yadb](https://github.com/ysbing/YADB) 来输入文本。默认值为 'always-yadb'。
+  - `displayId?: number` - 可选参数，用于指定要使用的显示器 ID。默认值为 undefined，表示使用当前显示器。
+
+## Android Agent 上的更多接口
+
+除了 [API 参考](./api.mdx) 中的通用 Agent 接口，AndroidAgent 还提供了一些其他接口：
+
+### `agent.launch()`
+
+启动一个网页或原生页面。
+
+- 类型
+
+```typescript
+function launch(uri: string): Promise<void>;
+```
+
+- 参数：
+
+  - `uri: string` - 要打开的 uri，可以是网页 url 或原生 app 的 package name 或 activity name，如果存在 activity name，则以 / 分隔（例如：com.android.settings/.Settings）
+
+- 返回值：
+
+  - `Promise<void>`
+
+- 示例：
+
+```typescript
+import { AndroidAgent, AndroidDevice } from '@midscene/android';
+
+const page = new AndroidDevice('s4ey59');
+const agent = new AndroidAgent(page);
+
+await agent.launch('https://www.ebay.com'); // 打开网页
+await agent.launch('com.android.settings'); // 打开系统设置 app(package name)
+await agent.launch('com.android.settings/.Settings'); // 打开系统设置 app(package name) 的 .Settings(activity name) 页面
+```
+
+### `agentFromAdbDevice()`
+
+从已连接的 adb 设备中，创建一个 AndroidAgent。
+
+- 类型
+
+```typescript
+function agentFromAdbDevice(
+  deviceId?: string,
+  opts?: PageAgentOpt,
+): Promise<AndroidAgent>;
+```
+
+- 参数：
+
+  - `deviceId?: string` - 可选参数，要连接的 adb 设备 id，如果未传入，则使用第一个连接的设备
+  - `opts?: PageAgentOpt & AndroidDeviceOpt` - 可选参数，用于初始化 AndroidAgent 的配置，其中 PageAgentOpt 参考 [构造器](./api.mdx)，AndroidDeviceOpt 的配置值参考 [AndroidDevice 的构造函数](./integrate-with-android#androiddevice-%E7%9A%84%E6%9E%84%E9%80%A0%E5%87%BD%E6%95%B0)
+
+- 返回值：
+
+  - `Promise<AndroidAgent>` 返回一个 AndroidAgent 实例
+
+- 示例：
+
+```typescript
+import { agentFromAdbDevice } from '@midscene/android';
+
+const agent = await agentFromAdbDevice('s4ey59'); // 传入 deviceId
+const agent = await agentFromAdbDevice(); // 不传入 deviceId，则使用第一个连接的设备
+```
+
+### `getConnectedDevices()`
+
+获取所有连接的 Android 设备。
+
+- 类型
+
+```typescript
+function getConnectedDevices(): Promise<Device[]>;
+interface Device {
+  /**
+   * The device udid.
+   */
+  udid: string;
+  /**
+   * Current device state, as it is visible in
+   * _adb devices -l_ output.
+   */
+  state: string;
+  port?: number;
+}
+```
+
+- 返回值：
+
+  - `Promise<Device[]>` 返回一个 Device 数组
+
+- 示例：
+
+```typescript
+import { agentFromAdbDevice, getConnectedDevices } from '@midscene/android';
+
+const devices = await getConnectedDevices();
+console.log(devices);
+const agent = await agentFromAdbDevice(devices[0].udid);
+```
+
+## 更多
+
+- 更多 Agent 上的 API 接口请参考 [API 参考](./api.mdx)。
+- 更多关于提示词的技巧请参考 [提示词技巧](./prompting-tips)
+
+## FAQ
+
+### 为什么我连接了设备，但是通过 adb 仍然无法控制？
+
+请检查是否在系统设置的开发者选项中，如果存在『USB 调试（安全设置）』，也需要开启。
+
+<p align="center">
+  <img src="/android-usb-debug.png" alt="android usb debug" width="400" />
+</p>
+
+### 如何使用自定义的 adb 路径、远程 adb 主机和端口？
+
+你可以使用 `MIDSCENE_ADB_PATH` 环境变量来指定 adb 可执行文件的路径，`MIDSCENE_ADB_REMOTE_HOST` 环境变量来指定远程 adb 主机，`MIDSCENE_ADB_REMOTE_PORT` 环境变量来指定远程 adb 端口。
+
+```bash
+export MIDSCENE_ADB_PATH=/path/to/adb
+export MIDSCENE_ADB_REMOTE_HOST=192.168.1.100
+export MIDSCENE_ADB_REMOTE_PORT=5037
+```
+
+此外，也可以通过 AndroidDevice 的构造函数来指定 adb 可执行文件的路径、远程 adb 主机和端口。
+
+```typescript
+const device = new AndroidDevice('s4ey59', {
+  androidAdbPath: '/path/to/adb',
+  remoteAdbHost: '192.168.1.100',
+  remoteAdbPort: 5037,
+});
+```
+
+
+
+---
+url: /zh/integrate-with-any-interface.md
+---
+
+
+
+# 与任意界面集成（预览特性）
+
+从 Midscene v0.28.0 开始，我们推出了与任意界面集成的功能。通过继承 `AbstractInterface` 类并告诉 Midscene 如何与界面交互，就可以创建一个功能齐全的 Midscene Agent。默认包含以下能力：
+
+- TypeScript 的 GUI 自动化 Agent SDK
+- Playground 调试面板
+- 通过 yaml 脚本控制界面
+- MCP 服务器
+- Midscene Agent 的全部能力
+
+请注意：只有具备视觉锚定（visual grounding）能力的模型才能用于控制界面。请阅读文档以[选择合适的模型](./choose-a-model)。
+
+:::tip 预览功能说明
+此功能仍在预览阶段。目前我们已经完成了以下工作：
+
+✅ 允许开发者定义继承 `AbstractInterface` 的类
+
+✅ 允许开发者使用 yaml 脚本驱动界面
+
+✅ 允许开发者使用 Playground
+
+接下来将要完成：
+
+- 允许开发者使用 MCP 服务器
+
+:::
+
+
+## 演示和社区项目
+
+我们已经为你准备了一个演示项目，帮助你学习如何定义自己的界面类。强烈建议你查看一下。
+
+* [演示项目](https://github.com/web-infra-dev/midscene-example/tree/main/custom-interface) - 一个简单的演示项目，展示如何定义自己的界面类
+
+* [Android (adb) Agent](https://github.com/web-infra-dev/midscene/blob/main/packages/android/src/device.ts) - 这是 Midscene Android (adb) Agent，同样依赖此特性实现
+
+还有一些使用此功能的社区项目：
+
+* [midscene-ios](https://github.com/lhuanyu/midscene-ios) - 使用 Midscene 驱动 "iPhone 镜像" 应用的项目
+
+
+## 配置 AI 模型服务
+
+将你的模型配置写入环境变量。更多信息请查看 [选择 AI 模型](../choose-a-model)。
+
+```bash
+# 替换为你的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 可能需要更多配置，如模型名称、接入点等，请参考 《选择 AI 模型》文档
+export OPENAI_BASE_URL="..."
+```
+
+
+## 实现你自己的界面类
+
+### 关键概念
+
+* `AbstractInterface` 类：一个预定义的抽象类，可以连接到 Midscene 智能体
+* **动作空间**：描述可以在界面上执行的动作集合。这将影响 AI 模型如何规划和执行动作
+
+### 步骤 1. 从 demo 项目开始
+
+这是最快的入门方式。
+
+```bash
+git clone https://github.com/web-infra-dev/midscene-example.git
+cd midscene-example/custom-interface
+npm install
+npm run build
+```
+
+### 步骤 2. 实现你的界面类
+
+定义一个继承 `AbstractInterface` 类的类，并实现所需的方法。
+
+你可以从 [`./src/sample-device.ts`](https://github.com/web-infra-dev/midscene-example/blob/main/custom-interface/src/sample-device.ts) 文件中获取示例实现。下面是你需要特别关注的关键点：
+
+需要实现的关键方法有：
+- `screenshotBase64()`、`size()`：帮助 AI 模型获取界面上下文
+- `actionSpace()`：一个由 `DeviceAction` 组成的数组，定义了在界面上可以执行的动作。AI 模型将依赖这些动作来执行具体操作。Midscene 已为常见界面与设备提供了预定义动作空间，同时也支持自定义动作。
+
+使用这些命令运行 Agent：
+
+- `npm run build` 重新编译 Agent 代码
+- `npm run demo` 使用 JavaScript 运行智能体
+- `npm run demo:yaml` 使用 yaml 脚本运行智能体
+
+
+### 步骤 3. 使用 Playground 测试 Agent
+
+将 Playground 服务附加到 Agent，即可在浏览器中测试。
+
+（即将推出...）
+
+### 步骤 4. 测试 MCP 服务
+
+（正在进行中...）
+
+### 步骤 5. 发布 npm 包，让你的用户使用它
+
+`./index.ts` 文件已经导出了你的 Agent 与界面类。现在可以发布到 npm。
+
+在 `package.json` 文件中填写 `name` 和 `version`，然后运行以下命令：
+
+```bash
+npm publish
+```
+
+你的 npm 包的典型用法如下：
+
+```typescript
+import { midsceneAgentForSampleDevice } from '...';
+
+const agent = midsceneAgentForSampleDevice({
+  foo: 'bar',
+});
+
+await agent.aiAction('click the button');
+```
+
+### 步骤 6. 在 Midscene CLI 和 YAML 脚本中调用你的类
+
+编写一个包含 `interface` 字段的 yaml 脚本来调用你的类：
+
+```yaml
+interface:
+  module: 'my-pkg-name'
+  # export: 'MyDeviceClass' # 如果是具名导出，使用该字段
+
+config:
+  output: './data.json'
+```
+
+该配置等价于：
+
+```typescript
+import MyDeviceClass from 'my-pkg-name';
+const device = new MyDeviceClass();
+const agent = new Agent(device, {
+  output: './data.json',
+});
+```
+
+YAML 的其他字段与[自动化脚本](./automate-with-scripts-in-yaml.html)文档一致。
+
+## API 参考
+
+### `AbstractInterface` 类
+
+```typescript
+import { AbstractInterface } from '@midscene/core';
+```
+
+`AbstractInterface` 是智能体控制界面的关键类。
+
+以下是你需要实现的必需方法：
+
+- `interfaceType: string`：为界面定义一个名称（不会提供给 AI 模型）
+- `screenshotBase64()`：截取界面的屏幕截图并返回带有 `'data:image/` 前缀的 base64 字符串
+- `size()`：界面的大小和 dpr，它是一个具有 `width`、`height` 和 `dpr` 属性的对象
+- `actionSpace()`：界面的动作空间，它是一个 `DeviceAction` 对象数组。可使用预定义动作空间，或定义任意自定义动作。
+
+以下是你可以实现的可选方法：
+
+- `destroy?()`：销毁
+- `describe?()`：描述这个界面，返回值用于报告和 Playground，但不会提供给 AI 模型
+- `beforeInvokeAction?()`：调用动作之前的钩子函数
+- `afterInvokeAction?()`：调用动作之后的钩子函数
+
+### 动作空间（Action Space）
+
+动作空间是界面上可执行动作的集合。AI 模型将基于这些动作来计划并执行操作。动作的描述与参数模式都会提供给 AI 模型。
+
+为了帮助你轻松定义动作空间，Midscene 为最常见的界面和设备提供了一组预定义的动作空间，同时也支持定义任意自定义动作。
+
+以下是如何导入工具来定义动作空间：
+
+```typescript
+import {
+	type ActionTapParam,
+	defineAction,
+	defineActionTap,
+} from "@midscene/core/device";
+```
+
+#### 预定义的动作空间
+
+这些是最常见界面和设备的预定义动作空间。你可以通过实现动作的调用方法将它们暴露给定制化界面。
+
+你可以在这些函数的类型定义中找到动作的参数。
+
+* `defineActionTap()`：定义点击动作。这也是调用 `aiTap` 方法的函数。
+* `defineActionDoubleClick()`：定义双击动作
+* `defineActionInput()`：定义输入动作。这也是调用 `aiInput` 方法的函数。这也是调用 `aiInput` 方法的函数。
+* `defineActionKeyboardPress()`：定义键盘按下动作。这也是调用 `aiKeyboardPress` 方法的函数。
+* `defineActionScroll()`：定义滚动动作。这也是调用 `aiScroll` 方法的函数。
+* `defineActionDragAndDrop()`：定义拖放动作
+* `defineActionLongPress()`：定义长按动作
+* `defineActionSwipe()`：定义滑动动作
+
+#### 定义一个自定义动作
+
+你可以使用 `defineAction()` 函数定义自己的动作。
+
+API 签名：
+
+```typescript
+import { defineAction } from "@midscene/core/device";
+
+defineAction(
+  {
+    name: string,
+    description: string,
+    paramSchema: z.ZodType<T>;
+    call: (param: z.infer<z.ZodType<T>>) => Promise<void>;
+  }
+)
+```
+
+* `name`：动作的名称，AI 模型将使用此名称调用动作
+* `description`：动作的描述，AI 模型将使用此描述来理解动作的作用。对于复杂动作，你可以在这里给出更详细的示例说明
+* `paramSchema`：动作参数的 [Zod](https://www.npmjs.com/package/zod) 模式，AI 模型将根据此模式帮助填充参数
+* `call`：调用动作的函数，你可以从符合 `paramSchema` 的 `param` 参数中获取参数
+
+
+示例：
+
+```typescript
+defineAction({
+  name: 'MyAction',
+  description: 'My action',
+  paramSchema: z.object({
+    name: z.string(),
+  }),
+  call: async (param) => {
+    console.log(param.name);
+  },
+});
+```
+
+如果你想要获取某个元素位置相关的参数，可以使用 `getMidsceneLocationSchema()` 函数获取特定的 zod 模式。
+
+一个更复杂的示例，关于如何定义自定义动作：
+
+```typescript
+import { getMidsceneLocationSchema } from "@midscene/core/device";
+
+defineAction({
+  name: 'LaunchApp',
+  description: 'A an app on screen',
+  paramSchema: z.object({
+    name: z.string().describe('The name of the app to launch'),
+    locate: getMidsceneLocationSchema().describe('The app icon to be launched'),
+  }),
+  call: async (param) => {
+    console.log(`launching app: ${param.name}, ui located at: ${JSON.stringify(param.locate.center)}`);
+  },
+});
+```
+
+
+## 常见问题（FAQ）
+
+**我可以使用普通的 LLM（如 GPT-4o）来控制界面吗？**
+
+不可以。你必须使用具备视觉锚定能力的模型。具备视觉锚定能力的模型可以在页面上定位目标元素并返回其坐标，这能显著提升自动化的稳定性。
+
+请阅读文档以[选择合适的模型](./choose-a-model)。
+
+**我的 interface-controller 可以在本文档中被推荐吗？**
+
+可以。我们欢迎收集有创意的项目并在本文档中列出它们。
+
+[当你的项目准备好后，给我们提一个 issue](https://github.com/web-infra-dev/midscene/issues)。
+
+
+
+---
+url: /zh/integrate-with-playwright.md
+---
+
+
+import { PackageManagerTabs } from '@theme';
+
+# 集成到 Playwright
+
+[Playwright.js](https://playwright.com/) 是由微软开发的一个开源自动化库，主要用于对网络应用程序进行端到端测试（end-to-end test）和网页抓取。
+
+与 Playwright 的集成方式有以下两种方式：
+
+- 直接用脚本方式集成和调用 Midscene Agent，适合快速体验、原型开发、数据抓取和自动化脚本等场景。
+- 在 Playwright 的测试用例中集成 Midscene，适合需要执行 UI 测试的场景。
+
+## 配置 AI 模型服务
+
+将你的模型配置写入环境变量。更多信息请查看 [选择 AI 模型](../choose-a-model)。
+
+```bash
+# 替换为你的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 可能需要更多配置，如模型名称、接入点等，请参考 《选择 AI 模型》文档
+export OPENAI_BASE_URL="..."
+```
+
+
+## 直接集成 Midscene Agent
+
+:::info 样例项目
+你可以在这里看到向 Playwright 集成的样例项目：[https://github.com/web-infra-dev/midscene-example/blob/main/playwright-demo](https://github.com/web-infra-dev/midscene-example/blob/main/playwright-demo)
+:::
+
+### 第一步：安装依赖
+
+<PackageManagerTabs command="install @midscene/web playwright @playwright/test tsx --save-dev" />
+
+### 第二步：编写脚本
+
+编写下方代码，保存为 `./demo.ts`
+
+```typescript
+import { chromium } from 'playwright';
+import { PlaywrightAgent } from '@midscene/web/playwright';
+import 'dotenv/config'; // read environment variables from .env file
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+Promise.resolve(
+  (async () => {
+    const browser = await chromium.launch({
+      headless: true, // 'true' means we can't see the browser window
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+
+    const page = await browser.newPage();
+    await page.setViewportSize({
+      width: 1280,
+      height: 768,
+    });
+    await page.goto('https://www.ebay.com');
+    await sleep(5000); // 👀 init Midscene agent
+    const agent = new PlaywrightAgent(page);
+
+    // 👀 type keywords, perform a search
+    await agent.aiAction('type "Headphones" in search box, hit Enter');
+
+    // 👀 wait for the loading
+    await agent.aiWaitFor('there is at least one headphone item on page');
+    // or you may use a plain sleep:
+    // await sleep(5000);
+
+    // 👀 understand the page content, find the items
+    const items = await agent.aiQuery(
+      '{itemTitle: string, price: Number}[], find item in list and corresponding price',
+    );
+    console.log('headphones in stock', items);
+
+    const isMoreThan1000 = await agent.aiBoolean(
+      'Is the price of the headphones more than 1000?',
+    );
+    console.log('isMoreThan1000', isMoreThan1000);
+
+    const price = await agent.aiNumber(
+      'What is the price of the first headphone?',
+    );
+    console.log('price', price);
+
+    const name = await agent.aiString(
+      'What is the name of the first headphone?',
+    );
+    console.log('name', name);
+
+    const location = await agent.aiLocate(
+      'What is the location of the first headphone?',
+    );
+    console.log('location', location);
+
+    // 👀 assert by AI
+    await agent.aiAssert('There is a category filter on the left');
+
+    // 👀 click on the first item
+    await agent.aiTap('the first item in the list');
+
+    await browser.close();
+  })(),
+);
+```
+
+更多 Agent 的 API 讲解请参考 [API 参考](./api.mdx)。
+
+### 第三步：运行
+
+使用 `tsx` 来运行，你会看到命令行打印出了耳机的商品信息：
+
+```bash
+# run
+npx tsx demo.ts
+
+# 命令行应该有如下输出
+#  [
+#   {
+#     itemTitle: 'JBL Tour Pro 2 - True wireless Noise Cancelling earbuds with Smart Charging Case',
+#     price: 551.21
+#   },
+#   {
+#     itemTitle: 'Soundcore Space One无线耳机40H ANC播放时间2XStronger语音还原',
+#     price: 543.94
+#   }
+# ]
+```
+
+### 第四步：查看运行报告
+
+当上面的命令执行成功后，会在控制台输出：`Midscene - report file updated: /path/to/report/some_id.html`， 通过浏览器打开该文件即可看到报告。
+
+### 如何限制页面在当前 tab 打开
+
+如果你想要限制页面在当前 tab 打开（比如点击一个带有 `target="_blank"` 属性的链接），你可以设置 `forceSameTabNavigation` 选项为 `true`：
+
+```typescript
+const mid = new PlaywrightAgent(page, {
+  forceSameTabNavigation: true,
+});
+```
+
+## 在 Playwright 的测试用例中集成 Midscene
+
+这里我们假设你已经拥有一个集成了 Playwright 的测试项目。
+
+:::info 样例项目
+你可以在这里看到向 Playwright 集成的样例项目：[https://github.com/web-infra-dev/midscene-example/blob/main/playwright-testing-demo](https://github.com/web-infra-dev/midscene-example/blob/main/playwright-testing-demo)
+:::
+
+### 第一步：新增依赖，更新配置文件
+
+新增依赖
+
+<PackageManagerTabs command="install @midscene/web --save-dev" />
+
+更新 playwright.config.ts
+
+```diff
+export default defineConfig({
+  testDir: './e2e',
++ timeout: 90 * 1000,
++ reporter: [["list"], ["@midscene/web/playwright-reporter", { type: "merged" }]], // type 可选, 默认值为 "merged"，表示多个测试用例生成一个报告，可选值为 "separate"，表示为每个测试用例一个报告
+});
+```
+
+其中 `reporter` 配置项的 `type` 可选值为 `merged` 或 `separate`，默认值为 `merged`，表示多个测试用例生成一个报告，可选值为 `separate`，表示为每个测试用例一个报告。
+
+### 第二步：扩展 `test` 实例
+
+把下方代码保存为 `./e2e/fixture.ts`;
+
+```typescript
+import { test as base } from '@playwright/test';
+import type { PlayWrightAiFixtureType } from '@midscene/web/playwright';
+import { PlaywrightAiFixture } from '@midscene/web/playwright';
+
+export const test = base.extend<PlayWrightAiFixtureType>(
+  PlaywrightAiFixture({
+    waitForNetworkIdleTimeout: 2000, // 可选, 交互过程中等待网络空闲的超时时间, 默认值为 2000ms, 设置为 0 则禁用超时
+  }),
+);
+```
+
+### 第三步：编写测试用例
+
+#### 基础 AI 操作
+
+- `ai` 或 `aiAction` - 通用 AI 交互
+- `aiTap` - 点击操作
+- `aiHover` - 悬停操作
+- `aiInput` - 输入操作
+- `aiKeyboardPress` - 键盘操作
+- `aiScroll` - 滚动操作
+- `aiRightClick` - 右键点击操作
+
+#### 查询
+
+- `aiAsk` - 询问 AI 模型任何问题
+- `aiQuery` - 从当前页面提取结构化的数据
+- `aiNumber` - 从当前页面提取数字
+- `aiString` - 从当前页面提取字符串
+- `aiBoolean` - 从当前页面提取布尔值
+
+#### 更多 API
+
+- `aiAssert` - 断言
+- `aiWaitFor` - 等待
+- `aiLocate` - 定位元素
+- `runYaml` - 执行 YAML 自动化脚本
+- `setAIActionContext` - 设置 AI 动作上下文，在调用 `agent.aiAction()` 时，发送给 AI 模型的背景知识
+- `evaluateJavaScript` - 在页面上下文中执行 JavaScript
+- `logScreenshot` - 在报告文件中记录当前截图，并添加描述
+- `freezePageContext` - 冻结页面上下文
+- `unfreezePageContext` - 解冻页面上下文
+
+除了上述暴露的快捷方法之外，如果还需要调用其它 agent 提供的 [API](./api.mdx)，请使用 `agentForPage` 获取 `PageAgent` 实例，使用 `PageAgent` 调用 API 进行交互：
+
+```typescript
+test('case demo', async ({ agentForPage, page }) => {
+  const agent = await agentForPage(page);
+
+  await agent.logScreenshot();
+  const logContent = agent._unstableLogContent();
+  console.log(logContent);
+});
+```
+
+#### 示例代码
+
+```typescript title="./e2e/ebay-search.spec.ts"
+import { expect } from '@playwright/test';
+import { test } from './fixture';
+
+test.beforeEach(async ({ page }) => {
+  page.setViewportSize({ width: 400, height: 905 });
+  await page.goto('https://www.ebay.com');
+  await page.waitForLoadState('networkidle');
+});
+
+test('search headphone on ebay', async ({
+  ai,
+  aiQuery,
+  aiAssert,
+  aiInput,
+  aiTap,
+  aiScroll,
+  aiWaitFor,
+  aiRightClick,
+  logScreenshot,
+}) => {
+  // 使用 aiInput 输入搜索关键词
+  await aiInput('Headphones', '搜索框');
+
+  // 使用 aiTap 点击搜索按钮
+  await aiTap('搜索按钮');
+
+  // 等待搜索结果加载
+  await aiWaitFor('搜索结果列表已加载', { timeoutMs: 5000 });
+
+  // 使用 aiScroll 滚动到页面底部
+  await aiScroll(
+    {
+      direction: 'down',
+      scrollType: 'untilBottom',
+    },
+    '搜索结果列表',
+  );
+
+  // 使用 aiQuery 获取商品信息
+  const items =
+    await aiQuery<Array<{ title: string; price: number }>>(
+      '获取搜索结果中的商品标题和价格',
+    );
+
+  console.log('headphones in stock', items);
+  expect(items?.length).toBeGreaterThan(0);
+
+  // 使用 aiAssert 验证筛选功能
+  await aiAssert('界面左侧有类目筛选功能');
+
+  // 使用 logScreenshot 记录当前状态
+  await logScreenshot('搜索结果', { content: '耳机搜索的最终结果' });
+});
+```
+
+更多 Agent 的 API 讲解请参考 [API 参考](./api.mdx)。
+
+### Step 4. 运行测试用例
+
+```bash
+npx playwright test ./e2e/ebay-search.spec.ts
+```
+
+### Step 5. 查看测试报告
+
+当上面的命令执行成功后，会在控制台输出：`Midscene - report file updated: ./current_cwd/midscene_run/report/some_id.html`，通过浏览器打开该文件即可看到报告。
+
+## 更多
+
+- 更多 Agent 上的 API 接口请参考 [API 参考](./api.mdx)。
+- 更多关于提示词的技巧请参考 [提示词技巧](./prompting-tips)
+
+
+
+---
+url: /zh/integrate-with-puppeteer.md
+---
+
+
+
+# 集成到 Puppeteer
+
+import { PackageManagerTabs } from '@theme';
+
+[Puppeteer](https://pptr.dev/) 是一个 Node.js 库，它通过 DevTools 协议或 WebDriver BiDi 提供控制 Chrome 或 Firefox 的高级 API。Puppeteer 默认在无界面模式（headless）下运行，但可以配置为在可见的浏览器模式（headed）中运行。
+
+:::info 样例项目
+你可以在这里看到向 Puppeteer 集成的样例项目：[https://github.com/web-infra-dev/midscene-example/blob/main/puppeteer-demo](https://github.com/web-infra-dev/midscene-example/blob/main/puppeteer-demo)
+
+这里还有一个 Puppeteer 和 Vitest 结合的样例项目：[https://github.com/web-infra-dev/midscene-example/tree/main/puppeteer-with-vitest-demo](https://github.com/web-infra-dev/midscene-example/tree/main/puppeteer-with-vitest-demo)
+:::
+
+## 配置 AI 模型服务
+
+将你的模型配置写入环境变量。更多信息请查看 [选择 AI 模型](../choose-a-model)。
+
+```bash
+# 替换为你的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 可能需要更多配置，如模型名称、接入点等，请参考 《选择 AI 模型》文档
+export OPENAI_BASE_URL="..."
+```
+
+
+## 第一步：安装依赖
+
+<PackageManagerTabs command="install @midscene/web puppeteer tsx --save-dev" />
+
+## 第二步：编写脚本
+
+编写下方代码，保存为 `./demo.ts`
+
+```typescript title="./demo.ts"
+import puppeteer from "puppeteer";
+import { PuppeteerAgent } from "@midscene/web/puppeteer";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+Promise.resolve(
+  (async () => {
+    const browser = await puppeteer.launch({
+      headless: false, // here we use headed mode to help debug
+    });
+
+    const page = await browser.newPage();
+    await page.setViewport({
+      width: 1280,
+      height: 800,
+      deviceScaleFactor: 1,
+    });
+
+    await page.goto("https://www.ebay.com");
+    await sleep(5000);
+
+    // 👀 初始化 Midscene agent 
+    const agent = new PuppeteerAgent(page);
+
+    // 👀 执行搜索
+    // 注：尽管这是一个英文页面，你也可以用中文指令控制它
+    await agent.aiAction('在搜索框输入 "Headphones" ，敲回车');
+    await sleep(5000);
+
+    // 👀 理解页面，提取数据
+    const items = await agent.aiQuery(
+      '{itemTitle: string, price: Number}[], 找到列表里的商品标题和价格',
+    );
+    console.log("耳机商品信息", items);
+
+    // 👀 用 AI 断言
+    await agent.aiAssert("界面左侧有类目筛选功能");
+
+    await browser.close();
+  })()
+);
+```
+
+更多 Agent 的 API 讲解请参考 [API 参考](./api.mdx)。
+
+## 第三步：运行
+
+使用 `tsx` 来运行，你会看到命令行打印出了耳机的商品信息：
+
+```bash
+# run
+npx tsx demo.ts
+
+# 命令行应该有如下输出
+#  [
+#   {
+#     itemTitle: 'JBL Tour Pro 2 - True wireless Noise Cancelling earbuds with Smart Charging Case',
+#     price: 551.21
+#   },
+#   {
+#     itemTitle: 'Soundcore Space One无线耳机40H ANC播放时间2XStronger语音还原',
+#     price: 543.94
+#   }
+# ]
+```
+
+## 第四步：查看运行报告
+
+当上面的命令执行成功后，会在控制台输出：`Midscene - report file updated: /path/to/report/some_id.html`， 通过浏览器打开该文件即可看到报告。
+
+## 如何限制页面在当前 tab 打开
+
+如果你想要限制页面在当前 tab 打开（比如点击一个带有 `target="_blank"` 属性的链接），你可以设置 `forceSameTabNavigation` 选项为 `true`：
+
+```typescript
+const mid = new PuppeteerAgent(page, {
+  forceSameTabNavigation: true,
+});
+```
+
+## 更多
+
+* 更多 Agent 上的 API 接口请参考 [API 参考](./api.mdx)。
+* 更多关于提示词的技巧请参考 [提示词技巧](./prompting-tips)
+
+
+
+---
+url: /zh/llm-txt.md
+---
+
+# LLMs.txt 文档
+
+如何让 Cursor、Windstatic、GitHub Copilot、ChatGPT 和 Claude 等工具理解 Midscene.js。
+
+我们支持 LLMs.txt 文件，使 Midscene.js 的文档可供大型语言模型使用。
+
+## 目录概览
+
+以下文件可供使用：
+
+- [llms.txt](https://midscenejs.com/zh/llms.txt)：主要的 LLMs.txt 文件
+- [llms-full.txt](https://midscenejs.com/zh/llms-full.txt)：Midscene.js 的完整文档
+
+
+## 使用方法
+
+### Cursor
+
+在 Cursor 中使用 `@Docs` 功能来将 LLMs.txt 文件包含到你的项目中。
+
+[阅读更多](https://docs.cursor.com/context/@-symbols/@-docs)
+
+### Windstatic
+
+使用 `@` 或在你的 `.windsurfrules` 文件中引用 LLMs.txt 文件。
+
+[阅读更多](https://docs.windsurf.com/windsurf/getting-started#memories-and-rules)
+
+
+
+
+
+---
+url: /zh/mcp-android.md
+---
+
+
+
+# MCP 服务
+
+Midscene 提供了专门的 MCP 服务，允许 AI 助手通过自然语言命令控制 Android 设备，自动化执行移动应用测试任务。
+
+:::info 什么是 MCP
+[MCP](https://modelcontextprotocol.io/introduction) 是一种标准化的方式，使 AI 模型能够与外部工具和功能进行交互。MCP 服务器暴露一组工具后，AI 模型可以调用这些工具来执行各种任务。对于 Midscene 来说，这些工具允许 AI 模型连接 Android 设备、启动应用、与 UI 元素交互等等。
+:::
+
+## 使用场景
+
+- 在 Android 设备上执行自动化测试
+- 控制 Android 应用进行 UI 交互
+
+## 设置 Midscene MCP
+
+### 前提条件
+
+1. OpenAI API 密钥或其他支持的 AI 模型提供商，更多信息请查看 [选择 AI 模型](./choose-a-model)。
+2. [Android adb](https://developer.android.com/tools/adb?hl=zh-cn) 工具已安装并配置
+3. Android 设备已启用 USB 调试模式并连接到电脑
+
+### 配置
+
+将 Midscene MCP 服务器添加到你的 MCP 配置中，注意不要遗漏 `MIDSCENE_MCP_ANDROID_MODE` 环境变量：
+
+```json
+{
+  "mcpServers": {
+    "mcp-midscene": {
+      "command": "npx",
+      "args": ["-y", "@midscene/mcp"],
+      "env": {
+        "MIDSCENE_MODEL_NAME": "REPLACE_WITH_YOUR_MODEL_NAME",
+        "OPENAI_API_KEY": "REPLACE_WITH_YOUR_OPENAI_API_KEY",
+        "MIDSCENE_MCP_ANDROID_MODE": "true",
+        "MCP_SERVER_REQUEST_TIMEOUT": "800000"
+      }
+    }
+  }
+}
+```
+
+其中有关配置 AI 模型的信息，请参阅[选择 AI 模型](./choose-a-model)。
+
+## 可用工具
+
+Midscene MCP 提供以下 Android 设备自动化工具：
+
+| 功能分类       | 工具名称                      | 功能描述                            |
+| -------------- | ----------------------------- | ----------------------------------- |
+| **设备管理**   | midscene_android_list_devices | 列出所有已连接的 Android 设备       |
+|                | midscene_android_connect      | 连接到指定的 Android 设备           |
+| **应用控制**   | midscene_android_launch       | 在 Android 设备上启动应用或打开网页 |
+| **系统操作**   | midscene_android_back         | 按下 Android 设备的返回键           |
+|                | midscene_android_home         | 按下 Android 设备的主页键           |
+| **页面交互**   | midscene_aiTap                | 点击通过自然语言描述的元素          |
+|                | midscene_aiInput              | 在表单字段或元素中输入文本          |
+|                | midscene_aiKeyboardPress      | 按下特定键盘按键                    |
+|                | midscene_aiScroll             | 滚动页面或特定元素                  |
+| **验证和观察** | midscene_aiWaitFor            | 等待页面上的条件为真                |
+|                | midscene_aiAssert             | 断言页面上的条件为真                |
+|                | midscene_screenshot           | 对当前页面截图                      |
+
+### 设备管理
+
+- **midscene_android_list_devices**：列出所有已连接的 Android 设备
+
+  ```
+  参数：无
+  ```
+
+- **midscene_android_connect**：连接到指定的 Android 设备
+  ```
+  参数：
+  - deviceId：（可选）要连接的设备 ID。如果未提供，使用第一个可用设备
+  - displayId：（可选）多屏 Android 设备的显示屏 ID（如 0、1、2），当指定时，所有 ADB 输入操作将针对此特定显示屏。
+  ```
+
+### 应用控制
+
+- **midscene_android_launch**：在 Android 设备上启动应用或打开网页
+  ```
+  参数：
+  - uri：要启动的应用包名、Activity 名称或要打开的网页 URL
+  ```
+
+### 系统操作
+
+- **midscene_android_back**：按下 Android 设备的返回键
+
+  ```
+  参数：无
+  ```
+
+- **midscene_android_home**：按下 Android 设备的主页键
+  ```
+  参数：无
+  ```
+
+### 页面交互
+
+- **midscene_aiTap**：点击通过自然语言描述的元素
+
+  ```
+  参数：
+  - locate：要点击元素的自然语言描述
+  ```
+
+- **midscene_aiInput**：在表单字段或元素中输入文本
+
+  ```
+  参数：
+  - value：要输入的文本
+  - locate：要输入文本的元素的自然语言描述
+  ```
+
+- **midscene_aiKeyboardPress**：按下特定键盘按键
+
+  ```
+  参数：
+  - key：要按下的按键（例如 'Enter'、'Tab'、'Escape'）
+  - locate：（可选）在按键前要聚焦的元素描述
+  - deepThink：（可选）如果为 true，使用更精确的元素定位
+  ```
+
+- **midscene_aiScroll**：滚动页面或特定元素
+  ```
+  参数：
+  - direction：'up'、'down'、'left' 或 'right'
+  - scrollType：'once'、'untilBottom'、'untilTop'、'untilLeft' 或 'untilRight'
+  - distance：（可选）以像素为单位的滚动距离
+  - locate：（可选）要滚动的元素描述
+  - deepThink：（可选）如果为 true，使用更精确的元素定位
+  ```
+
+### 验证和观察
+
+- **midscene_aiWaitFor**：等待页面上的条件为真
+
+  ```
+  参数：
+  - assertion：要等待的条件的自然语言描述
+  - timeoutMs：（可选）最大等待时间（毫秒）
+  - checkIntervalMs：（可选）检查条件的频率
+  ```
+
+- **midscene_aiAssert**：断言页面上的条件为真
+
+  ```
+  参数：
+  - assertion：要检查的条件的自然语言描述
+  ```
+
+- **midscene_screenshot**：对当前页面截图
+  ```
+  参数：
+  - name：截图的名称
+  ```
+
+## 常见问题
+
+### 如何连接 Android 设备？
+
+1. 确保已安装 Android SDK 并配置 ADB
+2. 在 Android 设备上启用开发者选项和 USB 调试
+3. 使用 USB 线连接设备到电脑
+4. 运行 `adb devices` 确认设备已连接
+5. 在 MCP 中使用 `midscene_android_list_devices` 查看可用设备
+
+### 如何启动 Android 应用？
+
+使用 `midscene_android_launch` 工具，参数可以是：
+
+- 应用包名：如 `com.android.chrome`
+- Activity 名称：如 `com.android.chrome/.MainActivity`
+- 网页 URL：如 `https://www.example.com`
+
+### 本地如果出现多个 Client 会导致 Server port 占用
+
+> 问题描述
+
+当用户在本地多个 Client （Claude Desktop、Cursor MCP、） 中同时使用了 Midscene MCP 将会出现端口占用导致服务报错
+
+> 如何解决
+
+- 将多余的 client 中的 MCP server 暂时先关闭
+- 执行命令
+
+```bash
+# For macOS/Linux:
+lsof -i:3766 | awk 'NR>1 {print $2}' | xargs -r kill -9
+
+# For Windows:
+FOR /F "tokens=5" %i IN ('netstat -ano ^| findstr :3766') DO taskkill /F /PID %i
+```
+
+### 如何获取 Midscene 执行的报告
+
+在每次执行完任务后都会生成 Midscene 任务报告，可以在命令行直接打开该 html 报告
+
+```bash
+# 将打开的地址替换为你的报告文件名
+open report_file_name.html
+```
+
+![image](https://lf3-static.bytednsdoc.com/obj/eden-cn/ozpmyhn_lm_hymuPild/ljhwZthlaukjlkulzlp/midscene/image.png)
+
+
+
+---
+url: /zh/model-provider.md
+---
+
+# 配置模型和服务商
+
+Midscene 默认集成了 OpenAI SDK 调用 AI 服务。使用这个 SDK 限定了 AI 服务出入参的形式，但并不意味着你只能使用 OpenAI 的模型，你可以使用任何兼容此类接口的模型服务（绝大多数平台或工具都支持）。
+
+在本文中，我们将展示如何配置 AI 提供商，以及如何选择不同的模型。你可以先阅读 [选择 AI 模型](./choose-a-model) 来了解如何选择模型。
+
+## 配置
+
+### 通用配置
+
+你可以通过环境变量来自定义配置。这些配置同样可以在 [Chrome 插件](./quick-experience) 中使用。
+
+常用的主要配置项如下，其中 `OPENAI_API_KEY` 是必选项：
+
+| 名称 | 描述 |
+|------|-------------|
+| `OPENAI_API_KEY` | 必选项。你的 OpenAI API Key (如 "sk-abcdefghijklmnopqrstuvwxyz") |
+| `OPENAI_BASE_URL` | 可选。API 的接入 URL。常用于切换到其他模型服务，如 `https://some_service_name.com/v1` |
+| `MIDSCENE_MODEL_NAME` | 可选。指定一个不同的模型名称 (默认是 gpt-4o)。常用于切换到其他模型服务|
+
+使用 `Qwen 2.5 VL` 模型的额外配置：
+
+| 名称 | 描述 |
+|------|-------------|
+| `MIDSCENE_USE_QWEN_VL` | 设置为 "1" 以适配 Qwen 2.5 VL 模型 |
+
+使用 `UI-TARS` 模型的额外配置：
+
+| 名称 | 描述 |
+|------|-------------|
+| `MIDSCENE_USE_VLM_UI_TARS` | 指定 UI-TARS 版本，支持的值为 `1.0` `1.5` `DOUBAO`（火山引擎版本） |
+
+使用 `Gemini 2.5 Pro` 模型的额外配置：
+
+| 名称 | 描述 |
+|------|-------------|
+| `MIDSCENE_USE_GEMINI` | 设置为 "1" 以适配 Gemini 2.5 Pro 模型 |
+
+关于模型的更多信息，请参阅 [选择 AI 模型](./choose-a-model)。
+
+### 高级配置
+
+还有一些高级配置项，通常不需要使用。
+
+| 名称 | 描述 |
+|------|-------------|
+| `OPENAI_USE_AZURE` | 可选。设置为 "true" 以使用 Azure OpenAI Service。更多详情请参阅后文 |
+| `MIDSCENE_OPENAI_INIT_CONFIG_JSON` | 可选。OpenAI SDK 的初始化配置 JSON |
+| `MIDSCENE_OPENAI_HTTP_PROXY` | 可选。HTTP/HTTPS 代理配置 (如 `http://127.0.0.1:8080` 或 `https://proxy.example.com:8080`)。这个选项优先级高于 `MIDSCENE_OPENAI_SOCKS_PROXY` |
+| `MIDSCENE_OPENAI_SOCKS_PROXY` | 可选。SOCKS 代理配置 (如 "socks5://127.0.0.1:1080") |
+| `MIDSCENE_PREFERRED_LANGUAGE` | 可选。模型响应的语言。如果当前时区是 GMT+8 则默认是 `Chinese`，否则是 `English` |
+| `MIDSCENE_REPLANNING_CYCLE_LIMIT` | 可选。最大重规划次数限制，默认是 10 |
+| `OPENAI_MAX_TOKENS` | 可选。模型响应的 max_tokens 数，默认是 2048 |
+
+### 调试配置
+
+通过设置以下配置，可以打印更多日志用于调试。这些日志也会打印到 `./midscene_run/log` 文件夹中。
+
+| 名称 | 描述 |
+|------|-------------|
+| `DEBUG=midscene:ai:profile:stats` | 可选。设置此项，可以打印 AI 服务消耗的时间、token 使用情况，用逗号分隔，便于分析 |
+| `DEBUG=midscene:ai:profile:detail` | 可选。设置此项，可以打印 AI token 消耗信息的详情 |
+| `DEBUG=midscene:ai:call` | 可选。设置此项，可以打印 AI 响应详情 |
+| `DEBUG=midscene:android:adb` | 可选。设置此项，可以打印 Android adb 命令调用详情 |
+
+## 两种配置环境变量的方式
+
+选择其中一种方式来配置环境变量。
+
+### 方法一：在系统中设置环境变量
+
+```bash
+# 替换为你自己的 API Key
+export OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+
+# 如果不是使用默认 OpenAI模型，还需要配置更多参数
+# export MIDSCENE_MODEL_NAME="..."
+```
+
+### 方法二：使用 dotenv 配置环境变量
+
+我们的 [demo 项目](https://github.com/web-infra-dev/midscene-example) 使用了这种方式。
+
+[Dotenv](https://www.npmjs.com/package/dotenv) 是一个零依赖的 npm 包，用于将环境变量从 `.env` 文件加载到环境变量 `process.env` 中。
+
+```bash
+# 安装 dotenv
+npm install dotenv --save
+```
+
+在项目根目录下创建一个 `.env` 文件，并添加以下内容。注意，这里不需要在每一行前添加 `export`。
+
+```bash
+OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"
+```
+
+在脚本中导入 dotenv 模块，导入后它会自动读取 `.env` 文件中的环境变量。
+
+```typescript
+import 'dotenv/config';
+```
+
+## 使用 Azure OpenAI 服务时的配置
+
+### 使用 ADT token provider
+
+此种模式无法运行在浏览器插件中。
+
+```bash
+# 使用 Azure OpenAI 服务时，配置为 1
+export MIDSCENE_USE_AZURE_OPENAI=1
+
+export MIDSCENE_AZURE_OPENAI_SCOPE="https://cognitiveservices.azure.com/.default"
+export AZURE_OPENAI_ENDPOINT="..."
+export AZURE_OPENAI_API_VERSION="2024-05-01-preview"
+export AZURE_OPENAI_DEPLOYMENT="gpt-4o"
+```
+
+### 使用 keyless 模式
+
+```bash
+export MIDSCENE_USE_AZURE_OPENAI=1
+export AZURE_OPENAI_ENDPOINT="..."
+export AZURE_OPENAI_KEY="..."
+export AZURE_OPENAI_API_VERSION="2024-05-01-preview"
+export AZURE_OPENAI_DEPLOYMENT="gpt-4o"
+```
+
+## 使用 Javascript 配置 AI 服务
+
+你也可以在运行 Midscene 代码之前，使用 Javascript 来配置 AI 服务。
+
+```typescript
+import { overrideAIConfig } from "@midscene/web/puppeteer";
+// 或者 import { overrideAIConfig } from "@midscene/web/playwright";
+// 或者 import { overrideAIConfig } from "@midscene/android";
+
+
+overrideAIConfig({
+  MIDSCENE_MODEL_NAME: "...",
+  // ...
+});
+```
+
+## 示例：使用 OpenAI 的 `gpt-4o` 模型
+
+配置环境变量：
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://endpoint.some_other_provider.com/v1" # 可选，如果你想要使用一个不同于 OpenAI 官方的接入点
+export MIDSCENE_MODEL_NAME="gpt-4o-2024-11-20" # 可选，默认是 "gpt-4o"
+```
+
+## 示例：使用阿里云官方的 `qwen-vl-max-latest` 模型
+
+配置环境变量：
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export MIDSCENE_MODEL_NAME="qwen-vl-max-latest"
+export MIDSCENE_USE_QWEN_VL=1
+```
+
+## 示例：使用 Doubao-1.5-thinking-vision-pro 模型
+
+配置环境变量：
+
+```bash
+export OPENAI_BASE_URL="https://ark-cn-beijing.bytedance.net/api/v3"
+export OPENAI_API_KEY="..."
+export MIDSCENE_MODEL_NAME='ep-...'
+export MIDSCENE_USE_DOUBAO_VISION=1
+```
+
+## 示例：使用 UI-TARS 模型
+
+配置环境变量：
+
+```bash
+export OPENAI_BASE_URL="http://localhost:1234/v1"
+export MIDSCENE_MODEL_NAME="ui-tars-72b-sft"
+export MIDSCENE_USE_VLM_UI_TARS=1
+```
+
+## 示例：使用 Anthropic 的 `claude-3-opus-20240229` 模型
+
+当配置 `MIDSCENE_USE_ANTHROPIC_SDK=1` 时，Midscene 会使用 Anthropic SDK (`@anthropic-ai/sdk`) 来调用模型。
+
+配置环境变量：
+
+```bash
+export MIDSCENE_USE_ANTHROPIC_SDK=1
+export ANTHROPIC_API_KEY="....."
+export MIDSCENE_MODEL_NAME="claude-3-opus-20240229"
+```
+
+## 调试 LLM 服务连接问题
+
+如果你想要调试 LLM 服务连接问题，可以使用示例项目中的 `connectivity-test` 目录：[https://github.com/web-infra-dev/midscene-example/tree/main/connectivity-test](https://github.com/web-infra-dev/midscene-example/tree/main/connectivity-test)
+
+将你的 `.env` 文件放在 `connectivity-test` 文件夹中，然后运行 `npm i && npm run test` 来查看问题。
+
+
+
+---
+url: /zh/prompting-tips.md
+---
+
+# 编写提示词（指令）的技巧
+
+你在 Midscene 编写的自然语言参数，最终都会变成提示词（Prompt）发送给大语言模型。以下是一些可以帮助提升效果的提示词工程（Prompt Engineering）技巧。
+
+## 目标是获得更稳定的响应
+
+由于 AI 常常会“幻想”，调优的目标是在多次运行中获得模型的稳定响应。大多数情况下，通过使用良好的提示，AI 模型的响应效果可以变得更好。
+
+## 提供更详细的描述并提供样例
+
+提供详细描述和示例一直是非常有用的提示词技巧。
+
+例如：
+❌ 错误示例
+```log
+搜'耳机'
+```
+
+✅ 正确示例
+```log
+找到搜索框（搜索框的上方应该有区域切换按钮，如 '国内'， '国际')，输入'耳机'，敲回车
+```
+
+❌ 错误示例
+```log
+断言：外卖服务正在正常运行
+```
+
+✅ 正确示例
+```log
+断言：界面上有个“外卖服务”的板块，并且标识着“正常”
+```
+
+### 在确定交互类型时，使用即时操作接口（Instant Action）
+
+例如：
+
+`agent.ai('点击登录按钮')` 是自动规划模式，Midscene 会规划步骤并执行。它可能会花费更多时间和 token.
+
+使用 `agent.aiTap('登录按钮')` 你可以直接使用 AI 模型定位结果并执行点击操作。它比自动规划模式更快且更准确。
+
+更多细节请参考 [API](./api.mdx).
+
+### 理解 `.ai` 交互出错的原因
+
+**理解报告文件**
+
+通过查看 Midscene 的运行报告，你可以看到每个 `.ai` 调用中的两个主要步骤：
+
+1. 规划（Planning）
+2. 定位（Locating）
+
+首先，你应该找出 AI 在规划步骤还是定位步骤中出错。
+
+当看到步骤不符预期（多步骤或少步骤），说明 AI 在规划步骤中出错。此时，你可以尝试在任务流中提供更多细节。
+
+例如：
+
+❌ 错误示例
+```log
+选择 "include" 选项
+```
+
+你可以尝试：
+
+✅ 正确示例
+```log
+点击 "range" 下拉菜单，并选择 "include" 选项
+```
+
+当看到定位结果不符预期（元素错误或坐标偏移），说明 AI 在定位步骤中出错。此时，你可以尝试在定位参数中提供更多细节。
+
+例如：
+
+❌ 错误示例
+```log
+点击 "Add" 按钮
+```
+
+你可以尝试：
+
+✅ 正确示例
+```log
+点击页面右上角的 "Add" 按钮，它是一个带有 "+" 图标的按钮，位于 "range" 下拉菜单的右侧
+```
+
+**其他优化方法**
+
+* 使用更大尺寸、更强的 AI 模型
+* 使用即时操作接口（Instant Action，如 `agent.aiTap()`）代替 `.ai`
+
+
+## 一个 Prompt (指令)只做一件事
+
+使用 `.ai` 每次只做一件事。尽管 Midscene 有自动重规划能力，但仍应保持指令简洁。否则，LLM 的输出可能会变得混乱。指令的长度对 token 消耗的影响几乎可以忽略不计。
+
+❌ 错误示例
+```log
+点击登录按钮，然后点击注册按钮，在表单中输入'test@test.com'作为邮箱，'test'作为密码，然后点击注册按钮
+```
+
+✅ 正确示例：将任务分解为多个步骤的 `.ai` 调用
+```log
+"点击登录按钮"
+"点击注册按钮"
+"在表单中[邮箱]输入'test@test.com'"
+"在表单中[密码]输入'test'"
+"点击注册按钮"
+```
+
+### LLM 可能无法准确辨别数值（比如坐标或十六进制颜色值），不妨提供一些选项
+
+例如：
+
+❌ 错误示例
+```log
+string，文本颜色的十六进制值
+```
+
+❌ 错误示例
+```log
+[number, number]，主按钮的 [x, y] 坐标
+```
+
+✅ 正确示例
+```log
+string，文本的颜色，返回：蓝色 / 红色 / 黄色 / 绿色 / 白色 / 黑色 / 其他
+```
+
+### 使用可视化报告和 Playground 进行调试
+
+测试报告里有每个步骤的详细信息。如果你想结合报告里的 UI 状态重新运行 Prompt，你可以启动本地 Playground Server，然后点击“Send to Playground”。
+
+启动本地 Playground Server:
+```
+npx --yes @midscene/web
+```
+
+![Playground](/midescene-playground-entry.jpg)
+
+
+### 从界面做推断，而不是 DOM 属性或者浏览器状态
+
+所有传递给 LLM 的数据都是截图和元素坐标。DOM和浏览器 对 LLM 来说几乎是不可见的。因此，务必确保你想提取的信息都在截图中有所体现且能被 LLM “看到”。
+
+❌ 错误示例
+```log
+标题有个 `test-id-size` 属性
+```
+
+❌ 错误示例
+```log
+浏览器有两个 tab 开着
+```
+
+❌ 错误示例
+```log
+异步请求已经结束了
+```
+
+✅ 正确示例
+```log
+标题是蓝色的
+```
+
+
+### 通过断言交叉检查结果
+
+LLM 可能会表现出错误的行为。更好的做法是运行操作后检查其结果。
+
+例如，你可以在插入记录后检查待办应用的列表内容。
+
+```typescript
+await ai('在任务框中输入“后天学习 AI”，然后按 Enter 键创建');
+
+// 检查结果
+const taskList = await aiQuery<string[]>('string[], 列表中的任务');
+expect(taskList.length).toBe(1);
+expect(taskList[0]).toBe('后天学习 AI');
+```
+
+### 中、英文提示词都是可行的
+
+由于大多数 AI 模型可以理解多种语言，所以请随意用你喜欢的语言撰写提示指令。即使提示语言与页面语言不同，通常也是可行的。
+
+
+
+---
+url: /zh/quick-experience-with-android.md
+---
+
+
+
+
+# 使用 Android Playground 快速体验
+
+通过使用 Midscene.js Android 设备，你可以快速在 Android 设备上体验 Midscene 的主要功能，而无需编写任何代码。
+
+该 Playground 和 `@midscene/android` 包共享一份代码，因此你可以将其视为 Midscene Android SDK 的一个 Playground 或调试工具。
+
+![](/android-playground.png)
+
+## 准备工作
+
+### 安装 Node.js
+
+安装 [Node.js 18 或以上版本](https://nodejs.org/en/download/)。
+
+### 准备 API Key
+
+准备一个视觉语言（VL）模型的 API Key。
+
+你可以在 [选择 AI 模型](../choose-a-model) 文档中查看 Midscene.js 支持的模型和配置。
+
+### 安装 adb
+
+`adb` 是一个命令行工具，允许你与 Android 设备通信。有两种安装 `adb` 的方法：
+
+- 方法 1：使用 [Android Studio](https://developer.android.com/studio?hl=zh-cn) 安装
+- 方法 2：使用 [Android 命令行工具](https://developer.android.com/studio#command-line-tools-only) 安装
+
+验证 `adb` 是否安装成功：
+
+```bash
+adb --version
+```
+
+当你看到以下输出时，表示 `adb` 安装成功：
+
+```log
+Android Debug Bridge version 1.0.41
+Version 34.0.4-10411341
+Installed as /usr/local/bin//adb
+Running on Darwin 24.3.0 (arm64) 
+```
+
+### 设置环境 ANDROID_HOME 变量
+
+参考[Android 环境变量](https://developer.android.com/tools/variables?hl=zh-cn)，设置环境变量 `ANDROID_HOME`。
+
+验证 `ANDROID_HOME` 变量是否设置成功：
+
+```bash
+echo $ANDROID_HOME
+```
+
+当上述命令有输出时，表示 `ANDROID_HOME` 变量设置成功：
+
+```log
+/Users/your_username/Library/Android/sdk
+```
+
+### 连接 Android 设备
+
+在 Android 设备的开发者选项中，启用 'USB 调试'，如果存在 'USB 调试（安全设置）'，也启用它，然后使用 USB 线连接 Android 设备。
+
+
+<p align="center">
+  <img src="/android-usb-debug-en.png" alt="android usb debug" width="400"/>
+</p>
+
+验证连接：
+
+```bash
+adb devices -l
+```
+
+当看到以下输出时，表示连接成功：
+
+```log
+List of devices attached
+s4ey59	device usb:34603008X product:cezanne model:M2006J device:cezan transport_id:3
+```
+
+
+## 启动 Playground
+
+```bash
+npx --yes @midscene/android-playground
+```
+
+## 配置 API Key
+
+点击齿轮按钮，进入配置页面：
+
+![](/android-set-env.png)
+
+参考 [配置模型和服务商](./model-provider) 文档，配置 API Key。
+
+## 开始体验
+
+配置完成后，你可以立即开始使用 Midscene。它一共有三个关键操作 Tab：
+
+- **Action**: 与网页进行交互，这就是所谓的自动规划（Auto Planning）。比如
+```
+在搜索框中输入 Midscene
+点击登录按钮
+```
+
+- **Query**: 从界面中提取 JSON 数据
+```
+提取页面中的用户 ID，返回 \{ id: string \}
+```
+
+- **Assert**: 验证页面
+
+```
+页面标题是 Midscene
+```
+
+- **Tap**: 在某个元素上点击，这就是所谓的即时操作（Instant Action）。
+```
+登录按钮
+```
+
+快来试试吧！
+
+> 关于自动规划（Auto Planning）和即时操作（Instant Action）的区别，请参考 [API](../api.mdx) 文档。
+
+## 想将 Midscene 集成到代码？
+
+插件体验结束后，你可能想将 Midscene 集成到代码中。这里有几种不同集成形式的文档：
+
+* [使用 YAML 格式的自动化脚本](../automate-with-scripts-in-yaml)
+
+
+* [与 Android(adb) 集成](./integrate-with-android)
+
+
+
+---
+url: /zh/quick-experience.md
+---
+
+
+
+
+# 通过 Chrome 插件快速体验
+
+通过使用 Midscene.js Chrome 插件，你可以快速在任意网页上体验 Midscene 的主要功能，而无需编写任何代码。
+
+该扩展与 npm `@midscene/web` 包共享了相同的代码，因此你可以将其视为 Midscene 的一个 Playground 或调试工具。
+
+<video
+  src="https://lf3-static.bytednsdoc.com/obj/eden-cn/nupipfups/Midscene/recording_2025-07-07_08-16-16.mp4"
+  controls
+/>
+
+## 准备工作
+
+准备你想要使用的 AI 模型及其 API Key。你可以在 [选择模型](../choose-a-model) 文档中查看 Midscene.js 支持的模型。
+
+## 安装与配置
+
+前往 Chrome 扩展商店安装 Midscene 扩展：[Midscene](https://chromewebstore.google.com/detail/midscene/gbldofcpkknbggpkmbdaefngejllnief)
+
+或下载安装包手动安装（**不推荐，无法获得自动更新**）：[Releases](https://github.com/web-infra-dev/midscene/releases)
+
+启动扩展（可能默认折叠在 Chrome 扩展列表中），通过粘贴 Key=Value 格式配置插件环境：
+
+```bash
+OPENAI_API_KEY="sk-replace-by-your-own"
+# ...可能还有其他配置项，一并贴入
+```
+
+## 开始体验
+
+配置完成后，你可以立即开始使用 Midscene。它一共有三个关键操作 Tab：
+
+- **Action**: 与网页进行交互，这就是所谓的自动规划（Auto Planning）。比如
+```
+在搜索框中输入 Midscene
+点击登录按钮
+```
+
+- **Query**: 从界面中提取 JSON 数据
+```
+提取页面中的用户 ID，返回 \{ id: string \}
+```
+
+- **Assert**: 验证页面
+
+```
+页面标题是 Midscene
+```
+
+- **Tap**: 在某个元素上点击，这就是所谓的即时操作（Instant Action）。
+```
+登录按钮
+```
+
+快来试试吧！
+
+> 关于自动规划（Auto Planning）和即时操作（Instant Action）的区别，请参考 [API](../api.mdx) 文档。
+
+## 想将 Midscene 集成到代码？
+
+插件体验结束后，你可能想将 Midscene 集成到代码中。这里有几种不同集成形式的文档：
+
+* [使用 YAML 格式的自动化脚本](../automate-with-scripts-in-yaml)
+
+
+- [使用 Chrome 插件的桥接模式](./bridge-mode-by-chrome-extension)
+- [与 Puppeteer 集成](./integrate-with-puppeteer)
+- [与 Playwright 集成](./integrate-with-playwright)
+
+## FAQ
+
+- 插件运行失败，提示 'Cannot access a chrome-extension:// URL of different extension'
+
+这一般是与其他插件冲突所致，如页面已经被其他插件注入了 `<iframe />` 或 `<script />`。
+
+找到可疑插件：
+
+1. 打开页面的调试器，找到被其他插件注入的 `<iframe />` 或 `<script />`，一般 URL 是 `chrome-extension://{这串就是ID}/...` 格式，复制其 ID。
+2. 打开 `chrome://extensions/` ，用 cmd+f 找到相同 ID 的插件，禁用它。
+3. 刷新页面，再次尝试。
+
+
+
+---
+url: /zh/web-mcp.md
+---
+
+
+
+# MCP 服务
+
+Midscene 提供了 MCP 服务，允许 AI 助手通过自然语言命令控制浏览器，自动化执行 UI 任务，以及生成 Midscene 自动化脚本。
+
+:::info 什么是 MCP
+[MCP](https://modelcontextprotocol.io/introduction) 是一种标准化的方式，使 AI 模型能够与外部工具和功能进行交互。MCP 服务器暴露一组工具后，AI 模型可以调用这些工具来执行各种任务。对于 Midscene 来说，这些工具允许 AI 模型控制浏览器、导航网页、与 UI 元素交互等等。
+:::
+
+## 使用场景
+
+* 控制浏览器执行自动化任务
+* 生成 Midscene 的自动化脚本
+
+### 使用示例
+
+> 给 Sauce Demo 站点生成 Midscene 测试用例
+
+<video src="https://lf3-static.bytednsdoc.com/obj/eden-cn/ozpmyhn_lm_hymuPild/ljhwZthlaukjlkulzlp/midscene/en-midscene-mcp-Sauce-Demo.mp4" controls/>
+
+## 设置 Midscene MCP
+
+### 前提条件
+
+1. OpenAI API 密钥或其他支持的 AI 模型提供商，更多信息请查看 [选择 AI 模型](./choose-a-model)。
+2. 对于 Chrome 浏览器集成（桥接模式）：
+   - 安装 Midscene Chrome 扩展（从 [Chrome Web Extension](https://chromewebstore.google.com/detail/midscenejs/gbldofcpkknbggpkmbdaefngejllnief?hl=zh-CN&utm_source=ext_sidebar) 下载）
+   - 在扩展中切换到"桥接模式"并点击"允许连接"
+
+### 配置
+
+将 Midscene MCP 服务器添加到你的 MCP 配置中：
+
+```json
+{
+  "mcpServers": {
+    "mcp-midscene": {
+      "command": "npx",
+      "args": ["-y", "@midscene/mcp"],
+      "env": {
+        "MIDSCENE_MODEL_NAME": "REPLACE_WITH_YOUR_MODEL_NAME",
+        "OPENAI_API_KEY": "REPLACE_WITH_YOUR_OPENAI_API_KEY",
+        "MCP_SERVER_REQUEST_TIMEOUT": "800000"
+      }
+    }
+  }
+}
+```
+
+有关配置 AI 模型的更多信息，请参阅[选择 AI 模型](./choose-a-model)。
+
+## 可用工具
+
+Midscene MCP 提供以下浏览器自动化工具：
+
+| 功能分类 | 工具名称 | 功能描述 |
+|---------|---------|---------|
+| **导航** | midscene_navigate | 在当前标签页导航到指定 URL |
+| **标签页管理** | midscene_get_tabs | 获取所有打开的浏览器标签页列表 |
+| | midscene_set_active_tab | 通过 ID 切换到特定标签页 |
+| **页面交互** | midscene_aiTap | 点击通过自然语言描述的元素 |
+| | midscene_aiInput | 在表单字段或元素中输入文本 |
+| | midscene_aiHover | 悬停在元素上 |
+| | midscene_aiKeyboardPress | 按下特定键盘按键 |
+| | midscene_aiScroll | 滚动页面或特定元素 |
+| **验证和观察** | midscene_aiWaitFor | 等待页面上的条件为真 |
+| | midscene_aiAssert | 断言页面上的条件为真 |
+| | midscene_screenshot | 对当前页面截图 |
+| **Playwright 代码示例** | midscene_playwright_example | 提供了 Midscene 的 Playwright 代码示例 |
+
+### 导航
+
+- **midscene_navigate**：在当前标签页导航到指定 URL
+  ```
+  参数：
+  - url：要导航到的 URL
+  ```
+
+### 标签页管理
+
+- **midscene_get_tabs**：获取所有打开的浏览器标签页列表，包括它们的 ID、标题和 URL
+  ```
+  参数：无
+  ```
+
+- **midscene_set_active_tab**：通过 ID 切换到特定标签页
+  ```
+  参数：
+  - tabId：要激活的标签页 ID
+  ```
+
+### 页面交互
+
+- **midscene_aiTap**：点击通过自然语言描述的元素
+  ```
+  参数：
+  - locate：要点击元素的自然语言描述
+  ```
+
+- **midscene_aiInput**：在表单字段或元素中输入文本
+  ```
+  参数：
+  - value：要输入的文本
+  - locate：要输入文本的元素的自然语言描述
+  ```
+
+- **midscene_aiHover**：悬停在元素上
+  ```
+  参数：
+  - locate：要悬停元素的自然语言描述
+  ```
+
+- **midscene_aiKeyboardPress**：按下特定键盘按键
+  ```
+  参数：
+  - key：要按下的按键（例如 'Enter'、'Tab'、'Escape'）
+  - locate：（可选）在按键前要聚焦的元素描述
+  - deepThink：（可选）如果为 true，使用更精确的元素定位
+  ```
+
+- **midscene_aiScroll**：滚动页面或特定元素
+  ```
+  参数：
+  - direction：'up'、'down'、'left' 或 'right'
+  - scrollType：'once'、'untilBottom'、'untilTop'、'untilLeft' 或 'untilRight'
+  - distance：（可选）以像素为单位的滚动距离
+  - locate：（可选）要滚动的元素描述
+  - deepThink：（可选）如果为 true，使用更精确的元素定位
+  ```
+
+### 验证和观察
+
+- **midscene_aiWaitFor**：等待页面上的条件为真
+  ```
+  参数：
+  - assertion：要等待的条件的自然语言描述
+  - timeoutMs：（可选）最大等待时间（毫秒）
+  - checkIntervalMs：（可选）检查条件的频率
+  ```
+
+- **midscene_aiAssert**：断言页面上的条件为真
+  ```
+  参数：
+  - assertion：要检查的条件的自然语言描述
+  ```
+
+- **midscene_screenshot**：对当前页面截图
+  ```
+  参数：
+  - name：截图的名称
+  ```
+
+## 常见问题
+
+### Midscene MCP 对比其他浏览器 MCP 有什么优势？
+
+- Midscene MCP 默认支持了 Bridge 模式，能够**直接控制你当前正在使用的浏览器**，**无需重新登录或者下载浏览器**
+- Midscene MCP 内置了对于浏览器页面控制和操作的最佳 Prompt 模板和操作执行实践，对比其他 MCP 实现，**能够提供更加稳定和可靠的浏览器自动化体验**
+- Midscene MCP 执行完成任务后将会自动生成执行用例报告，**随时可观看执行过程**
+
+
+### 本地如果出现多个 Client 会导致 Server port 占用
+
+> 问题描述
+
+当用户在本地多个 Client （Claude Desktop、Cursor MCP、） 中同时使用了 Midscene MCP 将会出现端口占用导致服务报错
+
+> 如何解决
+
+- 将多余的 client 中的 MCP server 暂时先关闭
+- 执行命令
+
+```bash
+# For macOS/Linux:
+lsof -i:3766 | awk 'NR>1 {print $2}' | xargs -r kill -9
+
+# For Windows:
+FOR /F "tokens=5" %i IN ('netstat -ano ^| findstr :3766') DO taskkill /F /PID %i
+```
+
+### 如何获取 Midscene 执行的报告
+
+在每次执行完任务后都会生成 Midscene 任务报告，可以在命令行直接打开该 html 报告
+
+```bash
+# 将打开的地址替换为你的报告文件名
+open report_file_name.html
+```
+
+![image](https://lf3-static.bytednsdoc.com/obj/eden-cn/ozpmyhn_lm_hymuPild/ljhwZthlaukjlkulzlp/midscene/image.png)
+

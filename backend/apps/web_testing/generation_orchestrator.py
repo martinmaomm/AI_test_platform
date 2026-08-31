@@ -105,7 +105,13 @@ def _model_failure(error: BaseException) -> tuple[str, str]:
     return 'MODEL_UNAVAILABLE', '本次锁定的模型暂时不可用，请检查模型配置或稍后重试。'
 
 
-def _safe_fail_generation(generation_id: str, error_code: str, message: str) -> dict[str, Any]:
+def _safe_fail_generation(
+    generation_id: str,
+    error_code: str,
+    message: str,
+    *,
+    updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Persist a safe failure if possible; never expose a raw backend exception."""
     try:
         generation = transition_generation(
@@ -113,6 +119,7 @@ def _safe_fail_generation(generation_id: str, error_code: str, message: str) -> 
             WebUIScriptGeneration.Status.FAILED,
             error_code=error_code,
             error_message=message,
+            updates=updates,
         )
         publish_terminal(generation)
         return {
@@ -169,9 +176,83 @@ def _map_explorer_error(error: MCPPageExplorerError) -> tuple[str, str]:
         'transient': 'TRANSIENT_SERVICE_ERROR',
         'TASK_CANCELLED': 'TASK_CANCELLED',
         'EVIDENCE_INSUFFICIENT': 'EVIDENCE_INSUFFICIENT',
+        'SCRIPT_FORMAT_INVALID': 'EVIDENCE_INSUFFICIENT',
         'read_only_violation': 'EXPLORATION_WRITE_BLOCKED',
     }
     return mappings.get(error.error_code, 'TRANSIENT_SERVICE_ERROR'), str(error)
+
+
+def _merge_explorer_failure_stats(
+    previous: dict[str, Any] | None,
+    failure: MCPPageExplorerError,
+) -> dict[str, Any]:
+    """Merge only the allowlisted, already-sanitized Explorer counters."""
+    extra = failure.tool_stats or {}
+    if not extra:
+        return dict(previous or {})
+    previous = previous or {}
+    counts = dict(previous.get('tool_counts') or {})
+    for name, count in (extra.get('tool_counts') or {}).items():
+        counts[str(name)] = counts.get(str(name), 0) + int(count)
+    merged = {
+        'total_tool_calls': int(previous.get('total_tool_calls', 0)) + int(extra.get('total_tool_calls', 0)),
+        'tool_counts': counts,
+        'failed_tool_calls': int(previous.get('failed_tool_calls', 0)) + int(extra.get('failed_tool_calls', 0)),
+        'termination_reason': extra.get('termination_reason') or previous.get('termination_reason'),
+        'duration_seconds': round(
+            float(previous.get('duration_seconds', 0)) + float(extra.get('duration_seconds', 0)), 3,
+        ),
+    }
+    # These are failure-only summaries from MCPPageExplorerError; never copy
+    # tool input, selector, output text, URL, or credential-bearing metadata.
+    if 'blocked_tool_calls' in extra:
+        merged['blocked_tool_calls'] = max(0, int(extra['blocked_tool_calls']))
+    for name in ('last_operation', 'last_blocked_operation'):
+        operation = extra.get(name)
+        if not isinstance(operation, dict):
+            continue
+        tool_name = str(operation.get('tool_name') or 'browser_tool')
+        if not (tool_name.startswith('playwright_') or tool_name == 'browser_console_logs'):
+            tool_name = 'browser_tool'
+        try:
+            call_index = max(0, int(operation.get('call_index', 0)))
+        except (TypeError, ValueError):
+            call_index = 0
+        status = str(operation.get('status') or 'unknown')
+        if status not in {'started', 'succeeded', 'failed', 'blocked'}:
+            status = 'unknown'
+        merged[name] = {
+            'tool_name': tool_name,
+            'call_index': call_index,
+            'status': status,
+        }
+    return merged
+
+
+def _cancel_with_explorer_stats(
+    generation_id: str,
+    failure: MCPPageExplorerError,
+    *,
+    previous_stats: dict[str, Any] | None = None,
+) -> WebUIScriptGeneration:
+    generation = cancel_generation(generation_id)
+    stats = _merge_explorer_failure_stats(previous_stats or generation.tool_stats, failure)
+    if stats and generation.tool_stats != stats:
+        generation.tool_stats = stats
+        generation.save(update_fields=['tool_stats', 'updated_at'])
+    return generation
+
+
+def _cancel_with_snapshot_stats(
+    generation_id: str,
+    tool_stats: dict[str, Any],
+) -> WebUIScriptGeneration:
+    """Keep an already completed exploration's counters on a late cancellation."""
+    generation = cancel_generation(generation_id)
+    if generation.tool_stats != tool_stats:
+        generation.tool_stats = tool_stats
+        generation.save(update_fields=['tool_stats', 'updated_at'])
+    return generation
 
 
 def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
@@ -314,6 +395,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             llm_model=model_manager.current_llm,
             mcp_config=preflight.mcp_config or {},
             cancel_check=lambda: bool(celery_task_id and cache.get(f'celery:cancel:{celery_task_id}')),
+            generation_id=str(generation.pk),
         )
         snapshot = asyncio.run(explorer.explore(
             scenario=scenario,
@@ -328,8 +410,13 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 str(generation.pk),
                 'EVIDENCE_INSUFFICIENT',
                 '页面探索证据与测试场景不一致，请缩短范围后重试。',
+                updates={'tool_stats': snapshot.tool_stats.model_dump(mode='json')},
             )
-        if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
+        if _is_task_cancelled(str(generation.pk), celery_task_id):
+            generation = _cancel_with_snapshot_stats(
+                generation.pk, snapshot.tool_stats.model_dump(mode='json'),
+            )
+            publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
         unresolved_questions = list(dict.fromkeys(snapshot.unresolved_questions))
@@ -421,7 +508,11 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 else:
                     code, message = 'EVIDENCE_INSUFFICIENT', '定向补充页面证据未成功，请人工检查后再保存。'
                 if code == 'TASK_CANCELLED':
-                    generation = cancel_generation(generation.pk)
+                    generation = _cancel_with_explorer_stats(
+                        generation.pk,
+                        exc,
+                        previous_stats=snapshot.tool_stats.model_dump(mode='json'),
+                    )
                     publish_terminal(generation)
                     return {'generation_id': str(generation.pk), 'status': 'cancelled'}
                 generation = transition_generation(
@@ -433,6 +524,9 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                     updates={
                         'script_draft': script,
                         'quality_report': report,
+                        'tool_stats': _merge_explorer_failure_stats(
+                            snapshot.tool_stats.model_dump(mode='json'), exc,
+                        ),
                         'warnings': [*list(generation.warnings), '定向补充探索未完成，未进行重复探索。'],
                     },
                 )
@@ -518,10 +612,13 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
     except MCPPageExplorerError as exc:
         code, message = _map_explorer_error(exc)
         if code == 'TASK_CANCELLED':
-            generation = cancel_generation(generation.pk)
+            generation = _cancel_with_explorer_stats(generation.pk, exc)
             publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-        return _safe_fail_generation(str(generation.pk), code, message)
+        return _safe_fail_generation(
+            str(generation.pk), code, message,
+            updates={'tool_stats': _merge_explorer_failure_stats(generation.tool_stats, exc)},
+        )
     except Exception:
         logger.error(
             'WebUI V2 orchestration failed without exposing raw details: generation_id=%s',

@@ -937,8 +937,15 @@ class MCPConfigurationActionView(APIView):
     
     def _build_mcp_connections(self, mcp_servers: dict) -> dict:
         """构建 MultiServerMCPClient 连接配置"""
+        from web_testing.generation_preflight import prepare_playwright_mcp_output_config
+
+        # Configuration probes launch the same server as generation tasks.
+        # Give each probe its own output id without rewriting the saved JSON.
+        runtime_config = prepare_playwright_mcp_output_config(
+            {'mcpServers': mcp_servers}, None,
+        )
         connections = {}
-        for server_name, server_config in mcp_servers.items():
+        for server_name, server_config in runtime_config['mcpServers'].items():
             if 'command' in server_config:
                 # stdio transport
                 conn = {
@@ -1179,5 +1186,4 @@ class MCPTestConnectionView(APIView):
             },
             message="MCP连接测试成功"
         )
-
 

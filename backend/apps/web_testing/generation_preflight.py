@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import os
 import re
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from django.conf import settings
 
@@ -40,6 +42,158 @@ _EXPLICIT_WRITE_INTENT_RE = re.compile(
     r'submit|create|update|delete|approve|pay|publish|upload)',
     re.IGNORECASE,
 )
+
+_EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE = '@executeautomation/playwright-mcp-server'
+_AITS_MCP_LOG_FILE_ENV = 'AITS_MCP_LOG_FILE'
+_AITS_MCP_SCREENSHOT_DIR_ENV = 'AITS_MCP_SCREENSHOT_DIR'
+_AITS_MCP_WORKING_DIR_ENV = 'AITS_MCP_WORKING_DIR'
+
+
+def validate_generation_output_id(generation_id: str | None) -> str:
+    """Return a canonical UUID directory segment without accepting path-like ids."""
+    if generation_id is None:
+        return str(uuid4())
+    try:
+        return str(UUID(str(generation_id)))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError('generation_id 必须是 UUID，不能作为输出目录路径使用。') from exc
+
+
+def _is_output_bootstrap_args(args: Any, bootstrap_path: Path) -> bool:
+    """Recognize this project's wrapper so repeated preparation stays idempotent."""
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return False
+    for index, arg in enumerate(args[:-1]):
+        if arg != '--package' or not args[index + 1].startswith(
+            f'{_EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE}@'
+        ):
+            continue
+        server_args = args[index + 2:]
+        if server_args[:1] == ['--']:
+            server_args = server_args[1:]
+        if len(server_args) < 2 or server_args[:1] != ['node']:
+            continue
+        if Path(server_args[1]).resolve() != bootstrap_path:
+            raise ValueError('Playwright MCP 已包装为非本项目输出启动器，不能安全重复包装。')
+        if any(arg == '--port' or arg.startswith('--port=') for arg in server_args[2:]):
+            raise ValueError('Playwright MCP 输出重定向仅支持 stdio，不能使用 --port。')
+        return True
+    return False
+
+
+def _executeautomation_package_spec(args: Any) -> tuple[list[str], str, list[str]] | None:
+    """Parse the supported npx stdio form while preserving npx and server options."""
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return None
+
+    package_indexes = [
+        index for index, arg in enumerate(args)
+        if (index == 0 or args[index - 1] != '--package')
+        and (arg == _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE
+        or arg.startswith(f'{_EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE}@')
+        )
+    ]
+    package_option_indexes = [index for index, arg in enumerate(args[:-1]) if arg == '--package']
+    if not package_indexes and not package_option_indexes:
+        return None
+    if len(package_indexes) > 1 or package_indexes and package_option_indexes:
+        raise ValueError('Playwright MCP npx 配置只能包含一个 @executeautomation 包版本。')
+
+    if package_option_indexes:
+        if len(package_option_indexes) != 1:
+            raise ValueError('Playwright MCP npx 配置只能包含一个 --package 选项。')
+        package_index = package_option_indexes[0]
+        package_spec = args[package_index + 1]
+        if not (
+            package_spec == _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE
+            or package_spec.startswith(f'{_EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE}@')
+        ):
+            return None
+        npx_options = args[:package_index]
+        server_args = args[package_index + 2:]
+        if server_args[:1] == ['--']:
+            server_args = server_args[1:]
+        if not server_args or server_args[0] != 'playwright-mcp-server':
+            raise ValueError('npx --package 形式必须以 playwright-mcp-server 启动 stdio 服务。')
+        server_args = server_args[1:]
+    else:
+        package_index = package_indexes[0]
+        package_spec = args[package_index]
+        npx_options = args[:package_index]
+        server_args = args[package_index + 1:]
+    if package_spec == _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE:
+        raise ValueError('Playwright MCP 必须固定到明确版本后才能重定向任务输出。')
+    if server_args[:1] == ['--']:
+        server_args = server_args[1:]
+    if any(arg == '--port' or arg.startswith('--port=') for arg in server_args):
+        raise ValueError('Playwright MCP 输出重定向仅支持 stdio，不能使用 --port。')
+    return npx_options, package_spec, server_args
+
+
+def prepare_playwright_mcp_output_config(
+    raw_config: dict[str, Any],
+    generation_id: str | None,
+    *,
+    base_dir: str | None = None,
+) -> dict[str, Any]:
+    """Derive an outputs-only runtime config for the pinned Playwright MCP server.
+
+    Database JSON is never mutated.  Unsupported MCP entries stay untouched so
+    callers that contain other MCP servers retain their existing behaviour.
+    """
+    config = copy.deepcopy(raw_config)
+    playwright = (config.get('mcpServers') or {}).get('playwright')
+    if not isinstance(playwright, dict):
+        return config
+
+    resolved_base_dir = Path(base_dir or str(settings.BASE_DIR)).resolve()
+    bootstrap_path = resolved_base_dir / 'scripts' / 'playwright_mcp_output_bootstrap.mjs'
+    command = playwright.get('command')
+    is_wrapped = _is_output_bootstrap_args(playwright.get('args', []), bootstrap_path)
+    parsed_args = None if is_wrapped else _executeautomation_package_spec(playwright.get('args', []))
+    if not is_wrapped and parsed_args is None:
+        return config
+    if not isinstance(command, str) or os.path.basename(command) != 'npx':
+        raise ValueError('固定的 @executeautomation Playwright MCP 仅支持通过 npx stdio 启动。')
+    if not bootstrap_path.is_file():
+        raise ValueError('Playwright MCP 输出启动器不存在，无法安全重定向输出。')
+    if is_wrapped and generation_id is None:
+        return config
+
+    output_id = validate_generation_output_id(generation_id)
+
+    configured_cwd = playwright.get('cwd')
+    if configured_cwd is not None and (not isinstance(configured_cwd, str) or not configured_cwd.strip()):
+        raise ValueError('MCP playwright cwd 必须是非空路径。')
+    resolved_cwd = None
+    if configured_cwd:
+        cwd_path = Path(configured_cwd).expanduser()
+        resolved_cwd = str((cwd_path if cwd_path.is_absolute() else resolved_base_dir / cwd_path).resolve())
+
+    env = playwright.setdefault('env', {})
+    if not isinstance(env, dict):
+        raise ValueError('MCP playwright env 必须是对象')
+    env[_AITS_MCP_LOG_FILE_ENV] = str(
+        resolved_base_dir / 'logs' / 'playwright-mcp' / f'{output_id}.log'
+    )
+    env[_AITS_MCP_SCREENSHOT_DIR_ENV] = str(
+        resolved_base_dir / 'temp' / 'playwright-mcp' / output_id / 'screenshots'
+    )
+    if resolved_cwd is not None:
+        env[_AITS_MCP_WORKING_DIR_ENV] = resolved_cwd
+
+    if is_wrapped:
+        return config
+
+    npx_options, package_spec, server_args = parsed_args
+    playwright['args'] = [
+        *npx_options,
+        '--package', package_spec,
+        '--',
+        'node', str(bootstrap_path),
+        *server_args,
+    ]
+    return config
 
 
 def exploration_requires_write_confirmation(description: str) -> bool:

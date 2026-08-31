@@ -5,11 +5,15 @@ import inspect
 import json
 import logging
 import os
+from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from uuid import UUID
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.conf import settings
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -27,13 +31,16 @@ from .generation_contracts import (
 )
 from .generation_orchestrator import run_v2_generation
 from .generation_preflight import (
+    prepare_playwright_mcp_output_config,
     prepare_playwright_mcp_config,
     resolve_active_playwright_mcp_config,
     run_safety_preflight,
+    validate_generation_output_id,
 )
 from .generation_security import get_temporary_credentials
 from .mcp_page_explorer import (
     MCPPageExplorer,
+    MCPPageExplorerError,
     ReadOnlyMCPBrowserToolGuard,
     suppress_mcp_raw_query_logs,
 )
@@ -281,6 +288,90 @@ class GenerationPreflightTests(GenerationPipelineBase):
         browser_path = prepared['mcpServers']['playwright']['env']['PLAYWRIGHT_BROWSERS_PATH']
         self.assertTrue(browser_path.endswith('/backend/.python-playwright-browsers'))
 
+    def test_playwright_output_config_is_per_generation_and_does_not_mutate_raw_config(self):
+        raw_config = {
+            'mcpServers': {
+                'playwright': {
+                    'command': 'npx',
+                    'args': ['--offline', '--yes', '@executeautomation/playwright-mcp-server@1.0.12'],
+                    'cwd': '.',
+                    'env': {'HOME': '/preserved-home', 'PLAYWRIGHT_BROWSERS_PATH': '/browser-cache'},
+                },
+                'unrelated': {'command': 'other-mcp', 'args': ['serve']},
+            },
+        }
+        original = deepcopy(raw_config)
+        generation_id = '5c28b555-89ea-405d-aa37-31bb45c3c0fb'
+
+        prepared = prepare_playwright_mcp_output_config(raw_config, generation_id)
+        server = prepared['mcpServers']['playwright']
+
+        self.assertEqual(raw_config, original)
+        self.assertEqual(server['command'], 'npx')
+        self.assertEqual(server['args'][:5], [
+            '--offline', '--yes', '--package', '@executeautomation/playwright-mcp-server@1.0.12', '--',
+        ])
+        self.assertEqual(server['args'][5:7], ['node', str(Path(settings.BASE_DIR) / 'scripts' / 'playwright_mcp_output_bootstrap.mjs')])
+        self.assertEqual(
+            server['env']['AITS_MCP_LOG_FILE'],
+            str(Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp' / f'{generation_id}.log'),
+        )
+        self.assertEqual(
+            server['env']['AITS_MCP_SCREENSHOT_DIR'],
+            str(Path(settings.BASE_DIR) / 'temp' / 'playwright-mcp' / generation_id / 'screenshots'),
+        )
+        self.assertEqual(server['env']['AITS_MCP_WORKING_DIR'], str(Path(settings.BASE_DIR).resolve()))
+        self.assertEqual(server['env']['HOME'], '/preserved-home')
+        self.assertEqual(server['env']['PLAYWRIGHT_BROWSERS_PATH'], '/browser-cache')
+        self.assertEqual(prepared['mcpServers']['unrelated'], raw_config['mcpServers']['unrelated'])
+
+        supplement = prepare_playwright_mcp_output_config(raw_config, generation_id)
+        self.assertEqual(
+            supplement['mcpServers']['playwright']['env']['AITS_MCP_SCREENSHOT_DIR'],
+            server['env']['AITS_MCP_SCREENSHOT_DIR'],
+        )
+        self.assertEqual(prepare_playwright_mcp_output_config(prepared, generation_id), prepared)
+        rebound_id = 'f6643f0c-6052-4462-bb4a-ddb9581e9d26'
+        rebound = prepare_playwright_mcp_output_config(prepared, rebound_id)
+        rebound_server = rebound['mcpServers']['playwright']
+        self.assertEqual(rebound_server['args'], server['args'])
+        self.assertEqual(rebound_server['env']['HOME'], '/preserved-home')
+        self.assertEqual(
+            rebound_server['env']['AITS_MCP_LOG_FILE'],
+            str(Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp' / f'{rebound_id}.log'),
+        )
+        self.assertEqual(
+            rebound_server['env']['AITS_MCP_SCREENSHOT_DIR'],
+            str(Path(settings.BASE_DIR) / 'temp' / 'playwright-mcp' / rebound_id / 'screenshots'),
+        )
+
+        package_form = deepcopy(raw_config)
+        package_form['mcpServers']['playwright']['args'] = [
+            '--offline', '--yes', '--package', '@executeautomation/playwright-mcp-server@1.0.12',
+            '--', 'playwright-mcp-server', '--help',
+        ]
+        package_prepared = prepare_playwright_mcp_output_config(package_form, generation_id)
+        self.assertEqual(package_prepared['mcpServers']['playwright']['args'][-1], '--help')
+
+    def test_playwright_output_config_rejects_unsafe_ids_and_http_mode_but_leaves_other_servers(self):
+        supported = {
+            'mcpServers': {
+                'playwright': {
+                    'command': 'npx',
+                    'args': ['-y', '@executeautomation/playwright-mcp-server@1.0.12', '--port', '8931'],
+                },
+            },
+        }
+        with self.assertRaisesRegex(ValueError, 'stdio'):
+            prepare_playwright_mcp_output_config(supported, '5c28b555-89ea-405d-aa37-31bb45c3c0fb')
+        supported['mcpServers']['playwright']['args'] = ['-y', '@executeautomation/playwright-mcp-server@1.0.12']
+        with self.assertRaisesRegex(ValueError, 'generation_id'):
+            prepare_playwright_mcp_output_config(supported, '../outside')
+        self.assertIsInstance(UUID(validate_generation_output_id(None)), UUID)
+
+        unrelated = {'mcpServers': {'playwright': {'command': 'npx', 'args': ['-y', 'other-mcp']}}}
+        self.assertEqual(prepare_playwright_mcp_output_config(unrelated, None), unrelated)
+
 
 class MCPPageExplorerTests(TestCase):
     def test_read_only_explorer_returns_snapshot_without_orm_or_raw_query_logging(self):
@@ -318,6 +409,38 @@ class MCPPageExplorerTests(TestCase):
         prompt = json.loads(FakeAgent.received_prompt)
         self.assertEqual(prompt['navigation_target_url'], 'https://web.example.test/')
         self.assertNotIn('https://', json.dumps(snapshot.model_dump(mode='json')))
+
+    def test_explorer_prepares_one_output_runtime_for_each_exploration_call(self):
+        class FakeClient:
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                return None
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                pass
+
+            async def run(self, prompt):
+                return json.dumps(snapshot_payload(), ensure_ascii=False)
+
+        original = {'mcpServers': {'playwright': {'command': 'npx', 'args': ['-y', 'other-mcp']}}}
+        runtime = deepcopy(original)
+        explorer = MCPPageExplorer(
+            llm_model=object(), mcp_config=original,
+            generation_id='5c28b555-89ea-405d-aa37-31bb45c3c0fb',
+        )
+        with patch('web_testing.mcp_page_explorer.prepare_playwright_mcp_output_config', return_value=runtime) as prepare, patch(
+            'web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient(),
+        ), patch('web_testing.mcp_page_explorer.MCPAgent', FakeAgent):
+            asyncio.run(explorer.explore(
+                scenario=ScenarioSpec.model_validate(scenario_payload()),
+                start_path='/', target_url_safe='https://web.example.test/',
+            ))
+        prepare.assert_called_once_with(original, '5c28b555-89ea-405d-aa37-31bb45c3c0fb')
+        direct_explorer = MCPPageExplorer(llm_model=object(), mcp_config=original)
+        self.assertIsInstance(UUID(direct_explorer.output_generation_id), UUID)
 
     def test_explorer_receives_page_discovery_targets_instead_of_blocking_questions(self):
         explorer = MCPPageExplorer(
@@ -413,6 +536,13 @@ class MCPPageExplorerTests(TestCase):
                 '',
                 inputs={'selector': 'button', 'text': '确认删除'},
             )
+        stats = guard.get_stats()
+        self.assertEqual(stats['total_tool_calls'], 0)
+        self.assertEqual(stats['blocked_tool_calls'], 1)
+        self.assertIsNone(stats['last_operation'])
+        self.assertEqual(stats['last_blocked_operation'], {
+            'tool_name': 'playwright_click', 'call_index': 1, 'status': 'blocked',
+        })
 
     def test_read_only_guard_blocks_enter_but_allows_non_submission_key(self):
         guard = ReadOnlyMCPBrowserToolGuard(max_tool_calls=50)
@@ -441,6 +571,218 @@ class MCPPageExplorerTests(TestCase):
 
     def test_async_explorer_contains_no_orm_access(self):
         self.assertNotIn('.objects', inspect.getsource(MCPPageExplorer))
+
+    def test_terminal_guard_wins_over_immediate_invalid_output_and_closes_client(self):
+        class FakeClient:
+            closed = False
+
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                type(self).closed = True
+
+        class SwallowingAgent:
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+
+            async def run(self, prompt):
+                for index in range(2):
+                    run_id = f'click-{index}'
+                    self.guard.on_tool_start(
+                        {'name': 'playwright_click'}, '', run_id=run_id,
+                        inputs={'selector': 'button.duplicate'},
+                    )
+                    self.guard.on_tool_end('Clicked', run_id=run_id, name='playwright_click')
+                try:
+                    self.guard.on_tool_start(
+                        {'name': 'playwright_click'}, '', run_id='blocked',
+                        inputs={'selector': 'button.duplicate'},
+                    )
+                except Exception:
+                    pass  # mcp-use 1.5.1 converts callback errors to ToolMessage.
+                return '[]'
+
+        explorer = MCPPageExplorer(llm_model=object(), mcp_config={'mcpServers': {}})
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+            'web_testing.mcp_page_explorer.MCPAgent', SwallowingAgent,
+        ):
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                asyncio.run(explorer.explore(
+                    scenario=ScenarioSpec.model_validate(scenario_payload()),
+                    start_path='/', target_url_safe='https://web.example.test/',
+                ))
+        self.assertEqual(raised.exception.error_code, 'repeated_interaction')
+        self.assertEqual(raised.exception.tool_stats['termination_reason'], 'repeated_interaction')
+        self.assertTrue(FakeClient.closed)
+
+    def test_guard_failure_wins_when_cancellation_cleanup_raises(self):
+        class FakeClient:
+            closed = False
+
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                type(self).closed = True
+
+        class WaitingAgent:
+            cleaned = False
+
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+
+            async def run(self, prompt):
+                for index in range(2):
+                    run_id = f'click-{index}'
+                    self.guard.on_tool_start({'name': 'playwright_click'}, '', run_id=run_id, inputs={'selector': 'button.loop'})
+                    self.guard.on_tool_end('Clicked', run_id=run_id, name='playwright_click')
+                try:
+                    self.guard.on_tool_start({'name': 'playwright_click'}, '', run_id='blocked', inputs={'selector': 'button.loop'})
+                except Exception:
+                    pass
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    type(self).cleaned = True
+                    raise RuntimeError('cleanup failure must not replace guard failure')
+
+        explorer = MCPPageExplorer(llm_model=object(), mcp_config={'mcpServers': {}})
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+            'web_testing.mcp_page_explorer.MCPAgent', WaitingAgent,
+        ):
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                asyncio.run(asyncio.wait_for(
+                    explorer.explore(
+                        scenario=ScenarioSpec.model_validate(scenario_payload()),
+                        start_path='/', target_url_safe='https://web.example.test/',
+                    ),
+                    timeout=2,
+                ))
+        self.assertEqual(raised.exception.error_code, 'repeated_interaction')
+        self.assertTrue(WaitingAgent.cleaned)
+        self.assertTrue(FakeClient.closed)
+
+    def test_malformed_json_and_array_are_evidence_failures_with_safe_failed_tool_stats(self):
+        class FakeClient:
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                return None
+
+        class InvalidAgent:
+            raw_output = '[]'
+
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+
+            async def run(self, prompt):
+                self.guard.on_tool_start(
+                    {'name': 'playwright_click'}, '', run_id='failed',
+                    inputs={'selector': 'input[type=password]', 'value': 'super-secret'},
+                )
+                self.guard.on_tool_end(
+                    {'isError': True, 'message': 'ToolMessage secret=super-secret'},
+                    run_id='failed', name='playwright_click',
+                )
+                return type(self).raw_output
+
+        for raw_output in ('{invalid', '[]'):
+            with self.subTest(raw_output=raw_output):
+                InvalidAgent.raw_output = raw_output
+                explorer = MCPPageExplorer(llm_model=object(), mcp_config={'mcpServers': {}})
+                with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+                    'web_testing.mcp_page_explorer.MCPAgent', InvalidAgent,
+                ):
+                    with self.assertRaises(MCPPageExplorerError) as raised:
+                        asyncio.run(explorer.explore(
+                            scenario=ScenarioSpec.model_validate(scenario_payload()),
+                            start_path='/', target_url_safe='https://web.example.test/',
+                        ))
+                self.assertEqual(raised.exception.error_code, 'EVIDENCE_INSUFFICIENT')
+                self.assertEqual(raised.exception.tool_stats['total_tool_calls'], 1)
+                self.assertEqual(raised.exception.tool_stats['failed_tool_calls'], 1)
+                self.assertEqual(raised.exception.tool_stats['last_operation'], {
+                    'tool_name': 'playwright_click', 'call_index': 1, 'status': 'failed',
+                })
+                self.assertNotIn('super-secret', str(raised.exception.tool_stats))
+
+    def test_active_user_cancellation_awaits_agent_and_returns_safe_stats(self):
+        class FakeClient:
+            closed = False
+
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                type(self).closed = True
+
+        class WaitingAgent:
+            cleaned = False
+
+            def __init__(self, **kwargs):
+                pass
+
+            async def run(self, prompt):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    type(self).cleaned = True
+                    raise
+
+        checks = {'count': 0}
+
+        def cancel_check():
+            checks['count'] += 1
+            return checks['count'] >= 3
+
+        explorer = MCPPageExplorer(
+            llm_model=object(), mcp_config={'mcpServers': {}}, cancel_check=cancel_check,
+        )
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+            'web_testing.mcp_page_explorer.MCPAgent', WaitingAgent,
+        ):
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                asyncio.run(asyncio.wait_for(
+                    explorer.explore(
+                        scenario=ScenarioSpec.model_validate(scenario_payload()),
+                        start_path='/', target_url_safe='https://web.example.test/',
+                    ),
+                    timeout=2,
+                ))
+        self.assertEqual(raised.exception.error_code, 'TASK_CANCELLED')
+        self.assertEqual(raised.exception.tool_stats['termination_reason'], 'TASK_CANCELLED')
+        self.assertTrue(WaitingAgent.cleaned)
+        self.assertTrue(FakeClient.closed)
+
+    def test_success_snapshot_keeps_nonterminal_failed_tool_count(self):
+        class FakeClient:
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                return None
+
+        class AgentWithFailedRead:
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+
+            async def run(self, prompt):
+                self.guard.on_tool_start({'name': 'playwright_screenshot'}, '', run_id='failed-read')
+                self.guard.on_tool_end({'isError': True}, run_id='failed-read', name='playwright_screenshot')
+                return json.dumps(snapshot_payload(), ensure_ascii=False)
+
+        explorer = MCPPageExplorer(llm_model=object(), mcp_config={'mcpServers': {}})
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+            'web_testing.mcp_page_explorer.MCPAgent', AgentWithFailedRead,
+        ):
+            snapshot = asyncio.run(explorer.explore(
+                scenario=ScenarioSpec.model_validate(scenario_payload()),
+                start_path='/', target_url_safe='https://web.example.test/',
+            ))
+        self.assertEqual(snapshot.tool_stats.total_tool_calls, 1)
+        self.assertEqual(snapshot.tool_stats.failed_tool_calls, 1)
 
 
 class GenerationOrchestratorTests(GenerationPipelineBase):
@@ -585,6 +927,102 @@ async def run(page):
             self.assertEqual(result['status'], 'cancelled')
         finally:
             cache.delete('celery:cancel:v2-cancelled-task')
+
+    def test_orchestrator_persists_allowlisted_explorer_failure_stats(self):
+        generation = self.make_generation()
+
+        class FailingExplorer:
+            def __init__(self, **kwargs):
+                pass
+
+            async def explore(self, **kwargs):
+                raise MCPPageExplorerError('repeated_interaction', 'safe terminal failure', tool_stats={
+                    'total_tool_calls': 2,
+                    'tool_counts': {'playwright_click': 2},
+                    'failed_tool_calls': 1,
+                    'termination_reason': 'repeated_interaction',
+                    'duration_seconds': 1.2,
+                    'last_operation': {
+                        'tool_name': 'playwright_click', 'call_index': 2,
+                        'status': 'failed', 'selector': 'input[type=password]', 'value': 'super-secret',
+                    },
+                    'last_blocked_operation': {
+                        'tool_name': 'playwright_click', 'call_index': 3,
+                        'status': 'blocked', 'raw_input': 'token=never-persist',
+                    },
+                })
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
+            'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_orchestrator.MCPPageExplorer', FailingExplorer), patch(
+            'web_testing.generation_orchestrator.publish_stage_changed'
+        ), patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = run_v2_generation(str(generation.pk), celery_task_id='failure-stats-task')
+
+        generation.refresh_from_db()
+        self.assertEqual(result['error_code'], 'REPEATED_INTERACTION')
+        self.assertEqual(generation.tool_stats['total_tool_calls'], 2)
+        self.assertEqual(generation.tool_stats['failed_tool_calls'], 1)
+        self.assertEqual(generation.tool_stats['last_operation'], {
+            'tool_name': 'playwright_click', 'call_index': 2, 'status': 'failed',
+        })
+        self.assertNotIn('selector', generation.tool_stats['last_operation'])
+        self.assertNotIn('super-secret', json.dumps(generation.tool_stats))
+        self.assertNotIn('never-persist', json.dumps(generation.tool_stats))
+
+    def test_orchestrator_persists_empty_stats_for_legacy_explorer_error(self):
+        generation = self.make_generation()
+
+        class LegacyFailingExplorer:
+            def __init__(self, **kwargs):
+                pass
+
+            async def explore(self, **kwargs):
+                raise MCPPageExplorerError('browser', 'safe browser failure')
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
+            'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_orchestrator.MCPPageExplorer', LegacyFailingExplorer), patch(
+            'web_testing.generation_orchestrator.publish_stage_changed'
+        ), patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = run_v2_generation(str(generation.pk), celery_task_id='legacy-failure-stats-task')
+
+        generation.refresh_from_db()
+        self.assertEqual(result['error_code'], 'BROWSER_UNAVAILABLE')
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(generation.tool_stats, {})
+
+    def test_orchestrator_persists_active_explorer_cancellation_stats(self):
+        generation = self.make_generation()
+
+        class CancelledExplorer:
+            def __init__(self, **kwargs):
+                pass
+
+            async def explore(self, **kwargs):
+                raise MCPPageExplorerError('TASK_CANCELLED', '用户已取消任务。', tool_stats={
+                    'total_tool_calls': 1,
+                    'tool_counts': {'playwright_get_visible_text': 1},
+                    'failed_tool_calls': 0,
+                    'termination_reason': 'TASK_CANCELLED',
+                    'duration_seconds': 0.25,
+                    'last_operation': {
+                        'tool_name': 'playwright_get_visible_text', 'call_index': 1, 'status': 'succeeded',
+                    },
+                })
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
+            'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_orchestrator.MCPPageExplorer', CancelledExplorer), patch(
+            'web_testing.generation_orchestrator.publish_stage_changed'
+        ), patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = run_v2_generation(str(generation.pk), celery_task_id='active-cancel-stats-task')
+
+        generation.refresh_from_db()
+        self.assertEqual(result['status'], 'cancelled')
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.CANCELLED)
+        self.assertEqual(generation.tool_stats['total_tool_calls'], 1)
+        self.assertEqual(generation.tool_stats['termination_reason'], 'TASK_CANCELLED')
 
     def test_task_signature_only_accepts_generation_id(self):
         parameters = list(inspect.signature(generate_webui_script_generation_v2_task.run).parameters)

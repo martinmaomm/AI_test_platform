@@ -6,6 +6,7 @@ WebUI Playwright智能体
 
 import logging
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -185,6 +186,8 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         self.total_tool_calls = 0
         self.tool_call_counts = Counter()
         self.interaction_call_counts = Counter()
+        self.failed_tool_calls = 0
+        self.blocked_tool_calls = 0
         self.consecutive_interaction_failures = 0
         self.login_page_detected = False
         self.login_form_seen = False
@@ -193,7 +196,11 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         self.login_verified = False
         self.termination_reason = None
         self._terminal_error = None
-        self._active_interactions = {}
+        self._observed_page_state_fingerprints = {}
+        self._page_state_version = 0
+        self._active_tools = {}
+        self._last_operation = None
+        self._last_blocked_operation = None
         self._lock = threading.RLock()
 
     @staticmethod
@@ -229,16 +236,51 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
 
     @staticmethod
     def _is_failed_output(output: Any) -> bool:
-        if isinstance(output, dict) and (output.get("error") or output.get("status") == "error"):
+        if isinstance(output, dict) and (
+            output.get("error")
+            or output.get("isError")
+            or output.get("is_error")
+            or output.get("status") == "error"
+        ):
+            return True
+        if (
+            getattr(output, "isError", False)
+            or getattr(output, "is_error", False)
+            or getattr(output, "status", None) == "error"
+        ):
             return True
         text = _guard_output_text(output).strip().lower()
         return bool(
             re.search(
                 r"operation failed|error executing tool|timeout .* exceeded|"
-                r"failed to|could not|invalid .*selector|exception",
+                r"failed to|could not|invalid .*selector|exception|tool[ _-]?error",
                 text,
             )
         )
+
+    @staticmethod
+    def _state_fingerprint(output: Any) -> str | None:
+        """Keep an in-memory state marker without retaining page content."""
+        if MCPBrowserToolGuard._is_failed_output(output):
+            return None
+        text = re.sub(r"\s+", " ", _guard_output_text(output).strip())
+        if not text:
+            return None
+        return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    def _record_observed_state(self, tool_name: str, output: Any):
+        # Only page observations establish progress.  Generic tool responses,
+        # ToolMessage IDs, screenshots, and alternating HTML/text formats do
+        # not demonstrate a changed page or modal state.
+        if tool_name not in _PAGE_CHECK_TOOLS:
+            return
+        fingerprint = self._state_fingerprint(output)
+        if fingerprint is None:
+            return
+        previous = self._observed_page_state_fingerprints.get(tool_name)
+        self._observed_page_state_fingerprints[tool_name] = fingerprint
+        if previous is not None and previous != fingerprint:
+            self._page_state_version += 1
 
     def _is_login_submission(self, tool_name: str, inputs: Any, input_str: str) -> bool:
         text = _guard_input_text(inputs, input_str).lower()
@@ -256,18 +298,38 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             )
         return False
 
-    def _raise_guard(self, error_kind: str, message: str):
+    def _raise_guard(
+        self,
+        error_kind: str,
+        message: str,
+        *,
+        blocked_before_execution: bool = False,
+        tool_name: str = '',
+    ):
         if self._terminal_error is None:
             self.termination_reason = error_kind
+            if blocked_before_execution:
+                self.blocked_tool_calls += 1
+                self._last_blocked_operation = {
+                    'tool_name': tool_name or 'browser_tool',
+                    'call_index': self.total_tool_calls + 1,
+                    'status': 'blocked',
+                }
             self._terminal_error = MCPToolGuardError(error_kind, message)
         raise self._terminal_error
 
-    def _record_interaction_failure(self):
+    @property
+    def terminal_error(self) -> MCPToolGuardError | None:
+        with self._lock:
+            return self._terminal_error
+
+    def _record_interaction_failure(self, tool_name: str):
         self.consecutive_interaction_failures += 1
         if self.consecutive_interaction_failures >= 3:
             self._raise_guard(
                 MCP_ERROR_INTERACTION_FAILURE,
                 "浏览器定位交互连续失败 3 次，已终止脚本生成。请检查定位器、页面状态或登录结果后重试。",
+                tool_name=tool_name,
             )
 
     def _record_page_check(self, tool_name: str, output: Any):
@@ -281,6 +343,7 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                     self._raise_guard(
                         MCP_ERROR_LOGIN_FAILED,
                         "登录失败：提交登录后连续两次页面检查仍停留在登录页，已终止脚本生成。请检查登录流程后重试。",
+                        tool_name=tool_name,
                     )
         elif self.login_attempts or self.login_form_seen:
             self.login_verified = True
@@ -306,6 +369,8 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                 self._raise_guard(
                     MCP_ERROR_TOOL_BUDGET,
                     f"浏览器工具调用已达到本次任务上限（{self.max_tool_calls} 次），已终止脚本生成。请缩短探索范围后重试。",
+                    blocked_before_execution=True,
+                    tool_name=tool_name,
                 )
 
             if tool_name == "playwright_fill":
@@ -318,55 +383,88 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                     self._raise_guard(
                         MCP_ERROR_LOGIN_FAILED,
                         "登录失败：尚未确认登录成功前再次提交登录，已终止脚本生成。请检查登录流程后重试。",
+                        blocked_before_execution=True,
+                        tool_name=tool_name,
                     )
                 self.login_attempts += 1
                 self.login_checks_since_attempt = 0
 
             interaction_key = None
             if self._is_interaction_tool(tool_name):
-                interaction_key = (tool_name, _normalize_guard_input(inputs, input_str))
+                interaction_key = (
+                    tool_name,
+                    _normalize_guard_input(inputs, input_str),
+                    self._page_state_version,
+                )
                 if self.interaction_call_counts[interaction_key] >= 2:
                     self._raise_guard(
                         MCP_ERROR_REPEATED_INTERACTION,
-                        "检测到相同的交互操作及参数已执行 2 次，已终止脚本生成。请检查定位器或操作流程后重试。",
+                        "未观察到页面状态变化，且相同的交互操作及参数已执行 2 次，已终止脚本生成。请检查定位器或操作流程后重试。",
+                        blocked_before_execution=True,
+                        tool_name=tool_name,
                     )
 
             self.total_tool_calls += 1
             self.tool_call_counts[tool_name] += 1
+            self._last_operation = {
+                "tool_name": tool_name,
+                "call_index": self.total_tool_calls,
+                "status": "started",
+            }
             if interaction_key is not None:
                 self.interaction_call_counts[interaction_key] += 1
-                self._active_interactions[run_id] = {
-                    "interaction_key": interaction_key,
-                    "is_locator_interaction": tool_name in _LOCATOR_INTERACTION_TOOLS,
-                }
+            self._active_tools[run_id] = {
+                "tool_name": tool_name,
+                "is_locator_interaction": tool_name in _LOCATOR_INTERACTION_TOOLS,
+                "call_index": self.total_tool_calls,
+            }
 
     def on_tool_end(self, output: Any, *, run_id=None, parent_run_id=None, **kwargs):
         with self._lock:
+            active_tool = self._active_tools.pop(run_id, None)
+            if active_tool is None:
+                return
+            tool_name = active_tool["tool_name"]
+            failed = self._is_failed_output(output)
+            if self._last_operation and self._last_operation["call_index"] == active_tool["call_index"]:
+                self._last_operation["status"] = "failed" if failed else "succeeded"
+            if failed:
+                self.failed_tool_calls += 1
             if self._terminal_error is not None:
                 return
-            active_interaction = self._active_interactions.pop(run_id, None)
-            if active_interaction and active_interaction["is_locator_interaction"]:
-                if self._is_failed_output(output):
-                    self._record_interaction_failure()
+            if active_tool.get("is_locator_interaction"):
+                if failed:
+                    self._record_interaction_failure(tool_name)
                 else:
                     self.consecutive_interaction_failures = 0
-            tool_name = str(kwargs.get("name") or "").strip().lower()
+            self._record_observed_state(tool_name, output)
             self._record_page_check(tool_name, output)
 
     def on_tool_error(self, error: BaseException, *, run_id=None, parent_run_id=None, **kwargs):
         with self._lock:
+            active_tool = self._active_tools.pop(run_id, None)
+            if active_tool is None:
+                return
+            if self._last_operation and self._last_operation["call_index"] == active_tool["call_index"]:
+                self._last_operation["status"] = "failed"
+            self.failed_tool_calls += 1
             if self._terminal_error is not None:
                 return
-            active_interaction = self._active_interactions.pop(run_id, None)
-            if active_interaction and active_interaction["is_locator_interaction"]:
-                self._record_interaction_failure()
+            if active_tool["is_locator_interaction"]:
+                self._record_interaction_failure(active_tool["tool_name"])
 
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "total_tool_calls": self.total_tool_calls,
                 "tool_counts": dict(self.tool_call_counts),
+                "failed_tool_calls": self.failed_tool_calls,
+                "blocked_tool_calls": self.blocked_tool_calls,
                 "termination_reason": self.termination_reason,
+                "last_operation": dict(self._last_operation) if self._last_operation else None,
+                "last_blocked_operation": (
+                    dict(self._last_blocked_operation) if self._last_blocked_operation else None
+                ),
             }
 
 

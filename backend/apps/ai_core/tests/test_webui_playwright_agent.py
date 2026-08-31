@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from langgraph.errors import GraphRecursionError
+from langchain_core.messages import ToolMessage
 
 from ai_core.webui_playwright_agent import (
     MCP_AGENT_ADDITIONAL_INSTRUCTIONS,
@@ -310,6 +311,100 @@ class MCPBrowserToolGuardTests(unittest.TestCase):
             MCP_ERROR_REPEATED_INTERACTION,
         )
         self.assertEqual(guard.get_stats()["total_tool_calls"], 2)
+
+    def test_changed_visible_text_allows_same_interaction_in_new_page_state(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        observation = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, observation, "playwright_get_visible_text", "列表页")
+        for _ in range(2):
+            run_id = self._start(guard, "playwright_click", {"selector": "button.expand"})
+            self._end(guard, run_id, "playwright_click", "Clicked")
+        changed = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, changed, "playwright_get_visible_text", "列表页 详情弹窗")
+
+        third = self._start(guard, "playwright_click", {"selector": "button.expand"})
+        self._end(guard, third, "playwright_click", "Clicked")
+
+        self.assertEqual(guard.get_stats()["total_tool_calls"], 5)
+        self.assertIsNone(guard.get_stats()["termination_reason"])
+
+    def test_escape_repeat_is_allowed_after_a_different_observed_modal_state(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        first_state = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, first_state, "playwright_get_visible_text", "编辑用户弹窗")
+        for _ in range(2):
+            run_id = self._start(guard, "playwright_press_key", {"key": "Escape"})
+            self._end(guard, run_id, "playwright_press_key", "Pressed")
+        second_state = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, second_state, "playwright_get_visible_text", "确认关闭弹窗")
+
+        third = self._start(guard, "playwright_press_key", {"key": "Escape"})
+        self._end(guard, third, "playwright_press_key", "Pressed")
+
+        self.assertEqual(guard.get_stats()["total_tool_calls"], 5)
+
+    def test_unchanged_or_alternating_page_reads_do_not_reset_interaction_loop(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        for tool_name, output in (
+            ("playwright_get_visible_text", "列表页"),
+            ("playwright_get_visible_html", "<main>列表页</main>"),
+        ):
+            run_id = self._start(guard, tool_name)
+            self._end(guard, run_id, tool_name, output)
+        for _ in range(2):
+            run_id = self._start(guard, "playwright_click", {"selector": "button.expand"})
+            self._end(guard, run_id, "playwright_click", "Successfully clicked element call_123")
+        repeated_read = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, repeated_read, "playwright_get_visible_text", "列表页")
+
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", {"selector": "button.expand"})
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
+
+    def test_failed_dict_and_tool_message_count_as_failed_tool_calls(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        first = self._start(guard, "playwright_click", {"selector": "button.missing"})
+        self._end(guard, first, "playwright_click", {"isError": True, "message": "secret=never-log"})
+        second = self._start(guard, "playwright_click", {"selector": "button.other"})
+        self._end(
+            guard,
+            second,
+            "playwright_click",
+            ToolMessage(content="tool_error", tool_call_id="call-1", status="error"),
+        )
+
+        stats = guard.get_stats()
+        self.assertEqual(stats["failed_tool_calls"], 2)
+        self.assertEqual(stats["last_operation"], {
+            "tool_name": "playwright_click", "call_index": 2, "status": "failed",
+        })
+        self.assertNotIn("secret", str(stats))
+
+    def test_executed_failure_terminal_does_not_count_as_pre_execution_block(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        for index in range(2):
+            run_id = self._start(guard, "playwright_click", {"selector": f"button.{index}"})
+            self._end(guard, run_id, "playwright_click", "Operation failed: Timeout 30000ms exceeded")
+        third = self._start(guard, "playwright_click", {"selector": "button.third"})
+        with self.assertRaises(MCPToolGuardError):
+            self._end(guard, third, "playwright_click", "Operation failed: Timeout 30000ms exceeded")
+
+        stats = guard.get_stats()
+        self.assertEqual(stats["total_tool_calls"], 3)
+        self.assertEqual(stats["failed_tool_calls"], 3)
+        self.assertEqual(stats["blocked_tool_calls"], 0)
+
+    def test_unmatched_or_parallel_callbacks_do_not_overwrite_admitted_operation(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        first = self._start(guard, "playwright_click", {"selector": "button.first"})
+        second = self._start(guard, "playwright_click", {"selector": "button.second"})
+        self._end(guard, first, "playwright_click", "Clicked")
+        guard.on_tool_error(RuntimeError("tool_error"), run_id=uuid4())
+        self.assertEqual(guard.get_stats()["last_operation"]["call_index"], 2)
+        self.assertEqual(guard.get_stats()["last_operation"]["status"], "started")
+        self._end(guard, second, "playwright_click", "Clicked")
+        self.assertEqual(guard.get_stats()["last_operation"]["status"], "succeeded")
 
     def test_read_only_page_checks_may_repeat(self):
         guard = MCPBrowserToolGuard(max_tool_calls=5)

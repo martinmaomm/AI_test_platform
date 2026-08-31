@@ -13,7 +13,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .generation_contracts import ExplorationSnapshot, ScenarioSpec
-from .generation_security import redact_metadata, redact_text
+from .generation_security import redact_exploration_metadata, redact_metadata, redact_text
 
 
 GENERATOR_SYSTEM_PROMPT = """你是 Python Playwright 异步测试脚本生成器。只依据给定场景和页面探索证据生成代码，
@@ -75,8 +75,8 @@ class ScriptGenerator:
         snapshot: ExplorationSnapshot,
     ) -> str:
         payload = {
-            'scenario': scenario.model_dump(mode='json'),
-            'exploration_snapshot': snapshot.model_dump(mode='json'),
+            'scenario': redact_metadata(scenario.model_dump(mode='json')),
+            'exploration_snapshot': redact_exploration_metadata(snapshot.model_dump(mode='json')),
         }
         return self._invoke(GENERATOR_SYSTEM_PROMPT, payload)
 
@@ -91,14 +91,14 @@ class ScriptGenerator:
         payload = {
             'script': redact_text(script),
             'quality_issues': redact_metadata(issues),
-            'scenario': scenario.model_dump(mode='json'),
-            'exploration_evidence': snapshot.model_dump(mode='json'),
+            'scenario': redact_metadata(scenario.model_dump(mode='json')),
+            'exploration_evidence': redact_exploration_metadata(snapshot.model_dump(mode='json')),
         }
         return self._invoke(REPAIR_SYSTEM_PROMPT, payload)
 
     def _invoke(self, system_prompt: str, payload: dict[str, Any]) -> str:
         output = self.llm_model.invoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=json.dumps(redact_metadata(payload), ensure_ascii=False)),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
         ])
         return _strip_code_fences(output)

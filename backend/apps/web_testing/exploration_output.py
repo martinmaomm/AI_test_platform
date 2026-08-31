@@ -22,11 +22,19 @@ _CLOSE_FENCE = re.compile(r'^\s*```[ \t]*(?:\n|$)')
 class ExplorationOutputError(ValueError):
     """Contains safe diagnostics; candidate data must never be logged."""
 
-    def __init__(self, kind: str, *, offset: int | None = None, repair_payload: dict | None = None):
+    def __init__(
+        self,
+        kind: str,
+        *,
+        offset: int | None = None,
+        repair_payload: dict | None = None,
+        diagnostics: tuple[dict[str, str], ...] = (),
+    ):
         super().__init__(kind)
         self.kind = kind
         self.offset = offset
         self.repair_payload = repair_payload
+        self.diagnostics = diagnostics
 
 
 def output_text(value: Any) -> str:

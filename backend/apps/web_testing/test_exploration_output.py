@@ -8,7 +8,7 @@ from django.test import SimpleTestCase
 from langchain_core.messages import AIMessage
 
 from .exploration_output import ExplorationOutputError, parse_exploration_output, semantic_tokens
-from .generation_contracts import ScenarioSpec
+from .generation_contracts import ExplorationSnapshot, GenerationContractError, ScenarioSpec, parse_exploration_snapshot_json
 from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 
 
@@ -317,6 +317,65 @@ class ExplorerRecoveryTests(SimpleTestCase):
         for forbidden in ('secret-value', 'password=', 'visited_paths', 'candidate_locators', '/model-path', 'get_by_role'):
             self.assertNotIn(forbidden, calls)
         llm.ainvoke.assert_not_called()
+
+    def test_schema_diagnostics_keep_only_contract_paths_and_standard_types(self):
+        payload = evidence()
+        del payload['page_states'][0]['path']
+        payload['page_states'][0]['title'] = 'SENTINEL_VALUE_NOT_FOR_LOGS'
+        payload['SENTINEL_KEY_NOT_FOR_LOGS'] = 'SENTINEL_INPUT_NOT_FOR_LOGS'
+        explorer = self.make_explorer()
+        with patch('web_testing.mcp_page_explorer.logger') as logger:
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                explorer._parse_snapshot(encoded(payload), '/', 0)
+        diagnostics = str(logger.mock_calls) + str(raised.exception)
+        self.assertIn('page_states[0].path', diagnostics)
+        self.assertIn('missing', diagnostics)
+        self.assertIn('contract_validation', diagnostics)
+        self.assertNotIn('SENTINEL_VALUE_NOT_FOR_LOGS', diagnostics)
+        self.assertNotIn('SENTINEL_KEY_NOT_FOR_LOGS', diagnostics)
+        self.assertNotIn('SENTINEL_INPUT_NOT_FOR_LOGS', diagnostics)
+
+    def test_schema_diagnostics_are_bounded_for_unknown_fields(self):
+        payload = evidence()
+        payload['elements'] = [
+            {'page_name': '首页', f'SENTINEL_KEY_{index}': 'SENTINEL_INPUT_NOT_FOR_LOGS'}
+            for index in range(100)
+        ]
+        with self.assertRaises(GenerationContractError) as raised:
+            parse_exploration_snapshot_json(encoded(payload))
+        diagnostics = raised.exception.diagnostics
+        self.assertLessEqual(len(diagnostics), 3)
+        for diagnostic in diagnostics:
+            self.assertLessEqual(len(diagnostic['path']), 160)
+            self.assertEqual(diagnostic['type'], 'extra_forbidden')
+            self.assertEqual(diagnostic['stage'], 'contract_validation')
+            self.assertNotIn('SENTINEL', diagnostic['path'])
+
+    def test_schema_diagnostics_are_the_same_for_primary_and_supplemental_exploration(self):
+        invalid = evidence()
+        del invalid['page_states'][0]['path']
+        original = evidence()
+        original['step_evidence']['S1']['status'] = 'unresolved'
+        original['unresolved_steps'] = ['S1']
+        original_snapshot = ExplorationSnapshot.model_validate(original)
+        for operation in ('primary', 'supplemental'):
+            with self.subTest(operation=operation):
+                explorer = self.make_explorer()
+                client, agent, client_patch, agent_patch = self.fake_runtime(encoded(invalid))
+                with client_patch, agent_patch, patch('web_testing.mcp_page_explorer.logger') as logger:
+                    with self.assertRaises(MCPPageExplorerError) as raised:
+                        if operation == 'primary':
+                            asyncio.run(self.explore(explorer))
+                        else:
+                            asyncio.run(explorer.explore_missing_evidence(
+                                scenario=scenario(), existing_snapshot=original_snapshot,
+                                start_path='/local', target_url_safe='https://example.invalid/',
+                            ))
+                diagnostics = str(logger.mock_calls) + str(raised.exception)
+                self.assertIn('page_states[0].path', diagnostics)
+                self.assertIn('missing', diagnostics)
+                self.assertNotIn('/model-path', diagnostics)
+                client.close_all_sessions.assert_awaited_once()
 
     def test_sync_interface_recovers_locally_and_messages_distinguish_failures(self):
         explorer = self.make_explorer()

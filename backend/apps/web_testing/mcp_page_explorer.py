@@ -33,7 +33,7 @@ from .generation_preflight import (
     prepare_playwright_mcp_output_config,
     validate_generation_output_id,
 )
-from .generation_security import redact_metadata
+from .generation_security import redact_exploration_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -385,11 +385,11 @@ class MCPPageExplorer:
         if self.cancel_check():
             raise self._failure('TASK_CANCELLED', '用户已取消任务。', duration_seconds)
 
-    def _log_output(self, raw_output, *, stage: str, kind: str, repaired: bool, offset=None):
+    def _log_output(self, raw_output, *, stage: str, kind: str, repaired: bool, offset=None, diagnostics=()):
         output_type, length = output_summary(raw_output)
         logger.info(
-            'V2 MCP output: generation_id=%s stage=%s type=%s length=%s failure_kind=%s json_offset=%s repair_attempted=%s',
-            self.generation_id or '<unknown>', stage, output_type, length, kind, offset, repaired,
+            'V2 MCP output: generation_id=%s stage=%s type=%s length=%s failure_kind=%s json_offset=%s repair_attempted=%s contract_diagnostics=%s',
+            self.generation_id or '<unknown>', stage, output_type, length, kind, offset, repaired, diagnostics,
         )
 
     def _output_failure(self, error: ExplorationOutputError, duration_seconds: float):
@@ -401,6 +401,9 @@ class MCPPageExplorer:
             message = 'MCP 页面探索证据格式错误，无法安全解析。'
         else:
             message = 'MCP 页面探索证据结构错误或证据不足，无法安全使用。'
+        if error.diagnostics:
+            diagnostic = error.diagnostics[0]
+            message += f" 字段：{diagnostic['path']}；类型：{diagnostic['type']}。"
         return self._failure('EVIDENCE_INSUFFICIENT', message, duration_seconds)
 
     def _snapshot_from_payload(self, payload: dict, start_path: str, duration_seconds: float) -> ExplorationSnapshot:
@@ -415,8 +418,10 @@ class MCPPageExplorer:
             'duration_seconds': round(duration_seconds, 3),
         }
         try:
-            return parse_exploration_snapshot_json(json.dumps(redact_metadata(payload), ensure_ascii=False))
-        except (GenerationContractError, ValueError, TypeError, RecursionError):
+            return parse_exploration_snapshot_json(json.dumps(redact_exploration_metadata(payload), ensure_ascii=False))
+        except GenerationContractError as exc:
+            raise ExplorationOutputError('schema_invalid', diagnostics=exc.diagnostics) from None
+        except (ValueError, TypeError, RecursionError):
             raise ExplorationOutputError('schema_invalid') from None
 
     def _parse_snapshot(self, raw_output: str, start_path: str, duration_seconds: float) -> ExplorationSnapshot:
@@ -444,7 +449,10 @@ class MCPPageExplorer:
             self._check_output_active(duration_seconds)
         except ExplorationOutputError as exc:
             self._check_output_active(duration_seconds)
-            self._log_output(diagnostic_output, stage=stage, kind=exc.kind, offset=exc.offset, repaired=repaired)
+            self._log_output(
+                diagnostic_output, stage=stage, kind=exc.kind, offset=exc.offset,
+                repaired=repaired, diagnostics=exc.diagnostics,
+            )
             raise self._output_failure(exc, duration_seconds) from None
         except MCPPageExplorerError:
             self._log_output(diagnostic_output, stage=stage, kind='interrupted', repaired=repaired)

@@ -167,6 +167,46 @@ class GenerationContractAndNormalizerTests(TestCase):
                 }],
             ), ensure_ascii=False))
 
+    def test_snapshot_locator_literals_and_dom_author_attributes_are_safe_but_actions_are_not(self):
+        attributes = {
+            'data-author': 'ui-library', 'placeholder': 'click(', 'href': '/help',
+            'autocomplete': 'off', 'data-custom-field': 'value',
+        }
+        for locator in (
+            'get_by_text("click(")', 'page.locator(\'[title="fill("]\')',
+            'button:has-text("fill(")', '[href="fill("]', '[data-ref="click("]',
+        ):
+            with self.subTest(locator=locator):
+                snapshot = parse_exploration_snapshot_json(json.dumps(snapshot_payload(
+                    elements=[{
+                        **snapshot_payload()['elements'][0],
+                        'stable_attributes': attributes,
+                        'candidate_locators': [locator],
+                    }],
+                ), ensure_ascii=False))
+                self.assertEqual(snapshot.elements[0].stable_attributes, attributes)
+        for locator in (
+            'page.get_by_text("click(").click()', 'get_by_text(f"{page.click()}")',
+            'get_by_text(f"{page.click()}"); other()',
+            'get_by_text(rf"{page.click()}"); other()',
+            'get_by_text(fr"{page.click()}"); other()',
+        ):
+            with self.subTest(action=locator):
+                with self.assertRaises(GenerationContractError):
+                    parse_exploration_snapshot_json(json.dumps(snapshot_payload(
+                        elements=[{
+                            **snapshot_payload()['elements'][0], 'candidate_locators': [locator],
+                        }],
+                    ), ensure_ascii=False))
+        for attributes in ({'data-token': 'secret'}, {'data-authtoken': 'secret'}, {'data-author': 'token=secret'}):
+            with self.subTest(attributes=attributes):
+                with self.assertRaises(GenerationContractError):
+                    parse_exploration_snapshot_json(json.dumps(snapshot_payload(
+                        elements=[{
+                            **snapshot_payload()['elements'][0], 'stable_attributes': attributes,
+                        }],
+                    ), ensure_ascii=False))
+
     def test_snapshot_must_cover_exactly_the_scenario_steps(self):
         scenario = ScenarioSpec.model_validate(scenario_payload())
         valid_snapshot = ExplorationSnapshot.model_validate(snapshot_payload())

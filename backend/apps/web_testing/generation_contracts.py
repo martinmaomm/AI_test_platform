@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
-from typing import Any, Callable, Final, Literal, TypeVar
+from collections.abc import Mapping
+from types import UnionType
+from typing import Any, Callable, Final, Literal, TypeVar, Union, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -19,7 +22,7 @@ from .models import WebUIScriptGeneration
 from .generation_security import (
     REDACTED_VALUE,
     find_suspected_credentials,
-    redact_metadata,
+    redact_dom_attributes,
     redact_text,
 )
 
@@ -30,12 +33,31 @@ TContract = TypeVar('TContract', bound=BaseModel)
 class GenerationContractError(ValueError):
     """Raised when a persisted generation artifact is not valid structured JSON."""
 
+    def __init__(self, message: str = 'contract_invalid', *, diagnostics: tuple[dict[str, str], ...] = ()):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
 
 _ABSOLUTE_URL_RE = re.compile(r'(?i)\bhttps?://')
 _ACTION_CALL_RE = re.compile(
     r'(?i)\b(?:click|fill|press|goto|evaluate|select_option|check|uncheck|hover|'
     r'upload_file|download)\s*\(',
 )
+_LOCATOR_ACTIONS = frozenset({
+    'click', 'fill', 'press', 'goto', 'evaluate', 'select_option', 'check',
+    'uncheck', 'hover', 'upload_file', 'download',
+})
+_SAFE_STEP_ID_RE = re.compile(r'^S[1-9][0-9]*$')
+_MAX_SAFE_DIAGNOSTICS = 3
+_MAX_SAFE_PATH_CHARS = 160
+_MAX_SAFE_STEP_ID_CHARS = 12
+_SAFE_ERROR_TYPES = frozenset({
+    'arguments_type', 'bool_parsing', 'bool_type', 'dict_type', 'extra_forbidden',
+    'float_parsing', 'float_type', 'greater_than_equal', 'int_parsing', 'int_type',
+    'less_than_equal', 'list_type', 'literal_error', 'missing', 'model_type',
+    'string_pattern_mismatch', 'string_too_long', 'string_too_short', 'string_type',
+    'too_long', 'too_short', 'value_error',
+})
 
 
 def _ensure_safe_contract_text(value: str, *, field_name: str, reject_absolute_url: bool = False) -> str:
@@ -83,6 +105,132 @@ def _validate_nested_text(
                 field_name=field_name,
                 reject_absolute_url=reject_absolute_url,
             )
+
+
+def _unwrap_optional_contract_type(annotation: Any) -> Any:
+    origin = get_origin(annotation)
+    if origin not in (UnionType, Union):
+        return annotation
+    args = [item for item in get_args(annotation) if item is not type(None)]
+    return args[0] if len(args) == 1 else Any
+
+
+def _safe_validation_path(model_type: type[BaseModel], location: tuple[Any, ...]) -> str:
+    """Project a Pydantic error location onto contract-owned, non-secret names."""
+    current: Any = model_type
+    parts: list[str] = []
+    for item in location:
+        if isinstance(current, type) and issubclass(current, BaseModel):
+            if isinstance(item, str) and item in current.model_fields:
+                parts.append(item)
+                current = _unwrap_optional_contract_type(current.model_fields[item].annotation)
+            else:
+                parts.append('<field>')
+                current = Any
+        elif get_origin(current) is list:
+            if isinstance(item, int) and item >= 0:
+                parts.append(f'[{min(item, 999)}]')
+            else:
+                parts.append('[item]')
+            current = _unwrap_optional_contract_type(get_args(current)[0]) if get_args(current) else Any
+        elif get_origin(current) in (dict, Mapping):
+            if isinstance(item, str) and len(item) <= _MAX_SAFE_STEP_ID_CHARS and _SAFE_STEP_ID_RE.fullmatch(item):
+                parts.append(item)
+            else:
+                parts.append('<key>')
+            args = get_args(current)
+            current = _unwrap_optional_contract_type(args[1]) if len(args) == 2 else Any
+        else:
+            parts.append('<field>')
+            current = Any
+    result = ''
+    for part in parts:
+        result += part if part.startswith('[') or not result else f'.{part}'
+    return (result or '<contract>')[:_MAX_SAFE_PATH_CHARS]
+
+
+def _safe_validation_diagnostics(error: ValidationError, model_type: type[BaseModel]) -> tuple[dict[str, str], ...]:
+    diagnostics = []
+    for item in error.errors(include_input=False, include_context=False, include_url=False)[:_MAX_SAFE_DIAGNOSTICS]:
+        error_type = str(item.get('type') or 'validation_error')
+        diagnostics.append({
+            'path': _safe_validation_path(model_type, tuple(item.get('loc') or ())),
+            'type': error_type if error_type in _SAFE_ERROR_TYPES else 'validation_error',
+            'stage': 'contract_validation',
+        })
+    return tuple(diagnostics)
+
+
+def _locator_contains_action_call(locator: str) -> bool:
+    """Reject executable action calls while allowing words inside locator literals."""
+    try:
+        tree = ast.parse(locator, mode='eval')
+    except (SyntaxError, ValueError, TypeError):
+        literal_free = _without_complete_quoted_literals(locator)
+        # A malformed candidate cannot prove that apparent action syntax is text.
+        return literal_free is None or bool(_ACTION_CALL_RE.search(literal_free))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        name = function.attr if isinstance(function, ast.Attribute) else (
+            function.id if isinstance(function, ast.Name) else ''
+        )
+        if name.lower() in _LOCATOR_ACTIONS:
+            return True
+    return False
+
+
+def _without_complete_quoted_literals(value: str) -> str | None:
+    """Mask complete CSS-style quotes; an incomplete escape or quote is unsafe."""
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        quote = value[index]
+        if quote not in {'\'', '"'}:
+            result.append(quote)
+            index += 1
+            continue
+        prefix_start = index
+        while prefix_start > 0 and value[prefix_start - 1].isalpha():
+            prefix_start -= 1
+        prefix = value[prefix_start:index].lower()
+        has_identifier_boundary = prefix_start == 0 or not (
+            value[prefix_start - 1].isalnum() or value[prefix_start - 1] == '_'
+        )
+        if prefix in {'f', 'fr', 'rf'} and has_identifier_boundary:
+            # AST handles valid f-strings. In malformed expression text, do not
+            # risk masking an interpolation that invokes a page action.
+            return None
+        result.append(' ')
+        index += 1
+        closed = False
+        while index < len(value):
+            current = value[index]
+            if current == '\\':
+                if index + 1 >= len(value):
+                    return None
+                result.extend('  ')
+                index += 2
+            elif current == quote:
+                result.append(' ')
+                index += 1
+                closed = True
+                break
+            else:
+                result.append(' ')
+                index += 1
+        if not closed:
+            return None
+    return ''.join(result)
+
+
+def _safe_diagnostic_summary(diagnostics: tuple[dict[str, str], ...]) -> str:
+    if not diagnostics:
+        return 'contract_validation'
+    return '; '.join(
+        f"{item['stage']}:{item['path']}:{item['type']}" for item in diagnostics
+    )[:600]
 
 
 class _StrictContract(BaseModel):
@@ -199,7 +347,7 @@ class ExplorationElement(_StrictContract):
     @field_validator('stable_attributes', mode='before')
     @classmethod
     def sanitize_attributes(cls, value):
-        sanitized = redact_metadata(value or {})
+        sanitized = redact_dom_attributes(value or {})
         if not isinstance(sanitized, dict):
             raise ValueError('stable_attributes 必须是对象')
         return {str(key): str(item) for key, item in sanitized.items()}
@@ -213,7 +361,7 @@ class ExplorationElement(_StrictContract):
                 field_name='candidate_locator',
                 reject_absolute_url=True,
             )
-            if _ACTION_CALL_RE.search(locator):
+            if _locator_contains_action_call(locator):
                 raise ValueError('candidate_locator 只能描述定位器，不能包含动作调用')
         return value
 
@@ -391,13 +539,21 @@ def parse_contract_json(
     try:
         return model_type.model_validate(_extract_json_object(raw_text))
     except (GenerationContractError, ValidationError) as first_error:
+        diagnostics = (
+            _safe_validation_diagnostics(first_error, model_type)
+            if isinstance(first_error, ValidationError) else first_error.diagnostics
+        )
         if format_repair is None:
-            raise GenerationContractError(str(first_error)) from first_error
-        repaired_text = format_repair(raw_text, str(first_error))
+            raise GenerationContractError('contract_invalid', diagnostics=diagnostics) from first_error
+        repaired_text = format_repair(raw_text, _safe_diagnostic_summary(diagnostics))
         try:
             return model_type.model_validate(_extract_json_object(repaired_text))
         except (GenerationContractError, ValidationError) as second_error:
-            raise GenerationContractError(f'模型输出在一次格式修复后仍无效: {second_error}') from second_error
+            diagnostics = (
+                _safe_validation_diagnostics(second_error, model_type)
+                if isinstance(second_error, ValidationError) else second_error.diagnostics
+            )
+            raise GenerationContractError('contract_invalid_after_repair', diagnostics=diagnostics) from second_error
 
 
 def parse_scenario_spec_json(raw_text: str, *, format_repair=None) -> ScenarioSpec:

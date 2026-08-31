@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -120,6 +121,20 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
             generator.repair(script='bad', issues=[], scenario=scenario, snapshot=snapshot),
             VALID_SCRIPT.strip(),
         )
+
+    def test_generator_and_repair_keep_validated_dom_author_attributes(self):
+        llm = Mock(return_value=VALID_SCRIPT)
+        llm.invoke.return_value = VALID_SCRIPT
+        data = snapshot_payload()
+        data['elements'][0]['stable_attributes'] = {'data-author': 'ui-library'}
+        scenario = ScenarioSpec.model_validate(scenario_payload())
+        snapshot = ExplorationSnapshot.model_validate(data)
+        generator = ScriptGenerator(llm)
+        generator.generate(scenario=scenario, snapshot=snapshot)
+        generator.repair(script='bad', issues=[], scenario=scenario, snapshot=snapshot)
+        for call, field in zip(llm.invoke.call_args_list, ('exploration_snapshot', 'exploration_evidence')):
+            prompt = call.args[0][1].content
+            self.assertEqual(json.loads(prompt)[field]['elements'][0]['stable_attributes']['data-author'], 'ui-library')
 
     def test_quality_warns_for_missing_evidence_without_treating_it_as_a_script_blocker(self):
         report = evaluate_script(

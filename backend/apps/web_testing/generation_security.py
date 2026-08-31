@@ -34,6 +34,7 @@ LOGIN_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 URL_RE = re.compile(r'https?://[^\s,，;；。]+', re.IGNORECASE)
+_AUTHOR_ATTRIBUTE_SEGMENT_RE = re.compile(r'(^|[-_])author(?=$|[-_])', re.IGNORECASE)
 
 
 class GenerationInputSecurityError(ValueError):
@@ -85,6 +86,58 @@ def redact_text(value: str) -> str:
         text,
     )
     return URL_RE.sub(lambda match: redact_url(match.group(0)), text)
+
+
+def _is_sensitive_dom_attribute_key(key: Any) -> bool:
+    """Keep a complete ``author`` segment from matching the ``auth`` pattern."""
+    return _is_sensitive_key(_AUTHOR_ATTRIBUTE_SEGMENT_RE.sub(r'\1attribute', str(key)))
+
+
+def redact_dom_attributes(value: Any) -> Any:
+    """Redact DOM attributes without treating the word ``author`` as ``auth``.
+
+    This is deliberately only used for the validated exploration element shape.
+    Attribute values and every name other than the precise ``author`` exception
+    keep the ordinary redaction semantics.
+    """
+    if not isinstance(value, dict):
+        return redact_metadata(value)
+    result = {}
+    for key, item_value in value.items():
+        safe_key = REDACTED_VALUE if _is_sensitive_dom_attribute_key(key) else str(key)
+        result[safe_key] = redact_metadata(item_value)
+    return result
+
+
+def _redact_exploration_elements(value: Any) -> Any:
+    if not isinstance(value, list):
+        return redact_metadata(value)
+    result = []
+    for element in value:
+        if not isinstance(element, dict):
+            result.append(redact_metadata(element))
+            continue
+        result.append({
+            str(key): REDACTED_VALUE if _is_sensitive_key(key) else (
+                redact_dom_attributes(item_value)
+                if str(key) == 'stable_attributes' else redact_metadata(item_value)
+            )
+            for key, item_value in element.items()
+        })
+    return result
+
+
+def redact_exploration_metadata(value: Any) -> Any:
+    """Redact a known exploration snapshot without relaxing generic metadata."""
+    if not isinstance(value, dict):
+        return redact_metadata(value)
+    return {
+        str(key): REDACTED_VALUE if _is_sensitive_key(key) else (
+            _redact_exploration_elements(item_value)
+            if str(key) == 'elements' else redact_metadata(item_value)
+        )
+        for key, item_value in value.items()
+    }
 
 
 def redact_metadata(value: Any) -> Any:

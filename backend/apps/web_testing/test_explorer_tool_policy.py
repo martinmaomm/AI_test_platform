@@ -20,6 +20,7 @@ from .mcp_page_explorer import (
     READ_ONLY_DISABLED_TOOL_MESSAGES,
     ReadOnlyMCPBrowserToolGuard,
 )
+from .exploration_policy import ExplorationPolicy
 
 
 ACTUAL_GRAPH_OUTPUT = json.dumps({
@@ -286,3 +287,70 @@ class ExplorerToolPolicyTests(SimpleTestCase):
             guard.on_tool_start({'name': 'playwright_get_visible_html'}, '', inputs={})
         self.assertEqual(guard.terminal_error.error_kind, 'tool_budget')
         self.assertIn('上限（2 次）', str(raised.exception))
+
+    def test_declared_crud_submit_is_allowed_and_recorded(self):
+        crud = ScenarioSpec.model_validate({
+            'title': '创建测试用户', 'objective': '创建并清理本轮测试用户',
+            'steps': [{
+                'id': 'S1', 'name': '创建用户', 'intent': 'create',
+                'target_hint': '测试用户', 'mutates_data': True, 'expected': '保存成功',
+            }],
+            'assertions': [{'id': 'A1', 'name': '成功', 'target_hint': '测试用户', 'expected': '成功', 'step_id': 'S1'}],
+            'cleanup': [{'id': 'C1', 'name': '清理', 'target_hint': '测试用户', 'condition': '删除本轮数据', 'step_id': 'S1'}],
+        })
+        policy = ExplorationPolicy.for_scenario(
+            crud, generation_id=self.generation_id, user_constraints='创建一条本轮测试用户数据。',
+        )
+        guard = ReadOnlyMCPBrowserToolGuard(max_tool_calls=3, policy=policy)
+        guard.on_tool_start({'name': 'playwright_click'}, '', run_id='save', inputs={'name': '保存新增'})
+        guard.on_tool_end('ok', run_id='save')
+        stats = guard.get_stats()
+        self.assertEqual(stats['potential_write_tool_calls'], 1)
+        self.assertEqual(stats['blocked_write_tool_calls'], 0)
+        self.assertTrue(policy.allows('delete'))
+
+    def test_explicit_read_only_constraint_still_blocks_declared_crud_submit(self):
+        crud = ScenarioSpec.model_validate({
+            'title': '创建测试用户', 'objective': '创建并清理本轮测试用户',
+            'steps': [{
+                'id': 'S1', 'name': '创建用户', 'intent': 'create',
+                'target_hint': '测试用户', 'mutates_data': True, 'expected': '保存成功',
+            }],
+            'assertions': [{'id': 'A1', 'name': '成功', 'target_hint': '测试用户', 'expected': '成功', 'step_id': 'S1'}],
+            'cleanup': [{'id': 'C1', 'name': '清理', 'target_hint': '测试用户', 'condition': '删除本轮数据', 'step_id': 'S1'}],
+        })
+        policy = ExplorationPolicy.for_scenario(
+            crud, generation_id=self.generation_id, user_constraints='只查看页面，不要写入。',
+        )
+        guard = ReadOnlyMCPBrowserToolGuard(max_tool_calls=3, policy=policy)
+        with self.assertRaises(Exception):
+            guard.on_tool_start({'name': 'playwright_click'}, '', inputs={'name': '保存新增'})
+        self.assertEqual(guard.terminal_error.error_kind, 'write_scope_violation')
+        self.assertEqual(guard.get_stats()['blocked_write_tool_calls'], 1)
+
+    def test_failed_recognisable_submit_stops_immediately_as_unknown_result(self):
+        policy = ExplorationPolicy.for_scenario(
+            ScenarioSpec.model_validate({
+                'title': '创建测试用户', 'objective': '创建并清理本轮测试用户',
+                'steps': [{'id': 'S1', 'name': '创建用户', 'intent': 'create', 'target_hint': '测试用户', 'mutates_data': True, 'expected': '保存成功'}],
+                'assertions': [{'id': 'A1', 'name': '成功', 'target_hint': '测试用户', 'expected': '成功', 'step_id': 'S1'}],
+                'cleanup': [{'id': 'C1', 'name': '清理', 'target_hint': '测试用户', 'condition': '删除本轮数据', 'step_id': 'S1'}],
+            }), generation_id=self.generation_id, user_constraints='',
+        )
+        guard = ReadOnlyMCPBrowserToolGuard(max_tool_calls=3, policy=policy)
+        guard.on_tool_start({'name': 'playwright_click'}, '', run_id='submit', inputs={'name': '保存新增'})
+        with self.assertRaises(Exception):
+            guard.on_tool_end({'isError': True}, run_id='submit')
+        self.assertEqual(guard.terminal_error.error_kind, 'write_result_unknown')
+        self.assertEqual(guard.get_stats()['potential_write_tool_calls'], 1)
+        self.assertEqual(guard.get_stats()['blocked_write_tool_calls'], 0)
+
+    def test_recognisable_extra_risk_is_blocked_not_counted_as_executed_write(self):
+        policy = ExplorationPolicy.for_scenario(
+            scenario(), generation_id=self.generation_id, user_constraints='',
+        )
+        guard = ReadOnlyMCPBrowserToolGuard(max_tool_calls=3, policy=policy)
+        with self.assertRaises(Exception):
+            guard.on_tool_start({'name': 'playwright_click'}, '', inputs={'name': '确认付款'})
+        self.assertEqual(guard.terminal_error.error_kind, 'extra_risk_action')
+        self.assertEqual(guard.get_stats()['potential_write_tool_calls'], 0)

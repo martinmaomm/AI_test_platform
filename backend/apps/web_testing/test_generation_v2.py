@@ -527,7 +527,7 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
         self.assertEqual(response.data['data']['revision'], 0)
         delay_mock.assert_not_called()
 
-    def test_write_risk_must_be_revised_to_read_only_before_resume(self):
+    def test_extra_risk_must_be_revised_before_resume(self):
         generation = self.pause_generation(
             status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
             error_code='EXPLORATION_WRITE_CONFIRMATION_REQUIRED',
@@ -536,7 +536,7 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
             self.request('POST', f'/script-generations/{generation.pk}/resolve/', {
                 'expected_status': generation.status,
                 'expected_revision': generation.revision,
-                'description': '探索阶段请提交新增用户并查看结果。',
+                'description': '探索阶段请付款并查看结果。',
             }),
             project_id=self.project.id,
             generation_id=generation.pk,
@@ -544,6 +544,37 @@ class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('description', response.data['error']['details'])
+
+    def test_legacy_crud_write_pause_can_resume_without_read_only_rewrite(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+            error_code='EXPLORATION_WRITE_CONFIRMATION_REQUIRED',
+        )
+        generation.description_safe = '探索阶段新增本轮用户并查看结果，结束后清理。'
+        generation.save(update_fields=['description_safe'])
+        with patch('web_testing.views.generate_webui_script_generation_v2_task.delay') as delay_mock:
+            delay_mock.return_value.id = 'resumed-crud'
+            response = WebUIScriptGenerationResolveView.as_view()(
+                self.request('POST', '/resolve/', {
+                    'expected_status': generation.status, 'expected_revision': generation.revision,
+                }), project_id=self.project.id, generation_id=generation.pk,
+            )
+        self.assertEqual(response.status_code, 202, response.data)
+        delay_mock.assert_called_once()
+
+    def test_new_extra_risk_pause_requires_a_description_change(self):
+        generation = self.pause_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+            error_code='EXPLORATION_EXTRA_RISK_BLOCKED',
+        )
+        with patch('web_testing.views.generate_webui_script_generation_v2_task.delay') as delay_mock:
+            response = WebUIScriptGenerationResolveView.as_view()(
+                self.request('POST', '/resolve/', {
+                    'expected_status': generation.status, 'expected_revision': generation.revision,
+                }), project_id=self.project.id, generation_id=generation.pk,
+            )
+        self.assertEqual(response.status_code, 400)
+        delay_mock.assert_not_called()
 
     def test_resume_limit_moves_paused_generation_to_review_without_dispatch(self):
         generation = self.pause_generation(

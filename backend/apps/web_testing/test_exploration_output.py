@@ -45,6 +45,16 @@ def trailing_comma(payload=None):
 
 
 class OutputParserTests(SimpleTestCase):
+    def test_cleanup_unknown_before_attempt_is_backward_compatible_and_truthful(self):
+        payload = evidence()
+        payload['cleanup_report'] = {
+            'status': 'unknown', 'attempted': False,
+            'reason': '浏览器故障发生在清理开始前。',
+        }
+        snapshot = parse_exploration_snapshot_json(encoded(payload))
+        self.assertEqual(snapshot.cleanup_report.status, 'unknown')
+        self.assertFalse(snapshot.cleanup_report.attempted)
+
     def test_single_objects_and_wrappers_preserve_nested_strings(self):
         payload = evidence()
         payload['warnings'] = ['字符 { [ ] } 和反斜杠 \\ 与引号 " 不是边界']

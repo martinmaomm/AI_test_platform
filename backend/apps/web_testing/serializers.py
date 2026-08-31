@@ -331,7 +331,14 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
             if not credentials:
                 raise serializers.ValidationError({'temporary_credentials': '请提供本次探索登录信息。'})
         elif generation.status == WebUIScriptGeneration.Status.NEEDS_CONFIRMATION:
-            if generation.error_code == 'INPUT_AMBIGUOUS':
+            if generation.error_code in {'EXPLORATION_WRITE_CONFIRMATION_REQUIRED', 'EXPLORATION_EXTRA_RISK_BLOCKED'}:
+                if generation.error_code == 'EXPLORATION_EXTRA_RISK_BLOCKED' and not description:
+                    raise serializers.ValidationError({'description': '请修订测试目标，移除当前不支持的额外风险操作。'})
+                if exploration_requires_write_confirmation(description or generation.description_safe):
+                    raise serializers.ValidationError({
+                        'description': '本次自动探索支持目标内测试数据增删改查；请移除审批、支付、发布及未授权文件/外部消息操作后继续。'
+                    })
+            elif generation.error_code == 'INPUT_AMBIGUOUS':
                 auto_explore = (
                     generation.current_stage == WebUIScriptGeneration.Stage.PREFLIGHTING
                     and not answers
@@ -346,10 +353,6 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
             else:
                 if not description:
                     raise serializers.ValidationError({'description': '请修订测试描述后继续。'})
-                if generation.error_code == 'EXPLORATION_WRITE_CONFIRMATION_REQUIRED' and exploration_requires_write_confirmation(description):
-                    raise serializers.ValidationError({
-                        'description': '探索阶段必须保持只读，请移除提交、新增、编辑或删除要求。'
-                    })
 
         attrs['safe_description'] = redact_text(description) if description else None
         attrs['safe_answers'] = [

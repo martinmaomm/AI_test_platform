@@ -396,12 +396,15 @@ class StepEvidence(_StrictContract):
 
 
 class ExplorationToolStats(_StrictContract):
+    """Callback-owned counters; potential writes have passed the tool guard."""
     total_tool_calls: int = Field(ge=0)
     tool_counts: dict[str, int] = Field(default_factory=dict)
     failed_tool_calls: int = Field(default=0, ge=0)
     termination_reason: str | None = Field(default=None, max_length=100)
     duration_seconds: float = Field(default=0, ge=0)
     model_calls: int = Field(default=0, ge=0)
+    potential_write_tool_calls: int = Field(default=0, ge=0)
+    blocked_write_tool_calls: int = Field(default=0, ge=0)
 
 
 class ExplorationCheckpoint(_StrictContract):
@@ -410,6 +413,42 @@ class ExplorationCheckpoint(_StrictContract):
     tool_name: str = Field(pattern=r'^(?:playwright_[a-z0-9_]+|browser_console_logs)$')
     call_index: int = Field(ge=1)
     status: Literal['succeeded', 'failed']
+
+
+class ExplorationAction(_StrictContract):
+    """One model-reported CRUD outcome, tied to a platform-owned scope."""
+
+    step_id: str | None = Field(default=None, pattern=r'^S[1-9][0-9]*$')
+    operation: Literal['create', 'update', 'delete']
+    scope: Literal['namespace', 'user_specified']
+    status: Literal['observed', 'unknown', 'blocked']
+    target: str = Field(min_length=1, max_length=300)
+    evidence_path: str = Field(default='', max_length=500)
+    result: str = Field(default='', max_length=500)
+
+    @field_validator('evidence_path')
+    @classmethod
+    def relative_evidence_path_only(cls, value):
+        if value and not value.startswith('/'):
+            raise ValueError('操作证据路径必须是相对路径')
+        return value
+
+
+class ExplorationCleanupReport(_StrictContract):
+    """Additive cleanup result; residuals must remain visible to callers."""
+
+    status: Literal['not_required', 'not_attempted', 'cleaned', 'residual', 'unknown'] = 'not_required'
+    attempted: bool = False
+    residuals: list[str] = Field(default_factory=list, max_length=20)
+    reason: str = Field(default='', max_length=500)
+
+    @model_validator(mode='after')
+    def validate_cleanup_state(self):
+        if self.status in {'cleaned', 'residual'} and not self.attempted:
+            raise ValueError('cleanup 状态要求记录已尝试清理')
+        if self.status == 'residual' and not self.residuals:
+            raise ValueError('cleanup 残留必须明确展示')
+        return self
 
 
 class ExplorationMissingTarget(_StrictContract):
@@ -452,6 +491,12 @@ class ExplorationSnapshot(_StrictContract):
     warnings: list[str] = Field(default_factory=list, max_length=50)
     tool_stats: ExplorationToolStats
     checkpoints: list[ExplorationCheckpoint] = Field(default_factory=list, max_length=100)
+    exploration_namespace: str = Field(default='', max_length=100)
+    exploration_policy_applied: bool = False
+    exploration_allowed_operations: list[Literal['create', 'update', 'delete']] = Field(default_factory=list, max_length=3)
+    exploration_explicit_read_only: bool = False
+    exploration_actions: list[ExplorationAction] = Field(default_factory=list, max_length=50)
+    cleanup_report: ExplorationCleanupReport = Field(default_factory=ExplorationCleanupReport)
     completion: ExplorationCompletion = Field(default_factory=ExplorationCompletion)
 
     @field_validator('visited_paths')
@@ -502,6 +547,9 @@ def validate_snapshot_against_scenario(
             raise GenerationContractError('未确认步骤必须引用已有场景步骤')
         if snapshot.step_evidence[step_id].status != 'unresolved':
             raise GenerationContractError('未确认步骤必须对应 unresolved 证据状态')
+    for action in snapshot.exploration_actions:
+        if action.step_id is not None and action.step_id not in scenario_step_ids:
+            raise GenerationContractError('探索操作账本包含未知场景步骤')
 
 
 def merge_exploration_snapshots(
@@ -530,6 +578,41 @@ def merge_exploration_snapshots(
                 seen.add(key)
                 merged.append(item)
         payload[name] = merged
+    current_actions = list(payload.get('exploration_actions') or [])
+    seen_actions: set[str] = set()
+    payload['exploration_actions'] = []
+    for item in [*current_actions, *supplement.get('exploration_actions', [])]:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if key not in seen_actions:
+            seen_actions.add(key)
+            payload['exploration_actions'].append(item)
+    current_namespace = str(payload.get('exploration_namespace') or '')
+    supplemental_namespace = str(supplement.get('exploration_namespace') or '')
+    if current_namespace and supplemental_namespace and current_namespace != supplemental_namespace:
+        raise GenerationContractError('定向补充探索 namespace 不一致')
+    payload['exploration_namespace'] = current_namespace or supplemental_namespace
+    for field in ('exploration_policy_applied', 'exploration_allowed_operations', 'exploration_explicit_read_only'):
+        current_value = payload.get(field)
+        supplemental_value = supplement.get(field)
+        if current_value not in (False, [], None) and supplemental_value not in (False, [], None) and current_value != supplemental_value:
+            raise GenerationContractError('定向补充探索策略不一致')
+        payload[field] = current_value if current_value not in (False, [], None) else supplemental_value
+    current_cleanup = payload.get('cleanup_report') or {}
+    supplemental_cleanup = supplement.get('cleanup_report') or {}
+    if supplemental_cleanup.get('status') not in {'not_required', 'not_attempted', None}:
+        payload['cleanup_report'] = supplemental_cleanup
+    elif int((supplement.get('tool_stats') or {}).get('potential_write_tool_calls', 0)) or any(
+        action not in current_actions and action.get('status') in {'observed', 'unknown'}
+        for action in supplement.get('exploration_actions', [])
+    ):
+        payload['cleanup_report'] = {
+            'status': 'unknown',
+            'attempted': bool(current_cleanup.get('attempted')),
+            'residuals': list(current_cleanup.get('residuals') or []),
+            'reason': '补充探索包含新的潜在写入，但未提供本轮清理结果；此前清理成功不能证明新数据已清理。',
+        }
+    else:
+        payload['cleanup_report'] = current_cleanup
     evidence = dict(payload.get('step_evidence') or {})
     for step_id in target_step_ids:
         candidate = (supplement.get('step_evidence') or {}).get(step_id)
@@ -560,6 +643,8 @@ def merge_exploration_snapshots(
         'termination_reason': extra_stats.get('termination_reason') or previous_stats.get('termination_reason'),
         'duration_seconds': float(previous_stats.get('duration_seconds', 0)) + float(extra_stats.get('duration_seconds', 0)),
         'model_calls': int(previous_stats.get('model_calls', 0)) + int(extra_stats.get('model_calls', 0)),
+        'potential_write_tool_calls': int(previous_stats.get('potential_write_tool_calls', 0)) + int(extra_stats.get('potential_write_tool_calls', 0)),
+        'blocked_write_tool_calls': int(previous_stats.get('blocked_write_tool_calls', 0)) + int(extra_stats.get('blocked_write_tool_calls', 0)),
     }
     result = ExplorationSnapshot.model_validate(payload)
     validate_snapshot_against_scenario(scenario, result)

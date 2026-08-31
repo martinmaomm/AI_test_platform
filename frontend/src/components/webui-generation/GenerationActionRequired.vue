@@ -18,11 +18,11 @@
 
     <div v-else-if="action.kind === 'description'" class="description-editor">
       <label>修订后的完整测试描述</label>
-      <el-input v-model="form.description" type="textarea" :rows="8" maxlength="2000" show-word-limit :disabled="resolving" placeholder="请写清步骤、成功标准、清理约束，并明确探索阶段只读。" />
+      <el-input v-model="form.description" type="textarea" :rows="8" maxlength="2000" show-word-limit :disabled="resolving" placeholder="请写清步骤、成功标准、目标数据范围、允许操作和清理约束。" />
     </div>
 
     <div v-if="action.kind === 'credentials'" class="credentials-editor">
-      <el-alert title="登录信息仅供本次探索使用，不会写入生成记录、脚本或浏览器存储。" type="warning" :closable="false" show-icon />
+      <el-alert title="登录信息仅供本轮测试流程使用，不会写入生成记录、脚本或浏览器存储。" type="warning" :closable="false" show-icon />
       <div class="credential-grid">
         <el-input v-model="form.username" autocomplete="off" placeholder="用户名" :disabled="resolving" />
         <el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="密码" :disabled="resolving" />

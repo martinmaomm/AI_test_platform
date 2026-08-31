@@ -223,7 +223,7 @@ class GenerationContractAndNormalizerTests(TestCase):
 
 
 class GenerationPreflightTests(GenerationPipelineBase):
-    def test_preflight_allows_normal_crud_goal_but_stops_exploration_write_request(self):
+    def test_preflight_allows_normal_crud_goal_and_explicit_exploration_crud(self):
         generation = self.make_generation(description_safe='新增、编辑、删除本轮测试数据，探索阶段只查看页面。')
         crud_scenario = ScenarioSpec.model_validate(scenario_payload(
             steps=[{**scenario_payload()['steps'][0], 'intent': 'create', 'mutates_data': True}],
@@ -236,9 +236,8 @@ class GenerationPreflightTests(GenerationPipelineBase):
         self.assertEqual(allowed.outcome, 'continue')
 
         generation.description_safe = '探索阶段请提交新增用户后查看结果。'
-        blocked = run_safety_preflight(generation, crud_scenario, credentials_available=False)
-        self.assertEqual(blocked.outcome, 'needs_confirmation')
-        self.assertEqual(blocked.error_code, 'EXPLORATION_WRITE_CONFIRMATION_REQUIRED')
+        result = run_safety_preflight(generation, crud_scenario, credentials_available=False)
+        self.assertEqual(result.outcome, 'continue')
 
     def test_preflight_does_not_misread_read_only_exploration_safety_constraints(self):
         generation = self.make_generation(description_safe=(
@@ -256,27 +255,37 @@ class GenerationPreflightTests(GenerationPipelineBase):
             'continue',
         )
 
-    def test_preflight_stops_only_explicit_exploration_write_requests(self):
+    def test_preflight_allows_explicit_exploration_write_requests(self):
         generation = self.make_generation(description_safe='探索阶段可以提交新增用户，并验证保存结果。')
         result = run_safety_preflight(
             generation,
             ScenarioSpec.model_validate(scenario_payload()),
             credentials_available=False,
         )
-        self.assertEqual(result.outcome, 'needs_confirmation')
+        self.assertEqual(result.outcome, 'continue')
 
-    def test_preflight_still_blocks_only_execute_write_not_read_only_wording(self):
+    def test_preflight_preserves_read_only_intent_without_forcing_it_on_crud(self):
         spec = ScenarioSpec.model_validate(scenario_payload())
         generation = self.make_generation(description_safe='探索阶段只执行新增并保存，用于确认页面行为。')
         self.assertEqual(
             run_safety_preflight(generation, spec, credentials_available=False).outcome,
-            'needs_confirmation',
+            'continue',
         )
         generation.description_safe = '探索阶段只查看页面，只读且不提交新增或编辑。'
         self.assertEqual(
             run_safety_preflight(generation, spec, credentials_available=False).outcome,
             'continue',
         )
+
+    def test_extra_risk_actions_remain_outside_ordinary_crud_exploration(self):
+        spec = ScenarioSpec.model_validate(scenario_payload())
+        for description in ('探索阶段请付款确认。', '探索阶段直接发布内容。', '探索阶段上传文件。'):
+            with self.subTest(description=description):
+                generation = self.make_generation(description_safe=description)
+                result = run_safety_preflight(generation, spec, credentials_available=False)
+                self.assertEqual(result.outcome, 'needs_confirmation')
+        generation.description_safe = '探索阶段不要付款或发布，只查看页面。'
+        self.assertEqual(run_safety_preflight(generation, spec, credentials_available=False).outcome, 'continue')
 
     def test_preflight_requires_credentials_without_cache_or_environment_variables(self):
         generation = self.make_generation()

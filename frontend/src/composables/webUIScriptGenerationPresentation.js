@@ -2,7 +2,7 @@
 
 export const GENERATION_STAGES = [
   ['normalizing', '理解目标'],
-  ['exploring', '只读探索页面'],
+  ['exploring', '探索并验证测试流程'],
   ['generating', '生成并检查草稿'],
   ['completed', '进入可编辑工作区']
 ]
@@ -22,14 +22,14 @@ export const TERMINAL_GENERATION_STATUSES = new Set([
 const STATUS_LABELS = {
   created: '等待任务启动',
   normalizing: '正在理解测试场景',
-  preflighting: '正在检查风险与登录条件',
-  exploring: '正在只读探索页面',
+  preflighting: '正在确认目标范围与登录条件',
+  exploring: '正在探索并验证测试流程',
   generating: '正在生成 Python 脚本',
   validating: '正在检查脚本质量',
   repairing: '正在自动修复脚本',
   needs_input: '需要补充场景信息',
-  needs_confirmation: '需要确认业务约束',
-  needs_credentials: '需要本次探索登录信息',
+  needs_confirmation: '需要确认目标范围',
+  needs_credentials: '需要本轮测试登录信息',
   needs_review: '需要人工检查',
   ready: '脚本已生成',
   ready_with_warnings: '脚本已生成（有警告）',
@@ -98,6 +98,33 @@ export const generationApiErrorMessage = (error, fallback) => {
   return body?.message || body?.error?.message || error?.message || fallback
 }
 
+const CLEANUP_STATUS_PRESENTATION = {
+  not_required: { label: '无需清理', type: 'info' },
+  not_attempted: { label: '未尝试清理', type: 'warning' },
+  cleaned: { label: '已清理', type: 'success' },
+  residual: { label: '发现残留', type: 'error' },
+  unknown: { label: '清理结果未知', type: 'warning' }
+}
+
+/** Keep cleanup evidence conservative: absent fields in legacy snapshots are not a success result. */
+export const explorationCleanupPresentation = (snapshot) => {
+  const report = snapshot?.cleanup_report
+  if (!report || typeof report !== 'object' || Array.isArray(report)) {
+    return { hasRecord: false, status: '', label: '尚无清理记录', type: 'info', attempted: false, residuals: [], reason: '' }
+  }
+  const status = CLEANUP_STATUS_PRESENTATION[report.status] ? report.status : 'unknown'
+  const presentation = CLEANUP_STATUS_PRESENTATION[status]
+  return {
+    hasRecord: true,
+    status,
+    label: presentation.label,
+    type: presentation.type,
+    attempted: Boolean(report.attempted),
+    residuals: Array.isArray(report.residuals) ? report.residuals.filter(Boolean).map(String) : [],
+    reason: String(report.reason || '')
+  }
+}
+
 export const generationActionRequired = (generation) => {
   const status = generation?.status
   if (!isPausedGeneration(status)) return null
@@ -113,7 +140,7 @@ export const generationActionRequired = (generation) => {
 
   if (status === 'needs_credentials') {
     return {
-      kind: 'credentials', title: '需要本次探索登录信息',
+      kind: 'credentials', title: '需要本轮测试登录信息',
       description: generation?.error_message || '登录信息缺失或已过期，请重新提供后继续。',
       questions: [], primaryLabel: '提交登录信息并继续', remainingAttempts
     }
@@ -121,15 +148,15 @@ export const generationActionRequired = (generation) => {
   if (status === 'needs_input') {
     return {
       kind: 'description', title: '场景信息不足',
-      description: generation?.error_message || '请补充完整步骤、成功标准和清理约束。',
+      description: generation?.error_message || '请补充完整步骤、成功标准、目标数据范围和清理约束。',
       questions: [], primaryLabel: '重新分析并继续', remainingAttempts
     }
   }
-  if (status === 'needs_confirmation' && generation?.current_stage === 'preflighting') {
+  if (status === 'needs_confirmation' && generation?.current_stage === 'preflighting' && errorCode !== 'EXPLORATION_EXTRA_RISK_BLOCKED') {
     return {
-      kind: 'auto_explore', title: '需要确认探索风险',
-      description: '继续后平台仅以只读方式打开页面、菜单和表单，不会提交新增、编辑、删除或支付等业务写操作。只有探索后仍影响业务含义的问题才会要求回答。',
-      questions: [], primaryLabel: '确认仅只读探索并继续', remainingAttempts
+      kind: 'target_scope', title: '常规 CRUD 测试流程已支持',
+      description: '常规测试数据的新增、查询、编辑、删除已支持，可按现有目标范围继续，旧记录无需补充描述。默认只使用本轮测试数据并尝试清理；清理失败或发现残留会明确告知并保留已有证据及草稿。若测试描述已明确要求只读，系统会遵守该限制。审批、付款、发布、上传等额外动作目前不在扩权支持范围，请修改测试目标。页面元素、DOM 和定位器不需要你填写。',
+      questions: [], primaryLabel: '确认常规 CRUD 范围并继续', remainingAttempts
     }
   }
   if (status === 'needs_confirmation' && businessQuestions.length) {
@@ -149,7 +176,7 @@ export const generationActionRequired = (generation) => {
   }
   return {
     kind: 'description', title: '需要调整探索约束',
-    description: generation?.error_message || '请修订描述并明确探索阶段只读。',
+    description: generation?.error_message || '请修订描述，明确目标范围、允许的操作和清理约束。',
     questions: [], primaryLabel: '修订后继续', remainingAttempts
   }
 }
@@ -188,12 +215,19 @@ export const buildGenerationTimeline = (generation) => {
 
 export const generationResolutionHint = (generation) => {
   const status = generation?.status
-  if (status === 'needs_input') return '请补充可验证的操作步骤、成功标准和清理要求后重新发起。'
-  if (status === 'needs_confirmation') return '请先处理探索风险或仍待确认的业务信息；页面元素、DOM 和定位器不需要人工填写。'
-  if (status === 'needs_credentials') return '请在“本次探索登录信息”中填写临时账号和密码后重新发起。'
-  if (status === 'needs_review') return '脚本和证据已保留，请根据阻断项或未确认项人工调整后再创建新的生成任务。'
-  if (status === 'failed') return generation?.error_message || '请检查模型、Playwright MCP、登录信息或页面可访问性后重试。'
-  if (status === 'cancelled') return '本次生成已停止；可以修改输入后重新发起。'
+  if (status === 'needs_input') return '请补充可验证的操作步骤、成功标准、目标数据范围和清理要求后重新发起。'
+  if (status === 'needs_confirmation') return '请先确认常规 CRUD 的目标范围和仍待确认的业务信息。审批、付款、发布、上传等额外动作目前不在扩权支持范围；页面元素、DOM 和定位器不需要人工填写。'
+  if (status === 'needs_credentials') return '请在“本轮测试登录信息”中填写临时账号和密码后重新发起。'
+  if (status === 'needs_review') return `${generation?.error_message ? `${generation.error_message} ` : ''}本次结果需要人工处理，尤其请确认清理失败或残留数据。草稿和证据已保留，可先查看后再决定是否新建任务。`
+  if (status === 'failed' || status === 'cancelled') {
+    const message = status === 'failed'
+      ? generation?.error_message || '请检查模型、Playwright MCP、登录信息或页面可访问性后重试。'
+      : '本次生成已停止。'
+    const cleanupStatus = generation?.exploration_snapshot?.cleanup_report?.status
+    return ['unknown', 'residual', 'not_attempted'].includes(cleanupStatus)
+      ? `${message} 重新发起前，请先检查“探索证据”中的本轮数据和清理结果，避免重复操作。`
+      : message
+  }
   if (status === 'ready_with_warnings') return '脚本可保存，但建议先查看定位器和探索证据警告。'
   return ''
 }

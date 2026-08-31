@@ -24,6 +24,10 @@ _WRITE_ACTION_RE = re.compile(
     r'submit|create|update|delete|approve|pay|publish|upload)',
     re.IGNORECASE,
 )
+_EXTRA_RISK_ACTION_RE = re.compile(
+    r'(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
+    re.IGNORECASE,
+)
 _NEGATED_WRITE_RE = re.compile(
     r'(?:不要|禁止|不得|避免|不允许|不可|不应|别)\s*(?:提交|新增|创建|编辑|修改|删除|审批|付款|发布|上传|'
     r'submit|create|update|delete|approve|pay|publish|upload)',
@@ -197,18 +201,17 @@ def prepare_playwright_mcp_output_config(
 
 
 def exploration_requires_write_confirmation(description: str) -> bool:
-    """Return true only for an explicit request to write during exploration.
+    """Keep extra-risk actions out of ordinary goal-scoped CRUD exploration.
 
-    CRUD is a valid *script* objective.  This check intentionally examines the
-    exploration clause only, so safety guidance such as "探索阶段不要提交新增"
-    cannot accidentally block the request.
+    Ordinary create/update/delete requests no longer need a read-only rewrite.
+    The explorer still enforces the user's scope and explicit no-write limits.
     """
     for sentence in re.split(r'[。！？!?.\n]+', description or ''):
         context_match = _EXPLORATION_CONTEXT_RE.search(sentence)
         if not context_match:
             continue
         suffix = sentence[context_match.end():]
-        action_match = _WRITE_ACTION_RE.search(suffix)
+        action_match = _EXTRA_RISK_ACTION_RE.search(suffix)
         if not action_match:
             continue
         # The whole exploration clause is negated, including wording such as
@@ -217,7 +220,7 @@ def exploration_requires_write_confirmation(description: str) -> bool:
         if _NEGATED_WRITE_RE.search(before_action) or _NEGATED_CONTEXT_WRITE_RE.search(before_action):
             continue
         action_prefix = suffix[:action_match.end()]
-        direct_action = bool(re.match(r'^\s*[，,:：;；-]*\s*' + _WRITE_ACTION_RE.pattern, suffix, re.I))
+        direct_action = bool(re.match(r'^\s*[，,:：;；-]*\s*' + _EXTRA_RISK_ACTION_RE.pattern, suffix, re.I))
         if direct_action or _EXPLICIT_WRITE_INTENT_RE.search(action_prefix):
             return True
     return False
@@ -322,12 +325,12 @@ def run_safety_preflight(generation, scenario: ScenarioSpec, *, credentials_avai
     if exploration_requires_write_confirmation(generation.description_safe):
         return PreflightResult(
             'needs_confirmation',
-            'EXPLORATION_WRITE_CONFIRMATION_REQUIRED',
-            '描述要求探索阶段提交写操作，需要人工确认后才能继续。',
+            'EXPLORATION_EXTRA_RISK_BLOCKED',
+            '本次探索包含审批、支付、发布或文件/外部消息操作，超出普通测试数据增删改查范围，请调整目标后继续。',
         )
     mcp_config_id, mcp_config = mcp_selection
     discovery_count = len({*scenario.discovery_targets, *scenario.ambiguities})
-    warnings = ['探索阶段仅查看页面和打开表单，不会提交业务写操作。']
+    warnings = ['探索会按测试目标实际操作页面；默认只修改本轮测试数据，并尝试清理。明确的禁止写入约束仍然有效。']
     if discovery_count:
         warnings.append(f'将通过页面探索自动确认 {discovery_count} 项信息。')
     return PreflightResult(

@@ -1,4 +1,4 @@
-"""Evidence-first completion assessment for read-only MCP exploration."""
+"""Evidence-first completion assessment for target-driven MCP exploration."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from .generation_contracts import (
     ExplorationSnapshot,
     ScenarioSpec,
 )
+from .exploration_policy import CRUD_OPERATIONS, ExplorationPolicy
 
 
 USER_DECISION_KINDS = frozenset({'business_decision', 'permission_scope', 'data_scope'})
@@ -111,10 +112,41 @@ def _is_allowed_user_decision(item: ExplorationMissingTarget, scenario: Scenario
     return True
 
 
+def _observed_action_for_step(step, snapshot: ExplorationSnapshot) -> bool:
+    return any(
+        action.step_id == step.id
+        and action.status == 'observed'
+        and (step.intent not in {'create', 'update', 'delete'} or action.operation == step.intent)
+        for action in snapshot.exploration_actions
+    )
+
+
+def _unknown_action_for_step(step, snapshot: ExplorationSnapshot) -> bool:
+    return any(
+        action.step_id == step.id
+        and action.status == 'unknown'
+        and (step.intent not in {'create', 'update', 'delete'} or action.operation == step.intent)
+        for action in snapshot.exploration_actions
+    )
+
+
+def _effective_allowed_operations(
+    snapshot: ExplorationSnapshot,
+    policy: ExplorationPolicy | None,
+) -> frozenset[str]:
+    if policy is not None:
+        return policy.allowed_operations
+    if snapshot.exploration_policy_applied:
+        return frozenset(snapshot.exploration_allowed_operations)
+    # Older snapshots predate policy metadata. Preserve their historical gate.
+    return CRUD_OPERATIONS
+
+
 def assess_exploration_completion(
     scenario: ScenarioSpec,
     snapshot: ExplorationSnapshot,
     *,
+    policy: ExplorationPolicy | None = None,
     targeted_rounds: int | None = None,
     budget_exhausted: bool = False,
     supplement_round_limit_reached: bool = False,
@@ -132,6 +164,12 @@ def assess_exploration_completion(
     has_real_observation = snapshot.tool_stats.total_tool_calls > snapshot.tool_stats.failed_tool_calls
     evidence = snapshot.model_dump(mode='json')['step_evidence']
     missing: list[ExplorationMissingTarget] = []
+    submission_unknown = False
+    allowed_operations = _effective_allowed_operations(snapshot, policy)
+    has_mutating_step = any(
+        step.mutates_data or step.intent in {'create', 'update', 'delete'}
+        for step in scenario.steps
+    )
 
     for step in scenario.steps:
         item = evidence.get(step.id)
@@ -139,11 +177,11 @@ def assess_exploration_completion(
         if not traceable:
             if item:
                 item['status'] = 'unresolved'
-                item['reason'] = '缺少与目标关联的真实只读页面观测。'
+                item['reason'] = '缺少与目标关联的真实页面观测。'
             else:
                 evidence[step.id] = {
                     'status': 'unresolved', 'paths': [], 'element_names': [],
-                    'reason': '缺少真实只读页面观测。',
+                    'reason': '缺少真实页面观测。',
                 }
             missing.append(ExplorationMissingTarget(
                 target=step.target_hint,
@@ -151,6 +189,23 @@ def assess_exploration_completion(
                 step_ids=[step.id],
                 reason='页面目标尚未由实际工具观测确认。',
             ))
+        operation = step.intent if step.intent in CRUD_OPERATIONS else None
+        if operation in allowed_operations:
+            if _unknown_action_for_step(step, snapshot):
+                submission_unknown = True
+                missing.append(ExplorationMissingTarget(
+                    target=step.target_hint,
+                    kind='observable',
+                    step_ids=[step.id],
+                    reason='提交结果未知；为避免重复写入，本轮不会重试该操作。',
+                ))
+            elif not _observed_action_for_step(step, snapshot):
+                missing.append(ExplorationMissingTarget(
+                    target=step.target_hint,
+                    kind='observable',
+                    step_ids=[step.id],
+                    reason='CRUD 目标尚未获得提交后的可观察结果。',
+                ))
 
     for target in scenario.discovery_targets:
         if not _discovery_target_covered(target, snapshot):
@@ -172,7 +227,7 @@ def assess_exploration_completion(
                 target=item.target,
                 kind='observable',
                 step_ids=item.step_ids,
-                reason='未验证为业务、权限或数据范围决策，继续只读探索。',
+                reason='未验证为业务、权限或数据范围决策，继续页面探索。',
             ))
 
     structured_questions = [
@@ -189,8 +244,22 @@ def assess_exploration_completion(
     ]
     user_questions = list(dict.fromkeys([*structured_questions, *legacy_questions]))
     observable_missing = [item for item in missing if item.kind == 'observable']
-    if observable_missing:
-        status = 'blocked' if budget_exhausted else 'needs_targeted_exploration'
+    observed_actions = any(action.status == 'observed' for action in snapshot.exploration_actions)
+    cleanup_status = snapshot.cleanup_report.status
+    cleanup_missing = observed_actions and cleanup_status in {'not_required', 'not_attempted'}
+    cleanup_unknown = cleanup_status == 'unknown'
+    cleanup_pending = (
+        observed_actions and cleanup_missing
+    )
+    if cleanup_pending:
+        missing.append(ExplorationMissingTarget(
+            target='本轮测试数据清理',
+            kind='observable',
+            reason='CRUD 操作已完成，但尚未获得清理尝试结果。',
+        ))
+        observable_missing = [item for item in missing if item.kind == 'observable']
+    if observable_missing or cleanup_unknown:
+        status = 'blocked' if budget_exhausted or submission_unknown or cleanup_unknown else 'needs_targeted_exploration'
     elif user_questions:
         status = 'needs_user_decision'
     else:
@@ -201,10 +270,31 @@ def assess_exploration_completion(
     payload['unresolved_steps'] = sorted(
         step_id for step_id, item in evidence.items() if item.get('status') == 'unresolved'
     )
-    if any(step.mutates_data or step.intent in {'create', 'update', 'delete'} for step in scenario.steps):
+    if cleanup_missing:
+        payload['cleanup_report'] = {
+            'status': 'not_attempted',
+            'attempted': False,
+            'reason': '已观察到本轮数据操作，但模型未报告清理结果。',
+        }
+    if has_mutating_step and not allowed_operations:
         payload['warnings'] = list(dict.fromkeys([
             *payload.get('warnings', []),
-            '只读探索仅确认 CRUD 相关 UI 与定位证据；提交结果须在脚本运行期验证。',
+            '本轮探索策略未允许 CRUD 提交，仅确认 UI 与定位证据，未将其标记为提交验证。',
+        ]))
+    elif has_mutating_step:
+        payload['warnings'] = list(dict.fromkeys([
+            *payload.get('warnings', []),
+            'CRUD 探索只允许当前 scope 内的数据；exploration_actions 记录提交后的实际观察结果。',
+        ]))
+    if snapshot.cleanup_report.status == 'residual':
+        payload['warnings'] = list(dict.fromkeys([
+            *payload.get('warnings', []),
+            *[f'本轮清理残留：{item}' for item in snapshot.cleanup_report.residuals],
+        ]))
+    elif cleanup_unknown:
+        payload['warnings'] = list(dict.fromkeys([
+            *payload.get('warnings', []),
+            '本轮 cleanup 状态未知；不得将其视为已完成。',
         ]))
     deduplicated_missing = []
     seen_missing: set[tuple] = set()

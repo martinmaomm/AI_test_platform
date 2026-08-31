@@ -9,7 +9,7 @@ from django.test import SimpleTestCase
 
 from .exploration_completion import assess_exploration_completion, can_request_user_decision
 from .generation_orchestrator import _test_case_context
-from .generation_contracts import ExplorationSnapshot, ScenarioSpec
+from .generation_contracts import ExplorationSnapshot, ScenarioSpec, merge_exploration_snapshots
 from .mcp_page_explorer import (
     MCP_BROWSER_TOOL_CALL_LIMIT,
     MCPPageExplorer,
@@ -17,6 +17,7 @@ from .mcp_page_explorer import (
     ReadOnlyMCPBrowserToolGuard,
     exploration_total_timeout_seconds,
 )
+from .exploration_policy import ExplorationPolicy
 
 
 def scenario(*, ambiguities=None):
@@ -144,7 +145,7 @@ class ExplorationCompletionTests(SimpleTestCase):
         self.assertFalse(can_request_user_decision(assessed))
         self.assertNotIn(question, assessed.completion.user_questions)
 
-    def test_crud_step_confirms_ui_but_marks_runtime_result_unverified(self):
+    def test_crud_step_without_observed_submission_requires_targeted_exploration(self):
         crud = scenario()
         crud = crud.model_copy(update={'steps': [crud.steps[0].model_copy(update={
             'intent': 'create', 'mutates_data': True,
@@ -152,8 +153,193 @@ class ExplorationCompletionTests(SimpleTestCase):
             {'id': 'C1', 'name': '清理', 'target_hint': '用户列表', 'condition': '测试数据存在时删除', 'step_id': 'S1'},
         ]})
         assessed = assess_exploration_completion(crud, snapshot())
+        self.assertEqual(assessed.completion.status, 'needs_targeted_exploration')
+        self.assertTrue(any('CRUD 目标尚未获得提交后' in item.reason for item in assessed.completion.missing_targets))
+
+    def test_unknown_submission_blocks_without_a_retry(self):
+        crud = scenario().model_copy(update={'steps': [scenario().steps[0].model_copy(update={
+            'intent': 'create', 'mutates_data': True,
+        })], 'cleanup': [{
+            'id': 'C1', 'name': '清理', 'target_hint': '用户列表',
+            'condition': '测试数据存在时删除', 'step_id': 'S1',
+        }]})
+        raw = snapshot().model_dump(mode='json')
+        raw['exploration_actions'] = [{
+            'step_id': 'S1', 'operation': 'create', 'scope': 'namespace',
+            'status': 'unknown', 'target': '本轮测试用户', 'evidence_path': '/',
+        }]
+        assessed = assess_exploration_completion(crud, ExplorationSnapshot.model_validate(raw))
+        self.assertEqual(assessed.completion.status, 'blocked')
+        self.assertTrue(any('提交结果未知' in item.reason for item in assessed.completion.missing_targets))
+
+    def test_cleanup_unknown_before_attempt_blocks_and_warns(self):
+        crud = scenario().model_copy(update={'steps': [scenario().steps[0].model_copy(update={
+            'intent': 'create', 'mutates_data': True,
+        })], 'cleanup': [{
+            'id': 'C1', 'name': '清理', 'target_hint': '用户列表',
+            'condition': '测试数据存在时删除', 'step_id': 'S1',
+        }]})
+        raw = snapshot().model_dump(mode='json')
+        raw['exploration_actions'] = [{
+            'step_id': 'S1', 'operation': 'create', 'scope': 'namespace',
+            'status': 'observed', 'target': '本轮测试用户', 'evidence_path': '/',
+        }]
+        raw['cleanup_report'] = {'status': 'unknown', 'attempted': False}
+        assessed = assess_exploration_completion(crud, ExplorationSnapshot.model_validate(raw))
+        self.assertEqual(assessed.completion.status, 'blocked')
+        self.assertIn('本轮 cleanup 状态未知；不得将其视为已完成。', assessed.warnings)
+
+    def test_observed_write_without_cleanup_report_requires_cleanup(self):
+        crud = scenario().model_copy(update={'steps': [scenario().steps[0].model_copy(update={
+            'intent': 'create', 'mutates_data': True,
+        })], 'cleanup': [{
+            'id': 'C1', 'name': '清理', 'target_hint': '用户列表',
+            'condition': '测试数据存在时删除', 'step_id': 'S1',
+        }]})
+        raw = snapshot().model_dump(mode='json')
+        raw['exploration_actions'] = [{
+            'step_id': 'S1', 'operation': 'create', 'scope': 'namespace',
+            'status': 'observed', 'target': '本轮测试用户', 'evidence_path': '/',
+        }]
+        assessed = assess_exploration_completion(crud, ExplorationSnapshot.model_validate(raw))
+        self.assertEqual(assessed.completion.status, 'needs_targeted_exploration')
+        self.assertEqual(assessed.cleanup_report.status, 'not_attempted')
+
+    def test_explicit_read_only_policy_completes_ui_evidence_without_submit(self):
+        crud = scenario().model_copy(update={'steps': [scenario().steps[0].model_copy(update={
+            'intent': 'create', 'mutates_data': True,
+        })], 'cleanup': [{
+            'id': 'C1', 'name': '清理', 'target_hint': '用户列表',
+            'condition': '测试数据存在时删除', 'step_id': 'S1',
+        }]})
+        policy = ExplorationPolicy.for_scenario(
+            crud, generation_id='52ae9c6a-50a7-424d-9373-423750c6fd9f', user_constraints='不要提交表单。',
+        )
+        raw = snapshot().model_dump(mode='json')
+        raw.update({
+            'exploration_policy_applied': True,
+            'exploration_allowed_operations': [],
+            'exploration_explicit_read_only': True,
+        })
+        assessed = assess_exploration_completion(crud, ExplorationSnapshot.model_validate(raw), policy=policy)
         self.assertEqual(assessed.completion.status, 'complete')
-        self.assertTrue(any('运行期验证' in warning for warning in assessed.warnings))
+        self.assertIn('仅确认 UI 与定位证据', assessed.warnings[-1])
+        self.assertEqual(
+            assess_exploration_completion(crud, assessed).completion.status,
+            'complete',
+        )
+
+    def test_merge_preserves_ledger_and_applies_successful_cleanup_delta(self):
+        crud = scenario().model_copy(update={'steps': [scenario().steps[0].model_copy(update={
+            'intent': 'create', 'mutates_data': True,
+        })], 'cleanup': [{
+            'id': 'C1', 'name': '清理', 'target_hint': '用户列表',
+            'condition': '测试数据存在时删除', 'step_id': 'S1',
+        }]})
+        first = snapshot().model_dump(mode='json')
+        first.update({
+            'exploration_namespace': 'aits-explore-test-attempt',
+            'exploration_policy_applied': True,
+            'exploration_allowed_operations': ['create', 'delete'],
+            'exploration_actions': [{
+                'step_id': 'S1', 'operation': 'create', 'scope': 'namespace',
+                'status': 'observed', 'target': '本轮测试用户', 'evidence_path': '/',
+            }],
+            'cleanup_report': {'status': 'not_attempted', 'attempted': False},
+        })
+        second = snapshot().model_dump(mode='json')
+        second.update({
+            'exploration_namespace': 'aits-explore-test-attempt',
+            'exploration_policy_applied': True,
+            'exploration_allowed_operations': ['create', 'delete'],
+            'exploration_actions': [{
+                'step_id': 'S1', 'operation': 'delete', 'scope': 'namespace',
+                'status': 'observed', 'target': '本轮测试用户', 'evidence_path': '/',
+            }],
+            'cleanup_report': {'status': 'cleaned', 'attempted': True},
+            'tool_stats': {'total_tool_calls': 1, 'potential_write_tool_calls': 1, 'blocked_write_tool_calls': 0},
+        })
+        merged = merge_exploration_snapshots(
+            ExplorationSnapshot.model_validate(first), ExplorationSnapshot.model_validate(second),
+            scenario=crud, target_step_ids={'S1'},
+        )
+        self.assertEqual([action.operation for action in merged.exploration_actions], ['create', 'delete'])
+        self.assertEqual(merged.cleanup_report.status, 'cleaned')
+        self.assertEqual(merged.tool_stats.potential_write_tool_calls, 1)
+
+    def test_supplement_failure_keeps_primary_evidence_and_marks_cleanup_unknown(self):
+        explorer = MCPPageExplorer(
+            llm_model=AsyncMock(), mcp_config={'mcpServers': {}},
+            generation_id='52ae9c6a-50a7-424d-9373-423750c6fd9f',
+        )
+        primary = snapshot(unresolved=True)
+        failed_snapshot = ExplorationSnapshot.model_validate({
+            'start_url_path': '/', 'tool_stats': {
+                'total_tool_calls': 2, 'potential_write_tool_calls': 1,
+                'termination_reason': 'mcp_error',
+            },
+        })
+        client = AsyncMock()
+        failure = MCPPageExplorerError('mcp_error', '补充失败', snapshot=failed_snapshot)
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client), patch.object(
+            explorer, '_explore_with_prompt', side_effect=[primary, failure],
+        ):
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                asyncio.run(explorer.explore_until_complete(
+                    scenario=scenario(), start_path='/', target_url_safe='https://example.invalid/',
+                ))
+        preserved = raised.exception.snapshot
+        self.assertEqual(preserved.page_states[0].name, '用户列表')
+        self.assertTrue(preserved.exploration_namespace.startswith('aits-explore-'))
+        self.assertEqual(preserved.cleanup_report.status, 'unknown')
+        self.assertFalse(preserved.cleanup_report.attempted)
+
+    def test_failure_delta_does_not_overwrite_prior_cleanup_without_new_write(self):
+        explorer = MCPPageExplorer(
+            llm_model=AsyncMock(), mcp_config={'mcpServers': {}},
+            generation_id='52ae9c6a-50a7-424d-9373-423750c6fd9f',
+        )
+        prior_raw = snapshot().model_dump(mode='json')
+        prior_raw.update({
+            'cleanup_report': {'status': 'cleaned', 'attempted': True},
+            'tool_stats': {'total_tool_calls': 2, 'potential_write_tool_calls': 1},
+        })
+        prior = ExplorationSnapshot.model_validate(prior_raw)
+        failed = ExplorationSnapshot.model_validate({
+            'start_url_path': '/',
+            'tool_stats': {'total_tool_calls': 3, 'potential_write_tool_calls': 1},
+        })
+        preserved = explorer._failure_snapshot_with_prior_evidence(prior, failed)
+        self.assertEqual(preserved.cleanup_report.status, 'cleaned')
+        self.assertTrue(preserved.cleanup_report.attempted)
+
+    def test_supplement_failure_keeps_known_residuals_and_handles_missing_snapshot(self):
+        explorer = MCPPageExplorer(llm_model=AsyncMock(), mcp_config={'mcpServers': {}})
+        prior = snapshot().model_copy(update={
+            'cleanup_report': ExplorationSnapshot.model_validate({
+                'start_url_path': '/', 'tool_stats': {'total_tool_calls': 0},
+                'cleanup_report': {'status': 'residual', 'attempted': True, 'residuals': ['test-user-1']},
+            }).cleanup_report,
+        })
+        failed = ExplorationSnapshot.model_validate({
+            'start_url_path': '/', 'tool_stats': {'total_tool_calls': 2, 'potential_write_tool_calls': 1},
+        })
+        preserved = explorer._failure_snapshot_with_prior_evidence(prior, failed)
+        self.assertEqual(preserved.cleanup_report.status, 'unknown')
+        self.assertEqual(preserved.cleanup_report.residuals, ['test-user-1'])
+        self.assertTrue(preserved.cleanup_report.attempted)
+        self.assertEqual(explorer._failure_snapshot_with_prior_evidence(prior, None).cleanup_report.status, 'residual')
+
+    def test_new_supplement_writes_cannot_reuse_previous_cleanup_success(self):
+        first = snapshot().model_dump(mode='json')
+        first['cleanup_report'] = {'status': 'cleaned', 'attempted': True}
+        extra = snapshot().model_dump(mode='json')
+        extra['tool_stats']['potential_write_tool_calls'] = 1
+        merged = merge_exploration_snapshots(
+            ExplorationSnapshot.model_validate(first), ExplorationSnapshot.model_validate(extra),
+            scenario=scenario(), target_step_ids={'S1'},
+        )
+        self.assertEqual(merged.cleanup_report.status, 'unknown')
 
 
 class ExplorerContinuationTests(SimpleTestCase):
@@ -217,6 +403,49 @@ class ExplorerContinuationTests(SimpleTestCase):
         self.assertEqual(prompts[1]['missing_targets'][0]['target'], '新增用户表单字段')
         self.assertEqual(prompts[1]['already_observed_pages'][0]['name'], '用户列表')
         self.assertEqual(result.completion.status, 'complete')
+
+    def test_supplement_prompt_reuses_namespace_and_includes_ledger(self):
+        explorer = self.explorer()
+        raw = snapshot(unresolved=True).model_dump(mode='json')
+        raw.update({
+            'exploration_namespace': 'aits-explore-existing-attempt',
+            'exploration_actions': [{
+                'step_id': 'S1', 'operation': 'create', 'scope': 'namespace',
+                'status': 'observed', 'target': '本轮测试用户', 'evidence_path': '/',
+            }],
+            'cleanup_report': {'status': 'not_attempted', 'attempted': False},
+        })
+        existing = ExplorationSnapshot.model_validate(raw)
+        prompts = []
+
+        async def run_prompt(prompt, *args, **kwargs):
+            prompts.append(__import__('json').loads(prompt))
+            return existing
+
+        with patch.object(explorer, '_explore_with_prompt', side_effect=run_prompt):
+            asyncio.run(explorer.explore_missing_evidence(
+                scenario=scenario(), existing_snapshot=existing,
+                start_path='/', target_url_safe='https://example.invalid/',
+            ))
+        prompt = prompts[0]
+        self.assertEqual(prompt['scope_policy']['exploration_namespace'], 'aits-explore-existing-attempt')
+        self.assertEqual(prompt['existing_exploration_namespace'], 'aits-explore-existing-attempt')
+        self.assertEqual(prompt['existing_exploration_actions'][0]['operation'], 'create')
+        self.assertEqual(prompt['existing_cleanup_report']['status'], 'not_attempted')
+
+    def test_supplement_timeout_keeps_primary_snapshot(self):
+        explorer = self.explorer()
+        client = AsyncMock()
+        primary = snapshot(unresolved=True)
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client), patch.object(
+            explorer, '_explore_with_prompt', side_effect=[primary, TimeoutError()],
+        ):
+            with self.assertRaises(MCPPageExplorerError) as raised:
+                asyncio.run(explorer.explore_until_complete(
+                    scenario=scenario(), start_path='/', target_url_safe='https://example.invalid/',
+                ))
+        self.assertEqual(raised.exception.error_code, 'exploration_timeout')
+        self.assertEqual(raised.exception.snapshot.page_states[0].name, '用户列表')
 
     def test_total_tool_budget_prevents_a_second_exploration_round(self):
         explorer = self.explorer()

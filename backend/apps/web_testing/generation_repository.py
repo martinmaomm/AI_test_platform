@@ -120,6 +120,43 @@ def attach_celery_task(generation_id: Any, celery_task_id: str) -> WebUIScriptGe
         return generation
 
 
+def claim_generation_worker(generation_id: Any, celery_task_id: str | None) -> WebUIScriptGeneration | None:
+    """Claim one durable generation attempt without replaying browser writes.
+
+    A crashed worker is deliberately not auto-restarted from the beginning.
+    The user must inspect the outcome and explicitly start a new generation.
+    """
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        if generation.status not in {
+            WebUIScriptGeneration.Status.CREATED, WebUIScriptGeneration.Status.NORMALIZING,
+            WebUIScriptGeneration.Status.PREFLIGHTING,
+        }:
+            return None
+        if celery_task_id and generation.celery_task_id and generation.celery_task_id != celery_task_id:
+            return None
+        workspace = dict(generation.workspace or {})
+        previous = workspace.get('_generation_dispatch') or {}
+        if previous.get('revision') == generation.revision:
+            return None
+        if celery_task_id and (
+            previous.get('task_id') == celery_task_id
+            or any(item.get('previous_task_id') == celery_task_id for item in generation.clarifications or [])
+        ):
+            return None
+        workspace['_generation_dispatch'] = {
+            'revision': generation.revision, 'task_id': celery_task_id or '<direct>',
+            'claimed_at': timezone.now().isoformat(),
+        }
+        generation.workspace = workspace
+        fields = ['workspace', 'updated_at']
+        if celery_task_id and not generation.celery_task_id:
+            generation.celery_task_id = celery_task_id
+            fields.append('celery_task_id')
+        generation.save(update_fields=fields)
+        return generation
+
+
 def prepare_generation_resolution(
     generation_id: Any,
     *,

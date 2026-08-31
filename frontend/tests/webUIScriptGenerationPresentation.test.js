@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import {
   buildGenerationTimeline,
   generationActionRequired,
+  generationResolutionHint,
+  explorationCleanupPresentation,
   isCurrentRevisionVerified,
   isWorkspaceActive
 } from '../src/composables/webUIScriptGenerationPresentation.js'
@@ -36,6 +38,66 @@ test('observable evidence gaps do not create a DOM questionnaire', () => {
   assert.equal(action.primaryLabel, '')
 })
 
+test('preflight confirmation supports ordinary CRUD without promising extra-risk actions', () => {
+  const action = generationActionRequired({
+    status: 'needs_confirmation', current_stage: 'preflighting',
+    error_code: 'EXPLORATION_WRITE_CONFIRMATION_REQUIRED'
+  })
+
+  assert.equal(action.kind, 'target_scope')
+  assert.equal(action.primaryLabel, '确认常规 CRUD 范围并继续')
+  assert.match(action.description, /常规测试数据的新增、查询、编辑、删除已支持/)
+  assert.match(action.description, /审批、付款、发布、上传/)
+  assert.match(action.description, /测试描述已明确要求只读/)
+  assert.doesNotMatch(action.primaryLabel, /仅只读/)
+})
+
+test('needs review preserves backend cleanup evidence and does not imply success', () => {
+  const hint = generationResolutionHint({
+    status: 'needs_review', error_message: '清理失败：仍有 1 条本轮测试数据。'
+  })
+
+  assert.match(hint, /清理失败：仍有 1 条本轮测试数据。/)
+  assert.match(hint, /人工处理/)
+  assert.doesNotMatch(hint, /已完成/)
+})
+
+test('extra risk rejection exposes the description editor instead of a blind continue button', () => {
+  const action = generationActionRequired({
+    status: 'needs_confirmation', current_stage: 'preflighting',
+    error_code: 'EXPLORATION_EXTRA_RISK_BLOCKED', error_message: '请移除支付操作'
+  })
+  assert.equal(action.kind, 'description')
+  assert.equal(action.description, '请移除支付操作')
+})
+
+test('model availability and gateway failures keep the backend error message', () => {
+  const message = '模型服务暂时不可用：上游网关超时，请稍后重试。'
+  assert.equal(generationResolutionHint({ status: 'failed', error_message: message }), message)
+})
+
+test('failure and cancellation with unknown cleanup warn before a new task', () => {
+  for (const status of ['failed', 'cancelled']) {
+    const hint = generationResolutionHint({
+      status, error_message: '模型服务异常（HTTP 500）',
+      exploration_snapshot: { cleanup_report: { status: 'unknown', attempted: false } }
+    })
+    assert.match(hint, /重新发起前/)
+    assert.match(hint, /避免重复操作/)
+  }
+})
+
+test('cleanup presentation does not infer success for legacy snapshots and flags residuals', () => {
+  assert.equal(explorationCleanupPresentation({}).hasRecord, false)
+  const cleanup = explorationCleanupPresentation({
+    cleanup_report: { status: 'residual', attempted: true, residuals: ['user:test-42'], reason: '删除接口超时' }
+  })
+  assert.deepEqual(cleanup, {
+    hasRecord: true, status: 'residual', label: '发现残留', type: 'error', attempted: true,
+    residuals: ['user:test-42'], reason: '删除接口超时'
+  })
+})
+
 test('workspace activity keeps polling alive and verified save requires the current revision', () => {
   const workspace = { verification: { status: 'passed', locked_revision: 4 }, repair: { status: 'idle' } }
   assert.equal(isWorkspaceActive(workspace), false)
@@ -47,7 +109,7 @@ test('workspace activity keeps polling alive and verified save requires the curr
   assert.equal(isWorkspaceActive({ verification: { status: 'passed' }, repair: { status: 'running' } }), true)
 })
 
-test('timeline uses understandable generation stages rather than execution-pass labels', () => {
+test('timeline distinguishes exploration and process validation from script debugging', () => {
   const labels = buildGenerationTimeline({ status: 'ready', current_stage: 'completed' }).map(item => item.label)
-  assert.deepEqual(labels, ['理解目标', '只读探索页面', '生成并检查草稿', '进入可编辑工作区'])
+  assert.deepEqual(labels, ['理解目标', '探索并验证测试流程', '生成并检查草稿', '进入可编辑工作区'])
 })

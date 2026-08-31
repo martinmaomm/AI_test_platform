@@ -22,7 +22,7 @@ from .generation_preflight import run_safety_preflight
 from .generation_repository import (
     MAX_GENERATION_RESUME_COUNT,
     PAUSED_GENERATION_STATUSES,
-    attach_celery_task,
+    claim_generation_worker,
     cancel_generation,
     get_generation_temporary_credentials,
     is_cancel_requested,
@@ -30,6 +30,7 @@ from .generation_repository import (
 )
 from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 from .models import WebUIScriptGeneration
+from .model_service_errors import classify_model_service_error
 from .requirement_normalizer import normalize_requirement
 from .script_generator import ScriptGenerator
 from .script_quality import blocker_issues, evaluate_script
@@ -100,9 +101,16 @@ def _is_rate_limited_error(error: BaseException) -> bool:
 
 
 def _model_failure(error: BaseException) -> tuple[str, str]:
+    service_error = classify_model_service_error(error, stage='generation')
+    if service_error:
+        return service_error
     if _is_rate_limited_error(error):
         return 'MODEL_RATE_LIMITED', '本次锁定的模型触发限流，请稍后重试或更换模型。'
     return 'MODEL_UNAVAILABLE', '本次锁定的模型暂时不可用，请检查模型配置或稍后重试。'
+
+
+def _cleanup_requires_attention(snapshot) -> bool:
+    return snapshot.cleanup_report.status in {'residual', 'unknown', 'not_attempted'}
 
 
 def _safe_fail_generation(
@@ -114,6 +122,7 @@ def _safe_fail_generation(
 ) -> dict[str, Any]:
     """Persist a safe failure if possible; never expose a raw backend exception."""
     try:
+        logger.warning('WebUI generation stopped: generation_id=%s error_code=%s', generation_id, error_code)
         generation = transition_generation(
             generation_id,
             WebUIScriptGeneration.Status.FAILED,
@@ -167,6 +176,10 @@ def _terminal_cancel_if_requested(generation_id: str, task_id: str | None):
 
 
 def _map_explorer_error(error: MCPPageExplorerError) -> tuple[str, str]:
+    if error.error_code in {'other', 'transient', 'rate_limit'}:
+        service_error = classify_model_service_error(error)
+        if service_error:
+            return service_error
     mappings = {
         'browser': 'BROWSER_UNAVAILABLE',
         'tool_parameter': 'MCP_CONFIGURATION_INVALID',
@@ -181,6 +194,9 @@ def _map_explorer_error(error: MCPPageExplorerError) -> tuple[str, str]:
         'EVIDENCE_INSUFFICIENT': 'EVIDENCE_INSUFFICIENT',
         'SCRIPT_FORMAT_INVALID': 'EVIDENCE_INSUFFICIENT',
         'read_only_violation': 'EXPLORATION_WRITE_BLOCKED',
+        'write_scope_violation': 'EXPLORATION_SCOPE_BLOCKED',
+        'extra_risk_action': 'EXPLORATION_EXTRA_RISK_BLOCKED',
+        'write_result_unknown': 'EXPLORATION_WRITE_RESULT_UNKNOWN',
         'exploration_timeout': 'EXPLORATION_TIMEOUT',
         'permission': 'EXPLORATION_PERMISSION_DENIED',
     }
@@ -209,6 +225,9 @@ def _merge_explorer_failure_stats(
         ),
         'model_calls': int(previous.get('model_calls', 0)) + int(extra.get('model_calls', 0)),
     }
+    for field in ('potential_write_tool_calls', 'blocked_write_tool_calls'):
+        if field in previous or field in extra:
+            merged[field] = int(previous.get(field, 0)) + int(extra.get(field, 0))
     # These are failure-only summaries from MCPPageExplorerError; never copy
     # tool input, selector, output text, URL, or credential-bearing metadata.
     if 'blocked_tool_calls' in extra:
@@ -249,7 +268,8 @@ def _cancel_with_explorer_stats(
         updates.append('tool_stats')
     if failure.snapshot is not None:
         generation.exploration_snapshot = failure.snapshot.model_dump(mode='json')
-        updates.append('exploration_snapshot')
+        generation.warnings = list(dict.fromkeys([*generation.warnings, *failure.snapshot.warnings]))
+        updates.extend(['exploration_snapshot', 'warnings'])
     if updates:
         generation.save(update_fields=[*updates, 'updated_at'])
     return generation
@@ -258,12 +278,17 @@ def _cancel_with_explorer_stats(
 def _cancel_with_snapshot_stats(
     generation_id: str,
     tool_stats: dict[str, Any],
+    snapshot=None,
 ) -> WebUIScriptGeneration:
     """Keep an already completed exploration's counters on a late cancellation."""
     generation = cancel_generation(generation_id)
-    if generation.tool_stats != tool_stats:
-        generation.tool_stats = tool_stats
-        generation.save(update_fields=['tool_stats', 'updated_at'])
+    generation.tool_stats = tool_stats
+    fields = ['tool_stats', 'updated_at']
+    if snapshot is not None:
+        generation.exploration_snapshot = snapshot.model_dump(mode='json')
+        generation.warnings = list(dict.fromkeys([*generation.warnings, *snapshot.warnings]))
+        fields.extend(['exploration_snapshot', 'warnings'])
+    generation.save(update_fields=fields)
     return generation
 
 
@@ -280,15 +305,6 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             'status': WebUIScriptGeneration.Status.FAILED,
             'error_code': 'TRANSIENT_SERVICE_ERROR',
         }
-    if celery_task_id:
-        try:
-            generation = attach_celery_task(generation.pk, celery_task_id)
-        except Exception:
-            return _safe_fail_generation(
-                str(generation.pk),
-                'TRANSIENT_SERVICE_ERROR',
-                '生成任务状态暂时无法更新，请稍后重试。',
-            )
     if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
         return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
@@ -298,6 +314,18 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             'status': generation.status,
             'error_code': generation.error_code,
         }
+
+    try:
+        claimed = claim_generation_worker(generation.pk, celery_task_id)
+    except Exception:
+        return _safe_fail_generation(str(generation.pk), 'TRANSIENT_SERVICE_ERROR', '无法确认任务执行权，尚未启动页面探索。')
+    if claimed is None:
+        generation.refresh_from_db()
+        return {
+            'generation_id': str(generation.pk), 'status': generation.status,
+            'skipped': True, 'reason': '生成任务重复或已过期，未重新执行页面操作。',
+        }
+    generation = claimed
 
     try:
         if generation.status in {
@@ -402,12 +430,13 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             progress=40,
             updates={'warnings': list(preflight.warnings)},
         )
-        publish_stage_changed(generation, '只读探索页面')
+        publish_stage_changed(generation, '探索并验证测试流程')
         explorer = MCPPageExplorer(
             llm_model=model_manager.current_llm,
             mcp_config=preflight.mcp_config or {},
             cancel_check=lambda: bool(celery_task_id and cache.get(f'celery:cancel:{celery_task_id}')),
             generation_id=str(generation.pk),
+            user_constraints=_normalization_description(generation),
         )
         explore_until_complete = getattr(explorer, 'explore_until_complete', None)
         if explore_until_complete is None:
@@ -428,11 +457,15 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 str(generation.pk),
                 'EVIDENCE_INSUFFICIENT',
                 '页面探索证据与测试场景不一致，请缩短范围后重试。',
-                updates={'tool_stats': snapshot.tool_stats.model_dump(mode='json')},
+                updates={
+                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
+                    'exploration_snapshot': snapshot.model_dump(mode='json'),
+                    'warnings': list(snapshot.warnings),
+                },
             )
         if _is_task_cancelled(str(generation.pk), celery_task_id):
             generation = _cancel_with_snapshot_stats(
-                generation.pk, snapshot.tool_stats.model_dump(mode='json'),
+                generation.pk, snapshot.tool_stats.model_dump(mode='json'), snapshot=snapshot,
             )
             publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
@@ -442,11 +475,11 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             scenario = scenario.model_copy(update={'ambiguities': unresolved_questions})
             generation = _pause_or_require_review(
                 generation,
-                WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+                WebUIScriptGeneration.Status.NEEDS_REVIEW if _cleanup_requires_attention(snapshot) else WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
                 progress=50,
-                error_code='INPUT_AMBIGUOUS',
-                error_message='页面已完成只读探索，但仍有少量业务信息无法从页面证据确定。',
-                warnings=unresolved_questions,
+                error_code='EXPLORATION_CLEANUP_UNCONFIRMED' if _cleanup_requires_attention(snapshot) else 'INPUT_AMBIGUOUS',
+                error_message='本次探索存在未确认的清理结果，请先检查残留数据；不会自动重新执行页面操作。' if _cleanup_requires_attention(snapshot) else '页面已完成目标范围内的探索，但仍有业务信息需要确认。',
+                warnings=list(dict.fromkeys([*unresolved_questions, *snapshot.warnings])),
                 updates={
                     'current_stage': WebUIScriptGeneration.Stage.EXPLORING,
                     'scenario_spec': scenario.model_dump(mode='json'),
@@ -454,6 +487,8 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                     'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
                 },
             )
+            if generation.status == WebUIScriptGeneration.Status.NEEDS_REVIEW:
+                publish_terminal(generation)
             return {
                 'generation_id': str(generation.pk),
                 'status': generation.status,
@@ -473,10 +508,10 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 updates={
                     'exploration_snapshot': snapshot.model_dump(mode='json'),
                     'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                    'warnings': [
-                        item.target for item in snapshot.completion.missing_targets
-                        if item.kind == 'observable'
-                    ],
+                    'warnings': list(dict.fromkeys([
+                        *snapshot.warnings,
+                        *[item.target for item in snapshot.completion.missing_targets if item.kind == 'observable'],
+                    ])),
                 },
             )
 
@@ -493,7 +528,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 'scenario_spec': scenario.model_dump(mode='json'),
                 'exploration_snapshot': snapshot.model_dump(mode='json'),
                 'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                'warnings': list(generation.warnings),
+                'warnings': list(dict.fromkeys([*generation.warnings, *snapshot.warnings])),
             },
         )
         publish_stage_changed(generation, '根据页面证据生成脚本')
@@ -549,18 +584,19 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             )
             report = evaluate_script(script, scenario=scenario, snapshot=snapshot)
 
-        warnings = [item['message'] for item in report.get('warnings', [])]
+        warnings = list(dict.fromkeys([*snapshot.warnings, *[item['message'] for item in report.get('warnings', [])]]))
+        cleanup_attention = _cleanup_requires_attention(snapshot)
         target_status = (
             WebUIScriptGeneration.Status.NEEDS_REVIEW
-            if blocker_issues(report)
+            if blocker_issues(report) or cleanup_attention
             else (WebUIScriptGeneration.Status.READY_WITH_WARNINGS if warnings else WebUIScriptGeneration.Status.READY)
         )
         generation = transition_generation(
             generation.pk,
             target_status,
             progress=100 if target_status != WebUIScriptGeneration.Status.NEEDS_REVIEW else 95,
-            error_code='QUALITY_GATE_BLOCKED' if target_status == WebUIScriptGeneration.Status.NEEDS_REVIEW else '',
-            error_message='脚本未通过静态质量检查，请人工修改后再保存。' if target_status == WebUIScriptGeneration.Status.NEEDS_REVIEW else '',
+            error_code='EXPLORATION_CLEANUP_UNCONFIRMED' if cleanup_attention else ('QUALITY_GATE_BLOCKED' if blocker_issues(report) else ''),
+            error_message='脚本草稿已保留，但探索数据清理未确认，请先检查残留数据再调试。' if cleanup_attention else ('脚本未通过静态质量检查，请人工修改后再保存。' if blocker_issues(report) else ''),
             updates={
                 'exploration_snapshot': snapshot.model_dump(mode='json'),
                 'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
@@ -586,6 +622,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
         updates = {'tool_stats': _merge_explorer_failure_stats(generation.tool_stats, exc)}
         if exc.snapshot is not None:
             updates['exploration_snapshot'] = exc.snapshot.model_dump(mode='json')
+            updates['warnings'] = list(dict.fromkeys([*generation.warnings, *exc.snapshot.warnings]))
         return _safe_fail_generation(str(generation.pk), code, message, updates=updates)
     except Exception:
         logger.error(

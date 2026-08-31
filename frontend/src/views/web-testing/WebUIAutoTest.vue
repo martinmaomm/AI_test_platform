@@ -1,7 +1,7 @@
 <template>
   <div v-if="selectedProject" class="webui-generation-page">
     <header class="page-header">
-      <div><h3>AI 脚本生成</h3><p>AI 先理解测试场景，再通过 Playwright MCP 只读探索页面并生成 Python 脚本</p></div>
+      <div><h3>探索并验证测试流程</h3><p>AI 理解测试场景后，在确认的目标范围内探索并验证流程，再生成 Python 脚本</p></div>
       <el-tag :type="isConnected ? 'success' : 'info'" effect="plain">{{ isConnected ? '实时通知已连接' : '使用详情查询恢复状态' }}</el-tag>
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
@@ -10,7 +10,7 @@
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
         <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
-        <el-empty v-else :image-size="96" description="填写场景后开始生成。生成记录会在刷新页面后自动恢复。" class="empty-result" />
+        <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。生成记录会在刷新页面后自动恢复。" class="empty-result" />
       </div>
     </div>
   </div>

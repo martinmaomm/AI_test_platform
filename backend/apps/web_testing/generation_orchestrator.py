@@ -12,6 +12,7 @@ from ai_core.model_manager import get_llm_manager
 
 from .generation_contracts import (
     GenerationContractError,
+    ScenarioInputInsufficientError,
     ScenarioSpec,
     is_terminal_status,
     validate_snapshot_against_scenario,
@@ -108,6 +109,18 @@ def _model_failure(error: BaseException) -> tuple[str, str]:
     if _is_rate_limited_error(error):
         return 'MODEL_RATE_LIMITED', '本次锁定的模型触发限流，请稍后重试或更换模型。'
     return 'MODEL_UNAVAILABLE', '本次锁定的模型暂时不可用，请检查模型配置或稍后重试。'
+
+
+def _record_normalization_contract_failure(
+    generation: WebUIScriptGeneration,
+    error: GenerationContractError,
+) -> None:
+    """Log only the parser's bounded, value-free contract diagnostics."""
+    logger.warning(
+        'WebUI scenario normalization failed: generation_id=%s error_code=MODEL_OUTPUT_INVALID contract_diagnostics=%s',
+        generation.pk,
+        error.diagnostics,
+    )
 
 
 def _cleanup_requires_attention(snapshot) -> bool:
@@ -345,19 +358,26 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                     generation.model_info['config_id'],
                     _test_case_context(generation),
                 )
-            except GenerationContractError:
+            except ScenarioInputInsufficientError:
                 generation = _pause_or_require_review(
                     generation,
                     WebUIScriptGeneration.Status.NEEDS_INPUT,
                     progress=10,
-                    error_code='SCENARIO_CONTRACT_INVALID',
-                    error_message='场景描述缺少可验证的步骤、断言或清理信息，请补充后继续。',
+                    error_code='SCENARIO_INPUT_INSUFFICIENT',
+                    error_message='场景信息不足，请补充明确目标、操作步骤和可验证结果后继续。',
                 )
                 return {
                     'generation_id': str(generation.pk),
                     'status': generation.status,
                     'error_code': generation.error_code,
                 }
+            except GenerationContractError as exc:
+                _record_normalization_contract_failure(generation, exc)
+                return _safe_fail_generation(
+                    str(generation.pk),
+                    'MODEL_OUTPUT_INVALID',
+                    '模型未能正确整理场景，请重试或更换模型。',
+                )
             except Exception as exc:
                 error_code, message = _model_failure(exc)
                 return _safe_fail_generation(str(generation.pk), error_code, message)

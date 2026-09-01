@@ -24,6 +24,7 @@ from projects.models import Environment, Project
 from .generation_contracts import (
     ExplorationSnapshot,
     GenerationContractError,
+    ScenarioInputInsufficientError,
     ScenarioSpec,
     parse_exploration_snapshot_json,
     parse_scenario_spec_json,
@@ -136,10 +137,113 @@ class GenerationContractAndNormalizerTests(TestCase):
         manager = Mock()
         manager.invoke.side_effect = ['{invalid', json.dumps(scenario_payload(), ensure_ascii=False)]
         with patch('web_testing.requirement_normalizer.get_llm_manager', return_value=manager) as factory:
-            spec = RequirementNormalizer(123).normalize('查询用户列表。', {'title': '列表用例'})
+            spec = RequirementNormalizer(123).normalize('查询用户列表并验证列表可见。', {'title': '列表用例'})
         self.assertEqual(spec.title, '查询用户列表')
         factory.assert_called_once_with(config_id=123)
         self.assertEqual(manager.invoke.call_count, 2)
+
+    def test_normalizer_adds_only_explicit_crud_assertions_and_default_cleanup(self):
+        description = (
+            '目标：验证“权限 > 用户列表”的新增、查询、编辑和删除流程。\n\n'
+            '步骤：\n'
+            '1. 登录后进入“权限 > 用户列表”；\n'
+            '2. 使用唯一名称和账号新增用户，并验证列表中出现该用户；\n'
+            '3. 编辑本轮新增用户的昵称，并验证更新成功；\n'
+            '4. 删除本轮新增用户，并查询验证该用户不存在。\n\n'
+            '约束：\n'
+            '- 唯一数据使用 time.time_ns() 生成；\n'
+            '- 不操作已有业务数据；'
+        )
+        payload = scenario_payload(
+            title='用户列表 CRUD',
+            objective='验证用户列表中的本轮测试数据可安全新增、编辑和删除。',
+            steps=[
+                {
+                    'id': 'S1', 'name': '进入用户列表', 'intent': 'navigate',
+                    'target_hint': '权限 > 用户列表', 'input_refs': [], 'mutates_data': False,
+                    'expected': '用户列表页面显示。',
+                },
+                {
+                    'id': 'S2', 'name': '新增唯一测试用户', 'intent': 'create',
+                    'target_hint': '用户列表', 'input_refs': ['time.time_ns'], 'mutates_data': True,
+                    'expected': '提交本轮唯一测试数据。',
+                },
+                {
+                    'id': 'S3', 'name': '编辑本轮用户昵称', 'intent': 'update',
+                    'target_hint': '用户列表', 'input_refs': [], 'mutates_data': True,
+                    'expected': '提交本轮用户昵称编辑。',
+                },
+                {
+                    'id': 'S4', 'name': '删除本轮测试用户', 'intent': 'delete',
+                    'target_hint': '用户列表', 'input_refs': [], 'mutates_data': True,
+                    'expected': '删除本轮测试数据。',
+                },
+            ],
+            assertions=[],
+            cleanup=[],
+            forbidden_actions=['不操作已有数据'],
+        )
+        manager = Mock()
+        manager.invoke.return_value = json.dumps(payload, ensure_ascii=False)
+
+        with patch('web_testing.requirement_normalizer.get_llm_manager', return_value=manager):
+            spec = RequirementNormalizer(123).normalize(description)
+
+        self.assertEqual([assertion.step_id for assertion in spec.assertions], ['S2', 'S3', 'S4'])
+        self.assertEqual([assertion.expected for assertion in spec.assertions], [
+            '本轮新建的唯一测试数据出现。',
+            '本轮新建测试数据的编辑结果已更新。',
+            '本轮新建测试数据已不存在。',
+        ])
+        self.assertEqual(len(spec.cleanup), 1)
+        self.assertEqual(spec.cleanup[0].step_id, 'S2')
+        self.assertIn('仅清理本轮新建且带唯一标记的测试数据', spec.cleanup[0].condition)
+        self.assertEqual(manager.invoke.call_count, 1)
+
+    def test_normalizer_keeps_existing_assertion_and_adds_other_explicit_results(self):
+        description = '新增后验证出现，编辑后验证更新，删除后验证不存在。'
+        payload = scenario_payload(
+            steps=[
+                {
+                    'id': 'S1', 'name': '新增测试数据', 'intent': 'create',
+                    'target_hint': '用户列表', 'input_refs': [], 'mutates_data': True,
+                    'expected': '提交本轮测试数据。',
+                },
+                {
+                    'id': 'S2', 'name': '编辑测试数据', 'intent': 'update',
+                    'target_hint': '用户列表', 'input_refs': [], 'mutates_data': True,
+                    'expected': '提交编辑。',
+                },
+                {
+                    'id': 'S3', 'name': '删除测试数据', 'intent': 'delete',
+                    'target_hint': '用户列表', 'input_refs': [], 'mutates_data': True,
+                    'expected': '删除本轮测试数据。',
+                },
+            ],
+            assertions=[{
+                'id': 'A2', 'name': '保留模型已有断言', 'target_hint': '用户列表',
+                'expected': '本轮测试数据出现。', 'step_id': 'S1',
+            }],
+            cleanup=[],
+        )
+        manager = Mock()
+        manager.invoke.return_value = json.dumps(payload, ensure_ascii=False)
+
+        with patch('web_testing.requirement_normalizer.get_llm_manager', return_value=manager):
+            spec = RequirementNormalizer(123).normalize(description)
+
+        self.assertEqual([assertion.step_id for assertion in spec.assertions], ['S1', 'S2', 'S3'])
+        self.assertEqual([assertion.id for assertion in spec.assertions], ['A2', 'A1', 'A3'])
+        self.assertEqual([assertion.name for assertion in spec.assertions], [
+            '保留模型已有断言', '验证编辑结果', '验证删除结果',
+        ])
+
+    def test_normalizer_marks_only_clearly_incomplete_description_as_user_input(self):
+        manager = Mock()
+        with patch('web_testing.requirement_normalizer.get_llm_manager', return_value=manager):
+            with self.assertRaises(ScenarioInputInsufficientError):
+                RequirementNormalizer(123).normalize('请帮我生成一个测试。')
+        manager.invoke.assert_not_called()
 
     def test_scenario_contract_requires_assertion_known_references_and_cleanup_for_mutation(self):
         with self.assertRaises(GenerationContractError):
@@ -1208,6 +1312,48 @@ async def run(page):
         ):
             result = run_v2_generation(str(generation.pk))
         self.assertEqual(result['error_code'], 'MODEL_RATE_LIMITED')
+
+    def test_orchestrator_pauses_only_deterministically_incomplete_input(self):
+        generation = self.make_generation()
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement',
+            side_effect=ScenarioInputInsufficientError('scenario_outcome_missing'),
+        ):
+            result = run_v2_generation(str(generation.pk))
+
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_INPUT)
+        self.assertEqual(result['error_code'], 'SCENARIO_INPUT_INSUFFICIENT')
+        generation.refresh_from_db()
+        self.assertEqual(generation.error_message, '场景信息不足，请补充明确目标、操作步骤和可验证结果后继续。')
+
+    def test_orchestrator_classifies_unrepairable_normalizer_output_without_exploration_or_raw_logs(self):
+        generation = self.make_generation(
+            description_safe='查询用户列表并验证列表可见。',
+        )
+        raw_output = json.dumps({
+            **scenario_payload(),
+            'SENTINEL_RAW_MODEL_OUTPUT': 'password=SENTINEL_SECRET_VALUE',
+        }, ensure_ascii=False)
+        manager = Mock()
+        manager.invoke.side_effect = [raw_output, raw_output]
+
+        with patch('web_testing.requirement_normalizer.get_llm_manager', return_value=manager), patch(
+            'web_testing.generation_orchestrator.MCPPageExplorer'
+        ) as explorer, patch('web_testing.generation_orchestrator.logger') as pipeline_logger:
+            result = run_v2_generation(str(generation.pk))
+
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(result['error_code'], 'MODEL_OUTPUT_INVALID')
+        generation.refresh_from_db()
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(generation.error_message, '模型未能正确整理场景，请重试或更换模型。')
+        explorer.assert_not_called()
+        self.assertEqual(manager.invoke.call_count, 2)
+        log_output = str(pipeline_logger.mock_calls)
+        self.assertIn('contract_diagnostics', log_output)
+        self.assertIn('extra_forbidden', log_output)
+        self.assertNotIn('SENTINEL_RAW_MODEL_OUTPUT', log_output)
+        self.assertNotIn('SENTINEL_SECRET_VALUE', log_output)
 
 class GenerationModelLockAPITests(GenerationPipelineBase):
     def test_api_locks_default_active_model_and_dispatches_only_generation_id(self):

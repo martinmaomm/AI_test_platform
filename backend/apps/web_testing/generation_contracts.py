@@ -38,6 +38,10 @@ class GenerationContractError(ValueError):
         self.diagnostics = diagnostics
 
 
+class ScenarioInputInsufficientError(GenerationContractError):
+    """Raised only when the submitted description is deterministically incomplete."""
+
+
 _ABSOLUTE_URL_RE = re.compile(r'(?i)\bhttps?://')
 _ACTION_CALL_RE = re.compile(
     r'(?i)\b(?:click|fill|press|goto|evaluate|select_option|check|uncheck|hover|'
@@ -667,10 +671,18 @@ def parse_contract_json(
     model_type: type[TContract],
     *,
     format_repair: Callable[[str, str], str] | None = None,
+    payload_transform: Callable[[Any], Any] | None = None,
 ) -> TContract:
     """Parse one strict contract; a caller may perform exactly one format repair."""
+
+    def validate(raw_payload: str) -> TContract:
+        payload = _extract_json_object(raw_payload)
+        if payload_transform is not None:
+            payload = payload_transform(payload)
+        return model_type.model_validate(payload)
+
     try:
-        return model_type.model_validate(_extract_json_object(raw_text))
+        return validate(raw_text)
     except (GenerationContractError, ValidationError) as first_error:
         diagnostics = (
             _safe_validation_diagnostics(first_error, model_type)
@@ -680,7 +692,7 @@ def parse_contract_json(
             raise GenerationContractError('contract_invalid', diagnostics=diagnostics) from first_error
         repaired_text = format_repair(raw_text, _safe_diagnostic_summary(diagnostics))
         try:
-            return model_type.model_validate(_extract_json_object(repaired_text))
+            return validate(repaired_text)
         except (GenerationContractError, ValidationError) as second_error:
             diagnostics = (
                 _safe_validation_diagnostics(second_error, model_type)
@@ -689,8 +701,18 @@ def parse_contract_json(
             raise GenerationContractError('contract_invalid_after_repair', diagnostics=diagnostics) from second_error
 
 
-def parse_scenario_spec_json(raw_text: str, *, format_repair=None) -> ScenarioSpec:
-    return parse_contract_json(raw_text, ScenarioSpec, format_repair=format_repair)
+def parse_scenario_spec_json(
+    raw_text: str,
+    *,
+    format_repair=None,
+    payload_transform: Callable[[Any], Any] | None = None,
+) -> ScenarioSpec:
+    return parse_contract_json(
+        raw_text,
+        ScenarioSpec,
+        format_repair=format_repair,
+        payload_transform=payload_transform,
+    )
 
 
 def parse_exploration_snapshot_json(raw_text: str, *, format_repair=None) -> ExplorationSnapshot:

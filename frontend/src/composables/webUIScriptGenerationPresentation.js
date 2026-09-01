@@ -228,7 +228,7 @@ export const buildGenerationTimeline = (generation) => {
 
 export const generationResolutionHint = (generation) => {
   const status = generation?.status
-  if (status === 'needs_input') return '请补充可验证的操作步骤、成功标准、目标数据范围和清理要求后重新发起。'
+  if (status === 'needs_input') return '请补充明确的测试目标、操作步骤和至少一个可验证结果后重新分析。页面元素和平台默认清理策略不需要填写。'
   if (status === 'needs_confirmation') return '请先确认常规 CRUD 的目标范围和仍待确认的业务信息。审批、付款、发布、上传等额外动作目前不在扩权支持范围；页面元素、DOM 和定位器不需要人工填写。'
   if (status === 'needs_credentials') return '请在“本轮测试登录信息”中填写临时账号和密码后重新发起。'
   if (status === 'needs_review') return `${generation?.error_message ? `${generation.error_message} ` : ''}本次结果需要人工处理，尤其请确认清理失败或残留数据。草稿和证据已保留，可先查看后再决定是否新建任务。`

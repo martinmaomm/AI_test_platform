@@ -89,6 +89,15 @@ test('model availability and gateway failures keep the backend error message', (
   assert.equal(generationResolutionHint({ status: 'failed', error_message: message }), message)
 })
 
+test('insufficient input guidance asks only for user-owned scenario information', () => {
+  const hint = generationResolutionHint({ status: 'needs_input' })
+  assert.match(hint, /测试目标/)
+  assert.match(hint, /操作步骤/)
+  assert.match(hint, /可验证结果/)
+  assert.match(hint, /默认清理策略不需要填写/)
+  assert.doesNotMatch(hint, /填写.*页面元素/)
+})
+
 test('failure and cancellation with unknown cleanup warn before a new task', () => {
   for (const status of ['failed', 'cancelled']) {
     const hint = generationResolutionHint({

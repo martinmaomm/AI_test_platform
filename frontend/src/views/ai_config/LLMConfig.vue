@@ -52,9 +52,15 @@
                 <div class="config-title">
                   {{ scope.row.model_name }}
                 </div>
-                <div class="config-model">提供商：{{ modelProviderLabel(scope.row) }} · 接口：{{ scope.row.provider || '—' }}</div>
+                <div class="config-model">接口类型：{{ scope.row.provider_display || scope.row.provider || '—' }}</div>
               </div>
             </div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="模型提供商" min-width="150" show-overflow-tooltip>
+          <template #default="scope">
+            {{ modelProviderLabel(scope.row) }}
           </template>
         </el-table-column>
 

@@ -152,6 +152,6 @@ class ExplorationPolicy:
                 'Use only the supplied namespace for created or edited data unless data_scope is user_specified.',
                 'Never select, edit, or delete existing data outside the user-specified scope.',
                 'After a submit, observe the result before another action. If the result is unknown, do not retry it.',
-                'Attempt the declared cleanup before ending and report residual or unknown state truthfully.',
+                'Attempt the declared cleanup before ending and observe its visible result; the platform records the tool trace automatically.',
             ],
         }

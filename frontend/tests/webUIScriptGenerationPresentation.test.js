@@ -109,8 +109,9 @@ test('failure and cancellation with unknown cleanup warn before a new task', () 
   }
 })
 
-test('cleanup presentation does not infer success for legacy snapshots and flags residuals', () => {
+test('cleanup presentation supports v2 traces and does not infer success when absent', () => {
   assert.equal(explorationCleanupPresentation({}).hasRecord, false)
+  assert.equal(explorationCleanupPresentation({ cleanup: { status: 'cleaned', attempted: true } }).status, 'cleaned')
   const cleanup = explorationCleanupPresentation({
     cleanup_report: { status: 'residual', attempted: true, residuals: ['user:test-42'], reason: '删除接口超时' }
   })

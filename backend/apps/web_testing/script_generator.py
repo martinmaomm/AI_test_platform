@@ -12,7 +12,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .generation_contracts import ExplorationSnapshot, ScenarioSpec
+from .generation_contracts import ScenarioSpec
+from .exploration_trace import ExplorationTrace, coerce_trace, successful_trace_evidence
 from .generation_security import redact_exploration_metadata, redact_metadata, redact_text
 
 
@@ -78,11 +79,12 @@ class ScriptGenerator:
         self,
         *,
         scenario: ScenarioSpec,
-        snapshot: ExplorationSnapshot,
+        trace: ExplorationTrace | None = None,
+        snapshot: Any = None,
     ) -> str:
         payload = {
             'scenario': redact_metadata(scenario.model_dump(mode='json')),
-            'exploration_snapshot': redact_exploration_metadata(snapshot.model_dump(mode='json')),
+            'exploration_trace': redact_exploration_metadata(successful_trace_evidence(coerce_trace(trace or snapshot))),
         }
         return self._invoke(GENERATOR_SYSTEM_PROMPT, payload)
 
@@ -92,13 +94,14 @@ class ScriptGenerator:
         script: str,
         issues: list[dict[str, Any]],
         scenario: ScenarioSpec,
-        snapshot: ExplorationSnapshot,
+        trace: ExplorationTrace | None = None,
+        snapshot: Any = None,
     ) -> str:
         payload = {
             'script': redact_text(script),
             'quality_issues': redact_metadata(issues),
             'scenario': redact_metadata(scenario.model_dump(mode='json')),
-            'exploration_evidence': redact_exploration_metadata(snapshot.model_dump(mode='json')),
+            'exploration_trace': redact_exploration_metadata(successful_trace_evidence(coerce_trace(trace or snapshot))),
         }
         return self._invoke(REPAIR_SYSTEM_PROMPT, payload)
 

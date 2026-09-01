@@ -305,3 +305,54 @@ def get_generation_temporary_credentials(generation_id: Any) -> dict[str, str] |
         credentials_expired=False,
     ).update(credentials_expired=True)
     return None
+
+
+def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int) -> WebUIScriptGeneration:
+    """Retry only model generation from a persisted v2 trace; never reopen MCP."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
+        retryable = {
+            'MODEL_UNAVAILABLE', 'MODEL_RATE_LIMITED', 'MODEL_SERVICE_ERROR',
+            'MODEL_GATEWAY_TIMEOUT', 'TRANSIENT_SERVICE_ERROR',
+        }
+        if generation.status != WebUIScriptGeneration.Status.FAILED or generation.error_code not in retryable:
+            raise GenerationResolutionConflict('当前失败状态不能只重试脚本生成。', generation)
+        if generation.revision != expected_revision or snapshot.get('schema_version') != 2:
+            raise GenerationResolutionConflict('探索轨迹或版本已变化，无法安全仅重试脚本生成。', generation)
+        generation.status = WebUIScriptGeneration.Status.GENERATING
+        generation.current_stage = WebUIScriptGeneration.Stage.GENERATING
+        generation.progress = 60
+        generation.revision += 1
+        generation.error_code = ''
+        generation.error_message = ''
+        generation.completed_at = None
+        generation.celery_task_id = None
+        generation.save(update_fields=['status', 'current_stage', 'progress', 'revision', 'error_code', 'error_message', 'completed_at', 'celery_task_id', 'updated_at'])
+        return generation
+
+
+def claim_trace_generation_retry(
+    generation_id: Any,
+    celery_task_id: str | None,
+) -> WebUIScriptGeneration | None:
+    """Claim one model-only retry delivery without reopening the browser."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        if generation.status != WebUIScriptGeneration.Status.GENERATING:
+            return None
+        if celery_task_id and generation.celery_task_id and generation.celery_task_id != celery_task_id:
+            return None
+        workspace = dict(generation.workspace or {})
+        dispatch = workspace.get('_trace_generation_dispatch') or {}
+        task_marker = celery_task_id or '<direct>'
+        if dispatch.get('revision') == generation.revision and dispatch.get('task_id') == task_marker:
+            return None
+        workspace['_trace_generation_dispatch'] = {
+            'revision': generation.revision,
+            'task_id': task_marker,
+            'claimed_at': timezone.now().isoformat(),
+        }
+        generation.workspace = workspace
+        generation.save(update_fields=['workspace', 'updated_at'])
+        return generation

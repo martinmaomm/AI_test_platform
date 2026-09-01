@@ -251,6 +251,10 @@ class WebUIScriptGenerationDraftSerializer(serializers.Serializer):
             raise serializers.ValidationError(str(exc)) from exc
 
 
+class WebUIScriptGenerationRetrySerializer(serializers.Serializer):
+    expected_revision = serializers.IntegerField(min_value=0)
+
+
 class WebUIScriptGenerationDebugSerializer(serializers.Serializer):
     expected_revision = serializers.IntegerField(min_value=0)
     confirm_execution = serializers.BooleanField()

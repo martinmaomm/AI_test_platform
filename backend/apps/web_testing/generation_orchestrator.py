@@ -15,9 +15,8 @@ from .generation_contracts import (
     ScenarioInputInsufficientError,
     ScenarioSpec,
     is_terminal_status,
-    validate_snapshot_against_scenario,
 )
-from .exploration_completion import assess_exploration_completion, can_request_user_decision
+from .exploration_trace import ExplorationTrace, assess_trace_coverage, coerce_trace, trace_has_minimum_page_state
 from .exploration_timeout import exploration_total_timeout_seconds
 from .generation_events import publish_stage_changed, publish_terminal
 from .generation_preflight import run_safety_preflight
@@ -25,6 +24,7 @@ from .generation_repository import (
     MAX_GENERATION_RESUME_COUNT,
     PAUSED_GENERATION_STATUSES,
     claim_generation_worker,
+    claim_trace_generation_retry,
     cancel_generation,
     get_generation_temporary_credentials,
     is_cancel_requested,
@@ -38,6 +38,11 @@ from .script_generator import ScriptGenerator
 from .script_quality import blocker_issues, evaluate_script
 
 logger = logging.getLogger(__name__)
+
+_PARTIAL_TRACE_ERROR_KINDS = frozenset({
+    'exploration_timeout', 'tool_budget', 'graph_recursion',
+    'repeated_interaction', 'interaction_failure',
+})
 
 
 def _normalization_description(generation: WebUIScriptGeneration) -> str:
@@ -123,8 +128,26 @@ def _record_normalization_contract_failure(
     )
 
 
-def _cleanup_requires_attention(snapshot) -> bool:
-    return snapshot.cleanup_report.status in {'residual', 'unknown', 'not_attempted'}
+def _cleanup_requires_attention(trace: ExplorationTrace) -> bool:
+    return str((trace.cleanup or {}).get('status') or '') in {'residual', 'unknown', 'not_attempted'}
+
+
+def _partial_trace_requires_attention(trace: ExplorationTrace) -> bool:
+    return str(trace.termination_reason or '') in _PARTIAL_TRACE_ERROR_KINDS
+
+
+def _usable_partial_trace(error: MCPPageExplorerError, scenario: ScenarioSpec) -> ExplorationTrace | None:
+    """Keep callback-owned evidence for soft stops without weakening safety failures."""
+    if error.error_code not in _PARTIAL_TRACE_ERROR_KINDS or error.snapshot is None:
+        return None
+    trace = assess_trace_coverage(scenario, coerce_trace(error.snapshot))
+    if not trace_has_minimum_page_state(trace):
+        return None
+    warning = f'页面探索因 {error.error_code} 提前结束；已使用现有轨迹生成待检查草稿。'
+    return trace.model_copy(update={
+        'termination_reason': error.error_code,
+        'warnings': list(dict.fromkeys([*trace.warnings, warning])),
+    })
 
 
 def _safe_fail_generation(
@@ -307,7 +330,7 @@ def _cancel_with_snapshot_stats(
 
 
 def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
-    """Run the V2 pipeline with bounded repair and at most one evidence supplement."""
+    """Run callback-recorded exploration, Python generation and bounded repair."""
     try:
         generation = WebUIScriptGeneration.objects.select_related(
             'environment', 'test_case', 'user'
@@ -469,81 +492,39 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             # Keep the historical explorer interface compatible with callers
             # that have not yet implemented the same-session method.
             explore_until_complete = explorer.explore
-        snapshot = asyncio.run(explore_until_complete(
-            scenario=scenario,
-            start_path=generation.start_path,
-            target_url_safe=generation.target_url_safe,
-            temporary_credentials=explorer_credentials,
-        ))
-        snapshot = assess_exploration_completion(scenario, snapshot)
         try:
-            validate_snapshot_against_scenario(scenario, snapshot)
-        except GenerationContractError:
+            trace = asyncio.run(explore_until_complete(
+                scenario=scenario,
+                start_path=generation.start_path,
+                target_url_safe=generation.target_url_safe,
+                temporary_credentials=explorer_credentials,
+            ))
+        except MCPPageExplorerError as exc:
+            trace = _usable_partial_trace(exc, scenario)
+            if trace is None:
+                raise
+        trace = assess_trace_coverage(scenario, coerce_trace(trace))
+        if not trace_has_minimum_page_state(trace):
             return _safe_fail_generation(
                 str(generation.pk),
-                'EVIDENCE_INSUFFICIENT',
-                '页面探索证据与测试场景不一致，请缩短范围后重试。',
+                'PAGE_UNREACHABLE',
+                '页面未打开，无法生成脚本。请检查浏览器、登录状态和页面可访问性后重试。',
                 updates={
-                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                    'exploration_snapshot': snapshot.model_dump(mode='json'),
-                    'warnings': list(snapshot.warnings),
+                    'tool_stats': trace.tool_stats,
+                    'exploration_snapshot': trace.model_dump(mode='json'),
+                    'warnings': list(trace.warnings),
                 },
             )
         if _is_task_cancelled(str(generation.pk), celery_task_id):
             generation = _cancel_with_snapshot_stats(
-                generation.pk, snapshot.tool_stats.model_dump(mode='json'), snapshot=snapshot,
+                generation.pk, trace.tool_stats, snapshot=trace,
             )
             publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
-        if can_request_user_decision(snapshot):
-            unresolved_questions = snapshot.completion.user_questions
-            scenario = scenario.model_copy(update={'ambiguities': unresolved_questions})
-            generation = _pause_or_require_review(
-                generation,
-                WebUIScriptGeneration.Status.NEEDS_REVIEW if _cleanup_requires_attention(snapshot) else WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
-                progress=50,
-                error_code='EXPLORATION_CLEANUP_UNCONFIRMED' if _cleanup_requires_attention(snapshot) else 'INPUT_AMBIGUOUS',
-                error_message='本次探索存在未确认的清理结果，请先检查残留数据；不会自动重新执行页面操作。' if _cleanup_requires_attention(snapshot) else '页面已完成目标范围内的探索，但仍有业务信息需要确认。',
-                warnings=list(dict.fromkeys([*unresolved_questions, *snapshot.warnings])),
-                updates={
-                    'current_stage': WebUIScriptGeneration.Stage.EXPLORING,
-                    'scenario_spec': scenario.model_dump(mode='json'),
-                    'exploration_snapshot': snapshot.model_dump(mode='json'),
-                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                },
-            )
-            if generation.status == WebUIScriptGeneration.Status.NEEDS_REVIEW:
-                publish_terminal(generation)
-            return {
-                'generation_id': str(generation.pk),
-                'status': generation.status,
-                'error_code': generation.error_code,
-            }
-
-        if snapshot.completion.status != 'complete':
-            error_code = (
-                'EXPLORATION_LIMIT_REACHED'
-                if snapshot.completion.budget_exhausted
-                else 'EVIDENCE_INSUFFICIENT'
-            )
-            return _safe_fail_generation(
-                str(generation.pk),
-                error_code,
-                '页面可观察目标未完成，未生成脚本；请缩短范围或检查页面访问权限。',
-                updates={
-                    'exploration_snapshot': snapshot.model_dump(mode='json'),
-                    'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                    'warnings': list(dict.fromkeys([
-                        *snapshot.warnings,
-                        *[item.target for item in snapshot.completion.missing_targets if item.kind == 'observable'],
-                    ])),
-                },
-            )
-
-        # Exploration has resolved every pre-exploration question.  Keep the
-        # discovery targets as evidence context, but do not leak stale prompts
-        # into script generation or the user-action panel.
+        # The trace is useful even when a tool budget/timeout ended exploration.
+        # Missing mandatory step coverage is handled as a static script blocker,
+        # not as an excuse to discard the captured browser state.
         scenario = scenario.model_copy(update={'ambiguities': []})
 
         generation = transition_generation(
@@ -552,15 +533,15 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             progress=60,
             updates={
                 'scenario_spec': scenario.model_dump(mode='json'),
-                'exploration_snapshot': snapshot.model_dump(mode='json'),
-                'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
-                'warnings': list(dict.fromkeys([*generation.warnings, *snapshot.warnings])),
+                'exploration_snapshot': trace.model_dump(mode='json'),
+                'tool_stats': trace.tool_stats,
+                'warnings': list(dict.fromkeys([*generation.warnings, *trace.warnings])),
             },
         )
         publish_stage_changed(generation, '根据页面证据生成脚本')
         generator = ScriptGenerator(model_manager.current_llm)
         try:
-            script = generator.generate(scenario=scenario, snapshot=snapshot)
+            script = generator.generate(scenario=scenario, trace=trace)
         except Exception as exc:
             error_code, message = _model_failure(exc)
             return _safe_fail_generation(str(generation.pk), error_code, message)
@@ -574,11 +555,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             updates={'script_draft': script},
         )
         publish_stage_changed(generation, '检查脚本质量')
-        report = evaluate_script(script, scenario=scenario, snapshot=snapshot)
-
-        # Exploration completion is a pre-generation gate. Quality validation
-        # must never reopen a browser session or compensate for missing evidence.
-        supplement_attempted = snapshot.completion.targeted_rounds > 0
+        report = evaluate_script(script, scenario=scenario, trace=trace)
 
         repair_count = 0
         while blocker_issues(report) and repair_count < 2:
@@ -596,7 +573,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                     script=script,
                     issues=blocker_issues(report),
                     scenario=scenario,
-                    snapshot=snapshot,
+                    trace=trace,
                 )
             except Exception as exc:
                 error_code, message = _model_failure(exc)
@@ -608,24 +585,34 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
                 progress=88 + repair_count * 2,
                 updates={'script_draft': script, 'repair_count': repair_count},
             )
-            report = evaluate_script(script, scenario=scenario, snapshot=snapshot)
+            report = evaluate_script(script, scenario=scenario, trace=trace)
 
-        warnings = list(dict.fromkeys([*snapshot.warnings, *[item['message'] for item in report.get('warnings', [])]]))
-        cleanup_attention = _cleanup_requires_attention(snapshot)
+        warnings = list(dict.fromkeys([*trace.warnings, *[item['message'] for item in report.get('warnings', [])]]))
+        cleanup_attention = _cleanup_requires_attention(trace)
+        partial_attention = _partial_trace_requires_attention(trace)
         target_status = (
             WebUIScriptGeneration.Status.NEEDS_REVIEW
-            if blocker_issues(report) or cleanup_attention
+            if blocker_issues(report) or cleanup_attention or partial_attention
             else (WebUIScriptGeneration.Status.READY_WITH_WARNINGS if warnings else WebUIScriptGeneration.Status.READY)
+        )
+        review_error_code = (
+            'EXPLORATION_CLEANUP_UNCONFIRMED' if cleanup_attention
+            else ('EXPLORATION_PARTIAL' if partial_attention else ('QUALITY_GATE_BLOCKED' if blocker_issues(report) else ''))
+        )
+        review_error_message = (
+            '脚本草稿已保留，但探索数据清理未确认，请先检查残留数据再调试。' if cleanup_attention
+            else ('脚本草稿已保留，但页面探索提前结束，请检查轨迹和脚本后再调试。' if partial_attention
+                  else ('脚本未通过静态质量检查，请人工修改后再保存。' if blocker_issues(report) else ''))
         )
         generation = transition_generation(
             generation.pk,
             target_status,
             progress=100 if target_status != WebUIScriptGeneration.Status.NEEDS_REVIEW else 95,
-            error_code='EXPLORATION_CLEANUP_UNCONFIRMED' if cleanup_attention else ('QUALITY_GATE_BLOCKED' if blocker_issues(report) else ''),
-            error_message='脚本草稿已保留，但探索数据清理未确认，请先检查残留数据再调试。' if cleanup_attention else ('脚本未通过静态质量检查，请人工修改后再保存。' if blocker_issues(report) else ''),
+            error_code=review_error_code,
+            error_message=review_error_message,
             updates={
-                'exploration_snapshot': snapshot.model_dump(mode='json'),
-                'tool_stats': snapshot.tool_stats.model_dump(mode='json'),
+                'exploration_snapshot': trace.model_dump(mode='json'),
+                'tool_stats': trace.tool_stats,
                 'script_draft': script,
                 'quality_report': report,
                 'warnings': warnings,
@@ -637,7 +624,7 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             'generation_id': str(generation.pk),
             'status': generation.status,
             'progress': generation.progress,
-            'supplement_attempted': supplement_attempted,
+            'trace_schema_version': trace.schema_version,
         }
     except MCPPageExplorerError as exc:
         code, message = _map_explorer_error(exc)
@@ -668,3 +655,64 @@ def _environment_credentials(variables: dict[str, Any]) -> dict[str, str] | None
     if username and password:
         return {'username': str(username), 'password': str(password)}
     return None
+
+
+def run_v2_generation_from_trace(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
+    """Resume the model-only half of the pipeline from a durable trace."""
+    try:
+        generation = claim_trace_generation_retry(generation_id, celery_task_id)
+        if generation is None:
+            current = WebUIScriptGeneration.objects.get(pk=generation_id)
+            return {'generation_id': str(generation_id), 'status': current.status, 'skipped': True}
+        scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
+        trace = ExplorationTrace.model_validate(generation.exploration_snapshot or {})
+        if not trace_has_minimum_page_state(trace):
+            return _safe_fail_generation(str(generation.pk), 'TRACE_RETRY_UNSAFE', '已保存探索轨迹不满足安全重试条件，未重新打开浏览器。')
+        model_manager = get_llm_manager(config_id=generation.model_info['config_id'])
+        generator = ScriptGenerator(model_manager.current_llm)
+        publish_stage_changed(generation, '根据探索轨迹重新生成脚本')
+        script = generator.generate(scenario=scenario, trace=trace)
+        generation = transition_generation(
+            generation.pk, WebUIScriptGeneration.Status.VALIDATING, progress=75,
+            updates={'script_draft': script},
+        )
+        report = evaluate_script(script, scenario=scenario, trace=trace)
+        repair_count = 0
+        while blocker_issues(report) and repair_count < 2:
+            generation = transition_generation(
+                generation.pk, WebUIScriptGeneration.Status.REPAIRING, progress=82 + repair_count * 4,
+                updates={'quality_report': report, 'repair_count': repair_count},
+            )
+            script = generator.repair(script=script, issues=blocker_issues(report), scenario=scenario, trace=trace)
+            repair_count += 1
+            generation = transition_generation(
+                generation.pk, WebUIScriptGeneration.Status.VALIDATING, progress=88 + repair_count * 2,
+                updates={'script_draft': script, 'repair_count': repair_count},
+            )
+            report = evaluate_script(script, scenario=scenario, trace=trace)
+        warnings = list(dict.fromkeys([*trace.warnings, *[item['message'] for item in report.get('warnings', [])]]))
+        partial_attention = _partial_trace_requires_attention(trace)
+        cleanup_attention = _cleanup_requires_attention(trace)
+        target_status = WebUIScriptGeneration.Status.NEEDS_REVIEW if blocker_issues(report) or partial_attention or cleanup_attention else (
+            WebUIScriptGeneration.Status.READY_WITH_WARNINGS if warnings else WebUIScriptGeneration.Status.READY
+        )
+        retry_error_code = (
+            'EXPLORATION_CLEANUP_UNCONFIRMED' if cleanup_attention
+            else ('EXPLORATION_PARTIAL' if partial_attention else ('QUALITY_GATE_BLOCKED' if blocker_issues(report) else ''))
+        )
+        retry_error_message = (
+            '脚本草稿已保留，但探索数据清理未确认，请先检查残留数据再调试。' if cleanup_attention
+            else ('脚本草稿已保留，但页面探索提前结束，请检查后再调试。' if partial_attention
+                  else ('脚本已生成，但质量检查仍有阻断项。' if blocker_issues(report) else ''))
+        )
+        generation = transition_generation(
+            generation.pk, target_status, progress=95 if target_status == WebUIScriptGeneration.Status.NEEDS_REVIEW else 100,
+            error_code=retry_error_code,
+            error_message=retry_error_message,
+            updates={'script_draft': script, 'quality_report': report, 'warnings': warnings, 'repair_count': repair_count},
+        )
+        publish_terminal(generation)
+        return {'generation_id': str(generation.pk), 'status': generation.status, 'trace_only': True}
+    except Exception as exc:
+        error_code, message = _model_failure(exc)
+        return _safe_fail_generation(str(generation_id), error_code, message)

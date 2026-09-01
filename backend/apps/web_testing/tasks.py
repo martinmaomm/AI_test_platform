@@ -98,6 +98,12 @@ def generate_webui_script_generation_v2_task(self, generation_id: str):
     return run_v2_generation(str(generation_id), celery_task_id=self.request.id)
 
 
+@shared_task(bind=True, name='web_testing.retry_webui_script_generation_from_trace')
+def retry_webui_script_generation_from_trace_task(self, generation_id: str):
+    from .generation_orchestrator import run_v2_generation_from_trace
+    return run_v2_generation_from_trace(str(generation_id), celery_task_id=self.request.id)
+
+
 def _run_test_script(
     script_content: str,
     base_url: str,
@@ -428,7 +434,8 @@ def debug_webui_script_generation_task(
 def repair_webui_script_generation_task(self, generation_id: str, locked_revision: int, locked_hash: str):
     """Generate a conservative candidate only; a user must review and debug it."""
     from ai_core.model_manager import get_llm_manager
-    from .generation_contracts import ExplorationSnapshot, ScenarioSpec
+    from .exploration_trace import ExplorationTrace
+    from .generation_contracts import ScenarioSpec
     from .generation_workspace import (
         accept_repair_candidate, finish_repair_failure, mark_repair_running,
     )
@@ -447,18 +454,18 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         if not issues:
             raise ValueError('缺少运行失败诊断，需要人工补充证据或重新调试。')
         scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
-        snapshot = ExplorationSnapshot.model_validate(generation.exploration_snapshot or {})
+        trace = ExplorationTrace.model_validate(generation.exploration_snapshot or {})
         manager = get_llm_manager(config_id=(generation.model_info or {}).get('config_id'))
         candidate = ScriptGenerator(manager.current_llm).repair(
-            script=generation.script_draft, issues=issues, scenario=scenario, snapshot=snapshot,
+            script=generation.script_draft, issues=issues, scenario=scenario, trace=trace,
         )
         try:
             normalize_for_storage(candidate)
         except ScriptContractError as exc:
             raise ValueError(f'修复候选未通过脚本契约：{exc}') from exc
-        report = evaluate_script(candidate, scenario=scenario, snapshot=snapshot)
+        report = evaluate_script(candidate, scenario=scenario, trace=trace)
         quality_blockers = blocker_issues(report)
-        policy_blockers = validate_targeted_repair(generation.script_draft, candidate, snapshot)
+        policy_blockers = validate_targeted_repair(generation.script_draft, candidate, trace)
         blockers = [*quality_blockers, *policy_blockers]
         if blockers:
             finish_repair_failure(
@@ -475,10 +482,10 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         logger.error('生成草稿修复失败: generation_id=%s', generation_id)
         finish_repair_failure(
             generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
-            message='修复服务未能生成可安全接受的候选，请人工审核或补充探索。', task_id=self.request.id,
-            blockers=[{'severity': 'blocker', 'code': 'REPAIR_EVIDENCE_INSUFFICIENT', 'message': '修复证据不足或候选不可安全接受，请人工审核或补充探索。'}],
+            message='修复服务未能生成可安全接受的候选，请人工审核或重新发起页面探索。', task_id=self.request.id,
+            blockers=[{'severity': 'blocker', 'code': 'REPAIR_TRACE_INSUFFICIENT', 'message': '修复轨迹不足或候选不可安全接受，请人工审核。'}],
         )
-        return build_error_result(self.request.id, '生成草稿修复失败，请人工审核或补充探索证据。')
+        return build_error_result(self.request.id, '生成草稿修复失败，请人工审核或重新发起页面探索。')
 
 
 @shared_task(bind=True, name='web_testing.generate_midscene_script')

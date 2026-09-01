@@ -11,6 +11,8 @@ import ast
 import copy
 from typing import Any
 
+from .exploration_trace import coerce_trace
+
 _LOCATOR_METHODS = frozenset({
     'locator', 'get_by_role', 'get_by_text', 'get_by_label', 'get_by_placeholder',
     'get_by_test_id', 'get_by_alt_text', 'get_by_title', 'filter', 'nth',
@@ -33,19 +35,14 @@ def _is_locator(node: ast.AST) -> bool:
     return False
 
 
-def _evidenced_locators(snapshot: Any) -> set[str]:
-    data = snapshot.model_dump(mode='json') if hasattr(snapshot, 'model_dump') else (snapshot or {})
-    confirmed_names = {
-        name
-        for evidence in data.get('step_evidence', {}).values()
-        if evidence.get('status') in {'confirmed', 'partially_confirmed'} and evidence.get('paths')
-        for name in evidence.get('element_names', [])
-    }
+def _evidenced_locators(trace: Any) -> set[str]:
+    data = coerce_trace(trace).model_dump(mode='json')
     result: set[str] = set()
-    for element in data.get('elements', []):
-        if element.get('visible_name') not in confirmed_names:
+    for event in data.get('events', []):
+        if event.get('status') != 'succeeded':
             continue
-        for value in element.get('candidate_locators', []):
+        locator = event.get('locator') or {}
+        for value in locator.values():
             try:
                 expression = ast.parse(value, mode='eval').body
             except (SyntaxError, ValueError, TypeError):

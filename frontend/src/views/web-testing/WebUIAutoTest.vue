@@ -9,7 +9,7 @@
       <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-environments="loadingEnvironments" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="isActive || submitting || isWorkspaceBusy" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" :credential-clear-version="credentialClearVersion" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
-        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
+        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
         <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。生成记录会在刷新页面后自动恢复。" class="empty-result" />
       </div>
     </div>
@@ -50,7 +50,7 @@ const isConnected = ref(false)
 const credentialClearVersion = ref(0)
 let websocketManager = null
 
-const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, debugExecution, debugExecutionLoading, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, create, cancel, resolve: resolveGeneration, save, saveDraft, debug, repair, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
+const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, debugExecution, debugExecutionLoading, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, create, cancel, resolve: resolveGeneration, retryGeneration, save, saveDraft, debug, repair, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
 
 const asList = (response) => {
   const body = response?.data ?? response ?? {}
@@ -108,6 +108,7 @@ const handleCancel = async () => {
   try { await ElMessageBox.confirm('确定取消当前脚本生成吗？已保存的阶段结果仍可查看。', '取消生成', { type: 'warning', confirmButtonText: '取消生成', cancelButtonText: '继续等待' }); const result = await cancel(); if (result) ElMessage.success('已请求取消生成任务') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '取消失败') }
 }
 const handleResolve = async (payload) => { try { const result = await resolveGeneration(payload); if (result) ElMessage.success('补充信息已提交，任务正在继续。') } catch { ElMessage.error(lastError.value || '提交补充信息失败') } }
+const handleRetryGeneration = async () => { try { const result = await retryGeneration(); if (result) ElMessage.success('正在基于已保存的探索轨迹重新生成脚本。') } catch { ElMessage.error(lastError.value || '仅重试脚本生成失败') } }
 const handleSave = async (title) => { try { const result = await save(title); if (result) ElMessage.success(result?.created ? '已创建并保存到测试用例' : '已保存到测试用例') } catch { ElMessage.error(lastError.value || '保存失败') } }
 const handleSaveDraft = async () => { try { const result = await saveDraft(); if (result) ElMessage.success('草稿已保存') } catch { ElMessage.error(lastError.value || '保存草稿失败') } }
 const handleDebug = async (runtimeVariables) => { try { const result = await debug(runtimeVariables); if (result) ElMessage.success('已启动真实调试；不会自动重试业务写操作。') } catch { ElMessage.error(lastError.value || '启动调试失败') } }

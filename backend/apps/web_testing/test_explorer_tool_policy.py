@@ -13,7 +13,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 from mcp_use.client.connectors.base import BaseConnector
 from pydantic import Field
 
-from .generation_contracts import ExplorationSnapshot, ScenarioSpec
+from .generation_contracts import ScenarioSpec
 from .mcp_page_explorer import (
     MCPPageExplorer,
     MCPPageExplorerError,
@@ -161,7 +161,7 @@ class ExplorerToolPolicyTests(SimpleTestCase):
             patch('web_testing.mcp_page_explorer.MCPAgent', return_value=agent),
         )
 
-    async def explore_with_actual_graph(self, model, client, *, supplemental=False, cancel_check=None):
+    async def explore_with_actual_graph(self, model, client, *, cancel_check=None):
         explorer = MCPPageExplorer(
             llm_model=model, mcp_config={'mcpServers': {}}, cancel_check=cancel_check,
         )
@@ -170,33 +170,24 @@ class ExplorerToolPolicyTests(SimpleTestCase):
                 'scenario': scenario(), 'start_path': '/',
                 'target_url_safe': 'https://example.invalid/',
             }
-            if supplemental:
-                return await explorer.explore_missing_evidence(
-                    **kwargs,
-                    existing_snapshot=ExplorationSnapshot(start_url_path='/', unresolved_steps=['S1'], step_evidence={}, tool_stats={'total_tool_calls': 0}),
-                )
             return await explorer.explore(**kwargs)
 
-    def test_actual_graph_main_and_supplemental_filter_close_and_finish_at_50_tools(self):
-        for supplemental in (False, True):
-            with self.subTest(supplemental=supplemental):
-                model = ActualGraphScriptedModel(target=50)
-                client = ActualGraphClient()
-                snapshot = asyncio.run(self.explore_with_actual_graph(
-                    model, client, supplemental=supplemental,
-                ))
-                self.assertEqual(snapshot.tool_stats.total_tool_calls, 50)
-                self.assertEqual(len(client.actual_calls), 50)
-                self.assertEqual(model.calls, 51)
-                self.assertEqual(client.opened, 1)
-                self.assertEqual(client.closed, 1)
-                self.assertFalse(client.active_sessions)
-                self.assertTrue({
-                    'playwright_close', 'playwright_evaluate', 'playwright_upload_file',
-                }.isdisjoint(model.exposed))
-                self.assertTrue({
-                    'playwright_click', 'playwright_fill', 'playwright_get_visible_text',
-                }.issubset(model.exposed))
+    def test_actual_graph_filters_tools_closes_and_finishes_at_50_tools(self):
+        model = ActualGraphScriptedModel(target=50)
+        client = ActualGraphClient()
+        snapshot = asyncio.run(self.explore_with_actual_graph(model, client))
+        self.assertEqual(snapshot.tool_stats['total_tool_calls'], 50)
+        self.assertEqual(len(client.actual_calls), 50)
+        self.assertEqual(model.calls, 51)
+        self.assertEqual(client.opened, 1)
+        self.assertEqual(client.closed, 1)
+        self.assertFalse(client.active_sessions)
+        self.assertTrue({
+            'playwright_close', 'playwright_evaluate', 'playwright_upload_file',
+        }.isdisjoint(model.exposed))
+        self.assertTrue({
+            'playwright_click', 'playwright_fill', 'playwright_get_visible_text',
+        }.issubset(model.exposed))
 
     def test_actual_graph_blocks_the_51st_browser_call_before_transport(self):
         model = ActualGraphScriptedModel(target=51)
@@ -221,40 +212,26 @@ class ExplorerToolPolicyTests(SimpleTestCase):
         self.assertEqual(client.closed, 1)
         self.assertFalse(client.active_sessions)
 
-    def test_only_expected_tools_are_disabled_for_main_and_supplemental_exploration(self):
+    def test_only_expected_tools_are_disabled_for_exploration(self):
         self.assertEqual(
             set(READ_ONLY_DISABLED_TOOL_MESSAGES),
             {'playwright_close', 'playwright_evaluate', 'playwright_upload_file'},
         )
-        for mode in ('main', 'supplemental'):
-            with self.subTest(mode=mode):
-                explorer = self.make_explorer()
-                client, agent, client_patch, agent_patch = self.fake_runtime()
-                with client_patch, agent_patch as agent_factory:
-                    if mode == 'main':
-                        asyncio.run(explorer.explore(
-                            scenario=scenario(), start_path='/',
-                            target_url_safe='https://example.invalid/',
-                        ))
-                    else:
-                        asyncio.run(explorer.explore_missing_evidence(
-                            scenario=scenario(),
-                            existing_snapshot=ExplorationSnapshot(
-                                start_url_path='/', unresolved_steps=['S1'], step_evidence={}, tool_stats={'total_tool_calls': 0},
-                            ),
-                            start_path='/',
-                            target_url_safe='https://example.invalid/',
-                        ))
-                self.assertEqual(
-                    agent_factory.call_args.kwargs['disallowed_tools'],
-                    list(READ_ONLY_DISABLED_TOOL_MESSAGES),
-                )
-                client.create_all_sessions.assert_awaited_once()
-                client.close_all_sessions.assert_awaited_once()
-                agent.initialize.assert_awaited_once()
-                agent.run.assert_awaited_once_with(
-                    ANY, manage_connector=False,
-                )
+        explorer = self.make_explorer()
+        client, agent, client_patch, agent_patch = self.fake_runtime()
+        with client_patch, agent_patch as agent_factory:
+            asyncio.run(explorer.explore(
+                scenario=scenario(), start_path='/',
+                target_url_safe='https://example.invalid/',
+            ))
+        self.assertEqual(
+            agent_factory.call_args.kwargs['disallowed_tools'],
+            list(READ_ONLY_DISABLED_TOOL_MESSAGES),
+        )
+        client.create_all_sessions.assert_awaited_once()
+        client.close_all_sessions.assert_awaited_once()
+        agent.initialize.assert_awaited_once()
+        agent.run.assert_awaited_once_with(ANY, manage_connector=False)
 
     def test_guard_blocks_each_disabled_tool_with_its_own_message(self):
         for tool_name, message in READ_ONLY_DISABLED_TOOL_MESSAGES.items():

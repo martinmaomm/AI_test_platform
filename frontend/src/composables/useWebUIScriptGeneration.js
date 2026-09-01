@@ -6,6 +6,7 @@ import {
   getWebUIScriptGeneration,
   getWebUITestCaseExecution,
   repairWebUIScriptGeneration,
+  retryWebUIScriptGenerationFromTrace,
   resolveWebUIScriptGeneration,
   saveWebUIScriptGeneration,
   updateWebUIScriptGenerationDraft
@@ -468,6 +469,28 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     }
   }
 
+  const retryGeneration = async () => {
+    if (!generation.value?.id || resolving.value) return null
+    const requestProjectId = currentProjectId.value
+    const generationId = generation.value.id
+    const requestScope = scopeVersion
+    resolving.value = true
+    try {
+      const response = await retryWebUIScriptGenerationFromTrace(requestProjectId, generationId, {
+        expected_revision: Number(generation.value.revision || 0)
+      })
+      if (!isCurrentScope(requestScope, requestProjectId)) return null
+      const record = apiData(response)
+      if (response?.success === false) throw new Error(response?.message || '仅重试脚本生成失败')
+      return applyGeneration(record)
+    } catch (error) {
+      lastError.value = generationApiErrorMessage(error, '仅重试脚本生成失败')
+      throw error
+    } finally {
+      if (isCurrentScope(requestScope, requestProjectId)) resolving.value = false
+    }
+  }
+
   // WebSocket only wakes an API refresh. It never mutates the durable state.
   const handleWebSocketEvent = (message) => {
     const record = generation.value
@@ -483,7 +506,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     generation, workspace, localDraft, loading, submitting, saving, cancelling, resolving,
     draftSaving, debugging, repairing, debugExecution, debugExecutionLoading, draftConflict,
     lastError, isActive, isPaused, isTerminal, isWorkspaceBusy, hasUnsavedDraft,
-    create, refresh, restore, cancel, resolve, save, saveDraft, debug, repair, updateLocalDraft,
+    create, refresh, restore, cancel, resolve, retryGeneration, save, saveDraft, debug, repair, updateLocalDraft,
     discardLocalDraftAndRefresh, stopPolling, handleWebSocketEvent, clearStoredGeneration, storageKey
   }
 }

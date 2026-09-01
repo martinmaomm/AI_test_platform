@@ -31,6 +31,7 @@ from .generation_contracts import (
     validate_snapshot_against_scenario,
 )
 from .generation_orchestrator import run_v2_generation
+from .generation_repository import claim_trace_generation_retry, prepare_trace_generation_retry
 from .generation_preflight import (
     prepare_playwright_mcp_output_config,
     prepare_playwright_mcp_config,
@@ -39,6 +40,7 @@ from .generation_preflight import (
     validate_generation_output_id,
 )
 from .generation_security import get_temporary_credentials
+from .exploration_trace import ExplorationEvent, ExplorationTrace
 from .mcp_page_explorer import (
     MCPPageExplorer,
     MCPPageExplorerError,
@@ -561,11 +563,52 @@ class MCPPageExplorerTests(TestCase):
                 start_path='/',
                 target_url_safe='https://web.example.test/',
             ))
-        self.assertIsInstance(snapshot, ExplorationSnapshot)
-        self.assertEqual(snapshot.tool_stats.total_tool_calls, 0)
+        self.assertEqual(snapshot.schema_version, 2)
+        self.assertEqual(snapshot.tool_stats['total_tool_calls'], 0)
         prompt = json.loads(FakeAgent.received_prompt)
         self.assertEqual(prompt['navigation_target_url'], 'https://web.example.test/')
+        self.assertNotIn('output_schema', prompt)
+        self.assertNotIn('exploration_actions', prompt['instruction'])
         self.assertNotIn('https://', json.dumps(snapshot.model_dump(mode='json')))
+
+    def test_plain_empty_or_markdown_final_answer_does_not_replace_callback_trace(self):
+        class FakeClient:
+            async def create_all_sessions(self):
+                return None
+
+            async def close_all_sessions(self):
+                return None
+
+        class TraceAgent:
+            final_answer = ''
+
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
+                self.guard.on_tool_start(
+                    {'name': 'playwright_navigate'}, '', run_id='navigate',
+                    inputs={'url': 'https://web.example.test/users', 'headless': True},
+                )
+                self.guard.on_tool_end('用户列表', run_id='navigate')
+                return type(self).final_answer
+
+        for final_answer in ('', '探索完成。', '### 已停止探索'):
+            with self.subTest(final_answer=final_answer):
+                TraceAgent.final_answer = final_answer
+                explorer = MCPPageExplorer(llm_model=object(), mcp_config={'mcpServers': {}})
+                with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
+                    'web_testing.mcp_page_explorer.MCPAgent', TraceAgent,
+                ):
+                    trace = asyncio.run(explorer.explore(
+                        scenario=ScenarioSpec.model_validate(scenario_payload()),
+                        start_path='/', target_url_safe='https://web.example.test/',
+                    ))
+                self.assertEqual(trace.observed_paths, ['/users'])
+                self.assertEqual(trace.events[0].tool_name, 'playwright_navigate')
 
     def test_explorer_prepares_one_output_runtime_for_each_exploration_call(self):
         class FakeClient:
@@ -867,18 +910,13 @@ class MCPPageExplorerTests(TestCase):
                 with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=FakeClient()), patch(
                     'web_testing.mcp_page_explorer.MCPAgent', InvalidAgent,
                 ):
-                    with self.assertRaises(MCPPageExplorerError) as raised:
-                        asyncio.run(explorer.explore(
-                            scenario=ScenarioSpec.model_validate(scenario_payload()),
-                            start_path='/', target_url_safe='https://web.example.test/',
-                        ))
-                self.assertEqual(raised.exception.error_code, 'EVIDENCE_INSUFFICIENT')
-                self.assertEqual(raised.exception.tool_stats['total_tool_calls'], 1)
-                self.assertEqual(raised.exception.tool_stats['failed_tool_calls'], 1)
-                self.assertEqual(raised.exception.tool_stats['last_operation'], {
-                    'tool_name': 'playwright_click', 'call_index': 1, 'status': 'failed',
-                })
-                self.assertNotIn('super-secret', str(raised.exception.tool_stats))
+                    trace = asyncio.run(explorer.explore(
+                        scenario=ScenarioSpec.model_validate(scenario_payload()),
+                        start_path='/', target_url_safe='https://web.example.test/',
+                    ))
+                self.assertEqual(trace.tool_stats['total_tool_calls'], 1)
+                self.assertEqual(trace.tool_stats['failed_tool_calls'], 1)
+                self.assertNotIn('super-secret', trace.model_dump_json())
 
     def test_active_user_cancellation_awaits_agent_and_returns_safe_stats(self):
         class FakeClient:
@@ -1012,8 +1050,8 @@ class MCPPageExplorerTests(TestCase):
                 scenario=ScenarioSpec.model_validate(scenario_payload()),
                 start_path='/', target_url_safe='https://web.example.test/',
             ))
-        self.assertEqual(snapshot.tool_stats.total_tool_calls, 1)
-        self.assertEqual(snapshot.tool_stats.failed_tool_calls, 1)
+        self.assertEqual(snapshot.tool_stats['total_tool_calls'], 1)
+        self.assertEqual(snapshot.tool_stats['failed_tool_calls'], 1)
 
 
 class GenerationOrchestratorTests(GenerationPipelineBase):
@@ -1111,7 +1149,7 @@ async def run(page):
         self.assertIn('async def run(page)', generation.script_draft)
         self.assertNotIn('https://', json.dumps(generation.exploration_snapshot))
 
-    def test_orchestrator_only_asks_questions_remaining_after_page_exploration(self):
+    def test_orchestrator_keeps_a_reviewable_draft_when_trace_cannot_cover_every_step(self):
         generation = self.make_generation()
         unresolved_question = '页面中存在两个同名用户模块，无法确定业务归属。'
 
@@ -1120,13 +1158,32 @@ async def run(page):
                 pass
 
             async def explore(self, **kwargs):
-                return ExplorationSnapshot.model_validate(snapshot_payload(
-                    unresolved_questions=[unresolved_question],
-                ))
+                return ExplorationTrace(
+                    start_path='/',
+                    events=[ExplorationEvent(
+                        sequence=1, tool_name='playwright_navigate', category='navigate',
+                        status='succeeded', relative_path='/dashboard', output_excerpt='系统首页',
+                    )],
+                    observed_paths=['/dashboard'],
+                )
 
-        class GeneratorMustNotRun:
+        class DraftGenerator:
             def __init__(self, _model):
-                raise AssertionError('探索后仍有问题时不能生成脚本')
+                pass
+
+            def generate(self, **kwargs):
+                return '''"""场景：查询用户列表。目标：验证列表可见。前置条件：无。清理策略：无需清理。"""
+from playwright.async_api import expect
+
+async def run(page):
+    # 步骤 1：进入用户列表
+    await page.goto('/users')
+    # 断言 1：确认用户列表可见
+    await expect(page.get_by_role('heading')).to_be_visible()
+'''
+
+            def repair(self, **kwargs):
+                return kwargs['script']
 
         scenario = ScenarioSpec.model_validate(scenario_payload(
             ambiguities=[unresolved_question],
@@ -1137,15 +1194,14 @@ async def run(page):
         ), patch(
             'web_testing.generation_orchestrator.MCPPageExplorer', FakeExplorer
         ), patch(
-            'web_testing.generation_orchestrator.ScriptGenerator', GeneratorMustNotRun
+            'web_testing.generation_orchestrator.ScriptGenerator', DraftGenerator
         ), patch('web_testing.generation_orchestrator.publish_stage_changed'):
             result = run_v2_generation(str(generation.pk), celery_task_id='post-exploration-question-task')
 
         generation.refresh_from_db()
-        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_CONFIRMATION)
-        self.assertEqual(generation.current_stage, WebUIScriptGeneration.Stage.EXPLORING)
-        self.assertEqual(generation.scenario_spec['ambiguities'], [unresolved_question])
-        self.assertEqual(generation.exploration_snapshot['unresolved_questions'], [unresolved_question])
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
+        self.assertEqual(generation.error_code, 'QUALITY_GATE_BLOCKED')
+        self.assertIn('async def run(page)', generation.script_draft)
 
     def test_orchestrator_honours_cancel_before_model_or_mcp_work(self):
         generation = self.make_generation()
@@ -1253,6 +1309,87 @@ async def run(page):
         self.assertEqual(generation.status, WebUIScriptGeneration.Status.CANCELLED)
         self.assertEqual(generation.tool_stats['total_tool_calls'], 1)
         self.assertEqual(generation.tool_stats['termination_reason'], 'TASK_CANCELLED')
+
+    def test_soft_exploration_timeout_uses_partial_trace_and_keeps_reviewable_draft(self):
+        generation = self.make_generation()
+        partial_trace = ExplorationTrace(
+            start_path='/',
+            events=[ExplorationEvent(
+                sequence=1, tool_name='playwright_navigate', category='navigate',
+                status='succeeded', relative_path='/users', output_excerpt='权限菜单 用户列表',
+            )],
+            observed_paths=['/users'],
+            tool_stats={'total_tool_calls': 1, 'failed_tool_calls': 0},
+            termination_reason='exploration_timeout',
+        )
+
+        class TimedOutExplorer:
+            def __init__(self, **kwargs):
+                pass
+
+            async def explore(self, **kwargs):
+                raise MCPPageExplorerError(
+                    'exploration_timeout', '页面探索已达到总时限。',
+                    snapshot=partial_trace,
+                )
+
+        class DraftGenerator:
+            def __init__(self, _model):
+                pass
+
+            def generate(self, **kwargs):
+                return '''"""场景：查询用户列表。目标：验证列表可见。前置条件：无。清理策略：无需清理。"""
+from playwright.async_api import expect
+
+async def run(page):
+    # 步骤 1：进入用户列表
+    await page.goto('/users')
+    # 断言 1：确认用户列表可见
+    await expect(page.get_by_text('用户列表', exact=True)).to_be_visible()
+'''
+
+            def repair(self, **kwargs):
+                return kwargs['script']
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
+            'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_orchestrator.MCPPageExplorer', TimedOutExplorer), patch(
+            'web_testing.generation_orchestrator.ScriptGenerator', DraftGenerator,
+        ), patch('web_testing.generation_orchestrator.publish_stage_changed'), patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ):
+            result = run_v2_generation(str(generation.pk), celery_task_id='partial-timeout-task')
+
+        generation.refresh_from_db()
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
+        self.assertEqual(generation.error_code, 'EXPLORATION_PARTIAL')
+        self.assertIn('async def run(page)', generation.script_draft)
+        self.assertEqual(generation.exploration_snapshot['schema_version'], 2)
+
+    def test_trace_only_retry_accepts_all_model_service_error_codes(self):
+        trace = ExplorationTrace(
+            start_path='/',
+            events=[ExplorationEvent(
+                sequence=1, tool_name='playwright_navigate', category='navigate',
+                status='succeeded', relative_path='/users', output_excerpt='用户列表',
+            )],
+            observed_paths=['/users'],
+        ).model_dump(mode='json')
+        for error_code in ('MODEL_SERVICE_ERROR', 'MODEL_GATEWAY_TIMEOUT'):
+            with self.subTest(error_code=error_code):
+                generation = self.make_generation(
+                    status=WebUIScriptGeneration.Status.FAILED,
+                    current_stage=WebUIScriptGeneration.Stage.GENERATING,
+                    error_code=error_code,
+                    exploration_snapshot=trace,
+                )
+                prepared = prepare_trace_generation_retry(
+                    generation.pk, expected_revision=generation.revision,
+                )
+                self.assertEqual(prepared.status, WebUIScriptGeneration.Status.GENERATING)
+                self.assertEqual(prepared.revision, generation.revision + 1)
+                self.assertIsNotNone(claim_trace_generation_retry(prepared.pk, 'trace-retry-task'))
+                self.assertIsNone(claim_trace_generation_retry(prepared.pk, 'trace-retry-task'))
 
     def test_orchestrator_passes_persisted_exploration_timeout_to_explorer(self):
         generation = self.make_generation(exploration_timeout_seconds=900)

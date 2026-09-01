@@ -121,7 +121,7 @@ const CLEANUP_STATUS_PRESENTATION = {
 
 /** Keep cleanup evidence conservative: absent fields in legacy snapshots are not a success result. */
 export const explorationCleanupPresentation = (snapshot) => {
-  const report = snapshot?.cleanup_report
+  const report = snapshot?.cleanup ?? snapshot?.cleanup_report
   if (!report || typeof report !== 'object' || Array.isArray(report)) {
     return { hasRecord: false, status: '', label: '尚无清理记录', type: 'info', attempted: false, residuals: [], reason: '' }
   }
@@ -183,7 +183,7 @@ export const generationActionRequired = (generation) => {
   if (['EVIDENCE_INSUFFICIENT', 'EXPLORATION_INCOMPLETE'].includes(errorCode) || completion.status === 'needs_targeted_exploration') {
     return {
       kind: 'exploration_issue', title: '页面探索未完成',
-      description: generation?.error_message || '当前页面证据不足，不能要求你填写 DOM 或定位器。请查看探索证据并修订业务目标后重新发起。',
+      description: generation?.error_message || '当前页面轨迹不足，不能要求你填写 DOM 或定位器。请查看探索轨迹并修订业务目标后重新发起。',
       questions: [], primaryLabel: '', remainingAttempts
     }
   }
@@ -236,11 +236,12 @@ export const generationResolutionHint = (generation) => {
     const message = status === 'failed'
       ? generation?.error_message || '请检查模型、Playwright MCP、登录信息或页面可访问性后重试。'
       : '本次生成已停止。'
-    const cleanupStatus = generation?.exploration_snapshot?.cleanup_report?.status
+    const cleanupStatus = generation?.exploration_snapshot?.cleanup?.status
+      ?? generation?.exploration_snapshot?.cleanup_report?.status
     return ['unknown', 'residual', 'not_attempted'].includes(cleanupStatus)
-      ? `${message} 重新发起前，请先检查“探索证据”中的本轮数据和清理结果，避免重复操作。`
+      ? `${message} 重新发起前，请先检查“探索轨迹”中的本轮数据和清理结果，避免重复操作。`
       : message
   }
-  if (status === 'ready_with_warnings') return '脚本可保存，但建议先查看定位器和探索证据警告。'
+  if (status === 'ready_with_warnings') return '脚本可保存，但建议先查看定位器和探索轨迹警告。'
   return ''
 }

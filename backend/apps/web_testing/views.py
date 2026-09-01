@@ -40,6 +40,7 @@ from .generation_repository import (
     attach_celery_task,
     cancel_generation,
     get_generation_for_project,
+    prepare_trace_generation_retry,
     prepare_generation_resolution,
     transition_generation,
 )
@@ -89,6 +90,7 @@ from .serializers import (
     WebUIScriptGenerationDebugSerializer,
     WebUIScriptGenerationDraftSerializer,
     WebUIScriptGenerationRepairSerializer,
+    WebUIScriptGenerationRetrySerializer,
     WebUIScriptGenerationResolveSerializer,
     WebUIScriptGenerationSaveSerializer,
     WebUIScriptGenerationSerializer,
@@ -112,6 +114,7 @@ from .tasks import (
     generate_midscene_script_task,
     generate_webui_script_generation_v2_task,
     repair_webui_script_generation_task,
+    retry_webui_script_generation_from_trace_task,
 )
 
 logger = logging.getLogger(__name__)
@@ -306,6 +309,41 @@ class WebUIScriptGenerationResolveView(APIView):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+
+
+class WebUIScriptGenerationRetryView(APIView):
+    """Retry only the LLM generation stage from the saved callback trace."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能重试自己创建的生成记录')
+        serializer = WebUIScriptGenerationRetrySerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            generation = prepare_trace_generation_retry(
+                generation.pk, expected_revision=serializer.validated_data['expected_revision'],
+            )
+            task = retry_webui_script_generation_from_trace_task.delay(str(generation.pk))
+            generation = attach_celery_task(generation.pk, task.id)
+        except GenerationResolutionConflict as exc:
+            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
+        except Exception:
+            logger.exception('仅重试脚本生成任务调度失败: generation_id=%s', generation_id)
+            generation = transition_generation(
+                generation_id, WebUIScriptGeneration.Status.FAILED,
+                error_code='TRANSIENT_SERVICE_ERROR', error_message='脚本生成重试任务暂时无法调度，请稍后重试。',
+            )
+            publish_terminal(generation)
+            return Response({'success': False, 'message': generation.error_message, 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({'success': True, 'message': '正在基于已保存的探索轨迹重新生成脚本。', 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_202_ACCEPTED)
 
 
 class WebUIScriptGenerationDraftView(APIView):

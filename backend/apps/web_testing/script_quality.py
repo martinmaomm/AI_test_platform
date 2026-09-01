@@ -9,7 +9,8 @@ import re
 import tokenize
 from typing import Any
 
-from .generation_contracts import ExplorationSnapshot, ScenarioSpec
+from .generation_contracts import ScenarioSpec
+from .exploration_trace import ExplorationTrace, coerce_trace
 from .generation_security import SENSITIVE_KEY_RE, find_suspected_credentials, redact_metadata
 from .script_contract import ScriptContractError, normalize_for_storage
 
@@ -17,6 +18,10 @@ from .script_contract import ScriptContractError, normalize_for_storage
 ACTION_NAMES = {
     'goto', 'click', 'dblclick', 'fill', 'type', 'check', 'uncheck',
     'select_option', 'press', 'hover', 'focus', 'clear', 'tap', 'drag_to',
+}
+LOCATOR_NAMES = {
+    'locator', 'get_by_role', 'get_by_text', 'get_by_label', 'get_by_placeholder',
+    'get_by_test_id', 'get_by_alt_text', 'get_by_title',
 }
 MUTATION_WORDS = ('create', 'update', 'delete', '新增', '编辑', '删除', '保存', '提交')
 SENSITIVE_LITERAL_RE = re.compile(r'(?i)(password|passwd|token|secret|api[_ -]?key)\s*[:=]\s*[\'\"]')
@@ -159,6 +164,29 @@ def _exact_text_locator(node: ast.Call) -> bool:
     )
 
 
+def _locator_literals(node: ast.Call) -> list[str]:
+    values: list[str] = []
+    for argument in node.args:
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            values.append(argument.value.strip())
+    for keyword in node.keywords:
+        if keyword.arg == 'exact':
+            continue
+        if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+            values.append(keyword.value.value.strip())
+    return [value for value in values if value]
+
+
+def _successful_trace_text(trace: ExplorationTrace) -> str:
+    chunks: list[str] = []
+    for event in trace.events:
+        if event.status != 'succeeded':
+            continue
+        chunks.extend(str(value) for value in event.locator.values())
+        chunks.append(event.output_excerpt)
+    return '\n'.join(chunks).lower()
+
+
 def _core_pass_checks(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     blocker_codes = {item['code'] for item in blockers}
     checks = [
@@ -172,6 +200,7 @@ def _core_pass_checks(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ('ASSERTION_COMMENT_VALID', '断言备注覆盖完整。', {'ASSERTION_COMMENT_MISSING'}),
         ('CLEANUP_VALID', '清理策略满足当前场景要求。', {'CLEANUP_FINALLY_MISSING', 'CLEANUP_COMMENT_MISSING'}),
         ('NAMES_IMPORTS_VALID', '名称和导入检查通过。', {'UNDEFINED_NAME', 'IMPORT_MISSING'}),
+        ('LOCATOR_TRACE_VALID', '业务定位器均可追溯到成功探索轨迹。', {'LOCATOR_NOT_IN_TRACE'}),
     ]
     return [
         _issue('pass', code, message)
@@ -184,9 +213,11 @@ def evaluate_script(
     script: str,
     *,
     scenario: ScenarioSpec,
-    snapshot: ExplorationSnapshot,
+    trace: ExplorationTrace | None = None,
+    snapshot: Any = None,
 ) -> dict[str, Any]:
     """Return only safe, structured and user-readable static findings."""
+    trace = coerce_trace(trace or snapshot)
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     source = str(script or '')
@@ -223,6 +254,8 @@ def evaluate_script(
     action_count = 0
     used_action_comments: set[int] = set()
     used_assertion_comments: set[int] = set()
+    successful_trace_text = _successful_trace_text(trace)
+    locator_issue_lines: set[int] = set()
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -237,6 +270,10 @@ def evaluate_script(
                 warnings.append(_issue('warning', 'FIXED_WAIT', '脚本包含固定等待，建议替换为可观察的页面断言。', line=node.lineno))
             if name == 'get_by_text' and not _exact_text_locator(node):
                 warnings.append(_issue('warning', 'AMBIGUOUS_TEXT_LOCATOR', '文本定位器可能匹配多个元素，建议结合 role 或稳定属性。', line=node.lineno))
+            if name in LOCATOR_NAMES and successful_trace_text:
+                literals = _locator_literals(node)
+                if literals and not any(value.lower() in successful_trace_text for value in literals):
+                    locator_issue_lines.add(node.lineno)
             if _is_expect_assertion(node):
                 expect_count += 1
                 if not _consume_comment(comments, used_assertion_comments, node.lineno, r'断言\s*\d+\s*[:：]'):
@@ -283,21 +320,28 @@ def evaluate_script(
         blockers.append(_issue('blocker', 'UNDEFINED_NAME', '脚本引用了未定义变量或缺失导入，无法安全执行。'))
     if action_count and len([item for item in blockers if item['code'] == 'ACTION_COMMENT_MISSING']) == action_count:
         blockers.append(_issue('blocker', 'ACTION_COMMENT_COVERAGE_ZERO', '业务动作没有可读步骤注释。'))
+    for line in sorted(locator_issue_lines):
+        blockers.append(_issue(
+            'blocker', 'LOCATOR_NOT_IN_TRACE',
+            '脚本使用了未在成功探索轨迹中出现的定位信息，请人工检查。', line=line,
+        ))
 
-    unresolved = set(snapshot.unresolved_steps)
-    if unresolved:
-        warnings.append(_issue('warning', 'MISSING_EVIDENCE', '部分场景步骤缺少页面探索证据，需要定向补充探索或人工检查。'))
-    evidence_ids = set(snapshot.step_evidence)
-    missing_evidence = {step.id for step in scenario.steps} - evidence_ids
-    if missing_evidence:
-        warnings.append(_issue('warning', 'MISSING_EVIDENCE', '部分场景步骤没有对应探索证据，需要定向补充探索或人工检查。'))
+    missing_steps = [
+        step.id for step in scenario.steps
+        if (trace.coverage.get(step.id) or {}).get('status') != 'confirmed'
+    ]
+    if missing_steps:
+        blockers.append(_issue(
+            'blocker', 'TRACE_STEP_COVERAGE_MISSING',
+            '缺少必要场景步骤的成功定位或页面观察，草稿已保留但不能保存或执行。',
+        ))
     step_comments = {
         int(match.group(1)) for comment in comments.values()
         if (match := re.match(r'步骤\s*(\d+)\s*[:：]', comment))
     }
     expected_step_numbers = set(range(1, len(scenario.steps) + 1))
     if step_comments != expected_step_numbers:
-        warnings.append(_issue('warning', 'SCENARIO_STEP_MAPPING_INCOMPLETE', '脚本步骤备注与场景步骤未完全对应，请人工核对。'))
+        blockers.append(_issue('blocker', 'SCENARIO_STEP_MAPPING_INCOMPLETE', '脚本步骤备注必须与场景步骤完全对应。'))
     return _report(blockers, warnings, passes=_core_pass_checks(blockers))
 
 

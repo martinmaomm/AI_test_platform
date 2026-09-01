@@ -135,18 +135,17 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         generator = ScriptGenerator(llm)
         generator.generate(scenario=scenario, snapshot=snapshot)
         generator.repair(script='bad', issues=[], scenario=scenario, snapshot=snapshot)
-        for call, field in zip(llm.invoke.call_args_list, ('exploration_snapshot', 'exploration_evidence')):
+        for call in llm.invoke.call_args_list:
             prompt = call.args[0][1].content
-            self.assertEqual(json.loads(prompt)[field]['elements'][0]['stable_attributes']['data-author'], 'ui-library')
+            self.assertIn('exploration_trace', json.loads(prompt))
 
-    def test_quality_warns_for_missing_evidence_without_treating_it_as_a_script_blocker(self):
+    def test_quality_blocks_missing_required_trace_coverage_but_keeps_draft_reviewable(self):
         report = evaluate_script(
             VALID_SCRIPT,
             scenario=ScenarioSpec.model_validate(scenario_payload()),
             snapshot=ExplorationSnapshot.model_validate(snapshot_payload(unresolved=True)),
         )
-        self.assertFalse(report['blockers'])
-        self.assertTrue(any(item['code'] == 'MISSING_EVIDENCE' for item in report['warnings']))
+        self.assertTrue(any(item['code'] == 'TRACE_STEP_COVERAGE_MISSING' for item in report['blockers']))
 
     def test_quality_blocks_sensitive_literals_and_placeholders_but_allows_environment_references(self):
         scenario = ScenarioSpec.model_validate(scenario_payload())
@@ -205,7 +204,7 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
             scenario=ScenarioSpec.model_validate(scenario_payload()),
             snapshot=ExplorationSnapshot.model_validate(snapshot_payload(unresolved=True)),
         )
-        missing = [item for item in report['checks'] if item['code'] == 'MISSING_EVIDENCE']
+        missing = [item for item in report['checks'] if item['code'] == 'TRACE_STEP_COVERAGE_MISSING']
         self.assertEqual(len(missing), 1)
         self.assertEqual(report['summary']['warning'], len(report['warnings']))
         self.assertEqual(report['summary']['blocker'], len(report['blockers']))
@@ -259,10 +258,10 @@ class OrchestratorPhase45Tests(Phase45Base):
         result = self._run_with(generation, Explorer, Generator)
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.READY_WITH_WARNINGS)
-        self.assertTrue(result['supplement_attempted'])
+        self.assertEqual(result['trace_schema_version'], 2)
         self.assertEqual(Explorer.explore_calls, 1)
         self.assertEqual(Generator.generate_calls, 1)
-        self.assertEqual(generation.exploration_snapshot['unresolved_steps'], [])
+        self.assertEqual(generation.exploration_snapshot['schema_version'], 2)
 
     def test_quality_repair_has_a_hard_two_attempt_limit(self):
         generation = self.generation()

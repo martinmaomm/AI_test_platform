@@ -10,7 +10,7 @@ let moduleId = 0
 const methods = [
   'cancelWebUIScriptGeneration', 'createWebUIScriptGeneration', 'debugWebUIScriptGeneration',
   'getWebUIScriptGeneration', 'getWebUITestCaseExecution', 'repairWebUIScriptGeneration',
-  'resolveWebUIScriptGeneration', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
+  'resolveWebUIScriptGeneration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
 ]
 const record = (workspace = {}) => ({
   id: 'test-generation', status: 'ready', environment_id: 4, script_draft: 'async def run(page):\n    pass',

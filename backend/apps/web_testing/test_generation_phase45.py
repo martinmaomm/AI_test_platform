@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -16,13 +16,13 @@ from ai_core.models import LLMConfiguration, MCPConfiguration, ModelType
 from projects.models import Environment, Project
 
 from .generation_contracts import ExplorationSnapshot, ScenarioSpec
-from .generation_orchestrator import run_v2_generation
+from .generation_orchestrator import _model_failure, run_v2_generation
 from .generation_events import publish_terminal
 from .generation_save_state import generation_reference
 from .models import WebUIScriptGeneration, WebUITestCase
 from .playwright_python_runner import ExecutionConfig, PlaywrightRunner
 from .script_extraction import extract_playwright_metadata
-from .script_generator import ScriptGenerator
+from .script_generator import SCRIPT_GENERATION_MAX_TOKENS, ScriptGenerator, ScriptGeneratorOutputError
 from .script_quality import evaluate_script
 from .serializers import WebUIScriptGenerationSerializer
 from .views import WebUIScriptGenerationSaveView
@@ -95,6 +95,7 @@ class Phase45Base(TestCase):
 class ScriptGeneratorAndQualityTests(Phase45Base):
     def test_generator_prompt_is_evidence_only_and_quality_requires_docstring_and_comments(self):
         llm = Mock()
+        llm.stream = None
         llm.invoke.return_value = VALID_SCRIPT
         scenario = ScenarioSpec.model_validate(scenario_payload())
         snapshot = ExplorationSnapshot.model_validate(snapshot_payload())
@@ -112,6 +113,7 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
 
     def test_generator_extracts_langchain_message_content_for_generate_and_repair(self):
         llm = Mock()
+        llm.stream = None
         llm.invoke.side_effect = [
             AIMessage(content=VALID_SCRIPT),
             AIMessage(content=[{'type': 'text', 'text': f'```python\n{VALID_SCRIPT}\n```'}]),
@@ -127,6 +129,7 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
 
     def test_generator_and_repair_keep_validated_dom_author_attributes(self):
         llm = Mock(return_value=VALID_SCRIPT)
+        llm.stream = None
         llm.invoke.return_value = VALID_SCRIPT
         data = snapshot_payload()
         data['elements'][0]['stable_attributes'] = {'data-author': 'ui-library'}
@@ -138,6 +141,84 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         for call in llm.invoke.call_args_list:
             prompt = call.args[0][1].content
             self.assertIn('exploration_trace', json.loads(prompt))
+
+    def test_generator_streams_chunks_and_sets_a_local_output_limit(self):
+        class StreamingLLM:
+            def __init__(self):
+                self.stream_calls = []
+                self.invoke = Mock()
+
+            def stream(self, messages, **kwargs):
+                self.stream_calls.append((messages, kwargs))
+                yield AIMessageChunk(content=VALID_SCRIPT[:80])
+                yield AIMessageChunk(content=[{'type': 'text', 'text': VALID_SCRIPT[80:]}])
+
+        llm = StreamingLLM()
+        scenario = ScenarioSpec.model_validate(scenario_payload())
+        script = ScriptGenerator(llm).generate(
+            scenario=scenario,
+            snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
+        )
+        repaired = ScriptGenerator(llm).repair(
+            script='bad', issues=[], scenario=scenario,
+            snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
+        )
+
+        self.assertEqual(script, VALID_SCRIPT.strip())
+        self.assertEqual(repaired, VALID_SCRIPT.strip())
+        self.assertEqual(
+            [call[1]['max_tokens'] for call in llm.stream_calls],
+            [SCRIPT_GENERATION_MAX_TOKENS, SCRIPT_GENERATION_MAX_TOKENS],
+        )
+        self.assertEqual(SCRIPT_GENERATION_MAX_TOKENS, 4096)
+        llm.invoke.assert_not_called()
+
+    def test_generator_falls_back_only_when_stream_is_unavailable(self):
+        llm = SimpleNamespace(invoke=Mock(return_value=AIMessage(content=VALID_SCRIPT)))
+        scenario = ScenarioSpec.model_validate(scenario_payload())
+
+        self.assertEqual(
+            ScriptGenerator(llm).repair(
+                script='bad', issues=[], scenario=scenario,
+                snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
+            ),
+            VALID_SCRIPT.strip(),
+        )
+        llm.invoke.assert_called_once()
+        self.assertEqual(llm.invoke.call_args.kwargs['max_tokens'], SCRIPT_GENERATION_MAX_TOKENS)
+
+    def test_generator_does_not_replay_invoke_after_a_stream_failure(self):
+        class StreamFailure(RuntimeError):
+            status_code = 504
+
+        class FailingStreamLLM:
+            def __init__(self):
+                self.invoke = Mock()
+
+            def stream(self, _messages, **_kwargs):
+                yield AIMessageChunk(content='partial source')
+                raise StreamFailure('provider stream interrupted')
+
+        llm = FailingStreamLLM()
+        with self.assertRaises(StreamFailure) as raised:
+            ScriptGenerator(llm).generate(
+                scenario=ScenarioSpec.model_validate(scenario_payload()),
+                snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
+            )
+        llm.invoke.assert_not_called()
+        self.assertEqual(_model_failure(raised.exception)[0], 'MODEL_GATEWAY_TIMEOUT')
+
+    def test_generator_rejects_an_empty_stream_response(self):
+        class EmptyStreamLLM:
+            def stream(self, _messages, **_kwargs):
+                yield AIMessageChunk(content=[])
+
+        with self.assertRaises(ScriptGeneratorOutputError) as raised:
+            ScriptGenerator(EmptyStreamLLM()).generate(
+                scenario=ScenarioSpec.model_validate(scenario_payload()),
+                snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
+            )
+        self.assertEqual(_model_failure(raised.exception)[0], 'MODEL_OUTPUT_INVALID')
 
     def test_quality_blocks_missing_required_trace_coverage_but_keeps_draft_reviewable(self):
         report = evaluate_script(

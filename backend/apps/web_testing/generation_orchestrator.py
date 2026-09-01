@@ -34,7 +34,7 @@ from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 from .models import WebUIScriptGeneration
 from .model_service_errors import classify_model_service_error
 from .requirement_normalizer import normalize_requirement
-from .script_generator import ScriptGenerator
+from .script_generator import ScriptGenerator, ScriptGeneratorOutputError
 from .script_quality import blocker_issues, evaluate_script
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,8 @@ def _model_failure(error: BaseException) -> tuple[str, str]:
     service_error = classify_model_service_error(error, stage='generation')
     if service_error:
         return service_error
+    if isinstance(error, ScriptGeneratorOutputError):
+        return 'MODEL_OUTPUT_INVALID', '模型未返回可用的 Python 脚本，请重试或更换模型。'
     if _is_rate_limited_error(error):
         return 'MODEL_RATE_LIMITED', '本次锁定的模型触发限流，请稍后重试或更换模型。'
     return 'MODEL_UNAVAILABLE', '本次锁定的模型暂时不可用，请检查模型配置或稍后重试。'

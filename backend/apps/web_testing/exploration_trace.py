@@ -23,6 +23,10 @@ TRACE_SCHEMA_VERSION = 2
 _MAX_EVENTS = 120
 _MAX_EXCERPT = 1200
 _MAX_INPUT = 320
+_MAX_GENERATOR_EVIDENCE_CHARS = 8_000
+_MAX_GENERATOR_EVENT_RESULT = 320
+_MAX_GENERATOR_EVENT_INPUT = 220
+_MAX_GENERATOR_EVENT_LOCATORS = 8
 _SECRET_KEY_RE = re.compile(r"(?i)(password|passwd|token|secret|cookie|authorization|api[_-]?key)")
 _ABSOLUTE_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
 _OBSERVATION_TOOLS = frozenset({"playwright_get_visible_text", "playwright_get_visible_html", "playwright_snapshot"})
@@ -312,9 +316,207 @@ def assess_trace_coverage(scenario, trace: ExplorationTrace) -> ExplorationTrace
 
 
 def successful_trace_evidence(trace: ExplorationTrace) -> dict[str, Any]:
-    """Generator input: excludes failed locators, fill values and full URLs."""
-    events = [event.model_dump(mode="json") for event in trace.events if event.status == "succeeded" and event.category in {"navigate", "observe", "interact"}]
-    return {"schema_version": TRACE_SCHEMA_VERSION, "start_path": trace.start_path, "observed_paths": trace.observed_paths, "events": events, "coverage": trace.coverage, "cleanup": trace.cleanup, "warnings": trace.warnings}
+    """Return a bounded, deterministic generator view of successful evidence.
+
+    Persisted traces remain complete for review.  This projection keeps the
+    navigation/action/locator/result facts needed for a script, while folding
+    repeated page observations and enforcing a request-size ceiling without a
+    second model summarisation pass.
+    """
+    def clip(value: Any, limit: int) -> str:
+        return str(value or '')[:limit]
+
+    def payload_size(value: dict[str, Any]) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(',', ':')))
+
+    def state_signature(event: ExplorationEvent) -> tuple[str, str]:
+        if event.state_fingerprint:
+            return ('fingerprint', event.state_fingerprint)
+        normalized_output = re.sub(r'\s+', ' ', event.output_excerpt).strip()
+        digest = hashlib.sha256(normalized_output.encode('utf-8', errors='replace')).hexdigest()[:16]
+        return ('output', digest)
+
+    def event_signature(event: ExplorationEvent) -> tuple[Any, ...]:
+        return (
+            event.category, event.relative_path, event.tool_name,
+            tuple(sorted(event.locator.items())), event.input_summary,
+            state_signature(event),
+        )
+
+    successful_events = sorted((
+        event for event in trace.events
+        if event.status == 'succeeded' and event.category in {'navigate', 'observe', 'interact'}
+    ), key=lambda event: event.sequence)
+
+    # Establish one chronological representative for each truly identical
+    # state before priority selection. Coverage pointing at a folded duplicate
+    # is remapped to the retained representative rather than left dangling.
+    representative_by_signature: dict[tuple[Any, ...], ExplorationEvent] = {}
+    representative_events: list[ExplorationEvent] = []
+    sequence_representative: dict[int, int] = {}
+    for event in successful_events:
+        signature = event_signature(event)
+        representative = representative_by_signature.get(signature)
+        if representative is None:
+            representative = event
+            representative_by_signature[signature] = event
+            representative_events.append(event)
+        sequence_representative[event.sequence] = representative.sequence
+
+    coverage_details: dict[str, dict[str, Any]] = {}
+    evidence: dict[str, Any] = {
+        'schema_version': TRACE_SCHEMA_VERSION,
+        'start_path': clip(trace.start_path, 300),
+        'observed_paths': [],
+        'events': [],
+        'coverage': {},
+        'cleanup': {
+            'status': clip((trace.cleanup or {}).get('status'), 80),
+            'attempted': bool((trace.cleanup or {}).get('attempted')),
+            'residuals': [],
+            'reason': '',
+        },
+        'warnings': [],
+    }
+
+    # Keep room for at least one compact key event. Coverage is added in a
+    # deterministic order and starts conservatively: a claimed status is only
+    # restored after its referenced event is actually selected below.
+    key_event_reserve = 1_600
+    for raw_step_id in sorted(trace.coverage, key=str):
+        step_id = clip(raw_step_id, 80)
+        if not step_id or step_id in evidence['coverage']:
+            continue
+        item = trace.coverage.get(raw_step_id) or {}
+        original_status = clip(item.get('status'), 40) or 'missing'
+        claims_evidence = original_status in {'confirmed', 'partially_confirmed'}
+        source_sequence = next((
+            sequence_representative[sequence]
+            for sequence in (item.get('event_sequences') or [])
+            if isinstance(sequence, int) and sequence in sequence_representative
+        ), None)
+        original_reason = clip(item.get('reason'), 120)
+        if claims_evidence:
+            safe_reason = (
+                '对应成功事件尚未进入压缩证据，已安全降级。'
+                if source_sequence is not None
+                else '原覆盖未引用可用的成功事件，已安全降级。'
+            )
+            compacted = {'status': 'missing', 'event_sequences': [], 'reason': safe_reason}
+        else:
+            compacted = {'status': original_status, 'event_sequences': [], 'reason': original_reason}
+        candidate_coverage = {**evidence['coverage'], step_id: compacted}
+        candidate = {**evidence, 'coverage': candidate_coverage}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS - key_event_reserve:
+            compacted = {**compacted, 'reason': ''}
+            candidate_coverage = {**evidence['coverage'], step_id: compacted}
+            candidate = {**evidence, 'coverage': candidate_coverage}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS - key_event_reserve:
+            break
+        evidence['coverage'] = candidate_coverage
+        coverage_details[step_id] = {
+            'original_status': original_status,
+            'original_reason': original_reason,
+            'claims_evidence': claims_evidence,
+            'source_sequence': source_sequence,
+        }
+
+    mandatory_sequences = {
+        item['source_sequence']
+        for item in coverage_details.values()
+        if item['claims_evidence'] and item['source_sequence'] is not None
+    }
+
+    def priority(event: ExplorationEvent) -> tuple[int, int]:
+        if event.sequence in mandatory_sequences:
+            return (0, event.sequence)
+        if event.category == 'interact':
+            return (1, event.sequence)
+        if event.category == 'navigate':
+            return (2, event.sequence)
+        return (3, event.sequence)
+
+    def compact_event(event: ExplorationEvent, *, minimal: bool = False) -> dict[str, Any]:
+        locator_limit = 80 if minimal else 160
+        max_locators = 4 if minimal else _MAX_GENERATOR_EVENT_LOCATORS
+        locator = {
+            clip(key, 80): clip(value, locator_limit)
+            for key, value in list(event.locator.items())[:max_locators]
+            if clip(key, 80) and clip(value, locator_limit)
+        }
+        return {
+            'sequence': event.sequence,
+            'tool_name': clip(event.tool_name, 120),
+            'category': event.category,
+            'relative_path': clip(event.relative_path, 300),
+            'locator': locator,
+            'input_summary': clip(event.input_summary, 100 if minimal else _MAX_GENERATOR_EVENT_INPUT),
+            'output_excerpt': clip(event.output_excerpt, 120 if minimal else _MAX_GENERATOR_EVENT_RESULT),
+        }
+
+    def coverage_after_selecting(sequence: int) -> dict[str, dict[str, Any]]:
+        updated = dict(evidence['coverage'])
+        for step_id, details in coverage_details.items():
+            if not details['claims_evidence'] or details['source_sequence'] != sequence:
+                continue
+            updated[step_id] = {
+                'status': details['original_status'],
+                'event_sequences': [sequence],
+                'reason': details['original_reason'],
+            }
+        return updated
+
+    for event in sorted(representative_events, key=priority):
+        candidate_coverage = coverage_after_selecting(event.sequence)
+        candidate_events = [*evidence['events'], compact_event(event)]
+        candidate = {**evidence, 'events': candidate_events, 'coverage': candidate_coverage}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS:
+            candidate_events[-1] = compact_event(event, minimal=True)
+            candidate = {**evidence, 'events': candidate_events, 'coverage': candidate_coverage}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS:
+            continue
+        evidence['events'] = candidate_events
+        evidence['coverage'] = candidate_coverage
+
+    # Priority controls admission only. The generator always receives the
+    # retained trace in its original temporal order.
+    evidence['events'].sort(key=lambda event: event['sequence'])
+
+    for path in dict.fromkeys(trace.observed_paths):
+        if len(evidence['observed_paths']) >= 20:
+            break
+        candidate_paths = [*evidence['observed_paths'], clip(path, 300)]
+        candidate = {**evidence, 'observed_paths': candidate_paths}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS:
+            break
+        evidence['observed_paths'] = candidate_paths
+
+    cleanup_reason = clip((trace.cleanup or {}).get('reason'), 160)
+    if cleanup_reason:
+        candidate_cleanup = {**evidence['cleanup'], 'reason': cleanup_reason}
+        candidate = {**evidence, 'cleanup': candidate_cleanup}
+        if payload_size(candidate) <= _MAX_GENERATOR_EVIDENCE_CHARS:
+            evidence['cleanup'] = candidate_cleanup
+    for residual in (trace.cleanup or {}).get('residuals') or []:
+        if len(evidence['cleanup']['residuals']) >= 8:
+            break
+        candidate_cleanup = {
+            **evidence['cleanup'],
+            'residuals': [*evidence['cleanup']['residuals'], clip(residual, 120)],
+        }
+        candidate = {**evidence, 'cleanup': candidate_cleanup}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS:
+            break
+        evidence['cleanup'] = candidate_cleanup
+    for warning in dict.fromkeys(trace.warnings):
+        if len(evidence['warnings']) >= 6:
+            break
+        candidate_warnings = [*evidence['warnings'], clip(warning, 120)]
+        candidate = {**evidence, 'warnings': candidate_warnings}
+        if payload_size(candidate) > _MAX_GENERATOR_EVIDENCE_CHARS:
+            break
+        evidence['warnings'] = candidate_warnings
+    return evidence
 
 
 def coerce_trace(value: Any) -> ExplorationTrace:

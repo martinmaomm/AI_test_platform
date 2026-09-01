@@ -17,6 +17,13 @@ from .exploration_trace import ExplorationTrace, coerce_trace, successful_trace_
 from .generation_security import redact_exploration_metadata, redact_metadata, redact_text
 
 
+SCRIPT_GENERATION_MAX_TOKENS = 4096
+
+
+class ScriptGeneratorOutputError(ValueError):
+    """Raised when a model returns no usable Python source."""
+
+
 GENERATOR_SYSTEM_PROMPT = """你是 Python Playwright 异步测试脚本生成器。只依据给定场景和页面探索证据生成代码，
 不得调用 MCP、不得探索页面、不得编造定位器或业务字段。只输出 Python 源码，不输出 Markdown。
 
@@ -39,28 +46,37 @@ REPAIR_SYSTEM_PROMPT = """你是 Python Playwright 脚本静态修复器。只�
 当问题 code 为 RUNTIME_FAILURE 时仅允许补充必要标准库 import、注释和有证据的定位器；不得改写控制流或业务参数。"""
 
 
-def _response_text(value: Any) -> str:
-    """Extract model text from strings, AIMessage objects and content blocks."""
+def _content_text(value: Any, *, separator: str) -> str:
+    """Extract text from LangChain messages or OpenAI-compatible content blocks."""
     if isinstance(value, str):
         return value
-    content = getattr(value, 'content', value)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, (list, tuple)):
-        chunks: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                chunks.append(block)
-            elif isinstance(block, dict):
-                text = block.get('text') or block.get('content')
-                if isinstance(text, str):
-                    chunks.append(text)
-            else:
-                text = getattr(block, 'text', None) or getattr(block, 'content', None)
-                if isinstance(text, str):
-                    chunks.append(text)
-        return '\n'.join(chunks)
-    return str(content or '')
+    if value is None:
+        return ''
+    if isinstance(value, dict):
+        text = value.get('text') or value.get('content')
+        return text if isinstance(text, str) else ''
+    content = getattr(value, 'content', None)
+    if content is not None and content is not value:
+        return _content_text(content, separator=separator)
+    if isinstance(value, (list, tuple)):
+        return separator.join(
+            text for text in (_content_text(block, separator=separator) for block in value)
+            if text
+        )
+    text = getattr(value, 'text', None)
+    if isinstance(text, str):
+        return text
+    return ''
+
+
+def _response_text(value: Any) -> str:
+    """Extract a complete non-streaming model response."""
+    return _content_text(value, separator='\n')
+
+
+def _stream_chunk_text(value: Any) -> str:
+    """Extract one incremental chunk without adding whitespace between tokens."""
+    return _content_text(value, separator='')
 
 
 def _strip_code_fences(value: Any) -> str:
@@ -106,8 +122,25 @@ class ScriptGenerator:
         return self._invoke(REPAIR_SYSTEM_PROMPT, payload)
 
     def _invoke(self, system_prompt: str, payload: dict[str, Any]) -> str:
-        output = self.llm_model.invoke([
+        messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-        ])
-        return _strip_code_fences(output)
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(',', ':'))),
+        ]
+        stream = getattr(self.llm_model, 'stream', None)
+        if callable(stream):
+            # Deliberately do not catch stream failures: replaying a partially
+            # consumed request with invoke() can duplicate provider work and
+            # hides the original OpenAI/LangChain exception chain.
+            output = ''.join(
+                _stream_chunk_text(chunk)
+                for chunk in stream(messages, max_tokens=SCRIPT_GENERATION_MAX_TOKENS)
+            )
+        else:
+            output = self.llm_model.invoke(
+                messages,
+                max_tokens=SCRIPT_GENERATION_MAX_TOKENS,
+            )
+        script = _strip_code_fences(output)
+        if not script:
+            raise ScriptGeneratorOutputError('模型未返回可用的 Python 脚本。')
+        return script

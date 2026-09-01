@@ -233,6 +233,55 @@ class ExplorerToolPolicyTests(SimpleTestCase):
         agent.initialize.assert_awaited_once()
         agent.run.assert_awaited_once_with(ANY, manage_connector=False)
 
+    def test_complete_exploration_uses_one_session_for_at_most_two_targeted_follow_ups(self):
+        class FakeClient:
+            opened = 0
+            closed = 0
+
+            async def create_all_sessions(self):
+                type(self).opened += 1
+
+            async def close_all_sessions(self):
+                type(self).closed += 1
+
+        class PartialAgent:
+            instances = 0
+            prompts = []
+
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+                type(self).instances += 1
+                self.index = type(self).instances
+
+            async def initialize(self):
+                return None
+
+            async def run(self, prompt, **kwargs):
+                type(self).prompts.append(json.loads(prompt))
+                self.guard.on_tool_start(
+                    {'name': 'playwright_get_visible_text'}, '', run_id=f'read-{self.index}',
+                    inputs={'path': '/dashboard'},
+                )
+                self.guard.on_tool_end('仪表盘', run_id=f'read-{self.index}')
+                return '探索停止'
+
+        explorer = self.make_explorer()
+        client = FakeClient()
+        with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client), patch(
+            'web_testing.mcp_page_explorer.MCPAgent', PartialAgent,
+        ):
+            trace = asyncio.run(explorer.explore_until_complete(
+                scenario=scenario(), start_path='/', target_url_safe='https://example.invalid/',
+            ))
+
+        self.assertEqual(PartialAgent.instances, 3)
+        self.assertEqual(client.opened, 1)
+        self.assertEqual(client.closed, 1)
+        self.assertEqual(trace.tool_stats['total_tool_calls'], 3)
+        self.assertEqual(PartialAgent.prompts[1]['round'], 1)
+        self.assertEqual(PartialAgent.prompts[2]['round'], 2)
+        self.assertEqual(PartialAgent.prompts[1]['current_relative_path'], '/dashboard')
+
     def test_guard_blocks_each_disabled_tool_with_its_own_message(self):
         for tool_name, message in READ_ONLY_DISABLED_TOOL_MESSAGES.items():
             with self.subTest(tool_name=tool_name):

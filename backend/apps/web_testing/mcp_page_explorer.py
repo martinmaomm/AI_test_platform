@@ -26,6 +26,7 @@ from .exploration_trace import (
     ExplorationTrace,
     ExplorationTraceRecorder,
     assess_trace_coverage,
+    required_trace_evidence_gaps,
 )
 from .exploration_timeout import exploration_total_timeout_seconds
 from .exploration_policy import ExplorationPolicy
@@ -67,6 +68,7 @@ READ_ONLY_DISABLED_TOOL_MESSAGES = {
 }
 
 EXPLORATION_TOTAL_MODEL_STEPS = MCP_MAX_STEPS
+MAX_TARGETED_EXPLORATION_ROUNDS = 2
 
 
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
@@ -306,6 +308,7 @@ class MCPPageExplorer:
             self._active_start_path,
             sensitive_values=sensitive_values,
             trace_file=trace_file,
+            runtime_namespace=self.policy.namespace,
         )
         self.guard = ReadOnlyMCPBrowserToolGuard(
             MCP_BROWSER_TOOL_CALL_LIMIT, policy=self.policy, trace_recorder=self.trace_recorder,
@@ -336,7 +339,7 @@ class MCPPageExplorer:
         target_url_safe: str,
         temporary_credentials: dict[str, str] | None = None,
     ) -> ExplorationTrace:
-        """Run one callback-recorded exploration session.
+        """Run a callback-recorded session plus at most two bounded follow-ups.
 
         A model's final response is intentionally ignored.  Partial but useful
         traces are returned to the orchestrator; hard browser/security failures
@@ -346,7 +349,8 @@ class MCPPageExplorer:
             raise self._failure('TASK_CANCELLED', '用户已取消任务。', 0)
         self._active_start_path = start_path
         self._configure_policy(scenario, temporary_credentials=temporary_credentials)
-        deadline = time.monotonic() + self.exploration_timeout_seconds
+        started_at = time.monotonic()
+        deadline = started_at + self.exploration_timeout_seconds
         client = None
         try:
             try:
@@ -363,7 +367,32 @@ class MCPPageExplorer:
                         max_steps=EXPLORATION_TOTAL_MODEL_STEPS,
                         deadline=deadline,
                     )
-                    return assess_trace_coverage(scenario, trace)
+                    trace = assess_trace_coverage(scenario, trace)
+                    for round_number in range(1, MAX_TARGETED_EXPLORATION_ROUNDS + 1):
+                        gaps = required_trace_evidence_gaps(scenario, trace)
+                        if not gaps:
+                            break
+                        remaining_model_steps = EXPLORATION_TOTAL_MODEL_STEPS - self.guard.model_call_count
+                        if remaining_model_steps <= 0:
+                            trace = trace.model_copy(update={
+                                'termination_reason': 'model_budget',
+                                'warnings': list(dict.fromkeys([
+                                    *trace.warnings, '补探未执行：全局模型步骤预算已耗尽。',
+                                ])),
+                            })
+                            break
+                        trace = await self._explore_with_prompt(
+                            self._build_follow_up_prompt(trace, gaps, round_number, remaining_model_steps),
+                            start_path,
+                            client=client,
+                            max_steps=remaining_model_steps,
+                            deadline=deadline,
+                        )
+                        trace = assess_trace_coverage(scenario, trace)
+                    elapsed = round(max(0, time.monotonic() - started_at), 3)
+                    return trace.model_copy(update={
+                        'tool_stats': {**trace.tool_stats, 'duration_seconds': elapsed},
+                    })
             except TimeoutError:
                 error = self._failure(
                     'exploration_timeout', '页面探索已达到总时限，未继续重试。', 0,
@@ -579,4 +608,32 @@ class MCPPageExplorer:
             'login_context': login_context,
             'scope_policy': self.policy.prompt_scope(),
             'instruction': '先自行探索并补齐页面可观察信息。仅在 scope_policy 允许时执行目标 CRUD；平台会自动记录工具调用，最终回复不需要输出 JSON、页面证据或脚本。',
+        }, ensure_ascii=False)
+
+    def _build_follow_up_prompt(
+        self,
+        trace: ExplorationTrace,
+        gaps: list[dict[str, str]],
+        round_number: int,
+        remaining_model_steps: int,
+    ) -> str:
+        """Continue the existing MCP/browser session without reopening completed work."""
+        confirmed = [
+            step_id for step_id, item in trace.coverage.items()
+            if item.get('status') == 'confirmed'
+        ]
+        return json.dumps({
+            'instruction': (
+                '继续当前浏览器会话进行定向补探。只处理 missing_steps，不要重做已确认步骤，'
+                '不要重复已成功的写操作；仍须遵守 scope_policy 和所有安全限制。最终回复无需复述证据。'
+            ),
+            'round': round_number,
+            'missing_steps': gaps,
+            'confirmed_step_ids': confirmed,
+            'current_relative_path': trace.last_location or trace.start_path,
+            'remaining_budget': {
+                'tool_calls': max(0, MCP_BROWSER_TOOL_CALL_LIMIT - int(trace.tool_stats.get('total_tool_calls', 0))),
+                'model_steps': max(0, remaining_model_steps),
+            },
+            'scope_policy': self.policy.prompt_scope(),
         }, ensure_ascii=False)

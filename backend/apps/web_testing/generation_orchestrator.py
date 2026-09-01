@@ -16,7 +16,13 @@ from .generation_contracts import (
     ScenarioSpec,
     is_terminal_status,
 )
-from .exploration_trace import ExplorationTrace, assess_trace_coverage, coerce_trace, trace_has_minimum_page_state
+from .exploration_trace import (
+    ExplorationTrace,
+    assess_trace_coverage,
+    coerce_trace,
+    required_trace_evidence_gaps,
+    trace_has_minimum_page_state,
+)
 from .exploration_timeout import exploration_total_timeout_seconds
 from .generation_events import publish_stage_changed, publish_terminal
 from .generation_preflight import run_safety_preflight
@@ -136,6 +142,26 @@ def _cleanup_requires_attention(trace: ExplorationTrace) -> bool:
 
 def _partial_trace_requires_attention(trace: ExplorationTrace) -> bool:
     return str(trace.termination_reason or '') in _PARTIAL_TRACE_ERROR_KINDS
+
+
+def _evidence_review_report(gaps: list[dict[str, str]]) -> dict[str, Any]:
+    blockers = [{
+        'level': 'blocker',
+        'code': 'TRACE_STEP_EVIDENCE_MISSING',
+        'message': f"步骤 {item['step_id']}：{item['reason']}",
+        'line': None,
+    } for item in gaps]
+    return {
+        'status': 'needs_review', 'blockers': blockers, 'warnings': [], 'checks': blockers,
+        'summary': {
+            'passed': 0, 'warning': 0, 'blocker': len(blockers),
+            'message': '缺少必需场景步骤的成功元素证据，未生成脚本。',
+        },
+    }
+
+
+def _evidence_review_warnings(gaps: list[dict[str, str]]) -> list[str]:
+    return [f"步骤 {item['step_id']} 缺少证据：{item['reason']}" for item in gaps]
 
 
 def _usable_partial_trace(error: MCPPageExplorerError, scenario: ScenarioSpec) -> ExplorationTrace | None:
@@ -524,9 +550,31 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             publish_terminal(generation)
             return {'generation_id': str(generation.pk), 'status': 'cancelled'}
 
-        # The trace is useful even when a tool budget/timeout ended exploration.
-        # Missing mandatory step coverage is handled as a static script blocker,
-        # not as an excuse to discard the captured browser state.
+        evidence_gaps = required_trace_evidence_gaps(scenario, trace)
+        if evidence_gaps:
+            generation = transition_generation(
+                generation.pk,
+                WebUIScriptGeneration.Status.NEEDS_REVIEW,
+                progress=55,
+                error_code='EVIDENCE_INSUFFICIENT',
+                error_message='缺少必需场景步骤的成功元素证据，未生成脚本。',
+                updates={
+                    'scenario_spec': scenario.model_dump(mode='json'),
+                    'exploration_snapshot': trace.model_dump(mode='json'),
+                    'tool_stats': trace.tool_stats,
+                    'quality_report': _evidence_review_report(evidence_gaps),
+                    'warnings': list(dict.fromkeys([
+                        *generation.warnings, *trace.warnings, *_evidence_review_warnings(evidence_gaps),
+                    ])),
+                },
+            )
+            publish_terminal(generation)
+            return {
+                'generation_id': str(generation.pk), 'status': generation.status,
+                'progress': generation.progress, 'trace_schema_version': trace.schema_version,
+            }
+
+        # Confirmed evidence is durable; no browser replay is needed after this point.
         scenario = scenario.model_copy(update={'ambiguities': []})
 
         generation = transition_generation(
@@ -667,9 +715,30 @@ def run_v2_generation_from_trace(generation_id: str, *, celery_task_id: str | No
             current = WebUIScriptGeneration.objects.get(pk=generation_id)
             return {'generation_id': str(generation_id), 'status': current.status, 'skipped': True}
         scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
-        trace = ExplorationTrace.model_validate(generation.exploration_snapshot or {})
+        trace = assess_trace_coverage(
+            scenario, ExplorationTrace.model_validate(generation.exploration_snapshot or {}),
+        )
         if not trace_has_minimum_page_state(trace):
             return _safe_fail_generation(str(generation.pk), 'TRACE_RETRY_UNSAFE', '已保存探索轨迹不满足安全重试条件，未重新打开浏览器。')
+        evidence_gaps = required_trace_evidence_gaps(scenario, trace)
+        if evidence_gaps:
+            generation = transition_generation(
+                generation.pk,
+                WebUIScriptGeneration.Status.NEEDS_REVIEW,
+                progress=55,
+                error_code='EVIDENCE_INSUFFICIENT',
+                error_message='已保存探索轨迹缺少必需步骤证据，未重新生成脚本。',
+                updates={
+                    'exploration_snapshot': trace.model_dump(mode='json'),
+                    'tool_stats': trace.tool_stats,
+                    'quality_report': _evidence_review_report(evidence_gaps),
+                    'warnings': list(dict.fromkeys([
+                        *generation.warnings, *trace.warnings, *_evidence_review_warnings(evidence_gaps),
+                    ])),
+                },
+            )
+            publish_terminal(generation)
+            return {'generation_id': str(generation.pk), 'status': generation.status, 'trace_only': True}
         model_manager = get_llm_manager(config_id=generation.model_info['config_id'])
         generator = ScriptGenerator(model_manager.current_llm)
         publish_stage_changed(generation, '根据探索轨迹重新生成脚本')

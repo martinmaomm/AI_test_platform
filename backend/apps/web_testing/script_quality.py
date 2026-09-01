@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import builtins
 import io
+import json
 import re
 import tokenize
 from typing import Any
 
 from .generation_contracts import ScenarioSpec
-from .exploration_trace import ExplorationTrace, coerce_trace
+from .exploration_trace import ElementEvidence, ExplorationTrace, coerce_trace, ensure_element_evidence
 from .generation_security import SENSITIVE_KEY_RE, find_suspected_credentials, redact_metadata
 from .script_contract import ScriptContractError, normalize_for_storage
 
@@ -23,6 +24,7 @@ LOCATOR_NAMES = {
     'locator', 'get_by_role', 'get_by_text', 'get_by_label', 'get_by_placeholder',
     'get_by_test_id', 'get_by_alt_text', 'get_by_title',
 }
+_LOCATOR_CHAIN_NAMES = LOCATOR_NAMES | {'filter', 'nth'}
 MUTATION_WORDS = ('create', 'update', 'delete', '新增', '编辑', '删除', '保存', '提交')
 SENSITIVE_LITERAL_RE = re.compile(r'(?i)(password|passwd|token|secret|api[_ -]?key)\s*[:=]\s*[\'\"]')
 ABSOLUTE_URL_RE = re.compile(r'(?i)https?://')
@@ -164,27 +166,77 @@ def _exact_text_locator(node: ast.Call) -> bool:
     )
 
 
-def _locator_literals(node: ast.Call) -> list[str]:
-    values: list[str] = []
+def _normalised_locator_value(node: ast.AST) -> str | bool | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bool)):
+        if isinstance(node.value, str):
+            return re.sub(r'\baits-explore-[a-zA-Z0-9-]+-[a-f0-9]{12}\b', '{run_id}', node.value)
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue) and isinstance(value.value, ast.Name) and value.value.id == 'run_id':
+                parts.append('{run_id}')
+            else:
+                return None
+        return ''.join(parts)
+    return None
+
+
+def _locator_signature(method: str, args: list[str | bool], kwargs: dict[str, str | bool]) -> str:
+    return json.dumps({
+        'method': method,
+        'args': args,
+        'kwargs': {key: kwargs[key] for key in sorted(kwargs)},
+    }, ensure_ascii=False, separators=(',', ':'))
+
+
+def _evidence_locator_signature(evidence: ElementEvidence) -> str:
+    method = {
+        'css': 'locator', 'role': 'get_by_role', 'text': 'get_by_text',
+        'label': 'get_by_label', 'placeholder': 'get_by_placeholder', 'testid': 'get_by_test_id',
+    }[evidence.locator_kind]
+    kwargs = {
+        str(key): value for key, value in evidence.locator_kwargs.items()
+        if isinstance(value, (str, bool))
+    }
+    return _locator_signature(method, [evidence.locator_value], kwargs)
+
+
+def _script_locator_signature(node: ast.Call) -> str | None:
+    method = _call_name(node)
+    if method not in LOCATOR_NAMES:
+        return None
+    if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Call):
+        # Chained filters/nth calls alter the locator structure. ElementEvidence
+        # is deliberately one locator contract, so such a chain needs its own
+        # recorded evidence rather than inheriting the base locator's approval.
+        return None
+    args: list[str | bool] = []
     for argument in node.args:
-        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-            values.append(argument.value.strip())
+        value = _normalised_locator_value(argument)
+        if value is None:
+            return None
+        args.append(value)
+    kwargs: dict[str, str | bool] = {}
     for keyword in node.keywords:
-        if keyword.arg == 'exact':
-            continue
-        if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
-            values.append(keyword.value.value.strip())
-    return [value for value in values if value]
+        if keyword.arg is None:
+            return None
+        value = _normalised_locator_value(keyword.value)
+        if value is None:
+            return None
+        kwargs[keyword.arg] = value
+    return _locator_signature(method, args, kwargs)
 
 
-def _successful_trace_text(trace: ExplorationTrace) -> str:
-    chunks: list[str] = []
-    for event in trace.events:
-        if event.status != 'succeeded':
-            continue
-        chunks.extend(str(value) for value in event.locator.values())
-        chunks.append(event.output_excerpt)
-    return '\n'.join(chunks).lower()
+def _outermost_locator_call(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bool:
+    parent = parents.get(node)
+    return not (
+        isinstance(parent, ast.Attribute)
+        and isinstance(parents.get(parent), ast.Call)
+        and _call_name(parents[parent]) in _LOCATOR_CHAIN_NAMES
+    )
 
 
 def _core_pass_checks(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -217,7 +269,7 @@ def evaluate_script(
     snapshot: Any = None,
 ) -> dict[str, Any]:
     """Return only safe, structured and user-readable static findings."""
-    trace = coerce_trace(trace or snapshot)
+    trace = ensure_element_evidence(coerce_trace(trace or snapshot))
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     source = str(script or '')
@@ -254,7 +306,16 @@ def evaluate_script(
     action_count = 0
     used_action_comments: set[int] = set()
     used_assertion_comments: set[int] = set()
-    successful_trace_text = _successful_trace_text(trace)
+    evidence_signatures = {
+        _evidence_locator_signature(item)
+        for item in trace.element_evidence
+        if item.stability in {'stable', 'acceptable'}
+    }
+    parents = {
+        child: node
+        for node in ast.walk(tree)
+        for child in ast.iter_child_nodes(node)
+    }
     locator_issue_lines: set[int] = set()
 
     for node in ast.walk(tree):
@@ -270,10 +331,12 @@ def evaluate_script(
                 warnings.append(_issue('warning', 'FIXED_WAIT', '脚本包含固定等待，建议替换为可观察的页面断言。', line=node.lineno))
             if name == 'get_by_text' and not _exact_text_locator(node):
                 warnings.append(_issue('warning', 'AMBIGUOUS_TEXT_LOCATOR', '文本定位器可能匹配多个元素，建议结合 role 或稳定属性。', line=node.lineno))
-            if name in LOCATOR_NAMES and successful_trace_text:
-                literals = _locator_literals(node)
-                if literals and not any(value.lower() in successful_trace_text for value in literals):
+            if name in LOCATOR_NAMES and _outermost_locator_call(node, parents):
+                signature = _script_locator_signature(node)
+                if signature is None or signature not in evidence_signatures:
                     locator_issue_lines.add(node.lineno)
+            if name in {'filter', 'nth'}:
+                locator_issue_lines.add(node.lineno)
             if _is_expect_assertion(node):
                 expect_count += 1
                 if not _consume_comment(comments, used_assertion_comments, node.lineno, r'断言\s*\d+\s*[:：]'):
@@ -323,7 +386,7 @@ def evaluate_script(
     for line in sorted(locator_issue_lines):
         blockers.append(_issue(
             'blocker', 'LOCATOR_NOT_IN_TRACE',
-            '脚本使用了未在成功探索轨迹中出现的定位信息，请人工检查。', line=line,
+            '脚本定位器未精确对应稳定的成功元素证据，请人工检查。', line=line,
         ))
 
     missing_steps = [

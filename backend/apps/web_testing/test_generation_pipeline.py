@@ -30,7 +30,7 @@ from .generation_contracts import (
     parse_scenario_spec_json,
     validate_snapshot_against_scenario,
 )
-from .generation_orchestrator import run_v2_generation
+from .generation_orchestrator import run_v2_generation, run_v2_generation_from_trace
 from .generation_repository import claim_trace_generation_retry, prepare_trace_generation_retry
 from .generation_preflight import (
     prepare_playwright_mcp_output_config,
@@ -1128,7 +1128,7 @@ async def run(page):
     # 步骤 1：进入用户列表
     await page.goto('/users')
     # 断言 1：确认用户列表可见
-    await expect(page.get_by_role('heading')).to_be_visible()
+    await expect(page.get_by_role('heading', name='用户列表')).to_be_visible()
 '''
 
         fake_manager = SimpleNamespace(current_llm=object())
@@ -1149,7 +1149,7 @@ async def run(page):
         self.assertIn('async def run(page)', generation.script_draft)
         self.assertNotIn('https://', json.dumps(generation.exploration_snapshot))
 
-    def test_orchestrator_keeps_a_reviewable_draft_when_trace_cannot_cover_every_step(self):
+    def test_orchestrator_stops_before_generation_when_trace_cannot_cover_every_step(self):
         generation = self.make_generation()
         unresolved_question = '页面中存在两个同名用户模块，无法确定业务归属。'
 
@@ -1168,10 +1168,13 @@ async def run(page):
                 )
 
         class DraftGenerator:
+            generate_calls = 0
+
             def __init__(self, _model):
                 pass
 
             def generate(self, **kwargs):
+                type(self).generate_calls += 1
                 return '''"""场景：查询用户列表。目标：验证列表可见。前置条件：无。清理策略：无需清理。"""
 from playwright.async_api import expect
 
@@ -1200,8 +1203,13 @@ async def run(page):
 
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
-        self.assertEqual(generation.error_code, 'QUALITY_GATE_BLOCKED')
-        self.assertIn('async def run(page)', generation.script_draft)
+        self.assertEqual(generation.error_code, 'EVIDENCE_INSUFFICIENT')
+        self.assertEqual(DraftGenerator.generate_calls, 0)
+        self.assertFalse(generation.script_draft)
+        self.assertTrue(any(
+            item['code'] == 'TRACE_STEP_EVIDENCE_MISSING'
+            for item in generation.quality_report['blockers']
+        ))
 
     def test_orchestrator_honours_cancel_before_model_or_mcp_work(self):
         generation = self.make_generation()
@@ -1310,15 +1318,15 @@ async def run(page):
         self.assertEqual(generation.tool_stats['total_tool_calls'], 1)
         self.assertEqual(generation.tool_stats['termination_reason'], 'TASK_CANCELLED')
 
-    def test_soft_exploration_timeout_uses_partial_trace_and_keeps_reviewable_draft(self):
+    def test_soft_exploration_timeout_without_step_evidence_stops_before_generation(self):
         generation = self.make_generation()
         partial_trace = ExplorationTrace(
             start_path='/',
             events=[ExplorationEvent(
                 sequence=1, tool_name='playwright_navigate', category='navigate',
-                status='succeeded', relative_path='/users', output_excerpt='权限菜单 用户列表',
+                status='succeeded', relative_path='/dashboard', output_excerpt='系统首页',
             )],
-            observed_paths=['/users'],
+            observed_paths=['/dashboard'],
             tool_stats={'total_tool_calls': 1, 'failed_tool_calls': 0},
             termination_reason='exploration_timeout',
         )
@@ -1338,15 +1346,7 @@ async def run(page):
                 pass
 
             def generate(self, **kwargs):
-                return '''"""场景：查询用户列表。目标：验证列表可见。前置条件：无。清理策略：无需清理。"""
-from playwright.async_api import expect
-
-async def run(page):
-    # 步骤 1：进入用户列表
-    await page.goto('/users')
-    # 断言 1：确认用户列表可见
-    await expect(page.get_by_text('用户列表', exact=True)).to_be_visible()
-'''
+                raise AssertionError('缺少证据时不得调用脚本生成器')
 
             def repair(self, **kwargs):
                 return kwargs['script']
@@ -1362,8 +1362,8 @@ async def run(page):
 
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
-        self.assertEqual(generation.error_code, 'EXPLORATION_PARTIAL')
-        self.assertIn('async def run(page)', generation.script_draft)
+        self.assertEqual(generation.error_code, 'EVIDENCE_INSUFFICIENT')
+        self.assertFalse(generation.script_draft)
         self.assertEqual(generation.exploration_snapshot['schema_version'], 2)
 
     def test_trace_only_retry_accepts_all_model_service_error_codes(self):
@@ -1390,6 +1390,40 @@ async def run(page):
                 self.assertEqual(prepared.revision, generation.revision + 1)
                 self.assertIsNotNone(claim_trace_generation_retry(prepared.pk, 'trace-retry-task'))
                 self.assertIsNone(claim_trace_generation_retry(prepared.pk, 'trace-retry-task'))
+
+    def test_trace_only_retry_keeps_missing_evidence_in_review_without_calling_generator(self):
+        trace = ExplorationTrace(
+            start_path='/',
+            events=[ExplorationEvent(
+                sequence=1, tool_name='playwright_navigate', category='navigate',
+                status='succeeded', relative_path='/dashboard', output_excerpt='系统首页',
+            )],
+            observed_paths=['/dashboard'],
+        ).model_dump(mode='json')
+        generation = self.make_generation(
+            status=WebUIScriptGeneration.Status.FAILED,
+            current_stage=WebUIScriptGeneration.Stage.GENERATING,
+            error_code='MODEL_SERVICE_ERROR', scenario_spec=scenario_payload(),
+            exploration_snapshot=trace,
+        )
+        prepared = prepare_trace_generation_retry(generation.pk, expected_revision=generation.revision)
+
+        class Generator:
+            def __init__(self, _model):
+                raise AssertionError('trace-only retry must not generate without evidence')
+
+        with patch('web_testing.generation_orchestrator.get_llm_manager') as manager, patch(
+            'web_testing.generation_orchestrator.ScriptGenerator', Generator,
+        ), patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = run_v2_generation_from_trace(str(prepared.pk), celery_task_id='trace-only-evidence-task')
+
+        manager.assert_not_called()
+        prepared.refresh_from_db()
+        self.assertEqual(result, {
+            'generation_id': str(prepared.pk), 'status': WebUIScriptGeneration.Status.NEEDS_REVIEW,
+            'trace_only': True,
+        })
+        self.assertEqual(prepared.error_code, 'EVIDENCE_INSUFFICIENT')
 
     def test_orchestrator_passes_persisted_exploration_timeout_to_explorer(self):
         generation = self.make_generation(exploration_timeout_seconds=900)

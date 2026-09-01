@@ -104,6 +104,9 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         prompt = str(llm.invoke.call_args)
         self.assertIn('不得调用 MCP', prompt)
         self.assertNotIn('secret', prompt)
+        generator_payload = json.loads(llm.invoke.call_args.args[0][1].content)
+        self.assertIn('element_evidence', generator_payload['exploration_trace'])
+        self.assertNotIn('events', generator_payload['exploration_trace'])
         report = evaluate_script(script, scenario=scenario, snapshot=snapshot)
         self.assertFalse(report['blockers'])
         invalid = 'async def run(page):\n    await page.goto("/")\n'
@@ -267,6 +270,22 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         fuzzy = exact.replace(', exact=True', '')
         fuzzy_report = evaluate_script(fuzzy, scenario=scenario, snapshot=snapshot)
         self.assertTrue(any(item['code'] == 'AMBIGUOUS_TEXT_LOCATOR' for item in fuzzy_report['warnings']))
+
+    def test_quality_requires_an_exact_locator_signature_from_stable_evidence(self):
+        scenario = ScenarioSpec.model_validate(scenario_payload())
+        data = snapshot_payload()
+        data['elements'][0]['candidate_locators'] = ['page.get_by_text("用户列表", exact=True)']
+        snapshot = ExplorationSnapshot.model_validate(data)
+        exact = VALID_SCRIPT.replace(
+            "page.get_by_role('heading')", "page.get_by_text('用户列表', exact=True)",
+        )
+        changed_semantics = exact.replace(', exact=True', '')
+
+        exact_report = evaluate_script(exact, scenario=scenario, snapshot=snapshot)
+        changed_report = evaluate_script(changed_semantics, scenario=scenario, snapshot=snapshot)
+
+        self.assertFalse(any(item['code'] == 'LOCATOR_NOT_IN_TRACE' for item in exact_report['blockers']))
+        self.assertTrue(any(item['code'] == 'LOCATOR_NOT_IN_TRACE' for item in changed_report['blockers']))
 
     def test_quality_report_has_deduplicated_checks_and_summary_counts(self):
         report = evaluate_script(

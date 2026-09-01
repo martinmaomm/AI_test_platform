@@ -83,7 +83,10 @@ class Phase45Base(TestCase):
         values = {
             'project': self.project, 'user': self.user, 'environment': self.environment,
             'description_safe': '查询用户列表。', 'target_url_safe': 'https://web.example.test/',
-            'model_info': {'config_id': self.model.id, 'provider': 'openai', 'model_name': 'model'},
+            'model_info': {
+                'config_id': self.model.id, 'provider': 'openai',
+                'provider_name': 'OpenAI 企业网关', 'model_name': 'model',
+            },
         }
         values.update(overrides)
         return WebUIScriptGeneration.objects.create(**values)
@@ -299,6 +302,7 @@ class SaveAndRunnerTests(Phase45Base):
         case = WebUITestCase.objects.get(pk=first.data['data']['test_case_id'])
         self.assertEqual(case.script_version, 1)
         self.assertNotIn('secret', str(case.generation_metadata))
+        self.assertEqual(case.generation_metadata['model']['provider_name'], 'OpenAI 企业网关')
         request = self.factory.post('/save/', {}, format='json')
         force_authenticate(request, user=self.user)
         second = WebUIScriptGenerationSaveView.as_view()(request, project_id=self.project.id, generation_id=generation.pk)

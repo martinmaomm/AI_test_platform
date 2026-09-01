@@ -8,11 +8,11 @@
 
 <script setup>
 import { computed } from 'vue'
-import { buildGenerationTimeline, generationStatusLabel, isPausedGeneration } from '@/composables/webUIScriptGenerationPresentation'
+import { buildGenerationTimeline, generationStatusLabel, isPausedGeneration, modelInfoLabel } from '@/composables/webUIScriptGenerationPresentation'
 const props = defineProps({ generation: { type: Object, default: null } })
 const timeline = computed(() => buildGenerationTimeline(props.generation))
 const activeIndex = computed(() => Math.max(0, timeline.value.findIndex(item => item.state === 'process')))
-const modelName = computed(() => { const model = props.generation?.model_info || {}; return model.model_name ? `${model.provider || 'LLM'} · ${model.model_name}` : '' })
+const modelName = computed(() => modelInfoLabel(props.generation?.model_info, ''))
 const progressStatus = computed(() => props.generation?.status === 'failed' ? 'exception' : props.generation?.status === 'cancelled' || isPausedGeneration(props.generation?.status) ? 'warning' : '')
 const stepProcessStatus = computed(() => props.generation?.status === 'failed' ? 'error' : 'process')
 const statusTagType = computed(() => props.generation?.status === 'failed' ? 'danger' : ['ready_with_warnings', 'needs_review'].includes(props.generation?.status) || isPausedGeneration(props.generation?.status) ? 'warning' : props.generation?.status === 'ready' ? 'success' : 'info')

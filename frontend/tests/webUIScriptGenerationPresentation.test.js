@@ -6,8 +6,21 @@ import {
   generationResolutionHint,
   explorationCleanupPresentation,
   isCurrentRevisionVerified,
-  isWorkspaceActive
+  isWorkspaceActive,
+  modelConfigurationLabel,
+  modelInfoLabel
 } from '../src/composables/webUIScriptGenerationPresentation.js'
+
+test('model labels prefer the editable provider name and preserve historic provider fallback', () => {
+  assert.equal(
+    modelConfigurationLabel({ provider: 'openai', provider_name: 'OpenAI 企业网关', model_name: 'gpt-4.1' }),
+    'OpenAI 企业网关 · gpt-4.1'
+  )
+  assert.equal(modelConfigurationLabel({ provider: 'openai', model_name: 'gpt-4.1' }), 'openai · gpt-4.1')
+  assert.equal(modelInfoLabel({ provider: 'openai', model_name: 'legacy-model' }), 'openai · legacy-model')
+  assert.equal(modelInfoLabel({ provider_name: '内部模型', model_name: 'current-model' }), '内部模型 · current-model')
+  assert.equal(modelInfoLabel({ provider: 'openai' }), '—')
+})
 
 test('only business-decision targets become clarification questions', () => {
   const action = generationActionRequired({

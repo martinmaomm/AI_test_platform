@@ -14,7 +14,7 @@ class LLMConfigurationSerializer(serializers.ModelSerializer):
     class Meta:
         model = LLMConfiguration
         fields = [
-            'id', 'model_type', 'model_type_display', 'provider', 'provider_display', 'is_active',
+            'id', 'model_type', 'model_type_display', 'provider', 'provider_name', 'provider_display', 'is_active',
             'api_key', 'base_url', 'model_name', 'extra_config', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -78,7 +78,7 @@ class LLMConfigurationListSerializer(serializers.ModelSerializer):
     class Meta:
         model = LLMConfiguration
         fields = [
-            'id', 'model_type', 'model_type_display', 'provider', 'provider_display', 'is_active',
+            'id', 'model_type', 'model_type_display', 'provider', 'provider_name', 'provider_display', 'is_active',
             'api_key_masked', 'base_url', 'model_name', 'created_at', 'updated_at'
         ]
     
@@ -224,5 +224,4 @@ class VisionTestConnectionSerializer(serializers.Serializer):
     """测试视觉模型连接的序列化器"""
     
     config_id = serializers.IntegerField(required=True)
-
 

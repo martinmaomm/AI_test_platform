@@ -103,6 +103,7 @@ class GenerationPipelineBase(TestCase):
         self.model = LLMConfiguration.objects.create(
             model_type=ModelType.LLM, provider='openai', api_key='test-key',
             base_url='https://llm.example.test', model_name='locked-model',
+            provider_name='OpenAI 企业网关',
             is_active=True, created_by=self.user,
         )
         self.mcp = MCPConfiguration.objects.create(
@@ -1175,6 +1176,7 @@ class GenerationModelLockAPITests(GenerationPipelineBase):
         generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
         self.assertEqual(generation.model_info['config_id'], self.model.id)
         self.assertEqual(generation.model_info['model_name'], 'locked-model')
+        self.assertEqual(generation.model_info['provider_name'], 'OpenAI 企业网关')
         delay.assert_called_once_with(str(generation.pk))
 
     def test_api_rejects_disabled_requested_model_without_fallback(self):

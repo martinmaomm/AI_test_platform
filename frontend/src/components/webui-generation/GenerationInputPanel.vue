@@ -50,6 +50,7 @@
 <script setup>
 import { computed, reactive, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { modelConfigurationLabel } from '@/composables/webUIScriptGenerationPresentation'
 
 const EXAMPLE_DESCRIPTION = `目标：验证“权限 > 用户列表”的新增、查询、编辑和删除流程。
 
@@ -79,7 +80,7 @@ const flatModules = computed(() => flattenModules(props.modules))
 const selectedEnvironment = computed(() => props.environments.find(item => item.id === form.environmentId) || null)
 const selectedEnvironmentBaseUrl = computed(() => selectedEnvironment.value?.config?.base_url || selectedEnvironment.value?.base_url || '')
 const formValid = computed(() => form.environmentId !== null && form.modelConfigId !== null && Number.isInteger(Number(form.environmentId)) && form.startPath.startsWith('/') && form.description.trim().length > 0 && form.description.length <= 2000 && Number.isInteger(Number(form.modelConfigId)))
-const modelLabel = (model) => `${model.provider || 'LLM'} · ${model.model_name || '未命名模型'}`
+const modelLabel = modelConfigurationLabel
 watch(() => props.environments, (items) => { if (!items.some(item => item.id === form.environmentId)) form.environmentId = items[0]?.id || null }, { immediate: true, deep: true })
 watch(() => props.modelConfigs, (items) => { if (!items.some(item => item.id === form.modelConfigId)) form.modelConfigId = items[0]?.id || null }, { immediate: true, deep: true })
 watch(() => props.modules, (items) => {

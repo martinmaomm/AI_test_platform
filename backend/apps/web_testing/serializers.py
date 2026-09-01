@@ -188,6 +188,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
                 model_info={
                     'config_id': model_config.id,
                     'provider': model_config.provider,
+                    'provider_name': model_config.provider_name,
                     'model_name': model_config.model_name,
                 },
             )

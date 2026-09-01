@@ -52,7 +52,7 @@
                 <div class="config-title">
                   {{ scope.row.model_name }}
                 </div>
-                <div class="config-model">{{ scope.row.model_name }}</div>
+                <div class="config-model">提供商：{{ modelProviderLabel(scope.row) }} · 接口：{{ scope.row.provider || '—' }}</div>
               </div>
             </div>
           </template>
@@ -115,8 +115,8 @@
           </el-select>
         </el-form-item>
         
-        <el-form-item label="模型提供商" prop="provider">
-          <el-select v-model="modelConfigForm.provider" placeholder="选择模型提供商" style="width: 100%">
+        <el-form-item label="模型接口类型" prop="provider">
+          <el-select v-model="modelConfigForm.provider" placeholder="选择模型接口类型" style="width: 100%">
             <el-option label="OpenAI" value="openai" />
             <el-option label="DeepSeek" value="deepseek" />
             <el-option label="Ollama" value="ollama" />
@@ -125,6 +125,10 @@
             <el-option label="智谱AI" value="zhipu" />
             <el-option label="其他" value="other" />
           </el-select>
+        </el-form-item>
+
+        <el-form-item label="模型提供商" prop="provider_name">
+          <el-input v-model="modelConfigForm.provider_name" maxlength="100" show-word-limit placeholder="可选；留空时使用模型接口类型" />
         </el-form-item>
         
          <el-form-item label="API密钥" prop="api_key">
@@ -167,6 +171,7 @@ import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { Connection, Search, Plus } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
 import dayjs from 'dayjs'
+import { modelProviderLabel } from '@/composables/webUIScriptGenerationPresentation'
 import {
   getLLMConfigurations,
   createLLMConfiguration,
@@ -192,6 +197,7 @@ const configurations = ref([])
 const modelConfigForm = reactive({
   model_type: 'llm',
   provider: '',
+  provider_name: '',
   api_key: '',
   base_url: '',
   model_name: '',
@@ -204,7 +210,7 @@ const modelConfigRules = {
     { required: true, message: '请选择模型类型', trigger: 'change' }
   ],
   provider: [
-    { required: true, message: '请选择模型提供商', trigger: 'change' }
+    { required: true, message: '请选择模型接口类型', trigger: 'change' }
   ],
   api_key: [
     { 
@@ -249,9 +255,9 @@ const filteredConfigurations = computed(() => {
   let result = configurations.value
 
   if (searchQuery.value) {
-    result = result.filter(config => 
-      config.model_name.toLowerCase().includes(searchQuery.value.toLowerCase())
-    )
+    const query = searchQuery.value.toLowerCase()
+    result = result.filter(config => [config.model_name, config.provider_name, config.provider]
+      .some(value => String(value || '').toLowerCase().includes(query)))
   }
 
   if (modelTypeFilter.value) {
@@ -294,6 +300,7 @@ const loadConfigurations = async () => {
 
 const onModelTypeChange = () => {
   modelConfigForm.provider = ''
+  modelConfigForm.provider_name = ''
   modelConfigForm.api_key = ''
   modelConfigForm.model_name = ''
   modelConfigForm.base_url = ''
@@ -309,6 +316,7 @@ const addModelConfiguration = () => {
   resetForm(modelConfigForm, {
     model_type: 'llm',
     provider: '',
+    provider_name: '',
     api_key: '',
     base_url: '',
     model_name: '',
@@ -323,6 +331,7 @@ const editConfiguration = (config) => {
   resetForm(modelConfigForm, {
     model_type: config.model_type,
     provider: config.provider || '',
+    provider_name: config.provider_name || '',
     api_key: config.api_key || '',
     base_url: config.base_url,
     model_name: config.model_name,
@@ -366,6 +375,7 @@ const cancelModelEdit = () => {
   resetForm(modelConfigForm, {
     model_type: 'llm',
     provider: '',
+    provider_name: '',
     api_key: '',
     base_url: '',
     model_name: '',

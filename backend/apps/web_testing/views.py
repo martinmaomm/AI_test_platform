@@ -553,6 +553,7 @@ class WebUIScriptGenerationSaveView(APIView):
                     'variables_fingerprint': script_hash(__import__('json').dumps(workspace['variables'], ensure_ascii=False, sort_keys=True, separators=(',', ':'))),
                     'model': {
                         'provider': (generation.model_info or {}).get('provider', ''),
+                        'provider_name': (generation.model_info or {}).get('provider_name', ''),
                         'model_name': (generation.model_info or {}).get('model_name', ''),
                     },
                     'quality_status': (generation.quality_report or {}).get('status', ''),

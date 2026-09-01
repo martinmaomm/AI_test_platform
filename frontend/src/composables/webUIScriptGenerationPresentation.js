@@ -39,6 +39,19 @@ const STATUS_LABELS = {
 
 export const generationStatusLabel = (status) => STATUS_LABELS[status] || '状态未知'
 
+/** Prefer the optional display name while keeping historic records readable. */
+export const modelProviderLabel = (model, fallback = 'LLM') => (
+  model?.provider_name || model?.provider || fallback
+)
+
+export const modelConfigurationLabel = (model) => (
+  `${modelProviderLabel(model)} · ${model?.model_name || '未命名模型'}`
+)
+
+export const modelInfoLabel = (model, emptyLabel = '—') => (
+  model?.model_name ? `${modelProviderLabel(model)} · ${model.model_name}` : emptyLabel
+)
+
 export const generationStorageKey = (userId, projectId) => (
   `aits:webui-script-generation:v2:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
 )

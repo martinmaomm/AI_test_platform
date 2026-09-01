@@ -19,7 +19,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { generationResolutionHint, generationStatusLabel, isPausedGeneration } from '@/composables/webUIScriptGenerationPresentation'
+import { generationResolutionHint, generationStatusLabel, isPausedGeneration, modelInfoLabel } from '@/composables/webUIScriptGenerationPresentation'
 import GenerationScenarioSummary from './GenerationScenarioSummary.vue'
 import GenerationEvidence from './GenerationEvidence.vue'
 import GenerationQualityReport from './GenerationQualityReport.vue'
@@ -34,7 +34,7 @@ const statusLabel = computed(() => generationStatusLabel(props.generation?.statu
 const resolutionHint = computed(() => generationResolutionHint(props.generation))
 const hintType = computed(() => ['failed', 'needs_review', 'needs_confirmation', 'needs_credentials', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
 const canSave = computed(() => ['ready', 'ready_with_warnings', 'needs_review'].includes(props.generation?.status))
-const modelText = computed(() => { const model = props.generation?.model_info || {}; return model.model_name ? `${model.provider || 'LLM'} · ${model.model_name}` : '—' })
+const modelText = computed(() => modelInfoLabel(props.generation?.model_info))
 const toolStatsText = computed(() => { const stats = props.generation?.tool_stats || {}; return `调用 ${stats.total_tool_calls || 0} 次，失败 ${stats.failed_tool_calls || 0} 次${stats.duration_seconds ? `，耗时 ${stats.duration_seconds} 秒` : ''}` })
 const requestSave = async () => {
   try {

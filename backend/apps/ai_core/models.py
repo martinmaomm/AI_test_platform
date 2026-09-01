@@ -34,6 +34,12 @@ class LLMConfiguration(models.Model):
     )
     provider = models.CharField(
         max_length=20, 
+        verbose_name='模型接口类型'
+    )
+    provider_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
         verbose_name='模型提供商'
     )
     is_active = models.BooleanField(default=True, verbose_name='是否启用')
@@ -65,11 +71,11 @@ class LLMConfiguration(models.Model):
         ordering = ['-is_active', '-created_at']
     
     def __str__(self):
-        return f"{self.provider} - {self.model_name}"
+        return f"{self.get_provider_display()} - {self.model_name}"
     
     def get_provider_display(self):
         """获取提供商显示名称"""
-        return self.provider
+        return self.provider_name or self.provider
     
     def get_model_type_display(self):
         """获取模型类型显示名称"""
@@ -92,6 +98,7 @@ class LLMConfiguration(models.Model):
             'model_type': self.model_type,
             'model_type_display': self.get_model_type_display(),
             'provider': self.provider,
+            'provider_name': self.provider_name,
             'provider_display': self.get_provider_display(),
             'is_active': self.is_active,
             'api_key': self.api_key,
@@ -384,5 +391,4 @@ class MCPTool(models.Model):
     
     def __str__(self):
         return f"{self.name} ({self.mcp_config.name})"
-
 

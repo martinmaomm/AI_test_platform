@@ -48,7 +48,7 @@ def main():
         django.setup()
         from django.core.management import call_command
         from django.test.runner import DiscoverRunner
-        call_command('makemigrations', 'web_testing', dry_run=True, check=True, verbosity=1)
+        call_command('makemigrations', 'ai_core', 'web_testing', dry_run=True, check=True, verbosity=1)
         labels = sys.argv[1:] or [
             'ai_core.tests.test_webui_playwright_agent',
             'ai_core.tests.test_mcp_output_connections',

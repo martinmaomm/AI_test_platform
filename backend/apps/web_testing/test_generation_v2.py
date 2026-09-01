@@ -33,6 +33,7 @@ from .views import (
     WebUIScriptGenerationCreateView,
     WebUIScriptGenerationDetailView,
     WebUIScriptGenerationResolveView,
+    WebUIScriptGenerationSettingsView,
 )
 
 
@@ -94,7 +95,8 @@ class WebUIScriptGenerationV2BaseTestCase(TestCase):
 
 class WebUIScriptGenerationModelAndStateTests(WebUIScriptGenerationV2BaseTestCase):
     def test_model_defaults_are_safe_and_recoverable(self):
-        response = self.create_generation()
+        with patch('web_testing.serializers.exploration_total_timeout_seconds', return_value=600):
+            response = self.create_generation()
         generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
 
         self.assertEqual(generation.status, WebUIScriptGeneration.Status.CREATED)
@@ -107,6 +109,7 @@ class WebUIScriptGenerationModelAndStateTests(WebUIScriptGenerationV2BaseTestCas
         self.assertEqual(generation.revision, 0)
         self.assertEqual(generation.resume_count, 0)
         self.assertEqual(generation.clarifications, [])
+        self.assertEqual(generation.exploration_timeout_seconds, 600)
 
     def test_state_transition_rejects_skips_and_is_idempotent(self):
         generation_id = self.create_generation().data['data']['id']
@@ -194,6 +197,52 @@ class WebUIScriptGenerationSecurityTests(TestCase):
 
 
 class WebUIScriptGenerationAPITests(WebUIScriptGenerationV2BaseTestCase):
+    def test_create_persists_default_or_requested_exploration_timeout(self):
+        with patch('web_testing.serializers.exploration_total_timeout_seconds', return_value=720):
+            default_response = self.create_generation()
+        default_generation = WebUIScriptGeneration.objects.get(pk=default_response.data['data']['id'])
+        self.assertEqual(default_generation.exploration_timeout_seconds, 720)
+        self.assertEqual(default_response.data['data']['exploration_timeout_seconds'], 720)
+
+        with patch(
+            'web_testing.views.generate_webui_script_generation_v2_task.delay',
+            return_value=type('TaskResult', (), {'id': 'v2-generation-timeout-override-task-id'})(),
+        ):
+            requested_response = WebUIScriptGenerationCreateView.as_view()(
+                self.request('POST', '/script-generations/', {
+                    'description': '查询列表。', 'environment_id': self.environment.id,
+                    'start_path': '/', 'exploration_timeout_seconds': 900,
+                }),
+                project_id=self.project.id,
+            )
+        self.assertEqual(requested_response.status_code, 201, requested_response.data)
+        requested_generation = WebUIScriptGeneration.objects.get(pk=requested_response.data['data']['id'])
+        self.assertEqual(requested_generation.exploration_timeout_seconds, 900)
+
+    def test_create_rejects_out_of_range_exploration_timeout(self):
+        for timeout in (59, 1801):
+            response = WebUIScriptGenerationCreateView.as_view()(
+                self.request('POST', '/script-generations/', {
+                    'description': '查询列表。', 'environment_id': self.environment.id,
+                    'start_path': '/', 'exploration_timeout_seconds': timeout,
+                }),
+                project_id=self.project.id,
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn('exploration_timeout_seconds', response.data['error']['details'])
+
+    def test_settings_returns_server_default_under_project_read_permission(self):
+        with patch('web_testing.views.exploration_total_timeout_seconds', return_value=900):
+            response = WebUIScriptGenerationSettingsView.as_view()(
+                self.request('GET', '/script-generation-settings/'), project_id=self.project.id,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['data'], {
+            'exploration_timeout_seconds': 900,
+            'min_exploration_timeout_seconds': 60,
+            'max_exploration_timeout_seconds': 1800,
+        })
+
     def pause_generation(self, *, status, error_code, scenario_spec=None, warnings=None):
         generation_id = self.create_generation().data['data']['id']
         WebUIScriptGeneration.objects.filter(pk=generation_id).update(

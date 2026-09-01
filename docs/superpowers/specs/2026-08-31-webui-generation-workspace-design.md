@@ -44,7 +44,7 @@
 
 新增工作区 JSON 字段，迁移为 `0016_webuiscriptgeneration_workspace`，仅加字段，保留旧记录。先在 backend 虚拟环境执行 `python manage.py migrate web_testing`，然后重启后端和 Celery。前端开发模式刷新，生产模式重新构建。无需重装依赖。
 
-`backend/env.example` 新增可选的 `WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS=600`；实际 `.env` 未改动。未设置时沿用 `AITS_LLM_TIMEOUT_SECONDS`，再回退到 600 秒；探索总时限约束初次及一次定向补探索，关闭会话另留最多 10 秒。
+`backend/env.example` 提供 `WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS=600`。该值只控制探索阶段，与单次模型请求的 `AITS_LLM_TIMEOUT_SECONDS` 独立；未设置或非法时回退到 600 秒。探索总时限约束初次及一次定向补探索，关闭会话另留最多 10 秒。后续任务级覆盖与快照规则见 `2026-09-01-webui-exploration-timeout-configuration.md`。
 
 提交不含浏览器 ZIP，不自动 push。回退优先恢复本次提交前的应用代码，保留新增数据库列和数据，不执行破坏性逆向迁移。正在运行的新任务先等结束或由用户停止，避免新旧代码混跑。
 

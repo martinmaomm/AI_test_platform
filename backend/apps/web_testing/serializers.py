@@ -12,6 +12,11 @@ from .models import (
 )
 from .generation_repository import create_generation
 from .generation_preflight import exploration_requires_write_confirmation
+from .exploration_timeout import (
+    EXPLORATION_TIMEOUT_MAX_SECONDS,
+    EXPLORATION_TIMEOUT_MIN_SECONDS,
+    exploration_total_timeout_seconds,
+)
 from .generation_save_state import is_generation_saved
 from .generation_security import (
     GenerationInputSecurityError,
@@ -53,7 +58,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id',
             'module_id', 'module_name', 'is_saved',
             'celery_task_id', 'status', 'current_stage', 'progress',
-            'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
+            'start_path', 'target_url_safe', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'workspace',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
@@ -65,7 +70,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id',
             'module_id', 'module_name', 'is_saved',
             'celery_task_id', 'status', 'current_stage', 'progress',
-            'start_path', 'target_url_safe', 'description_safe', 'scenario_spec',
+            'start_path', 'target_url_safe', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'workspace',
             'model_info', 'tool_stats', 'repair_count', 'credentials_required',
@@ -84,6 +89,11 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
     url = serializers.CharField(max_length=1000, required=False, allow_blank=False, write_only=True)
     module_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     model_config_id = serializers.IntegerField(min_value=1, required=False, write_only=True)
+    exploration_timeout_seconds = serializers.IntegerField(
+        min_value=EXPLORATION_TIMEOUT_MIN_SECONDS,
+        max_value=EXPLORATION_TIMEOUT_MAX_SECONDS,
+        required=False,
+    )
     temporary_credentials = serializers.DictField(required=False, write_only=True)
 
     def validate_temporary_credentials(self, value):
@@ -168,6 +178,9 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
         start_path = validated_data.pop('normalized_start_path')
         base_url = validated_data.pop('base_url')
         model_config = validated_data.pop('model_config')
+        exploration_timeout_seconds = validated_data.pop('exploration_timeout_seconds', None)
+        if exploration_timeout_seconds is None:
+            exploration_timeout_seconds = exploration_total_timeout_seconds()
         validated_data.pop('environment_id', None)
         validated_data.pop('module_id', None)
         validated_data.pop('url', None)
@@ -184,6 +197,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
                 start_path=start_path,
                 target_url_safe=build_safe_target_url(base_url, start_path),
                 description_safe=redact_text(description),
+                exploration_timeout_seconds=exploration_timeout_seconds,
                 credentials_provided=credentials is not None,
                 model_info={
                     'config_id': model_config.id,

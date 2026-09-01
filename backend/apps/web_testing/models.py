@@ -275,6 +275,11 @@ class WebUIScriptGeneration(models.Model):
     start_path = models.CharField(max_length=500, default='/', verbose_name='环境内起始路径')
     target_url_safe = models.TextField(blank=True, default='', verbose_name='脱敏目标地址')
     description_safe = models.TextField(blank=True, default='', verbose_name='脱敏场景描述')
+    exploration_timeout_seconds = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        verbose_name='页面探索总超时时间（秒）',
+    )
     scenario_spec = models.JSONField(default=dict, blank=True, verbose_name='规范化场景')
     exploration_snapshot = models.JSONField(default=dict, blank=True, verbose_name='探索证据')
     script_draft = models.TextField(blank=True, default='', verbose_name='脚本草稿')

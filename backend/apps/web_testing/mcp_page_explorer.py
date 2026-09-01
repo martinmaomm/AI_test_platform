@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -26,6 +25,7 @@ from .exploration_output import (
     output_summary,
     parse_exploration_output,
 )
+from .exploration_timeout import exploration_total_timeout_seconds
 from .generation_contracts import (
     ExplorationToolStats,
     ExplorationSnapshot,
@@ -73,20 +73,6 @@ READ_ONLY_DISABLED_TOOL_MESSAGES = {
 }
 
 EXPLORATION_TOTAL_MODEL_STEPS = MCP_MAX_STEPS
-
-
-def exploration_total_timeout_seconds() -> float:
-    """Use the established LLM timeout unless the WebUI override is configured."""
-    raw_value = (
-        os.getenv('WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS')
-        or os.getenv('AITS_LLM_TIMEOUT_SECONDS')
-        or '600'
-    )
-    try:
-        return float(min(1800, max(60, int(raw_value))))
-    except (TypeError, ValueError):
-        logger.warning('Invalid exploration timeout configuration; using 600 seconds.')
-        return 600.0
 
 
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
@@ -275,12 +261,18 @@ class MCPPageExplorer:
         cancel_check: Callable[[], bool] | None = None,
         generation_id: str | None = None,
         user_constraints: str | None = None,
+        exploration_timeout_seconds: float | None = None,
     ):
         self.llm_model = llm_model
         self.mcp_config = mcp_config
         self.cancel_check = cancel_check or (lambda: False)
         self.generation_id = generation_id
         self.user_constraints = str(user_constraints or '')
+        self.exploration_timeout_seconds = (
+            exploration_total_timeout_seconds()
+            if exploration_timeout_seconds is None
+            else float(exploration_timeout_seconds)
+        )
         self.output_generation_id = validate_generation_output_id(generation_id)
         self.policy = ExplorationPolicy.read_only()
         self.guard = ReadOnlyMCPBrowserToolGuard(MCP_BROWSER_TOOL_CALL_LIMIT, policy=self.policy)
@@ -352,7 +344,7 @@ class MCPPageExplorer:
             raise self._failure('TASK_CANCELLED', '用户已取消任务。', 0)
         self._configure_policy(scenario)
         self._active_start_path = start_path
-        deadline = time.monotonic() + exploration_total_timeout_seconds()
+        deadline = time.monotonic() + self.exploration_timeout_seconds
         client = None
         snapshot: ExplorationSnapshot | None = None
         try:

@@ -1150,6 +1150,52 @@ async def run(page):
         self.assertEqual(generation.tool_stats['total_tool_calls'], 1)
         self.assertEqual(generation.tool_stats['termination_reason'], 'TASK_CANCELLED')
 
+    def test_orchestrator_passes_persisted_exploration_timeout_to_explorer(self):
+        generation = self.make_generation(exploration_timeout_seconds=900)
+
+        class CancelledExplorer:
+            init_kwargs = None
+
+            def __init__(self, **kwargs):
+                type(self).init_kwargs = kwargs
+
+            async def explore(self, **kwargs):
+                raise MCPPageExplorerError('TASK_CANCELLED', '用户已取消任务。')
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
+            'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_orchestrator.MCPPageExplorer', CancelledExplorer), patch(
+            'web_testing.generation_orchestrator.publish_stage_changed'
+        ), patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = run_v2_generation(str(generation.pk), celery_task_id='persisted-timeout-task')
+
+        self.assertEqual(result['status'], 'cancelled')
+        self.assertEqual(CancelledExplorer.init_kwargs['exploration_timeout_seconds'], 900)
+
+    def test_orchestrator_uses_server_default_for_historic_null_timeout(self):
+        generation = self.make_generation(exploration_timeout_seconds=None)
+
+        class CancelledExplorer:
+            init_kwargs = None
+
+            def __init__(self, **kwargs):
+                type(self).init_kwargs = kwargs
+
+            async def explore(self, **kwargs):
+                raise MCPPageExplorerError('TASK_CANCELLED', '用户已取消任务。')
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=ScenarioSpec.model_validate(scenario_payload())), patch(
+            'web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_orchestrator.MCPPageExplorer', CancelledExplorer), patch(
+            'web_testing.generation_orchestrator.exploration_total_timeout_seconds', return_value=840,
+        ), patch('web_testing.generation_orchestrator.publish_stage_changed'), patch(
+            'web_testing.generation_orchestrator.publish_terminal'
+        ):
+            result = run_v2_generation(str(generation.pk), celery_task_id='historic-timeout-task')
+
+        self.assertEqual(result['status'], 'cancelled')
+        self.assertEqual(CancelledExplorer.init_kwargs['exploration_timeout_seconds'], 840)
+
     def test_task_signature_only_accepts_generation_id(self):
         parameters = list(inspect.signature(generate_webui_script_generation_v2_task.run).parameters)
         self.assertEqual(parameters, ['generation_id'])

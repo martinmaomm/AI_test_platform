@@ -7,6 +7,7 @@ app_name = 'web_testing'
 
 urlpatterns = [
     # AI + Playwright MCP script generation.
+    path('script-generation-settings/', views.WebUIScriptGenerationSettingsView.as_view(), name='script-generation-settings'),
     path('script-generations/', views.WebUIScriptGenerationCreateView.as_view(), name='script-generation-create'),
     path('script-generations/<uuid:generation_id>/', views.WebUIScriptGenerationDetailView.as_view(), name='script-generation-detail'),
     path('script-generations/<uuid:generation_id>/cancel/', views.WebUIScriptGenerationCancelView.as_view(), name='script-generation-cancel'),

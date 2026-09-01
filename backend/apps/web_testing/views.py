@@ -29,6 +29,11 @@ from .execution_variables import (
     pop_runtime_variables,
     store_runtime_variables,
 )
+from .exploration_timeout import (
+    EXPLORATION_TIMEOUT_MAX_SECONDS,
+    EXPLORATION_TIMEOUT_MIN_SECONDS,
+    exploration_total_timeout_seconds,
+)
 from .generation_events import publish_terminal
 from .generation_repository import (
     GenerationResolutionConflict,
@@ -165,6 +170,23 @@ class WebUIScriptGenerationCreateView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+class WebUIScriptGenerationSettingsView(APIView):
+    """Return server-side defaults that are safe for a project member to use."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(READ)
+    def get(self, request, project_id):
+        return Response({
+            'success': True,
+            'data': {
+                'exploration_timeout_seconds': int(exploration_total_timeout_seconds()),
+                'min_exploration_timeout_seconds': EXPLORATION_TIMEOUT_MIN_SECONDS,
+                'max_exploration_timeout_seconds': EXPLORATION_TIMEOUT_MAX_SECONDS,
+            },
+        })
 
 
 class WebUIScriptGenerationDetailView(APIView):

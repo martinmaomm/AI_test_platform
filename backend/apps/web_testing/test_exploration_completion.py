@@ -15,8 +15,8 @@ from .mcp_page_explorer import (
     MCPPageExplorer,
     MCPPageExplorerError,
     ReadOnlyMCPBrowserToolGuard,
-    exploration_total_timeout_seconds,
 )
+from .exploration_timeout import exploration_total_timeout_seconds
 from .exploration_policy import ExplorationPolicy
 
 
@@ -488,10 +488,12 @@ class ExplorerContinuationTests(SimpleTestCase):
         self.assertNotIn('tool_stats', schema['properties'])
         self.assertNotIn('checkpoints', schema['properties'])
 
-    def test_exploration_timeout_defaults_to_existing_llm_timeout_and_accepts_override(self):
-        with patch.dict('os.environ', {'AITS_LLM_TIMEOUT_SECONDS': '750'}, clear=False):
-            self.assertEqual(exploration_total_timeout_seconds(), 750.0)
-        with patch.dict('os.environ', {
-            'AITS_LLM_TIMEOUT_SECONDS': '750', 'WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS': '900',
-        }, clear=False):
-            self.assertEqual(exploration_total_timeout_seconds(), 900.0)
+    def test_exploration_timeout_is_independent_from_llm_timeout_and_clamped(self):
+        with patch.dict('os.environ', {'AITS_LLM_TIMEOUT_SECONDS': '750'}, clear=True):
+            self.assertEqual(exploration_total_timeout_seconds(), 600.0)
+        with patch.dict('os.environ', {'WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS': 'invalid'}, clear=True):
+            self.assertEqual(exploration_total_timeout_seconds(), 600.0)
+        with patch.dict('os.environ', {'WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS': '30'}, clear=True):
+            self.assertEqual(exploration_total_timeout_seconds(), 60.0)
+        with patch.dict('os.environ', {'WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS': '3600'}, clear=True):
+            self.assertEqual(exploration_total_timeout_seconds(), 1800.0)

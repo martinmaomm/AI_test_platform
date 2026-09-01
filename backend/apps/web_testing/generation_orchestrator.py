@@ -17,6 +17,7 @@ from .generation_contracts import (
     validate_snapshot_against_scenario,
 )
 from .exploration_completion import assess_exploration_completion, can_request_user_decision
+from .exploration_timeout import exploration_total_timeout_seconds
 from .generation_events import publish_stage_changed, publish_terminal
 from .generation_preflight import run_safety_preflight
 from .generation_repository import (
@@ -437,6 +438,11 @@ def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) 
             cancel_check=lambda: bool(celery_task_id and cache.get(f'celery:cancel:{celery_task_id}')),
             generation_id=str(generation.pk),
             user_constraints=_normalization_description(generation),
+            exploration_timeout_seconds=(
+                generation.exploration_timeout_seconds
+                if generation.exploration_timeout_seconds is not None
+                else exploration_total_timeout_seconds()
+            ),
         )
         explore_until_complete = getattr(explorer, 'explore_until_complete', None)
         if explore_until_complete is None:

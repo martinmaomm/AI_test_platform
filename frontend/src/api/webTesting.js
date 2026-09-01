@@ -50,6 +50,9 @@ export const batchUpdateWebUITestCases = async (projectId, caseIds, updateData) 
 export const createWebUIScriptGeneration = async (projectId, data) =>
   (await api.post(`${base(projectId)}/script-generations/`, data)).data
 
+export const getWebUIScriptGenerationSettings = async (projectId) =>
+  (await api.get(`${base(projectId)}/script-generation-settings/`)).data
+
 export const getWebUIScriptGeneration = async (projectId, generationId) =>
   (await api.get(`${base(projectId)}/script-generations/${generationId}/`)).data
 

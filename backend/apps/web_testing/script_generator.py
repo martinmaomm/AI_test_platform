@@ -17,7 +17,7 @@ from .exploration_trace import ExplorationTrace, coerce_trace, successful_trace_
 from .generation_security import redact_exploration_metadata, redact_metadata, redact_text
 
 
-SCRIPT_GENERATION_MAX_TOKENS = 4096
+SCRIPT_GENERATION_MAX_TOKENS = 8192
 
 
 class ScriptGeneratorOutputError(ValueError):
@@ -74,11 +74,6 @@ def _response_text(value: Any) -> str:
     return _content_text(value, separator='\n')
 
 
-def _stream_chunk_text(value: Any) -> str:
-    """Extract one incremental chunk without adding whitespace between tokens."""
-    return _content_text(value, separator='')
-
-
 def _strip_code_fences(value: Any) -> str:
     text = _response_text(value).strip()
     text = re.sub(r'^```(?:python)?\s*', '', text, flags=re.IGNORECASE)
@@ -126,20 +121,14 @@ class ScriptGenerator:
             SystemMessage(content=system_prompt),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(',', ':'))),
         ]
-        stream = getattr(self.llm_model, 'stream', None)
-        if callable(stream):
-            # Deliberately do not catch stream failures: replaying a partially
-            # consumed request with invoke() can duplicate provider work and
-            # hides the original OpenAI/LangChain exception chain.
-            output = ''.join(
-                _stream_chunk_text(chunk)
-                for chunk in stream(messages, max_tokens=SCRIPT_GENERATION_MAX_TOKENS)
-            )
-        else:
-            output = self.llm_model.invoke(
-                messages,
-                max_tokens=SCRIPT_GENERATION_MAX_TOKENS,
-            )
+        # ModelManager enforces ``streaming=True`` for production models.
+        # LangChain preserves this invoke contract while aggregating the
+        # provider stream, which keeps script generation aligned with
+        # structured-output and MCP callers without duplicating stream joins.
+        output = self.llm_model.invoke(
+            messages,
+            max_tokens=SCRIPT_GENERATION_MAX_TOKENS,
+        )
         script = _strip_code_fences(output)
         if not script:
             raise ScriptGeneratorOutputError('模型未返回可用的 Python 脚本。')

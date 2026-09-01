@@ -226,11 +226,12 @@ class MidSceneAgent:
                 
         except Exception as e:
             logger.error(f"流式调用视觉模型失败 [{step_name}]: {e}")
-            # 回退到普通调用
-            return self._call_vision_model(prompt, screenshot_b64)
+            # 流式请求可能已经返回了部分内容，不能再次调用模型，
+            # 否则会重复执行并产生重复计费。
+            raise
     
     def _call_vision_model(self, prompt: str, screenshot_b64: str = "") -> str:
-        """调用视觉模型（非流式）"""
+        """调用视觉模型并等待聚合结果（底层传输仍由全局流式策略控制）。"""
         try:
             result = self.generate_midscene_script(
                 natural_language=prompt,
@@ -591,7 +592,7 @@ export default async function run() {{
                 # 使用流式调用
                 response = self.model_manager.stream_invoke(messages, callback=streaming_callback)
             else:
-                # 使用普通调用
+                # 统一 invoke 契约；ModelManager 创建的模型会在底层流式传输并聚合结果。
                 response = self.model_manager.invoke(messages)
             
             return {

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -142,18 +142,12 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
             prompt = call.args[0][1].content
             self.assertIn('exploration_trace', json.loads(prompt))
 
-    def test_generator_streams_chunks_and_sets_a_local_output_limit(self):
-        class StreamingLLM:
+    def test_generator_uses_global_streaming_invoke_and_sets_a_local_output_limit(self):
+        class StreamingInvokeLLM:
             def __init__(self):
-                self.stream_calls = []
-                self.invoke = Mock()
+                self.invoke = Mock(return_value=AIMessage(content=VALID_SCRIPT))
 
-            def stream(self, messages, **kwargs):
-                self.stream_calls.append((messages, kwargs))
-                yield AIMessageChunk(content=VALID_SCRIPT[:80])
-                yield AIMessageChunk(content=[{'type': 'text', 'text': VALID_SCRIPT[80:]}])
-
-        llm = StreamingLLM()
+        llm = StreamingInvokeLLM()
         scenario = ScenarioSpec.model_validate(scenario_payload())
         script = ScriptGenerator(llm).generate(
             scenario=scenario,
@@ -167,13 +161,12 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         self.assertEqual(script, VALID_SCRIPT.strip())
         self.assertEqual(repaired, VALID_SCRIPT.strip())
         self.assertEqual(
-            [call[1]['max_tokens'] for call in llm.stream_calls],
+            [call.kwargs['max_tokens'] for call in llm.invoke.call_args_list],
             [SCRIPT_GENERATION_MAX_TOKENS, SCRIPT_GENERATION_MAX_TOKENS],
         )
-        self.assertEqual(SCRIPT_GENERATION_MAX_TOKENS, 4096)
-        llm.invoke.assert_not_called()
+        self.assertEqual(SCRIPT_GENERATION_MAX_TOKENS, 8192)
 
-    def test_generator_falls_back_only_when_stream_is_unavailable(self):
+    def test_generator_uses_invoke_when_stream_is_unavailable(self):
         llm = SimpleNamespace(invoke=Mock(return_value=AIMessage(content=VALID_SCRIPT)))
         scenario = ScenarioSpec.model_validate(scenario_payload())
 
@@ -187,34 +180,30 @@ class ScriptGeneratorAndQualityTests(Phase45Base):
         llm.invoke.assert_called_once()
         self.assertEqual(llm.invoke.call_args.kwargs['max_tokens'], SCRIPT_GENERATION_MAX_TOKENS)
 
-    def test_generator_does_not_replay_invoke_after_a_stream_failure(self):
-        class StreamFailure(RuntimeError):
+    def test_generator_does_not_retry_a_failed_invoke(self):
+        class InvokeFailure(RuntimeError):
             status_code = 504
 
-        class FailingStreamLLM:
+        class FailingInvokeLLM:
             def __init__(self):
-                self.invoke = Mock()
+                self.invoke = Mock(side_effect=InvokeFailure('provider stream interrupted'))
 
-            def stream(self, _messages, **_kwargs):
-                yield AIMessageChunk(content='partial source')
-                raise StreamFailure('provider stream interrupted')
-
-        llm = FailingStreamLLM()
-        with self.assertRaises(StreamFailure) as raised:
+        llm = FailingInvokeLLM()
+        with self.assertRaises(InvokeFailure) as raised:
             ScriptGenerator(llm).generate(
                 scenario=ScenarioSpec.model_validate(scenario_payload()),
                 snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
             )
-        llm.invoke.assert_not_called()
+        llm.invoke.assert_called_once()
         self.assertEqual(_model_failure(raised.exception)[0], 'MODEL_GATEWAY_TIMEOUT')
 
-    def test_generator_rejects_an_empty_stream_response(self):
-        class EmptyStreamLLM:
-            def stream(self, _messages, **_kwargs):
-                yield AIMessageChunk(content=[])
+    def test_generator_rejects_an_empty_invoke_response(self):
+        class EmptyInvokeLLM:
+            def invoke(self, _messages, **_kwargs):
+                return AIMessage(content=[])
 
         with self.assertRaises(ScriptGeneratorOutputError) as raised:
-            ScriptGenerator(EmptyStreamLLM()).generate(
+            ScriptGenerator(EmptyInvokeLLM()).generate(
                 scenario=ScenarioSpec.model_validate(scenario_payload()),
                 snapshot=ExplorationSnapshot.model_validate(snapshot_payload()),
             )

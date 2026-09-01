@@ -129,6 +129,11 @@ class ModelManager:
         init_params = {
             'model': model_name,
             'max_tokens': 8192,  # 强制解除输出截断限制，拉满大模型肺活量
+            # Keep transport behavior at the model boundary.  LangChain then
+            # aggregates stream/astream back into invoke/ainvoke results for
+            # callers such as structured output, MCP agents, and connection
+            # tests without changing their contracts.
+            'streaming': True,
         }
         
         # 根据提供商设置 model_provider 和特定参数
@@ -201,10 +206,15 @@ class ModelManager:
             self.llm_type = provider
         
         # 从 extra_config 中读取其他通用参数
-        common_params = ['temperature', 'max_tokens', 'top_p', 'top_k', 'streaming']
+        common_params = ['temperature', 'max_tokens', 'top_p', 'top_k']
         for param in common_params:
             if param in extra_config:
                 init_params[param] = extra_config[param]
+
+        # Streaming is a global transport policy.  Retain the setting in the
+        # configuration API for backward compatibility, but do not allow a
+        # saved ``streaming: false`` to disable it for a production model.
+        init_params['streaming'] = True
         
         # 过滤掉 None 值，避免传递给 init_chat_model
         filtered_params = {k: v for k, v in init_params.items() if v is not None}
@@ -262,35 +272,49 @@ class ModelManager:
         try:
             return self._stream_invoke_unified(messages, callback, **kwargs)
         except Exception as e:
-            logger.warning(f"流式调用失败，回退到普通调用: {e}")
-            return self.invoke(messages, **kwargs)
+            # Do not replay a stream with invoke(): the provider may already
+            # have produced tokens, and a second request can duplicate work
+            # and billing.  Keep the provider exception as the direct cause
+            # for upstream error classification.
+            logger.error(f"流式调用失败: {e}", exc_info=True)
+            raise RuntimeError(f"流式LLM调用失败: {e}") from e
     
     def _stream_invoke_unified(self, messages: List[Union[HumanMessage, SystemMessage]], 
                                callback: Optional[Callable[[str], None]] = None, **kwargs) -> str:
         """统一的流式调用方法（适用于所有通过 init_chat_model 初始化的 ChatModel）"""
-        if not hasattr(self.current_llm, 'stream'):
+        stream = getattr(self.current_llm, 'stream', None)
+        if not callable(stream):
             logger.warning("当前LLM不支持流式输出，回退到普通调用")
             return self.invoke(messages, **kwargs)
         
         full_response = ""
-        for chunk in self.current_llm.stream(messages, **kwargs):
-            # LangChain 1.0+ 中，ChatModel返回的消息块有content属性
-            # 只提取content内容，忽略其他元数据
-            if isinstance(chunk, str):
-                content = chunk
-            elif hasattr(chunk, 'content'):
-                content = chunk.content
-            else:
-                # 如果chunk没有content属性，跳过这个chunk
-                continue
-            
-            # 只处理非空的字符串内容
-            if content and isinstance(content, str) and content.strip():
+        for chunk in stream(messages, **kwargs):
+            content = self._extract_stream_chunk_content(chunk)
+            if content:
                 full_response += content
                 if callback:
                     callback(content)
         
         return full_response
+
+    @classmethod
+    def _extract_stream_chunk_content(cls, chunk: Any) -> str:
+        """Return text from a LangChain chunk, including content blocks."""
+        if isinstance(chunk, str):
+            return chunk
+        if isinstance(chunk, dict):
+            text = chunk.get('text')
+            if isinstance(text, str):
+                return text
+            return cls._extract_stream_chunk_content(chunk.get('content'))
+        if isinstance(chunk, (list, tuple)):
+            return ''.join(cls._extract_stream_chunk_content(item) for item in chunk)
+
+        content = getattr(chunk, 'content', None)
+        if content is not None:
+            return cls._extract_stream_chunk_content(content)
+        text = getattr(chunk, 'text', None)
+        return text if isinstance(text, str) else ''
     
     def _extract_response_content(self, response) -> str:
         """提取响应内容"""
@@ -351,11 +375,7 @@ class ModelManager:
             return self.stream_invoke(messages, callback=internal_callback)
         except Exception as e:
             logger.error(f"流式调用LLM失败 [{step_name}]: {e}")
-            try:
-                return self.invoke(messages)
-            except Exception as fallback_error:
-                logger.error(f"回退调用也失败 [{step_name}]: {fallback_error}")
-                raise
+            raise
     
     def get_model_info(self) -> Dict[str, Any]:
         """获取模型信息"""

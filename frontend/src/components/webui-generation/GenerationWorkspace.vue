@@ -40,12 +40,9 @@
     <div class="workspace-actions">
       <el-button :loading="draftSaving" :disabled="busy || !canSaveDraft" @click="emit('save-draft')">保存草稿</el-button>
       <el-button type="warning" :loading="debugging" :disabled="busy || !canDebug" @click="requestDebug">真实调试</el-button>
-      <el-button v-if="canRepair" type="primary" plain :loading="repairing" :disabled="busy || Boolean(draft?.dirty)" @click="requestRepair">{{ draft?.dirty ? '请先保存草稿' : `请求修复（${repair.count || 0}/2）` }}</el-button>
     </div>
 
     <el-alert v-if="verification.message || verification.error_message" class="verification-message" type="warning" :closable="false" show-icon :title="verification.message || verification.error_message" />
-    <el-alert v-if="repair.status === 'ready'" class="verification-message" type="success" :closable="false" show-icon title="修复草稿已就绪，请人工查看修改后再决定是否真实调试。系统不会自动执行修复后的脚本。" />
-    <el-alert v-if="repair.status === 'failed'" class="verification-message" type="error" :closable="false" show-icon :title="repair.message || repair.error_message || '后台修复失败，请查看当前调试证据。'" />
 
     <section v-if="debugExecution || debugExecutionLoading" class="workspace-section execution-section">
       <div class="section-heading"><div><h5>调试详情</h5><p>失败原因、失败截图和原始日志仅在服务端实际提供时展示。</p></div></div>
@@ -64,15 +61,14 @@ import { isCurrentRevisionVerified, workspaceVerificationLabel, workspaceVerific
 
 const props = defineProps({
   generation: { type: Object, default: null }, draft: { type: Object, default: null }, busy: Boolean,
-  draftSaving: Boolean, debugging: Boolean, repairing: Boolean,
+  draftSaving: Boolean, debugging: Boolean,
   debugExecution: { type: Object, default: null }, debugExecutionLoading: Boolean
 })
-const emit = defineEmits(['update-draft', 'save-draft', 'debug', 'repair'])
+const emit = defineEmits(['update-draft', 'save-draft', 'debug'])
 const form = reactive({ script_draft: '', variables: [] })
 const runtimeVariables = reactive([])
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
 const verification = computed(() => workspace.value.verification || {})
-const repair = computed(() => workspace.value.repair || {})
 const hasPassed = computed(() => !props.draft?.dirty && isCurrentRevisionVerified(
   workspace.value, props.draft?.revision ?? workspace.value.revision, props.generation?.environment_id
 ))
@@ -82,7 +78,6 @@ const displayVerificationLabel = computed(() => verification.value.status === 'p
   : workspaceVerificationLabel(displayVerificationStatus.value))
 const canSaveDraft = computed(() => Boolean(form.script_draft.trim()) && !form.variables.some(item => !item.name.trim()))
 const canDebug = computed(() => canSaveDraft.value && !props.draftSaving)
-const canRepair = computed(() => ['failed', 'error'].includes(verification.value.status) && Number(repair.value.count || 0) < 2 && verification.value.evidence_sufficient !== false)
 
 const copyVariables = (variables) => (variables || []).map(item => ({
   name: item?.name || '', value: item?.value || '', is_secret: Boolean(item?.is_secret),
@@ -121,14 +116,6 @@ const requestDebug = async () => {
     runtimeVariables.forEach(item => { item.value = '' })
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error('调试确认失败，请重试。')
-  }
-}
-const requestRepair = async () => {
-  try {
-    await ElMessageBox.confirm('将基于当前失败证据请求一次后台修复（最多两次）。修复后不会自动调试，需由你查看并再次确认。是否继续？', '确认请求修复', { type: 'warning', confirmButtonText: '请求修复', cancelButtonText: '取消' })
-    emit('repair')
-  } catch (error) {
-    if (error !== 'cancel' && error !== 'close') ElMessage.error('修复确认失败，请重试。')
   }
 }
 </script>

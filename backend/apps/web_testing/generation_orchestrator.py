@@ -1,4 +1,4 @@
-"""Deterministic phase-2/3 orchestration for V2 WebUI script generation."""
+"""v3 GoalPlan -> callback ledger -> deterministic replay orchestration."""
 
 from __future__ import annotations
 
@@ -10,780 +10,129 @@ from django.core.cache import cache
 
 from ai_core.model_manager import get_llm_manager
 
-from .generation_contracts import (
-    GenerationContractError,
-    ScenarioInputInsufficientError,
-    ScenarioSpec,
-    is_terminal_status,
-)
-from .exploration_trace import (
-    ExplorationTrace,
-    assess_trace_coverage,
-    coerce_trace,
-    required_trace_evidence_gaps,
-    trace_has_minimum_page_state,
-)
 from .exploration_timeout import exploration_total_timeout_seconds
+from .exploration_trace import ExplorationTrace, coerce_trace, required_goal_evidence_gaps, trace_has_minimum_page_state
+from .generation_contracts import GenerationContractError, GoalPlan, ScenarioInputInsufficientError, is_terminal_status
 from .generation_events import publish_stage_changed, publish_terminal
-from .generation_preflight import run_safety_preflight
-from .generation_repository import (
-    MAX_GENERATION_RESUME_COUNT,
-    PAUSED_GENERATION_STATUSES,
-    claim_generation_worker,
-    claim_trace_generation_retry,
-    cancel_generation,
-    get_generation_temporary_credentials,
-    is_cancel_requested,
-    transition_generation,
-)
+from .generation_preflight import environment_credentials, run_safety_preflight
+from .generation_repository import PAUSED_GENERATION_STATUSES, claim_generation_worker, claim_trace_generation_retry, get_generation_temporary_credentials, is_cancel_requested, transition_generation
 from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 from .models import WebUIScriptGeneration
-from .model_service_errors import classify_model_service_error
 from .requirement_normalizer import normalize_requirement
-from .script_generator import ScriptGenerator, ScriptGeneratorOutputError
+from .script_generator import ScriptGenerator
 from .script_quality import blocker_issues, evaluate_script
+from .generation_workspace import variable_definitions_for_goal_plan, workspace_for_generation
 
 logger = logging.getLogger(__name__)
 
-_PARTIAL_TRACE_ERROR_KINDS = frozenset({
-    'exploration_timeout', 'tool_budget', 'graph_recursion',
-    'repeated_interaction', 'interaction_failure',
-})
-
 
 def _normalization_description(generation: WebUIScriptGeneration) -> str:
-    """Build model input from the safe description and persisted clarifications."""
-    sections = [generation.description_safe]
+    additions = []
     for item in generation.clarifications or []:
-        answers = item.get('answers') or []
-        if not answers:
-            continue
-        lines = ['用户补充确认：']
-        for answer in answers:
-            question = str(answer.get('question') or '').strip()
-            value = str(answer.get('answer') or '').strip()
-            if question and value:
-                lines.append(f'- {question}：{value}')
-        if len(lines) > 1:
-            sections.append('\n'.join(lines))
-    return '\n\n'.join(section for section in sections if section)
+        additions.extend(str(answer.get('answer') or '') for answer in item.get('answers') or [] if answer.get('answer'))
+    return '\n\n'.join([generation.description_safe, *additions])
 
 
-def _pause_or_require_review(
-    generation: WebUIScriptGeneration,
-    target_status: str,
-    *,
-    progress: int,
-    error_code: str,
-    error_message: str,
-    warnings: list[str] | None = None,
-    updates: dict[str, Any] | None = None,
-) -> WebUIScriptGeneration:
-    """Pause once, or stop an exhausted clarification loop for review."""
-    persisted_updates = {**(updates or {}), 'warnings': warnings or []}
-    if target_status in PAUSED_GENERATION_STATUSES and generation.resume_count >= MAX_GENERATION_RESUME_COUNT:
-        review_updates = {
-            key: value for key, value in persisted_updates.items()
-            if key != 'current_stage'
-        }
-        reviewed = transition_generation(
-            generation.pk,
-            WebUIScriptGeneration.Status.NEEDS_REVIEW,
-            progress=progress,
-            error_code='RESUME_LIMIT_REACHED',
-            error_message='多次补充后仍无法安全确定场景，请人工检查描述后重新发起。',
-            updates=review_updates,
-        )
+def _review_report(gaps: list[dict[str, str]]) -> dict[str, Any]:
+    blockers = [{'level': 'blocker', 'code': 'GOAL_EVIDENCE_MISSING', 'message': f"Goal {item['goal_id']}：{item['reason']}", 'line': None} for item in gaps]
+    return {'status': 'needs_review', 'blockers': blockers, 'warnings': [], 'checks': blockers, 'summary': {'passed': 0, 'warning': 0, 'blocker': len(blockers)}}
+
+
+def _fail(generation_id: str, code: str, message: str) -> dict[str, Any]:
+    logger.warning('WebUI v3 generation stopped: generation_id=%s error_code=%s', generation_id, code)
+    try:
+        generation = transition_generation(generation_id, WebUIScriptGeneration.Status.FAILED, progress=100, error_code=code, error_message=message)
+        publish_terminal(generation)
+        return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': code}
+    except Exception:
+        return {'generation_id': generation_id, 'status': 'failed', 'error_code': code}
+
+
+def _terminal_cancel(generation_id: str, task_id: str | None) -> bool:
+    return bool(task_id and cache.get(f'celery:cancel:{task_id}')) or is_cancel_requested(generation_id)
+
+
+def _compile_persisted(generation: WebUIScriptGeneration, plan: GoalPlan, trace: ExplorationTrace) -> dict[str, Any]:
+    gaps = required_goal_evidence_gaps(plan, trace)
+    if gaps:
+        reviewed = transition_generation(generation.pk, WebUIScriptGeneration.Status.NEEDS_REVIEW, progress=100, error_code='GOAL_EVIDENCE_MISSING', error_message='部分 Goal 缺少可回放证据，未生成伪完整脚本。', updates={'exploration_snapshot': trace.model_dump(mode='json'), 'quality_report': _review_report(gaps), 'tool_stats': trace.tool_stats, 'warnings': [f"Goal {item['goal_id']}：{item['reason']}" for item in gaps]})
         publish_terminal(reviewed)
-        return reviewed
-    return transition_generation(
-        generation.pk,
-        target_status,
-        progress=progress,
-        error_code=error_code,
-        error_message=error_message,
-        updates=persisted_updates,
-    )
+        return {'generation_id': str(reviewed.pk), 'status': reviewed.status, 'error_code': reviewed.error_code}
+    script, replay_plan = ScriptGenerator().generate(plan=plan, trace=trace)
+    report = evaluate_script(script, plan=plan, trace=trace, replay_plan=replay_plan)
+    blockers = blocker_issues(report)
+    status = WebUIScriptGeneration.Status.NEEDS_REVIEW if blockers else (WebUIScriptGeneration.Status.READY_WITH_WARNINGS if report['warnings'] else WebUIScriptGeneration.Status.READY)
+    workspace = workspace_for_generation(generation)
+    workspace['variables'] = variable_definitions_for_goal_plan(plan)
+    completed = transition_generation(generation.pk, status, progress=100, error_code='SCRIPT_QUALITY_BLOCKED' if blockers else '', error_message='回放计划或脚本质量门禁未通过。' if blockers else '', updates={'exploration_snapshot': trace.model_dump(mode='json'), 'script_draft': script, 'workspace': workspace, 'quality_report': {**report, 'replay_plan': replay_plan.model_dump(mode='json')}, 'tool_stats': trace.tool_stats, 'warnings': [item['message'] for item in report['warnings']]})
+    publish_terminal(completed)
+    return {'generation_id': str(completed.pk), 'status': completed.status, 'quality_status': report['status']}
 
 
-def _is_rate_limited_error(error: BaseException) -> bool:
-    error_text = str(error).lower()
-    return any(marker in error_text for marker in (
-        '429', 'too many requests', 'rate limit', 'rate_limited', 'upstream_rate_limited',
-    ))
-
-
-def _model_failure(error: BaseException) -> tuple[str, str]:
-    service_error = classify_model_service_error(error, stage='generation')
-    if service_error:
-        return service_error
-    if isinstance(error, ScriptGeneratorOutputError):
-        return 'MODEL_OUTPUT_INVALID', '模型未返回可用的 Python 脚本，请重试或更换模型。'
-    if _is_rate_limited_error(error):
-        return 'MODEL_RATE_LIMITED', '本次锁定的模型触发限流，请稍后重试或更换模型。'
-    return 'MODEL_UNAVAILABLE', '本次锁定的模型暂时不可用，请检查模型配置或稍后重试。'
-
-
-def _record_normalization_contract_failure(
-    generation: WebUIScriptGeneration,
-    error: GenerationContractError,
-) -> None:
-    """Log only the parser's bounded, value-free contract diagnostics."""
-    logger.warning(
-        'WebUI scenario normalization failed: generation_id=%s error_code=MODEL_OUTPUT_INVALID contract_diagnostics=%s',
-        generation.pk,
-        error.diagnostics,
-    )
-
-
-def _cleanup_requires_attention(trace: ExplorationTrace) -> bool:
-    return str((trace.cleanup or {}).get('status') or '') in {'residual', 'unknown', 'not_attempted'}
-
-
-def _partial_trace_requires_attention(trace: ExplorationTrace) -> bool:
-    return str(trace.termination_reason or '') in _PARTIAL_TRACE_ERROR_KINDS
-
-
-def _evidence_review_report(gaps: list[dict[str, str]]) -> dict[str, Any]:
-    blockers = [{
-        'level': 'blocker',
-        'code': 'TRACE_STEP_EVIDENCE_MISSING',
-        'message': f"步骤 {item['step_id']}：{item['reason']}",
-        'line': None,
-    } for item in gaps]
-    return {
-        'status': 'needs_review', 'blockers': blockers, 'warnings': [], 'checks': blockers,
-        'summary': {
-            'passed': 0, 'warning': 0, 'blocker': len(blockers),
-            'message': '缺少必需场景步骤的成功元素证据，未生成脚本。',
-        },
-    }
-
-
-def _evidence_review_warnings(gaps: list[dict[str, str]]) -> list[str]:
-    return [f"步骤 {item['step_id']} 缺少证据：{item['reason']}" for item in gaps]
-
-
-def _usable_partial_trace(error: MCPPageExplorerError, scenario: ScenarioSpec) -> ExplorationTrace | None:
-    """Keep callback-owned evidence for soft stops without weakening safety failures."""
-    if error.error_code not in _PARTIAL_TRACE_ERROR_KINDS or error.snapshot is None:
-        return None
-    trace = assess_trace_coverage(scenario, coerce_trace(error.snapshot))
-    if not trace_has_minimum_page_state(trace):
-        return None
-    warning = f'页面探索因 {error.error_code} 提前结束；已使用现有轨迹生成待检查草稿。'
-    return trace.model_copy(update={
-        'termination_reason': error.error_code,
-        'warnings': list(dict.fromkeys([*trace.warnings, warning])),
-    })
-
-
-def _safe_fail_generation(
-    generation_id: str,
-    error_code: str,
-    message: str,
-    *,
-    updates: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Persist a safe failure if possible; never expose a raw backend exception."""
+def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
+    """Run a fresh v3 generation. Persisted v2 JSON is intentionally rejected."""
     try:
-        logger.warning('WebUI generation stopped: generation_id=%s error_code=%s', generation_id, error_code)
-        generation = transition_generation(
-            generation_id,
-            WebUIScriptGeneration.Status.FAILED,
-            error_code=error_code,
-            error_message=message,
-            updates=updates,
-        )
-        publish_terminal(generation)
-        return {
-            'generation_id': str(generation.pk),
-            'status': generation.status,
-            'error_code': generation.error_code,
-        }
+        generation = WebUIScriptGeneration.objects.select_related('environment', 'test_case', 'user').get(pk=generation_id)
     except Exception:
-        logger.error(
-            'WebUI V2 generation failure could not be persisted: generation_id=%s code=%s',
-            generation_id,
-            error_code,
-        )
-        return {
-            'generation_id': str(generation_id),
-            'status': WebUIScriptGeneration.Status.FAILED,
-            'error_code': 'TRANSIENT_SERVICE_ERROR',
-        }
-
-
-def _is_task_cancelled(generation_id: str, task_id: str | None) -> bool:
-    return is_cancel_requested(generation_id) or bool(task_id and cache.get(f'celery:cancel:{task_id}'))
-
-
-def _test_case_context(generation) -> dict[str, Any] | None:
-    test_case = generation.test_case
-    if test_case is None:
-        return None
-    # WebUITestCase is now an independent-script model. Do not read the
-    # removed structured-step fields when regenerating from an existing case.
-    return {
-        'title': test_case.title,
-        'description': test_case.description,
-        'script_version': int(getattr(test_case, 'script_version', 0) or 0),
-        'has_script': bool(getattr(test_case, 'test_script_content', '') or ''),
-    }
-
-
-def _terminal_cancel_if_requested(generation_id: str, task_id: str | None):
-    if _is_task_cancelled(generation_id, task_id):
-        generation = cancel_generation(generation_id)
-        publish_terminal(generation)
-        return generation
-    return None
-
-
-def _map_explorer_error(error: MCPPageExplorerError) -> tuple[str, str]:
-    if error.error_code in {'other', 'transient', 'rate_limit'}:
-        service_error = classify_model_service_error(error)
-        if service_error:
-            return service_error
-    mappings = {
-        'browser': 'BROWSER_UNAVAILABLE',
-        'tool_parameter': 'MCP_CONFIGURATION_INVALID',
-        'tool_budget': 'EXPLORATION_LIMIT_REACHED',
-        'repeated_interaction': 'REPEATED_INTERACTION',
-        'interaction_failure': 'LOCATOR_FAILURE_LIMIT',
-        'login_failed': 'LOGIN_FAILED',
-        'graph_recursion': 'EXPLORATION_LIMIT_REACHED',
-        'rate_limit': 'MODEL_RATE_LIMITED',
-        'transient': 'TRANSIENT_SERVICE_ERROR',
-        'TASK_CANCELLED': 'TASK_CANCELLED',
-        'EVIDENCE_INSUFFICIENT': 'EVIDENCE_INSUFFICIENT',
-        'SCRIPT_FORMAT_INVALID': 'EVIDENCE_INSUFFICIENT',
-        'read_only_violation': 'EXPLORATION_WRITE_BLOCKED',
-        'write_scope_violation': 'EXPLORATION_SCOPE_BLOCKED',
-        'extra_risk_action': 'EXPLORATION_EXTRA_RISK_BLOCKED',
-        'write_result_unknown': 'EXPLORATION_WRITE_RESULT_UNKNOWN',
-        'exploration_timeout': 'EXPLORATION_TIMEOUT',
-        'permission': 'EXPLORATION_PERMISSION_DENIED',
-    }
-    return mappings.get(error.error_code, 'TRANSIENT_SERVICE_ERROR'), str(error)
-
-
-def _merge_explorer_failure_stats(
-    previous: dict[str, Any] | None,
-    failure: MCPPageExplorerError,
-) -> dict[str, Any]:
-    """Merge only the allowlisted, already-sanitized Explorer counters."""
-    extra = failure.tool_stats or {}
-    if not extra:
-        return dict(previous or {})
-    previous = previous or {}
-    counts = dict(previous.get('tool_counts') or {})
-    for name, count in (extra.get('tool_counts') or {}).items():
-        counts[str(name)] = counts.get(str(name), 0) + int(count)
-    merged = {
-        'total_tool_calls': int(previous.get('total_tool_calls', 0)) + int(extra.get('total_tool_calls', 0)),
-        'tool_counts': counts,
-        'failed_tool_calls': int(previous.get('failed_tool_calls', 0)) + int(extra.get('failed_tool_calls', 0)),
-        'termination_reason': extra.get('termination_reason') or previous.get('termination_reason'),
-        'duration_seconds': round(
-            float(previous.get('duration_seconds', 0)) + float(extra.get('duration_seconds', 0)), 3,
-        ),
-        'model_calls': int(previous.get('model_calls', 0)) + int(extra.get('model_calls', 0)),
-    }
-    for field in ('potential_write_tool_calls', 'blocked_write_tool_calls'):
-        if field in previous or field in extra:
-            merged[field] = int(previous.get(field, 0)) + int(extra.get(field, 0))
-    # These are failure-only summaries from MCPPageExplorerError; never copy
-    # tool input, selector, output text, URL, or credential-bearing metadata.
-    if 'blocked_tool_calls' in extra:
-        merged['blocked_tool_calls'] = max(0, int(extra['blocked_tool_calls']))
-    for name in ('last_operation', 'last_blocked_operation'):
-        operation = extra.get(name)
-        if not isinstance(operation, dict):
-            continue
-        tool_name = str(operation.get('tool_name') or 'browser_tool')
-        if not (tool_name.startswith('playwright_') or tool_name == 'browser_console_logs'):
-            tool_name = 'browser_tool'
-        try:
-            call_index = max(0, int(operation.get('call_index', 0)))
-        except (TypeError, ValueError):
-            call_index = 0
-        status = str(operation.get('status') or 'unknown')
-        if status not in {'started', 'succeeded', 'failed', 'blocked'}:
-            status = 'unknown'
-        merged[name] = {
-            'tool_name': tool_name,
-            'call_index': call_index,
-            'status': status,
-        }
-    return merged
-
-
-def _cancel_with_explorer_stats(
-    generation_id: str,
-    failure: MCPPageExplorerError,
-    *,
-    previous_stats: dict[str, Any] | None = None,
-) -> WebUIScriptGeneration:
-    generation = cancel_generation(generation_id)
-    stats = _merge_explorer_failure_stats(previous_stats or generation.tool_stats, failure)
-    updates = []
-    if stats and generation.tool_stats != stats:
-        generation.tool_stats = stats
-        updates.append('tool_stats')
-    if failure.snapshot is not None:
-        generation.exploration_snapshot = failure.snapshot.model_dump(mode='json')
-        generation.warnings = list(dict.fromkeys([*generation.warnings, *failure.snapshot.warnings]))
-        updates.extend(['exploration_snapshot', 'warnings'])
-    if updates:
-        generation.save(update_fields=[*updates, 'updated_at'])
-    return generation
-
-
-def _cancel_with_snapshot_stats(
-    generation_id: str,
-    tool_stats: dict[str, Any],
-    snapshot=None,
-) -> WebUIScriptGeneration:
-    """Keep an already completed exploration's counters on a late cancellation."""
-    generation = cancel_generation(generation_id)
-    generation.tool_stats = tool_stats
-    fields = ['tool_stats', 'updated_at']
-    if snapshot is not None:
-        generation.exploration_snapshot = snapshot.model_dump(mode='json')
-        generation.warnings = list(dict.fromkeys([*generation.warnings, *snapshot.warnings]))
-        fields.extend(['exploration_snapshot', 'warnings'])
-    generation.save(update_fields=fields)
-    return generation
-
-
-def run_v2_generation(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
-    """Run callback-recorded exploration, Python generation and bounded repair."""
-    try:
-        generation = WebUIScriptGeneration.objects.select_related(
-            'environment', 'test_case', 'user'
-        ).get(pk=generation_id)
-    except Exception:
-        logger.error('WebUI V2 generation record cannot be loaded: generation_id=%s', generation_id)
-        return {
-            'generation_id': str(generation_id),
-            'status': WebUIScriptGeneration.Status.FAILED,
-            'error_code': 'TRANSIENT_SERVICE_ERROR',
-        }
-    if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
+        return {'generation_id': str(generation_id), 'status': 'failed', 'error_code': 'TRANSIENT_SERVICE_ERROR'}
+    if _terminal_cancel(str(generation.pk), celery_task_id):
         return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-
     if generation.status in PAUSED_GENERATION_STATUSES or is_terminal_status(generation.status):
-        return {
-            'generation_id': str(generation.pk),
-            'status': generation.status,
-            'error_code': generation.error_code,
-        }
-
-    try:
-        claimed = claim_generation_worker(generation.pk, celery_task_id)
-    except Exception:
-        return _safe_fail_generation(str(generation.pk), 'TRANSIENT_SERVICE_ERROR', '无法确认任务执行权，尚未启动页面探索。')
+        return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': generation.error_code}
+    claimed = claim_generation_worker(generation.pk, celery_task_id)
     if claimed is None:
         generation.refresh_from_db()
-        return {
-            'generation_id': str(generation.pk), 'status': generation.status,
-            'skipped': True, 'reason': '生成任务重复或已过期，未重新执行页面操作。',
-        }
+        return {'generation_id': str(generation.pk), 'status': generation.status, 'skipped': True}
     generation = claimed
-
     try:
-        if generation.status in {
-            WebUIScriptGeneration.Status.CREATED,
-            WebUIScriptGeneration.Status.NORMALIZING,
-        }:
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.NORMALIZING,
-                progress=10,
-            )
-            publish_stage_changed(generation, '理解测试场景')
-            try:
-                scenario = normalize_requirement(
-                    _normalization_description(generation),
-                    generation.model_info['config_id'],
-                    _test_case_context(generation),
-                )
-            except ScenarioInputInsufficientError:
-                generation = _pause_or_require_review(
-                    generation,
-                    WebUIScriptGeneration.Status.NEEDS_INPUT,
-                    progress=10,
-                    error_code='SCENARIO_INPUT_INSUFFICIENT',
-                    error_message='场景信息不足，请补充明确目标、操作步骤和可验证结果后继续。',
-                )
-                return {
-                    'generation_id': str(generation.pk),
-                    'status': generation.status,
-                    'error_code': generation.error_code,
-                }
-            except GenerationContractError as exc:
-                _record_normalization_contract_failure(generation, exc)
-                return _safe_fail_generation(
-                    str(generation.pk),
-                    'MODEL_OUTPUT_INVALID',
-                    '模型未能正确整理场景，请重试或更换模型。',
-                )
-            except Exception as exc:
-                error_code, message = _model_failure(exc)
-                return _safe_fail_generation(str(generation.pk), error_code, message)
-            if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-                return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.PREFLIGHTING,
-                progress=25,
-                updates={
-                    'scenario_spec': scenario.model_dump(mode='json'),
-                    'credentials_required': scenario.credentials_required,
-                },
-            )
+        if generation.status in {WebUIScriptGeneration.Status.CREATED, WebUIScriptGeneration.Status.NORMALIZING}:
+            publish_stage_changed(generation, '理解测试目标')
+            plan = normalize_requirement(_normalization_description(generation), model_config_id=generation.model_info['config_id'], test_case_context={'title': generation.test_case.title} if generation.test_case else None)
+            generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.PREFLIGHTING, progress=25, updates={'scenario_spec': plan.model_dump(mode='json'), 'credentials_required': plan.credentials_required})
         elif generation.status == WebUIScriptGeneration.Status.PREFLIGHTING:
-            try:
-                scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
-            except Exception:
-                return _safe_fail_generation(
-                    str(generation.pk),
-                    'SCENARIO_CONTRACT_INVALID',
-                    '已保存的场景信息无法继续，请重新发起生成。',
-                )
+            plan = GoalPlan.model_validate(generation.scenario_spec or {})
         else:
-            return _safe_fail_generation(
-                str(generation.pk),
-                'TRANSIENT_SERVICE_ERROR',
-                '当前生成阶段不能从暂停处理继续，请刷新后重试。',
-            )
-
-        publish_stage_changed(generation, '检查风险与登录条件')
-        credentials = get_generation_temporary_credentials(generation.pk)
-        preflight = run_safety_preflight(
-            generation,
-            scenario,
-            credentials_available=credentials is not None,
-        )
-        if preflight.outcome != 'continue':
-            target_status = {
-                'needs_confirmation': WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
-                'needs_credentials': WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
-                'failed': WebUIScriptGeneration.Status.FAILED,
-            }[preflight.outcome]
-            generation = _pause_or_require_review(
-                generation,
-                target_status,
-                progress=25,
-                error_code=preflight.error_code,
-                error_message=preflight.message,
-                warnings=preflight.warnings,
-            )
-            if generation.status == WebUIScriptGeneration.Status.FAILED:
-                publish_terminal(generation)
-            return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': generation.error_code}
-
-        if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-            return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-
-        # Resolve the locked model before entering the browser exploration loop.
-        try:
-            model_manager = get_llm_manager(config_id=generation.model_info['config_id'])
-        except Exception as exc:
-            error_code, message = _model_failure(exc)
-            return _safe_fail_generation(str(generation.pk), error_code, message)
-        environment_variables = (generation.environment.config or {}).get('variables') or {}
-        explorer_credentials = credentials or _environment_credentials(environment_variables)
-        generation = transition_generation(
-            generation.pk,
-            WebUIScriptGeneration.Status.EXPLORING,
-            progress=40,
-            updates={'warnings': list(preflight.warnings)},
-        )
-        publish_stage_changed(generation, '探索并验证测试流程')
-        explorer = MCPPageExplorer(
-            llm_model=model_manager.current_llm,
-            mcp_config=preflight.mcp_config or {},
-            cancel_check=lambda: bool(celery_task_id and cache.get(f'celery:cancel:{celery_task_id}')),
-            generation_id=str(generation.pk),
-            user_constraints=_normalization_description(generation),
-            exploration_timeout_seconds=(
-                generation.exploration_timeout_seconds
-                if generation.exploration_timeout_seconds is not None
-                else exploration_total_timeout_seconds()
-            ),
-        )
-        explore_until_complete = getattr(explorer, 'explore_until_complete', None)
-        if explore_until_complete is None:
-            # Keep the historical explorer interface compatible with callers
-            # that have not yet implemented the same-session method.
-            explore_until_complete = explorer.explore
-        try:
-            trace = asyncio.run(explore_until_complete(
-                scenario=scenario,
-                start_path=generation.start_path,
-                target_url_safe=generation.target_url_safe,
-                temporary_credentials=explorer_credentials,
-            ))
-        except MCPPageExplorerError as exc:
-            trace = _usable_partial_trace(exc, scenario)
-            if trace is None:
-                raise
-        trace = assess_trace_coverage(scenario, coerce_trace(trace))
-        if not trace_has_minimum_page_state(trace):
-            return _safe_fail_generation(
-                str(generation.pk),
-                'PAGE_UNREACHABLE',
-                '页面未打开，无法生成脚本。请检查浏览器、登录状态和页面可访问性后重试。',
-                updates={
-                    'tool_stats': trace.tool_stats,
-                    'exploration_snapshot': trace.model_dump(mode='json'),
-                    'warnings': list(trace.warnings),
-                },
-            )
-        if _is_task_cancelled(str(generation.pk), celery_task_id):
-            generation = _cancel_with_snapshot_stats(
-                generation.pk, trace.tool_stats, snapshot=trace,
-            )
-            publish_terminal(generation)
-            return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-
-        evidence_gaps = required_trace_evidence_gaps(scenario, trace)
-        if evidence_gaps:
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.NEEDS_REVIEW,
-                progress=55,
-                error_code='EVIDENCE_INSUFFICIENT',
-                error_message='缺少必需场景步骤的成功元素证据，未生成脚本。',
-                updates={
-                    'scenario_spec': scenario.model_dump(mode='json'),
-                    'exploration_snapshot': trace.model_dump(mode='json'),
-                    'tool_stats': trace.tool_stats,
-                    'quality_report': _evidence_review_report(evidence_gaps),
-                    'warnings': list(dict.fromkeys([
-                        *generation.warnings, *trace.warnings, *_evidence_review_warnings(evidence_gaps),
-                    ])),
-                },
-            )
-            publish_terminal(generation)
-            return {
-                'generation_id': str(generation.pk), 'status': generation.status,
-                'progress': generation.progress, 'trace_schema_version': trace.schema_version,
-            }
-
-        # Confirmed evidence is durable; no browser replay is needed after this point.
-        scenario = scenario.model_copy(update={'ambiguities': []})
-
-        generation = transition_generation(
-            generation.pk,
-            WebUIScriptGeneration.Status.GENERATING,
-            progress=60,
-            updates={
-                'scenario_spec': scenario.model_dump(mode='json'),
-                'exploration_snapshot': trace.model_dump(mode='json'),
-                'tool_stats': trace.tool_stats,
-                'warnings': list(dict.fromkeys([*generation.warnings, *trace.warnings])),
-            },
-        )
-        publish_stage_changed(generation, '根据页面证据生成脚本')
-        generator = ScriptGenerator(model_manager.current_llm)
-        try:
-            script = generator.generate(scenario=scenario, trace=trace)
-        except Exception as exc:
-            error_code, message = _model_failure(exc)
-            return _safe_fail_generation(str(generation.pk), error_code, message)
-        if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-            return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-
-        generation = transition_generation(
-            generation.pk,
-            WebUIScriptGeneration.Status.VALIDATING,
-            progress=75,
-            updates={'script_draft': script},
-        )
-        publish_stage_changed(generation, '检查脚本质量')
-        report = evaluate_script(script, scenario=scenario, trace=trace)
-
-        repair_count = 0
-        while blocker_issues(report) and repair_count < 2:
-            if _terminal_cancel_if_requested(str(generation.pk), celery_task_id):
-                return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.REPAIRING,
-                progress=82 + repair_count * 4,
-                updates={'quality_report': report, 'repair_count': repair_count},
-            )
-            publish_stage_changed(generation, '按质量检查结果修复脚本')
-            try:
-                script = generator.repair(
-                    script=script,
-                    issues=blocker_issues(report),
-                    scenario=scenario,
-                    trace=trace,
-                )
-            except Exception as exc:
-                error_code, message = _model_failure(exc)
-                return _safe_fail_generation(str(generation.pk), error_code, message)
-            repair_count += 1
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.VALIDATING,
-                progress=88 + repair_count * 2,
-                updates={'script_draft': script, 'repair_count': repair_count},
-            )
-            report = evaluate_script(script, scenario=scenario, trace=trace)
-
-        warnings = list(dict.fromkeys([*trace.warnings, *[item['message'] for item in report.get('warnings', [])]]))
-        cleanup_attention = _cleanup_requires_attention(trace)
-        partial_attention = _partial_trace_requires_attention(trace)
-        target_status = (
-            WebUIScriptGeneration.Status.NEEDS_REVIEW
-            if blocker_issues(report) or cleanup_attention or partial_attention
-            else (WebUIScriptGeneration.Status.READY_WITH_WARNINGS if warnings else WebUIScriptGeneration.Status.READY)
-        )
-        review_error_code = (
-            'EXPLORATION_CLEANUP_UNCONFIRMED' if cleanup_attention
-            else ('EXPLORATION_PARTIAL' if partial_attention else ('QUALITY_GATE_BLOCKED' if blocker_issues(report) else ''))
-        )
-        review_error_message = (
-            '脚本草稿已保留，但探索数据清理未确认，请先检查残留数据再调试。' if cleanup_attention
-            else ('脚本草稿已保留，但页面探索提前结束，请检查轨迹和脚本后再调试。' if partial_attention
-                  else ('脚本未通过静态质量检查，请人工修改后再保存。' if blocker_issues(report) else ''))
-        )
-        generation = transition_generation(
-            generation.pk,
-            target_status,
-            progress=100 if target_status != WebUIScriptGeneration.Status.NEEDS_REVIEW else 95,
-            error_code=review_error_code,
-            error_message=review_error_message,
-            updates={
-                'exploration_snapshot': trace.model_dump(mode='json'),
-                'tool_stats': trace.tool_stats,
-                'script_draft': script,
-                'quality_report': report,
-                'warnings': warnings,
-                'repair_count': repair_count,
-            },
-        )
-        publish_terminal(generation)
-        return {
-            'generation_id': str(generation.pk),
-            'status': generation.status,
-            'progress': generation.progress,
-            'trace_schema_version': trace.schema_version,
-        }
-    except MCPPageExplorerError as exc:
-        code, message = _map_explorer_error(exc)
-        if code == 'TASK_CANCELLED':
-            generation = _cancel_with_explorer_stats(generation.pk, exc)
-            publish_terminal(generation)
-            return {'generation_id': str(generation.pk), 'status': 'cancelled'}
-        updates = {'tool_stats': _merge_explorer_failure_stats(generation.tool_stats, exc)}
-        if exc.snapshot is not None:
-            updates['exploration_snapshot'] = exc.snapshot.model_dump(mode='json')
-            updates['warnings'] = list(dict.fromkeys([*generation.warnings, *exc.snapshot.warnings]))
-        return _safe_fail_generation(str(generation.pk), code, message, updates=updates)
-    except Exception:
-        logger.error(
-            'WebUI V2 orchestration failed without exposing raw details: generation_id=%s',
-            generation.pk,
-        )
-        return _safe_fail_generation(
-            str(generation.pk),
-            'TRANSIENT_SERVICE_ERROR',
-            '生成流程状态暂时无法继续，请稍后重试。',
-        )
-
-
-def _environment_credentials(variables: dict[str, Any]) -> dict[str, str] | None:
-    username = variables.get('UI_TEST_USERNAME') or variables.get('ui_test_username')
-    password = variables.get('UI_TEST_PASSWORD') or variables.get('ui_test_password')
-    if username and password:
-        return {'username': str(username), 'password': str(password)}
-    return None
-
-
-def run_v2_generation_from_trace(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
-    """Resume the model-only half of the pipeline from a durable trace."""
+            return _fail(str(generation.pk), 'TRANSIENT_SERVICE_ERROR', '当前生成阶段不能继续。')
+    except ScenarioInputInsufficientError:
+        return _fail(str(generation.pk), 'INPUT_AMBIGUOUS', '描述缺少明确测试对象，请补充目标。')
+    except (GenerationContractError, KeyError, ValueError):
+        return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v3 GoalPlan。')
+    credentials = (
+        get_generation_temporary_credentials(generation.pk)
+        or environment_credentials(generation.environment)
+    )
+    preflight = run_safety_preflight(generation, plan, credentials_available=credentials is not None)
+    if preflight.outcome != 'continue':
+        status = {'needs_credentials': WebUIScriptGeneration.Status.NEEDS_CREDENTIALS, 'needs_confirmation': WebUIScriptGeneration.Status.NEEDS_CONFIRMATION, 'failed': WebUIScriptGeneration.Status.FAILED}[preflight.outcome]
+        paused = transition_generation(generation.pk, status, progress=25, error_code=preflight.error_code, error_message=preflight.message, updates={'warnings': preflight.warnings})
+        if status == WebUIScriptGeneration.Status.FAILED:
+            publish_terminal(paused)
+        return {'generation_id': str(paused.pk), 'status': paused.status, 'error_code': paused.error_code}
     try:
-        generation = claim_trace_generation_retry(generation_id, celery_task_id)
-        if generation is None:
-            current = WebUIScriptGeneration.objects.get(pk=generation_id)
-            return {'generation_id': str(generation_id), 'status': current.status, 'skipped': True}
-        scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
-        trace = assess_trace_coverage(
-            scenario, ExplorationTrace.model_validate(generation.exploration_snapshot or {}),
-        )
-        if not trace_has_minimum_page_state(trace):
-            return _safe_fail_generation(str(generation.pk), 'TRACE_RETRY_UNSAFE', '已保存探索轨迹不满足安全重试条件，未重新打开浏览器。')
-        evidence_gaps = required_trace_evidence_gaps(scenario, trace)
-        if evidence_gaps:
-            generation = transition_generation(
-                generation.pk,
-                WebUIScriptGeneration.Status.NEEDS_REVIEW,
-                progress=55,
-                error_code='EVIDENCE_INSUFFICIENT',
-                error_message='已保存探索轨迹缺少必需步骤证据，未重新生成脚本。',
-                updates={
-                    'exploration_snapshot': trace.model_dump(mode='json'),
-                    'tool_stats': trace.tool_stats,
-                    'quality_report': _evidence_review_report(evidence_gaps),
-                    'warnings': list(dict.fromkeys([
-                        *generation.warnings, *trace.warnings, *_evidence_review_warnings(evidence_gaps),
-                    ])),
-                },
-            )
-            publish_terminal(generation)
-            return {'generation_id': str(generation.pk), 'status': generation.status, 'trace_only': True}
-        model_manager = get_llm_manager(config_id=generation.model_info['config_id'])
-        generator = ScriptGenerator(model_manager.current_llm)
-        publish_stage_changed(generation, '根据探索轨迹重新生成脚本')
-        script = generator.generate(scenario=scenario, trace=trace)
-        generation = transition_generation(
-            generation.pk, WebUIScriptGeneration.Status.VALIDATING, progress=75,
-            updates={'script_draft': script},
-        )
-        report = evaluate_script(script, scenario=scenario, trace=trace)
-        repair_count = 0
-        while blocker_issues(report) and repair_count < 2:
-            generation = transition_generation(
-                generation.pk, WebUIScriptGeneration.Status.REPAIRING, progress=82 + repair_count * 4,
-                updates={'quality_report': report, 'repair_count': repair_count},
-            )
-            script = generator.repair(script=script, issues=blocker_issues(report), scenario=scenario, trace=trace)
-            repair_count += 1
-            generation = transition_generation(
-                generation.pk, WebUIScriptGeneration.Status.VALIDATING, progress=88 + repair_count * 2,
-                updates={'script_draft': script, 'repair_count': repair_count},
-            )
-            report = evaluate_script(script, scenario=scenario, trace=trace)
-        warnings = list(dict.fromkeys([*trace.warnings, *[item['message'] for item in report.get('warnings', [])]]))
-        partial_attention = _partial_trace_requires_attention(trace)
-        cleanup_attention = _cleanup_requires_attention(trace)
-        target_status = WebUIScriptGeneration.Status.NEEDS_REVIEW if blocker_issues(report) or partial_attention or cleanup_attention else (
-            WebUIScriptGeneration.Status.READY_WITH_WARNINGS if warnings else WebUIScriptGeneration.Status.READY
-        )
-        retry_error_code = (
-            'EXPLORATION_CLEANUP_UNCONFIRMED' if cleanup_attention
-            else ('EXPLORATION_PARTIAL' if partial_attention else ('QUALITY_GATE_BLOCKED' if blocker_issues(report) else ''))
-        )
-        retry_error_message = (
-            '脚本草稿已保留，但探索数据清理未确认，请先检查残留数据再调试。' if cleanup_attention
-            else ('脚本草稿已保留，但页面探索提前结束，请检查后再调试。' if partial_attention
-                  else ('脚本已生成，但质量检查仍有阻断项。' if blocker_issues(report) else ''))
-        )
-        generation = transition_generation(
-            generation.pk, target_status, progress=95 if target_status == WebUIScriptGeneration.Status.NEEDS_REVIEW else 100,
-            error_code=retry_error_code,
-            error_message=retry_error_message,
-            updates={'script_draft': script, 'quality_report': report, 'warnings': warnings, 'repair_count': repair_count},
-        )
-        publish_terminal(generation)
-        return {'generation_id': str(generation.pk), 'status': generation.status, 'trace_only': True}
-    except Exception as exc:
-        error_code, message = _model_failure(exc)
-        return _safe_fail_generation(str(generation_id), error_code, message)
+        manager = get_llm_manager(config_id=generation.model_info['config_id'])
+        generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.EXPLORING, progress=45, updates={'warnings': preflight.warnings})
+        publish_stage_changed(generation, '按目标探索页面')
+        explorer = MCPPageExplorer(llm_model=manager.current_llm, mcp_config=preflight.mcp_config or {}, generation_id=str(generation.pk), user_constraints=_normalization_description(generation), cancel_check=lambda: _terminal_cancel(str(generation.pk), celery_task_id), exploration_timeout_seconds=generation.exploration_timeout_seconds or exploration_total_timeout_seconds())
+        trace = asyncio.run(explorer.explore_until_complete(plan=plan, start_path=generation.start_path, target_url_safe=generation.target_url_safe, temporary_credentials=credentials))
+    except MCPPageExplorerError as exc:
+        if exc.snapshot is None:
+            return _fail(str(generation.pk), exc.error_code, str(exc))
+        trace = exc.snapshot
+    except Exception:
+        return _fail(str(generation.pk), 'BROWSER_UNAVAILABLE', '页面探索服务暂时不可用。')
+    if not trace_has_minimum_page_state(trace):
+        return _fail(str(generation.pk), 'EXPLORATION_NO_PAGE_STATE', '未取得可用页面观察，未生成脚本。')
+    generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.GENERATING, progress=70, updates={'exploration_snapshot': trace.model_dump(mode='json'), 'tool_stats': trace.tool_stats})
+    publish_stage_changed(generation, '整理可回放路径')
+    return _compile_persisted(generation, plan, trace)
+
+def run_generation_from_trace(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
+    generation = claim_trace_generation_retry(generation_id, celery_task_id)
+    if generation is None:
+        return {'generation_id': str(generation_id), 'status': 'skipped'}
+    try:
+        plan = GoalPlan.model_validate(generation.scenario_spec or {})
+        trace = coerce_trace(generation.exploration_snapshot or {})
+    except Exception:
+        return _fail(str(generation_id), 'V3_TRACE_INVALID', '已保存的 v3 轨迹无法继续编译。')
+    return _compile_persisted(generation, plan, trace)

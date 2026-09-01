@@ -1,10 +1,12 @@
-/** Pure, presentation-only helpers for the V2 WebUI generation page. */
+/** Pure, presentation-only helpers for the V3 WebUI generation page. */
 
 export const GENERATION_STAGES = [
-  ['normalizing', '理解目标'],
-  ['exploring', '探索并验证测试流程'],
-  ['generating', '生成并检查草稿'],
-  ['completed', '进入可编辑工作区']
+  ['normalizing', '理解测试目标'],
+  ['exploring', '按目标探索页面'],
+  ['planning', '整理可回放路径'],
+  ['generating', '生成 Python 脚本'],
+  ['validating', '检查脚本质量'],
+  ['completed', '整理生成结果']
 ]
 
 export const ACTIVE_GENERATION_STATUSES = new Set([
@@ -53,7 +55,7 @@ export const modelInfoLabel = (model, emptyLabel = '—') => (
 )
 
 export const generationStorageKey = (userId, projectId) => (
-  `aits:webui-script-generation:v2:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
+  `aits:webui-script-generation:v3:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
 )
 
 export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(status)
@@ -119,9 +121,9 @@ const CLEANUP_STATUS_PRESENTATION = {
   unknown: { label: '清理结果未知', type: 'warning' }
 }
 
-/** Keep cleanup evidence conservative: absent fields in legacy snapshots are not a success result. */
+/** Keep cleanup evidence conservative: an absent v3 record is not a success result. */
 export const explorationCleanupPresentation = (snapshot) => {
-  const report = snapshot?.cleanup ?? snapshot?.cleanup_report
+  const report = snapshot?.cleanup
   if (!report || typeof report !== 'object' || Array.isArray(report)) {
     return { hasRecord: false, status: '', label: '尚无清理记录', type: 'info', attempted: false, residuals: [], reason: '' }
   }
@@ -142,13 +144,9 @@ export const generationActionRequired = (generation) => {
   const status = generation?.status
   if (!isPausedGeneration(status)) return null
   const errorCode = generation?.error_code || ''
-  const completion = generation?.exploration_snapshot?.completion || {}
-  const businessQuestions = [
-    ...(Array.isArray(completion.user_questions) ? completion.user_questions : []),
-    ...(Array.isArray(completion.missing_targets) ? completion.missing_targets
-      .filter(item => item?.kind === 'business_decision')
-      .map(item => item.user_question || item.reason) : [])
-  ].map(item => String(item || '').trim()).filter(Boolean)
+  const businessQuestions = (Array.isArray(generation?.scenario_spec?.ambiguities)
+    ? generation.scenario_spec.ambiguities
+    : []).map(item => String(item || '').trim()).filter(Boolean)
   const remainingAttempts = Math.max(0, 3 - Number(generation?.resume_count || 0))
 
   if (status === 'needs_credentials') {
@@ -167,9 +165,9 @@ export const generationActionRequired = (generation) => {
   }
   if (status === 'needs_confirmation' && generation?.current_stage === 'preflighting' && errorCode !== 'EXPLORATION_EXTRA_RISK_BLOCKED') {
     return {
-      kind: 'target_scope', title: '常规 CRUD 测试流程已支持',
-      description: '常规测试数据的新增、查询、编辑、删除已支持，可按现有目标范围继续，旧记录无需补充描述。默认只使用本轮测试数据并尝试清理；清理失败或发现残留会明确告知并保留已有证据及草稿。若测试描述已明确要求只读，系统会遵守该限制。审批、付款、发布、上传等额外动作目前不在扩权支持范围，请修改测试目标。页面元素、DOM 和定位器不需要你填写。',
-      questions: [], primaryLabel: '确认常规 CRUD 范围并继续', remainingAttempts
+      kind: 'target_scope', title: '需要确认本次目标范围',
+      description: '平台会按照测试目标驱动 Playwright MCP 探索，不依赖固定按钮文案。仅允许操作本轮测试数据，并按目标计划尝试清理；清理失败或结果未知会明确告知。审批、付款、发布、上传等额外副作用仍需要修改目标或单独授权。页面元素、DOM 和定位器不需要你填写。',
+      questions: [], primaryLabel: '确认目标范围并继续', remainingAttempts
     }
   }
   if (status === 'needs_confirmation' && businessQuestions.length) {
@@ -180,7 +178,7 @@ export const generationActionRequired = (generation) => {
       primaryLabel: '提交答案并继续', remainingAttempts
     }
   }
-  if (['EVIDENCE_INSUFFICIENT', 'EXPLORATION_INCOMPLETE'].includes(errorCode) || completion.status === 'needs_targeted_exploration') {
+  if (['GOAL_EVIDENCE_INSUFFICIENT', 'GOAL_INCOMPLETE', 'EVIDENCE_INSUFFICIENT', 'EXPLORATION_INCOMPLETE'].includes(errorCode)) {
     return {
       kind: 'exploration_issue', title: '页面探索未完成',
       description: generation?.error_message || '当前页面轨迹不足，不能要求你填写 DOM 或定位器。请查看探索轨迹并修订业务目标后重新发起。',
@@ -207,7 +205,11 @@ export const matchesGenerationWebSocketEvent = (message, generation) => {
 
 export const buildGenerationTimeline = (generation) => {
   const currentStage = generation?.current_stage || 'created'
-  const stageIndex = { created: 0, normalizing: 0, preflighting: 0, exploring: 1, generating: 2, validating: 2, repairing: 2, completed: 3 }
+  const stageIndex = {
+    created: 0, normalizing: 0, preflighting: 0, exploring: 1,
+    planning: 2, replay_planning: 2, generating: 3,
+    validating: 4, repairing: 4, completed: 5
+  }
   const currentIndex = stageIndex[currentStage] ?? 0
   const terminal = isTerminalGeneration(generation?.status)
 
@@ -229,7 +231,7 @@ export const buildGenerationTimeline = (generation) => {
 export const generationResolutionHint = (generation) => {
   const status = generation?.status
   if (status === 'needs_input') return '请补充明确的测试目标、操作步骤和至少一个可验证结果后重新分析。页面元素和平台默认清理策略不需要填写。'
-  if (status === 'needs_confirmation') return '请先确认常规 CRUD 的目标范围和仍待确认的业务信息。审批、付款、发布、上传等额外动作目前不在扩权支持范围；页面元素、DOM 和定位器不需要人工填写。'
+  if (status === 'needs_confirmation') return '请确认本次测试目标范围和仍待确认的业务信息。平台会自行探索页面元素；审批、付款、发布、上传等额外副作用仍需单独确认。'
   if (status === 'needs_credentials') return '请在“本轮测试登录信息”中填写临时账号和密码后重新发起。'
   if (status === 'needs_review') return `${generation?.error_message ? `${generation.error_message} ` : ''}本次结果需要人工处理，尤其请确认清理失败或残留数据。草稿和证据已保留，可先查看后再决定是否新建任务。`
   if (status === 'failed' || status === 'cancelled') {
@@ -237,7 +239,6 @@ export const generationResolutionHint = (generation) => {
       ? generation?.error_message || '请检查模型、Playwright MCP、登录信息或页面可访问性后重试。'
       : '本次生成已停止。'
     const cleanupStatus = generation?.exploration_snapshot?.cleanup?.status
-      ?? generation?.exploration_snapshot?.cleanup_report?.status
     return ['unknown', 'residual', 'not_attempted'].includes(cleanupStatus)
       ? `${message} 重新发起前，请先检查“探索轨迹”中的本轮数据和清理结果，避免重复操作。`
       : message

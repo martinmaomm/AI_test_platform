@@ -30,11 +30,11 @@
         <div v-else class="field-help">服务器默认值暂不可用；可留空，创建时由服务器 env 决定。</div>
       </el-form-item>
       <el-form-item label="测试描述" required>
-        <div class="description-actions"><span>请写清目标、主要步骤、成功标准、目标数据范围和清理约束。</span><el-button text type="primary" :disabled="busy || paused" @click="insertExample">插入示例</el-button></div>
-        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy || paused" placeholder="例如：验证用户列表中的新增、查询、编辑、删除流程。" />
+        <div class="description-actions"><span>请写清目标、主要步骤、成功标准、目标数据范围和清理约束；系统不依赖固定按钮名称或业务词语。</span><el-button text type="primary" :disabled="busy || paused" @click="insertExample">插入示例</el-button></div>
+        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy || paused" placeholder="例如：登录后进入目标页面，完成指定流程并验证最终页面状态。" />
       </el-form-item>
       <el-collapse class="input-collapse">
-        <el-collapse-item title="编写提示" name="tips"><ol><li>说明测试目标和要进入的页面。</li><li>按顺序列出主要操作，并写明每一步如何判断成功。</li><li>涉及创建、编辑或删除时，说明唯一测试数据和清理要求；未特别说明时，默认只操作本轮测试数据。</li><li>如目标要求仅只读，请在描述中明确；系统会尊重该限制，不执行写操作。审批、付款、发布、上传等额外动作目前不在扩权支持范围，请修改测试目标。</li></ol></el-collapse-item>
+        <el-collapse-item title="编写提示" name="tips"><ol><li>说明测试目标和要进入的页面。</li><li>按顺序列出主要操作，并写明每一步如何判断成功。</li><li>涉及改变页面数据时，说明唯一测试数据和清理要求；未特别说明时，默认只操作本轮测试数据。</li><li>如目标要求仅只读，请在描述中明确；系统会尊重该限制，不执行写操作。审批、付款、发布、上传等额外动作目前不在授权范围，请修改测试目标。</li></ol></el-collapse-item>
         <el-collapse-item title="本轮测试登录信息（按需填写）" name="credentials">
           <el-alert type="warning" :closable="false" show-icon title="仅供本轮测试流程使用；提交后立即从页面内存清除，不会写入脚本、生成记录或本地存储。" />
           <div class="credential-grid"><el-input v-model="form.username" autocomplete="off" placeholder="用户名" :disabled="busy || paused" /><el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="密码" :disabled="busy || paused" /></div>
@@ -46,7 +46,7 @@
         </el-select>
         <div class="field-help">只显示已启用的语言模型；平台会锁定本次选择，生成中不会自动切换模型。</div>
       </el-form-item>
-      <el-alert class="execution-scope-alert" type="warning" :closable="false" show-icon title="开始后会在确认的目标范围内实际执行常规新增、查询、编辑、删除流程。默认只操作本轮测试数据并尝试清理；清理失败或发现残留会明确告知，并保留已获得的证据及已有草稿供人工处理。测试描述明确仅只读时，不执行写操作。审批、付款、发布、上传等额外动作目前不在扩权支持范围。" />
+      <el-alert class="execution-scope-alert" type="warning" :closable="false" show-icon title="开始后会按测试目标在页面中执行真实操作。默认只操作本轮测试数据并尝试清理；清理失败或发现残留会明确告知，并保留已获得的证据及已有草稿供人工处理。测试描述明确仅只读时，不执行写操作。审批、付款、发布、上传等额外高风险动作目前不在授权范围。" />
       <div class="form-actions"><el-button v-if="paused" type="warning" size="large" disabled>请先处理当前暂停任务</el-button><el-button v-else-if="!busy" type="primary" size="large" :disabled="!formValid" :loading="submitting" native-type="submit">分析并生成脚本</el-button><el-button v-else type="danger" size="large" :loading="cancelling" :disabled="cancelling" @click="emit('cancel')">取消生成</el-button></div>
     </el-form>
   </section>

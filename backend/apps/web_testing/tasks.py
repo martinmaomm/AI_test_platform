@@ -90,18 +90,18 @@ def _remove_failure_screenshots(execution_id: int):
         logger.warning('删除执行 %s 的失败截图目录失败', execution_id, exc_info=True)
 
 
-@shared_task(bind=True, name='web_testing.generate_webui_script_generation_v2')
-def generate_webui_script_generation_v2_task(self, generation_id: str):
+@shared_task(bind=True, name='web_testing.generate_webui_script_generation')
+def generate_webui_script_generation_task(self, generation_id: str):
     """Run the durable AI + Playwright MCP generation pipeline by record ID."""
-    from .generation_orchestrator import run_v2_generation
+    from .generation_orchestrator import run_generation
 
-    return run_v2_generation(str(generation_id), celery_task_id=self.request.id)
+    return run_generation(str(generation_id), celery_task_id=self.request.id)
 
 
 @shared_task(bind=True, name='web_testing.retry_webui_script_generation_from_trace')
 def retry_webui_script_generation_from_trace_task(self, generation_id: str):
-    from .generation_orchestrator import run_v2_generation_from_trace
-    return run_v2_generation_from_trace(str(generation_id), celery_task_id=self.request.id)
+    from .generation_orchestrator import run_generation_from_trace
+    return run_generation_from_trace(str(generation_id), celery_task_id=self.request.id)
 
 
 def _run_test_script(
@@ -433,16 +433,11 @@ def debug_webui_script_generation_task(
 @shared_task(bind=True, name='web_testing.repair_webui_script_generation')
 def repair_webui_script_generation_task(self, generation_id: str, locked_revision: int, locked_hash: str):
     """Generate a conservative candidate only; a user must review and debug it."""
-    from ai_core.model_manager import get_llm_manager
     from .exploration_trace import ExplorationTrace
-    from .generation_contracts import ScenarioSpec
+    from .generation_contracts import GoalPlan
     from .generation_workspace import (
         accept_repair_candidate, finish_repair_failure, mark_repair_running,
     )
-    from .script_contract import ScriptContractError, normalize_for_storage
-    from .script_generator import ScriptGenerator
-    from .script_quality import blocker_issues, evaluate_script
-    from .script_repair_policy import validate_targeted_repair
 
     generation = mark_repair_running(generation_id, locked_revision=locked_revision, locked_hash=locked_hash, task_id=self.request.id)
     if generation is None:
@@ -453,31 +448,9 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         issues = verification.get('diagnostics') or []
         if not issues:
             raise ValueError('缺少运行失败诊断，需要人工补充证据或重新调试。')
-        scenario = ScenarioSpec.model_validate(generation.scenario_spec or {})
-        trace = ExplorationTrace.model_validate(generation.exploration_snapshot or {})
-        manager = get_llm_manager(config_id=(generation.model_info or {}).get('config_id'))
-        candidate = ScriptGenerator(manager.current_llm).repair(
-            script=generation.script_draft, issues=issues, scenario=scenario, trace=trace,
-        )
-        try:
-            normalize_for_storage(candidate)
-        except ScriptContractError as exc:
-            raise ValueError(f'修复候选未通过脚本契约：{exc}') from exc
-        report = evaluate_script(candidate, scenario=scenario, trace=trace)
-        quality_blockers = blocker_issues(report)
-        policy_blockers = validate_targeted_repair(generation.script_draft, candidate, trace)
-        blockers = [*quality_blockers, *policy_blockers]
-        if blockers:
-            finish_repair_failure(
-                generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
-                message='修复候选未通过静态或保守变更检查，已保留原稿。', blockers=blockers, task_id=self.request.id,
-            )
-            return {'success': False, 'generation_id': generation_id, 'blockers': blockers}
-        if not accept_repair_candidate(
-            generation_id, locked_revision=locked_revision, locked_hash=locked_hash, candidate_script=candidate, task_id=self.request.id,
-        ):
-            return build_error_result(self.request.id, '草稿已变化，修复候选未写入。')
-        return {'success': True, 'generation_id': generation_id, 'status': 'ready_for_review'}
+        GoalPlan.model_validate(generation.scenario_spec or {})
+        ExplorationTrace.model_validate(generation.exploration_snapshot or {})
+        raise ValueError('v3 回放脚本不支持通用 LLM 修复；请重新探索或人工审核。')
     except Exception as exc:
         logger.error('生成草稿修复失败: generation_id=%s', generation_id)
         finish_repair_failure(

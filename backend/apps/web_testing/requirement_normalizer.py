@@ -1,194 +1,69 @@
-"""LLM-backed, strictly structured WebUI scenario normalisation."""
+"""LLM-backed v3 GoalPlan normalisation without action-word heuristics."""
 
 from __future__ import annotations
 
 import json
-import logging
 import re
-from copy import deepcopy
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai_core.model_manager import get_llm_manager
 
-from .generation_contracts import (
-    ScenarioInputInsufficientError,
-    ScenarioSpec,
-    parse_scenario_spec_json,
-)
+from .generation_contracts import GoalPlan, ScenarioInputInsufficientError, parse_goal_plan_json
 from .generation_security import redact_metadata, redact_text
 
-logger = logging.getLogger(__name__)
-
-
-_ACTION_PATTERN = re.compile(
-    r'新增|创建|添加|编辑|修改|更新|删除|移除|查询|查看|进入|打开|保存|提交|验证|确认|检查',
-)
-_OUTCOME_PATTERN = re.compile(
-    r'验证|确认|检查|出现|存在|可见|不存在|消失|成功|失败|生效|结果|状态|应当|应该|期望',
-)
 _GENERIC_DESCRIPTION_PATTERN = re.compile(r'^(?:请)?(?:帮我)?(?:生成|编写|创建)?(?:一个)?(?:测试|用例|脚本)?[。！!？?\s]*$')
-_EXPLICIT_SUCCESS_PATTERNS = (
-    ('create', re.compile(r'(?:新增|创建|添加).{0,80}(?:出现|存在|可见|验证|确认|检查)')),
-    ('update', re.compile(r'(?:编辑|修改|更新).{0,80}(?:验证|确认|检查|生效|成功|更新)')),
-    ('delete', re.compile(r'(?:删除|移除).{0,80}(?:验证|确认|检查|不存在|消失)')),
-)
-_ASSERTION_EXPECTED = {
-    'create': '本轮新建的唯一测试数据出现。',
-    'update': '本轮新建测试数据的编辑结果已更新。',
-    'delete': '本轮新建测试数据已不存在。',
-}
-_ASSERTION_NAME = {
-    'create': '验证新增结果',
-    'update': '验证编辑结果',
-    'delete': '验证删除结果',
-}
-_DEFAULT_CLEANUP_CONDITION = '仅清理本轮新建且带唯一标记的测试数据；结束或失败时尝试删除，失败时报告残留。'
 
-
-NORMALIZER_SYSTEM_PROMPT = """你是 WebUI 自动化测试场景整理器。只将用户已明确表达的目标整理成 JSON，
-不得编造接口字段、页面元素、业务结果或登录流程。
-页面可通过目标范围内的实际探索获得的信息，例如表单字段、按钮文案、输入提示、菜单层级、相对路径、列表状态和可见元素，
-必须写入 discovery_targets，不能写入 ambiguities，也不能要求用户提前提供。
-只有页面无法观察且会改变业务含义或安全边界、必须由用户决策的信息，才写入 ambiguities。
-用户已经说明通过列表出现、内容更新或记录不存在来验证结果时，不得再追问 Toast 文案等可选成功标志。
-普通增删改查目标允许在探索中实际提交和观察结果，不要自行添加“探索只读”的 forbidden_actions。
-用户明确写了“只查看/不提交/探索阶段只读”时必须保留在 forbidden_actions，不能为了完成目标忽略它。
-默认只能修改、删除本轮新建且带唯一标记的测试数据，不修改已有数据；用户明确指定已有数据时不得扩大到其他记录。
-对于本轮新建数据，cleanup 默认写明“结束或失败时尝试清理本轮数据；失败时报告残留”，不要求用户补写这项平台默认策略。
+NORMALIZER_SYSTEM_PROMPT = """你是 WebUI 自动化测试目标整理器。将用户已明确表达的目标整理为严格 JSON。
+不得编造页面字段、按钮、定位器、接口、登录流程或业务结果。页面入口、控件和路径属于后续真实探索，不要求用户预先提供。
+每个 Goal 的 kind 只能是 setup/exercise/verify/cleanup，它只表示测试阶段，绝不代表页面按钮或 CRUD 意图。
+side_effect 只能由用户目标语义判断；test_data 的 Goal 必须由一个 cleanup Goal 的 cleanup_for_goal_ids 引用。
+verify Goal 必须提供 verification；有 cleanup_for_goal_ids 的 cleanup Goal 也必须提供 verification。verification 只能是 null，或 {"mode":"visible"}，或 {"mode":"contains_ref|not_contains_ref","input_ref":"当前 Goal 已声明 ref"}。
+input_refs 的 name 必须是大写执行变量名。source 为 credential 时才提供 credential_slot，值只能是 username 或 password；其他 source 必须省略 credential_slot。
+同名 input ref 在所有 Goal 中必须保持相同 source 和 credential_slot；不得使用系统保留变量名。
+需要登录时 credentials_required=true，并同时声明 UI_TEST_USERNAME/username 和 UI_TEST_PASSWORD/password 两个 credential ref；不需要登录时不得声明 credential ref。
+整个 GoalPlan 至少包含一个 verification contract，保证最终脚本有可验证结果。
+除空白或“帮我生成测试”这类完全没有测试对象的输入外，不因缺少固定动作词或成功词而拒绝输入。
 不要输出 Markdown、解释、代码、用户名、密码、Token 或完整 URL。
-输出必须严格匹配以下 JSON 结构：
+输出必须严格匹配：
 {
-  "title":"", "objective":"", "preconditions":[],
-  "steps":[{"id":"S1","name":"","intent":"navigate|read|create|update|delete|assert|cleanup","target_hint":"","input_refs":[],"mutates_data":false,"expected":""}],
-  "assertions":[{"id":"A1","name":"","target_hint":"","expected":"","step_id":"S1"}],
-  "cleanup":[{"id":"C1","name":"","target_hint":"","condition":"","step_id":"S1"}],
-  "forbidden_actions":[], "credentials_required":false, "discovery_targets":[],
-  "ambiguities":[], "risk_level":"low|medium|high"
+  "schema_version":3,"title":"","objective":"","preconditions":[],
+  "goals":[{"id":"G1","kind":"setup|exercise|verify|cleanup","objective":"","completion_criteria":"","input_refs":[{"name":"USER_NAME","source":"generated"}],"verification":null,"side_effect":"none|test_data|external|unknown","cleanup_for_goal_ids":[]}],
+  "forbidden_actions":[],"credentials_required":false,"discovery_notes":[],"ambiguities":[],"risk_level":"low|medium|high"
 }"""
 
 
 class RequirementNormalizer:
-    """One LLM call plus at most one JSON-only format repair."""
+    """One interpretation call and at most one JSON-only repair call."""
 
     def __init__(self, model_config_id: int):
         self.model_config_id = model_config_id
         self.model_manager = get_llm_manager(config_id=model_config_id)
 
-    def normalize(self, description_safe: str, test_case_context: dict[str, Any] | None = None) -> ScenarioSpec:
-        self._raise_if_description_is_clearly_insufficient(description_safe)
-        safe_context = redact_metadata(test_case_context or {})
-        user_payload = {
-            'description': redact_text(description_safe),
-            'test_case_context': safe_context,
-        }
-        raw_output = self.model_manager.invoke([
-            SystemMessage(content=NORMALIZER_SYSTEM_PROMPT),
-            HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
-        ])
-        return parse_scenario_spec_json(
-            raw_output,
-            format_repair=self._repair_json_once,
-            payload_transform=lambda payload: self._apply_explicit_scenario_defaults(payload, description_safe),
-        )
-
-    @staticmethod
-    def _raise_if_description_is_clearly_insufficient(description_safe: str) -> None:
-        description = redact_text(description_safe).strip()
+    def normalize(self, description_safe: str, test_case_context: dict[str, Any] | None = None) -> GoalPlan:
+        description = redact_text(str(description_safe or '')).strip()
         if not description or _GENERIC_DESCRIPTION_PATTERN.fullmatch(description):
             raise ScenarioInputInsufficientError('scenario_target_missing')
-        if not _ACTION_PATTERN.search(description):
-            raise ScenarioInputInsufficientError('scenario_steps_missing')
-        if not _OUTCOME_PATTERN.search(description):
-            raise ScenarioInputInsufficientError('scenario_outcome_missing')
-
-    @staticmethod
-    def _apply_explicit_scenario_defaults(payload: Any, description_safe: str) -> Any:
-        """Fill only assertion and cleanup guarantees stated by policy or user text."""
-        if not isinstance(payload, dict):
-            return payload
-        normalized = deepcopy(payload)
-        steps = normalized.get('steps')
-        if not isinstance(steps, list):
-            return normalized
-
-        mutation_steps = [
-            step for step in steps
-            if isinstance(step, dict) and (step.get('mutates_data') or step.get('intent') in {'create', 'update', 'delete'})
-        ]
-        assertions = normalized.get('assertions')
-        if assertions is None:
-            assertions = []
-        if isinstance(assertions, list):
-            existing_step_ids = {
-                item.get('step_id') for item in assertions if isinstance(item, dict)
-            }
-            used_ids = {
-                item.get('id') for item in assertions if isinstance(item, dict)
-            }
-            for intent, pattern in _EXPLICIT_SUCCESS_PATTERNS:
-                if not pattern.search(description_safe):
-                    continue
-                step = next((item for item in mutation_steps if item.get('intent') == intent), None)
-                if step is None:
-                    continue
-                step_id = step.get('id')
-                target_hint = step.get('target_hint')
-                if not isinstance(step_id, str) or not isinstance(target_hint, str) or not target_hint.strip():
-                    continue
-                if step_id in existing_step_ids:
-                    continue
-                next_index = 1
-                while f'A{next_index}' in used_ids:
-                    next_index += 1
-                assertion_id = f'A{next_index}'
-                assertions.append({
-                    'id': assertion_id,
-                    'name': _ASSERTION_NAME[intent],
-                    'target_hint': target_hint,
-                    'expected': _ASSERTION_EXPECTED[intent],
-                    'step_id': step_id,
-                })
-                existing_step_ids.add(step_id)
-                used_ids.add(assertion_id)
-            normalized['assertions'] = assertions
-
-        if mutation_steps and not normalized.get('cleanup'):
-            create_step = next((item for item in mutation_steps if item.get('intent') == 'create'), None)
-            if create_step is not None:
-                step_id = create_step.get('id')
-                target_hint = create_step.get('target_hint')
-                if isinstance(step_id, str) and isinstance(target_hint, str) and target_hint.strip():
-                    normalized['cleanup'] = [{
-                        'id': 'C1',
-                        'name': '清理本轮新建测试数据',
-                        'target_hint': target_hint,
-                        'condition': _DEFAULT_CLEANUP_CONDITION,
-                        'step_id': step_id,
-                    }]
-        return normalized
+        raw_output = self.model_manager.invoke([
+            SystemMessage(content=NORMALIZER_SYSTEM_PROMPT),
+            HumanMessage(content=json.dumps({
+                'description': description,
+                'test_case_context': redact_metadata(test_case_context or {}),
+            }, ensure_ascii=False)),
+        ])
+        return parse_goal_plan_json(raw_output, format_repair=self._repair_json_once)
 
     def _repair_json_once(self, invalid_output: str, validation_error: str) -> str:
-        """Ask only for schema-conforming reformatting, never a new interpretation."""
-        prompt = {
-            'instruction': (
-                '仅修复以下 JSON 的格式或缺失结构，不新增业务操作、页面元素、定位器或业务字段。'
-                '可根据用户已经明确的成功标准补全 assertions，并为本轮新建的唯一测试数据补全默认 cleanup。只输出 JSON。'
-            ),
-            'validation_error': validation_error,
-            'invalid_output': redact_text(invalid_output),
-        }
         return self.model_manager.invoke([
-            SystemMessage(content='你是严格 JSON 格式修复器，不补充业务含义。'),
-            HumanMessage(content=json.dumps(prompt, ensure_ascii=False)),
+            SystemMessage(content='你是严格 JSON 格式修复器。不得新增业务目标、页面元素、定位器或完成状态；只输出 JSON。'),
+            HumanMessage(content=json.dumps({
+                'instruction': '仅修复 v3 GoalPlan JSON 的格式、字段名或缺失的结构。',
+                'validation_error': validation_error,
+                'invalid_output': redact_text(invalid_output),
+            }, ensure_ascii=False)),
         ])
 
 
-def normalize_requirement(
-    description_safe: str,
-    model_config_id: int,
-    test_case_context: dict[str, Any] | None = None,
-) -> ScenarioSpec:
-    """Convenience entry point used by the Celery orchestrator."""
+def normalize_requirement(description_safe: str, *, model_config_id: int, test_case_context: dict[str, Any] | None = None) -> GoalPlan:
     return RequirementNormalizer(model_config_id).normalize(description_safe, test_case_context)

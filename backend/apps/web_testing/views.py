@@ -112,7 +112,7 @@ from .tasks import (
     debug_webui_script_generation_task,
     execute_webui_test_suite_task,
     generate_midscene_script_task,
-    generate_webui_script_generation_v2_task,
+    generate_webui_script_generation_task,
     repair_webui_script_generation_task,
     retry_webui_script_generation_from_trace_task,
 )
@@ -147,7 +147,7 @@ class WebUIScriptGenerationCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         generation = serializer.save()
         try:
-            task = generate_webui_script_generation_v2_task.delay(str(generation.pk))
+            task = generate_webui_script_generation_task.delay(str(generation.pk))
             generation = attach_celery_task(generation.pk, task.id)
         except Exception:
             logger.exception('WebUI 脚本生成任务调度失败: generation_id=%s', generation.pk)
@@ -282,7 +282,7 @@ class WebUIScriptGenerationResolveView(APIView):
         try:
             if values.get('temporary_credentials'):
                 store_temporary_credentials(generation.pk, values['temporary_credentials'])
-            task = generate_webui_script_generation_v2_task.delay(str(generation.pk))
+            task = generate_webui_script_generation_task.delay(str(generation.pk))
             generation = attach_celery_task(generation.pk, task.id)
         except Exception:
             logger.exception('WebUI 暂停任务恢复失败: generation_id=%s', generation.pk)

@@ -3,6 +3,7 @@ Playwright Python脚本运行器
 使用pytest执行Playwright Python测试脚本
 """
 
+import json
 import os
 import re
 import sys
@@ -304,7 +305,7 @@ python_functions = test_*
             'PATH', 'HOME', 'SHELL', 'VIRTUAL_ENV', 'PWD', 'TMPDIR',
             'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
             'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE',
-            'CURL_CA_BUNDLE', 'NODE_OPTIONS',
+            'CURL_CA_BUNDLE', 'NODE_OPTIONS', 'WEBUI_RUNTIME_VARIABLES',
         }
         safe: Dict[str, str] = {}
         for key, value in (values or {}).items():
@@ -335,8 +336,17 @@ python_functions = test_*
             'PLAYWRIGHT_BASE_URL': config.base_url or '',
             'PYTHONIOENCODING': 'utf-8',  # 防止 Windows GBK 编码报错
         })
-        # Values intentionally never appear in command arguments or logs.
-        env.update(self._safe_environment_variables(config.environment_variables))
+        # Values intentionally never appear in command arguments or logs.  The
+        # JSON copy is consumed only by the managed run(page, variables)
+        # wrapper; individual variables remain available to manually-authored
+        # run(page) scripts that read os.environ.
+        runtime_variables = self._safe_environment_variables(config.environment_variables)
+        env.update(runtime_variables)
+        env['WEBUI_RUNTIME_VARIABLES'] = json.dumps(
+            runtime_variables,
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
 
         python_browser_path = self._resolve_python_browser_path()
         if python_browser_path:

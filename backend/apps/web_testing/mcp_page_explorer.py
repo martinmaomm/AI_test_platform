@@ -1,240 +1,111 @@
-"""Target-driven Playwright MCP exploration for the V2 generation pipeline."""
+"""Same-session, Goal-scoped Playwright MCP exploration for v3."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
+import secrets
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
 from django.conf import settings
-
-from ai_core.webui_playwright_agent import (
-    MCP_BROWSER_TOOL_CALL_LIMIT,
-    MCP_MAX_STEPS,
-    MCPBrowserToolGuard,
-    _classify_mcp_error,
-    _get_mcp_error_message,
-)
-from ai_core.mcp_agent_budget import BudgetedMCPAgent as MCPAgent
 from mcp_use import MCPClient
 
-from .exploration_trace import (
-    ExplorationTrace,
-    ExplorationTraceRecorder,
-    assess_trace_coverage,
-    required_trace_evidence_gaps,
-)
-from .exploration_timeout import exploration_total_timeout_seconds
+from ai_core.mcp_agent_budget import BudgetedMCPAgent as MCPAgent
+from ai_core.webui_playwright_agent import MCP_BROWSER_TOOL_CALL_LIMIT, MCP_MAX_STEPS, MCPBrowserToolGuard, _classify_mcp_error, _get_mcp_error_message
+
 from .exploration_policy import ExplorationPolicy
-from .generation_preflight import (
-    prepare_playwright_mcp_output_config,
-    validate_generation_output_id,
-)
+from .exploration_timeout import exploration_total_timeout_seconds
+from .exploration_trace import ExplorationTrace, ExplorationTraceRecorder, evaluate_goal_events
+from .generation_contracts import Goal, GoalPlan
+from .generation_preflight import prepare_playwright_mcp_output_config, validate_generation_output_id
 
 logger = logging.getLogger(__name__)
 
-EXPLORER_CONSTRAINTS = f"""你只负责目标驱动的页面探索，绝对不要生成 Python、JavaScript 或测试脚本。
-所有 playwright_navigate 调用必须传 JSON 布尔值 `headless: true`。
-浏览器工具总数最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。
-允许打开页面、读取可见文本、打开菜单/Tab/查询条件/表单弹窗；仅在 scope_policy 允许的 CRUD 目标内执行写操作；如提供登录信息，只能用于本次登录。
-切换页面或打开、关闭弹窗后，使用 playwright_get_visible_text 或 playwright_get_visible_html 确认新的页面状态；不要在未观察到变化时反复执行相同交互。
-工具可用性以当前探索能力为准：通过可见页面工具获取证据，无法确认的内容记录为未确认，不得用 JavaScript 绕过。
-不得执行审批、付款、发布、下载或未授权文件操作；不得超出 scope_policy 的 CRUD 操作或数据范围。
-禁止调用 playwright_close；浏览器会话由平台在本次探索结束时统一清理。
-不得输出用户名、密码、Token、Cookie、HTML、截图 Base64 或完整 URL。
-优先通过页面导航、打开菜单和打开表单解决 discovery_targets；不得因为探索前不知道字段、入口、提示或路径就要求用户回答。
-只有完成页面探索后仍无法从页面证据确定的问题，才写入 unresolved_questions。
-每次实际提交后必须先观察结果；结果未知时记录 unknown，不得盲目重试。完成目标后必须尝试 cleanup，并如实报告 residual 或 unknown。
-最终回复只需简短说明已停止探索；普通文本、空文本或 Markdown 都可以。平台会从真实 Playwright 工具调用自动记录探索轨迹，绝不能在最终回复复述页面内容、定位器、凭据、Token、Cookie、HTML、截图 Base64 或完整 URL。"""
-
-_WRITE_ACTION_MARKERS = (
-    '提交', '保存', '确认删除', '删除', '审批', '付款', '支付', '发布', '上传',
-    '下载', 'submit', 'save', 'delete', 'approve', 'pay', 'publish', 'upload',
-    'download',
-)
-_EXTRA_RISK_ACTION_MARKERS = (
-    '审批', '付款', '支付', '发布', '上传', '下载',
-    'approve', 'pay', 'publish', 'upload', 'download',
-)
+EXPLORER_CONSTRAINTS = f"""你只负责当前 Goal 的页面探索，绝不生成 Python、JavaScript 或测试脚本。
+所有 playwright_navigate 调用必须传 JSON 布尔值 headless: true。浏览器工具最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。
+平台在 callback 发生时绑定当前 Goal；最终文本不提供事件、选择器、HTML 或脚本。每个 Goal 结束前必须进行新的页面观察。
+不允许审批、付款、发布、上传、下载或未授权外部操作。只在 active_goal_may_write=true 的当前 Goal 内操作本轮 namespace 测试数据；结果未知时停止，不得重试。
+runtime_input_values 是平台为当前 Goal 提供的唯一输入值映射。仅在实际需要填充或选择时原样使用其中的值；不得猜测 ref、不得改写值、不得在最终文本中复述这些值。
+当前 Goal 若包含 verification，结束前必须调用带具体 selector 的 playwright_get_visible_html 作为验证 probe。contains_ref/not_contains_ref 必须以该 selector 的原始工具输出中对应 runtime ref 值存在/不存在为依据；不能以 playwright_get_visible_text 替代。
+不得输出用户名、密码、Token、Cookie、完整 URL、截图 Base64 或 HTML。"""
 
 READ_ONLY_DISABLED_TOOL_MESSAGES = {
-    'playwright_evaluate': '页面探索不允许执行页面 JavaScript。请通过页面读取工具获取证据，无法确认的内容请记录为未确认。',
-    'playwright_upload_file': '页面探索不允许上传文件。请在后续脚本执行阶段处理该操作。',
-    'playwright_close': '页面探索不允许关闭浏览器。浏览器会话将在探索结束后由平台统一清理。',
+    'playwright_evaluate': '页面探索不允许执行页面 JavaScript。',
+    'playwright_upload_file': '页面探索不允许上传文件。',
+    'playwright_close': '页面探索不允许关闭浏览器。',
 }
-
-EXPLORATION_TOTAL_MODEL_STEPS = MCP_MAX_STEPS
-MAX_TARGETED_EXPLORATION_ROUNDS = 2
+_HIGH_RISK_MARKERS = ('审批', '付款', '支付', '发布', '上传', '下载', 'approve', 'pay', 'publish', 'upload', 'download')
+_RUNTIME_REF_TOKEN_RE = re.compile(r'[^a-zA-Z0-9_-]+')
 
 
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
-    """Keep budgets and static tool bans while enforcing explicit write scope.
-
-    The historical name remains import-compatible.  A browser tool only sees
-    selector/input metadata, so this guard blocks recognisable forbidden
-    submits and records only submit tools that enter execution; page-specific row ownership remains
-    an instruction-and-ledger obligation rather than a claimed sandbox.
-    """
-
-    def __init__(
-        self,
-        max_tool_calls: int = MCP_BROWSER_TOOL_CALL_LIMIT,
-        *,
-        policy: ExplorationPolicy | None = None,
-        trace_recorder: ExplorationTraceRecorder | None = None,
-    ):
+    """Budget/safety guard that attributes potential writes from Goal metadata."""
+    def __init__(self, max_tool_calls: int = MCP_BROWSER_TOOL_CALL_LIMIT, *, policy: ExplorationPolicy | None = None, trace_recorder: ExplorationTraceRecorder | None = None):
         super().__init__(max_tool_calls)
-        self._legacy_read_only = policy is None
         self.policy = policy or ExplorationPolicy.read_only()
-        self._safe_checkpoints: list[dict[str, Any]] = []
+        self.trace_recorder = trace_recorder or ExplorationTraceRecorder()
+        self.model_call_count = 0
         self._potential_write_tool_calls = 0
         self._blocked_write_tool_calls = 0
-        self._potential_write_runs: dict[Any, tuple[str, str]] = {}
-        self._successful_write_operations: list[str] = []
-        self.model_call_count = 0
-        self.trace_recorder = trace_recorder or ExplorationTraceRecorder()
+        self._possible_write_runs: set[Any] = set()
 
     def on_chat_model_start(self, serialized, messages, **kwargs):
-        # Count actual model invocations across both exploration rounds. The
-        # prompt never supplies this value and it is not derived from output.
         with self._lock:
             self.model_call_count += 1
 
     def on_tool_start(self, serialized, input_str, *, inputs=None, **kwargs):
         run_id = kwargs.get('run_id')
         self.trace_recorder.on_tool_start(serialized, input_str, run_id=run_id, inputs=inputs)
-        tool_name = str((serialized or {}).get('name') or '').strip().lower()
-        input_text = self._read_only_input_text(inputs, input_str)
-        is_login_submission = self._is_login_submission(tool_name, inputs, input_str)
+        tool_name = str((serialized or {}).get('name') or '').lower()
+        text = json.dumps(inputs, ensure_ascii=False).lower() if isinstance(inputs, dict) else str(input_str or '').lower()
         try:
             with self._lock:
-                disabled_message = READ_ONLY_DISABLED_TOOL_MESSAGES.get(tool_name)
-                if disabled_message is not None:
-                    self._raise_guard(
-                        'read_only_violation', disabled_message,
-                        blocked_before_execution=True, tool_name=tool_name,
-                    )
-                is_enter = tool_name.endswith('_press_key') and any(
-                    key in input_text for key in ('enter', 'numpadenter')
-                )
-                operation = self.policy.operation_from_tool_input(input_text)
-                if tool_name.endswith(('_click', '_press_key')) and any(
-                    marker in input_text for marker in _EXTRA_RISK_ACTION_MARKERS
-                ):
+                if tool_name in READ_ONLY_DISABLED_TOOL_MESSAGES:
                     self._blocked_write_tool_calls += 1
-                    self._raise_guard(
-                        'extra_risk_action', '探索阶段不允许执行审批、付款、发布、上传或下载等额外风险操作。',
-                        blocked_before_execution=True, tool_name=tool_name,
-                    )
-                is_recognisable_submit = not is_login_submission and (is_enter or (
-                    tool_name.endswith(('_click', '_press_key')) and any(
-                        marker in input_text for marker in _WRITE_ACTION_MARKERS
-                    )
-                ))
-                if is_recognisable_submit and not self.policy.allows(operation):
+                    self._raise_guard('read_only_violation', READ_ONLY_DISABLED_TOOL_MESSAGES[tool_name], blocked_before_execution=True, tool_name=tool_name)
+                if tool_name.endswith(('_click', '_press_key')) and any(marker in text for marker in _HIGH_RISK_MARKERS):
                     self._blocked_write_tool_calls += 1
-                    if self._legacy_read_only:
-                        message = (
-                            '只读探索不允许通过 Enter 提交表单，以防止新增或编辑数据被写入。'
-                            if is_enter else '只读探索检测到可能提交业务写操作，已终止以保护现有数据。'
-                        )
-                        error_kind = 'read_only_violation'
-                    else:
-                        message = '探索策略不允许该提交操作：请遵守用户的只读/禁止动作约束或声明的 CRUD 目标。'
-                        error_kind = 'write_scope_violation'
-                    self._raise_guard(
-                        error_kind, message, blocked_before_execution=True, tool_name=tool_name,
-                    )
-            result = super().on_tool_start(serialized, input_str, inputs=inputs, **kwargs)
+                    self._raise_guard('extra_risk_action', '探索阶段不允许审批、付款、发布、上传或下载等高风险操作。', blocked_before_execution=True, tool_name=tool_name)
+                # A generic click is potentially writing only because the
+                # active Goal declared test_data/cleanup semantics, never
+                # because a page label happened to contain a CRUD word.
+                if tool_name.endswith(('_click', '_press_key')):
+                    if self.policy.current_goal_may_write():
+                        self._potential_write_tool_calls += 1
+                        self._possible_write_runs.add(run_id)
+                    elif self.policy.explicit_read_only and ('enter' in text or 'submit' in text):
+                        self._blocked_write_tool_calls += 1
+                        self._raise_guard('read_only_violation', '当前 Goal 是观察性目标，禁止可能提交表单的操作。', blocked_before_execution=True, tool_name=tool_name)
+            return super().on_tool_start(serialized, input_str, inputs=inputs, **kwargs)
         except BaseException as exc:
             self.trace_recorder.mark_blocked(serialized, input_str, run_id=run_id, inputs=inputs, error=exc)
             raise
-        if is_recognisable_submit:
-            with self._lock:
-                self._potential_write_tool_calls += 1
-                self._potential_write_runs[kwargs.get('run_id')] = (tool_name, operation or 'unknown')
-        return result
 
     def on_tool_end(self, output, *, run_id=None, **kwargs):
         self.trace_recorder.on_tool_end(output, run_id=run_id)
         super().on_tool_end(output, run_id=run_id, **kwargs)
-        self._record_safe_checkpoint()
-        with self._lock:
-            write_run = self._potential_write_runs.pop(run_id, None)
-            tool_name, operation = write_run or ('', '')
-            if tool_name and not self._is_failed_output(output):
-                self._successful_write_operations.append(operation)
-            if tool_name and self._is_failed_output(output) and self._terminal_error is None:
-                self._raise_guard(
-                    'write_result_unknown',
-                    '可能提交的数据操作未获得可确认结果，已终止本轮探索以避免盲目重试。',
-                    tool_name=tool_name,
-                )
+        if run_id in self._possible_write_runs and self._is_failed_output(output) and self._terminal_error is None:
+            self._raise_guard('write_result_unknown', '可能写入未获得可确认结果，已停止以避免重复操作。')
 
     def on_tool_error(self, error, *, run_id=None, **kwargs):
         self.trace_recorder.on_tool_error(error, run_id=run_id)
         super().on_tool_error(error, run_id=run_id, **kwargs)
-        self._record_safe_checkpoint()
-        with self._lock:
-            write_run = self._potential_write_runs.pop(run_id, None)
-            tool_name = write_run[0] if write_run else ''
-            if tool_name and self._terminal_error is None:
-                self._raise_guard(
-                    'write_result_unknown',
-                    '可能提交的数据操作发生工具错误，已终止本轮探索以避免盲目重试。',
-                    tool_name=tool_name,
-                )
-
-    def _record_safe_checkpoint(self):
-        """Persist only completed operation metadata, never input or output."""
-        stats = self.get_stats()
-        operation = stats.get('last_operation')
-        if not isinstance(operation, dict) or operation.get('status') not in {'succeeded', 'failed'}:
-            return
-        checkpoint = {
-            'tool_name': str(operation.get('tool_name') or 'browser_tool'),
-            'call_index': int(operation.get('call_index') or 0),
-            'status': str(operation['status']),
-        }
-        if checkpoint['call_index'] > 0 and checkpoint not in self._safe_checkpoints:
-            self._safe_checkpoints.append(checkpoint)
-
-    def safe_checkpoints(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(item) for item in self._safe_checkpoints]
+        if run_id in self._possible_write_runs and self._terminal_error is None:
+            self._raise_guard('write_result_unknown', '可能写入发生工具错误，已停止以避免重复操作。')
 
     def get_stats(self):
         stats = super().get_stats()
-        stats['potential_write_tool_calls'] = self._potential_write_tool_calls
-        stats['blocked_write_tool_calls'] = self._blocked_write_tool_calls
-        stats['successful_write_operations'] = list(self._successful_write_operations)
+        stats.update({'potential_write_tool_calls': self._potential_write_tool_calls, 'blocked_write_tool_calls': self._blocked_write_tool_calls})
         return stats
-
-    @staticmethod
-    def _read_only_input_text(inputs: Any, input_str: str) -> str:
-        if isinstance(inputs, dict):
-            try:
-                return json.dumps(inputs, ensure_ascii=False).lower()
-            except (TypeError, ValueError):
-                return str(inputs).lower()
-        return str(input_str or '').lower()
 
 
 class MCPPageExplorerError(RuntimeError):
-    """A safe explorer failure carrying failure-only tool statistics."""
-
-    def __init__(
-        self,
-        error_code: str,
-        message: str,
-        *,
-        tool_stats: dict[str, Any] | None = None,
-        snapshot: ExplorationTrace | None = None,
-    ):
+    def __init__(self, error_code: str, message: str, *, tool_stats: dict[str, Any] | None = None, snapshot: ExplorationTrace | None = None):
         self.error_code = error_code
         self.tool_stats = dict(tool_stats or {})
         self.snapshot = snapshot
@@ -243,397 +114,188 @@ class MCPPageExplorerError(RuntimeError):
 
 @contextmanager
 def suppress_mcp_raw_query_logs():
-    """Prevent mcp_use from writing its raw `Received query` payload at INFO."""
-    mcp_loggers = [logging.getLogger(name) for name in ('mcp_use', 'mcpagent')]
-    old_levels = [mcp_logger.level for mcp_logger in mcp_loggers]
-    for mcp_logger in mcp_loggers:
-        mcp_logger.setLevel(logging.WARNING)
+    loggers = [logging.getLogger(name) for name in ('mcp_use', 'mcpagent')]
+    levels = [item.level for item in loggers]
+    for item in loggers:
+        item.setLevel(logging.WARNING)
     try:
         yield
     finally:
-        for mcp_logger, old_level in zip(mcp_loggers, old_levels):
-            mcp_logger.setLevel(old_level)
+        for item, level in zip(loggers, levels):
+            item.setLevel(level)
 
 
 class MCPPageExplorer:
-    """A small MCP wrapper that reuses guard/error semantics without old script generation."""
-
-    def __init__(
-        self,
-        *,
-        llm_model: Any,
-        mcp_config: dict[str, Any],
-        cancel_check: Callable[[], bool] | None = None,
-        generation_id: str | None = None,
-        user_constraints: str | None = None,
-        exploration_timeout_seconds: float | None = None,
-    ):
+    def __init__(self, *, llm_model: Any, mcp_config: dict[str, Any], cancel_check: Callable[[], bool] | None = None, generation_id: str | None = None, user_constraints: str | None = None, exploration_timeout_seconds: float | None = None):
         self.llm_model = llm_model
         self.mcp_config = mcp_config
         self.cancel_check = cancel_check or (lambda: False)
         self.generation_id = generation_id
         self.user_constraints = str(user_constraints or '')
-        self.exploration_timeout_seconds = (
-            exploration_total_timeout_seconds()
-            if exploration_timeout_seconds is None
-            else float(exploration_timeout_seconds)
-        )
+        self.exploration_timeout_seconds = exploration_total_timeout_seconds() if exploration_timeout_seconds is None else float(exploration_timeout_seconds)
         self.output_generation_id = validate_generation_output_id(generation_id)
         self.policy = ExplorationPolicy.read_only()
         self.trace_recorder = ExplorationTraceRecorder()
-        self.guard = ReadOnlyMCPBrowserToolGuard(
-            MCP_BROWSER_TOOL_CALL_LIMIT, policy=self.policy, trace_recorder=self.trace_recorder,
-        )
-        self._active_start_path = '/'
+        self.guard = ReadOnlyMCPBrowserToolGuard(policy=self.policy, trace_recorder=self.trace_recorder)
+        self._plan_runtime_values: dict[str, str] = {}
+        self._plan_input_sources: dict[str, str] = {}
 
-    def _configure_policy(
-        self,
-        scenario,
-        *,
-        temporary_credentials: dict[str, str] | None = None,
-    ) -> None:
-        self.policy = ExplorationPolicy.for_scenario(
-            scenario,
-            generation_id=self.output_generation_id,
-            user_constraints=self.user_constraints,
-        )
+    def _configure(self, plan: GoalPlan, start_path: str, credentials: dict[str, str] | None):
+        self.policy = ExplorationPolicy.for_plan(plan, generation_id=self.output_generation_id, user_constraints=self.user_constraints)
         trace_file = None
-        if self.generation_id and self.output_generation_id:
-            trace_file = (
-                Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp'
-                / f'{self.output_generation_id}.trace.jsonl'
-            )
-        sensitive_values = tuple(str(value) for value in (temporary_credentials or {}).values() if value)
-        self.trace_recorder = ExplorationTraceRecorder(
-            self._active_start_path,
-            sensitive_values=sensitive_values,
-            trace_file=trace_file,
-            runtime_namespace=self.policy.namespace,
-        )
-        self.guard = ReadOnlyMCPBrowserToolGuard(
-            MCP_BROWSER_TOOL_CALL_LIMIT, policy=self.policy, trace_recorder=self.trace_recorder,
-        )
+        if self.output_generation_id:
+            trace_file = Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp' / f'{self.output_generation_id}.trace.jsonl'
+        self.trace_recorder = ExplorationTraceRecorder(start_path, sensitive_values=tuple(str(value) for value in (credentials or {}).values() if value), trace_file=trace_file, runtime_namespace=self.policy.namespace)
+        self.guard = ReadOnlyMCPBrowserToolGuard(policy=self.policy, trace_recorder=self.trace_recorder)
+        self._plan_runtime_values = {}
+        self._plan_input_sources = plan.input_sources()
+        for goal in plan.goals:
+            for spec in goal.input_refs:
+                if spec.name in self._plan_runtime_values:
+                    continue
+                if spec.source == 'credential':
+                    if credentials and credentials.get(spec.credential_slot):
+                        self._plan_runtime_values[spec.name] = str(credentials[spec.credential_slot])
+                    continue
+                safe_ref = _RUNTIME_REF_TOKEN_RE.sub('-', spec.name).strip('-')[:48] or 'value'
+                self._plan_runtime_values[spec.name] = f'{self.policy.namespace}-{safe_ref}-{secrets.token_hex(8)}'
 
-    async def explore(
-        self,
-        *,
-        scenario,
-        start_path: str,
-        target_url_safe: str,
-        temporary_credentials: dict[str, str] | None = None,
-    ) -> ExplorationTrace:
+    def _runtime_values_for_goal(self, goal: Goal, credentials: dict[str, str] | None) -> tuple[dict[str, str], dict[str, str]]:
+        """Build an in-memory-only, value-unique map for one Goal execution."""
+        values: dict[str, str] = {}
+        sources: dict[str, str] = {}
+        for spec in goal.input_refs:
+            ref = spec.name
+            sources[ref] = spec.source
+            if ref in self._plan_runtime_values:
+                values[ref] = self._plan_runtime_values[ref]
+        return values, sources
+
+    async def explore_until_complete(self, *, plan: GoalPlan, start_path: str, target_url_safe: str, temporary_credentials: dict[str, str] | None = None) -> ExplorationTrace:
         if self.cancel_check():
-            raise self._failure('TASK_CANCELLED', '用户已取消任务。', 0)
-        self._active_start_path = start_path
-        self._configure_policy(scenario, temporary_credentials=temporary_credentials)
-        return await self._explore_with_prompt(
-            self._build_prompt(scenario, start_path, target_url_safe, temporary_credentials),
-            start_path,
-        )
-
-    async def explore_until_complete(
-        self,
-        *,
-        scenario,
-        start_path: str,
-        target_url_safe: str,
-        temporary_credentials: dict[str, str] | None = None,
-    ) -> ExplorationTrace:
-        """Run a callback-recorded session plus at most two bounded follow-ups.
-
-        A model's final response is intentionally ignored.  Partial but useful
-        traces are returned to the orchestrator; hard browser/security failures
-        still surface as ``MCPPageExplorerError`` with the trace attached.
-        """
-        if self.cancel_check():
-            raise self._failure('TASK_CANCELLED', '用户已取消任务。', 0)
-        self._active_start_path = start_path
-        self._configure_policy(scenario, temporary_credentials=temporary_credentials)
-        started_at = time.monotonic()
-        deadline = started_at + self.exploration_timeout_seconds
+            raise self._failure('TASK_CANCELLED', '用户已取消任务。')
+        self._configure(plan, start_path, temporary_credentials)
+        started = time.monotonic()
+        deadline = started + self.exploration_timeout_seconds
         client = None
         try:
-            try:
-                async with asyncio.timeout_at(deadline):
-                    runtime_mcp_config = prepare_playwright_mcp_output_config(
-                        self.mcp_config, self.output_generation_id,
-                    )
-                    client = MCPClient.from_dict(runtime_mcp_config)
-                    await client.create_all_sessions()
-                    trace = await self._explore_with_prompt(
-                        self._build_prompt(scenario, start_path, target_url_safe, temporary_credentials),
-                        start_path,
-                        client=client,
-                        max_steps=EXPLORATION_TOTAL_MODEL_STEPS,
-                        deadline=deadline,
-                    )
-                    trace = assess_trace_coverage(scenario, trace)
-                    for round_number in range(1, MAX_TARGETED_EXPLORATION_ROUNDS + 1):
-                        gaps = required_trace_evidence_gaps(scenario, trace)
-                        if not gaps:
-                            break
-                        remaining_model_steps = EXPLORATION_TOTAL_MODEL_STEPS - self.guard.model_call_count
-                        if remaining_model_steps <= 0:
-                            trace = trace.model_copy(update={
-                                'termination_reason': 'model_budget',
-                                'warnings': list(dict.fromkeys([
-                                    *trace.warnings, '补探未执行：全局模型步骤预算已耗尽。',
-                                ])),
-                            })
-                            break
-                        trace = await self._explore_with_prompt(
-                            self._build_follow_up_prompt(trace, gaps, round_number, remaining_model_steps),
-                            start_path,
-                            client=client,
-                            max_steps=remaining_model_steps,
-                            deadline=deadline,
-                        )
-                        trace = assess_trace_coverage(scenario, trace)
-                    elapsed = round(max(0, time.monotonic() - started_at), 3)
-                    return trace.model_copy(update={
-                        'tool_stats': {**trace.tool_stats, 'duration_seconds': elapsed},
-                    })
-            except TimeoutError:
-                error = self._failure(
-                    'exploration_timeout', '页面探索已达到总时限，未继续重试。', 0,
-                )
-                raise error from None
+            runtime_config = prepare_playwright_mcp_output_config(self.mcp_config, self.output_generation_id)
+            client = MCPClient.from_dict(runtime_config)
+            await client.create_all_sessions()
+            for goal in plan.goals:
+                await self._run_goal(client, plan, goal, start_path, target_url_safe, temporary_credentials, deadline, supplement=False)
+                run = evaluate_goal_events(goal, self.trace_recorder.events)
+                self.trace_recorder.record_goal_run(run)
+                if run.status == 'uncertain':
+                    await self._run_goal(client, plan, goal, start_path, target_url_safe, temporary_credentials, deadline, supplement=True)
+                    self.trace_recorder.record_goal_run(evaluate_goal_events(goal, self.trace_recorder.events))
+                current = next(item for item in self.trace_recorder.build(tool_stats={}).goal_runs if item.goal_id == goal.id)
+                if current.status != 'completed':
+                    break
+            return self._snapshot(start_path, time.monotonic() - started)
+        except MCPPageExplorerError:
+            raise
+        except Exception as exc:
+            raise self._failure(_classify_mcp_error(exc), _get_mcp_error_message(exc), start_path) from exc
         finally:
             if client is not None:
                 try:
-                    # Cleanup is bounded independently from the exploration
-                    # deadline so an expired task budget cannot leak its
-                    # browser process/session.
                     async with asyncio.timeout(10):
                         await client.close_all_sessions()
-                except TimeoutError:
-                    logger.warning('V2 MCP 会话清理达到独立清理时限')
                 except Exception:
-                    logger.warning('V2 MCP 会话清理失败', exc_info=True)
+                    logger.warning('v3 MCP 会话清理失败', exc_info=True)
 
-    async def _explore_with_prompt(
-        self,
-        prompt: str,
-        start_path: str,
-        *,
-        client=None,
-        max_steps: int = MCP_MAX_STEPS,
-        deadline: float | None = None,
-    ) -> ExplorationTrace:
-        """Run one bounded prompt, optionally in a caller-owned browser session."""
-        owns_client = client is None
-        started_at = time.monotonic()
-        self._active_start_path = start_path
-        try:
-            if client is None:
-                runtime_mcp_config = prepare_playwright_mcp_output_config(
-                    self.mcp_config, self.output_generation_id,
-                )
-                client = MCPClient.from_dict(runtime_mcp_config)
-                await client.create_all_sessions()
-            agent = MCPAgent(
-                llm=self.llm_model,
-                client=client,
-                max_steps=max(1, max_steps),
-                additional_instructions=EXPLORER_CONSTRAINTS,
-                disallowed_tools=list(READ_ONLY_DISABLED_TOOL_MESSAGES),
-                callbacks=[self.guard],
+    async def _run_goal(self, client, plan: GoalPlan, goal: Goal, start_path: str, target_url_safe: str, credentials: dict[str, str] | None, deadline: float, *, supplement: bool):
+        if self.cancel_check():
+            raise self._failure('TASK_CANCELLED', '用户已取消任务。', start_path)
+        if time.monotonic() >= deadline:
+            raise self._failure('exploration_timeout', '页面探索已达到总时限。', start_path)
+        self.policy.set_active_goal(goal.id)
+        runtime_values, runtime_sources = self._runtime_values_for_goal(goal, credentials)
+        self.trace_recorder.set_active_goal(goal.id, runtime_values, runtime_sources, goal.verification.model_dump(mode='json') if goal.verification else None)
+        remaining_model_steps = MCP_MAX_STEPS - self.guard.model_call_count
+        if remaining_model_steps <= 0:
+            raise self._failure(
+                'MODEL_STEP_BUDGET', '页面探索已用完模型总步数，未继续额外调用。', start_path,
             )
-            with suppress_mcp_raw_query_logs():
-                await self._run_with_cancel(agent, prompt, deadline=deadline)
-            return self._trace_snapshot(start_path, time.monotonic() - started_at)
-        except MCPPageExplorerError as exc:
-            error = self._failure(exc.error_code, str(exc), time.monotonic() - started_at)
-            self._log_failure(error)
-            raise error
-        except Exception as exc:
-            terminal_error = self.guard.terminal_error
-            if terminal_error is not None:
-                error = self._failure(
-                    terminal_error.error_kind, str(terminal_error), time.monotonic() - started_at,
-                )
-            else:
-                error_kind = _classify_mcp_error(exc)
-                error = self._failure(
-                    error_kind, _get_mcp_error_message(exc), time.monotonic() - started_at,
-                )
-            self._log_failure(error)
-            raise error from exc
-        finally:
-            if owns_client and client is not None:
-                try:
-                    await client.close_all_sessions()
-                except Exception:
-                    logger.warning('V2 MCP 会话清理失败', exc_info=True)
-
-    def _trace_snapshot(self, start_path: str, duration_seconds: float, *, termination_reason: str = '') -> ExplorationTrace:
-        stats = self.guard.get_stats()
-        payload = {
-            'total_tool_calls': stats['total_tool_calls'],
-            'tool_counts': stats['tool_counts'],
-            'failed_tool_calls': stats['failed_tool_calls'],
-            'termination_reason': termination_reason or stats['termination_reason'] or '',
-            'duration_seconds': round(max(0, duration_seconds), 3),
-            'model_calls': self.guard.model_call_count,
-            'potential_write_tool_calls': stats['potential_write_tool_calls'],
-            'blocked_write_tool_calls': stats['blocked_write_tool_calls'],
-        }
-        cleanup_status = (
-            'cleaned' if 'delete' in stats['successful_write_operations']
-            else ('unknown' if stats['potential_write_tool_calls'] else 'not_required')
-        )
-        cleanup = {
-            'status': cleanup_status,
-            'attempted': 'delete' in stats['successful_write_operations'],
-            'residuals': [],
-            'reason': (
-                '' if not stats['potential_write_tool_calls'] or 'delete' in stats['successful_write_operations']
-                else '探索在可能写入后结束，无法确认清理结果。'
+        agent = MCPAgent(llm=self.llm_model, client=client, max_steps=remaining_model_steps, additional_instructions=EXPLORER_CONSTRAINTS, disallowed_tools=list(READ_ONLY_DISABLED_TOOL_MESSAGES), callbacks=[self.guard])
+        prompt = json.dumps({
+            'goal': goal.model_dump(mode='json'),
+            'completed_goal_runs': [item.model_dump(mode='json') for item in self.trace_recorder.build(tool_stats={}).goal_runs],
+            'current_relative_path': self.trace_recorder.build(tool_stats={}).last_location,
+            'remaining_model_steps': remaining_model_steps,
+            'navigation_target_url': target_url_safe,
+            'start_path': start_path,
+            'login_context': '当前 Goal 已声明 credential refs；仅在页面确实要求登录时使用 runtime_input_values 中的对应值。' if any(spec.source == 'credential' for spec in goal.input_refs) else '当前 Goal 未声明 credential ref。',
+            'runtime_input_values': runtime_values,
+            'verification_probe': goal.verification.model_dump(mode='json') if goal.verification else None,
+            'scope_policy': self.policy.prompt_scope(),
+            'instruction': (
+                '这是一次有界补探，只补当前 Goal 的 locator-backed HTML verification probe。'
+                if supplement and goal.verification else
+                '这是一次有界补探，只补当前 Goal 的可观察完成标准。'
+                if supplement else
+                '只执行当前 Goal；结束前必须完成带 selector 的 playwright_get_visible_html verification probe。'
+                if goal.verification else
+                '只执行当前 Goal；结束前必须产生新的页面观察。'
             ),
-        }
-        return self.trace_recorder.build(
-            tool_stats=payload, termination_reason=payload['termination_reason'], cleanup=cleanup,
-            warnings=['探索在可能写入后结束，必须人工确认残留。'] if cleanup_status == 'unknown' else [],
-        ).model_copy(update={'start_path': start_path})
-
-    def _failure(self, error_code: str, message: str, duration_seconds: float) -> MCPPageExplorerError:
-        stats = self.guard.get_stats()
-        safe_stats = {
-            'total_tool_calls': stats['total_tool_calls'],
-            'tool_counts': stats['tool_counts'],
-            'failed_tool_calls': stats['failed_tool_calls'],
-            'termination_reason': stats['termination_reason'] or error_code,
-            'duration_seconds': round(max(0, duration_seconds), 3),
-            'model_calls': self.guard.model_call_count,
-            'potential_write_tool_calls': stats['potential_write_tool_calls'],
-            'blocked_write_tool_calls': stats['blocked_write_tool_calls'],
-        }
-        if stats['last_operation'] is not None:
-            safe_stats['last_operation'] = stats['last_operation']
-        if stats['blocked_tool_calls']:
-            safe_stats['blocked_tool_calls'] = stats['blocked_tool_calls']
-        if stats['last_blocked_operation'] is not None:
-            safe_stats['last_blocked_operation'] = stats['last_blocked_operation']
-        trace = self._trace_snapshot(self._active_start_path, duration_seconds, termination_reason=error_code)
-        return MCPPageExplorerError(error_code, message, tool_stats=safe_stats, snapshot=trace)
-
-    def _guard_failure(self, duration_seconds: float) -> MCPPageExplorerError | None:
-        terminal_error = self.guard.terminal_error
-        if terminal_error is None:
-            return None
-        return self._failure(terminal_error.error_kind, str(terminal_error), duration_seconds)
-
-    def _log_failure(self, error: MCPPageExplorerError):
-        logger.warning(
-            'V2 MCP exploration failed: generation_id=%s error_code=%s tool_stats=%s',
-            self.generation_id or '<unknown>', error.error_code, error.tool_stats,
-        )
-
-    async def _cancel_and_await(self, run_task):
-        if not run_task.done():
-            run_task.cancel()
-        try:
+        }, ensure_ascii=False)
+        init_task = asyncio.create_task(agent.initialize())
+        # Let connector initialization enter its cancellable await before the
+        # first cancellation poll. Otherwise a task cancelled before scheduling
+        # never gives the connector a chance to release its partial state.
+        await asyncio.sleep(0)
+        while not init_task.done():
+            if self.cancel_check():
+                init_task.cancel()
+                try:
+                    await init_task
+                except asyncio.CancelledError:
+                    pass
+                raise self._failure('TASK_CANCELLED', '用户已取消任务。', start_path)
+            if time.monotonic() >= deadline:
+                init_task.cancel()
+                try:
+                    await init_task
+                except asyncio.CancelledError:
+                    pass
+                raise self._failure('exploration_timeout', '页面探索已达到总时限。', start_path)
+            await asyncio.wait({init_task}, timeout=0.25)
+        await init_task
+        with suppress_mcp_raw_query_logs():
+            run_task = asyncio.create_task(agent.run(prompt, manage_connector=False))
+            while not run_task.done():
+                if self.cancel_check():
+                    await self._cancel_task(run_task)
+                    raise self._failure('TASK_CANCELLED', '用户已取消任务。', start_path)
+                if time.monotonic() >= deadline:
+                    await self._cancel_task(run_task)
+                    raise self._failure('exploration_timeout', '页面探索已达到总时限。', start_path)
+                if self.guard.terminal_error is not None:
+                    await self._cancel_task(run_task)
+                    raise self._failure(self.guard.terminal_error.error_kind, str(self.guard.terminal_error), start_path)
+                await asyncio.wait({run_task}, timeout=0.25)
             await run_task
-        except (asyncio.CancelledError, Exception):
+
+    @staticmethod
+    async def _cancel_task(task: asyncio.Task) -> None:
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
             pass
 
-    async def _run_with_cancel(self, agent, prompt: str, *, deadline: float | None = None) -> str:
-        run_task = asyncio.create_task(self._initialize_and_run(agent, prompt))
-        started_at = time.monotonic()
-        try:
-            while True:
-                guard_failure = self._guard_failure(time.monotonic() - started_at)
-                if guard_failure is not None:
-                    await self._cancel_and_await(run_task)
-                    raise guard_failure
-                if self.cancel_check():
-                    await self._cancel_and_await(run_task)
-                    guard_failure = self._guard_failure(time.monotonic() - started_at)
-                    if guard_failure is not None:
-                        raise guard_failure
-                    raise self._failure('TASK_CANCELLED', '用户已取消任务。', time.monotonic() - started_at)
-                if deadline is not None and time.monotonic() >= deadline:
-                    await self._cancel_and_await(run_task)
-                    raise self._failure('exploration_timeout', '页面探索已达到总时限，未继续重试。', time.monotonic() - started_at)
-                if run_task.done():
-                    try:
-                        output = await run_task
-                    except Exception:
-                        guard_failure = self._guard_failure(time.monotonic() - started_at)
-                        if guard_failure is not None:
-                            raise guard_failure
-                        raise
-                    guard_failure = self._guard_failure(time.monotonic() - started_at)
-                    if guard_failure is not None:
-                        raise guard_failure
-                    return output
-                await asyncio.wait({run_task}, timeout=0.25)
-        except BaseException:
-            await self._cancel_and_await(run_task)
-            guard_failure = self._guard_failure(time.monotonic() - started_at)
-            if guard_failure is not None:
-                raise guard_failure
-            raise
+    def _snapshot(self, start_path: str, elapsed: float) -> ExplorationTrace:
+        stats = self.guard.get_stats()
+        return self.trace_recorder.build(tool_stats={
+            'total_tool_calls': stats['total_tool_calls'], 'tool_counts': stats['tool_counts'],
+            'failed_tool_calls': stats['failed_tool_calls'], 'termination_reason': stats['termination_reason'] or '',
+            'duration_seconds': round(max(0, elapsed), 3), 'model_calls': self.guard.model_call_count,
+            'potential_write_tool_calls': stats['potential_write_tool_calls'], 'blocked_write_tool_calls': stats['blocked_write_tool_calls'],
+        }, termination_reason=stats['termination_reason'] or '', cleanup={'status': 'unknown' if stats['potential_write_tool_calls'] else 'not_required', 'attempted': False, 'residuals': [], 'reason': 'possible writes require visible cleanup confirmation' if stats['potential_write_tool_calls'] else ''})
 
-    async def _initialize_and_run(self, agent, prompt: str) -> str:
-        # Sessions are owned by this Explorer so its finally block closes them
-        # exactly once for normal, error, and cancellation paths. Keeping this
-        # lifecycle in the monitored task also makes adapter initialization
-        # cancellable before any browser tool can run.
-        await agent.initialize()
-        return await agent.run(prompt, manage_connector=False)
-
-    def _build_prompt(
-        self,
-        scenario,
-        start_path: str,
-        target_url_safe: str,
-        credentials: dict[str, str] | None,
-    ) -> str:
-        login_context = '无临时登录信息；如页面要求登录，请仅记录未确认项。'
-        if credentials:
-            login_context = (
-                '仅在页面确实要求登录时使用以下本次临时信息，不得在输出中复述：'
-                f"用户名={credentials['username']}，密码={credentials['password']}"
-            )
-        return json.dumps({
-            'constraints': EXPLORER_CONSTRAINTS,
-            'navigation_target_url': target_url_safe,
-            'start_url_path': start_path,
-            'scenario': scenario.model_dump(mode='json'),
-            'discovery_targets': list(dict.fromkeys([
-                *scenario.discovery_targets,
-                *scenario.ambiguities,
-            ])),
-            'login_context': login_context,
-            'scope_policy': self.policy.prompt_scope(),
-            'instruction': '先自行探索并补齐页面可观察信息。仅在 scope_policy 允许时执行目标 CRUD；平台会自动记录工具调用，最终回复不需要输出 JSON、页面证据或脚本。',
-        }, ensure_ascii=False)
-
-    def _build_follow_up_prompt(
-        self,
-        trace: ExplorationTrace,
-        gaps: list[dict[str, str]],
-        round_number: int,
-        remaining_model_steps: int,
-    ) -> str:
-        """Continue the existing MCP/browser session without reopening completed work."""
-        confirmed = [
-            step_id for step_id, item in trace.coverage.items()
-            if item.get('status') == 'confirmed'
-        ]
-        return json.dumps({
-            'instruction': (
-                '继续当前浏览器会话进行定向补探。只处理 missing_steps，不要重做已确认步骤，'
-                '不要重复已成功的写操作；仍须遵守 scope_policy 和所有安全限制。最终回复无需复述证据。'
-            ),
-            'round': round_number,
-            'missing_steps': gaps,
-            'confirmed_step_ids': confirmed,
-            'current_relative_path': trace.last_location or trace.start_path,
-            'remaining_budget': {
-                'tool_calls': max(0, MCP_BROWSER_TOOL_CALL_LIMIT - int(trace.tool_stats.get('total_tool_calls', 0))),
-                'model_steps': max(0, remaining_model_steps),
-            },
-            'scope_policy': self.policy.prompt_scope(),
-        }, ensure_ascii=False)
+    def _failure(self, code: str, message: str, start_path: str = '/') -> MCPPageExplorerError:
+        trace = self._snapshot(start_path, 0)
+        return MCPPageExplorerError(code, message, tool_stats=trace.tool_stats, snapshot=trace)

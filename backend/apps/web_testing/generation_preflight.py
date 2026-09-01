@@ -1,4 +1,4 @@
-"""Deterministic V2 generation preflight; this module never calls a model or browser."""
+"""Deterministic v3 generation preflight; this module never calls a model or browser."""
 
 from __future__ import annotations
 
@@ -14,36 +14,15 @@ from django.conf import settings
 
 from ai_core.models import LLMConfiguration, MCPConfiguration, ModelType
 
-from .generation_contracts import ScenarioSpec
+from .generation_contracts import GoalPlan
 
-_EXPLORATION_CONTEXT_RE = re.compile(
-    r'(?:探索阶段|探索期|exploration(?:\s+phase)?)', re.IGNORECASE,
-)
-_WRITE_ACTION_RE = re.compile(
-    r'(?:提交|新增|创建|编辑|修改|删除|审批|付款|发布|上传|'
-    r'submit|create|update|delete|approve|pay|publish|upload)',
-    re.IGNORECASE,
-)
 _EXTRA_RISK_ACTION_RE = re.compile(
     r'(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
     re.IGNORECASE,
 )
-_NEGATED_WRITE_RE = re.compile(
-    r'(?:不要|禁止|不得|避免|不允许|不可|不应|别)\s*(?:提交|新增|创建|编辑|修改|删除|审批|付款|发布|上传|'
-    r'submit|create|update|delete|approve|pay|publish|upload)',
-    re.IGNORECASE,
-)
-_NEGATED_CONTEXT_WRITE_RE = re.compile(
-    r'(?:不要|禁止|不得|避免|不允许|不可|不应|别).{0,24}'
-    r'(?:探索阶段|探索期|exploration(?:\s+phase)?).{0,36}'
-    r'(?:提交|新增|创建|编辑|修改|删除|审批|付款|发布|上传|'
-    r'submit|create|update|delete|approve|pay|publish|upload)',
-    re.IGNORECASE,
-)
-_EXPLICIT_WRITE_INTENT_RE = re.compile(
-    r'(?:请|需|需要|必须|应当|应该|要|允许|可以|可|执行|进行|完成|直接|先|同时)'
-    r'\s*(?:提交|新增|创建|编辑|修改|删除|审批|付款|发布|上传|'
-    r'submit|create|update|delete|approve|pay|publish|upload)',
+_NEGATED_EXTRA_RISK_RE = re.compile(
+    r'(?:不要|禁止|不得|避免|不允许|不可|不应|别|勿|do\s+not|don[\'’]?t|never)'
+    r'.{0,24}(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
     re.IGNORECASE,
 )
 
@@ -201,27 +180,13 @@ def prepare_playwright_mcp_output_config(
 
 
 def exploration_requires_write_confirmation(description: str) -> bool:
-    """Keep extra-risk actions out of ordinary goal-scoped CRUD exploration.
+    """Keep only a dedicated high-risk safety deny-list.
 
-    Ordinary create/update/delete requests no longer need a read-only rewrite.
-    The explorer still enforces the user's scope and explicit no-write limits.
+    This does not identify goals, browser writes, event coverage, or replay
+    evidence.  Normal interactions are governed exclusively by Goal metadata.
     """
-    for sentence in re.split(r'[。！？!?.\n]+', description or ''):
-        context_match = _EXPLORATION_CONTEXT_RE.search(sentence)
-        if not context_match:
-            continue
-        suffix = sentence[context_match.end():]
-        action_match = _EXTRA_RISK_ACTION_RE.search(suffix)
-        if not action_match:
-            continue
-        # The whole exploration clause is negated, including wording such as
-        # "禁止在探索阶段提交" where the negation appears before the context.
-        before_action = sentence[:context_match.end() + action_match.end()]
-        if _NEGATED_WRITE_RE.search(before_action) or _NEGATED_CONTEXT_WRITE_RE.search(before_action):
-            continue
-        action_prefix = suffix[:action_match.end()]
-        direct_action = bool(re.match(r'^\s*[，,:：;；-]*\s*' + _EXTRA_RISK_ACTION_RE.pattern, suffix, re.I))
-        if direct_action or _EXPLICIT_WRITE_INTENT_RE.search(action_prefix):
+    for clause in re.split(r'[。！？!?.\n；;]+', str(description or '')):
+        if _EXTRA_RISK_ACTION_RE.search(clause) and not _NEGATED_EXTRA_RISK_RE.search(clause):
             return True
     return False
 
@@ -293,14 +258,23 @@ def resolve_active_playwright_mcp_config(user_id: int) -> tuple[int, dict[str, A
     return None
 
 
-def _has_environment_credentials(environment) -> bool:
+def environment_credentials(environment) -> dict[str, str] | None:
+    """Return the two supported login slots without copying them into artifacts."""
     variables = (environment.config or {}).get('variables') or {}
+    if not isinstance(variables, dict):
+        return None
     username = variables.get('UI_TEST_USERNAME') or variables.get('ui_test_username')
     password = variables.get('UI_TEST_PASSWORD') or variables.get('ui_test_password')
-    return bool(username and password)
+    if username in (None, '') or password in (None, ''):
+        return None
+    return {'username': str(username), 'password': str(password)}
 
 
-def run_safety_preflight(generation, scenario: ScenarioSpec, *, credentials_available: bool) -> PreflightResult:
+def _has_environment_credentials(environment) -> bool:
+    return environment_credentials(environment) is not None
+
+
+def run_safety_preflight(generation, plan: GoalPlan, *, credentials_available: bool) -> PreflightResult:
     """Return a stable, user-actionable decision without starting MCP."""
     environment = generation.environment
     if not environment.is_active or not environment.is_web_environment or not (environment.config or {}).get('base_url'):
@@ -319,17 +293,17 @@ def run_safety_preflight(generation, scenario: ScenarioSpec, *, credentials_avai
     if not mcp_selection:
         return PreflightResult('failed', 'MCP_CONFIG_MISSING', '没有可用的 Playwright MCP 配置。')
 
-    if scenario.credentials_required and not (credentials_available or _has_environment_credentials(environment)):
+    if plan.credentials_required and not (credentials_available or _has_environment_credentials(environment)):
         return PreflightResult('needs_credentials', 'CREDENTIALS_REQUIRED', '场景需要登录，请提供本次探索登录信息或配置环境变量。')
 
     if exploration_requires_write_confirmation(generation.description_safe):
         return PreflightResult(
             'needs_confirmation',
             'EXPLORATION_EXTRA_RISK_BLOCKED',
-            '本次探索包含审批、支付、发布或文件/外部消息操作，超出普通测试数据增删改查范围，请调整目标后继续。',
+            '本次探索包含审批、支付、发布或文件/外部消息操作，超出普通测试数据操作范围，请调整目标后继续。',
         )
     mcp_config_id, mcp_config = mcp_selection
-    discovery_count = len({*scenario.discovery_targets, *scenario.ambiguities})
+    discovery_count = len({*plan.discovery_notes, *plan.ambiguities})
     warnings = ['探索会按测试目标实际操作页面；默认只修改本轮测试数据，并尝试清理。明确的禁止写入约束仍然有效。']
     if discovery_count:
         warnings.append(f'将通过页面探索自动确认 {discovery_count} 项信息。')

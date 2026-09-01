@@ -1,6 +1,6 @@
 """Web UI Python Playwright script contract.
 
-Database scripts contain only an async ``run(page)`` business function.  The
+Database scripts contain an async ``run(page)`` or v3 ``run(page, variables)`` business function.  The
 execution service owns the browser lifecycle and creates the synchronous
 pytest entry point used by Celery.
 """
@@ -70,6 +70,21 @@ def _uses_browser_lifecycle(node: ast.AST) -> bool:
     return False
 
 
+def _valid_run_signature(run: ast.AsyncFunctionDef) -> bool:
+    """Accept the established page entry and the v3 variable-aware entry."""
+    args = run.args
+    names = [item.arg for item in args.args]
+    return (
+        not args.posonlyargs
+        and names in (['page'], ['page', 'variables'])
+        and not args.defaults
+        and not args.kwonlyargs
+        and not args.kw_defaults
+        and not args.vararg
+        and not args.kwarg
+    )
+
+
 def validate_script(content: str) -> NormalizedScript:
     """Validate a script and return its contract metadata.
 
@@ -85,19 +100,12 @@ def validate_script(content: str) -> NormalizedScript:
     if run:
         args = run.args
         if (
-            args.posonlyargs
-            or len(args.args) != 1
-            or args.args[0].arg != "page"
-            or args.defaults
-            or args.kwonlyargs
-            or args.kw_defaults
-            or args.vararg
-            or args.kwarg
+            not _valid_run_signature(run)
         ):
-            raise ScriptContractError("run 函数必须定义为 async def run(page)")
+            raise ScriptContractError("run 函数必须定义为 async def run(page) 或 async def run(page, variables)")
         if _uses_browser_lifecycle(run):
             raise ScriptContractError(
-                "run(page) 不得创建或管理浏览器，请移除 async_playwright/launch/new_page，交由统一执行器管理"
+                "run 不得创建或管理浏览器，请移除 async_playwright/launch/new_page，交由统一执行器管理"
             )
         warning = None
         if main:
@@ -122,20 +130,13 @@ def normalize_for_storage(content: str) -> str:
     module = _parse(content)
     run = _function(module, "run")
     if not run:
-        raise ScriptContractError("保存脚本必须包含 async def run(page)，旧版 main 只能在执行时兼容")
+        raise ScriptContractError("保存脚本必须包含 async def run(page) 或 async def run(page, variables)")
 
     args = run.args
     if (
-        args.posonlyargs
-        or len(args.args) != 1
-        or args.args[0].arg != "page"
-        or args.defaults
-        or args.kwonlyargs
-        or args.kw_defaults
-        or args.vararg
-        or args.kwarg
+        not _valid_run_signature(run)
     ):
-        raise ScriptContractError("run 函数必须严格定义为 async def run(page)")
+        raise ScriptContractError("run 函数必须严格定义为 async def run(page) 或 async def run(page, variables)")
 
     if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main" for node in module.body):
         raise ScriptContractError("保存脚本不得包含 main 函数；请只保留 async def run(page)")
@@ -295,7 +296,7 @@ def materialize_script(
     suite_decorator = f"@allure.suite({suite_name!r})\n" if suite_name else ""
     allure_import = "import allure\n" if suite_name else ""
 
-    # A script that already has run(page) always uses the managed browser,
+    # A script that already has run always uses the managed browser,
     # even when an old main() remains in the same file.
     module = _parse(normalized.content)
     if original.legacy and not original_has_run and _uses_browser_lifecycle(_function(module, "main")):
@@ -308,9 +309,12 @@ import asyncio
 '''
         return textwrap.dedent(normalized.content + wrapper).strip() + "\n"
 
+    run_args = [item.arg for item in _function(module, "run").args.args]
+    run_call = 'await run(page, runtime_variables)' if run_args == ['page', 'variables'] else 'await run(page)'
     wrapper = f'''
 
 import asyncio
+import json
 import logging
 import os
 from playwright.async_api import async_playwright
@@ -326,7 +330,13 @@ async def _run_with_managed_browser():
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
         try:
-            await run(page)
+            runtime_variables = json.loads(os.environ.get("WEBUI_RUNTIME_VARIABLES", "{{}}"))
+        except (TypeError, ValueError):
+            runtime_variables = {{}}
+        if not isinstance(runtime_variables, dict):
+            runtime_variables = {{}}
+        try:
+            {run_call}
         except Exception:
             if {screenshot_path_literal}:
                 try:

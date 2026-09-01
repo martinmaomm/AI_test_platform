@@ -16,7 +16,7 @@ from mcp_use.client.connectors.base import BaseConnector
 
 from ai_core.mcp_agent_budget import BudgetedMCPAgent, mcp_graph_recursion_limit
 from ai_core.webui_playwright_agent import MCPBrowserToolGuard
-from web_testing.generation_contracts import ScenarioSpec
+from web_testing.generation_contracts import GoalPlan
 from web_testing.mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 
 
@@ -133,12 +133,15 @@ class MCPPageExplorerInitializationCancellationTests(SimpleTestCase):
                 self.closed += 1
                 self.active_sessions = {}
 
-        scenario = ScenarioSpec.model_validate({
-            'title': 'Read', 'objective': 'Read',
-            'steps': [{'id': 'S1', 'name': 'Read', 'intent': 'read',
-                       'target_hint': 'List', 'expected': 'Visible'}],
-            'assertions': [{'id': 'A1', 'name': 'Visible', 'target_hint': 'List',
-                            'expected': 'Visible', 'step_id': 'S1'}],
+        plan = GoalPlan.model_validate({
+            'schema_version': 3, 'title': 'Read', 'objective': 'Read',
+            'goals': [
+                {'id': 'G1', 'kind': 'setup', 'objective': 'Read',
+                 'completion_criteria': 'Visible', 'side_effect': 'none'},
+                {'id': 'G2', 'kind': 'verify', 'objective': 'Verify',
+                 'completion_criteria': 'Visible', 'side_effect': 'none',
+                 'verification': {'mode': 'visible'}},
+            ],
         })
         client = WaitingClient()
         checks = {'count': 0}
@@ -153,8 +156,8 @@ class MCPPageExplorerInitializationCancellationTests(SimpleTestCase):
         )
         with patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client):
             with self.assertRaises(MCPPageExplorerError) as raised:
-                asyncio.run(asyncio.wait_for(explorer.explore(
-                    scenario=scenario, start_path='/', target_url_safe='https://example.invalid/',
+                asyncio.run(asyncio.wait_for(explorer.explore_until_complete(
+                    plan=plan, start_path='/', target_url_safe='https://example.invalid/',
                 ), timeout=2))
 
         self.assertEqual(raised.exception.error_code, 'TASK_CANCELLED')

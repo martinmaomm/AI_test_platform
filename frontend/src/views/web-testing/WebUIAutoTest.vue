@@ -9,7 +9,7 @@
       <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-environments="loadingEnvironments" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="isActive || submitting || isWorkspaceBusy" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" :credential-clear-version="credentialClearVersion" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
-        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
+        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
         <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。生成记录会在刷新页面后自动恢复。" class="empty-result" />
       </div>
     </div>
@@ -50,7 +50,7 @@ const isConnected = ref(false)
 const credentialClearVersion = ref(0)
 let websocketManager = null
 
-const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, debugExecution, debugExecutionLoading, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, create, cancel, resolve: resolveGeneration, retryGeneration, save, saveDraft, debug, repair, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
+const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, debugExecution, debugExecutionLoading, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, create, cancel, resolve: resolveGeneration, retryGeneration, save, saveDraft, debug, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
 
 const asList = (response) => {
   const body = response?.data ?? response ?? {}
@@ -112,7 +112,6 @@ const handleRetryGeneration = async () => { try { const result = await retryGene
 const handleSave = async (title) => { try { const result = await save(title); if (result) ElMessage.success(result?.created ? '已创建并保存到测试用例' : '已保存到测试用例') } catch { ElMessage.error(lastError.value || '保存失败') } }
 const handleSaveDraft = async () => { try { const result = await saveDraft(); if (result) ElMessage.success('草稿已保存') } catch { ElMessage.error(lastError.value || '保存草稿失败') } }
 const handleDebug = async (runtimeVariables) => { try { const result = await debug(runtimeVariables); if (result) ElMessage.success('已启动真实调试；不会自动重试业务写操作。') } catch { ElMessage.error(lastError.value || '启动调试失败') } }
-const handleRepair = async () => { try { const result = await repair(); if (result) ElMessage.success('已请求后台修复，完成后请先查看草稿再决定是否调试。') } catch { ElMessage.error(lastError.value || '请求修复失败') } }
 const handleDiscardLocalDraft = async () => { try { await ElMessageBox.confirm('将丢弃当前未保存的本地脚本和变量编辑，并刷新服务端版本。', '确认刷新工作区', { type: 'warning', confirmButtonText: '丢弃并刷新', cancelButtonText: '保留本地编辑' }); const result = await discardLocalDraftAndRefresh(); if (result) ElMessage.success('已刷新服务端工作区版本') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '刷新工作区失败') } }
 
 watch(projectId, () => { loadEnvironments(); loadModules(); loadModels(); loadExplorationSettings() }, { immediate: true })

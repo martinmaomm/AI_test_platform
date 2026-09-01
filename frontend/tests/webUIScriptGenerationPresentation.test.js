@@ -25,16 +25,7 @@ test('model labels prefer the editable provider name and preserve historic provi
 test('only business-decision targets become clarification questions', () => {
   const action = generationActionRequired({
     status: 'needs_confirmation', current_stage: 'exploring', error_code: 'INPUT_AMBIGUOUS',
-    exploration_snapshot: {
-      completion: {
-        status: 'needs_user_decision',
-        missing_targets: [
-          { target: '保存按钮定位器', kind: 'observable', reason: '页面加载超时', user_question: '填写 CSS 选择器' },
-          { target: '删除后的业务规则', kind: 'business_decision', reason: '规则未在页面显示', user_question: '删除后是否需要二次确认？' }
-        ],
-        user_questions: []
-      }
-    }
+    scenario_spec: { ambiguities: ['删除后是否需要二次确认？'] }
   })
 
   assert.equal(action.kind, 'clarifications')
@@ -43,26 +34,24 @@ test('only business-decision targets become clarification questions', () => {
 
 test('observable evidence gaps do not create a DOM questionnaire', () => {
   const action = generationActionRequired({
-    status: 'needs_confirmation', current_stage: 'exploring', error_code: 'EVIDENCE_INSUFFICIENT',
-    exploration_snapshot: { completion: { status: 'needs_targeted_exploration', missing_targets: [{ target: '提交按钮', kind: 'observable', reason: '未获得稳定证据' }] } }
+    status: 'needs_confirmation', current_stage: 'exploring', error_code: 'GOAL_EVIDENCE_INSUFFICIENT'
   })
 
   assert.equal(action.kind, 'exploration_issue')
   assert.equal(action.primaryLabel, '')
 })
 
-test('preflight confirmation supports ordinary CRUD without promising extra-risk actions', () => {
+test('preflight confirmation describes goal-scoped exploration without fixed CRUD wording', () => {
   const action = generationActionRequired({
     status: 'needs_confirmation', current_stage: 'preflighting',
     error_code: 'EXPLORATION_WRITE_CONFIRMATION_REQUIRED'
   })
 
   assert.equal(action.kind, 'target_scope')
-  assert.equal(action.primaryLabel, '确认常规 CRUD 范围并继续')
-  assert.match(action.description, /常规测试数据的新增、查询、编辑、删除已支持/)
+  assert.equal(action.primaryLabel, '确认目标范围并继续')
+  assert.match(action.description, /测试目标驱动 Playwright MCP 探索/)
   assert.match(action.description, /审批、付款、发布、上传/)
-  assert.match(action.description, /测试描述已明确要求只读/)
-  assert.doesNotMatch(action.primaryLabel, /仅只读/)
+  assert.doesNotMatch(action.description, /常规 CRUD/)
 })
 
 test('needs review preserves backend cleanup evidence and does not imply success', () => {
@@ -102,19 +91,17 @@ test('failure and cancellation with unknown cleanup warn before a new task', () 
   for (const status of ['failed', 'cancelled']) {
     const hint = generationResolutionHint({
       status, error_message: '模型服务异常（HTTP 500）',
-      exploration_snapshot: { cleanup_report: { status: 'unknown', attempted: false } }
+      exploration_snapshot: { schema_version: 3, cleanup: { status: 'unknown', attempted: false } }
     })
     assert.match(hint, /重新发起前/)
     assert.match(hint, /避免重复操作/)
   }
 })
 
-test('cleanup presentation supports v2 traces and does not infer success when absent', () => {
+test('cleanup presentation reads only v3 cleanup and does not infer success when absent', () => {
   assert.equal(explorationCleanupPresentation({}).hasRecord, false)
   assert.equal(explorationCleanupPresentation({ cleanup: { status: 'cleaned', attempted: true } }).status, 'cleaned')
-  const cleanup = explorationCleanupPresentation({
-    cleanup_report: { status: 'residual', attempted: true, residuals: ['user:test-42'], reason: '删除接口超时' }
-  })
+  const cleanup = explorationCleanupPresentation({ cleanup: { status: 'residual', attempted: true, residuals: ['user:test-42'], reason: '删除接口超时' } })
   assert.deepEqual(cleanup, {
     hasRecord: true, status: 'residual', label: '发现残留', type: 'error', attempted: true,
     residuals: ['user:test-42'], reason: '删除接口超时'
@@ -134,5 +121,5 @@ test('workspace activity keeps polling alive and verified save requires the curr
 
 test('timeline distinguishes exploration and process validation from script debugging', () => {
   const labels = buildGenerationTimeline({ status: 'ready', current_stage: 'completed' }).map(item => item.label)
-  assert.deepEqual(labels, ['理解目标', '探索并验证测试流程', '生成并检查草稿', '进入可编辑工作区'])
+  assert.deepEqual(labels, ['理解测试目标', '按目标探索页面', '整理可回放路径', '生成 Python 脚本', '检查脚本质量', '整理生成结果'])
 })

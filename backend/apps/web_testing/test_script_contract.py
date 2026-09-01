@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 import shutil
 import sys
@@ -42,7 +43,7 @@ class ScriptContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ScriptContractError, "不得创建或管理浏览器"):
             validate_script(script)
 
-    def test_run_signature_only_allows_one_page_argument(self):
+    def test_run_signature_allows_only_page_or_v3_variables(self):
         invalid_scripts = [
             "async def run(page, extra):\n    pass",
             "async def run(page, *, required):\n    pass",
@@ -55,6 +56,13 @@ class ScriptContractTests(unittest.TestCase):
             with self.subTest(script=script):
                 with self.assertRaisesRegex(ScriptContractError, "run 函数必须"):
                     validate_script(script)
+
+    def test_v3_variable_aware_run_is_storable_and_receives_runtime_mapping(self):
+        script = "async def run(page, variables):\n    await page.goto('/')\n"
+        self.assertEqual(normalize_for_storage(script), script.strip())
+        materialized = materialize_script(script, 'v3_variables')
+        self.assertIn('await run(page, runtime_variables)', materialized)
+        self.assertIn('WEBUI_RUNTIME_VARIABLES', materialized)
 
     def test_legacy_main_is_converted_to_run(self):
         script = "async def main():\n    print('legacy')\n\nif __name__ == '__main__':\n    pass\n"
@@ -215,6 +223,34 @@ async def main(page):
             child_env = run.call_args.kwargs["env"]
             expected = os.path.join(runner.project_root, ".python-playwright-browsers")
             self.assertEqual(child_env["PLAYWRIGHT_BROWSERS_PATH"], expected)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def test_runner_passes_safe_variables_to_v3_managed_wrapper(self):
+        runner = PlaywrightRunner()
+        work_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        try:
+            with patch(
+                "web_testing.playwright_python_runner.subprocess.run",
+                return_value=completed,
+            ) as run:
+                runner._run_pytest_command(
+                    work_dir,
+                    ExecutionConfig(environment_variables={
+                        'UI_TEST_USERNAME': 'tester',
+                        'USER_NAME': 'generated-override',
+                        'PLAYWRIGHT_BASE_URL': 'must-not-override',
+                        'WEBUI_RUNTIME_VARIABLES': 'must-not-override',
+                    }),
+                )
+
+            child_env = run.call_args.kwargs['env']
+            self.assertEqual(json.loads(child_env['WEBUI_RUNTIME_VARIABLES']), {
+                'UI_TEST_USERNAME': 'tester',
+                'USER_NAME': 'generated-override',
+            })
+            self.assertEqual(child_env['PLAYWRIGHT_BASE_URL'], '')
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -308,7 +308,7 @@ def get_generation_temporary_credentials(generation_id: Any) -> dict[str, str] |
 
 
 def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int) -> WebUIScriptGeneration:
-    """Retry only model generation from a persisted v2 trace; never reopen MCP."""
+    """Retry only v3 compilation from a persisted callback ledger; never reopen MCP."""
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
@@ -318,7 +318,7 @@ def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int
         }
         if generation.status != WebUIScriptGeneration.Status.FAILED or generation.error_code not in retryable:
             raise GenerationResolutionConflict('当前失败状态不能只重试脚本生成。', generation)
-        if generation.revision != expected_revision or snapshot.get('schema_version') != 2:
+        if generation.revision != expected_revision or snapshot.get('schema_version') != 3:
             raise GenerationResolutionConflict('探索轨迹或版本已变化，无法安全仅重试脚本生成。', generation)
         generation.status = WebUIScriptGeneration.Status.GENERATING
         generation.current_stage = WebUIScriptGeneration.Stage.GENERATING

@@ -1,4 +1,4 @@
-"""Shared, durable save-state helpers for V2 WebUI generations."""
+"""Shared, durable save-state helpers for v3 WebUI generations."""
 
 from __future__ import annotations
 

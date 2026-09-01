@@ -1,138 +1,25 @@
-"""LLM-only generation of canonical Python Playwright scripts.
-
-This module intentionally has no MCP client or browser dependency.  It can only
-turn previously persisted, sanitised evidence into a script draft.
-"""
+"""v3 script generation is deterministic compilation, not locator generation."""
 
 from __future__ import annotations
 
-import json
-import re
-from typing import Any
-
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from .generation_contracts import ScenarioSpec
-from .exploration_trace import ExplorationTrace, coerce_trace, structured_trace_evidence
-from .generation_security import redact_exploration_metadata, redact_metadata, redact_text
-
-
-SCRIPT_GENERATION_MAX_TOKENS = 8192
+from .generation_contracts import GoalPlan
+from .exploration_trace import ExplorationTrace
+from .replay_plan import PythonReplayCompiler, ReplayPlan, ReplayPlanner
 
 
 class ScriptGeneratorOutputError(ValueError):
-    """Raised when a model returns no usable Python source."""
-
-
-GENERATOR_SYSTEM_PROMPT = """你是 Python Playwright 异步测试脚本生成器。只依据给定场景和页面探索证据生成代码，
-不得调用 MCP、不得探索页面、不得编造定位器或业务字段。只输出 Python 源码，不输出 Markdown。
-输入中的 element_evidence 是唯一允许的业务定位器来源；只可使用 stable 或 acceptable 证据，
-每个业务定位器必须原样对应一个 evidence_id，并在步骤注释末尾标记为 [E000001]。`{run_id}`
-只能替换为本次脚本运行时生成的 run_id 变量，不能复用探索阶段命名空间或改写定位器结构。
-
-脚本约束：
-1. 入口必须是 `async def run(page):`；不能创建或关闭 browser/context/page。
-2. 所有页面跳转只能使用相对路径；账号密码只能从 `os.environ` 读取，绝不能写入脚本。
-3. 文件顶部用已脱敏模块 docstring 写明“场景、目标、前置条件、清理策略”。
-4. 每个业务动作前写 `# 步骤 N：中文可读名称`；每个 expect 前写 `# 断言 N：中文可读名称`；清理逻辑写 `# 清理：中文说明`。
-5. 代码应让新手能顺着注释理解，每个动作和注释一一对应；有写操作必须使用 try/finally 清理本轮数据。
-6. 未确认页面证据时不要猜测定位器；缺少元素证据的步骤不得生成定位代码。
-7. 每次脚本运行使用 time.time_ns() 等生成新的唯一测试数据，绝不能复制探索阶段已经使用的名称、账号、记录 ID 或命名空间。
-8. 探索阶段的操作成功和清理记录只是生成依据，不代表本 Python 脚本已经运行通过。清理失败或结果未知时保留警告，不编造成功结果。"""
-
-REPAIR_SYSTEM_PROMPT = """你是 Python Playwright 脚本静态修复器。只修复给定质量问题，不能调用 MCP 或浏览器，
-不得新增未提供的页面事实、定位器、业务字段或敏感值。只输出完整 Python 源码。仍必须保留 async def run(page)、
-模块 docstring、步骤/断言/清理中文注释、相对 URL 和环境变量凭据读取。
-运行失败不代表原断言错误：禁止删除或弱化断言、修改预期值、吞掉异常、跳过步骤、扩大数据操作范围，或删除 finally 清理。
-定位问题只能使用 element_evidence 中已提供的定位器；缺少证据时保留原稿，不得编造替代定位器。业务结果不符、账号错误、
-环境不可达、运行变量缺失不能通过改写测试目标修复。修复稿仍需用户检查并主动调试，不能宣称已运行通过。
-当问题 code 为 RUNTIME_FAILURE 时仅允许补充必要标准库 import、注释和有证据的定位器；不得改写控制流或业务参数。"""
-
-
-def _content_text(value: Any, *, separator: str) -> str:
-    """Extract text from LangChain messages or OpenAI-compatible content blocks."""
-    if isinstance(value, str):
-        return value
-    if value is None:
-        return ''
-    if isinstance(value, dict):
-        text = value.get('text') or value.get('content')
-        return text if isinstance(text, str) else ''
-    content = getattr(value, 'content', None)
-    if content is not None and content is not value:
-        return _content_text(content, separator=separator)
-    if isinstance(value, (list, tuple)):
-        return separator.join(
-            text for text in (_content_text(block, separator=separator) for block in value)
-            if text
-        )
-    text = getattr(value, 'text', None)
-    if isinstance(text, str):
-        return text
-    return ''
-
-
-def _response_text(value: Any) -> str:
-    """Extract a complete non-streaming model response."""
-    return _content_text(value, separator='\n')
-
-
-def _strip_code_fences(value: Any) -> str:
-    text = _response_text(value).strip()
-    text = re.sub(r'^```(?:python)?\s*', '', text, flags=re.IGNORECASE)
-    return re.sub(r'\s*```$', '', text).strip()
+    pass
 
 
 class ScriptGenerator:
-    """Thin model adapter that receives no credentials or live browser objects."""
+    """Compatibility-shaped façade for the orchestration boundary.
 
-    def __init__(self, llm_model: Any):
+    ``llm_model`` is accepted only because the surrounding pipeline owns a
+    locked model. It is deliberately not consulted for actions or locators.
+    """
+    def __init__(self, llm_model=None):
         self.llm_model = llm_model
 
-    def generate(
-        self,
-        *,
-        scenario: ScenarioSpec,
-        trace: ExplorationTrace | None = None,
-        snapshot: Any = None,
-    ) -> str:
-        payload = {
-            'scenario': redact_metadata(scenario.model_dump(mode='json')),
-            'exploration_trace': redact_exploration_metadata(structured_trace_evidence(coerce_trace(trace or snapshot))),
-        }
-        return self._invoke(GENERATOR_SYSTEM_PROMPT, payload)
-
-    def repair(
-        self,
-        *,
-        script: str,
-        issues: list[dict[str, Any]],
-        scenario: ScenarioSpec,
-        trace: ExplorationTrace | None = None,
-        snapshot: Any = None,
-    ) -> str:
-        payload = {
-            'script': redact_text(script),
-            'quality_issues': redact_metadata(issues),
-            'scenario': redact_metadata(scenario.model_dump(mode='json')),
-            'exploration_trace': redact_exploration_metadata(structured_trace_evidence(coerce_trace(trace or snapshot))),
-        }
-        return self._invoke(REPAIR_SYSTEM_PROMPT, payload)
-
-    def _invoke(self, system_prompt: str, payload: dict[str, Any]) -> str:
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(',', ':'))),
-        ]
-        # ModelManager enforces ``streaming=True`` for production models.
-        # LangChain preserves this invoke contract while aggregating the
-        # provider stream, which keeps script generation aligned with
-        # structured-output and MCP callers without duplicating stream joins.
-        output = self.llm_model.invoke(
-            messages,
-            max_tokens=SCRIPT_GENERATION_MAX_TOKENS,
-        )
-        script = _strip_code_fences(output)
-        if not script:
-            raise ScriptGeneratorOutputError('模型未返回可用的 Python 脚本。')
-        return script
+    def generate(self, *, plan: GoalPlan, trace: ExplorationTrace) -> tuple[str, ReplayPlan]:
+        replay_plan = ReplayPlanner.build(plan, trace)
+        return PythonReplayCompiler.compile(plan, trace, replay_plan), replay_plan

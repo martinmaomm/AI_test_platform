@@ -81,7 +81,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
 
 
 class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
-    """Validate a new V2 generation request without persisting secret values."""
+    """Validate a new v3 generation request without persisting secret values."""
 
     description = serializers.CharField(max_length=2000, trim_whitespace=True)
     environment_id = serializers.IntegerField(min_value=1)
@@ -217,7 +217,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
 
 
 class WebUIScriptGenerationSaveSerializer(serializers.Serializer):
-    """Optional user-visible title for saving a quality-approved V2 draft."""
+    """Optional user-visible title for saving a quality-approved v3 draft."""
 
     title = serializers.CharField(max_length=200, required=False, allow_blank=False, trim_whitespace=True)
     mode = serializers.ChoiceField(choices=['draft', 'verified'], required=False)
@@ -355,7 +355,7 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
                     raise serializers.ValidationError({'description': '请修订测试目标，移除当前不支持的额外风险操作。'})
                 if exploration_requires_write_confirmation(description or generation.description_safe):
                     raise serializers.ValidationError({
-                        'description': '本次自动探索支持目标内测试数据增删改查；请移除审批、支付、发布及未授权文件/外部消息操作后继续。'
+                        'description': '本次自动探索支持目标范围内的测试数据操作；请移除审批、支付、发布及未授权文件/外部消息操作后继续。'
                     })
             elif generation.error_code == 'INPUT_AMBIGUOUS':
                 auto_explore = (

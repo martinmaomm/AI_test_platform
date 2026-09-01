@@ -5,7 +5,6 @@ import {
   debugWebUIScriptGeneration,
   getWebUIScriptGeneration,
   getWebUITestCaseExecution,
-  repairWebUIScriptGeneration,
   retryWebUIScriptGenerationFromTrace,
   resolveWebUIScriptGeneration,
   saveWebUIScriptGeneration,
@@ -46,7 +45,7 @@ const cloneVariables = (variables) => (Array.isArray(variables) ? variables : []
 }))
 
 /**
- * Durable V2 generation state. localStorage intentionally stores only the
+ * Durable v3 generation state. localStorage intentionally stores only the
  * generation UUID. Draft source and secret/runtime values stay in memory.
  */
 export function useWebUIScriptGeneration({ projectId, userId }) {
@@ -58,7 +57,6 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const resolving = ref(false)
   const draftSaving = ref(false)
   const debugging = ref(false)
-  const repairing = ref(false)
   const localDraft = ref(null)
   const draftConflict = ref(false)
   const debugExecution = ref(null)
@@ -150,7 +148,6 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     resolving.value = false
     draftSaving.value = false
     debugging.value = false
-    repairing.value = false
     debugExecutionLoading.value = false
     debugExecutionRequestId = null
   }
@@ -377,35 +374,6 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     }
   }
 
-  const repair = async () => {
-    if (!generation.value?.id || repairing.value || isWorkspaceBusy.value) return null
-    if (hasUnsavedDraft.value) {
-      lastError.value = '请先保存当前草稿，再基于该版本的失败证据请求修复。'
-      throw new Error(lastError.value)
-    }
-    const requestProjectId = currentProjectId.value
-    const generationId = generation.value.id
-    const requestScope = scopeVersion
-    repairing.value = true
-    lastError.value = ''
-    try {
-      const response = await repairWebUIScriptGeneration(requestProjectId, generationId, {
-        expected_revision: Number(localDraft.value?.revision ?? generation.value.workspace?.revision ?? 0)
-      })
-      if (!isCurrentScope(requestScope, requestProjectId) || String(generation.value?.id) !== String(generationId)) return null
-      const record = apiData(response)
-      if (response?.success === false) throw new Error(response?.message || '请求修复失败')
-      return applyGeneration(record)
-    } catch (error) {
-      if (!isCurrentScope(requestScope, requestProjectId) || String(generation.value?.id) !== String(generationId)) return null
-      if (error?.response?.status === 409) draftConflict.value = true
-      lastError.value = generationApiErrorMessage(error, '请求修复失败')
-      throw error
-    } finally {
-      if (isCurrentGenerationScope(requestScope, requestProjectId, generationId)) repairing.value = false
-    }
-  }
-
   const loadDebugExecution = async (record = generation.value) => {
     const verification = record?.workspace?.verification || {}
     const executionId = verification.execution_id
@@ -504,9 +472,9 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
 
   return {
     generation, workspace, localDraft, loading, submitting, saving, cancelling, resolving,
-    draftSaving, debugging, repairing, debugExecution, debugExecutionLoading, draftConflict,
+    draftSaving, debugging, debugExecution, debugExecutionLoading, draftConflict,
     lastError, isActive, isPaused, isTerminal, isWorkspaceBusy, hasUnsavedDraft,
-    create, refresh, restore, cancel, resolve, retryGeneration, save, saveDraft, debug, repair, updateLocalDraft,
+    create, refresh, restore, cancel, resolve, retryGeneration, save, saveDraft, debug, updateLocalDraft,
     discardLocalDraftAndRefresh, stopPolling, handleWebSocketEvent, clearStoredGeneration, storageKey
   }
 }

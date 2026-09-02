@@ -20,6 +20,32 @@ _SAFE_DIAGNOSTIC_PATH_SEGMENTS = frozenset({
     'preconditions', 'forbidden_actions', 'credentials_required',
     'allow_test_data_writes', 'cleanup_expected', 'discovery_notes', 'risk_level',
 })
+_SYMBOLIC_CREDENTIAL_REFERENCE_RE = re.compile(r'\bUI_TEST_(?:USERNAME|PASSWORD)\b')
+_SAFE_CUSTOM_ERROR_TYPES = (
+    ('不能包含完整 URL', 'absolute_url_forbidden'),
+    ('不能包含敏感信息', 'sensitive_text_forbidden'),
+    ('仅支持 schema_version=4', 'schema_version_mismatch'),
+    ('ref 断言必须且只能声明 input_ref', 'assertion_ref_shape'),
+    ('literal 断言必须且只能声明 literal', 'assertion_literal_shape'),
+    ('visible 断言不能声明 ref 或 literal', 'assertion_visible_shape'),
+    ('input ref 不可重复', 'duplicate_input_ref'),
+    ('assertion_id 不可重复', 'duplicate_assertion_id'),
+    ('每条 success criterion 只能声明一个机器断言', 'duplicate_criterion_assertion'),
+    ('每条 success criterion 都必须有机器可编译的 assertion requirement', 'criterion_assertion_missing'),
+    ('assertion requirement 引用了未声明的 input ref', 'unknown_assertion_input_ref'),
+    ('credentials_required=true 时必须声明 username 和 password 凭据变量', 'credential_refs_incomplete'),
+    ('声明 credential input ref 时 credentials_required 必须为 true', 'credential_flag_missing'),
+    ('cleanup_expected 仅适用于允许测试数据写入的场景', 'cleanup_without_write_scope'),
+    ('场景必须至少有一条 main assertion requirement', 'main_assertion_missing'),
+    ('cleanup_expected 必须声明 cleanup assertion requirement', 'cleanup_assertion_missing'),
+    ('仅 cleanup_expected 场景可以声明 cleanup assertion requirement', 'unexpected_cleanup_assertion'),
+    ('cleanup assertion 不能以仍包含目标值证明清理完成', 'cleanup_assertion_positive'),
+    ('credential input ref 必须声明 credential_slot', 'credential_slot_missing'),
+    ('仅 credential input ref 可以声明 credential_slot', 'unexpected_credential_slot'),
+    ('credential ref 必须命名为', 'credential_ref_name_invalid'),
+    ('字段必须是数组', 'list_field_required'),
+    ('input_refs 必须是数组', 'input_refs_list_required'),
+)
 
 
 class GenerationContractError(ValueError):
@@ -44,7 +70,13 @@ class _StrictContract(BaseModel):
 
 def _validate_safe_value(value: Any, field_name: str, *, reject_absolute_url: bool = False) -> None:
     if isinstance(value, str):
-        if REDACTED_VALUE in value or find_suspected_credentials(value) or redact_text(value) != value:
+        findings = set(find_suspected_credentials(value))
+        # The model is required to name credential slots symbolically.  The
+        # broad login-pair detector can otherwise mistake a sentence such as
+        # "使用 UI_TEST_USERNAME 和 UI_TEST_PASSWORD" for literal credentials.
+        if _SYMBOLIC_CREDENTIAL_REFERENCE_RE.search(value):
+            findings.discard('login_pair')
+        if REDACTED_VALUE in value or findings:
             raise ValueError(f'{field_name} 不能包含敏感信息')
         if reject_absolute_url and re.search(r'(?i)https?://', value):
             raise ValueError(f'{field_name} 不能包含完整 URL')
@@ -70,9 +102,18 @@ def _safe_diagnostic_path(location: Any) -> str:
 def _safe_diagnostics(error: ValidationError) -> tuple[dict[str, str], ...]:
     return tuple({
         'path': _safe_diagnostic_path(item.get('loc', ())),
-        'type': str(item.get('type') or 'validation_error')[:80],
+        'type': _safe_diagnostic_type(item),
         'stage': 'contract_validation',
-    } for item in error.errors(include_input=False, include_context=False, include_url=False)[:3])
+    } for item in error.errors(include_input=False, include_context=True, include_url=False)[:3])
+
+
+def _safe_diagnostic_type(item: dict[str, Any]) -> str:
+    """Map known validators to actionable codes without exposing their input."""
+    message = str((item.get('ctx') or {}).get('error') or '')
+    for fragment, error_type in _SAFE_CUSTOM_ERROR_TYPES:
+        if fragment in message:
+            return error_type
+    return str(item.get('type') or 'validation_error')[:80]
 
 
 class InputSpec(_StrictContract):

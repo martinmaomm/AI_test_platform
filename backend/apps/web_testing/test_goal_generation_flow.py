@@ -88,6 +88,23 @@ class ScenarioContractRegressionTests(SimpleTestCase):
                 }],
             ))
 
+    def test_symbolic_credential_refs_are_not_treated_as_literal_secrets(self):
+        plan = ScenarioPlan.model_validate(plan_payload(
+            objective='使用 UI_TEST_USERNAME 和 UI_TEST_PASSWORD 完成登录后验证。',
+            credentials_required=True,
+            input_refs=[
+                {
+                    'name': 'UI_TEST_USERNAME', 'source': 'credential',
+                    'credential_slot': 'username',
+                },
+                {
+                    'name': 'UI_TEST_PASSWORD', 'source': 'credential',
+                    'credential_slot': 'password',
+                },
+            ],
+        ))
+        self.assertTrue(plan.credentials_required)
+
     def test_workspace_variables_follow_explicit_sources_without_values(self):
         plan = ScenarioPlan.model_validate(plan_payload(
             credentials_required=True,
@@ -186,9 +203,8 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
 
     def test_native_structured_output_uses_low_randomness_without_json_fallback(self):
         structured_model = Mock()
-        structured_plan = ScenarioPlan.model_validate(plan_payload())
         structured_model.invoke.return_value = {
-            'parsed': structured_plan,
+            'parsed': plan_payload(),
             'raw': None,
             'parsing_error': None,
         }
@@ -201,10 +217,61 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         ):
             plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
         self.assertEqual(plan.schema_version, 4)
-        llm.with_structured_output.assert_called_once_with(ScenarioPlan, include_raw=True)
+        llm.with_structured_output.assert_called_once_with(
+            ScenarioPlan.model_json_schema(),
+            include_raw=True,
+        )
         self.assertEqual(structured_model.invoke.call_args.kwargs['temperature'], 0)
         self.assertNotIn('include_raw', structured_model.invoke.call_args.kwargs)
         manager.invoke.assert_not_called()
+
+    def test_native_structured_invalid_dict_uses_one_targeted_repair(self):
+        structured_model = Mock()
+        structured_model.invoke.return_value = {
+            'parsed': plan_payload(schema_version=3),
+            'raw': None,
+            'parsing_error': None,
+        }
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        manager.invoke.return_value = json.dumps(plan_payload(), ensure_ascii=False)
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        self.assertEqual(plan.schema_version, 4)
+        manager.invoke.assert_called_once()
+        repair_request = json.loads(manager.invoke.call_args.args[0][1].content)
+        self.assertEqual(
+            repair_request['validation_diagnostics'][0]['path'],
+            'schema_version',
+        )
+
+    def test_model_input_replaces_transport_url_and_redaction_markers(self):
+        structured_model = Mock()
+        structured_model.invoke.return_value = {
+            'parsed': plan_payload(),
+            'raw': None,
+            'parsing_error': None,
+        }
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            RequirementNormalizer(8).normalize(
+                '打开 https://example.test/login，登录账号 <redacted> <redacted> 后验证。',
+            )
+        model_input = json.loads(structured_model.invoke.call_args.args[0][1].content)
+        serialized = json.dumps(model_input, ensure_ascii=False)
+        self.assertNotIn('https://', serialized)
+        self.assertNotIn('<redacted>', serialized)
+        self.assertIn('目标页面', serialized)
+        self.assertIn('运行时凭据', serialized)
 
     def test_explicit_structured_output_capability_gap_falls_back_once_at_low_randomness(self):
         llm = Mock()
@@ -289,8 +356,44 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         self.assertEqual(manager.invoke.call_count, 2)
         repair_request = json.loads(manager.invoke.call_args_list[1].args[0][1].content)
         self.assertEqual(repair_request['validation_diagnostics'][0]['path'], 'schema_version')
+        self.assertEqual(
+            repair_request['validation_guidance'][0]['type'],
+            'schema_version_mismatch',
+        )
+        self.assertEqual(
+            repair_request['json_schema']['properties']['schema_version']['default'],
+            4,
+        )
+        self.assertEqual(
+            repair_request['scenario_input']['description'],
+            '检查当前页面的目标状态。',
+        )
         self.assertNotIn('validation_error', repair_request)
         self.assertEqual(manager.invoke.call_args_list[1].kwargs['temperature'], 0)
+
+    def test_cleanup_repair_receives_actionable_relationship_rule(self):
+        invalid = plan_payload(
+            cleanup_expected=True,
+            allow_test_data_writes=True,
+        )
+        manager = Mock()
+        manager.current_llm = None
+        manager.invoke.side_effect = [
+            json.dumps(invalid, ensure_ascii=False),
+            json.dumps(plan_payload(), ensure_ascii=False),
+        ]
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            RequirementNormalizer(8).normalize('创建测试数据后完成清理。')
+        repair_request = json.loads(manager.invoke.call_args_list[1].args[0][1].content)
+        guidance = repair_request['validation_guidance'][0]
+        self.assertEqual(guidance['type'], 'cleanup_assertion_missing')
+        self.assertIn('phase=cleanup', guidance['rule'])
+        self.assertIn(
+            '创建测试数据后完成清理',
+            repair_request['scenario_input']['description'],
+        )
 
     def test_structured_parser_failure_with_raw_output_uses_one_targeted_repair(self):
         structured_model = Mock()
@@ -375,6 +478,22 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         self.assertIn('<field>', serialized)
         self.assertNotIn('password', serialized)
         self.assertNotIn('private-value', serialized)
+
+    def test_contract_diagnostics_map_safe_root_validation_codes(self):
+        cases = (
+            ('https://example.test', 'absolute_url_forbidden'),
+            ('<redacted>', 'sensitive_text_forbidden'),
+        )
+        for objective, expected_type in cases:
+            with self.subTest(expected_type=expected_type):
+                with self.assertRaises(GenerationContractError) as captured:
+                    parse_scenario_plan_json(json.dumps(
+                        plan_payload(objective=objective), ensure_ascii=False,
+                    ))
+                self.assertEqual(
+                    captured.exception.diagnostics[0]['type'],
+                    expected_type,
+                )
 
 
 class TraceSecurityAndReplayRegressionTests(SimpleTestCase):

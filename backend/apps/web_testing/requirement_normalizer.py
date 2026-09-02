@@ -16,7 +16,7 @@ from .generation_contracts import (
     ScenarioPlan,
     parse_scenario_plan_json,
 )
-from .generation_security import redact_metadata, redact_text
+from .generation_security import REDACTED_VALUE, URL_RE, redact_metadata, redact_text
 
 _LOW_RANDOMNESS_TEMPERATURE = 0
 _STRUCTURED_OUTPUT_CAPABILITY_TERMS = (
@@ -33,6 +33,40 @@ _EXPLICIT_READ_ONLY_PATTERN = re.compile(
     r'(?:只查看|仅查看|只读|禁止(?:任何)?写入|不得(?:进行)?写(?:入|操作)|不允许(?:进行)?写(?:入|操作)|read[ -]?only)',
     re.I,
 )
+_MODEL_TARGET_REFERENCE = '目标页面'
+_MODEL_CREDENTIAL_REFERENCE = '运行时凭据'
+_CONTRACT_REPAIR_GUIDANCE = {
+    'absolute_url_forbidden': '删除完整 URL，用“目标页面”或相对路径表达，不改变业务目标。',
+    'sensitive_text_forbidden': '删除具体凭据值或脱敏占位符，需要登录时只引用 UI_TEST_USERNAME 和 UI_TEST_PASSWORD。',
+    'schema_version_mismatch': '将 schema_version 设为整数 4。',
+    'assertion_ref_shape': 'contains_ref/not_contains_ref 只声明 input_ref，literal 留空。',
+    'assertion_literal_shape': 'contains_literal/not_contains_literal 只声明 literal，input_ref 留空。',
+    'assertion_visible_shape': 'visible 断言的 input_ref 和 literal 都必须留空。',
+    'duplicate_input_ref': '删除重复 input_refs，保留唯一的变量声明。',
+    'duplicate_assertion_id': '为每条断言分配唯一且连续的 A1、A2、A3 编号。',
+    'duplicate_criterion_assertion': '每个 criterion_index 只保留一条 assertion_requirement。',
+    'criterion_assertion_missing': '使 success_criteria 与 assertion_requirements 一一对应，criterion_index 从 0 连续递增。',
+    'unknown_assertion_input_ref': '将断言引用的 input_ref 补充到 input_refs，或改为已声明的等价变量。',
+    'credential_refs_incomplete': 'credentials_required=true 时同时声明 username/UI_TEST_USERNAME 和 password/UI_TEST_PASSWORD 两个 credential input ref。',
+    'credential_flag_missing': '已声明 credential input ref 时，将 credentials_required 设为 true。',
+    'cleanup_without_write_scope': '用户要求写入并清理时保留 cleanup_expected=true 且设 allow_test_data_writes=true；否则两者都为 false。',
+    'main_assertion_missing': '至少保留一条 phase=main 的 assertion_requirement。',
+    'cleanup_assertion_missing': (
+        '先核对 scenario_input：只有用户明确要求测试后清理时才保留 cleanup_expected=true。'
+        '此时复用现有“清理后目标不存在”的 success criterion，并将对应 '
+        'assertion_requirement 设为 phase=cleanup；如果尚无该 criterion，根据已声明的测试数据 '
+        'input_ref 补充 not_contains_ref，不得凭空添加 literal。'
+        '如果用户未要求额外清理，将 cleanup_expected 改为 false，'
+        '不要把场景本身的删除步骤误当成 cleanup。'
+    ),
+    'unexpected_cleanup_assertion': '只有用户要求写入后清理时保留 phase=cleanup 并设 cleanup_expected=true，否则改为 phase=main。',
+    'cleanup_assertion_positive': '清理断言必须使用 not_contains_ref 或 not_contains_literal 验证目标已不存在。',
+    'credential_slot_missing': 'credential input ref 必须按变量用途声明 credential_slot=username 或 password。',
+    'unexpected_credential_slot': '非 credential 类型 input ref 的 credential_slot 必须留空。',
+    'credential_ref_name_invalid': 'username 凭据只能命名 UI_TEST_USERNAME，password 凭据只能命名 UI_TEST_PASSWORD。',
+    'list_field_required': '将指定字段改为 JSON 数组。',
+    'input_refs_list_required': '将 input_refs 改为 JSON 数组。',
+}
 
 NORMALIZER_SYSTEM_PROMPT = """你是 WebUI 自动化测试目标整理器。将用户已明确表达的完整测试场景整理为严格 JSON。
 不得编造页面字段、按钮、定位器、接口、登录流程或业务结果。页面入口、控件和路径属于后续真实探索，不要求用户预先提供。
@@ -62,18 +96,26 @@ class RequirementNormalizer:
         description = redact_text(str(description_safe or '')).strip()
         if not description or _GENERIC_DESCRIPTION_PATTERN.fullmatch(description):
             raise ScenarioInputInsufficientError('scenario_target_missing')
+        model_input = _prepare_model_value({
+            'description': description,
+            'test_case_context': redact_metadata(test_case_context or {}),
+        })
         messages = [
             SystemMessage(content=NORMALIZER_SYSTEM_PROMPT),
-            HumanMessage(content=json.dumps({
-                'description': description,
-                'test_case_context': redact_metadata(test_case_context or {}),
-            }, ensure_ascii=False)),
+            HumanMessage(content=json.dumps(model_input, ensure_ascii=False)),
         ]
         try:
             raw_output = self._invoke_structured_plan(messages)
         except _StructuredOutputUnsupported:
             raw_output = self._invoke_json_prompt(messages)
-        plan = parse_scenario_plan_json(raw_output, format_repair=self._repair_json_once)
+        plan = parse_scenario_plan_json(
+            raw_output,
+            format_repair=lambda invalid_output, diagnostics: self._repair_json_once(
+                invalid_output,
+                diagnostics,
+                scenario_input=model_input,
+            ),
+        )
         plan = _apply_explicit_read_only_override(plan, description)
         _validate_assertion_literals(plan, description, test_case_context or {})
         return plan
@@ -85,7 +127,14 @@ class RequirementNormalizer:
         if not callable(with_structured_output):
             raise _StructuredOutputUnsupported('with_structured_output unavailable')
         try:
-            structured_model = with_structured_output(ScenarioPlan, include_raw=True)
+            # Pass a plain JSON Schema so provider/LangChain streaming adapters
+            # cannot run Pydantic validation before the raw response reaches us.
+            # ScenarioPlan validation and the single repair attempt stay owned
+            # by parse_scenario_plan_json below.
+            structured_model = with_structured_output(
+                ScenarioPlan.model_json_schema(),
+                include_raw=True,
+            )
             structured_output = structured_model.invoke(
                 messages, temperature=_LOW_RANDOMNESS_TEMPERATURE,
             )
@@ -132,13 +181,31 @@ class RequirementNormalizer:
         self,
         invalid_output: str,
         diagnostics: tuple[dict[str, str], ...],
+        *,
+        scenario_input: dict[str, Any] | None = None,
     ) -> str:
+        guidance = [
+            {
+                'path': item.get('path', '<contract>'),
+                'type': item.get('type', 'validation_error'),
+                'rule': _CONTRACT_REPAIR_GUIDANCE[item['type']],
+            }
+            for item in diagnostics
+            if item.get('type') in _CONTRACT_REPAIR_GUIDANCE
+        ]
         return self.model_manager.invoke([
-            SystemMessage(content='你是严格 JSON 格式修复器。不得新增业务目标、页面元素、定位器或完成状态；只输出 JSON。'),
+            SystemMessage(content=(
+                '你是严格 JSON 合约修复器。必须逐条执行 validation_guidance，'
+                '不得通过删除用户要求的清理、凭据或写入语义来规避校验。'
+                '不得新增业务目标、页面元素、定位器或完成状态；只输出 JSON。'
+            )),
             HumanMessage(content=json.dumps({
-                'instruction': '仅针对 validation_diagnostics 指出的 v4 ScenarioPlan JSON 路径修复格式、字段名或缺失结构。',
+                'instruction': '仅修复 validation_diagnostics 指出的 v4 ScenarioPlan 结构、字段及它们的关联关系。',
                 'validation_diagnostics': list(diagnostics),
-                'invalid_output': redact_text(invalid_output),
+                'validation_guidance': guidance,
+                'json_schema': ScenarioPlan.model_json_schema(),
+                'scenario_input': scenario_input or {},
+                'invalid_output': _prepare_repair_output(invalid_output),
             }, ensure_ascii=False)),
         ], temperature=_LOW_RANDOMNESS_TEMPERATURE)
 
@@ -180,6 +247,38 @@ def _extract_raw_output(raw_output: Any) -> Any | None:
     if isinstance(candidate, (dict, list, tuple)):
         return candidate if candidate else None
     return candidate if isinstance(candidate, (int, float, bool)) else None
+
+
+def _prepare_model_value(value: Any) -> Any:
+    """Remove transport-only values that must never become ScenarioPlan text."""
+    if isinstance(value, dict):
+        return {
+            _prepare_model_text(str(key)): _prepare_model_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_prepare_model_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_prepare_model_value(item) for item in value]
+    if isinstance(value, str):
+        return _prepare_model_text(value)
+    return value
+
+
+def _prepare_model_text(value: str) -> str:
+    return URL_RE.sub(_MODEL_TARGET_REFERENCE, value).replace(
+        REDACTED_VALUE,
+        _MODEL_CREDENTIAL_REFERENCE,
+    )
+
+
+def _prepare_repair_output(invalid_output: str) -> str:
+    """Sanitise semantic-repair input without breaking its JSON syntax."""
+    try:
+        payload = json.loads(str(invalid_output))
+    except (TypeError, ValueError):
+        return _prepare_model_text(str(invalid_output))
+    return json.dumps(_prepare_model_value(payload), ensure_ascii=False)
 
 
 def normalize_requirement(description_safe: str, *, model_config_id: int, test_case_context: dict[str, Any] | None = None) -> ScenarioPlan:

@@ -1,4 +1,4 @@
-"""Static quality and provenance gate for deterministic v3 replay scripts."""
+"""Static quality, safety and callback-provenance gate for v4 replay scripts."""
 
 from __future__ import annotations
 
@@ -8,8 +8,7 @@ import re
 from typing import Any
 
 from .exploration_trace import ExplorationTrace
-from .generation_contracts import GoalPlan
-from .generation_security import find_suspected_credentials
+from .generation_contracts import ScenarioPlan
 from .replay_plan import PythonReplayCompiler, ReplayPlan, ReplayPlanner
 from .script_contract import ScriptContractError, normalize_for_storage
 
@@ -25,6 +24,8 @@ _SENSITIVE_NAME_RE = re.compile(
 _ABSOLUTE_URL_RE = re.compile(r'(?i)https?://')
 _STEP_COMMENT_RE = re.compile(r'^\s*#\s*步骤\s+(\d+)\s*[:：]')
 _ASSERTION_COMMENT_RE = re.compile(r'^\s*#\s*断言\s+(\d+)\s*[:：]')
+_CLEANUP_COMMENT_RE = re.compile(r'^\s*#\s*清理\s+(\d+)\s*[:：]')
+_CLEANUP_ASSERTION_COMMENT_RE = re.compile(r'^\s*#\s*清理验证\s+(\d+)\s*[:：]')
 
 
 def _issue(level: str, code: str, message: str, line: int | None = None) -> dict[str, Any]:
@@ -95,11 +96,9 @@ def _undefined_names(tree: ast.Module, run: ast.AsyncFunctionDef) -> set[str]:
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             if hasattr(node, 'name'):
                 defined.add(node.name)
-            defined.update(
-                item.arg for item in [
-                    *node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
-                ]
-            )
+            defined.update(item.arg for item in [
+                *node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+            ])
             if node.args.vararg:
                 defined.add(node.args.vararg.arg)
             if node.args.kwarg:
@@ -117,6 +116,8 @@ def _plain_nonempty_string(node: ast.AST | None) -> bool:
 
 
 def _has_sensitive_literal_assignment(tree: ast.AST) -> bool:
+    """Detect secret storage without treating selector syntax as an assignment."""
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             if _plain_nonempty_string(node.value) and any(
@@ -163,13 +164,13 @@ def _has_unresolved_placeholder(tree: ast.AST, lines: list[str]) -> bool:
     return any(re.search(r'(?i)\bTODO\b|待补充|待确认|占位', line) for line in lines)
 
 
-def _finally_action_shapes(run: ast.AsyncFunctionDef) -> list[str]:
+def _finally_shapes(run: ast.AsyncFunctionDef, *, assertions: bool) -> list[str]:
     calls: list[ast.Call] = []
     for node in ast.walk(run):
         if not isinstance(node, ast.Try) or not node.finalbody:
             continue
         for statement in node.finalbody:
-            calls.extend(_action_calls(statement))
+            calls.extend(_assertion_calls(statement) if assertions else _action_calls(statement))
     calls.sort(key=lambda node: (node.lineno, node.col_offset))
     return _call_shapes(calls)
 
@@ -180,7 +181,13 @@ def _append_once(target: list[dict[str, Any]], issue: dict[str, Any]) -> None:
         target.append(issue)
 
 
-def evaluate_script(source: str, *, plan: GoalPlan, trace: ExplorationTrace, replay_plan: ReplayPlan | None = None) -> dict[str, Any]:
+def evaluate_script(
+    source: str,
+    *,
+    plan: ScenarioPlan,
+    trace: ExplorationTrace,
+    replay_plan: ReplayPlan | None = None,
+) -> dict[str, Any]:
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     source = str(source or '')
@@ -208,42 +215,52 @@ def evaluate_script(source: str, *, plan: GoalPlan, trace: ExplorationTrace, rep
         or run_nodes[0].args.vararg
         or run_nodes[0].args.kwarg
     ):
-        blockers.append(_issue('blocker', 'RUN_SIGNATURE_INVALID', 'v3 脚本必须严格定义 async def run(page, variables)。'))
+        blockers.append(_issue(
+            'blocker', 'RUN_SIGNATURE_INVALID',
+            'v4 脚本必须严格定义 async def run(page, variables)。',
+        ))
         return _report(blockers, warnings)
     run = run_nodes[0]
     lines = source.splitlines()
     module_docstring = ast.get_docstring(tree) or ''
     if '场景：' not in module_docstring or '目标：' not in module_docstring:
-        blockers.append(_issue('blocker', 'DOCSTRING_MISSING', '文件顶部必须包含“场景”和“目标”说明。'))
+        blockers.append(_issue('blocker', 'DOCSTRING_MISSING', '文件顶部必须包含场景和目标说明。'))
     if _ABSOLUTE_URL_RE.search(source):
-        blockers.append(_issue('blocker', 'ABSOLUTE_URL_FORBIDDEN', '脚本只能使用相对路径，不能包含完整 URL。'))
-    if _has_sensitive_literal_assignment(tree) or any(
-        find_suspected_credentials(node.value)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        and ('=' in node.value or ':' in node.value)
-    ):
-        blockers.append(_issue('blocker', 'SENSITIVE_LITERAL', '脚本不能包含明文账号、密码、Token 或密钥。'))
+        blockers.append(_issue('blocker', 'ABSOLUTE_URL_FORBIDDEN', '脚本只能使用相对路径。'))
+    if _has_sensitive_literal_assignment(tree) or '<runtime_sensitive_data>' in source:
+        blockers.append(_issue('blocker', 'SENSITIVE_LITERAL', '脚本不能包含明文凭据或敏感运行时值。'))
     if _has_unresolved_placeholder(tree, lines):
-        blockers.append(_issue('blocker', 'UNRESOLVED_PLACEHOLDER', '脚本包含 TODO、pass 或未实现占位。'))
+        blockers.append(_issue('blocker', 'UNRESOLVED_PLACEHOLDER', '脚本包含 pass、TODO 或未实现占位。'))
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = _call_name(node)
             if name in _BROWSER_LIFECYCLE_METHODS:
-                _append_once(blockers, _issue('blocker', 'BROWSER_LIFECYCLE_FORBIDDEN', '脚本不能自行创建或关闭浏览器、上下文或页面。', node.lineno))
+                _append_once(blockers, _issue(
+                    'blocker', 'BROWSER_LIFECYCLE_FORBIDDEN',
+                    '脚本不能自行创建或关闭浏览器、上下文或页面。', node.lineno,
+                ))
             if name == 'wait_for_timeout' or (
                 name == 'sleep' and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id in {'time', 'asyncio'}
             ):
-                _append_once(blockers, _issue('blocker', 'FIXED_WAIT_FORBIDDEN', '脚本不能使用固定等待，应依赖页面状态或 expect。', node.lineno))
+                _append_once(blockers, _issue(
+                    'blocker', 'FIXED_WAIT_FORBIDDEN',
+                    '脚本不能使用固定等待，应依赖页面状态或 expect。', node.lineno,
+                ))
         if isinstance(node, ast.Name) and node.id in {'sync_playwright', 'async_playwright'}:
-            _append_once(blockers, _issue('blocker', 'PLAYWRIGHT_LIFECYCLE_FORBIDDEN', '脚本由统一执行器管理 Playwright 生命周期。', getattr(node, 'lineno', None)))
+            _append_once(blockers, _issue(
+                'blocker', 'PLAYWRIGHT_LIFECYCLE_FORBIDDEN',
+                '脚本由统一执行器管理 Playwright 生命周期。', getattr(node, 'lineno', None),
+            ))
 
     undefined = sorted(_undefined_names(tree, run))
     if undefined:
-        blockers.append(_issue('blocker', 'UNDEFINED_NAME', f'脚本引用了未定义名称：{", ".join(undefined[:5])}。'))
+        blockers.append(_issue(
+            'blocker', 'UNDEFINED_NAME',
+            f'脚本引用了未定义名称：{", ".join(undefined[:5])}。',
+        ))
 
     try:
         plan_value = replay_plan or ReplayPlanner.build(plan, trace)
@@ -258,73 +275,160 @@ def evaluate_script(source: str, *, plan: GoalPlan, trace: ExplorationTrace, rep
     expected_action_calls = _action_calls(expected_tree)
     expected_assertion_calls = _assertion_calls(expected_tree)
     if _call_shapes(action_calls) != _call_shapes(expected_action_calls):
-        blockers.append(_issue('blocker', 'ACTION_NOT_FROM_REPLAY_PLAN', '脚本动作或定位器与确定性 ReplayPlan 不一致。'))
+        blockers.append(_issue(
+            'blocker', 'ACTION_NOT_FROM_REPLAY_PLAN',
+            '脚本动作或定位器与确定性 ReplayPlan 不一致。',
+        ))
     if _call_shapes(assertion_calls) != _call_shapes(expected_assertion_calls):
-        blockers.append(_issue('blocker', 'ASSERTION_NOT_FROM_REPLAY_PLAN', '脚本断言与 callback verification 证据不一致。'))
+        blockers.append(_issue(
+            'blocker', 'ASSERTION_NOT_FROM_REPLAY_PLAN',
+            '脚本断言与 callback assertion evidence 不一致。',
+        ))
+    if ast.dump(tree, include_attributes=False) != ast.dump(expected_tree, include_attributes=False):
+        blockers.append(_issue(
+            'blocker', 'SCRIPT_NOT_DETERMINISTIC_REPLAY',
+            '脚本包含确定性 callback 编译结果之外的可执行代码。',
+        ))
     if not assertion_calls:
-        blockers.append(_issue('blocker', 'EXPECT_MISSING', '脚本至少需要一个由探索证据支持的 expect 断言。'))
+        blockers.append(_issue('blocker', 'EXPECT_MISSING', '脚本至少需要一个真实语义 expect 断言。'))
 
-    events = {item.event_id: item for item in trace.events}
-    action_refs = [(item.goal_id, item.event_id) for item in plan_value.actions]
-    assertion_refs = [
-        (events[event_id].goal_id, event_id)
-        for event_id in plan_value.assertion_event_ids
-        if event_id in events
-    ]
-    missing_action_refs = [
-        event_id for goal_id, event_id in action_refs
-        if source.count(f'[{goal_id}/{event_id}]') != 1
-    ]
-    if missing_action_refs:
-        blockers.append(_issue('blocker', 'ACTION_EVIDENCE_REFERENCE_MISSING', f'缺少或重复动作证据引用：{", ".join(missing_action_refs)}。'))
-    missing_assertion_refs = [
-        event_id for goal_id, event_id in assertion_refs
-        if source.count(f'[{goal_id}/{event_id}]') != 1
-    ]
-    if missing_assertion_refs:
-        blockers.append(_issue('blocker', 'ASSERTION_EVIDENCE_REFERENCE_MISSING', f'缺少或重复断言证据引用：{", ".join(missing_assertion_refs)}。'))
+    all_actions = [*plan_value.actions, *plan_value.cleanup_actions]
+    all_assertions = [*plan_value.assertions, *plan_value.cleanup_assertions]
+    for action in all_actions:
+        if source.count(f'[{action.event_id}]') != 1:
+            blockers.append(_issue(
+                'blocker', 'ACTION_EVIDENCE_REFERENCE_MISSING',
+                f'动作 {action.event_id} 缺少唯一 callback 溯源。',
+            ))
+    for assertion in all_assertions:
+        marker = f'[{assertion.assertion_id}/{assertion.event_id}]'
+        if source.count(marker) != 1:
+            blockers.append(_issue(
+                'blocker', 'ASSERTION_EVIDENCE_REFERENCE_MISSING',
+                f'断言 {assertion.assertion_id} 缺少唯一 callback 溯源。',
+            ))
 
-    step_numbers = [int(match.group(1)) for line in lines if (match := _STEP_COMMENT_RE.match(line))]
-    if step_numbers != list(range(1, len(plan_value.actions) + 1)):
-        blockers.append(_issue('blocker', 'ACTION_COMMENT_MISSING', '每个回放动作必须按顺序提供“步骤 N：...”中文备注。'))
-    assertion_numbers = [int(match.group(1)) for line in lines if (match := _ASSERTION_COMMENT_RE.match(line))]
-    if assertion_numbers != list(range(1, len(plan_value.assertion_event_ids) + 1)):
-        blockers.append(_issue('blocker', 'ASSERTION_COMMENT_MISSING', '每个断言必须按顺序提供“断言 N：...”中文备注。'))
-    for call, (goal_id, event_id) in zip(action_calls, action_refs):
+    comment_groups = (
+        (_STEP_COMMENT_RE, len(plan_value.actions), 'ACTION_COMMENT_MISSING'),
+        (_ASSERTION_COMMENT_RE, len(plan_value.assertions), 'ASSERTION_COMMENT_MISSING'),
+        (_CLEANUP_COMMENT_RE, len(plan_value.cleanup_actions), 'CLEANUP_COMMENT_MISSING'),
+        (
+            _CLEANUP_ASSERTION_COMMENT_RE,
+            len(plan_value.cleanup_assertions),
+            'CLEANUP_ASSERTION_COMMENT_MISSING',
+        ),
+    )
+    for pattern, count, code in comment_groups:
+        numbers = [
+            int(match.group(1)) for line in lines if (match := pattern.match(line))
+        ]
+        if numbers != list(range(1, count + 1)):
+            blockers.append(_issue('blocker', code, '步骤或断言备注编号不完整。'))
+
+    for call, action in zip(action_calls, all_actions):
         comment = _nearest_comment(lines, call.lineno)
-        if not _STEP_COMMENT_RE.match(comment) or f'[{goal_id}/{event_id}]' not in comment:
-            _append_once(blockers, _issue('blocker', 'ACTION_COMMENT_MISSING', '业务动作缺少可读步骤备注和证据引用。', call.lineno))
-    for call, (goal_id, event_id) in zip(assertion_calls, assertion_refs):
+        pattern = (
+            _CLEANUP_COMMENT_RE if action in plan_value.cleanup_actions else _STEP_COMMENT_RE
+        )
+        if not pattern.match(comment) or f'[{action.event_id}]' not in comment:
+            _append_once(blockers, _issue(
+                'blocker',
+                'CLEANUP_COMMENT_MISSING' if action in plan_value.cleanup_actions else 'ACTION_COMMENT_MISSING',
+                '动作缺少可读编号备注和 callback 证据引用。',
+                call.lineno,
+            ))
+    for call, assertion in zip(assertion_calls, all_assertions):
         comment = _nearest_comment(lines, call.lineno)
-        if not _ASSERTION_COMMENT_RE.match(comment) or f'[{goal_id}/{event_id}]' not in comment:
-            _append_once(blockers, _issue('blocker', 'ASSERTION_COMMENT_MISSING', '断言缺少可读备注和证据引用。', call.lineno))
+        pattern = (
+            _CLEANUP_ASSERTION_COMMENT_RE
+            if assertion in plan_value.cleanup_assertions else _ASSERTION_COMMENT_RE
+        )
+        marker = f'[{assertion.assertion_id}/{assertion.event_id}]'
+        if not pattern.match(comment) or marker not in comment:
+            _append_once(blockers, _issue(
+                'blocker',
+                'CLEANUP_ASSERTION_COMMENT_MISSING'
+                if assertion in plan_value.cleanup_assertions else 'ASSERTION_COMMENT_MISSING',
+                '断言缺少可读编号备注和 callback 证据引用。',
+                call.lineno,
+            ))
 
     evidence_by_event = {item.event_id: item for item in trace.locator_evidence}
-    for action in plan_value.actions:
+    for action in all_actions:
         evidence = evidence_by_event.get(action.event_id)
         if evidence is None:
-            blockers.append(_issue('blocker', 'LOCATOR_EVIDENCE_MISSING', f'{action.event_id} 没有 LocatorEvidence。'))
+            blockers.append(_issue(
+                'blocker', 'LOCATOR_EVIDENCE_MISSING',
+                f'{action.event_id} 没有 LocatorEvidence。',
+            ))
         elif evidence.validation in {'fragile', 'rejected'}:
-            blockers.append(_issue('blocker', 'LOCATOR_EVIDENCE_FRAGILE', f'{action.event_id} 的定位器不够稳定。'))
+            blockers.append(_issue(
+                'blocker', 'LOCATOR_EVIDENCE_FRAGILE',
+                f'{action.event_id} 的定位器不够稳定。',
+            ))
         elif evidence.validation == 'acceptable':
-            warnings.append(_issue('warning', 'LOCATOR_COUNT_UNVERIFIED', f'{action.event_id} 已由真实动作验证，但 MCP 无法独立证明定位器唯一。'))
-    for event_id in plan_value.assertion_event_ids:
-        evidence = evidence_by_event.get(event_id)
+            warnings.append(_issue(
+                'warning', 'LOCATOR_COUNT_UNVERIFIED',
+                f'{action.event_id} 已由真实动作验证，但未独立证明定位器唯一。',
+            ))
+    for assertion in all_assertions:
+        evidence = evidence_by_event.get(assertion.event_id)
         if evidence is None or evidence.validation in {'fragile', 'rejected'}:
-            blockers.append(_issue('blocker', 'ASSERTION_EVIDENCE_MISSING', f'{event_id} 缺少可编译的断言定位证据。'))
+            blockers.append(_issue(
+                'blocker', 'ASSERTION_EVIDENCE_MISSING',
+                f'{assertion.assertion_id} 缺少可编译的断言定位证据。',
+            ))
 
-    cleanup_actions = [item for item in plan_value.actions if item.cleanup]
-    if cleanup_actions:
-        expected_run = next(
-            item for item in expected_tree.body
-            if isinstance(item, ast.AsyncFunctionDef) and item.name == 'run'
-        )
-        if _finally_action_shapes(run) != _finally_action_shapes(expected_run):
-            blockers.append(_issue('blocker', 'CLEANUP_FINALLY_MISSING', 'cleanup Goal 的全部动作必须位于 try/finally 的 finally 中。'))
+    expected_assertion_ids = {item.assertion_id for item in plan.assertion_requirements}
+    compiled_assertion_ids = {item.assertion_id for item in all_assertions}
+    if expected_assertion_ids != compiled_assertion_ids:
+        missing = ', '.join(sorted(expected_assertion_ids - compiled_assertion_ids))
+        blockers.append(_issue(
+            'blocker', 'SUCCESS_CRITERIA_UNCOVERED',
+            f'success criteria 缺少 callback 语义证据：{missing or "unknown"}。',
+        ))
+
+    expected_run = next(
+        item for item in expected_tree.body
+        if isinstance(item, ast.AsyncFunctionDef) and item.name == 'run'
+    )
+    if _finally_shapes(run, assertions=False) != _finally_shapes(
+        expected_run, assertions=False,
+    ):
+        blockers.append(_issue(
+            'blocker', 'CLEANUP_FINALLY_MISMATCH',
+            'finally 中的清理动作必须精确来自成功 cleanup callback。',
+        ))
+    if _finally_shapes(run, assertions=True) != _finally_shapes(
+        expected_run, assertions=True,
+    ):
+        blockers.append(_issue(
+            'blocker', 'CLEANUP_VERIFICATION_FINALLY_MISMATCH',
+            'finally 中的清理验证必须精确来自后续成功 observation callback。',
+        ))
+    if plan.cleanup_expected:
+        if not plan_value.cleanup_actions:
+            blockers.append(_issue(
+                'blocker', 'CLEANUP_EVIDENCE_MISSING',
+                '计划要求清理，但没有成功清理动作 callback。',
+            ))
+        if (
+            not plan_value.cleanup_assertions
+            or trace.cleanup.get('status') != 'completed'
+        ):
+            blockers.append(_issue(
+                'blocker', 'CLEANUP_VERIFICATION_MISSING',
+                '清理动作没有后续真实页面观察确认，不能标记为已清理。',
+            ))
+
+    for message in plan_value.warnings:
+        warnings.append(_issue('warning', 'EXPLORATION_EVIDENCE_INCOMPLETE', message))
     return _report(blockers, warnings)
 
 
-def _report(blockers: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> dict[str, Any]:
+def _report(
+    blockers: list[dict[str, Any]], warnings: list[dict[str, Any]],
+) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     for item in [*blockers, *warnings]:
         _append_once(checks, item)
@@ -347,7 +451,3 @@ def _report(blockers: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> d
 
 def blocker_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
     return list(report.get('blockers') or [])
-
-
-def has_missing_evidence(report: dict[str, Any]) -> bool:
-    return any(item.get('code', '').endswith('EVIDENCE_MISSING') for item in report.get('blockers') or [])

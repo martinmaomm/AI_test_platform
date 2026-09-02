@@ -16,7 +16,7 @@ from mcp_use.client.connectors.base import BaseConnector
 
 from ai_core.mcp_agent_budget import BudgetedMCPAgent, mcp_graph_recursion_limit
 from ai_core.webui_playwright_agent import MCPBrowserToolGuard
-from web_testing.generation_contracts import GoalPlan
+from web_testing.generation_contracts import ScenarioPlan
 from web_testing.mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
 
 
@@ -30,6 +30,12 @@ def read_visible_text() -> str:
 def read_fixture_metadata() -> str:
     """Return synthetic non-browser evidence for model-budget verification."""
     return 'synthetic metadata'
+
+
+@tool('aits_local_checkpoint_fixture')
+def local_checkpoint_fixture() -> str:
+    """Return a local marker acknowledgement for extension-hook tests."""
+    return 'accepted'
 
 
 class ScriptedLoopModel(BaseChatModel):
@@ -95,6 +101,21 @@ class BudgetedMCPAgentGraphTests(SimpleTestCase):
 
         self.assertEqual(model.calls, 60)
 
+    def test_initialized_agent_registers_local_tool_through_public_wrapper(self):
+        agent = self.make_agent(ScriptedLoopModel(), read_fixture_metadata)
+        original_executor = agent._agent_executor
+        with patch.object(
+            agent, '_create_system_message_from_tools', new=AsyncMock(),
+        ) as rebuild_prompt, patch.object(
+            agent, '_create_agent', return_value=object(),
+        ) as rebuild_executor:
+            asyncio.run(agent.register_local_tools([local_checkpoint_fixture]))
+
+        self.assertIn('aits_local_checkpoint_fixture', {tool.name for tool in agent._tools})
+        self.assertIsNot(agent._agent_executor, original_executor)
+        rebuild_prompt.assert_awaited_once()
+        rebuild_executor.assert_called_once()
+
 
 class MCPPageExplorerInitializationCancellationTests(SimpleTestCase):
     def test_cancellation_interrupts_real_agent_initialization_and_closes_sessions(self):
@@ -133,15 +154,17 @@ class MCPPageExplorerInitializationCancellationTests(SimpleTestCase):
                 self.closed += 1
                 self.active_sessions = {}
 
-        plan = GoalPlan.model_validate({
-            'schema_version': 3, 'title': 'Read', 'objective': 'Read',
-            'goals': [
-                {'id': 'G1', 'kind': 'setup', 'objective': 'Read',
-                 'completion_criteria': 'Visible', 'side_effect': 'none'},
-                {'id': 'G2', 'kind': 'verify', 'objective': 'Verify',
-                 'completion_criteria': 'Visible', 'side_effect': 'none',
-                 'verification': {'mode': 'visible'}},
-            ],
+        plan = ScenarioPlan.model_validate({
+            'schema_version': 4, 'title': 'Read', 'objective': 'Read current page',
+            'instructions': ['Read the current page', 'Verify visible evidence'],
+            'success_criteria': ['Visible evidence is retained'],
+            'assertion_requirements': [{
+                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                'kind': 'visible', 'input_ref': '', 'literal': '',
+            }],
+            'input_refs': [], 'preconditions': [], 'forbidden_actions': [],
+            'credentials_required': False, 'allow_test_data_writes': False,
+            'cleanup_expected': False, 'discovery_notes': [], 'risk_level': 'low',
         })
         client = WaitingClient()
         checks = {'count': 0}

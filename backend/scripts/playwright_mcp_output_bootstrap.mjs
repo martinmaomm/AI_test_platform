@@ -65,7 +65,15 @@ export function safeScreenshotName(value) {
   return basename.slice(0, MAX_SCREENSHOT_BASENAME_LENGTH);
 }
 
-export async function configureOutputOverrides(packageRoot, { logFile, screenshotDir }) {
+export function managedLogOutputs(disableFileLogging = false) {
+  return disableFileLogging ? [] : ['file'];
+}
+
+export async function configureOutputOverrides(packageRoot, {
+  logFile,
+  screenshotDir,
+  disableFileLogging = false,
+}) {
   const resolvedLogFile = path.resolve(logFile);
   const resolvedScreenshotDir = path.resolve(screenshotDir);
   const loggingModule = await import(pathToFileURL(path.join(packageRoot, 'dist/logging/index.js')).href);
@@ -76,7 +84,7 @@ export async function configureOutputOverrides(packageRoot, { logFile, screensho
   Logger.getInstance({
     level: 'info',
     format: 'json',
-    outputs: ['file'],
+    outputs: managedLogOutputs(disableFileLogging),
     filePath: resolvedLogFile,
     maxFileSize: 10485760,
     maxFiles: 5,
@@ -101,6 +109,7 @@ export function buildServerArgv(packageRoot, serverArgs) {
 export async function runBootstrap() {
   const logFile = requiredAbsoluteEnvPath('AITS_MCP_LOG_FILE');
   const screenshotDir = requiredAbsoluteEnvPath('AITS_MCP_SCREENSHOT_DIR');
+  const disableFileLogging = process.env.AITS_MCP_DISABLE_FILE_LOG === '1';
   const workingDir = process.env.AITS_MCP_WORKING_DIR;
   if (workingDir) {
     if (!path.isAbsolute(workingDir) || !fs.statSync(workingDir).isDirectory()) {
@@ -111,7 +120,11 @@ export async function runBootstrap() {
   const packageRoot = resolvePlaywrightMcpPackageRoot();
   const serverArgs = process.argv.slice(2);
   process.argv = buildServerArgv(packageRoot, serverArgs);
-  await configureOutputOverrides(packageRoot, { logFile, screenshotDir });
+  await configureOutputOverrides(packageRoot, {
+    logFile,
+    screenshotDir,
+    disableFileLogging,
+  });
   await import(pathToFileURL(path.join(packageRoot, 'dist/index.js')).href);
 }
 

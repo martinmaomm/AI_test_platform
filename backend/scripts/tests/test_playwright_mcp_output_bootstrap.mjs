@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   buildServerArgv,
   configureOutputOverrides,
+  managedLogOutputs,
   resolvePlaywrightMcpPackageRoot,
   safeScreenshotName,
 } from '../playwright_mcp_output_bootstrap.mjs';
@@ -32,6 +33,8 @@ test('resolves npm exec package, preserves HOME, forces safe task-local outputs'
     assert.equal(Logger.getInstance().config.filePath, logFile);
     assert.equal(Logger.getInstance().config.maxFileSize, 10485760);
     assert.equal(Logger.getInstance().config.maxFiles, 5);
+    assert.deepEqual(managedLogOutputs(false), ['file']);
+    assert.deepEqual(managedLogOutputs(true), []);
     assert.equal(process.env.HOME, homeBefore);
 
     const { ScreenshotTool } = await import(pathToFileURL(path.join(packageRoot, 'dist/tools/browser/screenshot.js')).href);

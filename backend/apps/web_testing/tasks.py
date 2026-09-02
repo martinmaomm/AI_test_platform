@@ -434,7 +434,7 @@ def debug_webui_script_generation_task(
 def repair_webui_script_generation_task(self, generation_id: str, locked_revision: int, locked_hash: str):
     """Generate a conservative candidate only; a user must review and debug it."""
     from .exploration_trace import ExplorationTrace
-    from .generation_contracts import GoalPlan
+    from .generation_contracts import ScenarioPlan
     from .generation_workspace import (
         accept_repair_candidate, finish_repair_failure, mark_repair_running,
     )
@@ -448,9 +448,9 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         issues = verification.get('diagnostics') or []
         if not issues:
             raise ValueError('缺少运行失败诊断，需要人工补充证据或重新调试。')
-        GoalPlan.model_validate(generation.scenario_spec or {})
+        ScenarioPlan.model_validate(generation.scenario_spec or {})
         ExplorationTrace.model_validate(generation.exploration_snapshot or {})
-        raise ValueError('v3 回放脚本不支持通用 LLM 修复；请重新探索或人工审核。')
+        raise ValueError('v4 回放脚本不支持通用 LLM 修复；请重新探索或人工审核。')
     except Exception as exc:
         logger.error('生成草稿修复失败: generation_id=%s', generation_id)
         finish_repair_failure(

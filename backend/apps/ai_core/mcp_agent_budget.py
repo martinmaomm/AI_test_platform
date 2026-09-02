@@ -1,8 +1,11 @@
 """Project-level MCPAgent limits compatible with LangChain's agent graph."""
 
+from collections.abc import Iterable
+
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.tools import BaseTool
 from mcp_use import MCPAgent
 from mcp_use.agents.middleware import tool_error_handler
 
@@ -39,3 +42,24 @@ class BudgetedMCPAgent(MCPAgent):
             middleware=middleware,
             debug=self.verbose,
         ).with_config({"recursion_limit": self.recursion_limit})
+
+    async def register_local_tools(self, tools: Iterable[BaseTool]) -> None:
+        """Add controlled in-process tools to this initialized agent.
+
+        ``mcp-use`` currently has no public post-initialization extension hook.
+        Keep its private collection/executor access isolated here so callers do
+        not depend on library internals and still use one MCPAgent and one run.
+        """
+
+        if self._is_remote or not self._initialized:
+            raise RuntimeError('local tools require an initialized local MCPAgent')
+        additions = list(tools)
+        if not additions:
+            return
+        existing_names = {item.name for item in self._tools}
+        duplicate_names = existing_names & {item.name for item in additions}
+        if duplicate_names or len({item.name for item in additions}) != len(additions):
+            raise ValueError('local tool names must be unique')
+        self._tools.extend(additions)
+        await self._create_system_message_from_tools(self._tools)
+        self._agent_executor = self._create_agent()

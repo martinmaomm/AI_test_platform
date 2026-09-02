@@ -1,9 +1,4 @@
-"""Strict v3 contracts for goal-scoped WebUI generation.
-
-The persisted JSON in this module is deliberately v3-only. It does not read
-or project the previous CRUD-step schema: callers must create a fresh
-generation after the development data cleanup.
-"""
+"""Strict v4 contracts for one continuous WebUI exploration."""
 
 from __future__ import annotations
 
@@ -17,12 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .execution_variables import ExecutionVariableError, validate_variable_name
 from .generation_security import REDACTED_VALUE, find_suspected_credentials, redact_text
 
-GOAL_PLAN_SCHEMA_VERSION = 3
+SCENARIO_PLAN_SCHEMA_VERSION = 4
 
 
 class GenerationContractError(ValueError):
-    """A model or persisted artifact is not a safe v3 contract."""
-
+    """A model or persisted artifact is not a safe v4 contract."""
     def __init__(self, message: str = 'contract_invalid', *, diagnostics: tuple[dict[str, str], ...] = ()):
         super().__init__(message)
         self.diagnostics = diagnostics
@@ -65,7 +59,7 @@ def _safe_diagnostics(error: ValidationError) -> tuple[dict[str, str], ...]:
 
 
 class InputSpec(_StrictContract):
-    """One explicit runtime input; source must never be inferred from its name."""
+    """One explicit runtime input; its value never belongs in persisted JSON."""
     name: str = Field(min_length=1, max_length=128)
     source: str = Field(pattern=r'^(?:generated|runtime|credential)$')
     credential_slot: str = Field(default='', pattern=r'^(?:|username|password)$')
@@ -85,94 +79,62 @@ class InputSpec(_StrictContract):
         if self.source != 'credential' and self.credential_slot:
             raise ValueError('仅 credential input ref 可以声明 credential_slot')
         if self.source == 'credential':
-            expected_name = {
-                'username': 'UI_TEST_USERNAME',
-                'password': 'UI_TEST_PASSWORD',
-            }[self.credential_slot]
-            if self.name != expected_name:
-                raise ValueError(f'{self.credential_slot} credential ref 必须命名为 {expected_name}')
+            expected = {'username': 'UI_TEST_USERNAME', 'password': 'UI_TEST_PASSWORD'}[self.credential_slot]
+            if self.name != expected:
+                raise ValueError(f'{self.credential_slot} credential ref 必须命名为 {expected}')
         return self
 
 
-class VerificationContract(_StrictContract):
-    """Goal-owned assertion semantics, independent of site wording or locators."""
-    mode: str = Field(pattern=r'^(?:visible|contains_ref|not_contains_ref)$')
+class AssertionRequirement(_StrictContract):
+    """Machine-compilable meaning for one user success criterion."""
+
+    assertion_id: str = Field(pattern=r'^A[1-9][0-9]*$')
+    criterion_index: int = Field(ge=0, le=19)
+    phase: str = Field(default='main', pattern=r'^(?:main|cleanup)$')
+    kind: str = Field(
+        pattern=r'^(?:visible|contains_ref|not_contains_ref|contains_literal|not_contains_literal)$'
+    )
     input_ref: str = Field(default='', max_length=128)
-
-    @field_validator('input_ref', mode='before')
-    @classmethod
-    def _optional_execution_variable_name(cls, value):
-        if value in (None, ''):
-            return ''
-        try:
-            return validate_variable_name(value)
-        except ExecutionVariableError as exc:
-            raise ValueError(str(exc)) from exc
+    literal: str = Field(default='', max_length=300)
 
     @model_validator(mode='after')
-    def _mode_shape(self):
-        if self.mode == 'visible' and self.input_ref:
-            raise ValueError('visible verification 不应声明 input_ref')
-        if self.mode != 'visible' and not self.input_ref:
-            raise ValueError('contains_ref/not_contains_ref verification 必须声明 input_ref')
+    def _semantic_shape(self):
+        uses_ref = self.kind in {'contains_ref', 'not_contains_ref'}
+        uses_literal = self.kind in {'contains_literal', 'not_contains_literal'}
+        if uses_ref != bool(self.input_ref):
+            raise ValueError('ref 断言必须且只能声明 input_ref')
+        if uses_literal != bool(self.literal):
+            raise ValueError('literal 断言必须且只能声明 literal')
+        if self.kind == 'visible' and (self.input_ref or self.literal):
+            raise ValueError('visible 断言不能声明 ref 或 literal')
         return self
 
 
-class Goal(_StrictContract):
-    id: str = Field(pattern=r'^G[1-9][0-9]*$')
-    kind: str = Field(pattern=r'^(?:setup|exercise|verify|cleanup)$')
-    objective: str = Field(min_length=2, max_length=1000)
-    completion_criteria: str = Field(min_length=2, max_length=1000)
-    input_refs: list[InputSpec] = Field(default_factory=list, max_length=20)
-    verification: VerificationContract | None = None
-    side_effect: str = Field(default='none', pattern=r'^(?:none|test_data|external|unknown)$')
-    cleanup_for_goal_ids: list[str] = Field(default_factory=list, max_length=30)
-
-    @field_validator('input_refs', 'cleanup_for_goal_ids', mode='before')
-    @classmethod
-    def _list_only(cls, value):
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise ValueError('字段必须是数组')
-        return value
-
-    @model_validator(mode='after')
-    def _input_refs_unique(self):
-        names = [item.name for item in self.input_refs]
-        if len(names) != len(set(names)):
-            raise ValueError('同一 Goal 的 input ref 不可重复')
-        if self.kind == 'verify' and self.verification is None:
-            raise ValueError('verify Goal 必须声明 verification contract')
-        if self.kind == 'cleanup' and self.cleanup_for_goal_ids and self.verification is None:
-            raise ValueError('清理测试数据的 cleanup Goal 必须声明 verification contract')
-        if self.kind not in {'verify', 'cleanup'} and self.verification is not None:
-            raise ValueError('仅 verify/cleanup Goal 可以声明 verification contract')
-        if self.verification and self.verification.input_ref and self.verification.input_ref not in names:
-            raise ValueError('verification input_ref 必须属于当前 Goal')
-        return self
-
-
-class GoalPlan(_StrictContract):
-    schema_version: int = Field(default=GOAL_PLAN_SCHEMA_VERSION, frozen=True)
+class ScenarioPlan(_StrictContract):
+    """A complete plan given to one agent; instructions are never run boundaries."""
+    schema_version: int = Field(default=SCENARIO_PLAN_SCHEMA_VERSION, frozen=True)
     title: str = Field(min_length=2, max_length=200)
     objective: str = Field(min_length=2, max_length=1000)
+    instructions: list[str] = Field(min_length=1, max_length=40)
+    success_criteria: list[str] = Field(min_length=1, max_length=20)
+    assertion_requirements: list[AssertionRequirement] = Field(min_length=1, max_length=20)
+    input_refs: list[InputSpec] = Field(default_factory=list, max_length=20)
     preconditions: list[str] = Field(default_factory=list, max_length=20)
-    goals: list[Goal] = Field(min_length=1, max_length=30)
     forbidden_actions: list[str] = Field(default_factory=list, max_length=30)
     credentials_required: bool = False
+    allow_test_data_writes: bool = False
+    cleanup_expected: bool = False
     discovery_notes: list[str] = Field(default_factory=list, max_length=30)
-    ambiguities: list[str] = Field(default_factory=list, max_length=20)
     risk_level: str = Field(default='low', pattern=r'^(?:low|medium|high)$')
 
     @field_validator('schema_version')
     @classmethod
-    def _only_v3(cls, value):
-        if value != GOAL_PLAN_SCHEMA_VERSION:
-            raise ValueError('仅支持 schema_version=3')
+    def _only_v4(cls, value):
+        if value != SCENARIO_PLAN_SCHEMA_VERSION:
+            raise ValueError('仅支持 schema_version=4')
         return value
 
-    @field_validator('preconditions', 'forbidden_actions', 'discovery_notes', 'ambiguities', mode='before')
+    @field_validator('instructions', 'success_criteria', 'preconditions', 'forbidden_actions', 'discovery_notes', mode='before')
     @classmethod
     def _text_list(cls, value):
         if value is None:
@@ -181,70 +143,73 @@ class GoalPlan(_StrictContract):
             raise ValueError('字段必须是数组')
         return [str(item) for item in value]
 
+    @field_validator('input_refs', 'assertion_requirements', mode='before')
+    @classmethod
+    def _input_list(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError('input_refs 必须是数组')
+        return value
+
     @model_validator(mode='after')
-    def _validate_goal_graph(self):
-        ids = [goal.id for goal in self.goals]
-        if len(ids) != len(set(ids)):
-            raise ValueError('Goal ID 不可重复')
-        known_ids = set(ids)
-        cleanup_references: set[str] = set()
-        for goal in self.goals:
-            if goal.kind != 'cleanup' and goal.cleanup_for_goal_ids:
-                raise ValueError('仅 cleanup Goal 可以声明 cleanup_for_goal_ids')
-            if goal.kind == 'cleanup':
-                unknown = set(goal.cleanup_for_goal_ids) - known_ids
-                if unknown or goal.id in goal.cleanup_for_goal_ids:
-                    raise ValueError('cleanup_for_goal_ids 必须引用其他已有 Goal')
-                cleanup_references.update(goal.cleanup_for_goal_ids)
-        required_cleanup = {goal.id for goal in self.goals if goal.side_effect == 'test_data'}
-        if required_cleanup - cleanup_references:
-            raise ValueError('写入测试数据的 Goal 必须有 cleanup Goal 引用')
-        input_specs: dict[str, tuple[str, str]] = {}
-        credential_slots: set[str] = set()
-        for goal in self.goals:
-            for item in goal.input_refs:
-                shape = (item.source, item.credential_slot)
-                if item.name in input_specs and input_specs[item.name] != shape:
-                    raise ValueError(f'执行变量 {item.name} 的来源或凭据槽定义冲突')
-                input_specs[item.name] = shape
-                if item.source == 'credential':
-                    credential_slots.add(item.credential_slot)
+    def _validate_plan(self):
+        names = [item.name for item in self.input_refs]
+        if len(names) != len(set(names)):
+            raise ValueError('input ref 不可重复')
+        assertion_ids = [item.assertion_id for item in self.assertion_requirements]
+        if len(assertion_ids) != len(set(assertion_ids)):
+            raise ValueError('assertion_id 不可重复')
+        criterion_indexes = [item.criterion_index for item in self.assertion_requirements]
+        if len(criterion_indexes) != len(set(criterion_indexes)):
+            raise ValueError('每条 success criterion 只能声明一个机器断言')
+        if set(criterion_indexes) != set(range(len(self.success_criteria))):
+            raise ValueError('每条 success criterion 都必须有机器可编译的 assertion requirement')
+        unknown_assertion_refs = {
+            item.input_ref for item in self.assertion_requirements
+            if item.input_ref and item.input_ref not in set(names)
+        }
+        if unknown_assertion_refs:
+            raise ValueError('assertion requirement 引用了未声明的 input ref')
+        credential_slots = {item.credential_slot for item in self.input_refs if item.source == 'credential'}
         if self.credentials_required and credential_slots != {'username', 'password'}:
             raise ValueError('credentials_required=true 时必须声明 username 和 password 凭据变量')
         if not self.credentials_required and credential_slots:
             raise ValueError('声明 credential input ref 时 credentials_required 必须为 true')
-        if not any(goal.verification is not None for goal in self.goals):
-            raise ValueError('GoalPlan 至少需要一个可编译的 verification contract')
-        _validate_safe_value(
-            self.model_dump(mode='json'), 'GoalPlan', reject_absolute_url=True,
-        )
-        self.input_sources()
+        if self.cleanup_expected and not self.allow_test_data_writes:
+            raise ValueError('cleanup_expected 仅适用于允许测试数据写入的场景')
+        cleanup_assertions = [
+            item for item in self.assertion_requirements if item.phase == 'cleanup'
+        ]
+        if not any(item.phase == 'main' for item in self.assertion_requirements):
+            raise ValueError('场景必须至少有一条 main assertion requirement')
+        if self.cleanup_expected and not cleanup_assertions:
+            raise ValueError('cleanup_expected 必须声明 cleanup assertion requirement')
+        if not self.cleanup_expected and cleanup_assertions:
+            raise ValueError('仅 cleanup_expected 场景可以声明 cleanup assertion requirement')
+        if any(
+            item.kind in {'contains_ref', 'contains_literal'}
+            for item in cleanup_assertions
+        ):
+            raise ValueError('cleanup assertion 不能以仍包含目标值证明清理完成')
+        _validate_safe_value(self.model_dump(mode='json'), 'ScenarioPlan', reject_absolute_url=True)
         return self
 
     def input_sources(self) -> dict[str, str]:
-        """Return the explicit source for every execution variable in the plan."""
-        result: dict[str, str] = {}
-        for goal in self.goals:
-            for item in goal.input_refs:
-                existing = result.get(item.name)
-                if existing is not None and existing != item.source:
-                    raise GenerationContractError('input_ref_source_conflict')
-                result[item.name] = item.source
-        return result
+        return {item.name: item.source for item in self.input_refs}
 
 
-def parse_goal_plan_json(raw_text: str, *, format_repair: Callable[[str, str], str] | None = None) -> GoalPlan:
-    """Parse one model response, allowing one JSON-format-only repair."""
+def parse_scenario_plan_json(raw_text: str, *, format_repair: Callable[[str, str], str] | None = None) -> ScenarioPlan:
     candidate = str(raw_text or '')
     for attempt in range(2):
         try:
-            return GoalPlan.model_validate(json.loads(candidate))
+            return ScenarioPlan.model_validate(json.loads(candidate))
         except (ValueError, TypeError, ValidationError) as exc:
             diagnostics = _safe_diagnostics(exc) if isinstance(exc, ValidationError) else ()
             if attempt == 0 and format_repair is not None:
                 candidate = format_repair(candidate, str(exc))
                 continue
-            raise GenerationContractError('goal_plan_invalid', diagnostics=diagnostics) from exc
+            raise GenerationContractError('scenario_plan_invalid', diagnostics=diagnostics) from exc
     raise AssertionError('unreachable')
 
 

@@ -1,4 +1,4 @@
-"""Deterministic v3 generation preflight; this module never calls a model or browser."""
+"""Deterministic v4 generation preflight; this module never calls a model or browser."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from django.conf import settings
 
 from ai_core.models import LLMConfiguration, MCPConfiguration, ModelType
 
-from .generation_contracts import GoalPlan
+from .generation_contracts import ScenarioPlan
 
 _EXTRA_RISK_ACTION_RE = re.compile(
     r'(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
@@ -30,6 +30,7 @@ _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE = '@executeautomation/playwright-mcp-s
 _AITS_MCP_LOG_FILE_ENV = 'AITS_MCP_LOG_FILE'
 _AITS_MCP_SCREENSHOT_DIR_ENV = 'AITS_MCP_SCREENSHOT_DIR'
 _AITS_MCP_WORKING_DIR_ENV = 'AITS_MCP_WORKING_DIR'
+_AITS_MCP_DISABLE_FILE_LOG_ENV = 'AITS_MCP_DISABLE_FILE_LOG'
 
 
 def validate_generation_output_id(generation_id: str | None) -> str:
@@ -118,6 +119,7 @@ def prepare_playwright_mcp_output_config(
     generation_id: str | None,
     *,
     base_dir: str | None = None,
+    sensitive_runtime: bool = False,
 ) -> dict[str, Any]:
     """Derive an outputs-only runtime config for the pinned Playwright MCP server.
 
@@ -162,6 +164,10 @@ def prepare_playwright_mcp_output_config(
     env[_AITS_MCP_SCREENSHOT_DIR_ENV] = str(
         resolved_base_dir / 'temp' / 'playwright-mcp' / output_id / 'screenshots'
     )
+    # The upstream server logs complete CallTool request bodies. Credential
+    # values must therefore disable its file logger instead of relying on its
+    # incomplete field-name redaction.
+    env[_AITS_MCP_DISABLE_FILE_LOG_ENV] = '1' if sensitive_runtime else '0'
     if resolved_cwd is not None:
         env[_AITS_MCP_WORKING_DIR_ENV] = resolved_cwd
 
@@ -183,7 +189,7 @@ def exploration_requires_write_confirmation(description: str) -> bool:
     """Keep only a dedicated high-risk safety deny-list.
 
     This does not identify goals, browser writes, event coverage, or replay
-    evidence.  Normal interactions are governed exclusively by Goal metadata.
+    evidence. Normal interactions are governed exclusively by scenario policy.
     """
     for clause in re.split(r'[。！？!?.\n；;]+', str(description or '')):
         if _EXTRA_RISK_ACTION_RE.search(clause) and not _NEGATED_EXTRA_RISK_RE.search(clause):
@@ -274,7 +280,7 @@ def _has_environment_credentials(environment) -> bool:
     return environment_credentials(environment) is not None
 
 
-def run_safety_preflight(generation, plan: GoalPlan, *, credentials_available: bool) -> PreflightResult:
+def run_safety_preflight(generation, plan: ScenarioPlan, *, credentials_available: bool) -> PreflightResult:
     """Return a stable, user-actionable decision without starting MCP."""
     environment = generation.environment
     if not environment.is_active or not environment.is_web_environment or not (environment.config or {}).get('base_url'):
@@ -303,8 +309,14 @@ def run_safety_preflight(generation, plan: GoalPlan, *, credentials_available: b
             '本次探索包含审批、支付、发布或文件/外部消息操作，超出普通测试数据操作范围，请调整目标后继续。',
         )
     mcp_config_id, mcp_config = mcp_selection
-    discovery_count = len({*plan.discovery_notes, *plan.ambiguities})
-    warnings = ['探索会按测试目标实际操作页面；默认只修改本轮测试数据，并尝试清理。明确的禁止写入约束仍然有效。']
+    discovery_count = len(set(plan.discovery_notes))
+    if plan.allow_test_data_writes:
+        scope_message = '本场景仅授权处理本轮命名空间内的测试数据。'
+        if plan.cleanup_expected:
+            scope_message += '结束前必须执行清理并用后续页面观察确认。'
+    else:
+        scope_message = '本场景不授予测试数据写入权限。'
+    warnings = [scope_message]
     if discovery_count:
         warnings.append(f'将通过页面探索自动确认 {discovery_count} 项信息。')
     return PreflightResult(

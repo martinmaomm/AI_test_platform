@@ -32,12 +32,12 @@ const activeTab = ref('scenario')
 const paused = computed(() => isPausedGeneration(props.generation?.status))
 const statusLabel = computed(() => generationStatusLabel(props.generation?.status))
 const resolutionHint = computed(() => generationResolutionHint(props.generation))
-const hintType = computed(() => ['failed', 'needs_review', 'needs_confirmation', 'needs_credentials', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
+const hintType = computed(() => props.generation?.status === 'failed' ? 'error' : ['needs_review', 'needs_confirmation', 'needs_credentials', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
 const canSave = computed(() => ['ready', 'ready_with_warnings', 'needs_review'].includes(props.generation?.status))
 const canRetryGeneration = computed(() => props.generation?.status === 'failed' && [
   'MODEL_UNAVAILABLE', 'MODEL_RATE_LIMITED', 'MODEL_SERVICE_ERROR',
   'MODEL_GATEWAY_TIMEOUT', 'TRANSIENT_SERVICE_ERROR'
-  ].includes(props.generation?.error_code) && props.generation?.exploration_snapshot?.schema_version === 3)
+  ].includes(props.generation?.error_code) && props.generation?.exploration_snapshot?.schema_version === 4)
 const modelText = computed(() => modelInfoLabel(props.generation?.model_info))
 const toolStatsText = computed(() => { const stats = props.generation?.tool_stats || {}; return `调用 ${stats.total_tool_calls || 0} 次，失败 ${stats.failed_tool_calls || 0} 次${stats.duration_seconds ? `，耗时 ${stats.duration_seconds} 秒` : ''}` })
 const requestSave = async () => {

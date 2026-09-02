@@ -260,23 +260,33 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             )
         )
 
+    def _tool_output_failed(self, tool_name: str, output: Any) -> bool:
+        """Allow a scoped agent to apply tool-aware callback error semantics."""
+
+        del tool_name
+        return self._is_failed_output(output)
+
     @staticmethod
-    def _state_fingerprint(output: Any) -> str | None:
+    def _state_fingerprint(output: Any, *, failed: bool | None = None) -> str | None:
         """Keep an in-memory state marker without retaining page content."""
-        if MCPBrowserToolGuard._is_failed_output(output):
+        if failed is True or (
+            failed is None and MCPBrowserToolGuard._is_failed_output(output)
+        ):
             return None
         text = re.sub(r"\s+", " ", _guard_output_text(output).strip())
         if not text:
             return None
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
-    def _record_observed_state(self, tool_name: str, output: Any):
+    def _record_observed_state(self, tool_name: str, output: Any, *, failed: bool | None = None):
         # Only page observations establish progress.  Generic tool responses,
         # ToolMessage IDs, screenshots, and alternating HTML/text formats do
         # not demonstrate a changed page or modal state.
         if tool_name not in _PAGE_CHECK_TOOLS:
             return
-        fingerprint = self._state_fingerprint(output)
+        if failed is True:
+            return
+        fingerprint = self._state_fingerprint(output, failed=failed)
         if fingerprint is None:
             return
         previous = self._observed_page_state_fingerprints.get(tool_name)
@@ -334,8 +344,16 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                 tool_name=tool_name,
             )
 
-    def _record_page_check(self, tool_name: str, output: Any):
-        if tool_name not in _PAGE_CHECK_TOOLS or not self._is_meaningful_page_check(output):
+    def _record_page_check(self, tool_name: str, output: Any, *, failed: bool | None = None):
+        meaningful = (
+            self._is_meaningful_page_check(output)
+            if failed is None
+            else bool(_guard_output_text(output).strip()) and not failed
+        )
+        if (
+            tool_name not in _PAGE_CHECK_TOOLS
+            or not meaningful
+        ):
             return
         if self._is_login_page(output):
             self.login_page_detected = True
@@ -427,7 +445,7 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             if active_tool is None:
                 return
             tool_name = active_tool["tool_name"]
-            failed = self._is_failed_output(output)
+            failed = self._tool_output_failed(tool_name, output)
             if self._last_operation and self._last_operation["call_index"] == active_tool["call_index"]:
                 self._last_operation["status"] = "failed" if failed else "succeeded"
             if failed:
@@ -439,8 +457,8 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                     self._record_interaction_failure(tool_name)
                 else:
                     self.consecutive_interaction_failures = 0
-            self._record_observed_state(tool_name, output)
-            self._record_page_check(tool_name, output)
+            self._record_observed_state(tool_name, output, failed=failed)
+            self._record_page_check(tool_name, output, failed=failed)
 
     def on_tool_error(self, error: BaseException, *, run_id=None, parent_run_id=None, **kwargs):
         with self._lock:

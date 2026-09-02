@@ -22,8 +22,11 @@ const deferred = () => {
   return { promise, resolve }
 }
 
-async function harness(t, initial = record()) {
+async function harness(t, initial = record(), options = {}) {
   const storage = new Map()
+  if (options.storedGenerationId) {
+    storage.set('aits:webui-script-generation:v4:1:1', options.storedGenerationId)
+  }
   const timers = new Map()
   const oldWindow = globalThis.window
   let timerId = 0
@@ -58,9 +61,20 @@ async function harness(t, initial = record()) {
   const userId = ref(1)
   const state = scope.run(() => useWebUIScriptGeneration({ projectId, userId }))
   t.after(() => { state.stopPolling(); scope.stop(); globalThis.window = oldWindow })
-  await state.create({ description: 'offline test' })
+  if (options.create !== false) await state.create({ description: 'offline test' })
   return { state, projectId, userId, calls, handlers, storage, timers }
 }
+
+test('restore reads only the scoped v4 generation id from localStorage', async t => {
+  const { state, calls, storage } = await harness(t, record(), {
+    storedGenerationId: 'test-generation', create: false
+  })
+  await state.restore()
+  const reads = calls.filter(call => call.name === 'getWebUIScriptGeneration')
+  assert.equal(reads.at(-1).args[1], 'test-generation')
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.deepEqual([...storage.keys()], ['aits:webui-script-generation:v4:1:1'])
+})
 
 test('polling preserves unsaved local code when a server revision changes', async t => {
   const { state, handlers, storage } = await harness(t)

@@ -116,34 +116,33 @@ def workspace_for_generation(generation: WebUIScriptGeneration) -> dict[str, Any
     return normalize_workspace(generation.workspace, script=generation.script_draft)
 
 
-def variable_definitions_for_goal_plan(plan: Any) -> list[dict[str, Any]]:
-    """Build the editable variable table from explicit v3 InputSpec objects."""
+def variable_definitions_for_scenario_plan(plan: Any) -> list[dict[str, Any]]:
+    """Build the editable variable table from explicit v4 InputSpec objects."""
     definitions: dict[str, dict[str, Any]] = {}
-    for goal in getattr(plan, 'goals', ()):
-        for spec in getattr(goal, 'input_refs', ()):
-            name = validate_variable_name(getattr(spec, 'name', ''))
-            source = str(getattr(spec, 'source', ''))
-            credential_slot = str(getattr(spec, 'credential_slot', ''))
-            current = definitions.get(name)
-            if current is not None:
-                if current['_source'] != source:
-                    raise ValueError(f'变量 {name} 的来源定义冲突')
-                continue
-            descriptions = {
-                'generated': '脚本每次运行时自动生成唯一值；也可以在执行时覆盖。',
-                'runtime': '执行前必须提供的业务变量。',
-                'credential': '执行前必须提供的登录信息。',
-            }
-            if source not in descriptions:
-                raise ValueError(f'变量 {name} 的来源无效')
-            definitions[name] = {
-                'name': name,
-                'value': '',
-                'is_secret': source == 'credential' and credential_slot == 'password',
-                'required': source in {'runtime', 'credential'},
-                'description': descriptions[source],
-                '_source': source,
-            }
+    for spec in getattr(plan, 'input_refs', ()):
+        name = validate_variable_name(getattr(spec, 'name', ''))
+        source = str(getattr(spec, 'source', ''))
+        credential_slot = str(getattr(spec, 'credential_slot', ''))
+        current = definitions.get(name)
+        if current is not None:
+            if current['_source'] != source:
+                raise ValueError(f'变量 {name} 的来源定义冲突')
+            continue
+        descriptions = {
+            'generated': '脚本每次运行时自动生成唯一值；也可以在执行时覆盖。',
+            'runtime': '执行前必须提供的业务变量。',
+            'credential': '执行前必须提供的登录信息。',
+        }
+        if source not in descriptions:
+            raise ValueError(f'变量 {name} 的来源无效')
+        definitions[name] = {
+            'name': name,
+            'value': '',
+            'is_secret': source == 'credential' and credential_slot == 'password',
+            'required': source in {'runtime', 'credential'},
+            'description': descriptions[source],
+            '_source': source,
+        }
     return [
         {key: value for key, value in definitions[name].items() if key != '_source'}
         for name in sorted(definitions)

@@ -81,7 +81,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
 
 
 class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
-    """Validate a new v3 generation request without persisting secret values."""
+    """Validate a new v4 generation request without persisting secret values."""
 
     description = serializers.CharField(max_length=2000, trim_whitespace=True)
     environment_id = serializers.IntegerField(min_value=1)
@@ -217,7 +217,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
 
 
 class WebUIScriptGenerationSaveSerializer(serializers.Serializer):
-    """Optional user-visible title for saving a quality-approved v3 draft."""
+    """Optional user-visible title for saving a quality-approved v4 draft."""
 
     title = serializers.CharField(max_length=200, required=False, allow_blank=False, trim_whitespace=True)
     mode = serializers.ChoiceField(choices=['draft', 'verified'], required=False)

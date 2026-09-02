@@ -1,8 +1,8 @@
-"""v3 script generation is deterministic compilation, not locator generation."""
+"""v4 script generation is deterministic compilation, not locator generation."""
 
 from __future__ import annotations
 
-from .generation_contracts import GoalPlan
+from .generation_contracts import ScenarioPlan
 from .exploration_trace import ExplorationTrace
 from .replay_plan import PythonReplayCompiler, ReplayPlan, ReplayPlanner
 
@@ -20,6 +20,6 @@ class ScriptGenerator:
     def __init__(self, llm_model=None):
         self.llm_model = llm_model
 
-    def generate(self, *, plan: GoalPlan, trace: ExplorationTrace) -> tuple[str, ReplayPlan]:
+    def generate(self, *, plan: ScenarioPlan, trace: ExplorationTrace) -> tuple[str, ReplayPlan]:
         replay_plan = ReplayPlanner.build(plan, trace)
         return PythonReplayCompiler.compile(plan, trace, replay_plan), replay_plan

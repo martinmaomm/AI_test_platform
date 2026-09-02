@@ -85,10 +85,33 @@ class RequirementNormalizer:
         if not callable(with_structured_output):
             raise _StructuredOutputUnsupported('with_structured_output unavailable')
         try:
-            structured_model = with_structured_output(ScenarioPlan)
-            return structured_model.invoke(
+            structured_model = with_structured_output(ScenarioPlan, include_raw=True)
+            structured_output = structured_model.invoke(
                 messages, temperature=_LOW_RANDOMNESS_TEMPERATURE,
             )
+            if isinstance(structured_output, dict) and any(
+                key in structured_output
+                for key in ('raw', 'parsed', 'parsing_error')
+            ):
+                parsed_output = structured_output.get('parsed')
+                if parsed_output is not None:
+                    return parsed_output
+                raw_output = _extract_raw_output(structured_output.get('raw'))
+                if raw_output is not None:
+                    return raw_output
+                raise GenerationContractError(
+                    'model_output_invalid',
+                    diagnostics=({
+                        'path': '<structured_output>',
+                        'type': (
+                            'structured_parse_error'
+                            if structured_output.get('parsing_error') is not None
+                            else 'structured_output_empty'
+                        ),
+                        'stage': 'contract_parsing',
+                    },),
+                )
+            return structured_output
         except Exception as exc:
             if _is_transport_failure(exc):
                 raise
@@ -142,6 +165,21 @@ def _is_transport_failure(exc: Exception) -> bool:
     if isinstance(status_code, int) and (status_code == 429 or 500 <= status_code <= 599):
         return True
     return bool(re.search(r'\b(?:429|5\d{2}|timeout)\b|timed?\s*out|connection\s+(?:closed|error|reset)', str(exc), re.I))
+
+
+def _extract_raw_output(raw_output: Any) -> Any | None:
+    if raw_output is None:
+        return None
+    candidate = (
+        raw_output.get('content')
+        if isinstance(raw_output, dict) and 'content' in raw_output
+        else getattr(raw_output, 'content', raw_output)
+    )
+    if isinstance(candidate, str):
+        return candidate if candidate.strip() else None
+    if isinstance(candidate, (dict, list, tuple)):
+        return candidate if candidate else None
+    return candidate if isinstance(candidate, (int, float, bool)) else None
 
 
 def normalize_requirement(description_safe: str, *, model_config_id: int, test_case_context: dict[str, Any] | None = None) -> ScenarioPlan:

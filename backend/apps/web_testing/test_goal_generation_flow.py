@@ -186,7 +186,12 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
 
     def test_native_structured_output_uses_low_randomness_without_json_fallback(self):
         structured_model = Mock()
-        structured_model.invoke.return_value = plan_payload()
+        structured_plan = ScenarioPlan.model_validate(plan_payload())
+        structured_model.invoke.return_value = {
+            'parsed': structured_plan,
+            'raw': None,
+            'parsing_error': None,
+        }
         llm = Mock()
         llm.with_structured_output.return_value = structured_model
         manager = Mock()
@@ -196,8 +201,9 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         ):
             plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
         self.assertEqual(plan.schema_version, 4)
-        llm.with_structured_output.assert_called_once_with(ScenarioPlan)
+        llm.with_structured_output.assert_called_once_with(ScenarioPlan, include_raw=True)
         self.assertEqual(structured_model.invoke.call_args.kwargs['temperature'], 0)
+        self.assertNotIn('include_raw', structured_model.invoke.call_args.kwargs)
         manager.invoke.assert_not_called()
 
     def test_explicit_structured_output_capability_gap_falls_back_once_at_low_randomness(self):
@@ -287,13 +293,12 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         self.assertEqual(manager.invoke.call_args_list[1].kwargs['temperature'], 0)
 
     def test_structured_parser_failure_with_raw_output_uses_one_targeted_repair(self):
-        class ParserFailure(RuntimeError):
-            def __init__(self):
-                super().__init__('structured parser rejected response')
-                self.llm_output = json.dumps(plan_payload(schema_version=3), ensure_ascii=False)
-
         structured_model = Mock()
-        structured_model.invoke.side_effect = ParserFailure()
+        structured_model.invoke.return_value = {
+            'parsed': None,
+            'raw': Mock(content=json.dumps(plan_payload(schema_version=3), ensure_ascii=False)),
+            'parsing_error': RuntimeError('structured parser rejected response'),
+        }
         llm = Mock()
         llm.with_structured_output.return_value = structured_model
         manager = Mock()
@@ -308,6 +313,49 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         manager.invoke.assert_called_once()
         repair_request = json.loads(manager.invoke.call_args.args[0][1].content)
         self.assertEqual(repair_request['validation_diagnostics'][0]['path'], 'schema_version')
+
+    def test_structured_envelope_without_parse_error_still_uses_raw_content(self):
+        structured_model = Mock()
+        structured_model.invoke.return_value = {
+            'parsed': None,
+            'raw': Mock(content=json.dumps(plan_payload(), ensure_ascii=False)),
+            'parsing_error': None,
+        }
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        self.assertEqual(plan.schema_version, 4)
+        manager.invoke.assert_not_called()
+
+    def test_structured_output_parse_error_without_raw_output_is_model_output_invalid(self):
+        for raw_output in (None, Mock(content='   ')):
+            with self.subTest(raw_output=raw_output):
+                structured_model = Mock()
+                structured_model.invoke.return_value = {
+                    'parsed': None,
+                    'raw': raw_output,
+                    'parsing_error': RuntimeError('structured parser rejected response'),
+                }
+                llm = Mock()
+                llm.with_structured_output.return_value = structured_model
+                manager = Mock()
+                manager.current_llm = llm
+                with patch(
+                    'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+                ):
+                    with self.assertRaisesRegex(GenerationContractError, 'model_output_invalid') as captured:
+                        RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+                self.assertEqual(
+                    captured.exception.diagnostics[0]['type'],
+                    'structured_parse_error',
+                )
+                structured_model.invoke.assert_called_once()
+                manager.invoke.assert_not_called()
 
     def test_contract_diagnostics_exclude_input_values(self):
         with self.assertRaises(GenerationContractError) as captured:

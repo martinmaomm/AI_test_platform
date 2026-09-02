@@ -21,7 +21,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from ai_core.models import LLMConfiguration, ModelType
 from projects.models import Environment, Project
 
-from .exploration_trace import CHECKPOINT_TOOL_NAME, ExplorationTraceRecorder
+from .exploration_trace import ExplorationTraceRecorder, FinalizedAction, FinalizedAssertion
 from .generation_contracts import GenerationContractError, GenerationTransitionError, ScenarioPlan
 from .generation_events import publish_terminal
 from .generation_preflight import (
@@ -73,15 +73,6 @@ def plan_payload(*, cleanup: bool = False):
     }
 
 
-def mark(recorder, run_id: str, phase: str, intent: str, assertion_id: str = ''):
-    marker_id = f'{run_id}-marker'
-    recorder.on_tool_start(
-        {'name': CHECKPOINT_TOOL_NAME}, '', run_id=marker_id,
-        inputs={'phase': phase, 'intent': intent, 'assertion_id': assertion_id},
-    )
-    recorder.on_tool_end('checkpoint accepted', run_id=marker_id)
-
-
 def record(recorder, run_id: str, tool_name: str, inputs: dict, output):
     recorder.on_tool_start(
         {'name': tool_name}, '', run_id=run_id, inputs=inputs,
@@ -96,31 +87,36 @@ def replay_fixture(*, verify_cleanup: bool = True):
     recorder.configure_runtime(
         {'ITEM_NAME': 'runtime-item'}, plan.input_sources(),
     )
-    mark(recorder, 'navigate', 'main', 'replay')
     record(
         recorder, 'navigate', 'playwright_navigate',
         {'url': 'https://example.test/items'}, 'URL: https://example.test/items',
     )
-    mark(recorder, 'fill', 'main', 'replay')
     record(
         recorder, 'fill', 'playwright_fill',
         {'selector': '[name=password][data-item="runtime-item"]', 'value': 'runtime-item'},
         'filled',
     )
-    mark(recorder, 'assert-main', 'assertion', 'evidence', 'A1')
     record(
         recorder, 'assert-main', 'playwright_get_visible_html',
         {'selector': '#result'}, '<main>runtime-item</main>',
     )
-    mark(recorder, 'cleanup', 'cleanup', 'cleanup')
     record(
         recorder, 'cleanup', 'playwright_click', {'selector': '#cleanup'}, 'clicked',
     )
     if verify_cleanup:
-        mark(recorder, 'assert-cleanup', 'cleanup', 'evidence', 'A2')
         record(
             recorder, 'assert-cleanup', 'playwright_get_visible_html',
             {'selector': '#result'}, '<main>empty</main>',
+        )
+    if verify_cleanup:
+        recorder.candidate_summary()
+        recorder.finalize_path(
+            main_actions=[FinalizedAction(event_id='E000002', step_name='填写测试值')],
+            assertions=[
+                FinalizedAssertion(assertion_id='A1', event_id='E000003'),
+                FinalizedAssertion(assertion_id='A2', event_id='E000005'),
+            ],
+            cleanup_actions=[FinalizedAction(event_id='E000004', step_name='清理测试数据')],
         )
     return plan, recorder.build(tool_stats={'total_tool_calls': 5})
 
@@ -614,5 +610,6 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             result = _compile_persisted(generation, plan, trace)
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
-        self.assertEqual(result['quality_status'], 'needs_review')
-        self.assertEqual(generation.error_code, 'SCRIPT_QUALITY_BLOCKED')
+        self.assertEqual(result['quality_status'], 'blocked')
+        self.assertEqual(generation.error_code, 'FINALIZATION_REQUIRED')
+        self.assertEqual(generation.script_draft, '')

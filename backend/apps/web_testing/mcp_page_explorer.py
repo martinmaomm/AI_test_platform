@@ -10,13 +10,13 @@ import secrets
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from langchain_core.tools import StructuredTool
 from mcp_use import MCPClient
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ai_core.mcp_agent_budget import BudgetedMCPAgent as MCPAgent
 from ai_core.webui_playwright_agent import MCP_BROWSER_TOOL_CALL_LIMIT, MCP_MAX_STEPS, MCPBrowserToolGuard, _classify_mcp_error, _get_mcp_error_message
@@ -24,13 +24,15 @@ from ai_core.webui_playwright_agent import MCP_BROWSER_TOOL_CALL_LIMIT, MCP_MAX_
 from .exploration_policy import ExplorationPolicy
 from .exploration_timeout import exploration_total_timeout_seconds
 from .exploration_trace import (
-    CHECKPOINT_TOOL_NAME,
+    FINALIZATION_TOOL_NAME,
     ExplorationTrace,
     ExplorationTraceRecorder,
+    FinalizedAction,
+    FinalizedAssertion,
     _tool_failed,
     recoverable_locator_failure,
 )
-from .generation_contracts import ScenarioPlan
+from .generation_contracts import GenerationContractError, ScenarioPlan
 from .generation_preflight import prepare_playwright_mcp_output_config, validate_generation_output_id
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,8 @@ EXPLORER_CONSTRAINTS = f"""你负责在一个连续浏览器会话中完成完�
 只创建一次连续上下文：按 instructions 顺序登录、导航、操作、验证和清理；业务步骤之间不得回到 start_path，除非确认会话丢失。
 所有 playwright_navigate 调用必须传 JSON 布尔值 headless: true。浏览器工具最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。
 callback 轨迹是平台唯一事实来源；最终文本不提供事件、选择器、HTML 或脚本。
-平台提供 aits_record_checkpoint 本地工具。只有在“下一次 Playwright callback”属于最终主路径、机器断言或真实清理时才先调用 checkpoint；失败 callback 会消费该 checkpoint，重试前必须重新标记。未标记的探索、绕路和定位尝试只保留诊断，不会进入脚本。
-主路径动作使用 phase=main,intent=replay；主断言使用 phase=assertion,intent=evidence 并传 ScenarioPlan 已声明的 main assertion_id，随后用带 selector 的 playwright_get_visible_html/text 观察；清理动作使用 phase=cleanup,intent=cleanup，动作成功后还必须使用 phase=cleanup,intent=evidence 和 cleanup assertion_id 绑定后续页面观察。checkpoint 本身不证明 selector、动作、断言或清理成功。
+平台自动记录每个 Playwright callback；失败、绕路和不稳定定位只用于诊断，绝不可静默删除。接近结束时先调用 aits_get_path_candidates，读取安全候选摘要；随后只调用一次 aits_finalize_path 提交最终主动作、所有 assertion_id 对应的观察事件、可选清理动作及简短中文步骤名。平台自动将首次成功 playwright_navigate 作为入口，不要手工选择 navigate。最终定稿后不得再调用浏览器工具，否则定稿会失效且必须重新定稿。
+只选择成功、顺序递增且有稳定 locator 的真实 callback。fill/select 只有精确匹配 runtime_input_values 已声明 input ref 时才可选择；候选摘要标为 unmapped_input 的事件不可选择。每条 assertion requirement 都必须绑定成功的带 selector observation，且其安全观察摘要确实满足 visible/contains/not_contains 语义。清理动作必须在主场景后，清理验证必须在最后一个清理动作后。
 每次成功操作后观察页面；SPA 路由变化后优先用能返回页面状态/URL 的观察工具确认当前位置。结束前保留验证和清理页面证据。
 不允许审批、付款、发布、上传、下载或未授权外部操作。只在 allow_test_data_writes=true 时操作本轮 namespace 测试数据；结果未知时停止，不得重试。
 runtime_input_values 是平台提供的唯一输入值映射。仅在实际需要填充或选择时原样使用；不得猜测 ref、不得改写值、不得在最终文本中复述这些值。
@@ -57,54 +59,47 @@ _HIGH_RISK_MARKERS = ('审批', '付款', '支付', '发布', '上传', '下载'
 _RUNTIME_REF_TOKEN_RE = re.compile(r'[^a-zA-Z0-9_-]+')
 
 
-class ExplorationCheckpointInput(BaseModel):
+class FinalizationInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    phase: Literal['main', 'assertion', 'cleanup']
-    intent: Literal['replay', 'evidence', 'cleanup']
-    assertion_id: str = Field(default='', pattern=r'^(?:|A[1-9][0-9]*)$')
+    main_actions: list[FinalizedAction] = Field(default_factory=list, max_length=120)
+    assertions: list[FinalizedAssertion] = Field(default_factory=list, max_length=20)
+    cleanup_actions: list[FinalizedAction] = Field(default_factory=list, max_length=120)
 
-    @model_validator(mode='after')
-    def _valid_pair(self):
-        valid_pairs = {
-            ('main', 'replay'), ('assertion', 'evidence'),
-            ('cleanup', 'cleanup'), ('cleanup', 'evidence'),
-        }
-        if (self.phase, self.intent) not in valid_pairs:
-            raise ValueError('phase 与 intent 不匹配')
-        if (self.intent == 'evidence') != bool(self.assertion_id):
-            raise ValueError('evidence intent 必须且只能提供 assertion_id')
-        return self
+class CandidateSummaryInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
 
 
-def build_exploration_checkpoint_tool(plan: ScenarioPlan) -> StructuredTool:
-    requirements = {item.assertion_id: item for item in plan.assertion_requirements}
+def build_finalization_tools(recorder: ExplorationTraceRecorder) -> list[StructuredTool]:
+    def candidates() -> dict[str, Any]:
+        """Read a redacted, callback-owned candidate summary before finalizing."""
+        return recorder.candidate_summary()
 
-    def record_checkpoint(
-        phase: str, intent: str, assertion_id: str = '',
-    ) -> str:
-        """Mark how the next real Playwright callback may be used."""
+    def finalize_path(
+        main_actions: list[FinalizedAction],
+        assertions: list[FinalizedAssertion],
+        cleanup_actions: list[FinalizedAction],
+    ) -> dict[str, str]:
+        """Submit the one final callback-backed replay path for deterministic validation."""
+        try:
+            return recorder.finalize_path(
+                main_actions=main_actions, assertions=assertions, cleanup_actions=cleanup_actions,
+            )
+        except GenerationContractError as exc:
+            # A rejected proposal is actionable agent feedback, not an agent-run failure.
+            return {'status': 'rejected', 'error_code': str(exc)}
 
-        if assertion_id and assertion_id not in requirements:
-            raise ValueError('assertion_id is not declared by ScenarioPlan')
-        if phase == 'cleanup' and not plan.cleanup_expected:
-            raise ValueError('cleanup checkpoint requires cleanup_expected=true')
-        if assertion_id:
-            expected_phase = 'assertion' if requirements[assertion_id].phase == 'main' else 'cleanup'
-            if phase != expected_phase:
-                raise ValueError('assertion_id phase does not match ScenarioPlan')
-        return 'checkpoint accepted; it must bind the next Playwright callback'
-
-    return StructuredTool.from_function(
-        func=record_checkpoint,
-        name=CHECKPOINT_TOOL_NAME,
-        description=(
-            'Classify only the next real Playwright callback. Use main/replay for a required '
-            'final-path action, assertion/evidence with a declared assertion_id for a semantic '
-            'observation, cleanup/cleanup for a real cleanup action, or cleanup/evidence with a '
-            'declared cleanup assertion_id for the later cleanup verification. This marker is not evidence.'
+    return [
+        StructuredTool.from_function(
+            func=candidates, name='aits_get_path_candidates',
+            description='读取安全候选事件摘要；必须在最终路径定稿前调用。',
+            args_schema=CandidateSummaryInput,
         ),
-        args_schema=ExplorationCheckpointInput,
-    )
+        StructuredTool.from_function(
+            func=finalize_path, name=FINALIZATION_TOOL_NAME,
+            description='一次提交最终路径。入口 navigate 由平台自动加入，不要提交它。',
+            args_schema=FinalizationInput,
+        ),
+    ]
 
 
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
@@ -255,7 +250,7 @@ class MCPPageExplorer:
             await self._await_task(asyncio.create_task(agent.initialize()), deadline, start_path)
             await self._await_task(
                 asyncio.create_task(agent.register_local_tools([
-                    build_exploration_checkpoint_tool(plan),
+                    *build_finalization_tools(self.trace_recorder),
                 ])),
                 deadline,
                 start_path,
@@ -267,21 +262,14 @@ class MCPPageExplorer:
                 'current_relative_path': self.trace_recorder.start_path,
                 'runtime_input_values': runtime_values,
                 'scope_policy': self.policy.prompt_scope(),
-                'checkpoint_protocol': {
-                    'main_replay': {'phase': 'main', 'intent': 'replay'},
-                    'assertion_evidence': {
-                        'phase': 'assertion', 'intent': 'evidence',
-                        'assertion_id': 'use an id declared in scenario_plan.assertion_requirements',
-                    },
-                    'cleanup': {'phase': 'cleanup', 'intent': 'cleanup'},
-                    'cleanup_verification': {
-                        'phase': 'cleanup', 'intent': 'evidence',
-                        'assertion_id': 'use a cleanup-phase id declared in assertion_requirements',
-                    },
-                    'binding': 'exactly the next Playwright callback; failure consumes the marker',
-                    'unmarked_callbacks': 'diagnostic exploration only; never replayed',
+                'finalization_protocol': {
+                    'candidate_tool': 'aits_get_path_candidates',
+                    'finalization_tool': FINALIZATION_TOOL_NAME,
+                    'entry_navigation': 'the platform automatically adds the first successful navigate callback',
+                    'input_rule': 'only callback-mapped runtime_input_values may be selected for fill/select',
+                    'staleness': 'any browser callback after finalization invalidates it',
                 },
-                'instruction': '一次连续完成完整场景；先观察，按自然业务状态前进。最终文本只简要说明完成或停止原因，不承担任何契约。',
+                'instruction': '一次连续完成完整场景；先观察，按自然业务状态前进。结束前读取候选摘要并完成一次最终路径定稿。最终文本只简要说明完成或停止原因，不承担任何契约。',
             }, ensure_ascii=False)
             with suppress_mcp_raw_query_logs():
                 await self._await_task(asyncio.create_task(agent.run(prompt, manage_connector=False)), deadline, start_path)

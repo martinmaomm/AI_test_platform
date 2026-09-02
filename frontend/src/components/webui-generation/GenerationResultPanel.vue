@@ -33,7 +33,13 @@ const paused = computed(() => isPausedGeneration(props.generation?.status))
 const statusLabel = computed(() => generationStatusLabel(props.generation?.status))
 const resolutionHint = computed(() => generationResolutionHint(props.generation))
 const hintType = computed(() => props.generation?.status === 'failed' ? 'error' : ['needs_review', 'needs_confirmation', 'needs_credentials', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
-const canSave = computed(() => ['ready', 'ready_with_warnings', 'needs_review'].includes(props.generation?.status))
+const canSave = computed(() => {
+  const blockers = props.generation?.quality_report?.blockers || []
+  return ['ready', 'ready_with_warnings'].includes(props.generation?.status)
+    && Boolean(props.generation?.script_draft?.trim())
+    && props.generation?.exploration_snapshot?.finalization?.status === 'valid'
+    && !blockers.length
+})
 const canRetryGeneration = computed(() => props.generation?.status === 'failed' && [
   'MODEL_UNAVAILABLE', 'MODEL_RATE_LIMITED', 'MODEL_SERVICE_ERROR',
   'MODEL_GATEWAY_TIMEOUT', 'TRANSIENT_SERVICE_ERROR'

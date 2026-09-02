@@ -3,7 +3,7 @@
 export const GENERATION_STAGES = [
   ['normalizing', '理解测试目标'],
   ['exploring', '连续探索页面'],
-  ['planning', '整理可回放路径'],
+  ['planning', '最终路径定稿'],
   ['generating', '生成 Python'],
   ['validating', '检查脚本'],
   ['completed', '完成']
@@ -26,7 +26,7 @@ const STATUS_LABELS = {
   normalizing: '正在理解测试场景',
   preflighting: '正在确认目标范围与登录条件',
   exploring: '正在连续探索页面',
-  generating: '正在整理回放路径并生成 Python',
+  generating: '正在完成最终路径定稿并生成 Python',
   validating: '正在检查脚本',
   repairing: '正在自动修复脚本',
   needs_input: '需要补充场景信息',
@@ -223,8 +223,11 @@ export const generationResolutionHint = (generation) => {
   if (status === 'needs_confirmation') return '请确认本次测试目标范围。平台会在一个连续会话中自行探索页面元素；额外高风险操作仍需单独调整目标。'
   if (status === 'needs_credentials') return '请在“本轮测试登录信息”中填写临时账号和密码后重新发起。'
   if (status === 'needs_review') {
+    if (String(generation?.error_code || '').startsWith('FINALIZATION')) {
+      return `${generation?.error_message || '最终路径定稿未完成或已失效。'} 已保留探索轨迹；没有脚本草稿，也不能保存。请重新发起任务并让智能体完成最终路径定稿。`
+    }
     const incomplete = generation?.error_code === 'EXPLORATION_EVIDENCE_INCOMPLETE'
-    return `${generation?.error_message ? `${generation.error_message} ` : ''}${incomplete ? '这不是系统失败：连续探索证据不完整，但草稿和页面证据已保留。' : '本次结果需要人工处理。'} 请确认清理失败或残留数据后再决定是否新建任务。`
+    return `${generation?.error_message ? `${generation.error_message} ` : ''}${incomplete ? '这不是系统失败：连续探索证据不完整，页面证据已保留，未生成草稿。' : '本次结果需要人工处理。'} 请确认清理失败或残留数据后再决定是否新建任务。`
   }
   if (status === 'failed' || status === 'cancelled') {
     const message = status === 'failed'

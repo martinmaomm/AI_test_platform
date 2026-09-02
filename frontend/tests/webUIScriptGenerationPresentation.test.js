@@ -25,7 +25,7 @@ test('v4 storage state is isolated from old generation state', () => {
 
 test('timeline presents one continuous exploration before replay and script checks', () => {
   const timeline = buildGenerationTimeline({ current_stage: 'exploring', status: 'exploring' })
-  assert.deepEqual(timeline.map(item => item.label), ['理解测试目标', '连续探索页面', '整理可回放路径', '生成 Python', '检查脚本', '完成'])
+  assert.deepEqual(timeline.map(item => item.label), ['理解测试目标', '连续探索页面', '最终路径定稿', '生成 Python', '检查脚本', '完成'])
   assert.equal(timeline[1].state, 'process')
 })
 
@@ -35,7 +35,7 @@ test('incomplete exploration is not presented as a system failure', () => {
     error_message: '探索未完整结束，但证据已保留。'
   })
   assert.match(hint, /不是系统失败/)
-  assert.match(hint, /草稿和页面证据已保留/)
+  assert.match(hint, /页面证据已保留，未生成草稿/)
 })
 
 test('cleanup presentation remains conservative for v4 traces', () => {

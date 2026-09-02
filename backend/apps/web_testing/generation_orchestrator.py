@@ -48,16 +48,37 @@ def _terminal_cancel(generation_id: str, task_id: str | None) -> bool:
 
 
 def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, trace: ExplorationTrace) -> dict[str, Any]:
-    script, replay_plan = ScriptGenerator().generate(plan=plan, trace=trace)
     generation = transition_generation(
         generation.pk, WebUIScriptGeneration.Status.VALIDATING, progress=85,
         updates={'exploration_snapshot': trace.model_dump(mode='json'), 'tool_stats': trace.tool_stats},
     )
     publish_stage_changed(generation, '检查脚本')
+    evidence_gaps = required_replay_evidence_gaps(trace, plan)
+    if evidence_gaps:
+        workspace = workspace_for_generation(generation)
+        workspace['variables'] = variable_definitions_for_scenario_plan(plan)
+        code = trace.finalization.error_code or 'FINALIZATION_REQUIRED'
+        completed = transition_generation(
+            generation.pk, WebUIScriptGeneration.Status.NEEDS_REVIEW, progress=100,
+            error_code=code,
+            error_message='最终路径定稿缺失或无效，已保留探索轨迹但未生成脚本草稿。',
+            updates={
+                'exploration_snapshot': trace.model_dump(mode='json'), 'script_draft': '',
+                'workspace': workspace,
+                'quality_report': {'status': 'blocked', 'blockers': [{
+                    'level': 'blocker', 'code': code,
+                    'message': '最终路径定稿、入口或断言证据未满足，不能生成脚本。',
+                }], 'warnings': [], 'replay_plan': {}},
+                'tool_stats': trace.tool_stats,
+                'warnings': [f"{item['event_id']}：{item['reason']}" for item in evidence_gaps],
+            },
+        )
+        publish_terminal(completed)
+        return {'generation_id': str(completed.pk), 'status': completed.status, 'quality_status': 'blocked', 'error_code': completed.error_code}
+    script, replay_plan = ScriptGenerator().generate(plan=plan, trace=trace)
     report = evaluate_script(script, plan=plan, trace=trace, replay_plan=replay_plan)
     blockers = blocker_issues(report)
-    evidence_gaps = required_replay_evidence_gaps(trace, plan)
-    incomplete = bool(evidence_gaps or not replay_plan.actions)
+    incomplete = not replay_plan.actions
     if blockers:
         status, error_code, error_message = (
             WebUIScriptGeneration.Status.NEEDS_REVIEW, 'SCRIPT_QUALITY_BLOCKED', '回放计划或脚本质量门禁未通过。',
@@ -65,7 +86,7 @@ def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, tr
     elif incomplete:
         status, error_code, error_message = (
             WebUIScriptGeneration.Status.NEEDS_REVIEW, 'EXPLORATION_EVIDENCE_INCOMPLETE',
-            '探索未完整结束，但已保留连续页面证据和可检查脚本草稿。',
+            '探索证据不完整，未生成脚本草稿。',
         )
     else:
         status = WebUIScriptGeneration.Status.READY_WITH_WARNINGS if report['warnings'] else WebUIScriptGeneration.Status.READY
@@ -77,7 +98,7 @@ def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, tr
     completed = transition_generation(
         generation.pk, status, progress=100, error_code=error_code, error_message=error_message,
         updates={
-            'exploration_snapshot': trace.model_dump(mode='json'), 'script_draft': script, 'workspace': workspace,
+            'exploration_snapshot': trace.model_dump(mode='json'), 'script_draft': '' if incomplete else script, 'workspace': workspace,
             'quality_report': {**report, 'replay_plan': replay_plan.model_dump(mode='json')},
             'tool_stats': trace.tool_stats, 'warnings': list(dict.fromkeys(warnings)),
         },

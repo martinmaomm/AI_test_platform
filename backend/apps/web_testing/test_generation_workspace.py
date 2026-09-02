@@ -57,7 +57,7 @@ class GenerationWorkspaceTests(TestCase):
             'project': self.project, 'user': self.user, 'environment': self.environment,
             'status': WebUIScriptGeneration.Status.NEEDS_REVIEW,
             'description_safe': 'Check users.', 'script_draft': VALID_SCRIPT,
-            'scenario_spec': {}, 'exploration_snapshot': {},
+            'scenario_spec': {}, 'exploration_snapshot': {'finalization': {'status': 'valid'}},
         }
         values.update(overrides)
         return WebUIScriptGeneration.objects.create(**values)

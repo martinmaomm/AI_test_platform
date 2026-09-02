@@ -545,6 +545,17 @@ class WebUIScriptGenerationSaveView(APIView):
                     WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
                 }:
                     return Response({'success': False, 'message': '当前脚本尚未通过质量检查，不能保存。'}, status=status.HTTP_409_CONFLICT)
+                finalization = (generation.exploration_snapshot or {}).get('finalization', {})
+                quality_blockers = (generation.quality_report or {}).get('blockers', [])
+                if (
+                    not (generation.script_draft or '').strip()
+                    or finalization.get('status') != 'valid'
+                    or quality_blockers
+                ):
+                    return Response(
+                        {'success': False, 'message': '最终路径定稿无效、存在阻断项或没有脚本草稿，不能保存。'},
+                        status=status.HTTP_409_CONFLICT,
+                    )
                 normalized_script = normalize_for_storage(generation.script_draft)
                 verification = workspace['verification']
                 if requested_mode == 'verified' and not (

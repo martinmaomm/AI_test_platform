@@ -16,7 +16,7 @@ from .generation_contracts import AssertionRequirement, GenerationContractError,
 from .generation_security import redact_text
 
 TRACE_SCHEMA_VERSION = 4
-CHECKPOINT_TOOL_NAME = 'aits_record_checkpoint'
+FINALIZATION_TOOL_NAME = 'aits_finalize_path'
 _MAX_EVENTS = 120
 _MAX_EXCERPT = 1200
 _SECRET_KEY_RE = re.compile(r'(?i)(password|passwd|token|secret|cookie|authorization|api[_-]?key)')
@@ -335,15 +335,6 @@ class ExplorationEvent(BaseModel):
         pattern=r'^(?:navigate|observe|screenshot|click|fill|select|press|check|uncheck|hover)$'
     )
     status: str = Field(pattern=r'^(?:succeeded|failed|blocked)$')
-    phase: str = Field(default='exploration', pattern=r'^(?:exploration|main|assertion|cleanup)$')
-    intent: str = Field(default='probe', pattern=r'^(?:probe|replay|evidence|cleanup)$')
-    checkpoint_id: str = Field(default='', pattern=r'^(?:|M[0-9]{6})$')
-    assertion_id: str = Field(default='', pattern=r'^(?:|A[1-9][0-9]*)$')
-    assertion_kind: str = Field(
-        default='',
-        pattern=r'^(?:|visible|contains_ref|not_contains_ref|contains_literal|not_contains_literal)$',
-    )
-    assertion_status: str = Field(default='', pattern=r'^(?:|satisfied|not_satisfied)$')
     relative_path: str = Field(pattern=r'^/')
     locator_input: dict[str, Any] = Field(default_factory=dict)
     input_refs: list[str] = Field(default_factory=list)
@@ -353,18 +344,6 @@ class ExplorationEvent(BaseModel):
     after_state_id: str = ''
     result_excerpt: str = Field(default='', max_length=_MAX_EXCERPT)
     screenshot_path: str = Field(default='', max_length=500)
-
-
-class CheckpointMarker(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    checkpoint_id: str = Field(pattern=r'^M[0-9]{6}$')
-    phase: str = Field(pattern=r'^(?:main|assertion|cleanup)$')
-    intent: str = Field(pattern=r'^(?:replay|evidence|cleanup)$')
-    assertion_id: str = Field(default='', pattern=r'^(?:|A[1-9][0-9]*)$')
-    bound_event_id: str = Field(default='', pattern=r'^(?:|E[0-9]{6})$')
-    binding_status: str = Field(
-        default='pending', pattern=r'^(?:pending|succeeded|failed|blocked|invalid|unbound)$',
-    )
 
 
 class AssertionEvidence(BaseModel):
@@ -378,6 +357,52 @@ class AssertionEvidence(BaseModel):
     )
     input_ref: str = Field(default='', max_length=128)
     literal: str = Field(default='', max_length=300)
+
+
+class FinalizedAction(BaseModel):
+    """An agent-selected replay action with a safe, human-readable label."""
+
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    event_id: str = Field(pattern=r'^E[0-9]{6}$')
+    step_name: str = Field(min_length=1, max_length=80)
+
+    @field_validator('step_name')
+    @classmethod
+    def _safe_step_name(cls, value: str) -> str:
+        from .generation_contracts import _validate_safe_value
+        _validate_safe_value(value, 'step_name', reject_absolute_url=True)
+        return value
+
+
+class FinalizedAssertion(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    assertion_id: str = Field(pattern=r'^A[1-9][0-9]*$')
+    event_id: str = Field(pattern=r'^E[0-9]{6}$')
+
+
+class PathFinalization(BaseModel):
+    """The one-shot, callback-backed final path decision for a trace."""
+
+    model_config = ConfigDict(extra='forbid')
+    status: str = Field(default='missing', pattern=r'^(?:missing|valid|invalid)$')
+    entry_event_id: str = Field(default='', pattern=r'^(?:|E[0-9]{6})$')
+    main_actions: list[FinalizedAction] = Field(default_factory=list, max_length=_MAX_EVENTS)
+    assertions: list[FinalizedAssertion] = Field(default_factory=list, max_length=20)
+    cleanup_actions: list[FinalizedAction] = Field(default_factory=list, max_length=_MAX_EVENTS)
+    invalidation_event_id: str = Field(default='', pattern=r'^(?:|E[0-9]{6})$')
+    error_code: str = Field(default='', max_length=80)
+    message: str = Field(default='', max_length=500)
+
+    @model_validator(mode='after')
+    def _consistent_state(self):
+        if self.status == 'valid' and (self.invalidation_event_id or self.error_code):
+            raise ValueError('有效最终路径不能包含失效信息')
+        if self.status == 'missing' and any((
+            self.entry_event_id, self.main_actions, self.assertions, self.cleanup_actions,
+            self.invalidation_event_id, self.error_code, self.message,
+        )):
+            raise ValueError('缺失最终路径不能保留选择结果')
+        return self
 
 
 class LocatorEvidence(BaseModel):
@@ -399,7 +424,6 @@ class ExplorationTrace(BaseModel):
     schema_version: int = Field(default=TRACE_SCHEMA_VERSION, frozen=True)
     start_path: str = Field(pattern=r'^/')
     events: list[ExplorationEvent] = Field(default_factory=list, max_length=_MAX_EVENTS)
-    checkpoints: list[CheckpointMarker] = Field(default_factory=list, max_length=_MAX_EVENTS)
     assertion_evidence: list[AssertionEvidence] = Field(default_factory=list, max_length=20)
     page_states: list[PageState] = Field(default_factory=list, max_length=_MAX_EVENTS)
     locator_evidence: list[LocatorEvidence] = Field(default_factory=list, max_length=_MAX_EVENTS)
@@ -407,6 +431,7 @@ class ExplorationTrace(BaseModel):
     cleanup_event_ids: list[str] = Field(default_factory=list, max_length=_MAX_EVENTS)
     cleanup_verification_event_ids: list[str] = Field(default_factory=list, max_length=20)
     assertion_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    finalization: PathFinalization = Field(default_factory=PathFinalization)
     cleanup: dict[str, Any] = Field(default_factory=dict)
     tool_stats: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list, max_length=50)
@@ -425,41 +450,27 @@ class ExplorationTrace(BaseModel):
         events = {event.event_id: event for event in self.events}
         if len(events) != len(self.events) or len({event.sequence for event in self.events}) != len(self.events):
             raise ValueError('callback event_id 和 sequence 必须唯一')
-        checkpoints = {item.checkpoint_id: item for item in self.checkpoints}
-        if len(checkpoints) != len(self.checkpoints):
-            raise ValueError('checkpoint_id 必须唯一')
         selected = {
             *self.replay_event_ids, *self.cleanup_event_ids,
             *self.cleanup_verification_event_ids, *self.assertion_event_ids,
         }
         if not selected <= set(events):
             raise ValueError('replay/cleanup/assertion event 必须来自 callback')
-        for event_id in selected:
-            event = events[event_id]
-            checkpoint = checkpoints.get(event.checkpoint_id)
-            if (
-                checkpoint is None
-                or checkpoint.bound_event_id != event_id
-                or checkpoint.binding_status != 'succeeded'
-                or checkpoint.phase != event.phase
-                or checkpoint.intent != event.intent
-                or checkpoint.assertion_id != event.assertion_id
-            ):
-                raise ValueError('选中 event 必须由匹配的成功 checkpoint 绑定')
-        if any(
-            events[event_id].status != 'succeeded'
-            or events[event_id].phase != 'main'
-            or events[event_id].intent != 'replay'
-            for event_id in self.replay_event_ids
-        ):
-            raise ValueError('主回放事件必须是 checkpoint 绑定的成功 callback')
-        if any(
-            events[event_id].status != 'succeeded'
-            or events[event_id].phase != 'cleanup'
-            or events[event_id].intent != 'cleanup'
-            for event_id in self.cleanup_event_ids
-        ):
-            raise ValueError('清理事件必须是 checkpoint 绑定的成功 callback')
+        if self.finalization.status != 'valid' and selected:
+            raise ValueError('没有有效最终路径时不能选择回放或断言事件')
+        if self.finalization.status == 'valid':
+            selected_actions = [
+                self.finalization.entry_event_id,
+                *(item.event_id for item in self.finalization.main_actions),
+            ]
+            if self.replay_event_ids != selected_actions:
+                raise ValueError('replay_event_ids 必须仅来自成功最终路径定稿')
+            if self.cleanup_event_ids != [item.event_id for item in self.finalization.cleanup_actions]:
+                raise ValueError('cleanup_event_ids 必须仅来自成功最终路径定稿')
+            if self.assertion_event_ids != [item.event_id for item in self.finalization.assertions]:
+                raise ValueError('assertion_event_ids 必须仅来自成功最终路径定稿')
+        if any(events[event_id].status != 'succeeded' for event_id in selected):
+            raise ValueError('最终路径只能选择成功 callback')
         evidence_event_ids = [item.event_id for item in self.assertion_evidence]
         if len({item.assertion_id for item in self.assertion_evidence}) != len(
             self.assertion_evidence
@@ -474,29 +485,16 @@ class ExplorationTrace(BaseModel):
             raise ValueError('cleanup verification 必须精确对应 cleanup assertion evidence')
         if any(
             events[event_id].status != 'succeeded'
-            or events[event_id].phase != 'cleanup'
-            or events[event_id].intent != 'evidence'
+            or events[event_id].action != 'observe'
             for event_id in self.cleanup_verification_event_ids
         ):
             raise ValueError('cleanup verification 必须来自成功页面观察 callback')
         if any(
             events[item.event_id].status != 'succeeded'
             or events[item.event_id].action != 'observe'
-            or events[item.event_id].intent != 'evidence'
-            or events[item.event_id].assertion_status != 'satisfied'
-            or (
-                item.phase == 'main'
-                and events[item.event_id].phase != 'assertion'
-            )
-            or (
-                item.phase == 'cleanup'
-                and events[item.event_id].phase != 'cleanup'
-            )
             for item in self.assertion_evidence
         ):
-            raise ValueError('assertion evidence 必须来自显式绑定且语义满足的 observation callback')
-        if any(item.bound_event_id and item.bound_event_id not in events for item in self.checkpoints):
-            raise ValueError('checkpoint 只能绑定真实 callback event')
+            raise ValueError('assertion evidence 必须来自满足语义的成功 observation callback')
         if any(
             event_ids != sorted(event_ids, key=lambda event_id: events[event_id].sequence)
             for event_ids in (
@@ -507,10 +505,9 @@ class ExplorationTrace(BaseModel):
             )
         ):
             raise ValueError('选中的 callback event 必须保持真实 sequence 顺序')
-        first_cleanup_sequence = min((
-            event.sequence for event in self.events
-            if event.phase == 'cleanup' and event.checkpoint_id
-        ), default=0)
+        first_cleanup_sequence = min(
+            (events[event_id].sequence for event_id in self.cleanup_event_ids), default=0,
+        )
         if any(
             item.phase == 'main' and (
                 first_cleanup_sequence
@@ -573,11 +570,7 @@ class ExplorationTrace(BaseModel):
             or status not in {'not_required', 'missing'}
         ):
             raise ValueError('没有成功 cleanup 动作时不能声明 cleanup 验证或完成')
-        attempted = any(
-            event.phase == 'cleanup' and event.intent == 'cleanup'
-            and event.action in _INTERACTION_ACTIONS
-            for event in self.events
-        )
+        attempted = bool(self.cleanup_event_ids)
         if self.cleanup.get('attempted') != attempted:
             raise ValueError('cleanup attempted 必须对应真实 callback 尝试')
         return self
@@ -626,12 +619,9 @@ def _evidence_locator(
 
 
 def build_locator_evidence(trace: ExplorationTrace) -> ExplorationTrace:
-    selected = {
-        *trace.replay_event_ids, *trace.cleanup_event_ids, *trace.assertion_event_ids,
-    }
     evidence: list[LocatorEvidence] = []
     for event in trace.events:
-        if event.event_id not in selected or event.status != 'succeeded':
+        if event.status != 'succeeded':
             continue
         item = _evidence_locator(event)
         if item is None:
@@ -650,31 +640,6 @@ def build_locator_evidence(trace: ExplorationTrace) -> ExplorationTrace:
     return trace.model_copy(update={'locator_evidence': evidence})
 
 
-def select_replay_events(
-    events: list[ExplorationEvent], assertion_evidence: list[AssertionEvidence],
-) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
-    replay = [
-        event.event_id for event in events
-        if event.status == 'succeeded' and event.phase == 'main'
-        and event.intent == 'replay' and event.action in _REPLAY_ACTIONS
-    ]
-    cleanup = [
-        event.event_id for event in events
-        if event.status == 'succeeded' and event.phase == 'cleanup'
-        and event.intent == 'cleanup' and event.action in _INTERACTION_ACTIONS
-    ]
-    assertions = [item.event_id for item in assertion_evidence]
-    cleanup_verifications = [
-        item.event_id for item in assertion_evidence if item.phase == 'cleanup'
-    ]
-    warnings: list[str] = []
-    if not replay:
-        warnings.append('连续探索未取得显式主场景回放动作；未标记的探索动作仅保留诊断。')
-    if not assertions:
-        warnings.append('未取得满足机器语义的 callback 断言证据；生成草稿不会伪装为已验证。')
-    return replay, cleanup, cleanup_verifications, assertions, warnings
-
-
 class ExplorationTraceRecorder:
     def __init__(
         self,
@@ -689,19 +654,17 @@ class ExplorationTraceRecorder:
         self._trace_file = Path(trace_file).resolve() if trace_file else None
         self._runtime_namespace = runtime_namespace
         self._events: list[ExplorationEvent] = []
-        self._checkpoints: list[CheckpointMarker] = []
-        self._assertion_evidence: list[AssertionEvidence] = []
         self._states: list[PageState] = []
         self._active: dict[Any, dict[str, Any]] = {}
-        self._active_checkpoint_calls: dict[Any, dict[str, Any]] = {}
         self._next_sequence = 1
-        self._next_checkpoint_sequence = 1
-        self._pending_checkpoint_id = ''
         self._runtime_values: dict[str, str] = {}
         self._runtime_sources: dict[str, str] = {}
+        self._plan_input_sources: dict[str, str] = {}
         self._credential_refs: frozenset[str] = frozenset()
         self._assertion_requirements: dict[str, AssertionRequirement] = {}
         self._cleanup_expected = False
+        self._finalization = PathFinalization()
+        self._candidate_summary_sequence: int | None = None
         self._warnings: list[str] = []
         self._last_location = self.start_path
         self._last_state_id = ''
@@ -717,6 +680,7 @@ class ExplorationTraceRecorder:
         self._assertion_requirements = {
             item.assertion_id: item for item in plan.assertion_requirements
         }
+        self._plan_input_sources = plan.input_sources()
         self._cleanup_expected = plan.cleanup_expected
 
     def configure_runtime(
@@ -732,53 +696,196 @@ class ExplorationTraceRecorder:
             key for key, source in self._runtime_sources.items() if source == 'credential'
         )
 
-    def _checkpoint(self, checkpoint_id: str) -> CheckpointMarker | None:
-        return next(
-            (item for item in self._checkpoints if item.checkpoint_id == checkpoint_id), None,
-        )
-
-    def _update_checkpoint(self, checkpoint_id: str, **updates: Any) -> None:
-        for index, item in enumerate(self._checkpoints):
-            if item.checkpoint_id == checkpoint_id:
-                self._checkpoints[index] = item.model_copy(update=updates)
-                return
-
-    def _record_checkpoint(self, inputs: Mapping[str, Any]) -> None:
-        phase = str(inputs.get('phase') or '')
-        intent = str(inputs.get('intent') or '')
-        assertion_id = str(inputs.get('assertion_id') or '')
-        valid_pairs = {
-            ('main', 'replay'), ('assertion', 'evidence'),
-            ('cleanup', 'cleanup'), ('cleanup', 'evidence'),
+    def candidate_summary(self) -> dict[str, Any]:
+        """Return only redacted callback facts that the same agent may finalize."""
+        self._candidate_summary_sequence = self._events[-1].sequence if self._events else 0
+        candidates = []
+        for event in self._events:
+            locator = _evidence_locator(event)
+            compilable = bool(
+                event.status == 'succeeded'
+                and event.action in _REPLAY_ACTIONS
+                and locator is not None
+                and locator[3] not in {'fragile', 'rejected'}
+                and not (
+                    event.action in {'fill', 'select'}
+                    and (len(event.input_refs) != 1 or not event.input_source)
+                )
+                and not (
+                    event.action == 'press'
+                    and not str(event.action_arguments.get('key') or '').strip()
+                )
+            )
+            candidates.append({
+                'event_id': event.event_id,
+                'sequence': event.sequence,
+                'action': event.action,
+                'status': event.status,
+                'relative_path': event.relative_path,
+                'locator': event.locator_input,
+                'input_refs': event.input_refs,
+                'input_source': event.input_source,
+                'observation_summary': event.result_excerpt if event.action == 'observe' else '',
+                'compilable': compilable,
+                'unmapped_input': event.action in {'fill', 'select'} and not compilable,
+            })
+        entry = next((item.event_id for item in self._events if item.action == 'navigate' and item.status == 'succeeded'), '')
+        return {
+            'entry_event_id': entry,
+            'candidate_sequence': self._candidate_summary_sequence,
+            'events': candidates,
+            'finalization_status': self._finalization.status,
+            'finalization_error_code': self._finalization.error_code,
         }
-        valid = (phase, intent) in valid_pairs
-        valid = valid and ((intent == 'evidence') == bool(assertion_id))
-        valid = valid and (not assertion_id or assertion_id in self._assertion_requirements)
-        valid = valid and (phase != 'cleanup' or self._cleanup_expected)
-        if assertion_id in self._assertion_requirements:
-            required_phase = self._assertion_requirements[assertion_id].phase
-            valid = valid and (
-                (phase == 'assertion' and required_phase == 'main')
-                or (phase == 'cleanup' and required_phase == 'cleanup')
+
+    def _require_action(self, event_id: str, *, cleanup: bool) -> ExplorationEvent:
+        event = next((item for item in self._events if item.event_id == event_id), None)
+        if event is None:
+            raise GenerationContractError('FINALIZATION_UNKNOWN_EVENT')
+        if event.status != 'succeeded' or event.action not in _INTERACTION_ACTIONS:
+            raise GenerationContractError('FINALIZATION_ACTION_NOT_SUCCESSFUL')
+        locator = _evidence_locator(event)
+        if locator is None or locator[3] in {'fragile', 'rejected'}:
+            raise GenerationContractError('FINALIZATION_ACTION_LOCATOR_UNSTABLE')
+        if event.action in {'fill', 'select'} and (
+            len(event.input_refs) != 1
+            or event.input_source not in {'generated', 'runtime', 'credential'}
+            or self._runtime_sources.get(event.input_refs[0]) != event.input_source
+        ):
+            raise GenerationContractError('FINALIZATION_INPUT_REF_UNMAPPED')
+        if event.action == 'press' and not str(event.action_arguments.get('key') or '').strip():
+            raise GenerationContractError('FINALIZATION_PRESS_KEY_MISSING')
+        return event
+
+    def _assertion_matches(self, requirement: AssertionRequirement, event: ExplorationEvent) -> bool:
+        if event.status != 'succeeded' or event.action != 'observe' or _evidence_locator(event) is None:
+            return False
+        text = event.result_excerpt
+        if not text:
+            return False
+        if requirement.kind == 'visible':
+            return True
+        if requirement.kind in {'contains_literal', 'not_contains_literal'}:
+            contains = requirement.literal in text
+        else:
+            value = self._runtime_values.get(requirement.input_ref, '')
+            if not value:
+                return False
+            marker = '<runtime_sensitive_data>' if requirement.input_ref in self._credential_refs else f'{{{{{requirement.input_ref}}}}}'
+            contains = marker in text
+        return contains if requirement.kind.startswith('contains_') else not contains
+
+    def finalize_path(
+        self,
+        *,
+        main_actions: list[FinalizedAction],
+        assertions: list[FinalizedAssertion],
+        cleanup_actions: list[FinalizedAction],
+    ) -> dict[str, str]:
+        """Validate a one-shot selection against callback-owned facts only."""
+        try:
+            latest_sequence = self._events[-1].sequence if self._events else 0
+            if self._candidate_summary_sequence is None:
+                raise GenerationContractError('FINALIZATION_CANDIDATES_REQUIRED')
+            if self._candidate_summary_sequence != latest_sequence:
+                raise GenerationContractError('FINALIZATION_CANDIDATES_STALE')
+            entry = next((item for item in self._events if item.action == 'navigate' and item.status == 'succeeded'), None)
+            if entry is None:
+                raise GenerationContractError('FINALIZATION_ENTRY_NAVIGATE_MISSING')
+            selected = [*(item.event_id for item in main_actions), *(item.event_id for item in cleanup_actions)]
+            if len(selected) != len(set(selected)):
+                raise GenerationContractError('FINALIZATION_DUPLICATE_EVENT')
+            if any(item.event_id == entry.event_id for item in [*main_actions, *cleanup_actions]):
+                raise GenerationContractError('FINALIZATION_ENTRY_NAVIGATE_AUTOMATIC')
+            main_events = [self._require_action(item.event_id, cleanup=False) for item in main_actions]
+            cleanup_events = [self._require_action(item.event_id, cleanup=True) for item in cleanup_actions]
+            if any(item.sequence <= entry.sequence for item in main_events):
+                raise GenerationContractError('FINALIZATION_MAIN_BEFORE_ENTRY')
+            if [item.sequence for item in main_events] != sorted(item.sequence for item in main_events):
+                raise GenerationContractError('FINALIZATION_MAIN_SEQUENCE_INVALID')
+            if [item.sequence for item in cleanup_events] != sorted(item.sequence for item in cleanup_events):
+                raise GenerationContractError('FINALIZATION_CLEANUP_SEQUENCE_INVALID')
+            if cleanup_events and main_events and cleanup_events[0].sequence <= main_events[-1].sequence:
+                raise GenerationContractError('FINALIZATION_CLEANUP_ORDER_INVALID')
+            selected_actions = [*main_events, *cleanup_events]
+            main_input_refs = {
+                event.input_refs[0]
+                for event in main_events
+                if event.action in {'fill', 'select'} and len(event.input_refs) == 1
+            }
+            required_input_refs = {
+                ref for ref, source in self._plan_input_sources.items()
+                if source in {'generated', 'credential'}
+            }
+            if not required_input_refs <= main_input_refs:
+                raise GenerationContractError('FINALIZATION_NON_RUNTIME_INPUT_MISSING')
+            required_ids = set(self._assertion_requirements)
+            submitted_ids = [item.assertion_id for item in assertions]
+            if set(submitted_ids) != required_ids or len(submitted_ids) != len(set(submitted_ids)):
+                raise GenerationContractError('FINALIZATION_ASSERTION_COVERAGE_INVALID')
+            assertion_evidence: list[AssertionEvidence] = []
+            for selection in assertions:
+                requirement = self._assertion_requirements[selection.assertion_id]
+                event = next((item for item in self._events if item.event_id == selection.event_id), None)
+                if event is None:
+                    raise GenerationContractError('FINALIZATION_UNKNOWN_EVENT')
+                if not self._assertion_matches(requirement, event):
+                    raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+                if requirement.phase == 'main' and event.sequence <= entry.sequence:
+                    raise GenerationContractError('FINALIZATION_ASSERTION_ORDER_INVALID')
+                if requirement.phase == 'cleanup':
+                    if not cleanup_events or event.sequence <= cleanup_events[-1].sequence:
+                        raise GenerationContractError('FINALIZATION_CLEANUP_VERIFICATION_INVALID')
+                if requirement.input_ref and not any(
+                    action.sequence < event.sequence
+                    and action.action in {'fill', 'select'}
+                    and action.input_refs == [requirement.input_ref]
+                    for action in selected_actions
+                ):
+                    raise GenerationContractError('FINALIZATION_ASSERTION_INPUT_DEPENDENCY_MISSING')
+                assertion_evidence.append(AssertionEvidence(
+                    assertion_id=requirement.assertion_id,
+                    criterion_index=requirement.criterion_index,
+                    phase=requirement.phase, event_id=event.event_id,
+                    kind=requirement.kind, input_ref=requirement.input_ref,
+                    literal=requirement.literal,
+                ))
+            if [next(event.sequence for event in self._events if event.event_id == item.event_id) for item in assertion_evidence] != sorted(
+                next(event.sequence for event in self._events if event.event_id == item.event_id) for item in assertion_evidence
+            ):
+                raise GenerationContractError('FINALIZATION_ASSERTION_SEQUENCE_INVALID')
+            if any(
+                item.phase == 'main' and cleanup_events and next(
+                    event.sequence for event in self._events if event.event_id == item.event_id
+                ) >= cleanup_events[0].sequence
+                for item in assertion_evidence
+            ):
+                raise GenerationContractError('FINALIZATION_ASSERTION_ORDER_INVALID')
+            if self._cleanup_expected and not cleanup_events:
+                raise GenerationContractError('FINALIZATION_CLEANUP_MISSING')
+            self._finalization = PathFinalization(
+                status='valid', entry_event_id=entry.event_id, main_actions=main_actions,
+                assertions=assertions, cleanup_actions=cleanup_actions,
             )
-        checkpoint_id = f'M{self._next_checkpoint_sequence:06d}'
-        self._next_checkpoint_sequence += 1
-        if self._pending_checkpoint_id:
-            self._update_checkpoint(self._pending_checkpoint_id, binding_status='unbound')
-            self._warnings.append(
-                f'{self._pending_checkpoint_id} 未绑定 Playwright callback，已被后续 checkpoint 替代。'
+            return {'status': 'accepted', 'entry_event_id': entry.event_id}
+        except GenerationContractError as exc:
+            self._finalization = PathFinalization(
+                status='invalid', error_code=str(exc), message='最终路径定稿被拒绝，请读取候选摘要后修正。',
             )
-        marker = CheckpointMarker(
-            checkpoint_id=checkpoint_id,
-            phase=phase if phase in {'main', 'assertion', 'cleanup'} else 'main',
-            intent=intent if intent in {'replay', 'evidence', 'cleanup'} else 'replay',
-            assertion_id=assertion_id if re.fullmatch(r'A[1-9][0-9]*', assertion_id) else '',
-            binding_status='pending' if valid else 'invalid',
-        )
-        self._checkpoints.append(marker)
-        self._pending_checkpoint_id = checkpoint_id if valid else ''
-        if not valid:
-            self._warnings.append(f'{checkpoint_id} checkpoint 参数或 assertion_id 无效，未绑定事件。')
+            raise
+
+    def _finalized_assertion_evidence(self) -> list[AssertionEvidence]:
+        evidence: list[AssertionEvidence] = []
+        for selection in self._finalization.assertions:
+            requirement = self._assertion_requirements[selection.assertion_id]
+            evidence.append(AssertionEvidence(
+                assertion_id=requirement.assertion_id, criterion_index=requirement.criterion_index,
+                phase=requirement.phase, event_id=selection.event_id, kind=requirement.kind,
+                input_ref=requirement.input_ref, literal=requirement.literal,
+            ))
+        return sorted(evidence, key=lambda item: next(
+            event.sequence for event in self._events if event.event_id == item.event_id
+        ))
 
     def on_tool_start(
         self,
@@ -790,18 +897,11 @@ class ExplorationTraceRecorder:
     ) -> None:
         name = str((serialized or {}).get('name') or 'browser_tool').lower()
         parsed_inputs = _as_mapping(inputs, input_str)
-        if name == CHECKPOINT_TOOL_NAME:
-            self._active_checkpoint_calls[run_id] = parsed_inputs
-            return
         if not name.startswith('playwright_') and name != 'browser_console_logs':
             return
         sequence = self._next_sequence
         self._next_sequence += 1
         event_id = f'E{sequence:06d}'
-        checkpoint = self._checkpoint(self._pending_checkpoint_id)
-        if checkpoint is not None:
-            self._pending_checkpoint_id = ''
-            self._update_checkpoint(checkpoint.checkpoint_id, bound_event_id=event_id)
         self._active[run_id] = {
             'sequence': sequence,
             'event_id': event_id,
@@ -810,10 +910,6 @@ class ExplorationTraceRecorder:
             'before_state_id': self._last_state_id,
             'runtime_values': dict(self._runtime_values),
             'input_sources': dict(self._runtime_sources),
-            'checkpoint_id': checkpoint.checkpoint_id if checkpoint else '',
-            'phase': checkpoint.phase if checkpoint else 'exploration',
-            'intent': checkpoint.intent if checkpoint else 'probe',
-            'assertion_id': checkpoint.assertion_id if checkpoint else '',
         }
 
     def _assertion_satisfied(
@@ -834,11 +930,6 @@ class ExplorationTraceRecorder:
         return contains if requirement.kind == 'contains_ref' else not contains
 
     def _complete(self, output: Any, *, run_id: Any, status: str) -> None:
-        if run_id in self._active_checkpoint_calls:
-            inputs = self._active_checkpoint_calls.pop(run_id)
-            if status == 'succeeded':
-                self._record_checkpoint(inputs)
-            return
         active = self._active.pop(run_id, None)
         if active is None or len(self._events) >= _MAX_EVENTS:
             return
@@ -891,12 +982,7 @@ class ExplorationTraceRecorder:
         }
         event = ExplorationEvent(
             event_id=event_id, sequence=sequence, tool_name=tool_name, action=action,
-            status=status, phase=active['phase'], intent=active['intent'],
-            checkpoint_id=active['checkpoint_id'], assertion_id=active['assertion_id'],
-            assertion_kind=(
-                self._assertion_requirements[active['assertion_id']].kind
-                if active['assertion_id'] in self._assertion_requirements else ''
-            ),
+            status=status,
             relative_path=path or '/',
             locator_input=_locator_input(
                 inputs, action, runtime_values, self._credential_refs,
@@ -909,59 +995,13 @@ class ExplorationTraceRecorder:
             result_excerpt=excerpt,
             screenshot_path=screenshot_path,
         )
-        binding_status = status
-        if status == 'succeeded' and event.checkpoint_id:
-            if event.phase == 'main':
-                valid_binding = event.intent == 'replay' and event.action in _REPLAY_ACTIONS
-            elif event.phase == 'cleanup' and event.intent == 'cleanup':
-                valid_binding = (
-                    event.intent == 'cleanup' and event.action in _INTERACTION_ACTIONS
-                )
-            else:
-                requirement = self._assertion_requirements.get(event.assertion_id)
-                requirement_phase_matches = bool(
-                    requirement
-                    and (
-                        (event.phase == 'assertion' and requirement.phase == 'main')
-                        or (event.phase == 'cleanup' and requirement.phase == 'cleanup')
-                    )
-                )
-                valid_binding = bool(
-                    event.intent == 'evidence'
-                    and event.action == 'observe'
-                    and requirement_phase_matches
-                    and _evidence_locator(event)
-                    and self._assertion_satisfied(requirement, raw_output, runtime_values)
-                )
-                event = event.model_copy(update={
-                    'assertion_status': 'satisfied' if valid_binding else 'not_satisfied',
-                })
-                if valid_binding and requirement is not None:
-                    self._assertion_evidence = [
-                        item for item in self._assertion_evidence
-                        if item.assertion_id != requirement.assertion_id
-                    ]
-                    self._assertion_evidence.append(AssertionEvidence(
-                        assertion_id=requirement.assertion_id,
-                        criterion_index=requirement.criterion_index,
-                        phase=requirement.phase,
-                        event_id=event.event_id,
-                        kind=requirement.kind,
-                        input_ref=requirement.input_ref,
-                        literal=requirement.literal,
-                    ))
-                    self._assertion_evidence.sort(key=lambda item: item.criterion_index)
-            if not valid_binding:
-                binding_status = 'invalid'
-                self._warnings.append(
-                    f'{event.checkpoint_id} 后续成功 callback 与声明 phase/intent/断言语义不匹配。'
-                )
-        if event.checkpoint_id:
-            self._update_checkpoint(
-                event.checkpoint_id, bound_event_id=event.event_id,
-                binding_status=binding_status,
-            )
         self._events.append(event)
+        if self._finalization.status == 'valid':
+            self._finalization = self._finalization.model_copy(update={
+                'status': 'invalid', 'invalidation_event_id': event.event_id,
+                'error_code': 'FINALIZATION_STALE',
+                'message': '最终路径定稿后新增了浏览器 callback，必须重新定稿。',
+            })
         if status == 'succeeded' and (callback_path or input_path):
             self._last_location = path or self._last_location
         if self._trace_file:
@@ -992,73 +1032,19 @@ class ExplorationTraceRecorder:
         termination_reason: str = '',
         warnings: list[str] | None = None,
     ) -> ExplorationTrace:
-        if self._pending_checkpoint_id:
-            self._update_checkpoint(self._pending_checkpoint_id, binding_status='unbound')
-            self._warnings.append(
-                f'{self._pending_checkpoint_id} 未绑定 Playwright callback，不能作为证据。'
-            )
-            self._pending_checkpoint_id = ''
-        replay, cleanup_ids, cleanup_verifications, assertions, selected_warnings = select_replay_events(
-            self._events, self._assertion_evidence,
-        )
-        attempted_cleanup = any(
-            item.phase == 'cleanup' and item.intent == 'cleanup'
-            and item.action in _INTERACTION_ACTIONS
-            for item in self._events
-        )
         events_by_id = {item.event_id: item for item in self._events}
-        first_cleanup_sequence = min((
-            item.sequence for item in self._events
-            if item.phase == 'cleanup' and item.checkpoint_id
-        ), default=0)
-        first_cleanup_action_sequence = min(
-            (events_by_id[event_id].sequence for event_id in cleanup_ids), default=0,
-        )
-        last_cleanup_sequence = max(
-            (events_by_id[event_id].sequence for event_id in cleanup_ids), default=0,
-        )
-        confirmed_cleanup_verifications = [
-            event_id for event_id in cleanup_verifications
-            if cleanup_ids
-            and events_by_id[event_id].sequence > first_cleanup_action_sequence
-        ] if cleanup_ids else []
-        confirmed_main_evidence = [
-            item for item in self._assertion_evidence
-            if item.phase == 'main'
-            and (
-                not first_cleanup_sequence
-                or events_by_id[item.event_id].sequence < first_cleanup_sequence
-            )
-        ]
-        effective_assertion_evidence = [
-            *confirmed_main_evidence,
-            *(
-                item for item in self._assertion_evidence
-                if item.event_id in confirmed_cleanup_verifications
-            ),
-        ]
-        effective_assertion_evidence.sort(
-            key=lambda item: events_by_id[item.event_id].sequence,
-        )
-        assertions = [item.event_id for item in effective_assertion_evidence]
-        if any(
-            item.phase == 'main' and item not in confirmed_main_evidence
-            for item in self._assertion_evidence
-        ):
-            selected_warnings.append(
-                'main assertion 发生在 cleanup 开始之后，已从主场景回放排除。'
-            )
-        if len(cleanup_verifications) != len(confirmed_cleanup_verifications):
-            selected_warnings.append(
-                'cleanup verification 前没有成功 cleanup 动作，不能作为清理证据。'
-            )
-        final_cleanup_verified = bool(
-            cleanup_ids
-            and any(
-                events_by_id[event_id].sequence > last_cleanup_sequence
-                for event_id in confirmed_cleanup_verifications
-            )
-        )
+        valid = self._finalization.status == 'valid'
+        replay = ([self._finalization.entry_event_id] + [
+            item.event_id for item in self._finalization.main_actions
+        ]) if valid else []
+        cleanup_ids = [item.event_id for item in self._finalization.cleanup_actions] if valid else []
+        assertion_evidence = self._finalized_assertion_evidence() if valid else []
+        assertions = [item.event_id for item in assertion_evidence]
+        cleanup_verifications = [item.event_id for item in assertion_evidence if item.phase == 'cleanup']
+        last_cleanup_sequence = max((events_by_id[event_id].sequence for event_id in cleanup_ids), default=0)
+        final_cleanup_verified = bool(cleanup_ids and any(
+            events_by_id[event_id].sequence > last_cleanup_sequence for event_id in cleanup_verifications
+        ))
         cleanup_summary = {
             'status': (
                 'completed' if self._cleanup_expected and cleanup_ids and final_cleanup_verified
@@ -1066,9 +1052,9 @@ class ExplorationTraceRecorder:
                 else 'missing' if self._cleanup_expected
                 else 'not_required'
             ),
-            'attempted': attempted_cleanup,
+            'attempted': bool(cleanup_ids),
             'evidence_event_ids': cleanup_ids,
-            'verification_event_ids': confirmed_cleanup_verifications,
+            'verification_event_ids': cleanup_verifications,
             'residuals': [],
             'reason': (
                 '' if not self._cleanup_expected or (cleanup_ids and final_cleanup_verified)
@@ -1080,17 +1066,17 @@ class ExplorationTraceRecorder:
         trace = ExplorationTrace(
             start_path=self.start_path,
             events=self._events,
-            checkpoints=self._checkpoints,
-            assertion_evidence=effective_assertion_evidence,
+            assertion_evidence=assertion_evidence,
             page_states=self._states,
             replay_event_ids=replay,
             cleanup_event_ids=cleanup_ids,
-            cleanup_verification_event_ids=confirmed_cleanup_verifications,
+            cleanup_verification_event_ids=cleanup_verifications,
             assertion_event_ids=assertions,
+            finalization=self._finalization,
             cleanup=cleanup_summary,
             tool_stats=dict(tool_stats),
             warnings=list(dict.fromkeys([
-                *(warnings or []), *self._warnings, *selected_warnings,
+                *(warnings or []), *self._warnings,
             ])),
             termination_reason=termination_reason,
             last_location=self._last_location,
@@ -1104,6 +1090,13 @@ def required_replay_evidence_gaps(
     evidence = {item.event_id: item for item in trace.locator_evidence}
     events = {item.event_id: item for item in trace.events}
     gaps: list[dict[str, str]] = []
+    if trace.finalization.status != 'valid':
+        gaps.append({
+            'event_id': 'finalization',
+            'reason': trace.finalization.error_code or '缺少有效最终路径定稿',
+        })
+    if not trace.finalization.entry_event_id:
+        gaps.append({'event_id': 'entry-navigate', 'reason': '缺少成功入口 navigate callback'})
     for event_id in [*trace.replay_event_ids, *trace.cleanup_event_ids]:
         event = events.get(event_id)
         item = evidence.get(event_id)

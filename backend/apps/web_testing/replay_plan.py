@@ -26,6 +26,7 @@ class ReplayAction(BaseModel):
     input_refs: list[str] = Field(default_factory=list)
     input_source: str = Field(default='', pattern=r'^(?:|generated|runtime|credential)$')
     action_arguments: dict[str, Any] = Field(default_factory=dict)
+    step_name: str = Field(default='', max_length=80)
 
 
 class ReplayAssertion(BaseModel):
@@ -42,6 +43,7 @@ class ReplayAssertion(BaseModel):
     )
     input_ref: str = ''
     literal: str = ''
+    criterion: str = Field(default='', max_length=500)
 
 
 ReplayStep = Annotated[
@@ -120,8 +122,7 @@ class ReplayPlanner:
         event_id: str,
         plan: ScenarioPlan,
         trace: ExplorationTrace,
-        warnings: list[str],
-    ) -> ReplayAction | None:
+    ) -> ReplayAction:
         events = {event.event_id: event for event in trace.events}
         evidence = {item.event_id: item for item in trace.locator_evidence}
         event = events.get(event_id)
@@ -129,8 +130,7 @@ class ReplayPlanner:
         if event is None or event.status != 'succeeded':
             raise GenerationContractError('replay_plan_event_not_callback_success')
         if item is None or item.validation in {'fragile', 'rejected'}:
-            warnings.append(f'{event_id} 缺少稳定定位器证据，已从可执行回放中排除。')
-            return None
+            raise GenerationContractError('replay_plan_selected_action_locator_invalid')
         owned_values = (item.value, item.kwargs, event.action_arguments)
         if any(_has_sensitive_placeholder(value) for value in owned_values):
             raise GenerationContractError('replay_plan_sensitive_locator_value')
@@ -143,24 +143,27 @@ class ReplayPlanner:
             if len(event.input_refs) != 1 or event.input_source not in {
                 'generated', 'runtime', 'credential',
             }:
-                warnings.append(
-                    f'{event_id} 的输入值没有精确变量映射，已从可执行回放中排除。'
-                )
-                return None
+                raise GenerationContractError('replay_plan_selected_action_input_mapping_invalid')
             if plan.input_sources().get(event.input_refs[0]) != event.input_source:
                 raise GenerationContractError('replay_plan_input_source_mismatch')
-        if event.action == 'press' and not isinstance(event.action_arguments.get('key'), str):
-            warnings.append(f'{event_id} 缺少按键参数，已从可执行回放中排除。')
-            return None
+        if event.action == 'press' and not str(event.action_arguments.get('key') or '').strip():
+            raise GenerationContractError('replay_plan_selected_press_key_missing')
         return ReplayAction(
             sequence=event.sequence,
             event_id=event_id,
             evidence_id=item.evidence_id,
             action=event.action,
-            relative_path=event.relative_path,
+            # The first successful navigate proves entry; the executor owns base_url
+            # and always replays the configured relative start path.
+            relative_path=trace.start_path if event.action == 'navigate' else event.relative_path,
             input_refs=event.input_refs,
             input_source=event.input_source,
             action_arguments=event.action_arguments,
+            step_name=next((
+                item.step_name for item in [
+                    *trace.finalization.main_actions, *trace.finalization.cleanup_actions,
+                ] if item.event_id == event_id
+            ), '进入起始页面' if event.action == 'navigate' else ''),
         )
 
     @staticmethod
@@ -169,8 +172,7 @@ class ReplayPlanner:
         assertion: AssertionEvidence,
         plan: ScenarioPlan,
         trace: ExplorationTrace,
-        warnings: list[str],
-    ) -> ReplayAssertion | None:
+    ) -> ReplayAssertion:
         requirements = {item.assertion_id: item for item in plan.assertion_requirements}
         requirement = requirements.get(assertion.assertion_id)
         if requirement is None or any((
@@ -185,13 +187,10 @@ class ReplayPlanner:
         evidence = {item.event_id: item for item in trace.locator_evidence}
         event = events.get(assertion.event_id)
         item = evidence.get(assertion.event_id)
-        if not event or event.status != 'succeeded' or event.assertion_status != 'satisfied':
+        if not event or event.status != 'succeeded' or event.action != 'observe':
             raise GenerationContractError('assertion_event_not_callback_success')
         if item is None or item.validation in {'fragile', 'rejected'}:
-            warnings.append(
-                f'{assertion.assertion_id} 缺少稳定定位器证据，无法编译该 success criterion。'
-            )
-            return None
+            raise GenerationContractError('replay_plan_selected_assertion_locator_invalid')
         if _has_sensitive_placeholder(item.value) or _has_sensitive_placeholder(item.kwargs):
             raise GenerationContractError('replay_plan_sensitive_assertion_locator')
         refs = _template_refs(item.value) | _template_refs(item.kwargs)
@@ -207,32 +206,27 @@ class ReplayPlanner:
             kind=assertion.kind,
             input_ref=assertion.input_ref,
             literal=assertion.literal,
+            criterion=plan.success_criteria[assertion.criterion_index],
         )
 
     @staticmethod
     def build(plan: ScenarioPlan, trace: ExplorationTrace) -> ReplayPlan:
         warnings = list(trace.warnings)
         actions = [
-            item for event_id in trace.replay_event_ids
-            if (item := ReplayPlanner._action(
-                event_id=event_id, plan=plan, trace=trace, warnings=warnings,
-            )) is not None
+            ReplayPlanner._action(event_id=event_id, plan=plan, trace=trace)
+            for event_id in trace.replay_event_ids
         ]
         cleanup_actions = [
-            item for event_id in trace.cleanup_event_ids
-            if (item := ReplayPlanner._action(
-                event_id=event_id, plan=plan, trace=trace, warnings=warnings,
-            )) is not None
+            ReplayPlanner._action(event_id=event_id, plan=plan, trace=trace)
+            for event_id in trace.cleanup_event_ids
         ]
         events = {event.event_id: event for event in trace.events}
         compiled_assertions = [
-            item for assertion in sorted(
+            ReplayPlanner._assertion(assertion=assertion, plan=plan, trace=trace)
+            for assertion in sorted(
                 trace.assertion_evidence,
                 key=lambda value: events[value.event_id].sequence,
             )
-            if (item := ReplayPlanner._assertion(
-                assertion=assertion, plan=plan, trace=trace, warnings=warnings,
-            )) is not None
         ]
         assertions = [item for item in compiled_assertions if item.phase == 'main']
         cleanup_assertions = [item for item in compiled_assertions if item.phase == 'cleanup']
@@ -283,7 +277,7 @@ class PythonReplayCompiler:
         lines = [
             json.dumps(
                 f'场景：{plan.title}\n目标：{plan.objective}\n'
-                '生成方式：动作、定位器、断言和清理仅来自显式归属的成功 callback。',
+                '生成方式：动作、定位器、断言和清理仅来自成功最终路径定稿的 callback。',
                 ensure_ascii=False,
             ),
             '',
@@ -409,7 +403,7 @@ class PythonReplayCompiler:
     ) -> list[str]:
         marker = f'[{action.event_id}]'
         lines = [
-            f'{indent}# {label} {number}：{marker} 仅回放真实成功 callback 的 {action.action}',
+                f'{indent}# {label} {number}：{marker} {action.step_name or action.action}',
         ]
         if action.action == 'navigate':
             lines.append(f'{indent}await page.goto({action.relative_path!r})')
@@ -452,7 +446,7 @@ class PythonReplayCompiler:
         marker = f'[{assertion.assertion_id}/{assertion.event_id}]'
         locator = PythonReplayCompiler._locator(item)
         lines = [
-            f'{indent}# {label} {number}：{marker} 按成功 callback 的 {assertion.kind} 语义验证',
+            f'{indent}# {label} {number}：{marker} {assertion.criterion or assertion.kind}',
         ]
         if assertion.kind == 'visible':
             lines.append(f'{indent}await expect({locator}).to_be_visible()')

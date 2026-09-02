@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 from django.test import SimpleTestCase
 
 from .exploration_policy import ExplorationPolicy
-from .exploration_trace import CHECKPOINT_TOOL_NAME, ExplorationTraceRecorder
+from .exploration_trace import ExplorationTraceRecorder, FinalizedAction, FinalizedAssertion
 from .generation_contracts import (
     GenerationContractError,
     ScenarioInputInsufficientError,
@@ -44,14 +44,6 @@ def plan_payload(**overrides):
     }
     value.update(overrides)
     return value
-
-
-def marker(recorder, run_id: str, phase: str, intent: str, assertion_id: str = ''):
-    recorder.on_tool_start(
-        {'name': CHECKPOINT_TOOL_NAME}, '', run_id=f'{run_id}-marker',
-        inputs={'phase': phase, 'intent': intent, 'assertion_id': assertion_id},
-    )
-    recorder.on_tool_end('checkpoint accepted', run_id=f'{run_id}-marker')
 
 
 def event(recorder, run_id: str, tool_name: str, inputs: dict, output):
@@ -379,7 +371,6 @@ class TraceSecurityAndReplayRegressionTests(SimpleTestCase):
         plan = ScenarioPlan.model_validate(plan_payload())
         recorder = ExplorationTraceRecorder('/')
         recorder.configure_plan(plan)
-        marker(recorder, 'observe', 'assertion', 'evidence', 'A1')
         event(
             recorder, 'observe', 'playwright_get_visible_html',
             {'text': 'Target', 'exact': False}, '<div>Target</div>',
@@ -390,7 +381,6 @@ class TraceSecurityAndReplayRegressionTests(SimpleTestCase):
 
         long_recorder = ExplorationTraceRecorder('/')
         long_recorder.configure_plan(plan)
-        marker(long_recorder, 'long', 'main', 'replay')
         event(
             long_recorder, 'long', 'playwright_click',
             {'selector': '#' + ('x' * 301)}, 'clicked',
@@ -401,15 +391,23 @@ class TraceSecurityAndReplayRegressionTests(SimpleTestCase):
         plan = ScenarioPlan.model_validate(plan_payload())
         recorder = ExplorationTraceRecorder('/')
         recorder.configure_plan(plan)
-        marker(recorder, 'press', 'main', 'replay')
+        event(
+            recorder, 'navigate', 'playwright_navigate',
+            {'url': 'https://example.test/'}, 'ok',
+        )
         event(
             recorder, 'press', 'playwright_press_key',
             {'selector': '[aria-label="query"]', 'key': 'Enter'}, 'pressed',
         )
-        marker(recorder, 'assert', 'assertion', 'evidence', 'A1')
         event(
             recorder, 'assert', 'playwright_get_visible_html',
             {'selector': '#result'}, '<main>visible</main>',
+        )
+        recorder.candidate_summary()
+        recorder.finalize_path(
+            main_actions=[FinalizedAction(event_id='E000002', step_name='提交查询')],
+            assertions=[FinalizedAssertion(assertion_id='A1', event_id='E000003')],
+            cleanup_actions=[],
         )
         trace = recorder.build(tool_stats={})
         replay = ReplayPlanner.build(plan, trace)

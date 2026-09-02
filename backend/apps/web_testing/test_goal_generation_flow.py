@@ -14,7 +14,12 @@ from django.test import SimpleTestCase
 
 from .exploration_policy import ExplorationPolicy
 from .exploration_trace import CHECKPOINT_TOOL_NAME, ExplorationTraceRecorder
-from .generation_contracts import ScenarioInputInsufficientError, ScenarioPlan
+from .generation_contracts import (
+    GenerationContractError,
+    ScenarioInputInsufficientError,
+    ScenarioPlan,
+    parse_scenario_plan_json,
+)
 from .generation_workspace import variable_definitions_for_scenario_plan
 from .mcp_page_explorer import ReadOnlyMCPBrowserToolGuard
 from .replay_plan import PythonReplayCompiler, ReplayPlanner
@@ -119,6 +124,7 @@ class ScenarioContractRegressionTests(SimpleTestCase):
 class RequirementNormalizerRegressionTests(SimpleTestCase):
     def _normalize(self, description: str, payload: dict):
         manager = Mock()
+        manager.current_llm = None
         manager.invoke.return_value = json.dumps(payload, ensure_ascii=False)
         with patch(
             'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
@@ -185,6 +191,150 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         self.assertEqual(plan.assertion_requirements[0].literal, 'READY')
         with self.assertRaises(Exception):
             self._normalize('确认页面显示完成状态。', literal_payload)
+
+    def test_native_structured_output_uses_low_randomness_without_json_fallback(self):
+        structured_model = Mock()
+        structured_model.invoke.return_value = plan_payload()
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        self.assertEqual(plan.schema_version, 4)
+        llm.with_structured_output.assert_called_once_with(ScenarioPlan)
+        self.assertEqual(structured_model.invoke.call_args.kwargs['temperature'], 0)
+        manager.invoke.assert_not_called()
+
+    def test_explicit_structured_output_capability_gap_falls_back_once_at_low_randomness(self):
+        llm = Mock()
+        llm.with_structured_output.side_effect = NotImplementedError('response_format unsupported')
+        manager = Mock()
+        manager.current_llm = llm
+        manager.invoke.return_value = json.dumps(plan_payload(), ensure_ascii=False)
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        self.assertEqual(plan.schema_version, 4)
+        manager.invoke.assert_called_once()
+        self.assertEqual(manager.invoke.call_args.kwargs['temperature'], 0)
+
+    def test_transport_failures_do_not_fall_back_or_repeat_request(self):
+        for message in ('HTTP 429 rate limit', 'HTTP 503 upstream unavailable', 'request timeout'):
+            with self.subTest(message=message):
+                structured_model = Mock()
+                structured_model.invoke.side_effect = RuntimeError(message)
+                llm = Mock()
+                llm.with_structured_output.return_value = structured_model
+                manager = Mock()
+                manager.current_llm = llm
+                with patch(
+                    'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+                structured_model.invoke.assert_called_once()
+                manager.invoke.assert_not_called()
+
+    def test_transport_failure_with_capability_text_does_not_fall_back(self):
+        structured_model = Mock()
+        structured_model.invoke.side_effect = RuntimeError('HTTP 503 response_format unsupported')
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 503'):
+                RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        structured_model.invoke.assert_called_once()
+        manager.invoke.assert_not_called()
+
+    def test_plain_attribute_error_does_not_fall_back(self):
+        structured_model = Mock()
+        structured_model.invoke.side_effect = AttributeError('internal parser attribute missing')
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            with self.assertRaisesRegex(AttributeError, 'internal parser'):
+                RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        structured_model.invoke.assert_called_once()
+        manager.invoke.assert_not_called()
+
+    def test_deterministic_json_extraction_accepts_one_fenced_or_wrapped_object(self):
+        payload = json.dumps(plan_payload(), ensure_ascii=False)
+        for raw_output in (f'```json\n{payload}\n```', f'模型结果如下：\n{payload}\n请继续'):
+            with self.subTest(raw_output=raw_output[:12]):
+                self.assertEqual(parse_scenario_plan_json(raw_output).schema_version, 4)
+
+    def test_semantic_repair_receives_field_diagnostics_and_runs_once(self):
+        invalid = plan_payload(schema_version=3, title='private title')
+        manager = Mock()
+        manager.current_llm = None
+        manager.invoke.side_effect = [
+            json.dumps(invalid, ensure_ascii=False),
+            json.dumps(plan_payload(), ensure_ascii=False),
+        ]
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        self.assertEqual(plan.schema_version, 4)
+        self.assertEqual(manager.invoke.call_count, 2)
+        repair_request = json.loads(manager.invoke.call_args_list[1].args[0][1].content)
+        self.assertEqual(repair_request['validation_diagnostics'][0]['path'], 'schema_version')
+        self.assertNotIn('validation_error', repair_request)
+        self.assertEqual(manager.invoke.call_args_list[1].kwargs['temperature'], 0)
+
+    def test_structured_parser_failure_with_raw_output_uses_one_targeted_repair(self):
+        class ParserFailure(RuntimeError):
+            def __init__(self):
+                super().__init__('structured parser rejected response')
+                self.llm_output = json.dumps(plan_payload(schema_version=3), ensure_ascii=False)
+
+        structured_model = Mock()
+        structured_model.invoke.side_effect = ParserFailure()
+        llm = Mock()
+        llm.with_structured_output.return_value = structured_model
+        manager = Mock()
+        manager.current_llm = llm
+        manager.invoke.return_value = json.dumps(plan_payload(), ensure_ascii=False)
+        with patch(
+            'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
+        ):
+            plan = RequirementNormalizer(8).normalize('检查当前页面的目标状态。')
+        self.assertEqual(plan.schema_version, 4)
+        structured_model.invoke.assert_called_once()
+        manager.invoke.assert_called_once()
+        repair_request = json.loads(manager.invoke.call_args.args[0][1].content)
+        self.assertEqual(repair_request['validation_diagnostics'][0]['path'], 'schema_version')
+
+    def test_contract_diagnostics_exclude_input_values(self):
+        with self.assertRaises(GenerationContractError) as captured:
+            parse_scenario_plan_json(json.dumps(plan_payload(
+                schema_version=3, title='private title',
+            ), ensure_ascii=False))
+        diagnostics = captured.exception.diagnostics
+        self.assertEqual(diagnostics[0]['path'], 'schema_version')
+        self.assertEqual(diagnostics[0]['stage'], 'contract_validation')
+        self.assertNotIn('private title', json.dumps(diagnostics, ensure_ascii=False))
+
+        with self.assertRaises(GenerationContractError) as extra_field:
+            parse_scenario_plan_json(json.dumps({
+                **plan_payload(), 'password': 'private-value',
+            }, ensure_ascii=False))
+        serialized = json.dumps(extra_field.exception.diagnostics, ensure_ascii=False)
+        self.assertIn('<field>', serialized)
+        self.assertNotIn('password', serialized)
+        self.assertNotIn('private-value', serialized)
 
 
 class TraceSecurityAndReplayRegressionTests(SimpleTestCase):

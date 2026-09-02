@@ -110,7 +110,13 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
             return _fail(str(generation.pk), 'TRANSIENT_SERVICE_ERROR', '当前生成阶段不能继续。')
     except ScenarioInputInsufficientError:
         return _fail(str(generation.pk), 'INPUT_AMBIGUOUS', '描述缺少明确测试对象，请补充目标。')
-    except (GenerationContractError, KeyError, ValueError):
+    except GenerationContractError as exc:
+        logger.warning(
+            'WebUI v4 ScenarioPlan rejected: generation_id=%s stage=normalizing diagnostics=%s',
+            generation.pk, list(exc.diagnostics),
+        )
+        return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v4 ScenarioPlan。')
+    except (KeyError, ValueError):
         return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v4 ScenarioPlan。')
     credentials = get_generation_temporary_credentials(generation.pk) or environment_credentials(generation.environment)
     preflight = run_safety_preflight(generation, plan, credentials_available=credentials is not None)

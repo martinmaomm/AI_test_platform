@@ -22,7 +22,7 @@ from ai_core.models import LLMConfiguration, ModelType
 from projects.models import Environment, Project
 
 from .exploration_trace import CHECKPOINT_TOOL_NAME, ExplorationTraceRecorder
-from .generation_contracts import GenerationTransitionError, ScenarioPlan
+from .generation_contracts import GenerationContractError, GenerationTransitionError, ScenarioPlan
 from .generation_events import publish_terminal
 from .generation_preflight import (
     prepare_playwright_mcp_output_config,
@@ -536,6 +536,25 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertEqual(result['error_code'], 'INTERNAL_EXPLORATION_ERROR')
         self.assertEqual(result['status'], 'failed')
         logged_exception.assert_called_once()
+
+    def test_normalization_contract_failure_logs_only_safe_diagnostics(self):
+        from .generation_orchestrator import run_generation
+
+        generation = self.make_generation()
+        error = GenerationContractError('scenario_plan_invalid', diagnostics=(
+            {'path': 'assertion_requirements.[item].kind', 'type': 'value_error', 'stage': 'contract_validation'},
+        ))
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement', side_effect=error,
+        ), patch('web_testing.generation_orchestrator.logger.warning') as logged_warning:
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+        self.assertEqual(result['error_code'], 'MODEL_OUTPUT_INVALID')
+        diagnostic_calls = [
+            call for call in logged_warning.call_args_list
+            if call.args and call.args[0].startswith('WebUI v4 ScenarioPlan rejected:')
+        ]
+        self.assertEqual(len(diagnostic_calls), 1)
+        self.assertEqual(diagnostic_calls[0].args[2], list(error.diagnostics))
 
     def test_cancelled_exploration_never_compiles_a_partial_snapshot(self):
         from .generation_orchestrator import run_generation

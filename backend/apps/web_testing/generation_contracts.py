@@ -13,6 +13,13 @@ from .execution_variables import ExecutionVariableError, validate_variable_name
 from .generation_security import REDACTED_VALUE, find_suspected_credentials, redact_text
 
 SCENARIO_PLAN_SCHEMA_VERSION = 4
+_SAFE_DIAGNOSTIC_PATH_SEGMENTS = frozenset({
+    'schema_version', 'title', 'objective', 'instructions', 'success_criteria',
+    'assertion_requirements', 'assertion_id', 'criterion_index', 'phase', 'kind',
+    'input_ref', 'literal', 'input_refs', 'name', 'source', 'credential_slot',
+    'preconditions', 'forbidden_actions', 'credentials_required',
+    'allow_test_data_writes', 'cleanup_expected', 'discovery_notes', 'risk_level',
+})
 
 
 class GenerationContractError(ValueError):
@@ -50,9 +57,19 @@ def _validate_safe_value(value: Any, field_name: str, *, reject_absolute_url: bo
             _validate_safe_value(item, field_name, reject_absolute_url=reject_absolute_url)
 
 
+def _safe_diagnostic_path(location: Any) -> str:
+    parts = []
+    for part in location:
+        if isinstance(part, str):
+            parts.append(part if part in _SAFE_DIAGNOSTIC_PATH_SEGMENTS else '<field>')
+        else:
+            parts.append('[item]')
+    return '.'.join(parts)[:160] or '<contract>'
+
+
 def _safe_diagnostics(error: ValidationError) -> tuple[dict[str, str], ...]:
     return tuple({
-        'path': '.'.join(str(part) if isinstance(part, str) else '[item]' for part in item.get('loc', ()))[:160] or '<contract>',
+        'path': _safe_diagnostic_path(item.get('loc', ())),
         'type': str(item.get('type') or 'validation_error')[:80],
         'stage': 'contract_validation',
     } for item in error.errors(include_input=False, include_context=False, include_url=False)[:3])
@@ -199,17 +216,83 @@ class ScenarioPlan(_StrictContract):
         return {item.name: item.source for item in self.input_refs}
 
 
-def parse_scenario_plan_json(raw_text: str, *, format_repair: Callable[[str, str], str] | None = None) -> ScenarioPlan:
-    candidate = str(raw_text or '')
+def _extract_single_json_object(raw_value: Any) -> str:
+    """Return one embedded JSON object when the surrounding text is unambiguous.
+
+    Model responses commonly add a Markdown fence or a short explanation.  This
+    is deliberately a local, deterministic cleanup: it never guesses between
+    multiple JSON objects and therefore cannot change ScenarioPlan semantics.
+    """
+    if isinstance(raw_value, BaseModel):
+        return json.dumps(raw_value.model_dump(mode='json'), ensure_ascii=False)
+    if isinstance(raw_value, (dict, list)):
+        return json.dumps(raw_value, ensure_ascii=False)
+
+    candidate = str(raw_value or '').strip()
+    fenced = re.fullmatch(r'```(?:json)?\s*(\{.*\})\s*```', candidate, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    try:
+        json.loads(candidate)
+        return candidate
+    except (TypeError, ValueError):
+        pass
+
+    decoder = json.JSONDecoder()
+    objects: list[Any] = []
+    position = 0
+    while True:
+        start = candidate.find('{', position)
+        if start < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(candidate, start)
+        except ValueError:
+            position = start + 1
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+        position = end
+    if len(objects) == 1:
+        return json.dumps(objects[0], ensure_ascii=False)
+    return candidate
+
+
+def _parse_scenario_plan_candidate(candidate: str) -> ScenarioPlan:
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, ValueError) as exc:
+        diagnostics = ({
+            'path': '<json>',
+            'type': 'json_decode_error',
+            'stage': 'json_decode',
+        },)
+        raise GenerationContractError('scenario_plan_invalid', diagnostics=diagnostics) from exc
+    try:
+        return ScenarioPlan.model_validate(payload)
+    except ValidationError as exc:
+        raise GenerationContractError(
+            'scenario_plan_invalid', diagnostics=_safe_diagnostics(exc),
+        ) from exc
+
+
+def parse_scenario_plan_json(
+    raw_value: Any,
+    *,
+    format_repair: Callable[[str, tuple[dict[str, str], ...]], str] | None = None,
+) -> ScenarioPlan:
+    """Parse a v4 plan after deterministic cleanup and at most one semantic repair."""
+    candidate = _extract_single_json_object(raw_value)
     for attempt in range(2):
         try:
-            return ScenarioPlan.model_validate(json.loads(candidate))
-        except (ValueError, TypeError, ValidationError) as exc:
-            diagnostics = _safe_diagnostics(exc) if isinstance(exc, ValidationError) else ()
+            return _parse_scenario_plan_candidate(candidate)
+        except GenerationContractError as exc:
             if attempt == 0 and format_repair is not None:
-                candidate = format_repair(candidate, str(exc))
+                candidate = _extract_single_json_object(
+                    format_repair(candidate, exc.diagnostics),
+                )
                 continue
-            raise GenerationContractError('scenario_plan_invalid', diagnostics=diagnostics) from exc
+            raise
     raise AssertionError('unreachable')
 
 

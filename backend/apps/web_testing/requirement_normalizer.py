@@ -18,6 +18,16 @@ from .generation_contracts import (
 )
 from .generation_security import redact_metadata, redact_text
 
+_LOW_RANDOMNESS_TEMPERATURE = 0
+_STRUCTURED_OUTPUT_CAPABILITY_TERMS = (
+    'structured output', 'structured_output', 'response_format', 'json schema',
+    'json_schema', 'function calling', 'tool calling', 'with_structured_output',
+)
+_UNSUPPORTED_CAPABILITY_TERMS = (
+    'not support', 'unsupported', 'not implemented',
+    'unexpected keyword argument',
+)
+
 _GENERIC_DESCRIPTION_PATTERN = re.compile(r'^(?:请)?(?:帮我)?(?:生成|编写|创建)?(?:一个)?(?:测试|用例|脚本)?[。！!？?\s]*$')
 _EXPLICIT_READ_ONLY_PATTERN = re.compile(
     r'(?:只查看|仅查看|只读|禁止(?:任何)?写入|不得(?:进行)?写(?:入|操作)|不允许(?:进行)?写(?:入|操作)|read[ -]?only)',
@@ -52,27 +62,86 @@ class RequirementNormalizer:
         description = redact_text(str(description_safe or '')).strip()
         if not description or _GENERIC_DESCRIPTION_PATTERN.fullmatch(description):
             raise ScenarioInputInsufficientError('scenario_target_missing')
-        raw_output = self.model_manager.invoke([
+        messages = [
             SystemMessage(content=NORMALIZER_SYSTEM_PROMPT),
             HumanMessage(content=json.dumps({
                 'description': description,
                 'test_case_context': redact_metadata(test_case_context or {}),
             }, ensure_ascii=False)),
-        ])
+        ]
+        try:
+            raw_output = self._invoke_structured_plan(messages)
+        except _StructuredOutputUnsupported:
+            raw_output = self._invoke_json_prompt(messages)
         plan = parse_scenario_plan_json(raw_output, format_repair=self._repair_json_once)
         plan = _apply_explicit_read_only_override(plan, description)
         _validate_assertion_literals(plan, description, test_case_context or {})
         return plan
 
-    def _repair_json_once(self, invalid_output: str, validation_error: str) -> str:
+    def _invoke_structured_plan(self, messages: list[SystemMessage | HumanMessage]) -> Any:
+        """Use native LangChain structured output, but only fall back on capability gaps."""
+        model = getattr(self.model_manager, 'current_llm', None)
+        with_structured_output = getattr(model, 'with_structured_output', None)
+        if not callable(with_structured_output):
+            raise _StructuredOutputUnsupported('with_structured_output unavailable')
+        try:
+            structured_model = with_structured_output(ScenarioPlan)
+            return structured_model.invoke(
+                messages, temperature=_LOW_RANDOMNESS_TEMPERATURE,
+            )
+        except Exception as exc:
+            if _is_transport_failure(exc):
+                raise
+            if _is_structured_output_unsupported(exc):
+                raise _StructuredOutputUnsupported(str(exc)) from exc
+            raw_output = getattr(exc, 'llm_output', None)
+            if raw_output is not None:
+                return raw_output
+            raise
+
+    def _invoke_json_prompt(self, messages: list[SystemMessage | HumanMessage]) -> str:
+        """Narrow fallback for providers that explicitly reject native structure."""
+        return self.model_manager.invoke(
+            messages, temperature=_LOW_RANDOMNESS_TEMPERATURE,
+        )
+
+    def _repair_json_once(
+        self,
+        invalid_output: str,
+        diagnostics: tuple[dict[str, str], ...],
+    ) -> str:
         return self.model_manager.invoke([
             SystemMessage(content='你是严格 JSON 格式修复器。不得新增业务目标、页面元素、定位器或完成状态；只输出 JSON。'),
             HumanMessage(content=json.dumps({
-                'instruction': '仅修复 v4 ScenarioPlan JSON 的格式、字段名或缺失的结构。',
-                'validation_error': validation_error,
+                'instruction': '仅针对 validation_diagnostics 指出的 v4 ScenarioPlan JSON 路径修复格式、字段名或缺失结构。',
+                'validation_diagnostics': list(diagnostics),
                 'invalid_output': redact_text(invalid_output),
             }, ensure_ascii=False)),
-        ])
+        ], temperature=_LOW_RANDOMNESS_TEMPERATURE)
+
+
+class _StructuredOutputUnsupported(RuntimeError):
+    """Internal marker: a provider explicitly lacks structured output support."""
+
+
+def _is_structured_output_unsupported(exc: Exception) -> bool:
+    """Keep fallback narrow so transport failures never create a second request."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    message = str(exc).lower()
+    has_capability_term = any(term in message for term in _STRUCTURED_OUTPUT_CAPABILITY_TERMS)
+    has_unsupported_term = any(term in message for term in _UNSUPPORTED_CAPABILITY_TERMS)
+    return has_capability_term and has_unsupported_term
+
+
+def _is_transport_failure(exc: Exception) -> bool:
+    status_code = getattr(exc, 'status_code', None)
+    response = getattr(exc, 'response', None)
+    if status_code is None:
+        status_code = getattr(response, 'status_code', None)
+    if isinstance(status_code, int) and (status_code == 429 or 500 <= status_code <= 599):
+        return True
+    return bool(re.search(r'\b(?:429|5\d{2}|timeout)\b|timed?\s*out|connection\s+(?:closed|error|reset)', str(exc), re.I))
 
 
 def normalize_requirement(description_safe: str, *, model_config_id: int, test_case_context: dict[str, Any] | None = None) -> ScenarioPlan:

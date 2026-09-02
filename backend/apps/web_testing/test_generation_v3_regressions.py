@@ -552,6 +552,39 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertEqual(len(diagnostic_calls), 1)
         self.assertEqual(diagnostic_calls[0].args[2], list(error.diagnostics))
 
+    def test_generation_exposes_normalizing_state_before_model_call(self):
+        from .generation_orchestrator import run_generation
+
+        generation = self.make_generation()
+        observed = {}
+
+        def inspect_persisted_state(*args, **kwargs):
+            current = WebUIScriptGeneration.objects.get(pk=generation.pk)
+            observed.update({
+                'status': current.status,
+                'stage': current.current_stage,
+                'progress': current.progress,
+                'started_at': current.started_at,
+            })
+            raise GenerationContractError('scenario_plan_invalid')
+
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement',
+            side_effect=inspect_persisted_state,
+        ), patch(
+            'web_testing.generation_orchestrator.publish_stage_changed',
+        ) as publish_stage:
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+
+        self.assertEqual(result['error_code'], 'MODEL_OUTPUT_INVALID')
+        self.assertEqual(observed['status'], WebUIScriptGeneration.Status.NORMALIZING)
+        self.assertEqual(observed['stage'], WebUIScriptGeneration.Stage.NORMALIZING)
+        self.assertEqual(observed['progress'], 10)
+        self.assertIsNotNone(observed['started_at'])
+        published_generation = publish_stage.call_args.args[0]
+        self.assertEqual(published_generation.status, WebUIScriptGeneration.Status.NORMALIZING)
+        self.assertEqual(published_generation.progress, 10)
+
     def test_cancelled_exploration_never_compiles_a_partial_snapshot(self):
         from .generation_orchestrator import run_generation
 

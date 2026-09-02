@@ -121,7 +121,13 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
     if generation is None:
         return {'generation_id': str(generation_id), 'status': 'skipped'}
     try:
-        if generation.status in {WebUIScriptGeneration.Status.CREATED, WebUIScriptGeneration.Status.NORMALIZING}:
+        if generation.status == WebUIScriptGeneration.Status.CREATED:
+            generation = transition_generation(
+                generation.pk,
+                WebUIScriptGeneration.Status.NORMALIZING,
+                progress=10,
+            )
+        if generation.status == WebUIScriptGeneration.Status.NORMALIZING:
             publish_stage_changed(generation, '理解测试目标')
             plan = normalize_requirement(_normalization_description(generation), model_config_id=generation.model_info['config_id'], test_case_context={'title': generation.test_case.title} if generation.test_case else None)
             generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.PREFLIGHTING, progress=25, updates={'scenario_spec': plan.model_dump(mode='json'), 'credentials_required': plan.credentials_required})

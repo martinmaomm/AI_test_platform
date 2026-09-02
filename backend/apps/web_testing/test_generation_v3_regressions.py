@@ -302,6 +302,55 @@ class V3MCPExplorerRegressionTests(SimpleTestCase):
         self.assertEqual(exhausted.exception.error_code, 'MODEL_STEP_BUDGET')
 
 
+class V3MCPExplorerAsyncCancellationTests(TestCase):
+    def _plan(self):
+        return GoalPlan.model_validate(plan_payload(include_external=False))
+
+    def test_cancel_check_with_sync_orm_query_runs_in_async_context_without_sync_error(self):
+        class Client:
+            opened = closed = 0
+            async def create_all_sessions(self):
+                self.opened += 1
+            async def close_all_sessions(self):
+                self.closed += 1
+
+        class Agent:
+            def __init__(self, **kwargs):
+                self.guard = kwargs['callbacks'][0]
+            async def initialize(self):
+                self.guard.on_chat_model_start({}, [])
+            async def run(self, *_args, **_kwargs):
+                run_id = 'observe'
+                self.guard.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id=run_id, inputs={'selector': '#main'})
+                self.guard.on_tool_end('<main id="main">页面已观察</main>', run_id=run_id)
+
+        calls = {'count': 0}
+        def cancel_check():
+            # A real synchronous Django DB access would raise
+            # SynchronousOnlyOperation if it ran directly on the event-loop
+            # thread. SELECT 1 also works with this suite's thread-local
+            # in-memory SQLite connection.
+            from django.db import connection
+
+            calls['count'] += 1
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT 1')
+                return cursor.fetchone()[0] != 1
+
+        client = Client()
+        with override_settings(BASE_DIR='/tmp'), patch('web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client), patch('web_testing.mcp_page_explorer.MCPAgent', Agent):
+            explorer = MCPPageExplorer(
+                llm_model=Mock(),
+                mcp_config={'mcpServers': {}},
+                generation_id=str(uuid4()),
+                cancel_check=cancel_check,
+            )
+            trace = asyncio.run(explorer.explore_until_complete(plan=self._plan(), start_path='/', target_url_safe='https://example.test'))
+        self.assertGreaterEqual(calls['count'], 1)
+        self.assertEqual((client.opened, client.closed), (1, 1))
+        self.assertEqual(trace.tool_stats['total_tool_calls'], 3)
+
+
 class V3ScriptQualityRegressionTests(SimpleTestCase):
     def test_compiled_script_has_provenance_cleanup_and_v3_run_signature(self):
         plan, trace = replay_fixture()
@@ -450,6 +499,28 @@ class V3GenerationPersistenceRegressionTests(TestCase):
             publish_terminal(event)
         self.assertEqual(send.call_count, 2)
         cache.delete(key)
+
+    def test_unknown_exploration_exception_records_stack_and_returns_internal_error_code(self):
+        from .generation_orchestrator import run_generation
+
+        generation = self.make_generation(start_path='/users', target_url_safe='https://web.example.test/users')
+        plan = GoalPlan.model_validate(plan_payload(include_external=False))
+        preflight = SimpleNamespace(outcome='continue', warnings=[], mcp_config={})
+
+        with patch('web_testing.generation_orchestrator.normalize_requirement', return_value=plan), \
+             patch('web_testing.generation_orchestrator.run_safety_preflight', return_value=preflight), \
+             patch('web_testing.generation_orchestrator.get_llm_manager', return_value=SimpleNamespace(current_llm=Mock())), \
+             patch('web_testing.generation_orchestrator.MCPPageExplorer') as explorer_cls, \
+             patch('web_testing.generation_orchestrator.logger.exception') as logged_exception:
+            explorer = Mock()
+            explorer.explore_until_complete.side_effect = RuntimeError('mcp crashed')
+            explorer_cls.return_value = explorer
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+
+        self.assertEqual(result['error_code'], 'INTERNAL_EXPLORATION_ERROR')
+        self.assertEqual(result['status'], 'failed')
+        logged_exception.assert_called_once()
+        self.assertIn('页面探索执行发生未知异常', logged_exception.call_args[0][0])
 
     def test_saved_marker_requires_matching_generation_reference(self):
         test_case = SimpleNamespace(generation_metadata={})

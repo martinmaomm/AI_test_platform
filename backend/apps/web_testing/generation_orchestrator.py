@@ -119,7 +119,11 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
             return _fail(str(generation.pk), exc.error_code, str(exc))
         trace = exc.snapshot
     except Exception:
-        return _fail(str(generation.pk), 'BROWSER_UNAVAILABLE', '页面探索服务暂时不可用。')
+        logger.exception(
+            '页面探索执行发生未知异常: generation_id=%s, stage=exploring',
+            generation.pk,
+        )
+        return _fail(str(generation.pk), 'INTERNAL_EXPLORATION_ERROR', '页面探索服务发生内部错误，请稍后重试。')
     if not trace_has_minimum_page_state(trace):
         return _fail(str(generation.pk), 'EXPLORATION_NO_PAGE_STATE', '未取得可用页面观察，未生成脚本。')
     generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.GENERATING, progress=70, updates={'exploration_snapshot': trace.model_dump(mode='json'), 'tool_stats': trace.tool_stats})

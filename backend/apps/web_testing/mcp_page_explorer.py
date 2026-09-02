@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from mcp_use import MCPClient
 
@@ -130,6 +131,10 @@ class MCPPageExplorer:
         self.llm_model = llm_model
         self.mcp_config = mcp_config
         self.cancel_check = cancel_check or (lambda: False)
+        if asyncio.iscoroutinefunction(self.cancel_check):
+            self._async_cancel_check = self.cancel_check
+        else:
+            self._async_cancel_check = sync_to_async(self.cancel_check, thread_sensitive=True)
         self.generation_id = generation_id
         self.user_constraints = str(user_constraints or '')
         self.exploration_timeout_seconds = exploration_total_timeout_seconds() if exploration_timeout_seconds is None else float(exploration_timeout_seconds)
@@ -172,7 +177,7 @@ class MCPPageExplorer:
         return values, sources
 
     async def explore_until_complete(self, *, plan: GoalPlan, start_path: str, target_url_safe: str, temporary_credentials: dict[str, str] | None = None) -> ExplorationTrace:
-        if self.cancel_check():
+        if await self._is_cancelled():
             raise self._failure('TASK_CANCELLED', '用户已取消任务。')
         self._configure(plan, start_path, temporary_credentials)
         started = time.monotonic()
@@ -206,7 +211,7 @@ class MCPPageExplorer:
                     logger.warning('v3 MCP 会话清理失败', exc_info=True)
 
     async def _run_goal(self, client, plan: GoalPlan, goal: Goal, start_path: str, target_url_safe: str, credentials: dict[str, str] | None, deadline: float, *, supplement: bool):
-        if self.cancel_check():
+        if await self._is_cancelled():
             raise self._failure('TASK_CANCELLED', '用户已取消任务。', start_path)
         if time.monotonic() >= deadline:
             raise self._failure('exploration_timeout', '页面探索已达到总时限。', start_path)
@@ -246,7 +251,7 @@ class MCPPageExplorer:
         # never gives the connector a chance to release its partial state.
         await asyncio.sleep(0)
         while not init_task.done():
-            if self.cancel_check():
+            if await self._is_cancelled():
                 init_task.cancel()
                 try:
                     await init_task
@@ -265,7 +270,7 @@ class MCPPageExplorer:
         with suppress_mcp_raw_query_logs():
             run_task = asyncio.create_task(agent.run(prompt, manage_connector=False))
             while not run_task.done():
-                if self.cancel_check():
+                if await self._is_cancelled():
                     await self._cancel_task(run_task)
                     raise self._failure('TASK_CANCELLED', '用户已取消任务。', start_path)
                 if time.monotonic() >= deadline:
@@ -276,6 +281,9 @@ class MCPPageExplorer:
                     raise self._failure(self.guard.terminal_error.error_kind, str(self.guard.terminal_error), start_path)
                 await asyncio.wait({run_task}, timeout=0.25)
             await run_task
+
+    async def _is_cancelled(self) -> bool:
+        return bool(await self._async_cancel_check())
 
     @staticmethod
     async def _cancel_task(task: asyncio.Task) -> None:

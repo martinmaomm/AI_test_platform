@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from openai import APIConnectionError, APIError, APITimeoutError, OpenAIError
+
 
 _MODEL_ERROR_MESSAGES = {
     429: (
@@ -26,6 +28,22 @@ _MODEL_ERROR_MESSAGES = {
     ),
 }
 _TRUSTED_MODEL_EXCEPTION_MODULE_PREFIXES = ("openai", "langchain")
+_NON_RETRYABLE_STREAM_ERROR_TYPES = frozenset({
+    "authentication_error",
+    "authorization_error",
+    "invalid_request_error",
+    "permission_error",
+})
+_NON_RETRYABLE_STREAM_ERROR_CODES = frozenset({
+    "invalid_api_key",
+    "invalid_request",
+    "invalid_request_error",
+    "model_not_found",
+})
+_STREAM_SERVICE_UNAVAILABLE_MESSAGES = frozenset({
+    "模型服务暂时不可用，请稍后重试",
+    "model service temporarily unavailable, please try again later",
+})
 
 
 def _iter_exception_chain(error: BaseException) -> Iterator[BaseException]:
@@ -81,24 +99,76 @@ def _model_service_error(status: int) -> tuple[str, str] | None:
     return _MODEL_ERROR_MESSAGES.get(status)
 
 
+def _stateless_model_service_error(error: BaseException) -> tuple[str, str] | None:
+    """Classify safe OpenAI stream and transport failures without a status code."""
+    if not _is_trusted_model_sdk_error(error):
+        return None
+    if isinstance(error, APITimeoutError):
+        return (
+            "MODEL_GATEWAY_TIMEOUT",
+            "本次锁定的模型服务请求超时，请稍后重试。",
+        )
+    if isinstance(error, APIConnectionError):
+        return (
+            "MODEL_SERVICE_ERROR",
+            "本次锁定的模型服务连接异常，请稍后重试。",
+        )
+    if isinstance(error, APIError):
+        error_type = str(getattr(error, "type", "") or "").lower()
+        error_code = str(getattr(error, "code", "") or "").lower()
+        if (
+            error_type in _NON_RETRYABLE_STREAM_ERROR_TYPES
+            or error_code in _NON_RETRYABLE_STREAM_ERROR_CODES
+        ):
+            return None
+        if error_type in {"rate_limit_error", "rate_limit_exceeded"}:
+            return _MODEL_ERROR_MESSAGES[429]
+        if error_type in {"timeout_error", "gateway_timeout"}:
+            return (
+                "MODEL_GATEWAY_TIMEOUT",
+                "本次锁定的模型服务请求超时，请稍后重试。",
+            )
+        return (
+            "MODEL_SERVICE_ERROR",
+            "本次锁定的模型服务流式响应异常，请稍后重试。",
+        )
+    if (
+        isinstance(error, OpenAIError)
+        and str(error).strip().lower() in _STREAM_SERVICE_UNAVAILABLE_MESSAGES
+    ):
+        return (
+            "MODEL_SERVICE_ERROR",
+            "本次锁定的模型服务暂时不可用，请稍后重试。",
+        )
+    return None
+
+
 def classify_model_service_error(
     error: BaseException,
     *,
     stage: str | None = None,
 ) -> tuple[str, str] | None:
-    """Return a stable safe error for a confirmed model-service status.
+    """Return a stable safe error for confirmed model-service failures.
 
     An explicit non-empty ``stage`` permits status classification at an
     unambiguous model-invocation boundary.  When it is absent, the exception
-    must instead originate from an OpenAI/LangChain SDK module.  ``stage`` is
-    not included in the returned message, so arbitrary exception details,
-    response bodies, requests, and credentials can never reach the user.
+    must instead originate from an OpenAI/LangChain SDK module. OpenAI's SSE
+    decoder can report API, connection, and timeout failures without a status;
+    those are recognised by trusted exception type and safe metadata only.
+    A base ``OpenAIError`` is accepted only for the exact known unavailable
+    message. ``stage`` and arbitrary exception details, response bodies,
+    requests, and credentials never reach the user.
     """
     known_model_stage = isinstance(stage, str) and bool(stage.strip())
 
     for candidate in _iter_exception_chain(error):
         status = _status_code(candidate)
-        if status is None or not (known_model_stage or _is_trusted_model_sdk_error(candidate)):
+        if status is None:
+            classified = _stateless_model_service_error(candidate)
+            if classified is not None:
+                return classified
+            continue
+        if not (known_model_stage or _is_trusted_model_sdk_error(candidate)):
             continue
         classified = _model_service_error(status)
         if classified is not None:

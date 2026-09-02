@@ -13,9 +13,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
+import httpx
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
+from openai import APIStatusError, OpenAIError
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from ai_core.models import LLMConfiguration, ModelType
@@ -542,9 +544,10 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         ))
         with patch(
             'web_testing.generation_orchestrator.normalize_requirement', side_effect=error,
-        ), patch('web_testing.generation_orchestrator.logger.warning') as logged_warning:
+        ) as normalize, patch('web_testing.generation_orchestrator.logger.warning') as logged_warning:
             result = run_generation(str(generation.pk), celery_task_id='task-1')
         self.assertEqual(result['error_code'], 'MODEL_OUTPUT_INVALID')
+        normalize.assert_called_once()
         diagnostic_calls = [
             call for call in logged_warning.call_args_list
             if call.args and call.args[0].startswith('WebUI v4 ScenarioPlan rejected:')
@@ -584,6 +587,97 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         published_generation = publish_stage.call_args.args[0]
         self.assertEqual(published_generation.status, WebUIScriptGeneration.Status.NORMALIZING)
         self.assertEqual(published_generation.progress, 10)
+
+    def test_normalizing_retries_one_stateless_model_error_then_continues(self):
+        from .generation_orchestrator import run_generation
+
+        generation = self.make_generation()
+        plan = ScenarioPlan.model_validate(plan_payload())
+        transient = OpenAIError('模型服务暂时不可用，请稍后重试')
+        preflight = SimpleNamespace(
+            outcome='needs_confirmation', error_code='INPUT_AMBIGUOUS',
+            message='需要确认测试范围。', warnings=[],
+        )
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement',
+            side_effect=[transient, plan],
+        ) as normalize, patch(
+            'web_testing.generation_orchestrator.run_safety_preflight', return_value=preflight,
+        ):
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+
+        self.assertEqual(normalize.call_count, 2)
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_CONFIRMATION)
+
+    def test_normalizing_two_stateless_model_errors_finish_failed_and_publish_terminal(self):
+        from .generation_orchestrator import run_generation
+
+        generation = self.make_generation()
+
+        def stream_error():
+            return OpenAIError('模型服务暂时不可用，请稍后重试')
+
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement',
+            side_effect=[stream_error(), stream_error()],
+        ) as normalize, patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ) as publish_terminal:
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+
+        generation.refresh_from_db()
+        self.assertEqual(normalize.call_count, 2)
+        self.assertEqual(result['error_code'], 'MODEL_SERVICE_ERROR')
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(generation.progress, 100)
+        publish_terminal.assert_called_once()
+
+    def test_normalizing_authentication_error_does_not_retry(self):
+        from .generation_orchestrator import run_generation
+
+        generation = self.make_generation()
+        response = httpx.Response(
+            401,
+            request=httpx.Request('POST', 'https://llm.example.test/v1/chat/completions'),
+        )
+        authentication_error = APIStatusError(
+            'invalid credentials', response=response,
+            body={'type': 'authentication_error'},
+        )
+        with patch(
+            'web_testing.generation_orchestrator.normalize_requirement',
+            side_effect=authentication_error,
+        ) as normalize:
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+
+        generation.refresh_from_db()
+        normalize.assert_called_once()
+        self.assertEqual(result['error_code'], 'MODEL_AUTHENTICATION_FAILED')
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(generation.progress, 100)
+
+    def test_generation_task_guard_marks_unknown_exception_failed_and_publishes_terminal(self):
+        from .tasks import generate_webui_script_generation_task
+
+        generation = self.make_generation()
+        with patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ) as publish_terminal, patch(
+            'web_testing.generation_orchestrator.run_generation',
+            side_effect=RuntimeError('unexpected failure'),
+        ), patch(
+            'web_testing.tasks.logger.exception',
+        ) as logged_exception:
+            result = generate_webui_script_generation_task.apply(
+                args=(str(generation.pk),), task_id='task-unknown',
+            ).get()
+
+        generation.refresh_from_db()
+        self.assertEqual(result['error_code'], 'INTERNAL_GENERATION_ERROR')
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(generation.progress, 100)
+        publish_terminal.assert_called_once()
+        logged_exception.assert_called_once()
 
     def test_cancelled_exploration_never_compiles_a_partial_snapshot(self):
         from .generation_orchestrator import run_generation

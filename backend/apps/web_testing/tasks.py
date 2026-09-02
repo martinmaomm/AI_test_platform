@@ -39,6 +39,17 @@ User = get_user_model()
 logger = logging.getLogger(__name__)
 
 
+def _run_generation_with_terminal_guard(generation_id: str, celery_task_id: str | None, runner):
+    """Keep an unexpected Celery exception from leaving a generation non-terminal."""
+    try:
+        return runner(generation_id, celery_task_id=celery_task_id)
+    except Exception:
+        logger.exception('WebUI 生成 Celery 任务发生未处理异常: generation_id=%s', generation_id)
+        from .generation_orchestrator import fail_unexpected_generation
+
+        return fail_unexpected_generation(generation_id)
+
+
 def _failure_screenshot_paths(execution_id: int, filename: str):
     """Return controlled absolute and persisted paths for one PNG screenshot."""
     root = os.path.abspath(os.path.join(str(settings.MEDIA_ROOT), 'webui_failure_screenshots'))
@@ -95,13 +106,18 @@ def generate_webui_script_generation_task(self, generation_id: str):
     """Run the durable AI + Playwright MCP generation pipeline by record ID."""
     from .generation_orchestrator import run_generation
 
-    return run_generation(str(generation_id), celery_task_id=self.request.id)
+    return _run_generation_with_terminal_guard(
+        str(generation_id), self.request.id, run_generation,
+    )
 
 
 @shared_task(bind=True, name='web_testing.retry_webui_script_generation_from_trace')
 def retry_webui_script_generation_from_trace_task(self, generation_id: str):
     from .generation_orchestrator import run_generation_from_trace
-    return run_generation_from_trace(str(generation_id), celery_task_id=self.request.id)
+
+    return _run_generation_with_terminal_guard(
+        str(generation_id), self.request.id, run_generation_from_trace,
+    )
 
 
 def _run_test_script(

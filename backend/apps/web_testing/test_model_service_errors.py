@@ -2,7 +2,7 @@
 
 import httpx
 from django.test import SimpleTestCase
-from openai import APIStatusError, OpenAI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI, OpenAIError
 from unittest.mock import patch
 
 from .model_service_errors import classify_model_service_error
@@ -107,6 +107,42 @@ class ModelServiceErrorTests(SimpleTestCase):
             classify_model_service_error(wrapper),
             ("MODEL_SERVICE_ERROR", "本次锁定的模型服务异常（HTTP 502），请稍后重试。"),
         )
+
+    def test_stateless_trusted_stream_and_transport_errors_have_safe_codes(self):
+        request = httpx.Request("POST", "https://provider.invalid/v1/chat/completions")
+        cases = (
+            (
+                APIError("stream failed", request=request, body={"type": "server_error"}),
+                ("MODEL_SERVICE_ERROR", "本次锁定的模型服务流式响应异常，请稍后重试。"),
+            ),
+            (
+                APIConnectionError(request=request),
+                ("MODEL_SERVICE_ERROR", "本次锁定的模型服务连接异常，请稍后重试。"),
+            ),
+            (
+                APITimeoutError(request=request),
+                ("MODEL_GATEWAY_TIMEOUT", "本次锁定的模型服务请求超时，请稍后重试。"),
+            ),
+            (
+                OpenAIError("模型服务暂时不可用，请稍后重试"),
+                ("MODEL_SERVICE_ERROR", "本次锁定的模型服务暂时不可用，请稍后重试。"),
+            ),
+        )
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                self.assertEqual(classify_model_service_error(error), expected)
+
+    def test_stateless_authentication_configuration_and_runtime_errors_are_not_classified(self):
+        request = httpx.Request("POST", "https://provider.invalid/v1/chat/completions")
+        errors = (
+            APIError("invalid credentials", request=request, body={"type": "authentication_error"}),
+            APIError("invalid request", request=request, body={"code": "invalid_request"}),
+            OpenAIError("The api_key client option must be set"),
+            RuntimeError("model service temporarily unavailable"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                self.assertIsNone(classify_model_service_error(error, stage=self.stage))
 
     def test_sdk_retries_one_chat_request_without_rerunning_the_surrounding_tool_step(self):
         requests = []

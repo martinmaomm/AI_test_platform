@@ -18,12 +18,16 @@ from .generation_preflight import environment_credentials, run_safety_preflight
 from .generation_repository import PAUSED_GENERATION_STATUSES, claim_generation_worker, claim_trace_generation_retry, get_generation_temporary_credentials, is_cancel_requested, transition_generation
 from .generation_workspace import variable_definitions_for_scenario_plan, workspace_for_generation
 from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
+from .model_service_errors import classify_model_service_error
 from .models import WebUIScriptGeneration
 from .requirement_normalizer import normalize_requirement
 from .script_generator import ScriptGenerator
 from .script_quality import blocker_issues, evaluate_script
 
 logger = logging.getLogger(__name__)
+_NORMALIZING_RETRYABLE_MODEL_ERROR_CODES = frozenset({
+    'MODEL_RATE_LIMITED', 'MODEL_SERVICE_ERROR', 'MODEL_GATEWAY_TIMEOUT',
+})
 
 
 def _normalization_description(generation: WebUIScriptGeneration) -> str:
@@ -41,6 +45,51 @@ def _fail(generation_id: str, code: str, message: str) -> dict[str, Any]:
         return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': code}
     except Exception:
         return {'generation_id': generation_id, 'status': 'failed', 'error_code': code}
+
+
+def fail_unexpected_generation(generation_id: str) -> dict[str, Any]:
+    """Best-effort terminal failure for a Celery entry-point exception."""
+    try:
+        generation = WebUIScriptGeneration.objects.only('pk', 'status', 'error_code').get(pk=generation_id)
+    except WebUIScriptGeneration.DoesNotExist:
+        return {'generation_id': str(generation_id), 'status': 'failed', 'error_code': 'INTERNAL_GENERATION_ERROR'}
+    except Exception:
+        logger.exception('无法读取意外失败的 WebUI 生成记录: generation_id=%s', generation_id)
+        return {'generation_id': str(generation_id), 'status': 'failed', 'error_code': 'INTERNAL_GENERATION_ERROR'}
+    if is_terminal_status(generation.status):
+        return {
+            'generation_id': str(generation.pk), 'status': generation.status,
+            'error_code': generation.error_code,
+        }
+    return _fail(
+        str(generation.pk), 'INTERNAL_GENERATION_ERROR',
+        '生成任务发生内部错误，请稍后重试。',
+    )
+
+
+def _normalize_with_one_transient_retry(generation: WebUIScriptGeneration) -> ScenarioPlan:
+    """Retry exactly once before browser work when a classified model call is transient."""
+    for attempt in range(2):
+        try:
+            return normalize_requirement(
+                _normalization_description(generation),
+                model_config_id=generation.model_info['config_id'],
+                test_case_context={'title': generation.test_case.title} if generation.test_case else None,
+            )
+        except Exception as exc:
+            model_error = classify_model_service_error(exc, stage='normalizing')
+            if (
+                attempt
+                or model_error is None
+                or model_error[0] not in _NORMALIZING_RETRYABLE_MODEL_ERROR_CODES
+            ):
+                raise
+            logger.warning(
+                'WebUI v4 normalizing model request failed transiently; retrying once: generation_id=%s',
+                generation.pk,
+                exc_info=True,
+            )
+    raise AssertionError('unreachable')
 
 
 def _terminal_cancel(generation_id: str, task_id: str | None) -> bool:
@@ -129,7 +178,7 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
             )
         if generation.status == WebUIScriptGeneration.Status.NORMALIZING:
             publish_stage_changed(generation, '理解测试目标')
-            plan = normalize_requirement(_normalization_description(generation), model_config_id=generation.model_info['config_id'], test_case_context={'title': generation.test_case.title} if generation.test_case else None)
+            plan = _normalize_with_one_transient_retry(generation)
             generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.PREFLIGHTING, progress=25, updates={'scenario_spec': plan.model_dump(mode='json'), 'credentials_required': plan.credentials_required})
         elif generation.status == WebUIScriptGeneration.Status.PREFLIGHTING:
             plan = ScenarioPlan.model_validate(generation.scenario_spec or {})
@@ -145,6 +194,11 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
         return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v4 ScenarioPlan。')
     except (KeyError, ValueError):
         return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v4 ScenarioPlan。')
+    except Exception as exc:
+        model_error = classify_model_service_error(exc, stage='normalizing')
+        if model_error is not None:
+            return _fail(str(generation.pk), *model_error)
+        raise
     credentials = get_generation_temporary_credentials(generation.pk) or environment_credentials(generation.environment)
     preflight = run_safety_preflight(generation, plan, credentials_available=credentials is not None)
     if preflight.outcome != 'continue':

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .generation_contracts import AssertionRequirement, GenerationContractError, ScenarioPlan
+from .generation_contracts import AssertionRequirement, GenerationContractError, InputSpec, ScenarioPlan
 from .generation_security import redact_text
 
 TRACE_SCHEMA_VERSION = 4
@@ -431,6 +431,7 @@ class ExplorationTrace(BaseModel):
     cleanup_event_ids: list[str] = Field(default_factory=list, max_length=_MAX_EVENTS)
     cleanup_verification_event_ids: list[str] = Field(default_factory=list, max_length=20)
     assertion_event_ids: list[str] = Field(default_factory=list, max_length=20)
+    dynamic_input_refs: list[InputSpec] = Field(default_factory=list, max_length=20)
     finalization: PathFinalization = Field(default_factory=PathFinalization)
     cleanup: dict[str, Any] = Field(default_factory=dict)
     tool_stats: dict[str, Any] = Field(default_factory=dict)
@@ -450,6 +451,11 @@ class ExplorationTrace(BaseModel):
         events = {event.event_id: event for event in self.events}
         if len(events) != len(self.events) or len({event.sequence for event in self.events}) != len(self.events):
             raise ValueError('callback event_id 和 sequence 必须唯一')
+        dynamic_names = [item.name for item in self.dynamic_input_refs]
+        if len(dynamic_names) != len(set(dynamic_names)) or any(
+            item.source != 'generated' for item in self.dynamic_input_refs
+        ):
+            raise ValueError('动态输入必须是唯一的 generated 变量定义')
         selected = {
             *self.replay_event_ids, *self.cleanup_event_ids,
             *self.cleanup_verification_event_ids, *self.assertion_event_ids,
@@ -659,7 +665,10 @@ class ExplorationTraceRecorder:
         self._next_sequence = 1
         self._runtime_values: dict[str, str] = {}
         self._runtime_sources: dict[str, str] = {}
+        self._runtime_value_kinds: dict[str, str] = {}
         self._plan_input_sources: dict[str, str] = {}
+        self._plan_input_value_kinds: dict[str, str] = {}
+        self._dynamic_input_specs: dict[str, InputSpec] = {}
         self._credential_refs: frozenset[str] = frozenset()
         self._assertion_requirements: dict[str, AssertionRequirement] = {}
         self._cleanup_expected = False
@@ -681,6 +690,9 @@ class ExplorationTraceRecorder:
             item.assertion_id: item for item in plan.assertion_requirements
         }
         self._plan_input_sources = plan.input_sources()
+        self._plan_input_value_kinds = {
+            item.name: item.value_kind for item in plan.input_refs
+        }
         self._cleanup_expected = plan.cleanup_expected
 
     def configure_runtime(
@@ -692,9 +704,29 @@ class ExplorationTraceRecorder:
         self._runtime_sources = {
             str(key): str(value) for key, value in input_sources.items() if key
         }
+        self._runtime_value_kinds = {
+            name: self._plan_input_value_kinds.get(name, 'text')
+            for name in self._runtime_sources
+        }
         self._credential_refs = frozenset(
             key for key, source in self._runtime_sources.items() if source == 'credential'
         )
+
+    def declare_dynamic_input(self, *, value_kind: str, runtime_value: str) -> InputSpec:
+        """Register one in-memory generated value without persisting that value."""
+        if len(self._dynamic_input_specs) >= 20:
+            raise GenerationContractError('DYNAMIC_INPUT_LIMIT_EXCEEDED')
+        index = len(self._dynamic_input_specs) + 1
+        name = f'DYNAMIC_INPUT_{index}'
+        while name in self._plan_input_sources:
+            index += 1
+            name = f'DYNAMIC_INPUT_{index}'
+        spec = InputSpec(name=name, source='generated', value_kind=value_kind)
+        self._dynamic_input_specs[spec.name] = spec
+        self._runtime_sources[spec.name] = spec.source
+        self._runtime_value_kinds[spec.name] = spec.value_kind
+        self._runtime_values[spec.name] = str(runtime_value)
+        return spec
 
     def candidate_summary(self) -> dict[str, Any]:
         """Return only redacted callback facts that the same agent may finalize."""
@@ -1072,6 +1104,7 @@ class ExplorationTraceRecorder:
             cleanup_event_ids=cleanup_ids,
             cleanup_verification_event_ids=cleanup_verifications,
             assertion_event_ids=assertions,
+            dynamic_input_refs=list(self._dynamic_input_specs.values()),
             finalization=self._finalization,
             cleanup=cleanup_summary,
             tool_stats=dict(tool_stats),
@@ -1082,6 +1115,45 @@ class ExplorationTraceRecorder:
             last_location=self._last_location,
         )
         return build_locator_evidence(trace)
+
+    def discard_active(self, run_id: Any) -> None:
+        """Forget a browser call that the finalization-only guard never executed."""
+        self._active.pop(run_id, None)
+
+
+def effective_scenario_plan(plan: ScenarioPlan, trace: ExplorationTrace) -> ScenarioPlan:
+    """Merge only dynamic refs selected by the valid final path into a plan."""
+    if trace.finalization.status != 'valid' or not trace.dynamic_input_refs:
+        return plan
+    events = {event.event_id: event for event in trace.events}
+    dynamic_specs_by_name = {item.name: item for item in trace.dynamic_input_refs}
+    selected_dynamic_refs = {
+        ref
+        for event_id in [*trace.replay_event_ids, *trace.cleanup_event_ids]
+        for ref in events[event_id].input_refs
+        if ref in dynamic_specs_by_name
+    }
+    if not selected_dynamic_refs:
+        return plan
+    existing_specs = {item.name: item for item in plan.input_refs}
+    additions: list[dict[str, Any]] = []
+    for name in sorted(selected_dynamic_refs):
+        dynamic_spec = dynamic_specs_by_name[name]
+        existing = existing_specs.get(name)
+        if existing is None:
+            additions.append(dynamic_spec.model_dump(mode='json'))
+            continue
+        if existing.model_dump(mode='json') != dynamic_spec.model_dump(mode='json'):
+            raise GenerationContractError('DYNAMIC_INPUT_CONFLICT')
+    if not additions:
+        return plan
+    return ScenarioPlan.model_validate({
+        **plan.model_dump(mode='json'),
+        'input_refs': [
+            *(item.model_dump(mode='json') for item in plan.input_refs),
+            *additions,
+        ],
+    })
 
 
 def required_replay_evidence_gaps(

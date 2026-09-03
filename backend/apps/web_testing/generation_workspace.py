@@ -122,6 +122,7 @@ def variable_definitions_for_scenario_plan(plan: Any) -> list[dict[str, Any]]:
     for spec in getattr(plan, 'input_refs', ()):
         name = validate_variable_name(getattr(spec, 'name', ''))
         source = str(getattr(spec, 'source', ''))
+        value_kind = str(getattr(spec, 'value_kind', 'text'))
         credential_slot = str(getattr(spec, 'credential_slot', ''))
         current = definitions.get(name)
         if current is not None:
@@ -138,7 +139,9 @@ def variable_definitions_for_scenario_plan(plan: Any) -> list[dict[str, Any]]:
         definitions[name] = {
             'name': name,
             'value': '',
-            'is_secret': source == 'credential' and credential_slot == 'password',
+            'is_secret': value_kind == 'password' or (
+                source == 'credential' and credential_slot == 'password'
+            ),
             'required': source in {'runtime', 'credential'},
             'description': descriptions[source],
             '_source': source,

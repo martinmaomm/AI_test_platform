@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from django.test import SimpleTestCase, override_settings
 
-from .exploration_trace import ExplorationTrace, ExplorationTraceRecorder, FinalizedAction, FinalizedAssertion
+from .exploration_trace import ExplorationTrace, ExplorationTraceRecorder, FinalizedAction, FinalizedAssertion, effective_scenario_plan
 from .generation_contracts import GenerationContractError, ScenarioPlan
-from .mcp_page_explorer import MCPPageExplorer, build_finalization_tools
+from .generation_workspace import variable_definitions_for_scenario_plan
+from .mcp_page_explorer import (
+    MCP_FINALIZATION_BROWSER_CALL_LIMIT,
+    FinalizationOnlyBrowserToolError,
+    MCPPageExplorer,
+    ReadOnlyMCPBrowserToolGuard,
+    build_dynamic_input_tools,
+    build_finalization_tools,
+)
 from .replay_plan import PythonReplayCompiler, ReplayPlanner
+from .script_generator import ScriptGenerator
 
 
 def plan_payload(*, cleanup=False, **overrides):
@@ -138,6 +148,122 @@ class FinalizationTraceTests(SimpleTestCase):
         self.assertNotIn('runtime-item', encoded)
         self.assertEqual(summary['events'][1]['input_refs'], ['ITEM_NAME'])
         self.assertEqual(summary['candidate_sequence'], 2)
+
+    def test_dynamic_generated_input_is_redacted_and_compiles_by_value_kind(self):
+        plan = ScenarioPlan.model_validate(plan_payload(
+            success_criteria=['结果区域可见'],
+            assertion_requirements=[{
+                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                'kind': 'visible', 'input_ref': '', 'literal': '',
+            }],
+            input_refs=[],
+        ))
+        driver = Driver(plan)
+        tool = build_dynamic_input_tools(
+            driver.recorder, lambda value_kind: f'private-{value_kind}-value',
+        )[0]
+        declared = tool.invoke({'value_kind': 'email'})
+        driver.event('playwright_navigate', {'url': 'https://example.test/'}, 'ok')
+        driver.event('playwright_fill', {'selector': '#new-field', 'value': declared['value']}, 'filled')
+        driver.event('playwright_click', {'selector': '#submit'}, 'clicked')
+        driver.event('playwright_get_visible_html', {'selector': '#result'}, '<main>saved</main>')
+        driver.finalize(
+            [('E000002', '填写动态输入'), ('E000003', '提交')], [('A1', 'E000004')],
+        )
+        trace = driver.build()
+        encoded = trace.model_dump_json()
+        self.assertIn('DYNAMIC_INPUT_1', encoded)
+        self.assertIn('"value_kind":"email"', encoded)
+        self.assertNotIn(declared['value'], encoded)
+        effective_plan = effective_scenario_plan(plan, trace)
+        self.assertEqual(
+            [(item.name, item.source, item.value_kind) for item in effective_plan.input_refs],
+            [('DYNAMIC_INPUT_1', 'generated', 'email')],
+        )
+        replay = ReplayPlanner.build(plan, trace)
+        self.assertEqual(replay.input_value_kinds, {'DYNAMIC_INPUT_1': 'email'})
+        source = PythonReplayCompiler.compile(plan, trace, replay)
+        self.assertIn('value_kind == "email"', source)
+        self.assertIn('@example.com', source)
+        self.assertIn('hashlib.sha256(ref.encode("utf-8")).hexdigest()[:8]', source)
+        self.assertNotIn(declared['value'], source)
+        generated_source, generated_replay = ScriptGenerator().generate(
+            plan=effective_plan, trace=trace,
+        )
+        self.assertEqual(generated_replay.input_sources, {'DYNAMIC_INPUT_1': 'generated'})
+        self.assertEqual(generated_source.count("'DYNAMIC_INPUT_1'"), 3)
+        self.assertEqual(
+            len(effective_scenario_plan(effective_plan, trace).input_refs), 1,
+        )
+        conflicting_plan = ScenarioPlan.model_validate(plan_payload(
+            success_criteria=['结果区域可见'],
+            assertion_requirements=[{
+                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                'kind': 'visible', 'input_ref': '', 'literal': '',
+            }],
+            input_refs=[{'name': 'DYNAMIC_INPUT_1', 'source': 'runtime'}],
+        ))
+        with self.assertRaisesRegex(GenerationContractError, 'DYNAMIC_INPUT_CONFLICT'):
+            effective_scenario_plan(conflicting_plan, trace)
+
+    def test_default_generated_values_are_short_and_email_is_valid_example_com(self):
+        explorer = MCPPageExplorer(
+            llm_model=Mock(), mcp_config={'mcpServers': {}}, generation_id=str(uuid4()),
+        )
+        long_ref = 'A' * 128
+        text = explorer._generated_runtime_value('text', long_ref)
+        email = explorer._generated_runtime_value('email', long_ref)
+        self.assertLessEqual(len(text), 32)
+        self.assertLessEqual(len(email), 64)
+        self.assertRegex(email, r'^aits-[0-9a-f]{8}-[0-9a-f]{16}@example\.com$')
+
+    def test_declared_but_unselected_dynamic_input_does_not_pollute_effective_plan_or_script(self):
+        plan = ScenarioPlan.model_validate(plan_payload(
+            success_criteria=['结果区域可见'],
+            assertion_requirements=[{
+                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                'kind': 'visible', 'input_ref': '', 'literal': '',
+            }],
+            input_refs=[],
+        ))
+        driver = Driver(plan)
+        declared = build_dynamic_input_tools(
+            driver.recorder, lambda _value_kind: 'private-password-value',
+        )[0].invoke({'value_kind': 'password'})
+        driver.event('playwright_navigate', {'url': 'https://example.test/'}, 'ok')
+        driver.event('playwright_click', {'selector': '#submit'}, 'clicked')
+        driver.event('playwright_get_visible_html', {'selector': '#result'}, '<main>saved</main>')
+        driver.finalize([('E000002', '提交')], [('A1', 'E000003')])
+        trace = driver.build()
+        effective_plan = effective_scenario_plan(plan, trace)
+        self.assertFalse(effective_plan.input_refs)
+        self.assertEqual(variable_definitions_for_scenario_plan(effective_plan), [])
+        self.assertNotIn(declared['name'], PythonReplayCompiler.compile(
+            plan, trace, ReplayPlanner.build(plan, trace),
+        ))
+
+    def test_dynamic_password_is_secret_in_workspace_and_value_kinds_are_compiled(self):
+        for value_kind in ('text', 'email', 'password', 'integer'):
+            with self.subTest(value_kind=value_kind):
+                plan = ScenarioPlan.model_validate(plan_payload(
+                    input_refs=[{'name': 'ITEM_NAME', 'source': 'generated', 'value_kind': value_kind}],
+                ))
+                driver = Driver(plan)
+                driver.complete_main()
+                driver.finalize(
+                    [('E000002', '填写测试值'), ('E000003', '提交')], [('A1', 'E000004')],
+                )
+                replay = ReplayPlanner.build(plan, driver.build())
+                self.assertEqual(replay.input_value_kinds['ITEM_NAME'], value_kind)
+        password_plan = ScenarioPlan.model_validate(plan_payload(input_refs=[{
+            'name': 'DYNAMIC_INPUT_1', 'source': 'generated', 'value_kind': 'password',
+        }], success_criteria=['结果区域可见'], assertion_requirements=[{
+            'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+            'kind': 'visible', 'input_ref': '', 'literal': '',
+        }]))
+        definitions = variable_definitions_for_scenario_plan(password_plan)
+        self.assertEqual(definitions[0]['value'], '')
+        self.assertTrue(definitions[0]['is_secret'])
 
     def test_finalization_requires_current_candidate_summary(self):
         plan = ScenarioPlan.model_validate(plan_payload())
@@ -288,4 +414,32 @@ class SingleAgentExplorerTests(SimpleTestCase):
         self.assertEqual((client.opened, client.closed), (1, 1))
         self.assertEqual((Agent.created, Agent.registrations, Agent.runs), (1, 1, 1))
         self.assertIn('finalization_protocol', Agent.prompt)
+        self.assertIn('aits_declare_generated_input', Agent.prompt['finalization_protocol']['input_rule'])
         self.assertFalse(trace.replay_event_ids)
+
+
+class FinalizationOnlyBudgetTests(SimpleTestCase):
+    def test_finalization_only_budget_is_recoverable_then_bounded(self):
+        guard = ReadOnlyMCPBrowserToolGuard(max_tool_calls=63)
+        for index in range(MCP_FINALIZATION_BROWSER_CALL_LIMIT):
+            run_id = f'read-{index}'
+            guard.on_tool_start({'name': 'playwright_get_visible_text'}, '', run_id=run_id, inputs={})
+            guard.on_tool_end('page state', run_id=run_id)
+        with self.assertRaises(FinalizationOnlyBrowserToolError):
+            guard.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id='soft-1', inputs={})
+        self.assertIsNone(guard.terminal_error)
+        self.assertTrue(guard.get_stats()['finalization_only_mode'])
+        self.assertEqual(guard.get_stats()['total_tool_calls'], MCP_FINALIZATION_BROWSER_CALL_LIMIT)
+        explorer = MCPPageExplorer(
+            llm_model=Mock(), mcp_config={'mcpServers': {}}, generation_id=str(uuid4()),
+        )
+        explorer.guard = guard
+        async def await_local_finalization_window():
+            task = asyncio.create_task(asyncio.sleep(0))
+            await explorer._await_task(task, time.monotonic() + 1, '/')
+        asyncio.run(await_local_finalization_window())
+        with self.assertRaises(FinalizationOnlyBrowserToolError):
+            guard.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id='soft-2', inputs={})
+        with self.assertRaisesRegex(Exception, '连续忽略收尾提示'):
+            guard.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id='hard', inputs={})
+        self.assertEqual(guard.terminal_error.error_kind, 'finalization_browser_budget_exhausted')

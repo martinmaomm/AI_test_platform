@@ -4,7 +4,7 @@
 
 - 状态：已实施，待真实页面验收
 - 日期：2026-09-02
-- 范围：WebUI 生成任务的连续探索、callback 轨迹、最终路径定稿、确定性 Python 编译、工作区保存门禁
+- 范围：WebUI 生成任务的连续探索、动态 generated 输入、callback 轨迹、最终路径定稿、确定性 Python 编译、工作区保存门禁
 - 非范围：真实数据库记录、真实网页、运行中的 Celery 任务、网站专属字段或按钮词表
 - 数据策略：保持 `schema_version=4`；移除旧 checkpoint 字段后由 `extra=forbid` 拒绝旧 v4 payload，不提供双读或兼容 shim，也无需迁移
 
@@ -15,7 +15,7 @@
 ## 目标流程
 
 ```text
-ScenarioPlan
+ScenarioPlan（解析边界机械规范化 assertion 形状）
   → 一个 MCP Client、一个浏览器会话、一个 MCPAgent、一次 agent.run
   → 自动记录所有 Playwright callback（成功、失败、绕路均保留）
   → 同一 Agent 读取安全候选摘要
@@ -31,9 +31,24 @@ ScenarioPlan
 1. 每个任务只创建一个 MCP Client、一个浏览器会话、一个 `MCPAgent`，并只调用一次 `agent.run`。
 2. Agent 连续完成登录、导航、操作、验证和清理；中间不自动回到 `start_path`。
 3. 平台为同一个 Agent 注册两个本地 `StructuredTool`：`aits_get_path_candidates` 与 `aits_finalize_path`。输入由 Pydantic 模型验证，不解析脆弱 JSON 文本。
-4. `aits_get_path_candidates` 只返回安全字段：事件 ID、顺序、动作、相对路径、安全 locator/input refs、安全观察摘要、可编译标记和 unmapped fill/select 标记，以及本次摘要绑定的最新 callback sequence。凭据、完整 URL、运行时值不返回。
-5. Agent 接近结束时先读候选，再一次提交有序主动作、每个 `assertion_id` 的观察事件、可选清理动作和短中文步骤名。定稿只能使用已读取且 sequence 未过期的候选摘要；首次成功 navigate 不由 Agent 选择，平台自动加入为可信入口。
-6. 定稿成功后任一 Playwright callback 都使定稿变为 `FINALIZATION_STALE`，同时使旧候选摘要过期；必须再次读取候选并重新定稿。
+4. 同一 Agent 还可调用 `aits_declare_generated_input(value_kind)`，仅在发现 ScenarioPlan 之外的必填字段时取得平台命名的 `DYNAMIC_INPUT_n` 与本次会话值；工具不接受网站字段名，value kind 仅为 `text`、`email`、`password`、`integer`。
+5. `aits_get_path_candidates` 只返回安全字段：事件 ID、顺序、动作、相对路径、安全 locator/input refs、安全观察摘要、可编译标记和 unmapped fill/select 标记，以及本次摘要绑定的最新 callback sequence。凭据、完整 URL、运行时值不返回。
+6. Agent 接近结束时先读候选，再一次提交有序主动作、每个 `assertion_id` 的观察事件、可选清理动作和短中文步骤名。定稿只能使用已读取且 sequence 未过期的候选摘要；首次成功 navigate 不由 Agent 选择，平台自动加入为可信入口。
+7. 定稿成功后任一实际 Playwright callback 都使定稿变为 `FINALIZATION_STALE`，同时使旧候选摘要过期；必须再次读取候选并重新定稿。
+
+## 模型计划规范化与动态输入
+
+`ScenarioPlan` 模型仍严格验证。仅在模型 JSON 进入解析边界时执行确定性字段规范化，并对初次输出和一次修复输出同样生效：`visible` 清空 `input_ref`/`literal`；`*_ref` 清空 literal，若只有 literal 则切换为对应 `*_literal`；`*_literal` 清空 input ref，若只有 input ref 则切换为对应 `*_ref`。非 visible 的两个字段都为空时不猜测，仍触发既有一次修复或失败。
+
+动态变量的实际值只存在于当前 MCPAgent 运行内存和浏览器 callback 入参中，轨迹、日志、数据库、最终计划、工作区与脚本只保留 `name`、`source=generated`、`value_kind` 和 `{{REF}}`。credential 与 generated 严格隔离，动态声明不能创建或替代登录凭据。
+
+轨迹会记录全部动态声明的安全定义，但只有最终定稿 `fill/select` 实际引用的动态 ref 才合并进有效 plan、ReplayPlan、Python 编译和工作区变量；声明后放弃的字段不会污染生成脚本。有效计划合并是幂等的：同名同定义跳过，冲突定义安全失败。预先 ScenarioPlan 声明的 generated/credential 继续按既有规则必须在主路径覆盖。`value_kind=password` 的 generated 变量在工作区标记 `is_secret=true`，不会持久化覆盖值；脚本运行时可接受一次性覆盖，未覆盖则按 value kind 自动生成合法新值；email 默认值使用 `example.com` 域名。
+
+## 预算与收尾
+
+`MCP_MAX_STEPS=100`。浏览器硬上限为 72 次，其中 60 次为有效探索预算。到达第 60 次后，浏览器工具调用返回可恢复的收尾提示，不写入 `guard.terminal_error`，因此同一个 Agent 可继续调用候选和定稿工具；连续 3 次无视提示仍请求浏览器时，才以有界 `finalization_browser_budget_exhausted` 终止。`tool_stats` 明确包含 `finalization_only_mode`、拦截次数与收尾浏览器预算；未定稿仍以 `FINALIZATION_REQUIRED` 阻断草稿，避免与普通 `tool_budget` 混淆。
+
+成功动作后优先单次目标 visible-text 观察；仅当可见文本不足以定位或验证时读取 HTML，且不重复读取未变化页面。必要异步状态复查仍由 Agent 按实际页面状态决定。
 
 ## 轨迹与定稿契约
 
@@ -56,7 +71,7 @@ ScenarioPlan
 
 - 没有成功入口 navigate，未知 ID、重复 ID，或事件顺序不递增；
 - 动作不成功、不是可回放交互、定位器缺失/fragile/不可编译；
-- `fill` 或 `select` 未精确映射到 `runtime_input_values` 中 ScenarioPlan 已声明的 input ref；
+- `fill` 或 `select` 未精确映射到 `runtime_input_values` 中 ScenarioPlan 已声明的 input ref，或同一 Agent 用动态声明工具创建的 generated ref；
 - 未先读取候选、候选摘要已被后续 callback 淘汰，或 `press` 缺少非空 key；
 - 主路径未覆盖 ScenarioPlan 的所有 `generated` / `credential` input ref（清理路径不能代替登录或建数输入）；每个引用 input ref 的 assertion 前没有选中的 `fill` / `select` 动作提供该 ref；
 - assertion 未覆盖每个 requirement，未指向带 selector 的成功 observation，或观察摘要不满足 visible/contains/not_contains；
@@ -79,11 +94,11 @@ ScenarioPlan
 2. 首次成功 navigate 自动进入 replay，并成为 `page.goto('/')` 的第一个浏览器动作。
 3. 未知、失败、fragile、unmapped fill/select、重复、乱序事件被拒绝。
 4. 定稿前必须读取最新候选摘要；后续 callback 后旧摘要不能再次定稿。
-5. 每条 requirement 都绑定真实 selector observation，且语义满足；`generated` / `credential` 输入和 assertion 输入依赖不得遗漏。
+5. 每条 requirement 都绑定真实 selector observation，且语义满足；预声明 `generated` / `credential` 输入和 assertion 输入依赖不得遗漏，动态 ref 仅在被最终路径实际使用时进入有效计划。
 6. 缺失/无效定稿不产草稿、不允许保存，轨迹和明确错误仍保留。
 7. 定稿后新增 callback 自动失效。
 8. 同任务维持 one client / one agent / one run，无第二模型调用。
-9. 凭据、完整 URL、运行时敏感值不进入候选摘要、轨迹或脚本。
+9. 凭据、完整 URL、运行时敏感值不进入候选摘要、轨迹或脚本；动态 generated/password 工作区变量也不持久化值。
 10. cleanup 仅在真实成功动作且后续语义验证时完成。
 11. 后端离线全套、前端单测与构建、`git diff --check` 通过。
 

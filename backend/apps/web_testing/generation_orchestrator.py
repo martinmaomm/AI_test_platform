@@ -11,7 +11,7 @@ from django.core.cache import cache
 from ai_core.model_manager import get_llm_manager
 
 from .exploration_timeout import exploration_total_timeout_seconds
-from .exploration_trace import ExplorationTrace, coerce_trace, required_replay_evidence_gaps, trace_has_minimum_page_state
+from .exploration_trace import ExplorationTrace, coerce_trace, effective_scenario_plan, required_replay_evidence_gaps, trace_has_minimum_page_state
 from .generation_contracts import GenerationContractError, ScenarioInputInsufficientError, ScenarioPlan, is_terminal_status
 from .generation_events import publish_stage_changed, publish_terminal
 from .generation_preflight import environment_credentials, run_safety_preflight
@@ -102,10 +102,11 @@ def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, tr
         updates={'exploration_snapshot': trace.model_dump(mode='json'), 'tool_stats': trace.tool_stats},
     )
     publish_stage_changed(generation, '检查脚本')
+    effective_plan = effective_scenario_plan(plan, trace)
     evidence_gaps = required_replay_evidence_gaps(trace, plan)
     if evidence_gaps:
         workspace = workspace_for_generation(generation)
-        workspace['variables'] = variable_definitions_for_scenario_plan(plan)
+        workspace['variables'] = variable_definitions_for_scenario_plan(effective_plan)
         code = trace.finalization.error_code or 'FINALIZATION_REQUIRED'
         completed = transition_generation(
             generation.pk, WebUIScriptGeneration.Status.NEEDS_REVIEW, progress=100,
@@ -124,8 +125,8 @@ def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, tr
         )
         publish_terminal(completed)
         return {'generation_id': str(completed.pk), 'status': completed.status, 'quality_status': 'blocked', 'error_code': completed.error_code}
-    script, replay_plan = ScriptGenerator().generate(plan=plan, trace=trace)
-    report = evaluate_script(script, plan=plan, trace=trace, replay_plan=replay_plan)
+    script, replay_plan = ScriptGenerator().generate(plan=effective_plan, trace=trace)
+    report = evaluate_script(script, plan=effective_plan, trace=trace, replay_plan=replay_plan)
     blockers = blocker_issues(report)
     incomplete = not replay_plan.actions
     if blockers:
@@ -141,7 +142,7 @@ def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, tr
         status = WebUIScriptGeneration.Status.READY_WITH_WARNINGS if report['warnings'] else WebUIScriptGeneration.Status.READY
         error_code = error_message = ''
     workspace = workspace_for_generation(generation)
-    workspace['variables'] = variable_definitions_for_scenario_plan(plan)
+    workspace['variables'] = variable_definitions_for_scenario_plan(effective_plan)
     warnings = [item['message'] for item in report['warnings']]
     warnings.extend(f"{item['event_id']}：{item['reason']}" for item in evidence_gaps)
     completed = transition_generation(

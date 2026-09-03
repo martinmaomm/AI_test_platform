@@ -740,3 +740,60 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertEqual(result['quality_status'], 'blocked')
         self.assertEqual(generation.error_code, 'FINALIZATION_REQUIRED')
         self.assertEqual(generation.script_draft, '')
+
+    def test_compile_persisted_generates_dynamic_input_script_and_workspace_without_value_leak(self):
+        from .generation_orchestrator import _compile_persisted
+
+        actual_value = 'dynamic-value-should-not-persist@example.com'
+        plan = ScenarioPlan.model_validate({
+            **plan_payload(),
+            'success_criteria': ['结果区域可见'],
+            'assertion_requirements': [{
+                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                'kind': 'visible', 'input_ref': '', 'literal': '',
+            }],
+            'input_refs': [],
+        })
+        recorder = ExplorationTraceRecorder('/items')
+        recorder.configure_plan(plan)
+        recorder.configure_runtime({}, plan.input_sources())
+        dynamic = recorder.declare_dynamic_input(
+            value_kind='email', runtime_value=actual_value,
+        )
+        record(recorder, 'navigate', 'playwright_navigate', {
+            'url': 'https://web.example.test/items',
+        }, 'URL: https://web.example.test/items')
+        record(recorder, 'fill', 'playwright_fill', {
+            'selector': '#dynamic', 'value': actual_value,
+        }, 'filled')
+        record(recorder, 'assert', 'playwright_get_visible_html', {
+            'selector': '#result',
+        }, '<main>saved</main>')
+        recorder.candidate_summary()
+        recorder.finalize_path(
+            main_actions=[FinalizedAction(event_id='E000002', step_name='填写动态输入')],
+            assertions=[FinalizedAssertion(assertion_id='A1', event_id='E000003')],
+            cleanup_actions=[],
+        )
+        trace = recorder.build(tool_stats={'total_tool_calls': 3})
+        generation = self.make_generation(
+            status=WebUIScriptGeneration.Status.GENERATING,
+            current_stage=WebUIScriptGeneration.Stage.GENERATING,
+            scenario_spec=plan.model_dump(mode='json'),
+        )
+        with patch('web_testing.generation_orchestrator.publish_stage_changed'), patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ):
+            result = _compile_persisted(generation, plan, trace)
+        generation.refresh_from_db()
+        self.assertIn(result['status'], {
+            WebUIScriptGeneration.Status.READY,
+            WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
+        })
+        self.assertIn('DYNAMIC_INPUT_1', generation.script_draft)
+        self.assertIn('@example.com', generation.script_draft)
+        self.assertNotIn(actual_value, generation.script_draft)
+        self.assertNotIn(actual_value, str(generation.exploration_snapshot))
+        variables = {item['name']: item for item in generation.workspace['variables']}
+        self.assertEqual(variables[dynamic.name]['value'], '')
+        self.assertFalse(variables[dynamic.name]['is_secret'])

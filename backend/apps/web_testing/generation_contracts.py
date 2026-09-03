@@ -16,7 +16,7 @@ SCENARIO_PLAN_SCHEMA_VERSION = 4
 _SAFE_DIAGNOSTIC_PATH_SEGMENTS = frozenset({
     'schema_version', 'title', 'objective', 'instructions', 'success_criteria',
     'assertion_requirements', 'assertion_id', 'criterion_index', 'phase', 'kind',
-    'input_ref', 'literal', 'input_refs', 'name', 'source', 'credential_slot',
+    'input_ref', 'literal', 'input_refs', 'name', 'source', 'value_kind', 'credential_slot',
     'preconditions', 'forbidden_actions', 'credentials_required',
     'allow_test_data_writes', 'cleanup_expected', 'discovery_notes', 'risk_level',
 })
@@ -43,6 +43,7 @@ _SAFE_CUSTOM_ERROR_TYPES = (
     ('credential input ref 必须声明 credential_slot', 'credential_slot_missing'),
     ('仅 credential input ref 可以声明 credential_slot', 'unexpected_credential_slot'),
     ('credential ref 必须命名为', 'credential_ref_name_invalid'),
+    ('credential ref 的 value_kind 必须为', 'credential_value_kind_invalid'),
     ('字段必须是数组', 'list_field_required'),
     ('input_refs 必须是数组', 'input_refs_list_required'),
 )
@@ -120,7 +121,21 @@ class InputSpec(_StrictContract):
     """One explicit runtime input; its value never belongs in persisted JSON."""
     name: str = Field(min_length=1, max_length=128)
     source: str = Field(pattern=r'^(?:generated|runtime|credential)$')
+    value_kind: str = Field(default='text', pattern=r'^(?:text|email|password|integer)$')
     credential_slot: str = Field(default='', pattern=r'^(?:|username|password)$')
+
+    @model_validator(mode='before')
+    @classmethod
+    def _default_credential_value_kind(cls, value):
+        if not isinstance(value, dict):
+            return value
+        if (
+            value.get('source') == 'credential'
+            and value.get('credential_slot') == 'password'
+            and 'value_kind' not in value
+        ):
+            return {**value, 'value_kind': 'password'}
+        return value
 
     @field_validator('name', mode='before')
     @classmethod
@@ -140,6 +155,9 @@ class InputSpec(_StrictContract):
             expected = {'username': 'UI_TEST_USERNAME', 'password': 'UI_TEST_PASSWORD'}[self.credential_slot]
             if self.name != expected:
                 raise ValueError(f'{self.credential_slot} credential ref 必须命名为 {expected}')
+            expected_value_kind = 'password' if self.credential_slot == 'password' else 'text'
+            if self.value_kind != expected_value_kind:
+                raise ValueError(f'{self.credential_slot} credential ref 的 value_kind 必须为 {expected_value_kind}')
         return self
 
 
@@ -176,7 +194,7 @@ class ScenarioPlan(_StrictContract):
     instructions: list[str] = Field(min_length=1, max_length=40)
     success_criteria: list[str] = Field(min_length=1, max_length=20)
     assertion_requirements: list[AssertionRequirement] = Field(min_length=1, max_length=20)
-    input_refs: list[InputSpec] = Field(default_factory=list, max_length=20)
+    input_refs: list[InputSpec] = Field(default_factory=list, max_length=40)
     preconditions: list[str] = Field(default_factory=list, max_length=20)
     forbidden_actions: list[str] = Field(default_factory=list, max_length=30)
     credentials_required: bool = False
@@ -310,11 +328,52 @@ def _parse_scenario_plan_candidate(candidate: str) -> ScenarioPlan:
         },)
         raise GenerationContractError('scenario_plan_invalid', diagnostics=diagnostics) from exc
     try:
-        return ScenarioPlan.model_validate(payload)
+        return ScenarioPlan.model_validate(_normalize_assertion_requirement_shapes(payload))
     except ValidationError as exc:
         raise GenerationContractError(
             'scenario_plan_invalid', diagnostics=_safe_diagnostics(exc),
         ) from exc
+
+
+def _normalize_assertion_requirement_shapes(payload: Any) -> Any:
+    """Mechanically repair mutually-exclusive assertion fields before validation.
+
+    This deliberately only resolves contradictory ``kind``/field polarity.  It
+    never invents a missing value or turns an otherwise ambiguous assertion
+    into a valid one, so the strict contract and its one model repair remain
+    the semantic authority.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    requirements = payload.get('assertion_requirements')
+    if not isinstance(requirements, list):
+        return payload
+    normalized = dict(payload)
+    items: list[Any] = []
+    for raw in requirements:
+        if not isinstance(raw, dict):
+            items.append(raw)
+            continue
+        item = dict(raw)
+        kind = item.get('kind')
+        input_ref = str(item.get('input_ref') or '')
+        literal = str(item.get('literal') or '')
+        if kind == 'visible':
+            item['input_ref'] = ''
+            item['literal'] = ''
+        elif kind in {'contains_ref', 'not_contains_ref'}:
+            item['literal'] = ''
+            if not input_ref and literal:
+                item['kind'] = kind.replace('_ref', '_literal')
+                item['literal'] = literal
+        elif kind in {'contains_literal', 'not_contains_literal'}:
+            item['input_ref'] = ''
+            if not literal and input_ref:
+                item['kind'] = kind.replace('_literal', '_ref')
+                item['input_ref'] = input_ref
+        items.append(item)
+    normalized['assertion_requirements'] = items
+    return normalized
 
 
 def parse_scenario_plan_json(

@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .exploration_trace import AssertionEvidence, ExplorationTrace
+from .exploration_trace import AssertionEvidence, ExplorationTrace, effective_scenario_plan
 from .generation_contracts import GenerationContractError, ScenarioPlan
 
 _TEMPLATE_REF_RE = re.compile(r'\{\{([A-Z_][A-Z0-9_]*)\}\}')
@@ -63,6 +63,7 @@ class ReplayPlan(BaseModel):
     cleanup_steps: list[ReplayStep] = Field(default_factory=list)
     assertion_event_ids: list[str] = Field(default_factory=list)
     input_sources: dict[str, str] = Field(default_factory=dict)
+    input_value_kinds: dict[str, str] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
     @model_validator(mode='after')
@@ -211,6 +212,7 @@ class ReplayPlanner:
 
     @staticmethod
     def build(plan: ScenarioPlan, trace: ExplorationTrace) -> ReplayPlan:
+        plan = effective_scenario_plan(plan, trace)
         warnings = list(trace.warnings)
         actions = [
             ReplayPlanner._action(event_id=event_id, plan=plan, trace=trace)
@@ -255,6 +257,7 @@ class ReplayPlanner:
             cleanup_steps=cleanup_steps,
             assertion_event_ids=[item.event_id for item in compiled_assertions],
             input_sources=plan.input_sources(),
+            input_value_kinds={item.name: item.value_kind for item in plan.input_refs},
             warnings=list(dict.fromkeys(warnings)),
         )
 
@@ -281,14 +284,16 @@ class PythonReplayCompiler:
                 ensure_ascii=False,
             ),
             '',
+            'import hashlib',
             'import re',
+            'import secrets',
             'import time',
             'from playwright.async_api import expect',
             '',
             'async def run(page, variables):',
             '    variables = variables or {}',
             '    resolved_values = {}',
-            '    def _value_for(ref, source):',
+            '    def _value_for(ref, source, value_kind):',
             '        if ref in resolved_values:',
             '            return resolved_values[ref]',
             '        supplied = variables.get(ref)',
@@ -297,7 +302,16 @@ class PythonReplayCompiler:
             '            return resolved_values[ref]',
             '        if source in {"runtime", "credential"}:',
             '            raise RuntimeError(f"required runtime variable {ref} is missing")',
-            '        resolved_values[ref] = f"aits-{ref.lower()}-{time.time_ns()}"',
+            '        scope = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:8]',
+            '        token = secrets.token_hex(6)',
+            '        if value_kind == "email":',
+            '            resolved_values[ref] = f"aits-{scope}-{token}@example.com"',
+            '        elif value_kind == "password":',
+            '            resolved_values[ref] = f"Aits!{token}9"',
+            '        elif value_kind == "integer":',
+            '            resolved_values[ref] = str((time.time_ns() % 900000) + 100000)',
+            '        else:',
+            '            resolved_values[ref] = f"aits-{scope}-{token}"',
             '        return resolved_values[ref]',
             '    def _source_for(ref):',
         ]
@@ -308,15 +322,24 @@ class PythonReplayCompiler:
             ])
         lines.extend([
             '        raise RuntimeError(f"unknown runtime variable {ref}")',
+            '    def _value_kind_for(ref):',
+        ])
+        for ref, value_kind in sorted(replay_plan.input_value_kinds.items()):
+            lines.extend([
+                f'        if ref == {ref!r}:',
+                f'            return {value_kind!r}',
+            ])
+        lines.extend([
+            '        raise RuntimeError(f"unknown runtime variable {ref}")',
             '    def _resolve_template(value):',
             '        if isinstance(value, str):',
             '            full = re.fullmatch(r"\\{\\{([A-Z_][A-Z0-9_]*)\\}\\}", value)',
             '            if full:',
             '                ref = full.group(1)',
-            '                return _value_for(ref, _source_for(ref))',
+            '                return _value_for(ref, _source_for(ref), _value_kind_for(ref))',
             '            return re.sub(',
             '                r"\\{\\{([A-Z_][A-Z0-9_]*)\\}\\}",',
-            '                lambda match: _value_for(match.group(1), _source_for(match.group(1))),',
+            '                lambda match: _value_for(match.group(1), _source_for(match.group(1)), _value_kind_for(match.group(1))),',
             '                value,',
             '            )',
             '        if isinstance(value, dict):',
@@ -338,13 +361,13 @@ class PythonReplayCompiler:
                 action_number += 1
                 lines.extend(PythonReplayCompiler._action_lines(
                     step, evidence[step.evidence_id], action_number,
-                    replay_plan.input_sources, body_indent, label='步骤',
+                    replay_plan.input_sources, replay_plan.input_value_kinds, body_indent, label='步骤',
                 ))
             else:
                 assertion_number += 1
                 lines.extend(PythonReplayCompiler._assertion_lines(
                     step, evidence[step.evidence_id], assertion_number,
-                    replay_plan.input_sources, body_indent,
+                    replay_plan.input_sources, replay_plan.input_value_kinds, body_indent,
                 ))
         if replay_plan.cleanup_actions:
             if not replay_plan.main_steps:
@@ -357,13 +380,13 @@ class PythonReplayCompiler:
                     cleanup_action_number += 1
                     lines.extend(PythonReplayCompiler._action_lines(
                         step, evidence[step.evidence_id], cleanup_action_number,
-                        replay_plan.input_sources, '        ', label='清理',
+                        replay_plan.input_sources, replay_plan.input_value_kinds, '        ', label='清理',
                     ))
                 else:
                     cleanup_assertion_number += 1
                     lines.extend(PythonReplayCompiler._assertion_lines(
                         step, evidence[step.evidence_id], cleanup_assertion_number,
-                        replay_plan.input_sources, '        ', label='清理验证',
+                        replay_plan.input_sources, replay_plan.input_value_kinds, '        ', label='清理验证',
                     ))
         return '\n'.join(lines) + '\n'
 
@@ -397,6 +420,7 @@ class PythonReplayCompiler:
         item,
         number: int,
         input_sources: dict[str, str],
+        input_value_kinds: dict[str, str],
         indent: str,
         *,
         label: str,
@@ -415,7 +439,7 @@ class PythonReplayCompiler:
             method = 'fill' if action.action == 'fill' else 'select_option'
             lines.append(
                 f'{indent}await {locator}.{method}('
-                f'_value_for({ref!r}, {input_sources[ref]!r})'
+                f'_value_for({ref!r}, {input_sources[ref]!r}, {input_value_kinds[ref]!r})'
                 f'{PythonReplayCompiler._kwargs(arguments)})'
             )
         elif action.action == 'press':
@@ -439,6 +463,7 @@ class PythonReplayCompiler:
         item,
         number: int,
         input_sources: dict[str, str],
+        input_value_kinds: dict[str, str],
         indent: str,
         *,
         label: str = '断言',
@@ -454,7 +479,8 @@ class PythonReplayCompiler:
         if assertion.kind in {'contains_ref', 'not_contains_ref'}:
             expected = (
                 f'_value_for({assertion.input_ref!r}, '
-                f'{input_sources[assertion.input_ref]!r})'
+                f'{input_sources[assertion.input_ref]!r}, '
+                f'{input_value_kinds[assertion.input_ref]!r})'
             )
         else:
             expected = repr(assertion.literal)

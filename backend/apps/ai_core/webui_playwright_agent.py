@@ -32,8 +32,8 @@ from .mcp_agent_budget import BudgetedMCPAgent as MCPAgent
 
 logger = logging.getLogger(__name__)
 
-MCP_MAX_STEPS = 60
-MCP_BROWSER_TOOL_CALL_LIMIT = 50
+MCP_MAX_STEPS = 100
+MCP_BROWSER_TOOL_CALL_LIMIT = 72
 
 MCP_EXPLORATION_CONSTRAINTS = f"""- 调用 `playwright_navigate` 时必须显式传入 JSON 布尔值 `headless: true`，不得省略，也不得传字符串 `\"true\"`。
 - 所有浏览器工具调用合计最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次；仅在缺少必要页面结构、可见文本或定位器时调用工具。

@@ -23,7 +23,7 @@ from .generation_contracts import (
 from .generation_workspace import variable_definitions_for_scenario_plan
 from .mcp_page_explorer import ReadOnlyMCPBrowserToolGuard
 from .replay_plan import PythonReplayCompiler, ReplayPlanner
-from .requirement_normalizer import RequirementNormalizer
+from .requirement_normalizer import NORMALIZER_SYSTEM_PROMPT, RequirementNormalizer
 from .script_quality import evaluate_script
 
 
@@ -131,6 +131,29 @@ class ScenarioContractRegressionTests(SimpleTestCase):
 
 
 class RequirementNormalizerRegressionTests(SimpleTestCase):
+    def test_normalizer_prompt_requires_typed_inputs_and_safe_credential_kinds(self):
+        self.assertIn('value_kind=text、email、password 或 integer', NORMALIZER_SYSTEM_PROMPT)
+        self.assertIn('UI_TEST_USERNAME 的 value_kind 必须为 text', NORMALIZER_SYSTEM_PROMPT)
+        self.assertIn('UI_TEST_PASSWORD 的 value_kind 必须为 password', NORMALIZER_SYSTEM_PROMPT)
+        self.assertIn('"value_kind":"text"', NORMALIZER_SYSTEM_PROMPT)
+
+    def test_credential_value_kind_diagnostic_is_safe_and_actionable(self):
+        with self.assertRaises(GenerationContractError) as captured:
+            parse_scenario_plan_json(json.dumps(plan_payload(
+                credentials_required=True,
+                input_refs=[
+                    {
+                        'name': 'UI_TEST_USERNAME', 'source': 'credential',
+                        'value_kind': 'text', 'credential_slot': 'username',
+                    },
+                    {
+                        'name': 'UI_TEST_PASSWORD', 'source': 'credential',
+                        'value_kind': 'text', 'credential_slot': 'password',
+                    },
+                ],
+            ), ensure_ascii=False))
+        self.assertEqual(captured.exception.diagnostics[0]['type'], 'credential_value_kind_invalid')
+
     def _normalize(self, description: str, payload: dict):
         manager = Mock()
         manager.current_llm = None
@@ -339,6 +362,52 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         for raw_output in (f'```json\n{payload}\n```', f'模型结果如下：\n{payload}\n请继续'):
             with self.subTest(raw_output=raw_output[:12]):
                 self.assertEqual(parse_scenario_plan_json(raw_output).schema_version, 4)
+
+    def test_assertion_shape_normalization_is_mechanical_and_keeps_contract_strict(self):
+        visible = parse_scenario_plan_json(json.dumps(plan_payload(
+            assertion_requirements=[{
+                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                'kind': 'visible', 'input_ref': 'ITEM_NAME', 'literal': 'ignored',
+            }],
+        ), ensure_ascii=False)).assertion_requirements[0]
+        self.assertEqual((visible.kind, visible.input_ref, visible.literal), ('visible', '', ''))
+
+        for kind, input_ref, literal, expected in (
+            ('contains_ref', 'ITEM_NAME', 'extra', ('contains_ref', 'ITEM_NAME', '')),
+            ('contains_ref', '', 'ready', ('contains_literal', '', 'ready')),
+            ('not_contains_literal', 'ITEM_NAME', '', ('not_contains_ref', 'ITEM_NAME', '')),
+        ):
+            with self.subTest(kind=kind, input_ref=input_ref, literal=literal):
+                requirement = parse_scenario_plan_json(json.dumps(plan_payload(
+                    input_refs=[{'name': 'ITEM_NAME', 'source': 'generated'}],
+                    assertion_requirements=[{
+                        'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                        'kind': kind, 'input_ref': input_ref, 'literal': literal,
+                    }],
+                ), ensure_ascii=False)).assertion_requirements[0]
+                self.assertEqual(
+                    (requirement.kind, requirement.input_ref, requirement.literal), expected,
+                )
+
+        with self.assertRaises(GenerationContractError):
+            parse_scenario_plan_json(json.dumps(plan_payload(
+                assertion_requirements=[{
+                    'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+                    'kind': 'contains_ref', 'input_ref': '', 'literal': '',
+                }],
+            ), ensure_ascii=False))
+
+    def test_assertion_shape_normalization_also_applies_to_the_one_repair_output(self):
+        repaired = plan_payload(assertion_requirements=[{
+            'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
+            'kind': 'contains_ref', 'input_ref': '', 'literal': 'ready',
+        }])
+        plan = parse_scenario_plan_json(
+            json.dumps(plan_payload(schema_version=3), ensure_ascii=False),
+            format_repair=lambda *_args: json.dumps(repaired, ensure_ascii=False),
+        )
+        requirement = plan.assertion_requirements[0]
+        self.assertEqual((requirement.kind, requirement.literal), ('contains_literal', 'ready'))
 
     def test_semantic_repair_receives_field_diagnostics_and_runs_once(self):
         invalid = plan_payload(schema_version=3, title='private title')

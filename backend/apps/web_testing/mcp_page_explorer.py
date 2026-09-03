@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-import re
 import secrets
 import time
 from contextlib import contextmanager
@@ -39,11 +39,11 @@ logger = logging.getLogger(__name__)
 
 EXPLORER_CONSTRAINTS = f"""你负责在一个连续浏览器会话中完成完整测试场景探索，绝不生成 Python、JavaScript 或测试脚本。
 只创建一次连续上下文：按 instructions 顺序登录、导航、操作、验证和清理；业务步骤之间不得回到 start_path，除非确认会话丢失。
-所有 playwright_navigate 调用必须传 JSON 布尔值 headless: true。浏览器工具最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。
+所有 playwright_navigate 调用必须传 JSON 布尔值 headless: true。浏览器工具硬上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。达到探索预算后，立即停止浏览器调用并只用本地定稿工具收尾。
 callback 轨迹是平台唯一事实来源；最终文本不提供事件、选择器、HTML 或脚本。
 平台自动记录每个 Playwright callback；失败、绕路和不稳定定位只用于诊断，绝不可静默删除。接近结束时先调用 aits_get_path_candidates，读取安全候选摘要；随后只调用一次 aits_finalize_path 提交最终主动作、所有 assertion_id 对应的观察事件、可选清理动作及简短中文步骤名。平台自动将首次成功 playwright_navigate 作为入口，不要手工选择 navigate。最终定稿后不得再调用浏览器工具，否则定稿会失效且必须重新定稿。
-只选择成功、顺序递增且有稳定 locator 的真实 callback。fill/select 只有精确匹配 runtime_input_values 已声明 input ref 时才可选择；候选摘要标为 unmapped_input 的事件不可选择。每条 assertion requirement 都必须绑定成功的带 selector observation，且其安全观察摘要确实满足 visible/contains/not_contains 语义。清理动作必须在主场景后，清理验证必须在最后一个清理动作后。
-每次成功操作后观察页面；SPA 路由变化后优先用能返回页面状态/URL 的观察工具确认当前位置。结束前保留验证和清理页面证据。
+只选择成功、顺序递增且有稳定 locator 的真实 callback。fill/select 只有精确匹配 runtime_input_values 或 aits_declare_generated_input 返回的 input ref 时才可选择；候选摘要标为 unmapped_input 的事件不可选择。每条 assertion requirement 都必须绑定成功的带 selector observation，且其安全观察摘要确实满足 visible/contains/not_contains 语义。清理动作必须在主场景后，清理验证必须在最后一个清理动作后。
+发现计划外必填输入时，先调用 aits_declare_generated_input 声明通用动态变量，再原样使用该工具返回的值；不能使用凭据变量或自行猜值代替。每次成功操作后优先一次目标 visible-text 观察；只有可见文本不足以定位或验证时才读取 HTML，不重复读取未变化页面。SPA 路由变化后优先用能返回页面状态/URL 的观察工具确认当前位置。结束前保留验证和清理页面证据。
 不允许审批、付款、发布、上传、下载或未授权外部操作。只在 allow_test_data_writes=true 时操作本轮 namespace 测试数据；结果未知时停止，不得重试。
 runtime_input_values 是平台提供的唯一输入值映射。仅在实际需要填充或选择时原样使用；不得猜测 ref、不得改写值、不得在最终文本中复述这些值。
 提供临时凭据时不要调用截图工具，避免把登录值或会话状态写入图片文件。
@@ -56,7 +56,6 @@ READ_ONLY_DISABLED_TOOL_MESSAGES = {
     'playwright_close': '页面探索不允许关闭浏览器。',
 }
 _HIGH_RISK_MARKERS = ('审批', '付款', '支付', '发布', '上传', '下载', 'approve', 'pay', 'publish', 'upload', 'download')
-_RUNTIME_REF_TOKEN_RE = re.compile(r'[^a-zA-Z0-9_-]+')
 
 
 class FinalizationInput(BaseModel):
@@ -67,6 +66,11 @@ class FinalizationInput(BaseModel):
 
 class CandidateSummaryInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
+
+
+class DynamicGeneratedInputRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    value_kind: str = Field(pattern=r'^(?:text|email|password|integer)$')
 
 
 def build_finalization_tools(recorder: ExplorationTraceRecorder) -> list[StructuredTool]:
@@ -102,17 +106,55 @@ def build_finalization_tools(recorder: ExplorationTraceRecorder) -> list[Structu
     ]
 
 
+def build_dynamic_input_tools(
+    recorder: ExplorationTraceRecorder,
+    value_factory: Callable[[str], str],
+) -> list[StructuredTool]:
+    def declare_generated_input(value_kind: str) -> dict[str, str]:
+        """Declare one discovered required input and return its in-memory value."""
+        runtime_value = value_factory(value_kind)
+        spec = recorder.declare_dynamic_input(
+            value_kind=value_kind, runtime_value=runtime_value,
+        )
+        return {
+            'name': spec.name,
+            'source': spec.source,
+            'value_kind': spec.value_kind,
+            'value': runtime_value,
+        }
+
+    return [StructuredTool.from_function(
+        func=declare_generated_input,
+        name='aits_declare_generated_input',
+        description='声明页面新发现的必填输入，返回仅限本次会话使用的动态变量和值。',
+        args_schema=DynamicGeneratedInputRequest,
+    )]
+
+
+MCP_FINALIZATION_BROWSER_CALL_LIMIT = 60
+MCP_FINALIZATION_IGNORED_BROWSER_CALL_LIMIT = 3
+
+
+class FinalizationOnlyBrowserToolError(RuntimeError):
+    """Recoverable feedback: browser work ended but local finalization remains allowed."""
+
+
 class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
     """Global budget guard that only terminates genuine unknown-write outcomes."""
 
-    def __init__(self, max_tool_calls: int = MCP_BROWSER_TOOL_CALL_LIMIT, *, policy: ExplorationPolicy | None = None, trace_recorder: ExplorationTraceRecorder | None = None):
+    def __init__(self, max_tool_calls: int = MCP_BROWSER_TOOL_CALL_LIMIT, *, finalization_browser_call_limit: int = MCP_FINALIZATION_BROWSER_CALL_LIMIT, policy: ExplorationPolicy | None = None, trace_recorder: ExplorationTraceRecorder | None = None):
         super().__init__(max_tool_calls)
+        if finalization_browser_call_limit <= 0:
+            raise ValueError('finalization browser budget must be positive')
+        self.finalization_browser_call_limit = min(finalization_browser_call_limit, max_tool_calls)
         self.policy = policy or ExplorationPolicy.read_only()
         self.trace_recorder = trace_recorder or ExplorationTraceRecorder()
         self.model_call_count = 0
         self._potential_write_tool_calls = 0
         self._blocked_write_tool_calls = 0
         self._possible_write_runs: set[Any] = set()
+        self._finalization_only_mode = False
+        self._finalization_only_blocked_calls = 0
 
     def on_chat_model_start(self, serialized, messages, **kwargs):
         with self._lock:
@@ -128,6 +170,22 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
         text = json.dumps(inputs, ensure_ascii=False).lower() if isinstance(inputs, dict) else str(input_str or '').lower()
         try:
             with self._lock:
+                if (
+                    self.finalization_browser_call_limit < self.max_tool_calls
+                    and self._is_browser_tool(tool_name)
+                    and self.total_tool_calls >= self.finalization_browser_call_limit
+                ):
+                    self._finalization_only_mode = True
+                    self._finalization_only_blocked_calls += 1
+                    if self._finalization_only_blocked_calls >= MCP_FINALIZATION_IGNORED_BROWSER_CALL_LIMIT:
+                        self._raise_guard(
+                            'finalization_browser_budget_exhausted',
+                            '已进入最终路径定稿阶段，连续忽略收尾提示调用浏览器工具，任务已停止。',
+                            blocked_before_execution=True, tool_name=tool_name,
+                        )
+                    raise FinalizationOnlyBrowserToolError(
+                        '浏览器探索预算已用完；请立即调用 aits_get_path_candidates 和 aits_finalize_path 收尾。'
+                    )
                 if tool_name in READ_ONLY_DISABLED_TOOL_MESSAGES:
                     self._blocked_write_tool_calls += 1
                     self._raise_guard('read_only_violation', READ_ONLY_DISABLED_TOOL_MESSAGES[tool_name], blocked_before_execution=True, tool_name=tool_name)
@@ -142,6 +200,9 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
                         self._blocked_write_tool_calls += 1
                         self._raise_guard('read_only_violation', '当前场景是观察性目标，禁止可能提交表单的操作。', blocked_before_execution=True, tool_name=tool_name)
             return super().on_tool_start(serialized, input_str, inputs=inputs, **kwargs)
+        except FinalizationOnlyBrowserToolError:
+            self.trace_recorder.discard_active(run_id)
+            raise
         except BaseException as exc:
             self.trace_recorder.mark_blocked(serialized, input_str, run_id=run_id, inputs=inputs, error=exc)
             raise
@@ -162,7 +223,13 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
 
     def get_stats(self):
         stats = super().get_stats()
-        stats.update({'potential_write_tool_calls': self._potential_write_tool_calls, 'blocked_write_tool_calls': self._blocked_write_tool_calls})
+        stats.update({
+            'potential_write_tool_calls': self._potential_write_tool_calls,
+            'blocked_write_tool_calls': self._blocked_write_tool_calls,
+            'finalization_only_mode': self._finalization_only_mode,
+            'finalization_only_blocked_calls': self._finalization_only_blocked_calls,
+            'finalization_browser_call_limit': self.finalization_browser_call_limit,
+        })
         return stats
 
 
@@ -220,14 +287,26 @@ class MCPPageExplorer:
                 # executes. Inventing one here would turn an input contract
                 # into persisted-looking test evidence.
                 continue
-            safe_ref = _RUNTIME_REF_TOKEN_RE.sub('-', spec.name).strip('-')[:48] or 'value'
-            runtime_values[spec.name] = f'{self.policy.namespace}-{safe_ref}-{secrets.token_hex(8)}'
+            runtime_values[spec.name] = self._generated_runtime_value(spec.value_kind, spec.name)
         self.trace_recorder.configure_runtime(runtime_values, plan.input_sources())
         self._sensitive_runtime_present = any(
             spec.source == 'credential' and spec.name in runtime_values
             for spec in plan.input_refs
         )
         return runtime_values
+
+    def _generated_runtime_value(self, value_kind: str, name: str = 'value') -> str:
+        scope = hashlib.sha256(
+            f'{self.policy.namespace}:{name}'.encode('utf-8'),
+        ).hexdigest()[:8]
+        token = secrets.token_hex(8)
+        if value_kind == 'email':
+            return f'aits-{scope}-{token}@example.com'
+        if value_kind == 'password':
+            return f'Aits!{token}9'
+        if value_kind == 'integer':
+            return str(secrets.randbelow(900000) + 100000)
+        return f'aits-{scope}-{token}'
 
     async def explore_until_complete(self, *, plan: ScenarioPlan, start_path: str, target_url_safe: str, temporary_credentials: dict[str, str] | None = None) -> ExplorationTrace:
         if await self._is_cancelled():
@@ -251,6 +330,7 @@ class MCPPageExplorer:
             await self._await_task(
                 asyncio.create_task(agent.register_local_tools([
                     *build_finalization_tools(self.trace_recorder),
+                    *build_dynamic_input_tools(self.trace_recorder, self._generated_runtime_value),
                 ])),
                 deadline,
                 start_path,
@@ -266,8 +346,9 @@ class MCPPageExplorer:
                     'candidate_tool': 'aits_get_path_candidates',
                     'finalization_tool': FINALIZATION_TOOL_NAME,
                     'entry_navigation': 'the platform automatically adds the first successful navigate callback',
-                    'input_rule': 'only callback-mapped runtime_input_values may be selected for fill/select',
+                    'input_rule': 'only callback-mapped runtime_input_values or aits_declare_generated_input refs may be selected for fill/select',
                     'staleness': 'any browser callback after finalization invalidates it',
+                    'finalization_browser_call_limit': MCP_FINALIZATION_BROWSER_CALL_LIMIT,
                 },
                 'instruction': '一次连续完成完整场景；先观察，按自然业务状态前进。结束前读取候选摘要并完成一次最终路径定稿。最终文本只简要说明完成或停止原因，不承担任何契约。',
             }, ensure_ascii=False)
@@ -325,6 +406,9 @@ class MCPPageExplorer:
             'failed_tool_calls': stats['failed_tool_calls'], 'termination_reason': stats['termination_reason'] or '',
             'duration_seconds': duration_seconds, 'model_calls': self.guard.model_call_count,
             'potential_write_tool_calls': stats['potential_write_tool_calls'], 'blocked_write_tool_calls': stats['blocked_write_tool_calls'],
+            'finalization_only_mode': stats['finalization_only_mode'],
+            'finalization_only_blocked_calls': stats['finalization_only_blocked_calls'],
+            'finalization_browser_call_limit': stats['finalization_browser_call_limit'],
         }, termination_reason=stats['termination_reason'] or '')
 
     def _failure(self, code: str, message: str, start_path: str = '/') -> MCPPageExplorerError:

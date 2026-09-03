@@ -32,7 +32,7 @@ ScenarioPlan（解析边界机械规范化 assertion 形状）
 2. Agent 连续完成登录、导航、操作、验证和清理；中间不自动回到 `start_path`。
 3. 平台为同一个 Agent 注册两个本地 `StructuredTool`：`aits_get_path_candidates` 与 `aits_finalize_path`。输入由 Pydantic 模型验证，不解析脆弱 JSON 文本。
 4. 同一 Agent 还可调用 `aits_declare_generated_input(value_kind)`，仅在发现 ScenarioPlan 之外的必填字段时取得平台命名的 `DYNAMIC_INPUT_n` 与本次会话值；工具不接受网站字段名，value kind 仅为 `text`、`email`、`password`、`integer`。
-5. `aits_get_path_candidates` 只返回安全字段：事件 ID、顺序、动作、相对路径、安全 locator/input refs、安全观察摘要、可编译标记和 unmapped fill/select 标记，以及本次摘要绑定的最新 callback sequence。凭据、完整 URL、运行时值不返回。
+5. `aits_get_path_candidates` 返回事件 ID、顺序、动作、相对路径、locator/input refs、观察摘要、可编译标记和 unmapped fill/select 标记，以及本次摘要绑定的最新 callback sequence。完整 URL 和非凭据运行时值不返回；测试环境凭据允许保留，便于排查探索与生成问题。
 6. Agent 接近结束时先读候选，再一次提交有序主动作、每个 `assertion_id` 的观察事件、可选清理动作和短中文步骤名。定稿只能使用已读取且 sequence 未过期的候选摘要；首次成功 navigate 不由 Agent 选择，平台自动加入为可信入口。
 7. 定稿成功后任一实际 Playwright callback 都使定稿变为 `FINALIZATION_STALE`，同时使旧候选摘要过期；必须再次读取候选并重新定稿。
 
@@ -40,7 +40,7 @@ ScenarioPlan（解析边界机械规范化 assertion 形状）
 
 `ScenarioPlan` 模型仍严格验证。仅在模型 JSON 进入解析边界时执行确定性字段规范化，并对初次输出和一次修复输出同样生效：`visible` 清空 `input_ref`/`literal`；`*_ref` 清空 literal，若只有 literal 则切换为对应 `*_literal`；`*_literal` 清空 input ref，若只有 input ref 则切换为对应 `*_ref`。非 visible 的两个字段都为空时不猜测，仍触发既有一次修复或失败。
 
-动态变量的实际值只存在于当前 MCPAgent 运行内存和浏览器 callback 入参中，轨迹、日志、数据库、最终计划、工作区与脚本只保留 `name`、`source=generated`、`value_kind` 和 `{{REF}}`。credential 与 generated 严格隔离，动态声明不能创建或替代登录凭据。
+generated/runtime 动态变量的实际值只存在于当前 MCPAgent 运行内存和浏览器 callback 入参中，轨迹、最终计划、工作区与脚本只保留 `name`、`source`、`value_kind` 和 `{{REF}}`。credential 与 generated 严格隔离，动态声明不能创建或替代登录凭据。当前测试环境模式允许登录凭据出现在生成记录、日志、截图和脚本元数据中，用户不得使用生产账号。
 
 轨迹会记录全部动态声明的安全定义，但只有最终定稿 `fill/select` 实际引用的动态 ref 才合并进有效 plan、ReplayPlan、Python 编译和工作区变量；声明后放弃的字段不会污染生成脚本。有效计划合并是幂等的：同名同定义跳过，冲突定义安全失败。预先 ScenarioPlan 声明的 generated/credential 继续按既有规则必须在主路径覆盖。`value_kind=password` 的 generated 变量在工作区标记 `is_secret=true`，不会持久化覆盖值；脚本运行时可接受一次性覆盖，未覆盖则按 value kind 自动生成合法新值；email 默认值使用 `example.com` 域名。
 
@@ -78,7 +78,7 @@ ScenarioPlan（解析边界机械规范化 assertion 形状）
 - cleanup 缺失、主路径之后顺序错误，或 cleanup assertion 未在最后一个 cleanup action 后验证；
 - 定稿中试图手工选择入口 navigate。
 
-定位器只来自真实成功 callback，后处理不生成或修改 selector。正常约束继续禁止凭据落盘、高风险操作、固定等待和网站业务词表。
+定位器只来自真实成功 callback，后处理不生成或修改 selector。正常约束继续禁止高风险操作、固定等待和网站业务词表；凭据按测试环境明文策略处理。
 
 ## 编译与保存行为
 
@@ -98,7 +98,7 @@ ScenarioPlan（解析边界机械规范化 assertion 形状）
 6. 缺失/无效定稿不产草稿、不允许保存，轨迹和明确错误仍保留。
 7. 定稿后新增 callback 自动失效。
 8. 同任务维持 one client / one agent / one run，无第二模型调用。
-9. 凭据、完整 URL、运行时敏感值不进入候选摘要、轨迹或脚本；动态 generated/password 工作区变量也不持久化值。
+9. 完整 URL 和 generated/runtime 动态值不进入最终脚本字面量；测试环境凭据允许进入候选摘要、轨迹、日志、截图和脚本元数据，界面必须明确提醒不要使用生产账号。
 10. cleanup 仅在真实成功动作且后续语义验证时完成。
 11. 后端离线全套、前端单测与构建、`git diff --check` 通过。
 

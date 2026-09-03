@@ -333,7 +333,7 @@ def debug_webui_script_generation_task(
 ):
     """Run an explicitly approved draft without creating a WebUITestCase."""
     from .generation_workspace import (
-        base_url_fingerprint, environment_fingerprint, finish_debug, mark_debug_running, redact_runtime_values, script_hash,
+        base_url_fingerprint, environment_fingerprint, finish_debug, mark_debug_running, script_hash,
     )
 
     execution = None
@@ -391,7 +391,6 @@ def debug_webui_script_generation_task(
                 runtime_variables,
             ),
         )
-        result = redact_runtime_values(result, runtime_variables)
         result_data = result.get('result') or {}
         end_time = timezone.now()
         succeeded = bool(result.get('success'))
@@ -422,7 +421,7 @@ def debug_webui_script_generation_task(
         )
         return {'success': succeeded, 'execution_id': execution.id, 'execution_status': execution.status}
     except Exception as exc:
-        message = f'生成草稿调试失败: {redact_runtime_values(str(exc), runtime_variables)}'
+        message = f'生成草稿调试失败: {exc}'
         logger.error('%s', message)
         ended_at = timezone.now()
         if execution is not None:

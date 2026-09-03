@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import ast
 import keyword
-import re
 import textwrap
 from dataclasses import dataclass
 from typing import Optional
 
 from .constants import WEBUI_BROWSER_ENGINE
-from .script_extraction import extract_playwright_metadata, redact_sensitive_text
+from .script_extraction import extract_playwright_metadata
 
 
 class ScriptContractError(ValueError):
@@ -34,11 +33,6 @@ SCRIPT_SOURCE_VALUES = {
     "mcp_exploration",
 }
 SCRIPT_FRAMEWORK = "playwright_python_async"
-_SENSITIVE_METADATA_KEY_RE = re.compile(
-    r"(?i)(password|passwd|token|secret|api[_ -]?key|authorization|credential|"
-    r"用户名|账号|帐号|密码|口令|令牌)"
-)
-
 
 def _parse(content: str) -> ast.Module:
     if not isinstance(content, str) or not content.strip():
@@ -222,20 +216,10 @@ def store_script_content(
 
 
 def _sanitize_metadata(value):
-    """Recursively redact strings before metadata is persisted as JSON."""
+    """Normalize JSON-compatible metadata without altering test credentials."""
 
-    if isinstance(value, str):
-        return redact_sensitive_text(value)
     if isinstance(value, dict):
-        sanitized = {}
-        for key, item in value.items():
-            key_text = str(key)
-            sanitized[key_text] = (
-                '<redacted>'
-                if _SENSITIVE_METADATA_KEY_RE.search(key_text)
-                else _sanitize_metadata(item)
-            )
-        return sanitized
+        return {str(key): _sanitize_metadata(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_sanitize_metadata(item) for item in value]
     if isinstance(value, tuple):

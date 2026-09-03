@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import ast
 import io
-import re
 import tokenize
-from typing import Any, Optional
+from typing import Any
 
 
 EXTRACTION_VERSION = 'webui-playwright-ast-v1'
@@ -21,45 +20,12 @@ ASSERTION_METHODS = {
     'to_have_value', 'to_have_url', 'to_have_title', 'to_have_count',
 }
 
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r'(?i)(\b(?:password|passwd|token|secret|api[_ -]?key|authorization|credential)\b'
-    r'|密码|口令|令牌|用户名|账号|帐号)(?:\s*[:=：]\s*|\s+)([^\s,，;；\'"()\[\]{}]+)'
-)
-_CREDENTIAL_VALUE_RE = re.compile(
-    r'(?i)(\b(?:username|user|login|password|passwd)\b|用户名|账号|帐号|密码|口令|令牌)'
-    r'(\s*[:=：]\s*|\s+)[^\s,，;；\'"()\[\]{}]+'
-)
-_LONG_NUMBER_RE = re.compile(r'(?<!\w)\d{4,}(?!\w)')
-
-
-def redact_sensitive_text(value: str) -> str:
-    """Redact obvious credential assignments and long numeric secrets."""
-
-    if not isinstance(value, str):
-        return value
-    value = _SENSITIVE_ASSIGNMENT_RE.sub(lambda match: f'{match.group(1)}=<redacted>', value)
-    value = _CREDENTIAL_VALUE_RE.sub(lambda match: f'{match.group(1)}{match.group(2)}<redacted>', value)
-    return _LONG_NUMBER_RE.sub('<redacted>', value)
-
-
-def _safe_expression(node: ast.AST, redact_value: bool = False) -> str:
+def _safe_expression(node: ast.AST) -> str:
     try:
         expression = ast.unparse(node)
     except Exception:
         expression = '<expression>'
-    if redact_value:
-        return '<redacted>'
-    return redact_sensitive_text(expression)
-
-
-def _call_args(call: ast.Call, redact_values: bool = False) -> list[str]:
-    values = [_safe_expression(arg, redact_values) for arg in call.args]
-    values.extend(
-        f'{kw.arg}={_safe_expression(kw.value, redact_values)}'
-        for kw in call.keywords
-        if kw.arg is not None
-    )
-    return values
+    return expression
 
 
 def _is_page_receiver(node: ast.AST) -> bool:
@@ -91,9 +57,7 @@ def _assertion_expected(method: str, call: ast.Call) -> str:
     }
     label = labels.get(method, f'断言 {method} 成功')
     if call.args:
-        expected = _safe_expression(call.args[0], redact_value=method in {
-            'to_have_value', 'to_have_text', 'to_contain_text'
-        })
+        expected = _safe_expression(call.args[0])
         if method in {'to_have_text', 'to_contain_text', 'to_have_value', 'to_have_url', 'to_have_title'}:
             return f'{label}：{expected}'
     return label
@@ -156,14 +120,14 @@ def extract_playwright_metadata(content: str, description: str = '') -> dict[str
             }
             readable_name = _nearest_readable_comment(comments, node.lineno, ('步骤', '清理'))
             if readable_name:
-                step['readable_name'] = redact_sensitive_text(readable_name)
+                step['readable_name'] = readable_name
             if locator and locator not in seen_locators:
                 locator_candidates.append({'expression': locator, 'source': 'ast'})
                 seen_locators.add(locator)
             if method == 'goto' and call.args:
                 step['url'] = _safe_expression(call.args[0])
             elif method in INPUT_ACTIONS:
-                step['value'] = '<redacted>'
+                step['value'] = _safe_expression(call.args[0]) if call.args else ''
             extracted_steps.append(step)
             continue
 
@@ -177,12 +141,12 @@ def extract_playwright_metadata(content: str, description: str = '') -> dict[str
             })
             readable_name = _nearest_readable_comment(comments, node.lineno, ('断言',))
             if readable_name:
-                assertion_candidates[-1]['readable_name'] = redact_sensitive_text(readable_name)
+                assertion_candidates[-1]['readable_name'] = readable_name
 
     if assertion_candidates:
         expected_result = '；'.join(item['expected'] for item in assertion_candidates)
     else:
-        safe_description = redact_sensitive_text(description).strip()
+        safe_description = str(description).strip()
         expected_result = (
             f'完成测试流程：{safe_description[:120]}'
             if safe_description else '测试流程执行完成并满足页面验证条件'

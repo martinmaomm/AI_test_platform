@@ -45,10 +45,9 @@ callback 轨迹是平台唯一事实来源；最终文本不提供事件、选�
 只选择成功、顺序递增且有稳定 locator 的真实 callback。fill/select 只有精确匹配 runtime_input_values 或 aits_declare_generated_input 返回的 input ref 时才可选择；候选摘要标为 unmapped_input 的事件不可选择。每条 assertion requirement 都必须绑定成功的带 selector observation，且其安全观察摘要确实满足 visible/contains/not_contains 语义。清理动作必须在主场景后，清理验证必须在最后一个清理动作后。
 发现计划外必填输入时，先调用 aits_declare_generated_input 声明通用动态变量，再原样使用该工具返回的值；不能使用凭据变量或自行猜值代替。每次成功操作后优先一次目标 visible-text 观察；只有可见文本不足以定位或验证时才读取 HTML，不重复读取未变化页面。SPA 路由变化后优先用能返回页面状态/URL 的观察工具确认当前位置。结束前保留验证和清理页面证据。
 不允许审批、付款、发布、上传、下载或未授权外部操作。只在 allow_test_data_writes=true 时操作本轮 namespace 测试数据；结果未知时停止，不得重试。
-runtime_input_values 是平台提供的唯一输入值映射。仅在实际需要填充或选择时原样使用；不得猜测 ref、不得改写值、不得在最终文本中复述这些值。
-提供临时凭据时不要调用截图工具，避免把登录值或会话状态写入图片文件。
+runtime_input_values 是平台提供的唯一输入值映射。仅在实际需要填充或选择时原样使用；不得猜测 ref、不得改写值。测试环境模式允许凭据随 callback、日志和截图保留。
 元素未找到、不可见、未启用、严格模式冲突或尚未加载时，先重新观察当前页面并在预算内调整定位；不要把确认未执行的定位失败当作写入结果未知。
-不得输出用户名、密码、Token、Cookie、完整 URL、截图 Base64 或 HTML。"""
+不得输出完整 URL、截图 Base64 或 HTML。"""
 
 READ_ONLY_DISABLED_TOOL_MESSAGES = {
     'playwright_evaluate': '页面探索不允许执行页面 JavaScript。',
@@ -268,7 +267,6 @@ class MCPPageExplorer:
         self.trace_recorder = ExplorationTraceRecorder()
         self.guard = ReadOnlyMCPBrowserToolGuard(policy=self.policy, trace_recorder=self.trace_recorder)
         self._started_at: float | None = None
-        self._sensitive_runtime_present = False
 
     def _configure(self, plan: ScenarioPlan, start_path: str, credentials: dict[str, str] | None):
         self.policy = ExplorationPolicy.for_plan(plan, generation_id=self.output_generation_id, user_constraints=self.user_constraints)
@@ -289,10 +287,6 @@ class MCPPageExplorer:
                 continue
             runtime_values[spec.name] = self._generated_runtime_value(spec.value_kind, spec.name)
         self.trace_recorder.configure_runtime(runtime_values, plan.input_sources())
-        self._sensitive_runtime_present = any(
-            spec.source == 'credential' and spec.name in runtime_values
-            for spec in plan.input_refs
-        )
         return runtime_values
 
     def _generated_runtime_value(self, value_kind: str, name: str = 'value') -> str:
@@ -319,12 +313,9 @@ class MCPPageExplorer:
             client = MCPClient.from_dict(prepare_playwright_mcp_output_config(
                 self.mcp_config,
                 self.output_generation_id,
-                sensitive_runtime=self._sensitive_runtime_present,
             ))
             await client.create_all_sessions()
             disallowed_tools = list(READ_ONLY_DISABLED_TOOL_MESSAGES)
-            if self._sensitive_runtime_present:
-                disallowed_tools.append('playwright_screenshot')
             agent = MCPAgent(llm=self.llm_model, client=client, max_steps=MCP_MAX_STEPS, additional_instructions=EXPLORER_CONSTRAINTS, disallowed_tools=disallowed_tools, callbacks=[self.guard])
             await self._await_task(asyncio.create_task(agent.initialize()), deadline, start_path)
             await self._await_task(

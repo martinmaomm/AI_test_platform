@@ -10,7 +10,6 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .execution_variables import ExecutionVariableError, validate_variable_name
-from .generation_security import REDACTED_VALUE, find_suspected_credentials, redact_text
 
 SCENARIO_PLAN_SCHEMA_VERSION = 4
 _SAFE_DIAGNOSTIC_PATH_SEGMENTS = frozenset({
@@ -20,10 +19,8 @@ _SAFE_DIAGNOSTIC_PATH_SEGMENTS = frozenset({
     'preconditions', 'forbidden_actions', 'credentials_required',
     'allow_test_data_writes', 'cleanup_expected', 'discovery_notes', 'risk_level',
 })
-_SYMBOLIC_CREDENTIAL_REFERENCE_RE = re.compile(r'\bUI_TEST_(?:USERNAME|PASSWORD)\b')
 _SAFE_CUSTOM_ERROR_TYPES = (
     ('不能包含完整 URL', 'absolute_url_forbidden'),
-    ('不能包含敏感信息', 'sensitive_text_forbidden'),
     ('仅支持 schema_version=4', 'schema_version_mismatch'),
     ('ref 断言必须且只能声明 input_ref', 'assertion_ref_shape'),
     ('literal 断言必须且只能声明 literal', 'assertion_literal_shape'),
@@ -63,22 +60,9 @@ class ScenarioInputInsufficientError(GenerationContractError):
 class _StrictContract(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
 
-    @model_validator(mode='after')
-    def _reject_sensitive_text(self):
-        _validate_safe_value(self.model_dump(mode='json'), self.__class__.__name__)
-        return self
-
 
 def _validate_safe_value(value: Any, field_name: str, *, reject_absolute_url: bool = False) -> None:
     if isinstance(value, str):
-        findings = set(find_suspected_credentials(value))
-        # The model is required to name credential slots symbolically.  The
-        # broad login-pair detector can otherwise mistake a sentence such as
-        # "使用 UI_TEST_USERNAME 和 UI_TEST_PASSWORD" for literal credentials.
-        if _SYMBOLIC_CREDENTIAL_REFERENCE_RE.search(value):
-            findings.discard('login_pair')
-        if REDACTED_VALUE in value or findings:
-            raise ValueError(f'{field_name} 不能包含敏感信息')
         if reject_absolute_url and re.search(r'(?i)https?://', value):
             raise ValueError(f'{field_name} 不能包含完整 URL')
     elif isinstance(value, dict):

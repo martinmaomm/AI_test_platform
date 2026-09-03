@@ -1,5 +1,4 @@
-"""Durable, secret-safe editing and verification state for generated scripts."""
-
+"""Durable editing and verification state for generated scripts."""
 from __future__ import annotations
 
 import hashlib
@@ -457,18 +456,3 @@ def _task_matches(state: dict[str, Any], task_id: str | None) -> bool:
     """A retry may re-enter a worker, but never impersonate a newer dispatch."""
     expected = str(state.get('task_id') or '')
     return not expected or task_id is None or expected == str(task_id)
-
-
-def redact_runtime_values(value: Any, runtime_variables: list[dict[str, Any]]) -> Any:
-    """Remove one-time values from execution data before it is persisted."""
-    secrets = [item.get('value') for item in runtime_variables if item.get('value')]
-    if isinstance(value, str):
-        result = value
-        for secret in secrets:
-            result = result.replace(str(secret), '<redacted>')
-        return result
-    if isinstance(value, dict):
-        return {key: redact_runtime_values(item, runtime_variables) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_runtime_values(item, runtime_variables) for item in value]
-    return value

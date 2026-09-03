@@ -103,19 +103,6 @@ def _template_refs(value: Any) -> set[str]:
     return set()
 
 
-def _has_sensitive_placeholder(value: Any) -> bool:
-    if isinstance(value, str):
-        return '<runtime_sensitive_data>' in value
-    if isinstance(value, Mapping):
-        return any(
-            _has_sensitive_placeholder(key) or _has_sensitive_placeholder(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, (list, tuple)):
-        return any(_has_sensitive_placeholder(item) for item in value)
-    return False
-
-
 class ReplayPlanner:
     @staticmethod
     def _action(
@@ -133,8 +120,6 @@ class ReplayPlanner:
         if item is None or item.validation in {'fragile', 'rejected'}:
             raise GenerationContractError('replay_plan_selected_action_locator_invalid')
         owned_values = (item.value, item.kwargs, event.action_arguments)
-        if any(_has_sensitive_placeholder(value) for value in owned_values):
-            raise GenerationContractError('replay_plan_sensitive_locator_value')
         refs: set[str] = set()
         for value in owned_values:
             refs.update(_template_refs(value))
@@ -192,8 +177,6 @@ class ReplayPlanner:
             raise GenerationContractError('assertion_event_not_callback_success')
         if item is None or item.validation in {'fragile', 'rejected'}:
             raise GenerationContractError('replay_plan_selected_assertion_locator_invalid')
-        if _has_sensitive_placeholder(item.value) or _has_sensitive_placeholder(item.kwargs):
-            raise GenerationContractError('replay_plan_sensitive_assertion_locator')
         refs = _template_refs(item.value) | _template_refs(item.kwargs)
         if not refs <= set(plan.input_sources()):
             raise GenerationContractError('replay_plan_assertion_template_ref_unknown')

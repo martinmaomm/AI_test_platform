@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   buildGenerationTimeline,
   explorationCleanupPresentation,
@@ -152,4 +153,11 @@ test('failed and cancelled runs with unknown cleanup warn before a replacement t
     assert.match(hint, /重新发起前/)
     assert.match(hint, /避免重复操作/)
   }
+})
+
+test('credential entry warns about retained test-environment artifacts', () => {
+  const inputPanel = readFileSync(new URL('../src/components/webui-generation/GenerationInputPanel.vue', import.meta.url), 'utf8')
+  assert.match(inputPanel, /凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号/)
+  assert.doesNotMatch(inputPanel, /不会写入脚本、生成记录或本地存储/)
+  assert.doesNotMatch(inputPanel, /登录密码不得写入脚本、日志、截图或报告/)
 })

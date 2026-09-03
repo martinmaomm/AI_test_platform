@@ -1,5 +1,6 @@
 <template>
   <div class="workspace">
+    <el-alert type="warning" :closable="false" show-icon title="测试环境模式下，凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" />
     <el-alert type="info" :closable="false" show-icon title="生成完成仅表示已得到脚本草稿；只有“本版调试通过”才表示该版本在约定测试数据上实际执行成功。" />
 
     <div class="workspace-status">
@@ -16,7 +17,7 @@
     </section>
 
     <section class="workspace-section">
-      <div class="section-heading"><div><h5>配置变量</h5><p>敏感默认值只留在本次页面内存；刷新后需要重新输入。调试覆盖值也只用于本次执行。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
+      <div class="section-heading"><div><h5>配置变量</h5><p>变量可用于脚本运行；调试覆盖值优先于草稿变量。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
       <el-table :data="form.variables" size="small" empty-text="暂无变量">
         <el-table-column label="变量名" min-width="145"><template #default="{ row }"><el-input v-model="row.name" :disabled="busy" placeholder="UI_TEST_USERNAME" @input="emitDraft" /></template></el-table-column>
         <el-table-column label="默认值" min-width="160"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" show-password :disabled="busy" @input="emitDraft" /></template></el-table-column>
@@ -29,7 +30,7 @@
 
     <el-collapse class="runtime-variables">
       <el-collapse-item title="本次调试变量（可选）" name="runtime">
-        <p>这里的值不会保存到草稿或浏览器存储，仅在本次真实调试请求中发送。</p>
+        <p>这里的值会覆盖草稿变量并用于本次真实调试。</p>
         <el-table :data="runtimeVariables" size="small" empty-text="先在上方配置变量">
           <el-table-column prop="name" label="变量" min-width="160" />
           <el-table-column label="本次覆盖值" min-width="220"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" show-password :disabled="busy" /></template></el-table-column>

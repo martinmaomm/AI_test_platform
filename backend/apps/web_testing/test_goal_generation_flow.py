@@ -105,6 +105,13 @@ class ScenarioContractRegressionTests(SimpleTestCase):
         ))
         self.assertTrue(plan.credentials_required)
 
+    def test_plaintext_credentials_are_allowed_in_scenario_plan(self):
+        plan = ScenarioPlan.model_validate(plan_payload(
+            objective='使用用户名 test-user、密码 test-password 和 token-for-test 完成登录验证。',
+            instructions=['输入用户名 test-user 和密码 test-password。'],
+        ))
+        self.assertIn('test-password', plan.objective)
+
     def test_workspace_variables_follow_explicit_sources_without_values(self):
         plan = ScenarioPlan.model_validate(plan_payload(
             credentials_required=True,
@@ -272,7 +279,7 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
             'schema_version',
         )
 
-    def test_model_input_replaces_transport_url_and_redaction_markers(self):
+    def test_model_input_replaces_transport_url_but_preserves_plaintext_credentials(self):
         structured_model = Mock()
         structured_model.invoke.return_value = {
             'parsed': plan_payload(),
@@ -287,14 +294,14 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
             'web_testing.requirement_normalizer.get_llm_manager', return_value=manager,
         ):
             RequirementNormalizer(8).normalize(
-                '打开 https://example.test/login，登录账号 <redacted> <redacted> 后验证。',
+                '打开 https://example.test/login，使用用户名 test-user、密码 test-password 和 token-for-test 登录后验证。',
             )
         model_input = json.loads(structured_model.invoke.call_args.args[0][1].content)
         serialized = json.dumps(model_input, ensure_ascii=False)
         self.assertNotIn('https://', serialized)
-        self.assertNotIn('<redacted>', serialized)
         self.assertIn('目标页面', serialized)
-        self.assertIn('运行时凭据', serialized)
+        self.assertIn('test-password', serialized)
+        self.assertIn('token-for-test', serialized)
 
     def test_explicit_structured_output_capability_gap_falls_back_once_at_low_randomness(self):
         llm = Mock()
@@ -549,24 +556,15 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         self.assertNotIn('private-value', serialized)
 
     def test_contract_diagnostics_map_safe_root_validation_codes(self):
-        cases = (
-            ('https://example.test', 'absolute_url_forbidden'),
-            ('<redacted>', 'sensitive_text_forbidden'),
-        )
-        for objective, expected_type in cases:
-            with self.subTest(expected_type=expected_type):
-                with self.assertRaises(GenerationContractError) as captured:
-                    parse_scenario_plan_json(json.dumps(
-                        plan_payload(objective=objective), ensure_ascii=False,
-                    ))
-                self.assertEqual(
-                    captured.exception.diagnostics[0]['type'],
-                    expected_type,
-                )
+        with self.assertRaises(GenerationContractError) as captured:
+            parse_scenario_plan_json(json.dumps(
+                plan_payload(objective='https://example.test'), ensure_ascii=False,
+            ))
+        self.assertEqual(captured.exception.diagnostics[0]['type'], 'absolute_url_forbidden')
 
 
 class TraceSecurityAndReplayRegressionTests(SimpleTestCase):
-    def test_runtime_values_template_and_credentials_never_persist(self):
+    def test_runtime_values_and_credentials_are_retained_in_test_environment_trace(self):
         plan = ScenarioPlan.model_validate(plan_payload(
             credentials_required=True,
             input_refs=[
@@ -599,8 +597,7 @@ class TraceSecurityAndReplayRegressionTests(SimpleTestCase):
             'saved screenshots/private-pass.png',
         )
         serialized = recorder.build(tool_stats={}).model_dump_json()
-        self.assertNotIn('private-user', serialized)
-        self.assertNotIn('private-pass', serialized)
+        self.assertIn('private-pass', serialized)
         self.assertIn('[name=password]', serialized)
 
     def test_locator_boolean_exact_is_preserved_and_long_selector_is_rejected_whole(self):

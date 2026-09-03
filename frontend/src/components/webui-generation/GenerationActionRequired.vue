@@ -22,7 +22,7 @@
     </div>
 
     <div v-if="action.kind === 'credentials'" class="credentials-editor">
-      <el-alert title="登录信息仅供本轮测试流程使用，不会写入生成记录、脚本或浏览器存储。" type="warning" :closable="false" show-icon />
+      <el-alert title="测试环境模式下，凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" type="warning" :closable="false" show-icon />
       <div class="credential-grid">
         <el-input v-model="form.username" autocomplete="off" placeholder="用户名" :disabled="resolving" />
         <el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="密码" :disabled="resolving" />

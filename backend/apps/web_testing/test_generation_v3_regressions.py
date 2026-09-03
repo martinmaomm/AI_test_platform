@@ -27,6 +27,7 @@ from .exploration_trace import ExplorationTraceRecorder, FinalizedAction, Finali
 from .generation_contracts import GenerationContractError, GenerationTransitionError, ScenarioPlan
 from .generation_events import publish_terminal
 from .generation_preflight import (
+    exploration_requires_write_confirmation,
     prepare_playwright_mcp_output_config,
     validate_generation_output_id,
 )
@@ -40,12 +41,20 @@ from .generation_repository import (
     transition_generation,
 )
 from .generation_save_state import generation_reference, is_generation_saved
-from .generation_security import get_temporary_credentials, store_temporary_credentials
-from .mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
+from .generation_security import (
+    GenerationInputSecurityError,
+    get_temporary_credentials,
+    normalize_start_path,
+    store_temporary_credentials,
+)
+from .mcp_page_explorer import EXPLORER_CONSTRAINTS, MCPPageExplorer, MCPPageExplorerError
 from .models import WebUIScriptGeneration
 from .replay_plan import PythonReplayCompiler, ReplayPlanner
 from .script_quality import evaluate_script
-from .serializers import WebUIScriptGenerationCreateSerializer
+from .serializers import (
+    WebUIScriptGenerationCreateSerializer,
+    WebUIScriptGenerationResolveSerializer,
+)
 from .views import WebUIScriptGenerationCreateView
 
 
@@ -234,9 +243,6 @@ class V4ScriptQualityRegressionTests(SimpleTestCase):
         replay = ReplayPlanner.build(plan, trace)
         source = PythonReplayCompiler.compile(plan, trace, replay)
         variants = {
-            'SENSITIVE_LITERAL': source.replace(
-                '    variables = variables or {}', '    password = "literal"',
-            ),
             'ABSOLUTE_URL_FORBIDDEN': source + '# https://example.test/forbidden\n',
             'RUN_SIGNATURE_INVALID': source.replace(
                 'async def run(page, variables):', 'async def run(page):',
@@ -268,9 +274,33 @@ class V4ScriptQualityRegressionTests(SimpleTestCase):
                 self.assertIn(
                     expected_code, {item['code'] for item in report['blockers']},
                 )
+        credential_report = evaluate_script(
+            source.replace('    variables = variables or {}', '    password = "test-only-password"'),
+            plan=plan, trace=trace, replay_plan=replay,
+        )
+        self.assertEqual(
+            {item['code'] for item in credential_report['blockers']},
+            {'SCRIPT_NOT_DETERMINISTIC_REPLAY'},
+        )
 
 
 class V4SafeOutputPathRegressionTests(SimpleTestCase):
+    def test_plaintext_credentials_do_not_weaken_target_or_high_risk_guards(self):
+        with self.assertRaisesRegex(GenerationInputSecurityError, '同源'):
+            normalize_start_path(
+                'https://other.example.test/items',
+                'https://web.example.test',
+            )
+        self.assertEqual(
+            normalize_start_path(
+                'https://web.example.test/items',
+                'https://web.example.test',
+            ),
+            '/items',
+        )
+        self.assertTrue(exploration_requires_write_confirmation('提交付款并发布结果。'))
+        self.assertFalse(exploration_requires_write_confirmation('不要付款或发布，只检查页面。'))
+
     def test_generation_output_id_and_mcp_artifact_paths_are_confined(self):
         with self.assertRaises(ValueError):
             validate_generation_output_id('../outside')
@@ -295,17 +325,14 @@ class V4SafeOutputPathRegressionTests(SimpleTestCase):
             prepared = prepare_playwright_mcp_output_config(
                 config, generation_id, base_dir=directory,
             )
-            sensitive = prepare_playwright_mcp_output_config(
-                config, generation_id, base_dir=directory,
-                sensitive_runtime=True,
-            )
         environment = prepared['mcpServers']['playwright']['env']
-        sensitive_environment = sensitive['mcpServers']['playwright']['env']
         self.assertIn(generation_id, environment['AITS_MCP_LOG_FILE'])
         self.assertIn(generation_id, environment['AITS_MCP_SCREENSHOT_DIR'])
         self.assertNotIn('..', environment['AITS_MCP_SCREENSHOT_DIR'])
         self.assertEqual(environment['AITS_MCP_DISABLE_FILE_LOG'], '0')
-        self.assertEqual(sensitive_environment['AITS_MCP_DISABLE_FILE_LOG'], '1')
+        self.assertIn('测试环境模式允许凭据随 callback、日志和截图保留', EXPLORER_CONSTRAINTS)
+        self.assertNotIn('不得输出用户名、密码、Token', EXPLORER_CONSTRAINTS)
+        self.assertNotIn('不要调用截图工具', EXPLORER_CONSTRAINTS)
 
 
 class V4GenerationPersistenceRegressionTests(TestCase):
@@ -385,6 +412,100 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             'start_path': '/items', 'model_config_id': other.id,
         })
         self.assertEqual(rejected.status_code, 400)
+
+    def test_create_and_resolution_accept_plaintext_test_credentials(self):
+        description = '使用用户名 test-user、密码 test-password 和 token=token-for-test 登录后检查首页。'
+        with patch(
+            'web_testing.views.generate_webui_script_generation_task.delay',
+            return_value=SimpleNamespace(id='plaintext-credential-task'),
+        ):
+            response = self.api_request(self.user, {
+                'description': description,
+                'environment_id': self.environment.id,
+                'start_path': '/items',
+            })
+        self.assertEqual(response.status_code, 201, response.data)
+        generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
+        self.assertEqual(generation.description_safe, description)
+
+        generation.status = WebUIScriptGeneration.Status.NEEDS_CONFIRMATION
+        generation.error_code = 'INPUT_AMBIGUOUS'
+        generation.scenario_spec = {'ambiguities': ['请补充测试登录信息。']}
+        generation.save(update_fields=['status', 'error_code', 'scenario_spec'])
+        serializer = WebUIScriptGenerationResolveSerializer(
+            data={
+                'expected_status': WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
+                'expected_revision': generation.revision,
+                'clarification_answers': [{
+                    'question': '请补充测试登录信息。',
+                    'answer': '用户名 test-user，密码 test-password，token=token-for-test。',
+                }],
+            },
+            context={'generation': generation},
+        )
+        serializer.is_valid(raise_exception=True)
+        self.assertEqual(
+            serializer.validated_data['safe_answers'][0]['answer'],
+            '用户名 test-user，密码 test-password，token=token-for-test。',
+        )
+
+    def test_create_uses_inline_login_pair_when_structured_credentials_are_absent(self):
+        description = '登录账号 inline-user inline-password 后检查首页。'
+        with patch(
+            'web_testing.views.generate_webui_script_generation_task.delay',
+            return_value=SimpleNamespace(id='inline-credential-task'),
+        ):
+            response = self.api_request(self.user, {
+                'description': description,
+                'environment_id': self.environment.id,
+                'start_path': '/items',
+            })
+        self.assertEqual(response.status_code, 201, response.data)
+        generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
+        self.assertEqual(generation.description_safe, description)
+        self.assertEqual(get_temporary_credentials(generation.pk), {
+            'username': 'inline-user',
+            'password': 'inline-password',
+        })
+
+    def test_structured_credentials_override_inline_login_pair_without_rejection(self):
+        with patch(
+            'web_testing.views.generate_webui_script_generation_task.delay',
+            return_value=SimpleNamespace(id='structured-credential-task'),
+        ):
+            response = self.api_request(self.user, {
+                'description': '登录账号 inline-user inline-password 后检查首页。',
+                'environment_id': self.environment.id,
+                'start_path': '/items',
+                'temporary_credentials': {
+                    'username': 'form-user',
+                    'password': 'form-password',
+                },
+            })
+        self.assertEqual(response.status_code, 201, response.data)
+        generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
+        self.assertEqual(get_temporary_credentials(generation.pk), {
+            'username': 'form-user',
+            'password': 'form-password',
+        })
+
+    def test_needs_credentials_resolution_accepts_inline_login_pair(self):
+        generation = self.make_generation(
+            status=WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+        )
+        serializer = WebUIScriptGenerationResolveSerializer(
+            data={
+                'expected_status': WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+                'expected_revision': generation.revision,
+                'description': '登录账号 resume-user resume-password 后继续。',
+            },
+            context={'generation': generation},
+        )
+        serializer.is_valid(raise_exception=True)
+        self.assertEqual(serializer.validated_data['temporary_credentials'], {
+            'username': 'resume-user',
+            'password': 'resume-password',
+        })
 
     def test_dispatch_failure_clears_credentials_and_marks_generation_failed(self):
         with patch(

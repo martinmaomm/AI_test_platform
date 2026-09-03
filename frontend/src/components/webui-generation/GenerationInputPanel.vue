@@ -4,7 +4,7 @@
       <h4>测试流程配置</h4>
       <p>选择环境并描述业务场景。系统会在确认的目标范围内探索并验证测试流程。</p>
     </div>
-    <el-alert title="正式脚本不会保存本次密码；需要登录时仅会引用环境变量，例如 UI_TEST_USERNAME 和 UI_TEST_PASSWORD。" type="info" :closable="false" show-icon />
+    <el-alert title="测试环境模式下，凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" type="warning" :closable="false" show-icon />
     <el-alert v-if="paused" title="当前任务已暂停，请先在右侧“需要你处理”区域补充信息。" type="warning" :closable="false" show-icon class="paused-alert" />
 
     <el-form class="generation-form" label-position="top" @submit.prevent="submit">
@@ -36,7 +36,7 @@
       <el-collapse class="input-collapse">
         <el-collapse-item title="编写提示" name="tips"><ol><li>说明测试目标和要进入的页面。</li><li>按顺序列出主要操作，并写明每一步如何判断成功。</li><li>涉及改变页面数据时，说明唯一测试数据和清理要求；未特别说明时，默认只操作本轮测试数据。</li><li>如目标要求仅只读，请在描述中明确；系统会尊重该限制，不执行写操作。审批、付款、发布、上传等额外动作目前不在授权范围，请修改测试目标。</li></ol></el-collapse-item>
         <el-collapse-item title="本轮测试登录信息（按需填写）" name="credentials">
-          <el-alert type="warning" :closable="false" show-icon title="仅供本轮测试流程使用；提交后立即从页面内存清除，不会写入脚本、生成记录或本地存储。" />
+          <el-alert type="warning" :closable="false" show-icon title="测试环境模式下，凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" />
           <div class="credential-grid"><el-input v-model="form.username" autocomplete="off" placeholder="用户名" :disabled="busy || paused" /><el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="密码" :disabled="busy || paused" /></div>
         </el-collapse-item>
       </el-collapse>
@@ -73,7 +73,7 @@ const EXAMPLE_DESCRIPTION = `目标：验证“权限 > 用户列表”的新增
 - 不操作已有业务数据；
 - 使用 try/finally 清理本轮创建的数据；
 - 清理失败或发现残留时，保留草稿并明确报告；
-- 登录密码不得写入脚本、日志、截图或报告。`
+- 测试环境凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。`
 
 const props = defineProps({ projectId: { type: [Number, String], default: null }, environments: { type: Array, default: () => [] }, modules: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, explorationSettings: { type: Object, default: null }, loadingEnvironments: Boolean, loadingModules: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean, credentialClearVersion: { type: Number, default: 0 } })
 const emit = defineEmits(['submit', 'cancel'])

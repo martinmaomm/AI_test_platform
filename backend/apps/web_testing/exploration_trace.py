@@ -13,13 +13,11 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .generation_contracts import AssertionRequirement, GenerationContractError, InputSpec, ScenarioPlan
-from .generation_security import redact_text
 
 TRACE_SCHEMA_VERSION = 4
 FINALIZATION_TOOL_NAME = 'aits_finalize_path'
 _MAX_EVENTS = 120
 _MAX_EXCERPT = 1200
-_SECRET_KEY_RE = re.compile(r'(?i)(password|passwd|token|secret|cookie|authorization|api[_-]?key)')
 _ABSOLUTE_URL_RE = re.compile(r'https?://[^\s\'"<>]+', re.I)
 _OBSERVATION_TOOLS = frozenset({
     'playwright_get_visible_text', 'playwright_get_visible_html', 'playwright_snapshot',
@@ -65,16 +63,15 @@ def _replace_runtime_values(
     runtime_values: Mapping[str, str],
     credential_refs: frozenset[str],
 ) -> tuple[str, dict[str, str]]:
+    """Template non-credential variables while retaining test credentials verbatim."""
     replacements: dict[str, str] = {}
     for index, (ref, runtime_value) in enumerate(
         sorted(runtime_values.items(), key=lambda item: len(item[1]), reverse=True)
     ):
-        if not runtime_value:
+        if not runtime_value or ref in credential_refs:
             continue
         marker = f'__AITS_RUNTIME_{index}__'
-        replacements[marker] = (
-            '<runtime_sensitive_data>' if ref in credential_refs else f'{{{{{ref}}}}}'
-        )
+        replacements[marker] = f'{{{{{ref}}}}}'
         text = text.replace(runtime_value, marker)
     return text, replacements
 
@@ -95,10 +92,8 @@ def _safe_text(
     text, replacements = _replace_runtime_values(
         _output_text(value), runtime_values, credential_refs,
     )
-    text = redact_text(text)
     text = _ABSOLUTE_URL_RE.sub(lambda item: _relative_path(item.group(0)) or '<url>', text)
-    text = _restore_runtime_markers(text, replacements)
-    return re.sub(r'\s+', ' ', text).strip()[:limit]
+    return _restore_runtime_markers(re.sub(r'\s+', ' ', text).strip(), replacements)[:limit]
 
 
 def _safe_locator_value(
@@ -107,20 +102,21 @@ def _safe_locator_value(
     runtime_values: Mapping[str, str],
     credential_refs: frozenset[str],
 ) -> Any:
-    """Redact runtime values without rewriting valid selector syntax."""
+    """Keep locator values while retaining URL and size safety constraints."""
 
     if isinstance(value, Mapping):
         return {
             str(key): _safe_locator_value(
-                item, runtime_values=runtime_values, credential_refs=credential_refs,
+                item,
+                runtime_values=runtime_values, credential_refs=credential_refs,
             )
             for key, item in value.items()
-            if not _SECRET_KEY_RE.search(str(key))
         }
     if isinstance(value, (list, tuple)):
         return [
             _safe_locator_value(
-                item, runtime_values=runtime_values, credential_refs=credential_refs,
+                item,
+                runtime_values=runtime_values, credential_refs=credential_refs,
             )
             for item in value
         ]
@@ -140,15 +136,16 @@ def _safe_action_value(
     if isinstance(value, Mapping):
         return {
             str(key): _safe_action_value(
-                item, runtime_values=runtime_values, credential_refs=credential_refs,
+                item,
+                runtime_values=runtime_values, credential_refs=credential_refs,
             )
             for key, item in value.items()
-            if not _SECRET_KEY_RE.search(str(key))
         }
     if isinstance(value, (list, tuple)):
         return [
             _safe_action_value(
-                item, runtime_values=runtime_values, credential_refs=credential_refs,
+                item,
+                runtime_values=runtime_values, credential_refs=credential_refs,
             )
             for item in value
         ]
@@ -282,7 +279,7 @@ def _locator_input(
     }
     for key, value in inputs.items():
         name = str(key).lower()
-        if name not in allowed or _SECRET_KEY_RE.search(name):
+        if name not in allowed:
             continue
         safe = _safe_locator_value(
             value, runtime_values=runtime_values, credential_refs=credential_refs,
@@ -729,7 +726,7 @@ class ExplorationTraceRecorder:
         return spec
 
     def candidate_summary(self) -> dict[str, Any]:
-        """Return only redacted callback facts that the same agent may finalize."""
+        """Return callback facts that the same agent may use to finalize."""
         self._candidate_summary_sequence = self._events[-1].sequence if self._events else 0
         candidates = []
         for event in self._events:
@@ -803,8 +800,8 @@ class ExplorationTraceRecorder:
             value = self._runtime_values.get(requirement.input_ref, '')
             if not value:
                 return False
-            marker = '<runtime_sensitive_data>' if requirement.input_ref in self._credential_refs else f'{{{{{requirement.input_ref}}}}}'
-            contains = marker in text
+            expected = value if requirement.input_ref in self._credential_refs else f'{{{{{requirement.input_ref}}}}}'
+            contains = expected in text
         return contains if requirement.kind.startswith('contains_') else not contains
 
     def finalize_path(
@@ -1006,11 +1003,11 @@ class ExplorationTraceRecorder:
         input_refs = _matched_runtime_refs(inputs, runtime_values, action)
         arguments = {
             key: _safe_action_value(
-                value, runtime_values=runtime_values, credential_refs=self._credential_refs,
+                value,
+                runtime_values=runtime_values, credential_refs=self._credential_refs,
             )
             for key, value in inputs.items()
             if key in {'key', 'button', 'click_count', 'delay', 'force', 'modifiers'}
-            and not _SECRET_KEY_RE.search(str(key))
         }
         event = ExplorationEvent(
             event_id=event_id, sequence=sequence, tool_name=tool_name, action=action,

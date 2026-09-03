@@ -1,9 +1,4 @@
-"""Sensitive-input handling for WebUI script generation.
-
-The database, WebSocket payloads and Celery arguments only receive values from
-this module after sanitisation. Temporary login values live solely in Django's
-configured cache (Redis in deployment).
-"""
+"""Target URL validation and optional login-input handling for WebUI generation."""
 
 from __future__ import annotations
 
@@ -21,20 +16,12 @@ SENSITIVE_KEY_RE = re.compile(
     r'credential|cookie|session|private[_-]?key)',
     re.IGNORECASE,
 )
-SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r'(?P<prefix>(?:password|passwd|pwd|secret|token|api[_ -]?key|'
-    r'authorization|auth|credential|cookie|session|private[_ -]?key|'
-    r'密码|口令|令牌|密钥)\s*(?:为|是|[:：=]))\s*'
-    r'(?P<value>[^\s,，;；。]+)',
-    re.IGNORECASE,
-)
 LOGIN_PAIR_RE = re.compile(
     r'(?P<prefix>(?:登录(?:账号|用户)|账号|用户名|user(?:name)?)\s*(?:为|是|[:：=])?\s*)'
     r'(?P<username>[^\s,，;；。]+)\s+(?P<password>[^\s,，;；。]+)',
     re.IGNORECASE,
 )
 URL_RE = re.compile(r'https?://[^\s,，;；。]+', re.IGNORECASE)
-_AUTHOR_ATTRIBUTE_SEGMENT_RE = re.compile(r'(^|[-_])author(?=$|[-_])', re.IGNORECASE)
 
 
 class GenerationInputSecurityError(ValueError):
@@ -72,128 +59,17 @@ def redact_url(value: str) -> str:
     return urlunsplit((parsed.scheme, netloc, parsed.path, query, ''))
 
 
-def redact_text(value: str) -> str:
-    """Redact obvious inline secret assignments and common login pairs."""
-    if not value:
-        return ''
-    text = str(value)
-    text = LOGIN_PAIR_RE.sub(
-        lambda match: f"{match.group('prefix')}{REDACTED_VALUE} {REDACTED_VALUE}",
-        text,
-    )
-    text = SENSITIVE_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group('prefix')} {REDACTED_VALUE}",
-        text,
-    )
-    return URL_RE.sub(lambda match: redact_url(match.group(0)), text)
-
-
-def _is_sensitive_dom_attribute_key(key: Any) -> bool:
-    """Keep a complete ``author`` segment from matching the ``auth`` pattern."""
-    return _is_sensitive_key(_AUTHOR_ATTRIBUTE_SEGMENT_RE.sub(r'\1attribute', str(key)))
-
-
-def redact_dom_attributes(value: Any) -> Any:
-    """Redact DOM attributes without treating the word ``author`` as ``auth``.
-
-    This is deliberately only used for the validated exploration element shape.
-    Attribute values and every name other than the precise ``author`` exception
-    keep the ordinary redaction semantics.
-    """
-    if not isinstance(value, dict):
-        return redact_metadata(value)
-    result = {}
-    for key, item_value in value.items():
-        safe_key = REDACTED_VALUE if _is_sensitive_dom_attribute_key(key) else str(key)
-        result[safe_key] = redact_metadata(item_value)
-    return result
-
-
-def _redact_exploration_elements(value: Any) -> Any:
-    if not isinstance(value, list):
-        return redact_metadata(value)
-    result = []
-    for element in value:
-        if not isinstance(element, dict):
-            result.append(redact_metadata(element))
-            continue
-        result.append({
-            str(key): REDACTED_VALUE if _is_sensitive_key(key) else (
-                redact_dom_attributes(item_value)
-                if str(key) == 'stable_attributes' else redact_metadata(item_value)
-            )
-            for key, item_value in element.items()
-        })
-    return result
-
-
-def redact_exploration_metadata(value: Any) -> Any:
-    """Redact a known exploration snapshot without relaxing generic metadata."""
-    if not isinstance(value, dict):
-        return redact_metadata(value)
-    return {
-        str(key): REDACTED_VALUE if _is_sensitive_key(key) else (
-            _redact_exploration_elements(item_value)
-            if str(key) == 'elements' else redact_metadata(item_value)
-        )
-        for key, item_value in value.items()
-    }
-
-
-def redact_metadata(value: Any) -> Any:
-    """Return a safe recursive projection suitable for persistence or logging."""
-    if isinstance(value, dict):
-        return {
-            str(key): REDACTED_VALUE if _is_sensitive_key(key) else redact_metadata(item_value)
-            for key, item_value in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_metadata(item) for item in value]
-    if isinstance(value, tuple):
-        return [redact_metadata(item) for item in value]
-    if isinstance(value, str):
-        return redact_text(redact_url(value) if value.startswith(('http://', 'https://')) else value)
-    return value
-
-
-def find_suspected_credentials(value: str) -> list[str]:
-    """Return detected credential categories without returning any secret value."""
-    if not value:
-        return []
-    findings: list[str] = []
-    if SENSITIVE_ASSIGNMENT_RE.search(value):
-        findings.append('secret_assignment')
-    if LOGIN_PAIR_RE.search(value):
-        findings.append('login_pair')
-    for url_match in URL_RE.finditer(value):
-        try:
-            parsed = urlsplit(url_match.group(0))
-        except ValueError:
-            continue
-        if parsed.username or parsed.password or any(_is_sensitive_key(key) for key, _ in parse_qsl(parsed.query)):
-            findings.append('url_secret')
-            break
-    return findings
-
-
 def extract_inline_login_credentials(value: str) -> dict[str, str] | None:
-    """Extract one complete login pair without persisting it with the description."""
+    """Return the first recognised login pair from a plaintext test description."""
     if not value:
         return None
-    matches = list(LOGIN_PAIR_RE.finditer(str(value)))
-    if not matches:
+    match = LOGIN_PAIR_RE.search(str(value))
+    if not match:
         return None
-    pairs = [
-        {
-            'username': match.group('username').strip(),
-            'password': match.group('password').strip(),
-        }
-        for match in matches
-    ]
-    first = pairs[0]
-    if any(item != first for item in pairs[1:]):
-        raise GenerationInputSecurityError('测试描述中只能指定一组被测环境登录账号和密码')
-    return validate_temporary_credentials(first)
+    return validate_temporary_credentials({
+        'username': match.group('username').strip(),
+        'password': match.group('password').strip(),
+    })
 
 
 def normalize_start_path(raw_value: str, base_url: str) -> str:
@@ -280,7 +156,7 @@ def validate_temporary_credentials(value: Any) -> dict[str, str]:
 
 
 def store_temporary_credentials(generation_id: Any, credentials: dict[str, str], *, timeout: int | None = None) -> None:
-    """Store credentials only in cache; callers must never include them in tasks."""
+    """Cache structured login inputs for the current generation run."""
     cache.set(
         _credentials_cache_key(generation_id),
         validate_temporary_credentials(credentials),

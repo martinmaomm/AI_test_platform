@@ -119,7 +119,6 @@ def prepare_playwright_mcp_output_config(
     generation_id: str | None,
     *,
     base_dir: str | None = None,
-    sensitive_runtime: bool = False,
 ) -> dict[str, Any]:
     """Derive an outputs-only runtime config for the pinned Playwright MCP server.
 
@@ -164,10 +163,9 @@ def prepare_playwright_mcp_output_config(
     env[_AITS_MCP_SCREENSHOT_DIR_ENV] = str(
         resolved_base_dir / 'temp' / 'playwright-mcp' / output_id / 'screenshots'
     )
-    # The upstream server logs complete CallTool request bodies. Credential
-    # values must therefore disable its file logger instead of relying on its
-    # incomplete field-name redaction.
-    env[_AITS_MCP_DISABLE_FILE_LOG_ENV] = '1' if sensitive_runtime else '0'
+    # Test-environment mode deliberately retains MCP artifacts, including
+    # credential-bearing requests, for generation diagnostics.
+    env[_AITS_MCP_DISABLE_FILE_LOG_ENV] = '0'
     if resolved_cwd is not None:
         env[_AITS_MCP_WORKING_DIR_ENV] = resolved_cwd
 

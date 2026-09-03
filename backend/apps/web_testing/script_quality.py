@@ -18,9 +18,6 @@ _ACTION_METHODS = {
 _BROWSER_LIFECYCLE_METHODS = {
     'launch', 'launch_persistent_context', 'new_context', 'new_page', 'close',
 }
-_SENSITIVE_NAME_RE = re.compile(
-    r'(?i)(?:password|passwd|pwd|token|secret|api[_-]?key|authorization|credential)',
-)
 _ABSOLUTE_URL_RE = re.compile(r'(?i)https?://')
 _STEP_COMMENT_RE = re.compile(r'^\s*#\s*步骤\s+(\d+)\s*[:：]')
 _ASSERTION_COMMENT_RE = re.compile(r'^\s*#\s*断言\s+(\d+)\s*[:：]')
@@ -111,45 +108,6 @@ def _undefined_names(tree: ast.Module, run: ast.AsyncFunctionDef) -> set[str]:
     }
 
 
-def _plain_nonempty_string(node: ast.AST | None) -> bool:
-    return bool(isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value)
-
-
-def _has_sensitive_literal_assignment(tree: ast.AST) -> bool:
-    """Detect secret storage without treating selector syntax as an assignment."""
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            if _plain_nonempty_string(node.value) and any(
-                isinstance(target, ast.Name) and _SENSITIVE_NAME_RE.search(target.id)
-                for target in node.targets
-            ):
-                return True
-        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
-            if (
-                isinstance(node.target, ast.Name)
-                and _SENSITIVE_NAME_RE.search(node.target.id)
-                and _plain_nonempty_string(node.value)
-            ):
-                return True
-        elif isinstance(node, ast.Dict):
-            for key, value in zip(node.keys, node.values):
-                if (
-                    isinstance(key, ast.Constant) and isinstance(key.value, str)
-                    and _SENSITIVE_NAME_RE.search(key.value)
-                    and _plain_nonempty_string(value)
-                ):
-                    return True
-        elif isinstance(node, ast.Call):
-            if any(
-                keyword.arg and _SENSITIVE_NAME_RE.search(keyword.arg)
-                and _plain_nonempty_string(keyword.value)
-                for keyword in node.keywords
-            ):
-                return True
-    return False
-
-
 def _has_unresolved_placeholder(tree: ast.AST, lines: list[str]) -> bool:
     if any(isinstance(node, ast.Pass) for node in ast.walk(tree)):
         return True
@@ -227,8 +185,6 @@ def evaluate_script(
         blockers.append(_issue('blocker', 'DOCSTRING_MISSING', '文件顶部必须包含场景和目标说明。'))
     if _ABSOLUTE_URL_RE.search(source):
         blockers.append(_issue('blocker', 'ABSOLUTE_URL_FORBIDDEN', '脚本只能使用相对路径。'))
-    if _has_sensitive_literal_assignment(tree) or '<runtime_sensitive_data>' in source:
-        blockers.append(_issue('blocker', 'SENSITIVE_LITERAL', '脚本不能包含明文凭据或敏感运行时值。'))
     if _has_unresolved_placeholder(tree, lines):
         blockers.append(_issue('blocker', 'UNRESOLVED_PLACEHOLDER', '脚本包含 pass、TODO 或未实现占位。'))
 

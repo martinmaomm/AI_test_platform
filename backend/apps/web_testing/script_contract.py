@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .constants import WEBUI_BROWSER_ENGINE
-from .assertion_state import instrument_runtime_assertions
+from .assertion_state import analyze_assertion_state, instrument_runtime_assertions
 from .script_extraction import extract_playwright_metadata
 from .target_urls import validate_target_url
 
@@ -330,19 +330,34 @@ import asyncio
 
     run_args = [item.arg for item in _function(module, "run").args.args]
     run_call = 'await run(page, runtime_variables)' if run_args == ['page', 'variables'] else 'await run(page)'
-    # This temporary instrumentation records only assertions that returned
-    # successfully.  It neither changes the saved source nor catches a user
-    # assertion exception; explicit asserts are followed by a counter only
-    # after Python has evaluated them successfully.
+    # The saved source remains untouched.  Its temporary materialization
+    # records a single stdout event only after each real assertion succeeds.
+    # A failed assertion that user code catches is still remembered, so it
+    # cannot later produce a false whole-case completion message.
     instrumented_content = instrument_runtime_assertions(normalized.content)
+    assertion_state_complete = analyze_assertion_state(normalized.content)['status'] == 'complete'
     runtime_support = f'''
 
 import inspect
 _aits_runtime_assertion_count = 0
+_aits_runtime_assertion_failed = False
 
-def _aits_record_assertion():
+def _aits_record_assertion(label):
     global _aits_runtime_assertion_count
     _aits_runtime_assertion_count += 1
+    print(f"验证 {{label}} 通过", flush=True)
+
+def _aits_record_assertion_failure():
+    global _aits_runtime_assertion_failed
+    _aits_runtime_assertion_failed = True
+
+def _aits_emit_completion():
+    if (
+        _aits_runtime_assertion_count > 0
+        and not _aits_runtime_assertion_failed
+        and {assertion_state_complete!r}
+    ):
+        print("测试用例执行完毕", flush=True)
 
 def _aits_write_assertion_count():
     if not {runtime_count_path_literal}:
@@ -353,37 +368,45 @@ def _aits_write_assertion_count():
     except OSError:
         pass
 
-try:
-    _aits_original_expect = expect
-except NameError:
-    _aits_original_expect = None
+class _AITSExpectationProxy:
+    def __init__(self, value, label):
+        self._aits_value = value
+        self._aits_label = label
 
-if _aits_original_expect is not None:
-    class _AITSExpectationProxy:
-        def __init__(self, value):
-            self._aits_value = value
+    def __getattr__(self, name):
+        original = getattr(self._aits_value, name)
+        if not name.startswith(("to_", "not_to_")):
+            return original
 
-        def __getattr__(self, name):
-            original = getattr(self._aits_value, name)
-            if not name.startswith(("to_", "not_to_")):
-                return original
-
-            def tracked(*args, **kwargs):
+        def tracked(*args, **kwargs):
+            try:
                 result = original(*args, **kwargs)
-                if not inspect.isawaitable(result):
-                    return result
+            except BaseException:
+                globals()["_aits_record_assertion_failure"]()
+                raise
+            if not inspect.isawaitable(result):
+                return result
 
-                async def await_and_record():
+            async def await_and_record():
+                try:
                     value = await result
-                    globals()["_aits_record_assertion"]()
-                    return value
+                except BaseException:
+                    globals()["_aits_record_assertion_failure"]()
+                    raise
+                globals()["_aits_record_assertion"](self._aits_label)
+                return value
 
-                return await_and_record()
+            return await_and_record()
 
-            return tracked
+        return tracked
 
-    def expect(*args, **kwargs):
-        return _AITSExpectationProxy(_aits_original_expect(*args, **kwargs))
+def _aits_wrap_expect(value, label):
+    # AST instrumentation is the sole path that adds a progress label.
+    # Unwrapping also keeps this helper safe if a manually maintained
+    # script has already passed a proxied expectation.
+    if isinstance(value, _AITSExpectationProxy):
+        value = value._aits_value
+    return _AITSExpectationProxy(value, label)
 '''
     wrapper = f'''
 
@@ -445,6 +468,7 @@ async def _run_with_managed_browser():
                 _aits_write_assertion_count()
             if _aits_close_error is not None and not _aits_active_exception:
                 raise _aits_close_error
+    _aits_emit_completion()
 
 {suite_decorator}def {safe_name}():
     asyncio.run(_run_with_managed_browser())

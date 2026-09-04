@@ -324,7 +324,9 @@ python_functions = test_*
 
     def _run_pytest_command(self, work_dir: str, config: ExecutionConfig) -> subprocess.CompletedProcess:
         """执行pytest命令"""
-        cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short"]
+        # Keep captured output for passing tests too. Disabling capture would
+        # interleave progress messages with the per-case status lines.
+        cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short", "-rA"]
         
         if config.generate_allure:
             allure_results_dir = os.path.join(work_dir, "allure-results")
@@ -577,9 +579,11 @@ python_functions = test_*
                 else:
                     continue
 
-                case_log = (
-                    case_output if status in {'failed', 'error'} else line
-                )
+                if status in {'failed', 'error'}:
+                    case_log = case_output
+                else:
+                    captured = self._extract_suite_case_output(stdout, test_case_id_str)
+                    case_log = '\n'.join(part for part in (line, captured) if part)
                 screenshot_file = (
                     os.path.join(config.failure_screenshot_dir, f'case_{test_case_id_str}.png')
                     if config and config.failure_screenshot_dir else None
@@ -605,6 +609,28 @@ python_functions = test_*
         return case_results
 
     @staticmethod
+    def _extract_suite_case_output(stdout: str, test_case_id: str) -> str:
+        """提取该用例的捕获输出，成功和失败均不得混入其他用例日志。"""
+        escaped_id = re.escape(str(test_case_id))
+        case_header = re.compile(
+            rf'^_+\s+.*\btest_case_{escaped_id}\b.*\s+_+\s*$',
+            re.I | re.M,
+        )
+        match = case_header.search(stdout or '')
+        if not match:
+            return ''
+        remainder = stdout[match.start():]
+        header_end = match.end() - match.start()
+        # PASSES/FAILURES/warnings/summary headings are boundaries too. In a
+        # mixed suite, the final failure is followed by the passing reports.
+        next_section = re.search(
+            r'(?m)^(?:_+\s+.*\s+_+|=+\s+.*\s+=+)\s*$',
+            remainder[header_end:],
+        )
+        end = header_end + next_section.start() if next_section else len(remainder)
+        return remainder[:end].strip()
+
+    @staticmethod
     def _extract_suite_case_failure(
         stdout: str,
         test_case_id: str,
@@ -612,24 +638,11 @@ python_functions = test_*
         allow_full_output: bool = False,
     ) -> str:
         """提取一个 Pytest 子用例的失败段落，避免把其他用例错误错误归属。"""
-        escaped_id = re.escape(str(test_case_id))
-        failure_header = re.compile(
-            rf'^_+\s+.*\btest_case_{escaped_id}\b.*\s+_+\s*$',
-            re.I | re.M,
-        )
-        match = failure_header.search(stdout or '')
-        if match:
-            remainder = stdout[match.start():]
-            next_section = re.search(
-                r'(?m)^(?:_+\s+.*\s+_+|=+\s+short test summary info\s+=+)\s*$',
-                remainder[match.end() - match.start():],
-            )
-            end = (
-                match.end() - match.start() + next_section.start()
-                if next_section else len(remainder)
-            )
-            return remainder[:end].strip()
+        captured = PlaywrightRunner._extract_suite_case_output(stdout, test_case_id)
+        if captured:
+            return captured
 
+        escaped_id = re.escape(str(test_case_id))
         summary_match = re.search(
             rf'(?m)^(?:FAILED|ERROR)\s+test_case_{escaped_id}\.py::[^\n]+$',
             stdout or '',

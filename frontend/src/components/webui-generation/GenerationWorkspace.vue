@@ -104,19 +104,36 @@ const displayVerificationLabel = computed(() => verification.value.status === 'p
   : workspaceVerificationLabel(displayVerificationStatus.value))
 const canSaveDraft = computed(() => Boolean(form.script_draft.trim()) && !form.variables.some(item => !item.name.trim()))
 const canDebug = computed(() => canSaveDraft.value && !props.draftSaving)
+let lastSyncedGenerationId = null
 
 const copyVariables = (variables) => (variables || []).map(item => ({
   name: item?.name || '', value: item?.value || '', is_secret: Boolean(item?.is_secret),
   required: Boolean(item?.required), description: item?.description || ''
 }))
 const reset = () => {
+  const nextGenerationId = props.draft?.generationId || null
+  const shouldClearRuntimeValues = lastSyncedGenerationId !== null && lastSyncedGenerationId !== nextGenerationId
+  const existingRuntimeMap = shouldClearRuntimeValues
+    ? new Map()
+    : new Map(runtimeVariables.map(item => [item.name, item.value]))
   form.script_draft = props.draft?.script_draft || ''
   form.variables = copyVariables(props.draft?.variables)
-  runtimeVariables.splice(0, runtimeVariables.length, ...form.variables.map(item => ({ name: item.name, value: '', is_secret: item.is_secret })))
+  runtimeVariables.splice(0, runtimeVariables.length, ...form.variables
+    .filter(item => item.name)
+    .map(item => ({ name: item.name, value: existingRuntimeMap.get(item.name) || '', is_secret: item.is_secret })))
+  lastSyncedGenerationId = nextGenerationId
 }
 // Do not watch `dirty`: the first edit changes it and must not reset the
 // editor or this run's in-memory runtime-variable overrides.
-watch(() => [props.draft?.generationId, props.draft?.revision], reset, { immediate: true })
+watch(
+  [() => props.draft?.generationId, () => props.draft?.revision, () => props.draft?.script_draft, () => props.draft?.variables],
+  () => {
+    if (!props.draft) return
+    if (props.draft.dirty && lastSyncedGenerationId === props.draft.generationId) return
+    reset()
+  },
+  { deep: true, immediate: true }
+)
 watch(() => form.variables, () => {
   const existing = new Map(runtimeVariables.map(item => [item.name, item.value]))
   runtimeVariables.splice(0, runtimeVariables.length, ...form.variables
@@ -129,7 +146,12 @@ const emitDraft = () => emit('update-draft', {
   script_draft: form.script_draft,
   variables: copyVariables(form.variables)
 })
-const updateScript = (value) => { form.script_draft = value || ''; emitDraft() }
+const updateScript = (value) => {
+  const nextValue = value || ''
+  if (nextValue === form.script_draft) return
+  form.script_draft = nextValue
+  emitDraft()
+}
 const addVariable = () => { form.variables.push({ name: '', value: '', is_secret: false, required: false, description: '' }); emitDraft() }
 const removeVariable = (index) => { form.variables.splice(index, 1); emitDraft() }
 const copyScript = async () => { try { await navigator.clipboard.writeText(form.script_draft); ElMessage.success('脚本已复制') } catch { ElMessage.error('复制失败，请手动复制脚本') } }

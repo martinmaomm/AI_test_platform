@@ -11,6 +11,7 @@ import ast
 import io
 import json
 import os
+import re
 import tokenize
 from typing import Any, Iterator
 
@@ -19,6 +20,7 @@ PENDING_ASSERTION_PREFIX = 'AITS_PENDING_ASSERTION:'
 PENDING_STEP_PREFIX = 'AITS_PENDING_STEP:'
 RUNTIME_ASSERTION_COUNT_KEY = 'runtime_assertion_count'
 _EXPECT_METHOD_PREFIXES = ('to_', 'not_to_')
+_PROGRESS_COMMENT_RE = re.compile(r'^\s*验证\s*[:：]\s*(?P<label>\S.*)$')
 
 
 def _run_function(tree: ast.Module) -> ast.AsyncFunctionDef | None:
@@ -180,12 +182,40 @@ def read_runtime_assertion_count(path: str | os.PathLike[str] | None) -> int:
         return 0
 
 
+def _progress_comments_by_line(source: str) -> dict[int, str]:
+    """Return valid ``# 验证：...`` labels keyed by their comment line."""
+    labels: dict[int, str] = {}
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for token in tokens:
+            if token.type != tokenize.COMMENT:
+                continue
+            match = _PROGRESS_COMMENT_RE.match(token.string[1:])
+            if match:
+                labels[token.start[0]] = match.group('label').strip()
+    except (tokenize.TokenError, IndentationError):
+        pass
+    return labels
+
+
+def _progress_label(labels: dict[int, str], line: int, assertion_type: str) -> str:
+    """Use an adjacent model-written label, with a generic source fallback."""
+    return labels.get(line - 1) or f'第 {line} 行的{assertion_type}'
+
+
 def instrument_runtime_assertions(source: str) -> str:
-    """Insert post-success counters after explicit asserts in temporary code only."""
+    """Instrument temporary code with assertion progress events only.
+
+    Each source assertion is evaluated exactly once.  Successful assertions
+    record their adjacent ``# 验证：...`` label (or a generic line fallback),
+    while a caught failure is remembered so a later success cannot claim that
+    the complete case finished normally.
+    """
     tree = ast.parse(source, filename='webui_test_script.py')
     run = _run_function(tree)
     if run is None:
         return source
+    labels = _progress_comments_by_line(source)
 
     class _RunAssertInstrumenter(ast.NodeTransformer):
         def __init__(self, target: ast.AsyncFunctionDef):
@@ -207,12 +237,45 @@ def instrument_runtime_assertions(source: str) -> str:
 
         def visit_Assert(self, node: ast.Assert):
             node = self.generic_visit(node)
-            if _is_literal_expression(node.test):
-                return node
-            increment = ast.Expr(
-                value=ast.Call(func=ast.Name(id='_aits_record_assertion', ctx=ast.Load()), args=[], keywords=[])
+            success: list[ast.stmt] = []
+            if not _is_literal_expression(node.test):
+                label = _progress_label(labels, node.lineno, '条件断言')
+                success.append(ast.Expr(
+                    value=ast.Call(
+                        func=ast.Name(id='_aits_record_assertion', ctx=ast.Load()),
+                        args=[ast.Constant(value=label)], keywords=[],
+                    )
+                ))
+            failure = ast.Expr(
+                value=ast.Call(
+                    func=ast.Name(id='_aits_record_assertion_failure', ctx=ast.Load()),
+                    args=[], keywords=[],
+                )
             )
-            return [node, ast.copy_location(increment, node)]
+            wrapped = ast.Try(
+                body=[node],
+                handlers=[ast.ExceptHandler(
+                    type=ast.Name(id='BaseException', ctx=ast.Load()),
+                    name=None,
+                    body=[failure, ast.Raise(exc=None, cause=None)],
+                )],
+                orelse=success,
+                finalbody=[],
+            )
+            return ast.copy_location(wrapped, node)
+
+        def visit_Await(self, node: ast.Await):
+            node = self.generic_visit(node)
+            if not _is_awaited_expect(node):
+                return node
+            matcher = node.value
+            label = _progress_label(labels, node.lineno, '页面断言')
+            matcher.func.value = ast.Call(
+                func=ast.Name(id='_aits_wrap_expect', ctx=ast.Load()),
+                args=[matcher.func.value, ast.Constant(value=label)],
+                keywords=[],
+            )
+            return node
 
     tree = _RunAssertInstrumenter(run).visit(tree)
     ast.fix_missing_locations(tree)

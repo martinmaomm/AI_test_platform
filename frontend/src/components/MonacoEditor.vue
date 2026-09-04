@@ -47,6 +47,7 @@ const emit = defineEmits(['update:value', 'change'])
 
 const editorContainer = ref(null)
 let editor = null
+let suppressModelChangeEvent = false
 let pmCompletionDisposable = null
 let envCompletionDisposable = null
 const completionVars = ref([])
@@ -317,8 +318,9 @@ onMounted(() => {
       insertSpaces: true
     })
 
-    // 监听内容变化
+    // Only real edits (including the public setValue API) notify consumers.
     editor.onDidChangeModelContent(() => {
+      if (suppressModelChangeEvent) return
       const value = editor.getValue()
       emit('update:value', value)
       emit('change', value)
@@ -344,7 +346,12 @@ onBeforeUnmount(() => {
 // 监听 value 变化
 watch(() => props.value, (newValue) => {
   if (editor && newValue !== editor.getValue()) {
-    editor.setValue(newValue || '')
+    suppressModelChangeEvent = true
+    try {
+      editor.setValue(newValue || '')
+    } finally {
+      suppressModelChangeEvent = false
+    }
   } else if (!editor) {
     console.warn('MonacoEditor未初始化，无法设置内容')
   }

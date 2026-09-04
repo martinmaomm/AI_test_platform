@@ -16,7 +16,7 @@ def mcp_graph_recursion_limit(max_steps: int) -> int:
 
 
 class BudgetedMCPAgent(MCPAgent):
-    """Keep mcp-use's model budget while sizing its LangGraph recursion budget."""
+    """Keep the model budget and run each ordered tool batch sequentially."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -41,7 +41,11 @@ class BudgetedMCPAgent(MCPAgent):
             system_prompt=system_prompt,
             middleware=middleware,
             debug=self.verbose,
-        ).with_config({"recursion_limit": self.recursion_limit})
+        ).with_config({
+            "recursion_limit": self.recursion_limit,
+            # Tools share one browser page; even fills/reads must finish in order.
+            "max_concurrency": 1,
+        })
 
     async def register_local_tools(self, tools: Iterable[BaseTool]) -> None:
         """Add controlled in-process tools to this initialized agent.

@@ -250,6 +250,8 @@ def _visible_login_form_state(output: Any) -> bool | None:
 
 
 EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览器上下文中探索并增量编写 Python 草稿。
+所有工具操作按顺序串行执行，包括填写、点击、读取页面和保存草稿；前一个完成后再执行下一个。需要根据页面结果决定的后续操作，应等待本轮工具结果后再发出。
+生成的 Python 脚本也必须按业务步骤逐个 await 浏览器操作，不使用 asyncio.gather、create_task、线程池或进程池并发执行测试步骤。
 浏览器调用上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，模型调用上限 {MCP_MAX_STEPS} 次；接近预算时停止浏览器操作，使用 aits_save_script 保存当前完整草稿和真实剩余步骤。
 每次得到足够的页面证据或修复草稿后，都必须调用 aits_save_script。该工具会返回静态检查反馈；按反馈继续完善，而不是只在最终文本一次性给代码。
 aits_save_script 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。

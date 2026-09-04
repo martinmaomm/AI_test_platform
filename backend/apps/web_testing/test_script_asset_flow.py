@@ -196,9 +196,18 @@ class ScriptAssetFlowTests(TestCase):
             'result': {'stdout': 'second passed', 'stderr': '', 'return_code': 0},
         }
 
+        def run_in_order(script_content, *_args, **_kwargs):
+            if script_content == first_script.strip():
+                self.assertFalse(detail.case_executions.filter(test_case=second_case).exists())
+                return failed_result
+            self.assertEqual(script_content, second_script.strip())
+            first_result = detail.case_executions.get(test_case=first_case)
+            self.assertEqual(first_result.status, 'failed')
+            return passed_result
+
         with patch(
             'web_testing.tasks._run_test_script',
-            side_effect=[failed_result, passed_result],
+            side_effect=run_in_order,
         ) as run_script, patch('web_testing.tasks.update_task_progress'):
             result = _execute_webui_test_suite_logic(
                 task,

@@ -50,20 +50,12 @@
               </div>
             </div>
 
-            <div v-if="execution.error_message" class="screenshot-card">
-              <div class="section-header">
-                <h3>失败现场</h3>
-                <span v-if="screenshotLoading" class="muted-text">正在加载截图…</span>
-              </div>
-              <el-image
-                v-if="screenshotUrl"
-                :src="screenshotUrl"
-                :preview-src-list="[screenshotUrl]"
-                fit="contain"
-                class="failure-screenshot"
-              />
-              <el-empty v-else-if="!screenshotLoading" description="未能生成失败截图" :image-size="70" />
-            </div>
+            <WebUIExecutionScreenshot
+              :project-id="execution.project_id"
+              :execution-id="execution.execution || execution.id"
+              :screenshot-path="execution.screenshot_path || ''"
+              :status="execution.status"
+            />
 
             <!-- Execution Logs -->
             <div class="log-container chart-card">
@@ -90,9 +82,9 @@
 </template>
 
 <script setup>
-import { ref, computed, onBeforeUnmount, watch } from 'vue'
+import { ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getWebUITestExecutionScreenshot } from '@/api/webTesting'
+import WebUIExecutionScreenshot from '@/components/WebUIExecutionScreenshot.vue'
 
 const props = defineProps({
   execution: {
@@ -107,8 +99,6 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['close'])
-const screenshotUrl = ref('')
-const screenshotLoading = ref(false)
 const openLogSections = ref([])
 
 const technicalLog = computed(() => {
@@ -118,31 +108,6 @@ const technicalLog = computed(() => {
   if (props.execution.log) parts.push(`--- log ---\n${props.execution.log}`)
   return parts.join('\n\n')
 })
-
-const revokeScreenshotUrl = () => {
-  if (screenshotUrl.value) {
-    URL.revokeObjectURL(screenshotUrl.value)
-    screenshotUrl.value = ''
-  }
-}
-
-const loadScreenshot = async () => {
-  revokeScreenshotUrl()
-  if (!props.execution?.error_message || !props.execution?.screenshot_path) return
-  screenshotLoading.value = true
-  try {
-    const executionId = props.execution.execution || props.execution.id
-    const blob = await getWebUITestExecutionScreenshot(props.execution.project_id, executionId)
-    screenshotUrl.value = URL.createObjectURL(blob)
-  } catch (error) {
-    console.warn('加载失败截图失败:', error)
-  } finally {
-    screenshotLoading.value = false
-  }
-}
-
-watch(() => props.execution?.id, loadScreenshot, { immediate: true })
-onBeforeUnmount(revokeScreenshotUrl)
 
 // 方法
 const formatTime = (timeStr) => {
@@ -243,37 +208,6 @@ const copyLogs = () => {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;
-}
-
-.screenshot-card {
-  background: #fff;
-  border: 1px solid #e8eaed;
-  border-left: 4px solid #f56c6c;
-  border-radius: 8px;
-  padding: 20px;
-}
-
-.section-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-
-.section-header h3 {
-  margin: 0;
-}
-
-.failure-screenshot {
-  display: block;
-  width: 100%;
-  max-height: 360px;
-  background: #f8f9fa;
-}
-
-.muted-text {
-  color: #909399;
-  font-size: 12px;
 }
 
 .value-url {

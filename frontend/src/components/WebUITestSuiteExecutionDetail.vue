@@ -102,14 +102,14 @@
                   </el-tag>
                 </div>
                 <pre v-if="caseItem.error_message" class="case-error">{{ caseItem.error_message }}</pre>
-                <div v-if="caseScreenshotUrls[caseItem.id]" class="case-screenshot-wrap">
-                  <el-image
-                    :src="caseScreenshotUrls[caseItem.id]"
-                    :preview-src-list="[caseScreenshotUrls[caseItem.id]]"
-                    fit="contain"
-                    class="case-screenshot"
-                  />
-                </div>
+                <WebUIExecutionScreenshot
+                  class="case-screenshot-wrap"
+                  :project-id="execution.project_id"
+                  :execution-id="execution.execution || execution.id"
+                  :case-execution-id="caseItem.id"
+                  :screenshot-path="caseItem.screenshot_path || ''"
+                  :status="caseItem.status"
+                />
                 <el-collapse v-if="caseItem.log || caseItem.stdout" v-model="openCaseLogs[caseItem.id]">
                   <el-collapse-item title="查看该子用例技术日志" name="technical">
                     <div class="log-content case-log-content">
@@ -170,7 +170,8 @@
 <script setup>
 import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getTestExecutionCases, getWebUITestExecutionScreenshot } from '@/api/webTesting'
+import { getTestExecutionCases } from '@/api/webTesting'
+import WebUIExecutionScreenshot from '@/components/WebUIExecutionScreenshot.vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { PieChart } from 'echarts/charts'
@@ -207,51 +208,30 @@ const emit = defineEmits(['close'])
 const activeTab = ref('overview')
 const caseExecutions = ref([])
 const casesLoading = ref(false)
-const caseScreenshotUrls = ref({})
 const openCaseLogs = ref({})
 const openLogSections = ref([])
-
-const revokeCaseScreenshotUrls = () => {
-  Object.values(caseScreenshotUrls.value).forEach((url) => {
-    if (url) URL.revokeObjectURL(url)
-  })
-  caseScreenshotUrls.value = {}
-}
-
-const loadCaseScreenshot = async (caseItem) => {
-  if (!caseItem.screenshot_path) return
-  try {
-    const executionId = props.execution.execution || props.execution.id
-    const blob = await getWebUITestExecutionScreenshot(
-      props.execution.project_id,
-      executionId,
-      caseItem.id
-    )
-    caseScreenshotUrls.value = {
-      ...caseScreenshotUrls.value,
-      [caseItem.id]: URL.createObjectURL(blob)
-    }
-  } catch (error) {
-    console.warn(`加载子用例 ${caseItem.id} 失败截图失败:`, error)
-  }
-}
+let casesRequestVersion = 0
 
 const loadCases = async () => {
+  const version = ++casesRequestVersion
   const projectId = props.execution?.project_id
   const executionId = props.execution?.execution || props.execution?.id
+  caseExecutions.value = []
+  openCaseLogs.value = {}
+  casesLoading.value = false
   if (!projectId || !executionId || props.execution?.exec_type === 'case') return
   casesLoading.value = true
-  revokeCaseScreenshotUrls()
   try {
     const response = await getTestExecutionCases(projectId, executionId)
+    if (version !== casesRequestVersion) return
     const payload = response?.data || response || {}
     caseExecutions.value = payload.cases || []
-    await Promise.all(caseExecutions.value.map(loadCaseScreenshot))
   } catch (error) {
+    if (version !== casesRequestVersion) return
     console.warn('加载套件子用例执行结果失败:', error)
     caseExecutions.value = []
   } finally {
-    casesLoading.value = false
+    if (version === casesRequestVersion) casesLoading.value = false
   }
 }
 
@@ -262,8 +242,8 @@ const formatCaseLog = (caseItem) => {
   return parts.join('\n\n')
 }
 
-watch(() => props.execution?.id, loadCases, { immediate: true })
-onBeforeUnmount(revokeCaseScreenshotUrls)
+watch(() => [props.execution?.project_id, props.execution?.execution || props.execution?.id, props.execution?.status], loadCases, { immediate: true })
+onBeforeUnmount(() => { casesRequestVersion += 1 })
 
 // 标签页配置
 const tabs = [
@@ -566,13 +546,6 @@ const copyLogs = () => {
 
 .case-screenshot-wrap {
   margin-top: 12px;
-}
-
-.case-screenshot {
-  display: block;
-  width: 100%;
-  max-height: 280px;
-  background: #fff;
 }
 
 .case-log-content {

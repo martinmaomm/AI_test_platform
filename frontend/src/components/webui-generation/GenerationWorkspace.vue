@@ -59,7 +59,7 @@
     <el-alert v-if="verification.message || verification.error_message" class="verification-message" type="warning" :closable="false" show-icon :title="verification.message || verification.error_message" />
 
     <section v-if="debugExecution || debugExecutionLoading" class="workspace-section execution-section">
-      <div class="section-heading"><div><h5>调试详情</h5><p>失败原因、失败截图和原始日志仅在服务端实际提供时展示。</p></div></div>
+      <div class="section-heading"><div><h5>调试详情</h5><p>正常结束和执行异常都会尝试截图，可在下方放大查看；失败原因和原始日志按实际结果展示。</p></div></div>
       <el-skeleton v-if="debugExecutionLoading && !debugExecution" :rows="5" animated />
       <WebUITestCaseExecutionDetail v-else-if="debugExecution" :execution="debugExecution" />
     </section>

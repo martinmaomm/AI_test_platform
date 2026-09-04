@@ -324,7 +324,7 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
         self.assertIn("asyncio.run(_run_with_managed_browser())", headed_materialized)
         self.assertNotIn("--base-url", headed_materialized)
 
-    def test_materialized_script_captures_failure_screenshot_before_closing_browser(self):
+    def test_materialized_script_captures_ending_screenshot_before_closing_browser(self):
         materialized = materialize_script(
             "async def run(page):\n    await page.click('#missing')\n",
             "test_failure",
@@ -335,11 +335,93 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
         screenshot_index = materialized.index("page.screenshot")
         context_close_index = materialized.index("await context.close()")
         self.assertLess(screenshot_index, context_close_index)
-        self.assertIn("full_page=False", materialized)
+        self.assertIn("full_page=True, timeout=5000", materialized)
         self.assertIn("/controlled/execution_1/single_case.png", materialized)
-        self.assertIn("raise", materialized)
 
-    def test_screenshot_failure_preserves_original_script_exception(self):
+    def test_materialized_script_captures_one_ending_screenshot_for_success_and_failure(self):
+        class FakePage:
+            def __init__(self, events):
+                self.events = events
+
+            async def screenshot(self, **kwargs):
+                self.events.append(('screenshot', kwargs))
+
+        class FakeContext:
+            def __init__(self, page, events):
+                self.page = page
+                self.events = events
+
+            async def new_page(self):
+                return self.page
+
+            async def close(self):
+                self.events.append(('context.close', None))
+
+        class FakeBrowser:
+            def __init__(self, context, events):
+                self.context = context
+                self.events = events
+
+            async def new_context(self, **_kwargs):
+                return self.context
+
+            async def close(self):
+                self.events.append(('browser.close', None))
+
+        def fake_modules(events):
+            page = FakePage(events)
+            context = FakeContext(page, events)
+            browser = FakeBrowser(context, events)
+
+            class BrowserType:
+                async def launch(self, **_kwargs):
+                    return browser
+
+            class Playwright:
+                chromium = BrowserType()
+
+            class PlaywrightContext:
+                async def __aenter__(self):
+                    return Playwright()
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+            fake_module = types.ModuleType('playwright.async_api')
+            fake_module.async_playwright = lambda: PlaywrightContext()
+            return {
+                'playwright': types.ModuleType('playwright'),
+                'playwright.async_api': fake_module,
+            }
+
+        for source, expected_error in (
+            ("async def run(page):\n    return None\n", None),
+            ("async def run(page):\n    raise ValueError('business failure')\n", 'business failure'),
+        ):
+            with self.subTest(expected_error=expected_error):
+                events = []
+                namespace = {}
+                materialized = materialize_script(
+                    source,
+                    'test_ending_screenshot',
+                    failure_screenshot_path='/controlled/ending.png',
+                )
+                with patch.dict(sys.modules, fake_modules(events)):
+                    exec(materialized, namespace)
+                    if expected_error:
+                        with self.assertRaisesRegex(ValueError, expected_error):
+                            namespace['test_ending_screenshot']()
+                    else:
+                        namespace['test_ending_screenshot']()
+
+                self.assertEqual(events[0], (
+                    'screenshot',
+                    {'path': '/controlled/ending.png', 'full_page': True, 'timeout': 5000},
+                ))
+                self.assertEqual([event for event, _ in events].count('screenshot'), 1)
+                self.assertEqual([event for event, _ in events][1:], ['context.close', 'browser.close'])
+
+    def test_screenshot_failure_preserves_success_and_original_script_exception(self):
         class FakePage:
             def __init__(self):
                 self.screenshot_args = None
@@ -370,40 +452,51 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
             async def close(self):
                 self.closed = True
 
-        page = FakePage()
-        context = FakeContext(page)
-        browser = FakeBrowser(context)
+        for source, expected_error in (
+            ("async def run(page):\n    return None\n", None),
+            ("async def run(page):\n    raise ValueError('original failure')\n", 'original failure'),
+        ):
+            with self.subTest(expected_error=expected_error):
+                page = FakePage()
+                context = FakeContext(page)
+                browser = FakeBrowser(context)
 
-        class BrowserType:
-            async def launch(self, **kwargs):
-                return browser
+                class BrowserType:
+                    async def launch(self, **kwargs):
+                        return browser
 
-        class Playwright:
-            chromium = BrowserType()
+                class Playwright:
+                    chromium = BrowserType()
 
-        class PlaywrightContext:
-            async def __aenter__(self):
-                return Playwright()
+                class PlaywrightContext:
+                    async def __aenter__(self):
+                        return Playwright()
 
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
 
-        fake_module = types.ModuleType('playwright.async_api')
-        fake_module.async_playwright = lambda: PlaywrightContext()
-        materialized = materialize_script(
-            "async def run(page):\n    raise ValueError('original failure')\n",
-            "test_preserve_original",
-            failure_screenshot_path="/controlled/failure.png",
-        )
-        namespace = {}
-        with patch.dict(sys.modules, {'playwright': types.ModuleType('playwright'), 'playwright.async_api': fake_module}):
-            exec(materialized, namespace)
-            with self.assertRaisesRegex(ValueError, 'original failure'):
-                namespace['test_preserve_original']()
+                fake_module = types.ModuleType('playwright.async_api')
+                fake_module.async_playwright = lambda: PlaywrightContext()
+                materialized = materialize_script(
+                    source,
+                    "test_preserve_original",
+                    failure_screenshot_path="/controlled/failure.png",
+                )
+                namespace = {}
+                with patch.dict(sys.modules, {'playwright': types.ModuleType('playwright'), 'playwright.async_api': fake_module}):
+                    exec(materialized, namespace)
+                    if expected_error:
+                        with self.assertRaisesRegex(ValueError, expected_error):
+                            namespace['test_preserve_original']()
+                    else:
+                        namespace['test_preserve_original']()
 
-        self.assertEqual(page.screenshot_args, {'path': '/controlled/failure.png', 'full_page': False})
-        self.assertTrue(context.closed)
-        self.assertTrue(browser.closed)
+                self.assertEqual(
+                    page.screenshot_args,
+                    {'path': '/controlled/failure.png', 'full_page': True, 'timeout': 5000},
+                )
+                self.assertTrue(context.closed)
+                self.assertTrue(browser.closed)
 
     def test_runner_writes_pytest_config_without_base_url(self):
         runner = PlaywrightRunner()
@@ -415,7 +508,7 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    def test_suite_result_parser_keeps_failure_details_and_screenshots_per_case(self):
+    def test_suite_result_parser_keeps_ending_screenshots_for_passed_and_failed_cases(self):
         runner = PlaywrightRunner()
         screenshot_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
         try:
@@ -426,17 +519,13 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
                     screenshot.write(b'PNG')
 
             stdout = '''
-test_case_11.py::test_case_11 FAILED
+test_case_11.py::test_case_11 PASSED
 test_case_12.py::test_case_12 FAILED
 
-_______________________________ test_case_11 ________________________________
-E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.
-E   waiting for get_by_role("button", name="登录")
 _______________________________ test_case_12 ________________________________
 E   playwright._impl._errors.TimeoutError: Locator.fill: Timeout 5000ms exceeded.
 E   waiting for get_by_label("用户名")
 =========================== short test summary info ============================
-FAILED test_case_11.py::test_case_11
 FAILED test_case_12.py::test_case_12
 '''
             results = runner._parse_suite_test_results(
@@ -449,12 +538,11 @@ FAILED test_case_12.py::test_case_12
             )
 
             first, second = results
-            self.assertIn('点击元素超时', first['error_message'])
-            self.assertIn('按钮“登录”', first['error_message'])
-            self.assertNotIn('用户名', first['log'])
+            self.assertEqual(first['status'], 'passed')
+            self.assertIsNone(first['error_message'])
+            self.assertIn('PASSED', first['log'])
             self.assertIn('输入元素超时', second['error_message'])
             self.assertIn('标签为“用户名”的输入项', second['error_message'])
-            self.assertNotIn('按钮“登录”', second['log'])
             self.assertTrue(first['screenshot_path'].endswith('case_11.png'))
             self.assertTrue(second['screenshot_path'].endswith('case_12.png'))
         finally:

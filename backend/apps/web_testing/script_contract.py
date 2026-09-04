@@ -408,16 +408,16 @@ async def _run_with_managed_browser():
             runtime_variables = {{}}
         try:
             {run_call}
-        except Exception:
+        finally:
             if {screenshot_path_literal}:
                 try:
-                    await page.screenshot(path={screenshot_path_literal}, full_page=False)
+                    await page.screenshot(
+                        path={screenshot_path_literal}, full_page=True, timeout=5000,
+                    )
                 except Exception as screenshot_error:
                     logging.getLogger(__name__).warning(
-                        "失败截图生成失败: %s", screenshot_error
+                        "执行结束截图生成失败: %s", screenshot_error
                     )
-            raise
-        finally:
             _aits_active_exception = sys.exc_info()[0] is not None
             _aits_close_error = None
             try:

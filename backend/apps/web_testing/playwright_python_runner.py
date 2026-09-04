@@ -594,7 +594,7 @@ python_functions = test_*
                     'stdout': case_log,
                     'screenshot_path': (
                         os.path.abspath(screenshot_file)
-                        if status in {'failed', 'error'} and screenshot_file and os.path.exists(screenshot_file)
+                        if screenshot_file and os.path.exists(screenshot_file)
                         else None
                     ),
                 })

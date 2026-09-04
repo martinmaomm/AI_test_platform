@@ -6,6 +6,7 @@ was migrated rather than discarded. No legacy trace or Goal contract is accepted
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import tempfile
 from pathlib import Path
@@ -24,8 +25,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from ai_core.models import LLMConfiguration, ModelType
 from projects.models import Project
 
-from .exploration_trace import ExplorationTraceRecorder, FinalizedAction, FinalizedAssertion
-from .generation_contracts import GenerationTransitionError, ScenarioPlan
+from .generation_contracts import GenerationTransitionError
 from .generation_events import publish_terminal
 from .generation_preflight import (
     exploration_requires_write_confirmation,
@@ -42,8 +42,6 @@ from .generation_repository import (
 )
 from .generation_save_state import generation_reference, is_generation_saved
 from .models import WebUIScriptGeneration
-from .replay_plan import PythonReplayCompiler, ReplayPlanner
-from .script_quality import evaluate_script
 from .script_exploration_agent import ScriptExplorationResult
 from .serializers import (
     WebUIScriptGenerationCreateSerializer,
@@ -51,144 +49,6 @@ from .serializers import (
 )
 from .target_urls import extract_target_url
 from .views import WebUIScriptGenerationCreateView
-
-
-def plan_payload(*, cleanup: bool = False):
-    criteria = ['测试值可见']
-    assertions = [{
-        'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
-        'kind': 'contains_ref', 'input_ref': 'ITEM_NAME', 'literal': '',
-    }]
-    if cleanup:
-        criteria.append('测试值清理后不可见')
-        assertions.append({
-            'assertion_id': 'A2', 'criterion_index': 1, 'phase': 'cleanup',
-            'kind': 'not_contains_ref', 'input_ref': 'ITEM_NAME', 'literal': '',
-        })
-    return {
-        'schema_version': 4,
-        'title': '连续回归场景',
-        'objective': '在同一会话中完成动作并验证 callback 证据。',
-        'instructions': ['进入页面', '执行操作', '验证结果'],
-        'success_criteria': criteria,
-        'assertion_requirements': assertions,
-        'input_refs': [{'name': 'ITEM_NAME', 'source': 'generated'}],
-        'preconditions': [], 'forbidden_actions': [],
-        'allow_test_data_writes': True,
-        'cleanup_expected': cleanup, 'discovery_notes': [], 'risk_level': 'low',
-    }
-
-
-def record(recorder, run_id: str, tool_name: str, inputs: dict, output):
-    recorder.on_tool_start(
-        {'name': tool_name}, '', run_id=run_id, inputs=inputs,
-    )
-    recorder.on_tool_end(output, run_id=run_id)
-
-
-def replay_fixture(*, verify_cleanup: bool = True):
-    plan = ScenarioPlan.model_validate(plan_payload(cleanup=True))
-    recorder = ExplorationTraceRecorder('/items')
-    recorder.configure_plan(plan)
-    recorder.configure_runtime(
-        {'ITEM_NAME': 'runtime-item'}, plan.input_sources(),
-    )
-    record(
-        recorder, 'navigate', 'playwright_navigate',
-        {'url': 'https://example.test/items'}, 'URL: https://example.test/items',
-    )
-    record(
-        recorder, 'fill', 'playwright_fill',
-        {'selector': '[name=password][data-item="runtime-item"]', 'value': 'runtime-item'},
-        'filled',
-    )
-    record(
-        recorder, 'assert-main', 'playwright_get_visible_html',
-        {'selector': '#result'}, '<main>runtime-item</main>',
-    )
-    record(
-        recorder, 'cleanup', 'playwright_click', {'selector': '#cleanup'}, 'clicked',
-    )
-    if verify_cleanup:
-        record(
-            recorder, 'assert-cleanup', 'playwright_get_visible_html',
-            {'selector': '#result'}, '<main>empty</main>',
-        )
-    if verify_cleanup:
-        recorder.candidate_summary()
-        recorder.finalize_path(
-            main_actions=[FinalizedAction(event_id='E000002', step_name='填写测试值')],
-            assertions=[
-                FinalizedAssertion(assertion_id='A1', event_id='E000003'),
-                FinalizedAssertion(assertion_id='A2', event_id='E000005'),
-            ],
-            cleanup_actions=[FinalizedAction(event_id='E000004', step_name='清理测试数据')],
-        )
-    return plan, recorder.build(tool_stats={'total_tool_calls': 5})
-
-
-class V4ScriptQualityRegressionTests(SimpleTestCase):
-    def test_compiled_script_has_callback_provenance_cleanup_verification_and_signature(self):
-        plan, trace = replay_fixture()
-        replay = ReplayPlanner.build(plan, trace)
-        source = PythonReplayCompiler.compile(plan, trace, replay)
-        report = evaluate_script(source, plan=plan, trace=trace, replay_plan=replay)
-        self.assertIn('async def run(page, variables):', source)
-        self.assertIn('finally:', source)
-        self.assertIn('[A2/E000005]', source)
-        self.assertIn('[name=password]', source)
-        self.assertNotIn('runtime-item', source)
-        self.assertIn(
-            'SCRIPT_CONTRACT_INVALID',
-            {item['code'] for item in report['blockers']},
-        )
-
-    def test_quality_restores_general_safety_executability_and_provenance_checks(self):
-        plan, trace = replay_fixture()
-        replay = ReplayPlanner.build(plan, trace)
-        source = PythonReplayCompiler.compile(plan, trace, replay)
-        variants = {
-            'ABSOLUTE_URL_FORBIDDEN': source + '# https://example.test/forbidden\n',
-            'RUN_SIGNATURE_INVALID': source.replace(
-                'async def run(page, variables):', 'async def run(page):',
-            ),
-            'ACTION_EVIDENCE_REFERENCE_MISSING': source.replace(
-                '[E000001]', '(E000001)', 1,
-            ),
-            'CLEANUP_FINALLY_MISMATCH': source.replace(
-                '    finally:', '    except Exception:',
-            ),
-            'UNRESOLVED_PLACEHOLDER': source.replace(
-                '    variables = variables or {}', '    pass',
-            ),
-            'BROWSER_LIFECYCLE_FORBIDDEN': source.replace(
-                '    variables = variables or {}', '    await page.close()',
-            ),
-            'FIXED_WAIT_FORBIDDEN': source.replace(
-                '    variables = variables or {}', '    await page.wait_for_timeout(100)',
-            ),
-            'UNDEFINED_NAME': source.replace(
-                '    variables = variables or {}', '    missing_name()',
-            ),
-        }
-        for expected_code, invalid_source in variants.items():
-            with self.subTest(expected_code=expected_code):
-                report = evaluate_script(
-                    invalid_source, plan=plan, trace=trace, replay_plan=replay,
-                )
-                self.assertIn(
-                    expected_code, {item['code'] for item in report['blockers']},
-                )
-        credential_report = evaluate_script(
-            source.replace('    variables = variables or {}', '    password = "test-only-password"'),
-            plan=plan, trace=trace, replay_plan=replay,
-        )
-        self.assertTrue(
-            {
-                'SCRIPT_CONTRACT_INVALID',
-                'SCRIPT_NOT_DETERMINISTIC_REPLAY',
-            }.issubset({item['code'] for item in credential_report['blockers']}),
-        )
 
 
 class V4SafeOutputPathRegressionTests(SimpleTestCase):
@@ -231,6 +91,19 @@ class V4SafeOutputPathRegressionTests(SimpleTestCase):
         self.assertIn(generation_id, environment['AITS_MCP_SCREENSHOT_DIR'])
         self.assertNotIn('..', environment['AITS_MCP_SCREENSHOT_DIR'])
         self.assertEqual(environment['AITS_MCP_DISABLE_FILE_LOG'], '0')
+
+
+class V5EntrypointBoundaryRegressionTests(SimpleTestCase):
+    def test_generation_entrypoint_imports_exclude_retired_v4_modules(self):
+        source = Path(__file__).with_name('generation_orchestrator.py').read_text(encoding='utf-8')
+        imports = {
+            node.module.rsplit('.', 1)[-1]
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        self.assertFalse(imports & {
+            'requirement_normalizer', 'script_generator', 'replay_plan', 'script_quality',
+        })
 
 
 class V4GenerationPersistenceRegressionTests(TestCase):
@@ -575,7 +448,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertEqual(generation.status, WebUIScriptGeneration.Status.NEEDS_REVIEW)
         publish_terminal.assert_called_once()
 
-    def test_local_schema5_brief_exposes_normalizing_stage_without_calling_normalizer(self):
+    def test_local_schema5_brief_exposes_normalizing_stage_without_calling_llm_manager(self):
         from .generation_orchestrator import run_generation
 
         generation = self.make_generation()
@@ -595,8 +468,8 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         with patch(
             'web_testing.generation_orchestrator._brief_for_generation', side_effect=inspect_state,
         ), patch(
-            'web_testing.requirement_normalizer.RequirementNormalizer.normalize',
-        ) as normalizer, patch(
+            'web_testing.generation_orchestrator.get_llm_manager',
+        ) as llm_manager, patch(
             'web_testing.generation_orchestrator.run_safety_preflight',
             return_value=SimpleNamespace(
                 outcome='needs_confirmation', error_code='INPUT_AMBIGUOUS',
@@ -605,7 +478,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         ), patch('web_testing.generation_orchestrator.publish_stage_changed') as publish_stage:
             result = run_generation(str(generation.pk), celery_task_id='task-1')
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_CONFIRMATION)
-        normalizer.assert_not_called()
+        llm_manager.assert_not_called()
         self.assertEqual(observed['status'], WebUIScriptGeneration.Status.NORMALIZING)
         self.assertEqual(observed['stage'], WebUIScriptGeneration.Stage.NORMALIZING)
         self.assertEqual(observed['progress'], 10)
@@ -614,7 +487,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertEqual(published_generation.status, WebUIScriptGeneration.Status.NORMALIZING)
         self.assertEqual(published_generation.progress, 10)
 
-    def test_agent_model_authentication_failure_is_terminal_without_normalizer_retry(self):
+    def test_agent_model_authentication_failure_is_terminal(self):
         from .generation_orchestrator import run_generation
 
         generation = self.make_generation()
@@ -645,15 +518,12 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         ), patch(
             'web_testing.script_exploration_agent.ScriptExplorationAgent', AuthenticationFailingAgent,
         ), patch(
-            'web_testing.requirement_normalizer.RequirementNormalizer.normalize',
-        ) as normalizer, patch(
             'web_testing.generation_orchestrator.publish_terminal',
         ) as publish_terminal:
             result = run_generation(str(generation.pk), celery_task_id='task-1')
 
         generation.refresh_from_db()
         self.assertEqual(AuthenticationFailingAgent.calls, 1)
-        normalizer.assert_not_called()
         self.assertEqual(result['error_code'], 'MODEL_AUTHENTICATION_FAILED')
         self.assertEqual(generation.status, WebUIScriptGeneration.Status.NEEDS_REVIEW)
         self.assertEqual(generation.progress, 100)

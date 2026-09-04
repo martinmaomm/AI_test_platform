@@ -347,6 +347,54 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         compile(agent._last_valid_script, '<entry-seed>', 'exec')
         self.assertEqual(agent._quality_report(agent._last_valid_script)['blockers'], [])
 
+    def test_partial_marker_text_in_string_gets_a_real_pending_comment(self):
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        script = COMPLETE_SCRIPT + "\n    example = '# AITS_PENDING_STEP: example text'\n"
+        feedback = agent._consider_candidate(
+            script, completed_steps=[], remaining_steps=[], variables=[],
+            completion='partial', source='test',
+        )
+        state = agent._quality_report(agent._last_valid_script)['assertion_state']
+        self.assertEqual(feedback['status'], 'accepted')
+        self.assertTrue(feedback['pending_step_inserted'])
+        self.assertEqual([item['kind'] for item in state['pending']], ['step'])
+        self.assertEqual(agent._artifact['completion'], 'partial')
+
+    def test_complete_script_keeps_marker_looking_string_as_complete(self):
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        script = COMPLETE_SCRIPT + "\n    example = '# AITS_PENDING_STEP: example text'\n"
+        feedback = agent._consider_candidate(
+            script, completed_steps=[], remaining_steps=[], variables=[],
+            completion='complete', source='test',
+        )
+        self.assertEqual(feedback['status'], 'accepted')
+        self.assertFalse(feedback['pending_step_inserted'])
+        self.assertEqual(agent._artifact['completion'], 'complete')
+
+    def test_partial_draft_without_assertion_gets_pending_assertion_reason(self):
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        script = COMPLETE_SCRIPT.replace('    await expect(page.get_by_role("heading")).to_be_visible()\n', '')
+        agent._consider_candidate(
+            script, completed_steps=[], remaining_steps=[], variables=[],
+            completion='partial', source='test',
+        )
+        state = agent._quality_report(agent._last_valid_script)['assertion_state']
+        self.assertEqual([item['kind'] for item in state['pending']], ['assertion'])
+        self.assertEqual(agent._artifact['remaining_steps'], ['草稿尚无真实断言，需补充可验证结果。'])
+
+    def test_real_pending_marker_is_not_automatically_removed(self):
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        agent._consider_candidate(
+            PARTIAL_SCRIPT, completed_steps=[], remaining_steps=[], variables=[],
+            completion='partial', source='test',
+        )
+        self.assertEqual(agent._last_valid_script, PARTIAL_SCRIPT.strip())
+        self.assertEqual(agent._quality_report(agent._last_valid_script)['assertion_state']['pending_count'], 1)
+
     def test_invalid_entry_does_not_create_browser_or_slash_seed(self):
         with patch('web_testing.script_exploration_agent.MCPClient.from_dict') as client:
             result = asyncio.run(self.make_agent().generate(brief=brief(), target_url='/'))

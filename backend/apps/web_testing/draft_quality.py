@@ -166,7 +166,14 @@ def evaluate_draft(script: str, *, target_url: str = '', snapshot: dict | None =
     if not any(line.lstrip().startswith('#') for line in source.splitlines()):
         warnings.append(_issue('STEP_COMMENTS_MISSING', '建议给主要操作步骤添加中文注释。', level='warning'))
     if state['pending_count']:
-        warnings.append(_issue('PENDING_WORK', f"还有 {state['pending_count']} 项步骤或断言待补充；草稿可以编辑，不能视为测试通过。", level='warning'))
+        pending_steps = sum(item.get('kind') == 'step' for item in state['pending'])
+        pending_assertions = state['pending_count'] - pending_steps
+        kinds = []
+        if pending_steps:
+            kinds.append(f'{pending_steps} 项步骤')
+        if pending_assertions:
+            kinds.append(f'{pending_assertions} 项断言')
+        warnings.append(_issue('PENDING_WORK', f"仍有{'、'.join(kinds)}待补充；草稿可以编辑，不能视为测试通过。", level='warning'))
     elif state['confirmed_count'] == 0:
         warnings.append(_issue('NO_REAL_ASSERTION', '脚本没有真实断言，执行完成也只能显示验证未完成。', level='warning'))
     # Successful tool calls support review, but do not make a locator/business

@@ -4,7 +4,8 @@
       <h5>最新探索状态</h5>
       <el-tag v-for="path in observedPaths" :key="path" class="path-tag" effect="plain">{{ path }}</el-tag>
       <p>累计工具调用：{{ stats.total_tool_calls || 0 }}，失败：{{ stats.failed_tool_calls || 0 }}，耗时：{{ stats.duration_seconds || 0 }} 秒</p>
-      <p v-if="trace.final_message">最新消息：{{ trace.final_message }}</p>
+      <p>{{ traceStatusSummary }}</p>
+      <p v-if="hasTechnicalModelOutput">模型最终回复和原始输出仅用于技术诊断，请在“技术信息”展开查看。</p>
     </div>
 
     <div class="trace-section">
@@ -53,7 +54,7 @@
 
     <div v-if="history.length" class="trace-section">
       <h5>草稿历史</h5>
-      <el-table :data="history" size="small" max-height="220"><el-table-column prop="revision" label="版本" width="90" /><el-table-column label="完成度" width="120"><template #default="{ row }">{{ row.artifact?.completion === 'complete' ? '草稿完成' : '待补充' }}</template></el-table-column><el-table-column label="剩余工作" min-width="280"><template #default="{ row }">{{ (row.artifact?.remaining_steps || []).join('；') || '未记录待补充项' }}</template></el-table-column></el-table>
+      <el-table :data="history" size="small" max-height="220"><el-table-column prop="revision" label="版本" width="90" /><el-table-column label="完成度" width="120"><template #default="{ row }">{{ row.artifact?.completion === 'complete' ? '草稿完成' : '待补充' }}</template></el-table-column><el-table-column label="剩余工作" min-width="280"><template #default="{ row }">{{ historySteps(row) }}</template></el-table-column></el-table>
     </div>
   </div>
   <el-empty v-else description="尚无 schema v5 探索轨迹" :image-size="56" />
@@ -61,6 +62,7 @@
 
 <script setup>
 import { computed } from 'vue'
+import { generationUserMessage } from '@/composables/webUIScriptGenerationPresentation'
 
 const props = defineProps({
   snapshot: { type: Object, default: () => ({}) },
@@ -86,12 +88,25 @@ const failureReason = computed(() => props.failureMessage || '')
 const completionTitle = computed(() => artifact.value.completion === 'partial'
   ? '草稿未完成：仅可将已记录证据整理为可编辑草稿，不能视为测试通过。'
   : '草稿完整性未知：请以已完成步骤、剩余步骤和终止原因为准。')
+const traceStatusSummary = computed(() => artifact.value.completion === 'complete'
+  ? '智能体已将最近保存的草稿标记为完成；这不代表脚本已实际调试通过。'
+  : artifact.value.completion === 'partial'
+    ? '最近保存的草稿仍有待补充项；请以草稿完整性和技术诊断为准。'
+    : '最近草稿状态尚未完整记录；请以草稿完整性和技术诊断为准。')
+const hasTechnicalModelOutput = computed(() => Boolean(trace.value?.final_message || trace.value?.model_output_raw))
 const pageLocation = item => item?.relative_path || item?.path || item?.url || item?.location || '未记录'
 const pageSummary = item => item?.excerpt || item?.summary || item?.title || item?.result_excerpt || item?.message || '—'
 const eventLocation = item => item?.relative_path || item?.path || item?.url || '—'
 const eventSummary = (item) => item?.result_excerpt || item?.message || item?.error_message || item?.summary || Object.entries(item?.locator_input || {}).map(([key, value]) => `${key}: ${value}`).join('；') || '—'
-const stepText = step => typeof step === 'string' ? step : step?.title || step?.name || step?.id || '未命名步骤'
+const stepText = step => {
+  const value = typeof step === 'string' ? step : step?.title || step?.name || step?.id || ''
+  return generationUserMessage(value, value ? '原始步骤说明请在技术信息查看' : '未命名步骤')
+}
 const stepKey = step => typeof step === 'string' ? step : JSON.stringify(step)
+const historySteps = row => {
+  const steps = Array.isArray(row?.artifact?.remaining_steps) ? row.artifact.remaining_steps : []
+  return steps.length ? steps.map(stepText).join('；') : '未记录待补充项'
+}
 const variableName = item => typeof item === 'string' ? item : item?.name || '—'
 const variableDescription = item => typeof item === 'string' ? '' : item?.description || '—'
 const variableRequired = item => typeof item === 'object' && Boolean(item?.required)

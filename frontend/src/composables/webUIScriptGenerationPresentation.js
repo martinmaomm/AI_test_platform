@@ -114,13 +114,68 @@ export const generationDraftCompletion = (generation) => {
   }
 }
 
-export const generationFailureReason = (generation) => (
-  generation?.error_message
-  || generation?.exploration_snapshot?.error_message
-  || generation?.exploration_snapshot?.final_message
-  || generation?.exploration_snapshot?.termination_reason
-  || ''
-)
+const KNOWN_GENERATION_ERROR_MESSAGES = {
+  TASK_CANCELLED: '任务已取消。',
+  INVALID_TARGET_URL: '目标网址无效，请填写完整的 HTTP(S) 地址。',
+  NO_SCRIPT_DRAFT: '未保存可用的 Python 草稿。',
+  CHECKPOINT_FAILED: '草稿保存失败，已停止本次生成；请以最后一次成功保存的版本为准。',
+  EXPLORATION_EVIDENCE_INCOMPLETE: '探索证据未完整保存。',
+  INPUT_AMBIGUOUS: '测试目标仍需确认。',
+  EXPLORATION_WRITE_CONFIRMATION_REQUIRED: '需要确认允许的测试数据操作范围。',
+  EXPLORATION_EXTRA_RISK_BLOCKED: '测试目标包含当前不允许的额外高风险操作。',
+  MODEL_SERVICE_ERROR: '模型服务异常，请稍后重试。',
+  MODEL_GATEWAY_TIMEOUT: '模型响应超时，请稍后重试。',
+  MODEL_AUTHENTICATION_FAILED: '模型认证或权限校验失败，请检查模型配置。',
+  MODEL_RATE_LIMITED: '模型服务触发限流，请稍后重试。',
+  exploration_timeout: '页面探索达到总时限，已保留当前证据。',
+  login_failed: '登录后页面仍显示登录表单，请检查测试账号或登录流程。',
+  external_domain_blocked: '探索尝试访问目标站点以外的地址，已停止。',
+  transient: '连接暂时中断，已保留当前草稿和探索证据。'
+}
+
+const USER_MESSAGE_LIMIT = 180
+const isChineseMessage = value => /[\u3400-\u9fff]/.test(String(value || ''))
+export const generationUserMessage = (value, fallback) => {
+  let text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!isChineseMessage(text)) return fallback
+  const chineseCount = (text.match(/[\u3400-\u9fff]/g) || []).length
+  const englishCount = (text.match(/[A-Za-z]/g) || []).length
+  if (englishCount > chineseCount * 2) {
+    if (fallback) return fallback
+    text = (text.match(/^[\u3400-\u9fff，。；：、（）()0-9\s]+/) || [''])[0].trim()
+  }
+  return text.length > USER_MESSAGE_LIMIT ? `${text.slice(0, USER_MESSAGE_LIMIT)}…` : text
+}
+
+/** Only backend diagnostics may become a normal warning; model final text stays technical. */
+export const generationFailureReason = (generation) => {
+  const snapshot = generation?.exploration_snapshot || {}
+  const diagnostic = generation?.error_message || snapshot.error_message || ''
+  const errorCode = generation?.error_code || snapshot.error_code || snapshot.termination_reason || ''
+  const compactDiagnostic = generationUserMessage(diagnostic, '')
+  if (compactDiagnostic) return compactDiagnostic
+  if (KNOWN_GENERATION_ERROR_MESSAGES[errorCode]) return KNOWN_GENERATION_ERROR_MESSAGES[errorCode]
+  if (diagnostic || errorCode) return generation?.status === 'failed'
+    ? '本次生成失败，原始诊断请查看技术信息。'
+    : '本次生成未完整结束，原始诊断请查看技术信息。'
+  return ''
+}
+
+const generationPendingSummary = (generation) => {
+  const completion = generationDraftCompletion(generation)
+  // The response recomputes this state from the current script. Exploration
+  // remaining_steps belong to the original artifact, not later human edits.
+  const state = generation?.workspace?.verification?.assertion_state || generation?.quality_report?.assertion_state || {}
+  const pending = Array.isArray(state.pending) ? state.pending : []
+  const pendingSteps = pending.filter(item => item?.kind === 'step')
+  const pendingAssertions = pending.filter(item => item?.kind === 'assertion')
+  if (pendingSteps.length) return `待补充步骤：${generationUserMessage(pendingSteps[0].reason, '具体原因未以中文记录，请在技术信息查看原始内容。')}`
+  if (pendingAssertions.length) return `待补充断言：${generationUserMessage(pendingAssertions[0].reason, '具体原因未以中文记录，请在技术信息查看原始内容。')}`
+  if (state.status === 'incomplete' && Number(state.confirmed_count || 0) === 0) return '草稿缺少真实断言，需补充可验证结果。'
+  if (state.status === 'complete') return '当前脚本未检测到待补充标记；请以本版实际调试结果为准。'
+  if (completion.remainingSteps.length) return `待补充项：${generationUserMessage(completion.remainingSteps[0], '具体原因未以中文记录，请在技术信息查看原始内容。')}`
+  return completion.isPartial ? '草稿未完成，尚未记录具体待补充项。' : ''
+}
 
 export const canRetryScriptFromTrace = (generation, busy = false) => {
   const snapshot = generation?.exploration_snapshot || {}
@@ -235,19 +290,19 @@ export const buildGenerationTimeline = (generation) => {
   })
 }
 
-export const generationResolutionHint = (generation) => {
+export const generationResolutionHint = (generation, { draftDirty = false } = {}) => {
   const status = generation?.status
   if (status === 'needs_input') return '请补充明确的测试目标、操作步骤和至少一个可验证结果后重新分析。页面元素和平台默认清理策略不需要填写。'
   if (status === 'needs_confirmation') return '请确认本次测试目标范围。平台会在一个连续会话中自行探索页面元素；额外高风险操作仍需单独调整目标。'
   if (status === 'needs_review') {
     const reason = generationFailureReason(generation)
-    const completion = generationDraftCompletion(generation)
-    return `${reason ? `${reason} ` : ''}${completion.isPartial ? '已保留未完成草稿和探索证据，可继续编辑，或仅基于现有轨迹整理脚本。' : '已保留当前探索证据，可继续检查或仅基于现有轨迹整理脚本。'}`
+    const pending = draftDirty ? '本地草稿有修改，保存后会重新检查待补充步骤和断言。' : generationPendingSummary(generation)
+    return `${reason ? `${reason} ` : ''}${pending ? `${pending} ` : ''}已保留草稿和探索证据，可继续编辑，或仅基于现有轨迹整理脚本。`
   }
   if (status === 'failed' || status === 'cancelled') {
-    const message = generationFailureReason(generation) || (status === 'failed' ? '本次生成未完成。' : '本次生成已停止。')
+    const message = generationFailureReason(generation) || (status === 'failed' ? '本次生成失败，详情请查看技术信息。' : '本次生成已取消。')
     const completion = generationDraftCompletion(generation)
-    return `${message}${completion.isPartial ? ' 未完成草稿仍可编辑，也可仅基于已保存证据整理脚本。' : ''}`
+    return `${message}${completion.isPartial && !draftDirty ? ` ${generationPendingSummary(generation)} 未完成草稿仍可编辑，也可仅基于已保存证据整理脚本。` : draftDirty ? ' 本地草稿有修改，保存后会重新检查。' : ''}`
   }
   if (status === 'ready_with_warnings') return '脚本可保存，但建议先查看定位器和探索轨迹警告。'
   return ''

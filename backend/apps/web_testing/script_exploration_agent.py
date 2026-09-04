@@ -57,6 +57,7 @@ _CHECKPOINT_INTERVAL_SECONDS = 3.0
 _RAW_MODEL_OUTPUT_LIMIT = 20000
 _MODEL_OUTPUT_SUMMARY_LIMIT = 2000
 _PENDING_STEP_PREFIX = '# AITS_PENDING_STEP:'
+_PENDING_ASSERTION_PREFIX = '# AITS_PENDING_ASSERTION:'
 _BASE64_RE = re.compile(r'(?<![a-z0-9+/=])[a-z0-9+/]{2048,}={0,2}', re.I)
 _SCREENSHOT_DATA_RE = re.compile(r'data:image/[^;,\s]+;base64,[a-z0-9+/=\s]+', re.I)
 _LOGIN_MARKERS = ('登录', 'login', 'sign in', 'signin')
@@ -257,8 +258,9 @@ EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览
 aits_save_script 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
 任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 aits_save_script 持久化最新完整草稿，不要等到最终回复。
 只根据真实观察生成 goto、定位器和断言。未实际完成的操作必须在代码中保留 # AITS_PENDING_STEP: {{\"reason\":\"...\"}}；未知断言使用 # AITS_PENDING_ASSERTION: ...。存在 pending step 或 remaining_steps 时不可声称 complete。
+若真实完成并确认某一待补充操作或断言，只移除该项对应 marker；仅删除 marker 不构成完成证明，绝不自动清除平台侧状态。只有全部目标工作和待补充项均已真实完成时，才以 completion=complete、remaining_steps=[] 保存；否则保持 partial 并列出具体剩余项。completed_steps、remaining_steps 和 marker 的 reason 使用简洁中文。
 不得伪造按钮、页面文字、定位器或断言。禁止 playwright_evaluate、上传、关闭浏览器、外域导航，以及审批、付款、发布、下载等未授权高风险操作。浏览器只可访问本次目标站点。
-无需也不得调用任何路径定稿工具或基于 event id 的完成协议。最终回复只简短说明；草稿的权威版本来自 aits_save_script。"""
+无需也不得调用任何路径定稿工具或基于 event id 的完成协议。最终回复只用中文简短说明已保存的草稿状态和剩余项，不输出推理过程；草稿的权威版本来自 aits_save_script。"""
 
 
 @dataclass(frozen=True)
@@ -627,12 +629,30 @@ class ScriptExplorationAgent:
         # but its positive result never proves the business flow actually ran.
         if report.get('completion') != 'complete':
             normalized_completion = 'partial'
-        if normalized_completion != 'complete' and _PENDING_STEP_PREFIX not in candidate:
-            reason = remaining[0] if remaining else '当前草稿仍需根据已保存 trace 补充未确认操作或断言。'
-            candidate = self._append_pending_step(candidate, reason)
-            auto_pending_step = True
-            if not remaining:
+        assertion_state = report.get('assertion_state') or {}
+        pending_items = assertion_state.get('pending') if isinstance(assertion_state, dict) else []
+        pending_items = pending_items if isinstance(pending_items, list) else []
+        has_pending_step = any(item.get('kind') == 'step' for item in pending_items if isinstance(item, dict))
+        if normalized_completion != 'complete':
+            # The assertion-state parser only reports tokenizer COMMENT tokens.
+            # A marker-looking string literal must not suppress a real marker.
+            # The platform never removes a real marker automatically; a model
+            # or user may explicitly remove one only after resolving that item.
+            if remaining and not has_pending_step:
+                candidate = self._append_pending_step(candidate, remaining[0])
+                auto_pending_step = True
+            elif not remaining and pending_items:
+                reason = next((str(item.get('reason') or '').strip() for item in pending_items if isinstance(item, dict) and item.get('reason')), '')
+                remaining = [reason or '草稿保留了待补充项，请根据对应标记完成后重新检查。']
+            elif not remaining and int(assertion_state.get('confirmed_count') or 0) == 0:
+                reason = '草稿尚无真实断言，需补充可验证结果。'
+                candidate = self._append_pending_assertion(candidate, reason)
                 remaining = [reason]
+            elif not remaining:
+                reason = '智能体未确认完成，未说明具体缺少项。'
+                candidate = self._append_pending_step(candidate, reason)
+                remaining = [reason]
+                auto_pending_step = True
             report = self._quality_report(candidate)
             blockers = list(report.get('blockers') or [])
         if blockers:
@@ -1045,6 +1065,14 @@ class ScriptExplorationAgent:
     def _append_pending_step(script: str, reason: str) -> str:
         payload = json.dumps({'reason': str(reason or '待根据已保存 trace 补充。')}, ensure_ascii=False)
         return f'{script.rstrip()}\n\n{_PENDING_STEP_PREFIX} {payload}\n'
+
+    @staticmethod
+    def _append_pending_assertion(script: str, reason: str) -> str:
+        payload = json.dumps({
+            'criterion': '补充可验证结果',
+            'reason': str(reason or '草稿尚无真实断言，需补充可验证结果。'),
+        }, ensure_ascii=False)
+        return f'{script.rstrip()}\n\n{_PENDING_ASSERTION_PREFIX} {payload}\n'
 
     @staticmethod
     def _safe_comment_text(value: Any, limit: int) -> str:

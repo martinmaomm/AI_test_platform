@@ -65,6 +65,12 @@ class AgentDraftQualityTests(SimpleTestCase):
         status, _, _ = evaluation_status(script, operation_success=True, runtime_assertion_count=1)
         self.assertEqual(status, 'incomplete')
 
+    def test_pending_quality_warning_distinguishes_steps_and_assertions(self):
+        script = SCRIPT + '\n    # AITS_PENDING_STEP: {"reason":"补充操作"}\n    # AITS_PENDING_ASSERTION: {"reason":"补充断言"}\n'
+        warning = next(item for item in evaluate_draft(script)['warnings'] if item['code'] == 'PENDING_WORK')
+        self.assertIn('1 项步骤', warning['message'])
+        self.assertIn('1 项断言', warning['message'])
+
     def test_pending_comment_in_string_does_not_change_status(self):
         script = SCRIPT + "\n    example = '# AITS_PENDING_STEP: 示例文字'\n"
         self.assertEqual(evaluate_draft(script)['completion'], 'complete')

@@ -9,6 +9,7 @@ import {
   canSaveGeneratedDraft,
   generationDraftCompletion,
   generationFailureReason,
+  generationUserMessage,
   generationActionRequired,
   generationApiErrorMessage,
   generationResolutionHint,
@@ -44,7 +45,7 @@ test('partial output is presented as editable evidence, not a completed test', (
     exploration_snapshot: { schema_version: 5, artifact: { completion: 'partial', completed_steps: ['打开页面'], remaining_steps: ['补充断言'] } }
   })
   assert.match(hint, /探索未完整结束，但证据已保留/)
-  assert.match(hint, /未完成草稿和探索证据/)
+  assert.match(hint, /已保留草稿和探索证据/)
   assert.deepEqual(generationDraftCompletion({ exploration_snapshot: { artifact: { completion: 'partial', completed_steps: ['打开页面'], remaining_steps: ['补充断言'] } } }), {
     completion: 'partial', isPartial: true, completedSteps: ['打开页面'], remainingSteps: ['补充断言']
   })
@@ -83,7 +84,7 @@ test('websocket messages only match an explicitly identified generation', () => 
 
 test('failed status is visibly distinct from incomplete exploration evidence', () => {
   assert.equal(generationStatusLabel('failed'), '生成失败')
-  assert.match(generationResolutionHint({ status: 'needs_review', error_code: 'EXPLORATION_EVIDENCE_INCOMPLETE' }), /已保留当前探索证据/)
+  assert.match(generationResolutionHint({ status: 'needs_review', error_code: 'EXPLORATION_EVIDENCE_INCOMPLETE' }), /已保留草稿和探索证据/)
 })
 
 test('workspace activity and revision verification remain explicit', () => {
@@ -165,9 +166,62 @@ test('needs input guidance requests only user-owned scenario information', () =>
 })
 
 test('actual generation error takes priority over trace termination text', () => {
-  assert.equal(generationFailureReason({ error_message: '模型服务异常', exploration_snapshot: { error_message: '可读轨迹错误', final_message: '已停止', termination_reason: 'MODEL_TIMEOUT' } }), '模型服务异常')
-  assert.equal(generationFailureReason({ exploration_snapshot: { error_message: '可读轨迹错误', final_message: '已停止', termination_reason: 'MODEL_TIMEOUT' } }), '可读轨迹错误')
-  assert.equal(generationFailureReason({ exploration_snapshot: { final_message: '已停止', termination_reason: 'MODEL_TIMEOUT' } }), '已停止')
+  assert.equal(generationFailureReason({ error_message: '模型服务异常', exploration_snapshot: { error_message: '可读轨迹错误', final_message: '已停止', termination_reason: 'MODEL_GATEWAY_TIMEOUT' } }), '模型服务异常')
+  assert.equal(generationFailureReason({ exploration_snapshot: { error_message: '可读轨迹错误', final_message: '已停止', termination_reason: 'MODEL_GATEWAY_TIMEOUT' } }), '可读轨迹错误')
+  assert.equal(generationFailureReason({ exploration_snapshot: { final_message: '已停止', termination_reason: 'MODEL_GATEWAY_TIMEOUT' } }), '模型响应超时，请稍后重试。')
+})
+
+test('model free text stays technical while normal warnings are bounded Chinese summaries', () => {
+  const english = 'I inspected several possible selectors and considered a long chain of alternatives. '.repeat(12)
+  const pending = `待补充断言：${english}`
+  const generation = {
+    status: 'needs_review', error_code: 'EXPLORATION_EVIDENCE_INCOMPLETE',
+    exploration_snapshot: { final_message: english, model_output_raw: english, artifact: { completion: 'partial', remaining_steps: [pending] } }
+  }
+  const hint = generationResolutionHint(generation)
+  assert.equal(generationFailureReason(generation), '探索证据未完整保存。')
+  assert.match(hint, /待补充项：/)
+  assert.match(hint, /具体原因未以中文记录/)
+  assert.doesNotMatch(hint, /I inspected several possible selectors/)
+  assert.ok(hint.length < 500)
+})
+
+test('mixed diagnostics are capped and unknown English failures receive a Chinese technical hint', () => {
+  const longEnglish = ' gateway timeout details '.repeat(30)
+  const mixed = generationFailureReason({ status: 'failed', error_message: `模型服务异常：${longEnglish}` })
+  assert.match(mixed, /^模型服务异常：/)
+  assert.doesNotMatch(mixed, /gateway timeout details/)
+  assert.ok(mixed.length <= 181)
+  const unknown = generationResolutionHint({ status: 'failed', error_code: 'UNRECOGNIZED_BACKEND_CODE', error_message: longEnglish })
+  assert.match(unknown, /原始诊断请查看技术信息/)
+  assert.doesNotMatch(unknown, /gateway timeout details/)
+  const known = generationFailureReason({ status: 'failed', error_code: 'MODEL_SERVICE_ERROR', error_message: longEnglish })
+  assert.equal(known, '模型服务异常，请稍后重试。')
+  assert.equal(generationUserMessage(`待补充断言：${longEnglish}`, '请在技术信息查看原始内容。'), '请在技术信息查看原始内容。')
+})
+
+test('interrupted drafts retain a Chinese error hint and all summary branches are bounded', () => {
+  assert.match(generationFailureReason({ status: 'needs_review', error_code: 'other', error_message: 'Unexpected EOF' }), /未完整结束.*技术信息/)
+  const message = generationUserMessage('中文'.repeat(200) + ' detailed message '.repeat(200), '')
+  assert.ok(message.length <= 181)
+  assert.match(message, /…$/)
+})
+
+test('current assertion state supersedes exploration todos after an edited draft is saved', () => {
+  const generation = {
+    status: 'needs_review',
+    exploration_snapshot: { artifact: { completion: 'partial', remaining_steps: ['旧探索未完成的删除验证'] } },
+    workspace: { verification: { assertion_state: { status: 'complete', pending: [], confirmed_count: 1, pending_count: 0 } } }
+  }
+  const hint = generationResolutionHint(generation)
+  assert.match(hint, /当前脚本未检测到待补充标记/)
+  assert.doesNotMatch(hint, /旧探索未完成的删除验证|调试通过/)
+  generation.workspace.verification.assertion_state = {
+    status: 'incomplete', confirmed_count: 0, pending_count: 1,
+    pending: [{ kind: 'assertion', reason: '补充列表为空的断言', line: 8 }]
+  }
+  assert.match(generationResolutionHint(generation), /待补充断言：补充列表为空的断言/)
+  assert.doesNotMatch(generationResolutionHint(generation), /旧探索未完成的删除验证/)
 })
 
 test('a schema-v5 trace can retry script organization without reopening a browser', () => {
@@ -211,4 +265,17 @@ test('generation output displays target_url and never uses the retired safe fiel
   assert.match(summary, /targetUrl/)
   assert.doesNotMatch(resultPanel, /target_url_safe/)
   assert.doesNotMatch(summary, /target_url_safe/)
+})
+
+test('workspace defers stale pending details after local edits and technical sections retain raw diagnostics', () => {
+  const workspace = readFileSync(new URL('../src/components/webui-generation/GenerationWorkspace.vue', import.meta.url), 'utf8')
+  const resultPanel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
+  const evidence = readFileSync(new URL('../src/components/webui-generation/GenerationEvidence.vue', import.meta.url), 'utf8')
+  assert.match(workspace, /本地草稿有修改，保存后会重新检查待补充步骤和断言/)
+  assert.doesNotMatch(workspace, /form\.script_draft\.includes\('AITS_PENDING_STEP'\)/)
+  assert.match(resultPanel, /查看任务技术信息/)
+  assert.match(resultPanel, /model_output_raw/)
+  assert.match(resultPanel, /generation_error_message/)
+  assert.doesNotMatch(evidence, /最新消息：\{\{ trace\.final_message \}\}/)
+  assert.match(evidence, /最近保存的草稿仍有待补充项/)
 })

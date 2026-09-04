@@ -29,10 +29,17 @@ python manage.py migrate web_testing
 
 - 草稿通过静态检查后可以编辑、调试、保存到独立测试用例；草稿生成成功不等于测试通过。
 - `AITS_PENDING_STEP` / `AITS_PENDING_ASSERTION` 表示待补充操作或断言，有这些标记不能显示为调试通过。
+- 工作区按代码行号区分待补步骤和待补断言；模型未说明具体缺项时会明确提示人工核对，不推断某个业务操作失败。确认完成后移除对应标记并重新调试，单纯删除注释不代表已验证。
+- 普通提示显示简短中文摘要，模型最终回复、原始输出和完整诊断在“技术信息”中按需展开；本地编辑后的旧检查行号不再作为当前结论展示。
 - 超时、失败或取消后保留最近已保存的草稿；“基于轨迹整理脚本”只处理已有证据，不重新打开浏览器、不重复业务写入。
 - 使用测试账号，请勿使用生产账号。部署步骤见上方迁移与重启说明。
 
 设计和验收说明见 [脚本优先生成](docs/superpowers/specs/2026-09-04-webui-script-first-generation.md)。
+
+当前维护入口是 `generation_orchestrator.py`（流程调度）、`script_exploration_agent.py`（连续探索并保存 Python）、`draft_quality.py`（草稿检查）和 `assertion_state.py`（待补充项与运行判定），均位于 `backend/apps/web_testing/`。
+旧版 ScenarioPlan 整理器、JSON 回放编译器和对应的 AST 一致性检查已移除；探索轨迹与浏览器工具守卫中的共用逻辑仍保留，不要仅凭文件里的旧版本命名删除它们。
+
+离线回归可在 `backend` 虚拟环境中运行 `python scripts/test_webui_generation_offline.py`：使用独立内存数据库、禁止网络访问，不触碰配置中的 MySQL、Redis 或被测网站。它不代替真实模型生成和浏览器业务流程验收。
 
 ## 部署依赖
 

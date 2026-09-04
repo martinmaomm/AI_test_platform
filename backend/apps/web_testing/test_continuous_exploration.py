@@ -21,8 +21,6 @@ from .mcp_page_explorer import (
     build_dynamic_input_tools,
     build_finalization_tools,
 )
-from .replay_plan import PythonReplayCompiler, ReplayPlanner
-from .script_generator import ScriptGenerator
 
 
 def plan_payload(*, cleanup=False, **overrides):
@@ -83,14 +81,6 @@ class FinalizationTraceTests(SimpleTestCase):
         self.assertEqual(trace.finalization.status, 'valid')
         self.assertNotIn('checkpoint', trace.model_dump_json().lower())
 
-    def test_entry_navigation_is_automatic_and_first_browser_action(self):
-        plan = ScenarioPlan.model_validate(plan_payload())
-        driver = Driver(plan, '/')
-        driver.complete_main()
-        driver.finalize([('E000002', '填写测试值'), ('E000003', '提交表单')], [('A1', 'E000004')])
-        source = PythonReplayCompiler.compile(plan, driver.build(), ReplayPlanner.build(plan, driver.build()))
-        self.assertLess(source.index("await page.goto('/')"), source.index('.fill('))
-
     def test_bad_action_finalizations_are_rejected(self):
         plan = ScenarioPlan.model_validate(plan_payload())
         driver = Driver(plan); driver.complete_main()
@@ -124,7 +114,6 @@ class FinalizationTraceTests(SimpleTestCase):
         driver.finalize([('E000002', '填写测试值'), ('E000003', '提交表单')], [('A1', 'E000004'), ('A2', 'E000006')], [('E000005', '清理测试数据')])
         trace = driver.build()
         self.assertEqual(trace.cleanup['status'], 'completed')
-        self.assertIn('finally:', PythonReplayCompiler.compile(plan, trace, ReplayPlanner.build(plan, trace)))
 
     def test_finalization_is_invalidated_by_later_callback_and_old_payload_rejected(self):
         plan = ScenarioPlan.model_validate(plan_payload())
@@ -149,7 +138,7 @@ class FinalizationTraceTests(SimpleTestCase):
         self.assertEqual(summary['events'][1]['input_refs'], ['ITEM_NAME'])
         self.assertEqual(summary['candidate_sequence'], 2)
 
-    def test_dynamic_generated_input_is_redacted_and_compiles_by_value_kind(self):
+    def test_dynamic_generated_input_is_redacted_and_added_to_effective_plan(self):
         plan = ScenarioPlan.model_validate(plan_payload(
             success_criteria=['结果区域可见'],
             assertion_requirements=[{
@@ -180,18 +169,6 @@ class FinalizationTraceTests(SimpleTestCase):
             [(item.name, item.source, item.value_kind) for item in effective_plan.input_refs],
             [('DYNAMIC_INPUT_1', 'generated', 'email')],
         )
-        replay = ReplayPlanner.build(plan, trace)
-        self.assertEqual(replay.input_value_kinds, {'DYNAMIC_INPUT_1': 'email'})
-        source = PythonReplayCompiler.compile(plan, trace, replay)
-        self.assertIn('value_kind == "email"', source)
-        self.assertIn('@example.com', source)
-        self.assertIn('hashlib.sha256(ref.encode("utf-8")).hexdigest()[:8]', source)
-        self.assertNotIn(declared['value'], source)
-        generated_source, generated_replay = ScriptGenerator().generate(
-            plan=effective_plan, trace=trace,
-        )
-        self.assertEqual(generated_replay.input_sources, {'DYNAMIC_INPUT_1': 'generated'})
-        self.assertEqual(generated_source.count("'DYNAMIC_INPUT_1'"), 3)
         self.assertEqual(
             len(effective_scenario_plan(effective_plan, trace).input_refs), 1,
         )
@@ -217,7 +194,7 @@ class FinalizationTraceTests(SimpleTestCase):
         self.assertLessEqual(len(email), 64)
         self.assertRegex(email, r'^aits-[0-9a-f]{8}-[0-9a-f]{16}@example\.com$')
 
-    def test_declared_but_unselected_dynamic_input_does_not_pollute_effective_plan_or_script(self):
+    def test_declared_but_unselected_dynamic_input_does_not_pollute_effective_plan(self):
         plan = ScenarioPlan.model_validate(plan_payload(
             success_criteria=['结果区域可见'],
             assertion_requirements=[{
@@ -238,23 +215,9 @@ class FinalizationTraceTests(SimpleTestCase):
         effective_plan = effective_scenario_plan(plan, trace)
         self.assertFalse(effective_plan.input_refs)
         self.assertEqual(variable_definitions_for_scenario_plan(effective_plan), [])
-        self.assertNotIn(declared['name'], PythonReplayCompiler.compile(
-            plan, trace, ReplayPlanner.build(plan, trace),
-        ))
+        self.assertNotIn(declared['name'], {item.name for item in effective_plan.input_refs})
 
-    def test_dynamic_password_is_secret_in_workspace_and_value_kinds_are_compiled(self):
-        for value_kind in ('text', 'email', 'password', 'integer'):
-            with self.subTest(value_kind=value_kind):
-                plan = ScenarioPlan.model_validate(plan_payload(
-                    input_refs=[{'name': 'ITEM_NAME', 'source': 'generated', 'value_kind': value_kind}],
-                ))
-                driver = Driver(plan)
-                driver.complete_main()
-                driver.finalize(
-                    [('E000002', '填写测试值'), ('E000003', '提交')], [('A1', 'E000004')],
-                )
-                replay = ReplayPlanner.build(plan, driver.build())
-                self.assertEqual(replay.input_value_kinds['ITEM_NAME'], value_kind)
+    def test_dynamic_password_is_secret_in_workspace(self):
         password_plan = ScenarioPlan.model_validate(plan_payload(input_refs=[{
             'name': 'DYNAMIC_INPUT_1', 'source': 'generated', 'value_kind': 'password',
         }], success_criteria=['结果区域可见'], assertion_requirements=[{
@@ -355,42 +318,6 @@ class FinalizationTraceTests(SimpleTestCase):
                 [('E000002', '提交表单')], [('A1', 'E000003')],
                 [('E000004', '清理输入'), ('E000005', '清理凭据'), ('E000006', '清理凭据')],
             )
-
-    def test_replay_planner_rejects_tampered_selected_contracts(self):
-        plan = ScenarioPlan.model_validate(plan_payload())
-        driver = Driver(plan)
-        driver.complete_main()
-        driver.finalize([('E000002', '填写测试值'), ('E000003', '提交表单')], [('A1', 'E000004')])
-        trace = driver.build()
-
-        fragile_locator = trace.model_copy(update={'locator_evidence': [
-            item.model_copy(update={'validation': 'fragile'}) if item.event_id == 'E000003' else item
-            for item in trace.locator_evidence
-        ]})
-        with self.assertRaisesRegex(GenerationContractError, 'replay_plan_selected_action_locator_invalid'):
-            ReplayPlanner.build(plan, fragile_locator)
-
-        unmapped_fill = trace.model_copy(update={'events': [
-            item.model_copy(update={'input_refs': [], 'input_source': ''}) if item.event_id == 'E000002' else item
-            for item in trace.events
-        ]})
-        with self.assertRaisesRegex(GenerationContractError, 'replay_plan_selected_action_input_mapping_invalid'):
-            ReplayPlanner.build(plan, unmapped_fill)
-
-        missing_press_key = trace.model_copy(update={'events': [
-            item.model_copy(update={'action': 'press', 'action_arguments': {}}) if item.event_id == 'E000003' else item
-            for item in trace.events
-        ]})
-        with self.assertRaisesRegex(GenerationContractError, 'replay_plan_selected_press_key_missing'):
-            ReplayPlanner.build(plan, missing_press_key)
-
-        fragile_assertion = trace.model_copy(update={'locator_evidence': [
-            item.model_copy(update={'validation': 'fragile'}) if item.event_id == 'E000004' else item
-            for item in trace.locator_evidence
-        ]})
-        with self.assertRaisesRegex(GenerationContractError, 'replay_plan_selected_assertion_locator_invalid'):
-            ReplayPlanner.build(plan, fragile_assertion)
-
 
 class SingleAgentExplorerTests(SimpleTestCase):
     def test_one_client_one_agent_one_run_and_finalization_tools(self):

@@ -16,18 +16,24 @@
       <div class="script-editor"><MonacoEditor :value="form.script_draft" language="python" theme="vs-dark" :read-only="busy" height="100%" @update:value="updateScript" /></div>
     </section>
 
-    <el-alert v-if="assertionState.pending_count" type="warning" :closable="false" show-icon title="草稿已生成，仍有待补充断言">
+    <el-alert v-if="draftDirty" type="info" :closable="false" show-icon title="本地草稿有修改，保存后会重新检查待补充步骤和断言。" />
+    <el-alert v-else-if="pendingSteps.length" type="warning" :closable="false" show-icon :title="`草稿仍有 ${pendingSteps.length} 项待补充步骤`">
       <template #default>
-        <p>补入真实 <code>await expect(...)</code> 或 <code>assert</code> 后，请删除对应 <code>AITS_PENDING_ASSERTION</code> 注释并重新运行。</p>
-        <ul><li v-for="item in assertionState.pending" :key="`${item.assertion_id}-${item.line}`">{{ item.assertion_id }}：{{ item.criterion || '未填写验证目标' }}（{{ item.reason }}）</li></ul>
+        <p>请先确认对应操作已真实完成，再删除该项 <code>AITS_PENDING_STEP</code> 注释并重新调试；仅删除注释不构成完成证明。</p>
+        <ul><li v-for="item in pendingSteps" :key="`step-${item.line}-${item.assertion_id}`">第 {{ item.line || '未记录' }} 行 · 待补充步骤：{{ displayPendingReason(item.reason) }}</li></ul>
       </template>
     </el-alert>
-    <el-alert v-else-if="assertionState.status === 'incomplete' && assertionState.confirmed_count === 0" type="warning" :closable="false" show-icon title="草稿缺少有效断言">
+    <el-alert v-if="!draftDirty && pendingAssertions.length" type="warning" :closable="false" show-icon :title="`草稿仍有 ${pendingAssertions.length} 项待补充断言`">
+      <template #default>
+        <p>补入真实 <code>await expect(...)</code> 或 <code>assert</code> 后，请删除对应 <code>AITS_PENDING_ASSERTION</code> 注释并重新运行。</p>
+        <ul><li v-for="item in pendingAssertions" :key="`assertion-${item.line}-${item.assertion_id}`">第 {{ item.line || '未记录' }} 行 · 待补充断言：{{ displayPendingReason(item.criterion, '未填写验证目标') }}（{{ displayPendingReason(item.reason) }}）</li></ul>
+      </template>
+    </el-alert>
+    <el-alert v-else-if="!draftDirty && assertionState.status === 'incomplete' && assertionState.confirmed_count === 0" type="warning" :closable="false" show-icon title="草稿缺少有效断言">
       <template #default>
         <p>删除 <code>AITS_PENDING_ASSERTION</code> 注释本身不会完成验证。请补入真实 <code>await expect(...)</code> 或非纯常量 <code>assert</code>，然后重新运行。</p>
       </template>
     </el-alert>
-    <el-alert v-if="hasPendingStep" type="warning" :closable="false" show-icon title="草稿仍含 AITS_PENDING_STEP；后端会将本次调试判定为未完成。" />
 
     <section class="workspace-section">
       <div class="section-heading"><div><h5>配置变量</h5><p>变量可用于脚本运行；调试覆盖值优先于草稿变量。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
@@ -71,7 +77,7 @@ import { computed, reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MonacoEditor from '@/components/MonacoEditor.vue'
 import WebUITestCaseExecutionDetail from '@/components/WebUITestCaseExecutionDetail.vue'
-import { isCurrentRevisionVerified, workspaceVerificationLabel, workspaceVerificationTagType } from '@/composables/webUIScriptGenerationPresentation'
+import { generationUserMessage, isCurrentRevisionVerified, workspaceVerificationLabel, workspaceVerificationTagType } from '@/composables/webUIScriptGenerationPresentation'
 
 const props = defineProps({
   generation: { type: Object, default: null }, draft: { type: Object, default: null }, busy: Boolean,
@@ -83,7 +89,12 @@ const form = reactive({ script_draft: '', variables: [] })
 const runtimeVariables = reactive([])
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
 const verification = computed(() => workspace.value.verification || {})
+const draftDirty = computed(() => Boolean(props.draft?.dirty))
 const assertionState = computed(() => verification.value.assertion_state || { status: '', pending: [], pending_count: 0, confirmed_count: 0 })
+const pendingItems = computed(() => draftDirty.value ? [] : (Array.isArray(assertionState.value.pending) ? assertionState.value.pending : []))
+const pendingSteps = computed(() => pendingItems.value.filter(item => item?.kind === 'step'))
+const pendingAssertions = computed(() => pendingItems.value.filter(item => item?.kind === 'assertion'))
+const displayPendingReason = (value, fallback = '具体原因未以中文记录，请在技术信息查看原始内容。') => generationUserMessage(value, fallback)
 const hasPassed = computed(() => !props.draft?.dirty && isCurrentRevisionVerified(
   workspace.value, props.draft?.revision ?? workspace.value.revision
 ))
@@ -93,7 +104,6 @@ const displayVerificationLabel = computed(() => verification.value.status === 'p
   : workspaceVerificationLabel(displayVerificationStatus.value))
 const canSaveDraft = computed(() => Boolean(form.script_draft.trim()) && !form.variables.some(item => !item.name.trim()))
 const canDebug = computed(() => canSaveDraft.value && !props.draftSaving)
-const hasPendingStep = computed(() => form.script_draft.includes('AITS_PENDING_STEP'))
 
 const copyVariables = (variables) => (variables || []).map(item => ({
   name: item?.name || '', value: item?.value || '', is_secret: Boolean(item?.is_secret),

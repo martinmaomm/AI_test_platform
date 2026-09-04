@@ -1,7 +1,7 @@
 <template>
   <div v-if="selectedProject" class="webui-generation-page">
     <header class="page-header">
-      <div><h3>探索并验证测试流程</h3><p>AI 理解测试场景后，在确认的目标范围内探索并验证流程，再生成 Python 脚本</p></div>
+      <div><h3>连续探索并编写测试脚本</h3><p>AI 理解测试目标后连续探索页面、编写 Python 草稿并进行静态检查；草稿就绪不代表实际调试通过</p></div>
       <el-tag :type="isConnected ? 'success' : 'info'" effect="plain">{{ isConnected ? '实时通知已连接' : '使用详情查询恢复状态' }}</el-tag>
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
@@ -108,7 +108,7 @@ const handleCancel = async () => {
   try { await ElMessageBox.confirm('确定取消当前脚本生成吗？已保存的阶段结果仍可查看。', '取消生成', { type: 'warning', confirmButtonText: '取消生成', cancelButtonText: '继续等待' }); const result = await cancel(); if (result) ElMessage.success('已请求取消生成任务') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '取消失败') }
 }
 const handleResolve = async (payload) => { try { const result = await resolveGeneration(payload); if (result) ElMessage.success('补充信息已提交，任务正在继续。') } catch { ElMessage.error(lastError.value || '提交补充信息失败') } }
-const handleRetryGeneration = async () => { try { const result = await retryGeneration(); if (result) ElMessage.success('正在基于已保存的探索轨迹重新生成脚本。') } catch { ElMessage.error(lastError.value || '仅重试脚本生成失败') } }
+const handleRetryGeneration = async () => { try { const result = await retryGeneration(); if (result) ElMessage.success('正在仅基于已保存的证据整理脚本，不会启动浏览器。') } catch { ElMessage.error(lastError.value || '基于轨迹整理脚本失败') } }
 const handleSave = async (title) => { try { const result = await save(title); if (result) ElMessage.success(result?.created ? '已创建并保存到测试用例' : '已保存到测试用例') } catch { ElMessage.error(lastError.value || '保存失败') } }
 const handleSaveDraft = async () => { try { const result = await saveDraft(); if (result) ElMessage.success('草稿已保存') } catch { ElMessage.error(lastError.value || '保存草稿失败') } }
 const handleDebug = async (runtimeVariables) => { try { const result = await debug(runtimeVariables); if (result) ElMessage.success('已启动真实调试；不会自动重试业务写操作。') } catch { ElMessage.error(lastError.value || '启动调试失败') } }

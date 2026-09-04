@@ -1,10 +1,12 @@
 """Celery tasks for Web UI script generation and independent script execution."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import uuid
+from difflib import unified_diff
 from typing import Any, Dict
 
 from celery import shared_task
@@ -502,11 +504,13 @@ def debug_webui_script_generation_task(
 
 @shared_task(bind=True, name='web_testing.repair_webui_script_generation')
 def repair_webui_script_generation_task(self, generation_id: str, locked_revision: int, locked_hash: str):
-    """Generate a conservative candidate only; a user must review and debug it."""
-    from .exploration_trace import ExplorationTrace
-    from .generation_contracts import ScenarioPlan
+    """Generate a code-only repair proposal; never replace or execute the draft."""
+    from ai_core.model_manager import get_llm_manager
+    from .generation_workspace import evaluate_workspace_draft
+    from .model_service_errors import classify_model_service_error
+    from .script_exploration_agent import ScriptExplorationAgent
     from .generation_workspace import (
-        accept_repair_candidate, finish_repair_failure, mark_repair_running,
+        finish_repair_failure, mark_repair_running, store_repair_candidate,
     )
 
     generation = mark_repair_running(generation_id, locked_revision=locked_revision, locked_hash=locked_hash, task_id=self.request.id)
@@ -518,17 +522,79 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         issues = verification.get('diagnostics') or []
         if not issues:
             raise ValueError('缺少运行失败诊断，需要人工补充证据或重新调试。')
-        ScenarioPlan.model_validate(generation.scenario_spec or {})
-        ExplorationTrace.model_validate(generation.exploration_snapshot or {})
-        raise ValueError('v4 回放脚本不支持通用 LLM 修复；请重新探索或人工审核。')
+        brief = generation.scenario_spec if isinstance(generation.scenario_spec, dict) else {}
+        snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
+        if brief.get('schema_version') != 5 or snapshot.get('schema_version') != 5:
+            raise ValueError('仅支持当前 v5 草稿的代码修复；旧版记录请人工处理源码。')
+        repair_brief = {
+            **brief,
+            'debug_diagnostics': [
+                {
+                    'code': str(item.get('code') or ''),
+                    'message': str(item.get('message') or ''),
+                }
+                for item in issues if isinstance(item, dict)
+            ],
+        }
+        manager = get_llm_manager(config_id=generation.model_info['config_id'])
+        agent = ScriptExplorationAgent(
+            llm_model=manager.current_llm,
+            mcp_config={},
+            generation_id=str(generation.pk),
+            cancel_check=lambda: bool(cache.get(f'celery:cancel:{self.request.id}')),
+            exploration_timeout_seconds=generation.exploration_timeout_seconds,
+            checkpoint_callback=None,
+        )
+        result = asyncio.run(agent.generate(
+            brief=repair_brief,
+            start_path=generation.start_path,
+            target_url=generation.target_url_safe,
+            credentials=None,
+            saved_snapshot=snapshot,
+            script_draft=generation.script_draft,
+            code_only=True,
+        ))
+        candidate = str(getattr(result, 'script_draft', '') or '')
+        if not candidate.strip():
+            raise ValueError(str(getattr(result, 'error_message', '') or '修复代理没有返回候选脚本。'))
+        quality = evaluate_workspace_draft(
+            candidate, start_path=generation.start_path,
+            snapshot=getattr(result, 'snapshot', None) or snapshot,
+        )
+        diff = ''.join(unified_diff(
+            generation.script_draft.splitlines(keepends=True), candidate.splitlines(keepends=True),
+            fromfile='原草稿', tofile='修复候选', n=3,
+        ))[:20000]
+        result_error_code = str(getattr(result, 'error_code', '') or '')
+        result_error_message = str(getattr(result, 'error_message', '') or '')
+        if not store_repair_candidate(
+            generation.pk, locked_revision=locked_revision, locked_hash=locked_hash,
+            candidate_script=candidate, candidate_diff=diff, quality_report=quality,
+            candidate_error_code=result_error_code, candidate_error_message=result_error_message,
+            task_id=self.request.id,
+        ):
+            return build_error_result(self.request.id, '草稿已变化，过期修复候选未保存。')
+        if result_error_code:
+            return {
+                'success': False, 'status': 'candidate_needs_review', 'generation_id': str(generation.pk),
+                'error_code': result_error_code,
+                'message': result_error_message or '修复代理返回了候选，但未完成整个修复过程，请人工审核。',
+            }
+        return {
+            'success': True, 'status': 'candidate_ready', 'generation_id': str(generation.pk),
+            'message': '修复候选已保存；原草稿未修改，需人工比较确认后再调试。',
+        }
     except Exception as exc:
+        model_error = classify_model_service_error(exc, stage='repairing')
+        code = model_error[0] if model_error else 'REPAIR_CANDIDATE_UNAVAILABLE'
+        message = model_error[1] if model_error else '修复服务未能生成可审核候选，请人工审核或重新调试。'
         logger.error('生成草稿修复失败: generation_id=%s', generation_id)
         finish_repair_failure(
             generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
-            message='修复服务未能生成可安全接受的候选，请人工审核或重新发起页面探索。', task_id=self.request.id,
-            blockers=[{'severity': 'blocker', 'code': 'REPAIR_TRACE_INSUFFICIENT', 'message': '修复轨迹不足或候选不可安全接受，请人工审核。'}],
+            message=message, task_id=self.request.id,
+            blockers=[{'severity': 'blocker', 'code': code, 'message': message}],
         )
-        return build_error_result(self.request.id, '生成草稿修复失败，请人工审核或重新发起页面探索。')
+        return build_error_result(self.request.id, message)
 
 
 @shared_task(bind=True, name='web_testing.generate_midscene_script')

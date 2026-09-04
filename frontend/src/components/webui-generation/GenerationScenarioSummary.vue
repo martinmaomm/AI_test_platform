@@ -1,18 +1,20 @@
 <template>
   <div v-if="scenario && Object.keys(scenario).length" class="summary-grid">
+    <div class="summary-item full"><span>标题</span><strong>{{ scenario.title || '未提供' }}</strong></div>
     <div class="summary-item full"><span>目标</span><strong>{{ scenario.objective || '未提供' }}</strong></div>
-    <div class="summary-item full"><span>连续场景步骤</span><ol><li v-for="item in scenario.instructions || []" :key="item">{{ item }}</li></ol></div>
-    <div class="summary-item full"><span>成功标准</span><ul><li v-for="item in scenario.success_criteria || []" :key="item">{{ item }}</li></ul></div>
-    <div v-if="scenario.preconditions?.length" class="summary-item full"><span>前置条件</span><ul><li v-for="item in scenario.preconditions" :key="item">{{ item }}</li></ul></div>
-    <div class="summary-item"><span>测试数据写入</span><strong>{{ scenario.allow_test_data_writes ? '仅限本轮命名空间' : '不允许' }}</strong></div>
-    <div class="summary-item"><span>清理预期</span><strong>{{ scenario.cleanup_expected ? '需要核对' : '不需要' }}</strong></div>
-    <div v-if="scenario.input_refs?.length" class="summary-item full"><span>运行变量</span><strong>{{ scenario.input_refs.map(item => item.name).join('、') }}</strong></div>
+    <div v-if="scenario.original_user_target" class="summary-item full"><span>原始目标</span><strong>{{ scenario.original_user_target }}</strong></div>
+    <div class="summary-item full"><span>连续场景步骤</span><ol v-if="instructions.length"><li v-for="item in instructions" :key="item">{{ item }}</li></ol><strong v-else>尚未拆分步骤</strong></div>
+    <div v-if="successCriteria.length" class="summary-item full"><span>成功标准</span><ul><li v-for="item in successCriteria" :key="item">{{ item }}</li></ul></div>
   </div>
   <el-empty v-else description="场景理解尚未完成" :image-size="70" />
 </template>
 
 <script setup>
-defineProps({ scenario: { type: Object, default: () => ({}) } })
+import { computed } from 'vue'
+
+const props = defineProps({ scenario: { type: Object, default: () => ({}) } })
+const instructions = computed(() => Array.isArray(props.scenario?.instructions) ? props.scenario.instructions : [])
+const successCriteria = computed(() => Array.isArray(props.scenario?.success_criteria) ? props.scenario.success_criteria : [])
 </script>
 
 <style scoped>

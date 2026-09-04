@@ -28,6 +28,7 @@ ACTIVE_GENERATION_STATUSES = frozenset({
 BUSY_VERIFICATION_STATUSES = frozenset({'pending', 'running'})
 BUSY_REPAIR_STATUSES = frozenset({'pending', 'running'})
 MAX_WORKSPACE_REPAIRS = 2
+MAX_ARTIFACT_HISTORY = 8
 _SECRET_VARIABLE_RE = re.compile(r'(?i)(password|passwd|token|secret|api[_-]?key|credential)')
 
 
@@ -65,47 +66,30 @@ def _verification(*, status: str = 'unverified', script: str = '', **values: Any
     return result
 
 
-def manual_draft_quality_report(script: str) -> dict[str, Any]:
-    """Re-check an edited draft without treating generated replay AST as immutable.
+def evaluate_workspace_draft(
+    script: str, *, start_path: str = '/', snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the shared static draft gate for generated and manually edited code.
 
-    This is intentionally narrower than the generator's evidence-quality report:
-    once a user edits a draft, AST equality with the original replay plan is no
-    longer meaningful.  The executable contract and variable definitions still
-    gate saving/debugging, while evidence-quality blockers on an unedited
-    generated draft continue to be enforced by the save view.
+    This deliberately does not compare a hand-edited AST with an old replay
+    plan.  The v5 quality contract is the single static authority; execution
+    proof remains separately guarded by ``finish_debug``.
     """
-    assertion_state = analyze_assertion_state(script)
-    report: dict[str, Any] = {
-        'status': 'ready',
-        'source': 'manual_draft',
-        'blockers': [],
-        'warnings': [],
-        'assertion_state': assertion_state,
-    }
-    try:
-        normalize_for_storage(script)
-    except ScriptContractError as exc:
+    from .draft_quality import evaluate_draft
+
+    report = evaluate_draft(script, start_path=start_path, snapshot=snapshot)
+    if not isinstance(report, dict):
+        raise ValueError('脚本静态检查未返回有效结果。')
+    report = deepcopy(report)
+    report['assertion_state'] = analyze_assertion_state(script)
+    report.setdefault('blockers', [])
+    report.setdefault('warnings', [])
+    report.setdefault('completion', 'unknown')
+    if report.get('status') not in {'ready', 'ready_with_warnings', 'needs_review'}:
         report['status'] = 'needs_review'
         report['blockers'].append({
-            'level': 'blocker',
-            'code': 'MANUAL_SCRIPT_CONTRACT_INVALID',
-            'message': str(exc),
-        })
-    if assertion_state['pending_count']:
-        if not report['blockers']:
-            report['status'] = 'ready_with_warnings'
-        report['warnings'].append({
-            'level': 'warning',
-            'code': 'PENDING_ASSERTIONS',
-            'message': f"仍有 {assertion_state['pending_count']} 项断言待补充。",
-        })
-    elif assertion_state['confirmed_count'] == 0:
-        if not report['blockers']:
-            report['status'] = 'ready_with_warnings'
-        report['warnings'].append({
-            'level': 'warning',
-            'code': 'NO_REAL_ASSERTION',
-            'message': '当前脚本尚无真实断言，运行完成后仍只能显示为验证未完成。',
+            'level': 'blocker', 'code': 'DRAFT_QUALITY_STATUS_INVALID',
+            'message': '脚本静态检查返回了未知状态。',
         })
     return report
 
@@ -119,6 +103,11 @@ def _repair(**values: Any) -> dict[str, Any]:
         'script_hash': '',
         'message': '',
         'blockers': [],
+        'candidate_script': '',
+        'candidate_diff': '',
+        'candidate_quality_report': {},
+        'candidate_error_code': '',
+        'candidate_error_message': '',
     }
     result.update(values)
     return result
@@ -150,7 +139,14 @@ def normalize_workspace(value: Any, *, script: str = '') -> dict[str, Any]:
         })
     if 'variables' not in raw:
         variables = infer_script_variables(script)
-    return {'revision': revision, 'variables': variables, 'verification': verification, 'repair': repair}
+    artifact_history = raw.get('artifact_history') if isinstance(raw.get('artifact_history'), list) else []
+    artifact_history = [deepcopy(item) for item in artifact_history[-MAX_ARTIFACT_HISTORY:] if isinstance(item, dict)]
+    agent_run = raw.get('_agent_run') if isinstance(raw.get('_agent_run'), dict) else {}
+    return {
+        'revision': revision, 'variables': variables, 'verification': verification,
+        'repair': repair, 'artifact_history': artifact_history,
+        '_agent_run': deepcopy(agent_run),
+    }
 
 
 def _without_persisted_secret_values(variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -319,7 +315,9 @@ def update_draft(generation_id: Any, *, expected_revision: int, script_draft: st
         workspace['verification'] = _verification(script=script_draft)
         workspace['repair'] = _repair(count=int(workspace['repair'].get('count') or 0))
         generation.workspace = workspace
-        generation.quality_report = manual_draft_quality_report(script_draft)
+        generation.quality_report = evaluate_workspace_draft(
+            script_draft, start_path=generation.start_path, snapshot=generation.exploration_snapshot,
+        )
         generation.save(update_fields=['script_draft', 'workspace', 'quality_report', 'updated_at'])
     return generation
 
@@ -336,6 +334,15 @@ def prepare_debug(generation_id: Any, *, expected_revision: int, execution_id: i
             raise WorkspaceConflict('当前草稿正在调试。', generation)
         if workspace['repair']['status'] in BUSY_REPAIR_STATUSES:
             raise WorkspaceConflict('修复正在生成，暂不能调试。', generation)
+        report = evaluate_workspace_draft(
+            generation.script_draft, start_path=generation.start_path, snapshot=generation.exploration_snapshot,
+        )
+        if report.get('status') == 'needs_review' or report.get('blockers'):
+            generation.quality_report = report
+            generation.save(update_fields=['quality_report', 'updated_at'])
+            raise WorkspaceConflict('当前草稿未通过静态检查，不能执行调试。', generation)
+        generation.quality_report = report
+        generation.save(update_fields=['quality_report', 'updated_at'])
         current_hash = script_hash(generation.script_draft)
         workspace['verification'] = _verification(
             status='pending', script=generation.script_draft,
@@ -520,6 +527,50 @@ def accept_repair_candidate(generation_id: Any, *, locked_revision: int, locked_
         )
         generation.workspace = workspace
         generation.save(update_fields=['script_draft', 'workspace', 'quality_report', 'updated_at'])
+        return True
+
+
+def store_repair_candidate(
+    generation_id: Any,
+    *,
+    locked_revision: int,
+    locked_hash: str,
+    candidate_script: str,
+    candidate_diff: str,
+    quality_report: dict[str, Any],
+    candidate_error_code: str = '',
+    candidate_error_message: str = '',
+    task_id: str | None = None,
+) -> bool:
+    """Store a repair proposal without replacing the user-owned draft."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        workspace = workspace_for_generation(generation)
+        repair = workspace['repair']
+        if (
+            repair.get('source_revision') != locked_revision
+            or repair.get('script_hash') != locked_hash
+            or workspace['revision'] != locked_revision
+            or script_hash(generation.script_draft) != locked_hash
+            or repair.get('status') not in {'pending', 'running'}
+            or not _task_matches(repair, task_id)
+        ):
+            return False
+        workspace['repair'] = _repair(
+            status='ready', count=min(MAX_WORKSPACE_REPAIRS, int(repair.get('count') or 0) + 1),
+            source_revision=locked_revision, script_hash=locked_hash,
+            task_id=repair.get('task_id', ''), candidate_hash=script_hash(candidate_script),
+            candidate_script=candidate_script, candidate_diff=candidate_diff,
+            candidate_quality_report=quality_report,
+            candidate_error_code=candidate_error_code,
+            candidate_error_message=candidate_error_message,
+            message=(
+                '修复代理返回了候选和异常信息；原草稿未改动，请人工比较、确认后再处理。'
+                if candidate_error_code else
+                '已生成修复候选；原草稿未改动，请人工比较、确认后再手动应用和调试。'
+            ),
+        )
+        _set_workspace(generation, workspace)
         return True
 
 

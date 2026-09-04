@@ -1,7 +1,7 @@
-"""Migrated v4 persistence, concurrency, API and quality regressions.
+"""Migrated v5 persistence, concurrency, API and quality regressions.
 
 The historical filename remains to demonstrate that broadly useful coverage
-was migrated rather than discarded. No v3 trace or Goal contract is accepted.
+was migrated rather than discarded. No legacy trace or Goal contract is accepted.
 """
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import httpx
+from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from openai import APIStatusError, OpenAIError
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -51,6 +52,7 @@ from .mcp_page_explorer import EXPLORER_CONSTRAINTS, MCPPageExplorer, MCPPageExp
 from .models import WebUIScriptGeneration
 from .replay_plan import PythonReplayCompiler, ReplayPlanner
 from .script_quality import evaluate_script
+from .script_exploration_agent import ScriptExplorationResult
 from .serializers import (
     WebUIScriptGenerationCreateSerializer,
     WebUIScriptGenerationResolveSerializer,
@@ -551,7 +553,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
                 serializer.save()
         self.assertFalse(WebUIScriptGeneration.objects.filter(project=self.project).exists())
 
-    def test_transitions_worker_claims_and_v4_trace_retry_are_idempotent(self):
+    def test_transitions_worker_claims_and_v5_artifact_retry_are_idempotent(self):
         generation = self.make_generation()
         with self.assertRaises(GenerationTransitionError):
             transition_generation(
@@ -577,8 +579,21 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         with self.assertRaises(GenerationResolutionConflict):
             prepare_trace_generation_retry(generation.pk, expected_revision=7)
 
-        generation.exploration_snapshot = {'schema_version': 4}
-        generation.save(update_fields=['exploration_snapshot'])
+        generation.exploration_snapshot = {
+            'schema_version': 5,
+            'events': [{'event_id': 'E1', 'action': 'navigate'}],
+            'tool_stats': {'total_tool_calls': 1},
+            'artifact': {
+                'revision': 1, 'completion': 'partial',
+                'completed_steps': ['打开页面'], 'remaining_steps': ['补充断言'],
+                'variables': [],
+            },
+        }
+        generation.script_draft = '''async def run(page, variables):
+    await page.goto('/items')
+    # AITS_PENDING_ASSERTION: {"reason":"尚待补充页面断言"}
+'''
+        generation.save(update_fields=['exploration_snapshot', 'script_draft'])
         retried = prepare_trace_generation_retry(
             generation.pk, expected_revision=7,
         )
@@ -613,95 +628,131 @@ class V4GenerationPersistenceRegressionTests(TestCase):
 
         event = SimpleNamespace(
             pk=f'event-{uuid4()}', user_id=self.user.id, celery_task_id='',
-            status=WebUIScriptGeneration.Status.READY,
+            status=WebUIScriptGeneration.Status.READY, revision=0,
             error_code='', error_message='',
         )
-        key = f'webui:script-generation:terminal-event:{event.pk}'
+        key = f'webui:script-generation:terminal-event:{event.pk}:{event.revision}'
         cache.delete(key)
         with patch(
             'web_testing.generation_events.websocket_message_service.send_task_completed',
-            side_effect=[False, True],
+            side_effect=[False, True, True],
         ) as send:
             publish_terminal(event)
             publish_terminal(event)
             publish_terminal(event)
-        self.assertEqual(send.call_count, 2)
+            self.assertEqual(send.call_count, 2)
+            event.revision = 1
+            publish_terminal(event)
+        self.assertEqual(send.call_count, 3)
         cache.delete(key)
 
-    def test_unknown_exploration_exception_is_logged_and_returns_internal_code(self):
+    def _v5_snapshot(self, *, revision=1, completion='complete', variables=None, events=None):
+        return {
+            'schema_version': 5,
+            'events': events if events is not None else [{'event_id': 'E1', 'action': 'navigate'}],
+            'page_states': [], 'locator_evidence': [],
+            'tool_stats': {'total_tool_calls': 1},
+            'artifact': {
+                'revision': revision, 'completion': completion,
+                'completed_steps': ['打开页面'],
+                'remaining_steps': [] if completion == 'complete' else ['人工补充断言'],
+                'variables': variables or [],
+            },
+        }
+
+    def _active_agent_generation(self, **overrides):
+        generation = self.make_generation(
+            status=WebUIScriptGeneration.Status.EXPLORING,
+            current_stage=WebUIScriptGeneration.Stage.EXPLORING,
+            celery_task_id='agent-task',
+            **overrides,
+        )
+        generation.workspace = {
+            '_agent_run': {
+                'generation_revision': generation.revision,
+                'task_id': 'agent-task',
+            },
+        }
+        generation.save(update_fields=['workspace'])
+        return generation
+
+    def _run_v5_agent(self, generation, agent_type, *, preflight=None):
         from .generation_orchestrator import run_generation
 
-        generation = self.make_generation(
-            start_path='/items', target_url_safe='https://web.example.test/items',
-        )
-        plan = ScenarioPlan.model_validate(plan_payload())
-        preflight = SimpleNamespace(outcome='continue', warnings=[], mcp_config={})
+        preflight = preflight or SimpleNamespace(outcome='continue', warnings=[], mcp_config={})
         with patch(
-            'web_testing.generation_orchestrator.normalize_requirement', return_value=plan,
-        ), patch(
             'web_testing.generation_orchestrator.run_safety_preflight', return_value=preflight,
         ), patch(
             'web_testing.generation_orchestrator.get_llm_manager',
             return_value=SimpleNamespace(current_llm=Mock()),
         ), patch(
-            'web_testing.generation_orchestrator.MCPPageExplorer',
-        ) as explorer_class, patch(
-            'web_testing.generation_orchestrator.logger.exception',
-        ) as logged_exception:
-            explorer = Mock()
-            explorer.explore_until_complete.side_effect = RuntimeError('mcp crashed')
-            explorer_class.return_value = explorer
-            result = run_generation(str(generation.pk), celery_task_id='task-1')
-        self.assertEqual(result['error_code'], 'INTERNAL_EXPLORATION_ERROR')
-        self.assertEqual(result['status'], 'failed')
-        logged_exception.assert_called_once()
+            'web_testing.script_exploration_agent.ScriptExplorationAgent', agent_type,
+        ):
+            return run_generation(str(generation.pk), celery_task_id='task-1')
 
-    def test_normalization_contract_failure_logs_only_safe_diagnostics(self):
+    def test_agent_exception_persists_needs_review_and_publishes_terminal(self):
         from .generation_orchestrator import run_generation
 
-        generation = self.make_generation()
-        error = GenerationContractError('scenario_plan_invalid', diagnostics=(
-            {'path': 'assertion_requirements.[item].kind', 'type': 'value_error', 'stage': 'contract_validation'},
-        ))
-        with patch(
-            'web_testing.generation_orchestrator.normalize_requirement', side_effect=error,
-        ) as normalize, patch('web_testing.generation_orchestrator.logger.warning') as logged_warning:
-            result = run_generation(str(generation.pk), celery_task_id='task-1')
-        self.assertEqual(result['error_code'], 'MODEL_OUTPUT_INVALID')
-        normalize.assert_called_once()
-        diagnostic_calls = [
-            call for call in logged_warning.call_args_list
-            if call.args and call.args[0].startswith('WebUI v4 ScenarioPlan rejected:')
-        ]
-        self.assertEqual(len(diagnostic_calls), 1)
-        self.assertEqual(diagnostic_calls[0].args[2], 'scenario_plan_invalid')
-        self.assertEqual(diagnostic_calls[0].args[3], list(error.diagnostics))
+        generation = self.make_generation(
+            start_path='/items', target_url_safe='https://web.example.test/items',
+        )
+        class BrokenAgent:
+            def __init__(self, **_kwargs):
+                pass
 
-    def test_generation_exposes_normalizing_state_before_model_call(self):
+            async def generate(self, **_kwargs):
+                raise RuntimeError('agent crashed')
+
+        with patch(
+            'web_testing.generation_orchestrator.run_safety_preflight',
+            return_value=SimpleNamespace(outcome='continue', warnings=[], mcp_config={}),
+        ), patch(
+            'web_testing.generation_orchestrator.get_llm_manager',
+            return_value=SimpleNamespace(current_llm=Mock()),
+        ), patch(
+            'web_testing.script_exploration_agent.ScriptExplorationAgent', BrokenAgent,
+        ), patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ) as publish_terminal:
+            result = run_generation(str(generation.pk), celery_task_id='task-1')
+        generation.refresh_from_db()
+        self.assertEqual(result['error_code'], 'INTERNAL_GENERATION_ERROR')
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.NEEDS_REVIEW)
+        publish_terminal.assert_called_once()
+
+    def test_local_schema5_brief_exposes_normalizing_stage_without_calling_normalizer(self):
         from .generation_orchestrator import run_generation
 
         generation = self.make_generation()
         observed = {}
 
-        def inspect_persisted_state(*args, **kwargs):
+        def inspect_state(_generation):
             current = WebUIScriptGeneration.objects.get(pk=generation.pk)
             observed.update({
-                'status': current.status,
-                'stage': current.current_stage,
-                'progress': current.progress,
-                'started_at': current.started_at,
+                'status': current.status, 'stage': current.current_stage,
+                'progress': current.progress, 'started_at': current.started_at,
             })
-            raise GenerationContractError('scenario_plan_invalid')
+            return {
+                'schema_version': 5, 'title': '本地 brief', 'objective': '检查目标页面。',
+                'original_user_target': '检查目标页面。', 'instructions': ['检查目标页面。'],
+                'credentials_required': False,
+            }
 
         with patch(
-            'web_testing.generation_orchestrator.normalize_requirement',
-            side_effect=inspect_persisted_state,
+            'web_testing.generation_orchestrator._brief_for_generation', side_effect=inspect_state,
         ), patch(
-            'web_testing.generation_orchestrator.publish_stage_changed',
-        ) as publish_stage:
+            'web_testing.requirement_normalizer.RequirementNormalizer.normalize',
+        ) as normalizer, patch(
+            'web_testing.generation_orchestrator.run_safety_preflight',
+            return_value=SimpleNamespace(
+                outcome='needs_confirmation', error_code='INPUT_AMBIGUOUS',
+                message='需要确认测试范围。', warnings=[],
+            ),
+        ), patch('web_testing.generation_orchestrator.publish_stage_changed') as publish_stage:
             result = run_generation(str(generation.pk), celery_task_id='task-1')
-
-        self.assertEqual(result['error_code'], 'MODEL_OUTPUT_INVALID')
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_CONFIRMATION)
+        normalizer.assert_not_called()
         self.assertEqual(observed['status'], WebUIScriptGeneration.Status.NORMALIZING)
         self.assertEqual(observed['stage'], WebUIScriptGeneration.Stage.NORMALIZING)
         self.assertEqual(observed['progress'], 10)
@@ -710,51 +761,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertEqual(published_generation.status, WebUIScriptGeneration.Status.NORMALIZING)
         self.assertEqual(published_generation.progress, 10)
 
-    def test_normalizing_retries_one_stateless_model_error_then_continues(self):
-        from .generation_orchestrator import run_generation
-
-        generation = self.make_generation()
-        plan = ScenarioPlan.model_validate(plan_payload())
-        transient = OpenAIError('模型服务暂时不可用，请稍后重试')
-        preflight = SimpleNamespace(
-            outcome='needs_confirmation', error_code='INPUT_AMBIGUOUS',
-            message='需要确认测试范围。', warnings=[],
-        )
-        with patch(
-            'web_testing.generation_orchestrator.normalize_requirement',
-            side_effect=[transient, plan],
-        ) as normalize, patch(
-            'web_testing.generation_orchestrator.run_safety_preflight', return_value=preflight,
-        ):
-            result = run_generation(str(generation.pk), celery_task_id='task-1')
-
-        self.assertEqual(normalize.call_count, 2)
-        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_CONFIRMATION)
-
-    def test_normalizing_two_stateless_model_errors_finish_failed_and_publish_terminal(self):
-        from .generation_orchestrator import run_generation
-
-        generation = self.make_generation()
-
-        def stream_error():
-            return OpenAIError('模型服务暂时不可用，请稍后重试')
-
-        with patch(
-            'web_testing.generation_orchestrator.normalize_requirement',
-            side_effect=[stream_error(), stream_error()],
-        ) as normalize, patch(
-            'web_testing.generation_orchestrator.publish_terminal',
-        ) as publish_terminal:
-            result = run_generation(str(generation.pk), celery_task_id='task-1')
-
-        generation.refresh_from_db()
-        self.assertEqual(normalize.call_count, 2)
-        self.assertEqual(result['error_code'], 'MODEL_SERVICE_ERROR')
-        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
-        self.assertEqual(generation.progress, 100)
-        publish_terminal.assert_called_once()
-
-    def test_normalizing_authentication_error_does_not_retry(self):
+    def test_agent_model_authentication_failure_is_terminal_without_normalizer_retry(self):
         from .generation_orchestrator import run_generation
 
         generation = self.make_generation()
@@ -766,17 +773,38 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             'invalid credentials', response=response,
             body={'type': 'authentication_error'},
         )
+        class AuthenticationFailingAgent:
+            calls = 0
+
+            def __init__(self, **_kwargs):
+                pass
+
+            async def generate(self, **_kwargs):
+                type(self).calls += 1
+                raise authentication_error
+
         with patch(
-            'web_testing.generation_orchestrator.normalize_requirement',
-            side_effect=authentication_error,
-        ) as normalize:
+            'web_testing.generation_orchestrator.run_safety_preflight',
+            return_value=SimpleNamespace(outcome='continue', warnings=[], mcp_config={}),
+        ), patch(
+            'web_testing.generation_orchestrator.get_llm_manager',
+            return_value=SimpleNamespace(current_llm=Mock()),
+        ), patch(
+            'web_testing.script_exploration_agent.ScriptExplorationAgent', AuthenticationFailingAgent,
+        ), patch(
+            'web_testing.requirement_normalizer.RequirementNormalizer.normalize',
+        ) as normalizer, patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ) as publish_terminal:
             result = run_generation(str(generation.pk), celery_task_id='task-1')
 
         generation.refresh_from_db()
-        normalize.assert_called_once()
+        self.assertEqual(AuthenticationFailingAgent.calls, 1)
+        normalizer.assert_not_called()
         self.assertEqual(result['error_code'], 'MODEL_AUTHENTICATION_FAILED')
-        self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.NEEDS_REVIEW)
         self.assertEqual(generation.progress, 100)
+        publish_terminal.assert_called_once()
 
     def test_generation_task_guard_marks_unknown_exception_failed_and_publishes_terminal(self):
         from .tasks import generate_webui_script_generation_task
@@ -801,35 +829,38 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         publish_terminal.assert_called_once()
         logged_exception.assert_called_once()
 
-    def test_cancelled_exploration_never_compiles_a_partial_snapshot(self):
+    def test_real_cancelled_generation_returns_terminal_state_without_starting_agent(self):
         from .generation_orchestrator import run_generation
 
         generation = self.make_generation(
             start_path='/items', target_url_safe='https://web.example.test/items',
         )
-        plan, trace = replay_fixture(verify_cleanup=False)
-        preflight = SimpleNamespace(outcome='continue', warnings=[], mcp_config={})
+        cancelled = cancel_generation(generation.pk)
+
+        class NeverStartedAgent:
+            calls = 0
+
+            def __init__(self, **_kwargs):
+                pass
+
+            async def generate(self, **_kwargs):
+                type(self).calls += 1
+                raise AssertionError('已取消的任务不应启动脚本 Agent')
+
         with patch(
-            'web_testing.generation_orchestrator.normalize_requirement', return_value=plan,
-        ), patch(
-            'web_testing.generation_orchestrator.run_safety_preflight', return_value=preflight,
-        ), patch(
-            'web_testing.generation_orchestrator.get_llm_manager',
-            return_value=SimpleNamespace(current_llm=Mock()),
-        ), patch(
-            'web_testing.generation_orchestrator.MCPPageExplorer',
-        ) as explorer_class, patch(
-            'web_testing.generation_orchestrator._compile_persisted',
-        ) as compile_persisted:
-            explorer = Mock()
-            explorer.explore_until_complete.side_effect = MCPPageExplorerError(
-                'TASK_CANCELLED', '用户已取消任务。', snapshot=trace,
-            )
-            explorer_class.return_value = explorer
+            'web_testing.script_exploration_agent.ScriptExplorationAgent', NeverStartedAgent,
+        ):
             result = run_generation(str(generation.pk), celery_task_id='task-1')
-        self.assertEqual(result['status'], WebUIScriptGeneration.Status.CANCELLED)
+        generation.refresh_from_db()
+        self.assertEqual(cancelled.status, WebUIScriptGeneration.Status.CANCELLED)
+        self.assertEqual(NeverStartedAgent.calls, 0)
+        self.assertEqual(
+            result['status'], WebUIScriptGeneration.Status.CANCELLED,
+            {'result': result, 'db_status': generation.status, 'error_code': generation.error_code},
+        )
         self.assertEqual(result['error_code'], 'TASK_CANCELLED')
-        compile_persisted.assert_not_called()
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.CANCELLED)
+        self.assertEqual(generation.script_draft, '')
 
     def test_saved_marker_requires_matching_generation_reference(self):
         test_case = SimpleNamespace(generation_metadata={})
@@ -844,78 +875,182 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         test_case.generation_metadata['generation_ref'] = 'wrong'
         self.assertFalse(is_generation_saved(generation))
 
-    def test_unverified_cleanup_finishes_as_needs_review_not_ready(self):
-        from .generation_orchestrator import _compile_persisted
+    def test_partial_agent_draft_persists_without_finalization_gate(self):
+        from .generation_orchestrator import _persist_agent_result
 
-        plan, trace = replay_fixture(verify_cleanup=False)
-        generation = self.make_generation(
-            status=WebUIScriptGeneration.Status.GENERATING,
-            current_stage=WebUIScriptGeneration.Stage.GENERATING,
-            scenario_spec=plan.model_dump(mode='json'),
-        )
-        with patch(
-            'web_testing.generation_orchestrator.publish_stage_changed',
-        ), patch('web_testing.generation_orchestrator.publish_terminal'):
-            result = _compile_persisted(generation, plan, trace)
+        generation = self._active_agent_generation()
+        draft = '''"""场景：查看详情。目标：先保留待补充的断言草稿。"""
+async def run(page, variables):
+    # 打开详情页
+    await page.goto('/items')
+    # AITS_PENDING_ASSERTION: {"reason":"当前证据不足以确认详情字段"}
+'''
+        with patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = _persist_agent_result(
+                generation, task_id='agent-task', script_draft=draft,
+                snapshot=self._v5_snapshot(completion='partial'), completion='partial',
+                error_code='', error_message='', final_message='已保留待补充草稿。',
+            )
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
-        self.assertEqual(result['quality_status'], 'blocked')
-        self.assertEqual(generation.error_code, 'FINALIZATION_REQUIRED')
-        self.assertEqual(generation.script_draft, '')
+        self.assertIn('AITS_PENDING_ASSERTION:', generation.script_draft)
+        self.assertEqual(generation.exploration_snapshot['schema_version'], 5)
+        self.assertEqual(generation.exploration_snapshot['final_message'], '已保留待补充草稿。')
+        self.assertNotEqual(generation.error_code, 'FINALIZATION_REQUIRED')
 
-    def test_compile_persisted_generates_dynamic_input_script_and_workspace_without_value_leak(self):
-        from .generation_orchestrator import _compile_persisted
+    def test_agent_artifact_preserves_fixed_and_dynamic_variables_without_finalization(self):
+        from .generation_orchestrator import _persist_agent_result
 
-        actual_value = 'dynamic-value-should-not-persist@example.com'
-        plan = ScenarioPlan.model_validate({
-            **plan_payload(),
-            'success_criteria': ['结果区域可见'],
-            'assertion_requirements': [{
-                'assertion_id': 'A1', 'criterion_index': 0, 'phase': 'main',
-                'kind': 'visible', 'input_ref': '', 'literal': '',
-            }],
-            'input_refs': [],
-        })
-        recorder = ExplorationTraceRecorder('/items')
-        recorder.configure_plan(plan)
-        recorder.configure_runtime({}, plan.input_sources())
-        dynamic = recorder.declare_dynamic_input(
-            value_kind='email', runtime_value=actual_value,
-        )
-        record(recorder, 'navigate', 'playwright_navigate', {
-            'url': 'https://web.example.test/items',
-        }, 'URL: https://web.example.test/items')
-        record(recorder, 'fill', 'playwright_fill', {
-            'selector': '#dynamic', 'value': actual_value,
-        }, 'filled')
-        record(recorder, 'assert', 'playwright_get_visible_html', {
-            'selector': '#result',
-        }, '<main>saved</main>')
-        recorder.candidate_summary()
-        recorder.finalize_path(
-            main_actions=[FinalizedAction(event_id='E000002', step_name='填写动态输入')],
-            assertions=[FinalizedAssertion(assertion_id='A1', event_id='E000003')],
-            cleanup_actions=[],
-        )
-        trace = recorder.build(tool_stats={'total_tool_calls': 3})
-        generation = self.make_generation(
-            status=WebUIScriptGeneration.Status.GENERATING,
-            current_stage=WebUIScriptGeneration.Stage.GENERATING,
-            scenario_spec=plan.model_dump(mode='json'),
-        )
-        with patch('web_testing.generation_orchestrator.publish_stage_changed'), patch(
-            'web_testing.generation_orchestrator.publish_terminal',
-        ):
-            result = _compile_persisted(generation, plan, trace)
+        generation = self._active_agent_generation()
+        draft = '''"""场景：填写联系人。目标：验证固定标题与动态邮箱。"""
+from playwright.async_api import expect
+
+async def run(page, variables):
+    # 打开联系人页面
+    await page.goto('/items')
+    fixed_title = '新建联系人'
+    email = variables.get('DYNAMIC_EMAIL', '')
+    # 填写运行时邮箱
+    await page.locator('#email').fill(email)
+    await expect(page.locator('#title')).to_have_text(fixed_title)
+'''
+        variables = [
+            {'name': 'FIXED_TITLE', 'value': '新建联系人', 'required': False, 'is_secret': False},
+            {'name': 'DYNAMIC_EMAIL', 'value': '', 'required': True, 'is_secret': False},
+        ]
+        with patch('web_testing.generation_orchestrator.publish_terminal'):
+            result = _persist_agent_result(
+                generation, task_id='agent-task', script_draft=draft,
+                snapshot=self._v5_snapshot(completion='partial', variables=variables), completion='partial',
+                error_code='', error_message='', final_message='草稿保存完成。',
+            )
         generation.refresh_from_db()
-        self.assertIn(result['status'], {
-            WebUIScriptGeneration.Status.READY,
-            WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
-        })
-        self.assertIn('DYNAMIC_INPUT_1', generation.script_draft)
-        self.assertIn('@example.com', generation.script_draft)
-        self.assertNotIn(actual_value, generation.script_draft)
-        self.assertNotIn(actual_value, str(generation.exploration_snapshot))
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
+        self.assertIn("fixed_title = '新建联系人'", generation.script_draft)
+        self.assertIn("variables.get('DYNAMIC_EMAIL', '')", generation.script_draft)
         variables = {item['name']: item for item in generation.workspace['variables']}
-        self.assertEqual(variables[dynamic.name]['value'], '')
-        self.assertFalse(variables[dynamic.name]['is_secret'])
+        self.assertEqual(variables['FIXED_TITLE']['value'], '新建联系人')
+        self.assertTrue(variables['DYNAMIC_EMAIL']['required'])
+        self.assertEqual(generation.exploration_snapshot['artifact']['revision'], 1)
+
+
+class V5RunningCancellationRegressionTests(TransactionTestCase):
+    """Exercise real checkpoint/cancel ordering outside TestCase's transaction."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='v5-running-cancel-owner', password='test-password',
+        )
+        self.project = Project.objects.create(
+            name='V5 running cancellation', project_type='web', owner=self.user,
+            created_by=self.user,
+        )
+        self.environment = Environment.objects.create(
+            project=self.project, name='Web',
+            category=Environment.EnvironmentCategory.WEB,
+            config={'base_url': 'https://web.example.test'}, is_active=True,
+        )
+        self.model = LLMConfiguration.objects.create(
+            model_type=ModelType.LLM, provider='openai', provider_name='Test provider',
+            api_key='key', base_url='https://llm.example.test', model_name='v5-model',
+            is_active=True, created_by=self.user,
+        )
+
+    def test_running_cancel_keeps_last_checkpoint_and_ignores_late_agent_result(self):
+        from .generation_orchestrator import _persist_agent_result, run_generation
+
+        def run_agent_coroutine_in_test_thread(awaitable):
+            """Keep thread-sensitive ORM callbacks on SQLite's test connection."""
+            async def wait_for_result():
+                return await awaitable
+
+            return async_to_sync(wait_for_result)()
+
+        checkpoint_draft = '''"""场景：查看详情。目标：保存可恢复的部分草稿。"""
+async def run(page, variables):
+    # 打开详情页
+    await page.goto('/items')
+    # AITS_PENDING_ASSERTION: {"reason":"尚未确认详情字段"}
+'''
+        late_draft = '''"""过期草稿，不应覆盖 checkpoint。"""
+async def run(page, variables):
+    await page.goto('/stale-result')
+'''
+        checkpoint_payload = {
+            'script_draft': checkpoint_draft,
+            'snapshot': {
+                'schema_version': 5,
+                'events': [{'event_id': 'checkpoint', 'action': 'navigate'}],
+                'page_states': [], 'locator_evidence': [],
+                'tool_stats': {'total_tool_calls': 1},
+                'artifact': {
+                    'revision': 1, 'completion': 'partial',
+                    'completed_steps': ['打开详情页'],
+                    'remaining_steps': ['补充详情断言'], 'variables': [],
+                },
+            },
+        }
+        late_snapshot = {
+            'schema_version': 5,
+            'events': [{'event_id': 'late', 'action': 'navigate'}],
+            'page_states': [], 'locator_evidence': [],
+            'tool_stats': {'total_tool_calls': 2},
+            'artifact': {
+                'revision': 2, 'completion': 'complete',
+                'completed_steps': ['错误的完成结果'], 'remaining_steps': [], 'variables': [],
+            },
+        }
+        generation = WebUIScriptGeneration.objects.create(
+            project=self.project, user=self.user, environment=self.environment,
+            description_safe='探索详情页并保存当前可用草稿。',
+            start_path='/items', target_url_safe='https://web.example.test/items',
+            model_info={'config_id': self.model.id},
+        )
+
+        class CheckpointThenCancelAgent:
+            checkpoint_saved = False
+
+            def __init__(self, **kwargs):
+                self.generation_id = kwargs['generation_id']
+                self.checkpoint_callback = kwargs['checkpoint_callback']
+
+            async def generate(self, **_kwargs):
+                type(self).checkpoint_saved = await sync_to_async(
+                    self.checkpoint_callback, thread_sensitive=True,
+                )(checkpoint_payload)
+                await sync_to_async(cancel_generation, thread_sensitive=True)(self.generation_id)
+                return ScriptExplorationResult(
+                    script_draft=late_draft, snapshot=late_snapshot,
+                    completion='complete', final_message='过期结果不应落库。',
+                )
+
+        with patch(
+            'web_testing.generation_orchestrator.run_safety_preflight',
+            return_value=SimpleNamespace(outcome='continue', warnings=[], mcp_config={}),
+        ), patch(
+            'web_testing.generation_orchestrator.get_llm_manager',
+            return_value=SimpleNamespace(current_llm=Mock()),
+        ), patch(
+            'web_testing.script_exploration_agent.ScriptExplorationAgent', CheckpointThenCancelAgent,
+        ), patch(
+            'web_testing.generation_orchestrator.asyncio',
+            SimpleNamespace(run=run_agent_coroutine_in_test_thread),
+        ), patch(
+            'web_testing.generation_orchestrator._persist_agent_result',
+            wraps=_persist_agent_result,
+        ) as persist_final, patch(
+            'web_testing.generation_orchestrator.publish_terminal',
+        ) as publish_terminal:
+            result = run_generation(str(generation.pk), celery_task_id='running-cancel-task')
+
+        generation.refresh_from_db()
+        self.assertTrue(CheckpointThenCancelAgent.checkpoint_saved)
+        self.assertEqual(result['status'], WebUIScriptGeneration.Status.CANCELLED)
+        self.assertEqual(result['error_code'], 'TASK_CANCELLED')
+        self.assertEqual(generation.status, WebUIScriptGeneration.Status.CANCELLED)
+        self.assertEqual(generation.script_draft, checkpoint_draft)
+        self.assertEqual(generation.exploration_snapshot['artifact']['revision'], 1)
+        self.assertNotIn('stale-result', generation.script_draft)
+        self.assertNotIn('过期结果不应落库。', generation.exploration_snapshot.get('final_message', ''))
+        persist_final.assert_not_called()
+        publish_terminal.assert_not_called()

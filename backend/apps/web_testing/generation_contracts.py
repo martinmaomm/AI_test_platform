@@ -434,7 +434,10 @@ _NEXT_STATUS = {
     'created': {'created', 'normalizing', 'preflighting', 'failed', 'cancelled'},
     'normalizing': {'normalizing', 'preflighting', 'needs_input', 'failed', 'cancelled'},
     'preflighting': {'preflighting', 'exploring', 'needs_confirmation', 'needs_credentials', 'failed', 'cancelled'},
-    'exploring': {'exploring', 'generating', 'needs_review', 'failed', 'cancelled'},
+    'exploring': {
+        'exploring', 'generating', 'validating', 'needs_review',
+        'ready', 'ready_with_warnings', 'failed', 'cancelled',
+    },
     'generating': {'generating', 'validating', 'needs_review', 'ready', 'ready_with_warnings', 'failed', 'cancelled'},
     'validating': {'validating', 'needs_review', 'ready', 'ready_with_warnings', 'failed', 'cancelled'},
     'repairing': {'repairing', 'needs_review', 'ready', 'ready_with_warnings', 'failed', 'cancelled'},

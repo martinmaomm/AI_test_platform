@@ -1,7 +1,7 @@
-"""v4 generation notifications.
+"""Script-first generation notifications.
 
 The durable database record is the source of truth.  These notifications use
-the existing node-start event shape for old WebSocket clients.  Terminal events
+the existing node-start event shape for WebSocket clients.  Terminal events
 are emitted only by :func:`publish_terminal`.
 """
 
@@ -24,7 +24,7 @@ def publish_stage_changed(generation, display_name: str) -> None:
     """Publish one safe, non-terminal stage event; failure is non-fatal."""
     task_id = generation.celery_task_id or str(generation.pk)
     logger.info(
-        'WebUI v4 generation stage: generation_id=%s stage=%s status=%s progress=%s',
+        'WebUI v5 generation stage: generation_id=%s stage=%s status=%s progress=%s',
         generation.pk,
         generation.current_stage,
         generation.status,
@@ -33,21 +33,21 @@ def publish_stage_changed(generation, display_name: str) -> None:
     try:
         send_node_start_notification_helper(
             user_id=generation.user_id,
-            node_name=f'v4_{generation.current_stage}',
+            node_name=f'v5_{generation.current_stage}',
             node_display_name=display_name,
             task_id=task_id,
             enable_streaming=True,
             room_type='webui_auto_test',
         )
     except Exception:
-        logger.warning('WebUI v4 阶段事件发送失败: generation_id=%s', generation.pk, exc_info=True)
+        logger.warning('WebUI v5 阶段事件发送失败: generation_id=%s', generation.pk, exc_info=True)
 
 
 def publish_terminal(generation) -> None:
-    """The single v4 source for safe completion, review, failure and cancel events."""
+    """The single source for completion, review, failure and cancel events."""
     task_id = generation.celery_task_id or str(generation.pk)
     result = {'generation_id': str(generation.pk), 'status': generation.status}
-    cache_key = f'webui:script-generation:terminal-event:{generation.pk}'
+    cache_key = f'webui:script-generation:terminal-event:{generation.pk}:{generation.revision}'
     cache_available = True
     try:
         if not cache.add(cache_key, generation.status, timeout=TERMINAL_EVENT_TTL_SECONDS):
@@ -58,7 +58,7 @@ def publish_terminal(generation) -> None:
         # completed generation into a worker/API failure.
         cache_available = False
         logger.warning(
-            'WebUI v4 终态事件去重缓存不可用，将降级发送: generation_id=%s',
+            'WebUI v5 终态事件去重缓存不可用，将降级发送: generation_id=%s',
             generation.pk,
         )
 
@@ -69,7 +69,7 @@ def publish_terminal(generation) -> None:
             cache.delete(cache_key)
         except Exception:
             logger.warning(
-                'WebUI v4 终态事件去重缓存清理失败: generation_id=%s',
+                'WebUI v5 终态事件去重缓存清理失败: generation_id=%s',
                 generation.pk,
             )
 
@@ -95,9 +95,9 @@ def publish_terminal(generation) -> None:
             )
         if not delivered:
             release_deduplication_key()
-            logger.warning('WebUI v4 终态事件未送达，将允许后续重试: generation_id=%s', generation.pk)
+            logger.warning('WebUI v5 终态事件未送达，将允许后续重试: generation_id=%s', generation.pk)
     except Exception:
         # Keep the database record as source of truth but permit a later caller
         # to retry if this notification was not handed to the websocket service.
         release_deduplication_key()
-        logger.warning('WebUI v4 终态事件发送失败: generation_id=%s', generation.pk, exc_info=True)
+        logger.warning('WebUI v5 终态事件发送失败: generation_id=%s', generation.pk, exc_info=True)

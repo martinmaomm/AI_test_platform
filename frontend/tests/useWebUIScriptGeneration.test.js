@@ -25,7 +25,7 @@ const deferred = () => {
 async function harness(t, initial = record(), options = {}) {
   const storage = new Map()
   if (options.storedGenerationId) {
-    storage.set('aits:webui-script-generation:v4:1:1', options.storedGenerationId)
+    storage.set('aits:webui-script-generation:v5:1:1', options.storedGenerationId)
   }
   const timers = new Map()
   const oldWindow = globalThis.window
@@ -65,7 +65,7 @@ async function harness(t, initial = record(), options = {}) {
   return { state, projectId, userId, calls, handlers, storage, timers }
 }
 
-test('restore reads only the scoped v4 generation id from localStorage', async t => {
+test('restore reads only the scoped v5 generation id from localStorage', async t => {
   const { state, calls, storage } = await harness(t, record(), {
     storedGenerationId: 'test-generation', create: false
   })
@@ -73,7 +73,7 @@ test('restore reads only the scoped v4 generation id from localStorage', async t
   const reads = calls.filter(call => call.name === 'getWebUIScriptGeneration')
   assert.equal(reads.at(-1).args[1], 'test-generation')
   assert.equal(state.generation.value.id, 'test-generation')
-  assert.deepEqual([...storage.keys()], ['aits:webui-script-generation:v4:1:1'])
+  assert.deepEqual([...storage.keys()], ['aits:webui-script-generation:v5:1:1'])
 })
 
 test('polling preserves unsaved local code when a server revision changes', async t => {
@@ -85,6 +85,37 @@ test('polling preserves unsaved local code when a server revision changes', asyn
   assert.equal(state.localDraft.value.revision, 0)
   assert.equal(state.hasUnsavedDraft.value, true)
   assert.deepEqual([...storage.values()], ['test-generation'])
+})
+
+test('same-revision incremental script text syncs when clean and never overwrites dirty code', async t => {
+  const { state, handlers } = await harness(t)
+  handlers.getWebUIScriptGeneration = async () => ({ data: { ...record(), script_draft: 'server checkpoint one' } })
+  await state.refresh()
+  assert.equal(state.localDraft.value.script_draft, 'server checkpoint one')
+  assert.equal(state.localDraft.value.dirty, false)
+
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'local user edit' })
+  handlers.getWebUIScriptGeneration = async () => ({ data: { ...record(), script_draft: 'server checkpoint two', tool_stats: { total_tool_calls: 2 } } })
+  await state.refresh()
+  assert.equal(state.generation.value.script_draft, 'server checkpoint two')
+  assert.equal(state.localDraft.value.script_draft, 'local user edit')
+  assert.equal(state.localDraft.value.dirty, true)
+})
+
+test('active incremental records update evidence without overwriting a dirty local draft', async t => {
+  const { state, handlers } = await harness(t, { ...record(), status: 'exploring', current_stage: 'exploring' })
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'local editable partial script' })
+  handlers.getWebUIScriptGeneration = async () => ({ data: {
+    ...record({ revision: 3 }), status: 'generating', current_stage: 'generating', script_draft: 'server incremental script',
+    tool_stats: { total_tool_calls: 8 }, exploration_snapshot: { schema_version: 5, events: [{ event_id: 'evt-1' }], artifact: { revision: 3, completion: 'partial' } }
+  } })
+  await state.refresh()
+  assert.equal(state.generation.value.script_draft, 'server incremental script')
+  assert.equal(state.generation.value.workspace.revision, 3)
+  assert.equal(state.generation.value.tool_stats.total_tool_calls, 8)
+  assert.equal(state.localDraft.value.script_draft, 'local editable partial script')
+  assert.equal(state.localDraft.value.revision, 0)
+  assert.equal(state.hasUnsavedDraft.value, true)
 })
 
 test('workspace debug keeps polling after generation is terminal, then stops', async t => {

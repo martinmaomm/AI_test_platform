@@ -1,12 +1,10 @@
-/** Pure, presentation-only helpers for the V4 continuous-exploration page. */
+/** Pure, presentation-only helpers for the schema-v5 exploration workspace. */
 
 export const GENERATION_STAGES = [
   ['normalizing', '理解测试目标'],
-  ['exploring', '连续探索页面'],
-  ['planning', '最终路径定稿'],
-  ['generating', '生成 Python'],
-  ['validating', '检查脚本'],
-  ['completed', '完成']
+  ['exploring', '连续探索并编写脚本'],
+  ['validating', '静态检查'],
+  ['completed', '草稿就绪（非测试通过）']
 ]
 
 export const ACTIVE_GENERATION_STATUSES = new Set([
@@ -26,15 +24,15 @@ const STATUS_LABELS = {
   normalizing: '正在理解测试场景',
   preflighting: '正在确认目标范围与登录条件',
   exploring: '正在连续探索页面',
-  generating: '正在完成最终路径定稿并生成 Python',
-  validating: '正在检查脚本',
-  repairing: '正在自动修复脚本',
+  generating: '正在连续探索并编写脚本',
+  validating: '正在静态检查脚本',
+  repairing: '正在整理脚本草稿',
   needs_input: '需要补充场景信息',
   needs_confirmation: '需要确认目标范围',
   needs_credentials: '需要本轮测试登录信息',
   needs_review: '需要人工检查',
-  ready: '脚本已生成',
-  ready_with_warnings: '脚本已生成（有警告）',
+  ready: '草稿已就绪（未代表测试通过）',
+  ready_with_warnings: '草稿已就绪（有警告，未代表测试通过）',
   failed: '生成失败',
   cancelled: '已取消'
 }
@@ -55,7 +53,7 @@ export const modelInfoLabel = (model, emptyLabel = '—') => (
 )
 
 export const generationStorageKey = (userId, projectId) => (
-  `aits:webui-script-generation:v4:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
+  `aits:webui-script-generation:v5:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
 )
 
 export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(status)
@@ -87,9 +85,55 @@ export const isWorkspaceActive = (workspace) => (
 export const isCurrentRevisionVerified = (workspace, revision, environmentId = undefined) => {
   const verification = workspace?.verification || {}
   const verifiedRevision = verification.locked_revision ?? verification.revision ?? verification.verified_revision
-  return verification.status === 'passed' && Number(verification.runtime_assertion_count || 0) > 0 && Number(verifiedRevision) === Number(revision) && (
+  return verification.status === 'passed'
+    && Number(verification.runtime_assertion_count || 0) > 0
+    && verification.assertion_state?.status === 'complete'
+    && Number(verifiedRevision) === Number(revision) && (
     environmentId === undefined || Number(verification.environment_id) === Number(environmentId)
   )
+}
+
+export const generationHasStaticBlockers = (generation) => {
+  const report = generation?.quality_report || {}
+  return Array.isArray(report.blockers) && report.blockers.length > 0
+    ? true
+    : (report.checks || []).some(item => item?.level === 'blocker')
+}
+
+export const canSaveGeneratedDraft = (generation, draft, busy = false) => (
+  !busy
+  && Boolean((draft?.script_draft || generation?.script_draft || '').trim())
+  && !generationHasStaticBlockers(generation)
+)
+
+export const generationDraftCompletion = (generation) => {
+  const artifact = generation?.exploration_snapshot?.artifact || {}
+  const completion = artifact.completion || 'unknown'
+  return {
+    completion,
+    isPartial: completion === 'partial',
+    completedSteps: Array.isArray(artifact.completed_steps) ? artifact.completed_steps : [],
+    remainingSteps: Array.isArray(artifact.remaining_steps) ? artifact.remaining_steps : []
+  }
+}
+
+export const generationFailureReason = (generation) => (
+  generation?.error_message
+  || generation?.exploration_snapshot?.error_message
+  || generation?.exploration_snapshot?.final_message
+  || generation?.exploration_snapshot?.termination_reason
+  || ''
+)
+
+export const canRetryScriptFromTrace = (generation, busy = false) => {
+  const snapshot = generation?.exploration_snapshot || {}
+  const hasTrace = (Array.isArray(snapshot.events) && snapshot.events.length > 0)
+    || (Array.isArray(snapshot.page_states) && snapshot.page_states.length > 0)
+  const hasTraceOrDraft = hasTrace || Boolean(generation?.script_draft?.trim())
+  return !busy
+    && snapshot.schema_version === 5
+    && hasTraceOrDraft
+    && ['failed', 'needs_review', 'cancelled'].includes(generation?.status)
 }
 
 const GENERATION_FIELD_LABELS = {
@@ -121,33 +165,6 @@ export const generationApiErrorMessage = (error, fallback) => {
   const detailMessages = collectErrorDetails(details)
   if (detailMessages.length) return detailMessages.slice(0, 3).join('；')
   return body?.message || body?.error?.message || error?.message || fallback
-}
-
-const CLEANUP_STATUS_PRESENTATION = {
-  not_required: { label: '无需清理', type: 'info' },
-  completed: { label: '清理已验证', type: 'success' },
-  attempted: { label: '已尝试，未验证', type: 'warning' },
-  missing: { label: '缺少清理证据', type: 'danger' },
-  unknown: { label: '清理结果未知', type: 'warning' }
-}
-
-/** Keep cleanup evidence conservative: an absent v4 record is not a success result. */
-export const explorationCleanupPresentation = (snapshot) => {
-  const report = snapshot?.cleanup
-  if (!report || typeof report !== 'object' || Array.isArray(report)) {
-    return { hasRecord: false, status: '', label: '尚无清理记录', type: 'info', attempted: false, residuals: [], reason: '' }
-  }
-  const status = CLEANUP_STATUS_PRESENTATION[report.status] ? report.status : 'unknown'
-  const presentation = CLEANUP_STATUS_PRESENTATION[status]
-  return {
-    hasRecord: true,
-    status,
-    label: presentation.label,
-    type: presentation.type,
-    attempted: Boolean(report.attempted),
-    residuals: Array.isArray(report.residuals) ? report.residuals.filter(Boolean).map(String) : [],
-    reason: String(report.reason || '')
-  }
 }
 
 export const generationActionRequired = (generation) => {
@@ -205,21 +222,24 @@ export const matchesGenerationWebSocketEvent = (message, generation) => {
 export const buildGenerationTimeline = (generation) => {
   const currentStage = generation?.current_stage || 'created'
   const stageIndex = {
-    created: 0, normalizing: 0, preflighting: 0, exploring: 1,
-    planning: 2, replay_planning: 2, generating: 3,
-    validating: 4, repairing: 4, completed: 5
+    created: 0, normalizing: 0, preflighting: 0,
+    exploring: 1, generating: 1,
+    validating: 2, repairing: 2,
+    completed: 3
   }
   const currentIndex = stageIndex[currentStage] ?? 0
   const terminal = isTerminalGeneration(generation?.status)
+  const draftReady = ['ready', 'ready_with_warnings'].includes(generation?.status)
 
   return GENERATION_STAGES.map(([stage, label], index) => {
     let state = 'wait'
-    if (stage === 'completed' && terminal) {
-      state = generation.status === 'cancelled'
-        ? 'wait'
-        : ['failed', 'needs_review'].includes(generation.status) ? 'error' : 'success'
+    if (draftReady) {
+      state = 'success'
+    } else if (terminal) {
+      if (index < currentIndex) state = 'success'
+      else if (index === currentIndex) state = ['failed', 'needs_review'].includes(generation.status) ? 'error' : 'wait'
     } else if (index === currentIndex) {
-      state = generation.status === 'failed' ? 'error' : 'process'
+      state = 'process'
     } else if (index < currentIndex) {
       state = 'success'
     }
@@ -233,20 +253,14 @@ export const generationResolutionHint = (generation) => {
   if (status === 'needs_confirmation') return '请确认本次测试目标范围。平台会在一个连续会话中自行探索页面元素；额外高风险操作仍需单独调整目标。'
   if (status === 'needs_credentials') return '请在“本轮测试登录信息”中填写临时账号和密码后重新发起。'
   if (status === 'needs_review') {
-    if (String(generation?.error_code || '').startsWith('FINALIZATION')) {
-      return `${generation?.error_message || '最终路径定稿未完成或已失效。'} 已保留探索轨迹；没有脚本草稿，也不能保存。请重新发起任务并让智能体完成最终路径定稿。`
-    }
-    const incomplete = generation?.error_code === 'EXPLORATION_EVIDENCE_INCOMPLETE'
-    return `${generation?.error_message ? `${generation.error_message} ` : ''}${incomplete ? '这不是系统失败：连续探索证据不完整，页面证据已保留，未生成草稿。' : '本次结果需要人工处理。'} 请确认清理失败或残留数据后再决定是否新建任务。`
+    const reason = generationFailureReason(generation)
+    const completion = generationDraftCompletion(generation)
+    return `${reason ? `${reason} ` : ''}${completion.isPartial ? '已保留未完成草稿和探索证据，可继续编辑，或仅基于现有轨迹整理脚本。' : '已保留当前探索证据，可继续检查或仅基于现有轨迹整理脚本。'}`
   }
   if (status === 'failed' || status === 'cancelled') {
-    const message = status === 'failed'
-      ? generation?.error_message || '请检查模型、Playwright MCP、登录信息或页面可访问性后重试。'
-      : '本次生成已停止。'
-    const cleanupStatus = generation?.exploration_snapshot?.cleanup?.status
-    return ['unknown', 'attempted', 'missing'].includes(cleanupStatus)
-      ? `${message} 重新发起前，请先检查“探索轨迹”中的本轮数据和清理结果，避免重复操作。`
-      : message
+    const message = generationFailureReason(generation) || (status === 'failed' ? '本次生成未完成。' : '本次生成已停止。')
+    const completion = generationDraftCompletion(generation)
+    return `${message}${completion.isPartial ? ' 未完成草稿仍可编辑，也可仅基于已保存证据整理脚本。' : ''}`
   }
   if (status === 'ready_with_warnings') return '脚本可保存，但建议先查看定位器和探索轨迹警告。'
   return ''

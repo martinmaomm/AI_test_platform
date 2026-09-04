@@ -16,6 +16,7 @@ from typing import Any, Iterator
 
 
 PENDING_ASSERTION_PREFIX = 'AITS_PENDING_ASSERTION:'
+PENDING_STEP_PREFIX = 'AITS_PENDING_STEP:'
 RUNTIME_ASSERTION_COUNT_KEY = 'runtime_assertion_count'
 _EXPECT_METHOD_PREFIXES = ('to_', 'not_to_')
 
@@ -86,23 +87,25 @@ def _pending_markers(script: str) -> list[dict[str, Any]]:
             if token.type != tokenize.COMMENT:
                 continue
             comment = token.string[1:].strip()
-            if not comment.startswith(PENDING_ASSERTION_PREFIX):
+            prefix = next((value for value in (PENDING_ASSERTION_PREFIX, PENDING_STEP_PREFIX) if comment.startswith(value)), None)
+            if prefix is None:
                 continue
-            payload = comment[len(PENDING_ASSERTION_PREFIX):].strip()
+            payload = comment[len(prefix):].strip()
             try:
                 value = json.loads(payload)
             except (TypeError, ValueError, json.JSONDecodeError):
                 value = {}
-            assertion_id = str(value.get('assertion_id') or 'unknown').strip() if isinstance(value, dict) else 'unknown'
+            assertion_id = str(value.get('assertion_id') or ('step' if prefix == PENDING_STEP_PREFIX else 'unknown')).strip() if isinstance(value, dict) else 'unknown'
             criterion = str(value.get('criterion') or '').strip() if isinstance(value, dict) else ''
             reason = str(value.get('reason') or '').strip() if isinstance(value, dict) else ''
             if not criterion or not reason:
-                reason = reason or '待补充断言标记格式无效，请删除或按约定补全。'
+                reason = reason or '仍有步骤或断言待补充，请完成后移除对应标记。'
             pending.append({
                 'assertion_id': assertion_id,
                 'criterion': criterion,
                 'reason': reason,
                 'line': token.start[0],
+                'kind': 'step' if prefix == PENDING_STEP_PREFIX else 'assertion',
             })
     except (tokenize.TokenError, IndentationError):
         # Syntax validation remains the script contract's job.  Markers parsed

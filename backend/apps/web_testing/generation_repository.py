@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from django.db import transaction
@@ -16,8 +17,10 @@ from .generation_contracts import (
 from .generation_security import clear_temporary_credentials, get_temporary_credentials
 from .models import WebUIScriptGeneration
 
+logger = logging.getLogger(__name__)
 
 MAX_GENERATION_RESUME_COUNT = 3
+MAX_ARTIFACT_HISTORY = 8
 PAUSED_GENERATION_STATUSES = frozenset({
     WebUIScriptGeneration.Status.NEEDS_INPUT,
     WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
@@ -147,6 +150,11 @@ def claim_generation_worker(generation_id: Any, celery_task_id: str | None) -> W
         workspace['_generation_dispatch'] = {
             'revision': generation.revision, 'task_id': celery_task_id or '<direct>',
             'claimed_at': timezone.now().isoformat(),
+        }
+        workspace['_agent_run'] = {
+            'generation_revision': generation.revision,
+            'task_id': celery_task_id or '<direct>',
+            'started_at': timezone.now().isoformat(),
         }
         generation.workspace = workspace
         fields = ['workspace', 'updated_at']
@@ -308,18 +316,20 @@ def get_generation_temporary_credentials(generation_id: Any) -> dict[str, str] |
 
 
 def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int) -> WebUIScriptGeneration:
-    """Retry only v4 compilation from a persisted callback ledger; never reopen MCP."""
+    """Retry code-only drafting from a v5 artifact; never reopen the browser."""
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
-        retryable = {
-            'MODEL_UNAVAILABLE', 'MODEL_RATE_LIMITED', 'MODEL_SERVICE_ERROR',
-            'MODEL_GATEWAY_TIMEOUT', 'TRANSIENT_SERVICE_ERROR',
+        retryable_statuses = {
+            WebUIScriptGeneration.Status.FAILED,
+            WebUIScriptGeneration.Status.NEEDS_REVIEW,
+            WebUIScriptGeneration.Status.CANCELLED,
         }
-        if generation.status != WebUIScriptGeneration.Status.FAILED or generation.error_code not in retryable:
-            raise GenerationResolutionConflict('当前失败状态不能只重试脚本生成。', generation)
-        if generation.revision != expected_revision or snapshot.get('schema_version') != 4:
-            raise GenerationResolutionConflict('探索轨迹或版本已变化，无法安全仅重试脚本生成。', generation)
+        has_trace_or_draft = bool(snapshot.get('events') or generation.script_draft.strip())
+        if generation.status not in retryable_statuses or not has_trace_or_draft:
+            raise GenerationResolutionConflict('当前记录没有可用于代码整理的真实轨迹或草稿，不能重试。', generation)
+        if generation.revision != expected_revision or snapshot.get('schema_version') != 5:
+            raise GenerationResolutionConflict('仅支持当前 v5 产物的代码整理；旧版记录请手动处理源码。', generation)
         generation.status = WebUIScriptGeneration.Status.GENERATING
         generation.current_stage = WebUIScriptGeneration.Stage.GENERATING
         generation.progress = 60
@@ -353,6 +363,218 @@ def claim_trace_generation_retry(
             'task_id': task_marker,
             'claimed_at': timezone.now().isoformat(),
         }
+        workspace['_agent_run'] = {
+            'generation_revision': generation.revision,
+            'task_id': task_marker,
+            'started_at': timezone.now().isoformat(),
+            'code_only': True,
+        }
         generation.workspace = workspace
-        generation.save(update_fields=['workspace', 'updated_at'])
+        fields = ['workspace', 'updated_at']
+        # The worker can start before the HTTP dispatcher attaches its id.
+        # Persist ownership here just as a fresh generation claim does.
+        if celery_task_id and not generation.celery_task_id:
+            generation.celery_task_id = celery_task_id
+            fields.append('celery_task_id')
+        generation.save(update_fields=fields)
         return generation
+
+
+def persist_generation_checkpoint(
+    generation_id: Any,
+    *,
+    generation_revision: int,
+    task_id: str,
+    script_draft: str,
+    snapshot: dict[str, Any],
+) -> bool:
+    """Durably persist one incremental agent artifact under the current run lock.
+
+    A late callback is intentionally a no-op after cancellation, retry, or any
+    user-visible terminal transition.  Database failures are returned as false
+    so callers never claim a checkpoint was saved merely because the agent
+    emitted one.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    try:
+        with transaction.atomic():
+            generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+            workspace = dict(generation.workspace or {})
+            run = workspace.get('_agent_run') if isinstance(workspace.get('_agent_run'), dict) else {}
+            if (
+                generation.revision != generation_revision
+                or generation.status not in {
+                    WebUIScriptGeneration.Status.EXPLORING,
+                    WebUIScriptGeneration.Status.GENERATING,
+                    WebUIScriptGeneration.Status.VALIDATING,
+                }
+                or int(run.get('generation_revision', -1)) != generation_revision
+                or str(run.get('task_id') or '') != task_id
+                or (task_id != '<direct>' and generation.celery_task_id != task_id)
+            ):
+                return False
+            artifact = snapshot.get('artifact') if isinstance(snapshot.get('artifact'), dict) else {}
+            history = workspace.get('artifact_history') if isinstance(workspace.get('artifact_history'), list) else []
+            effective_script = script_draft if script_draft.strip() else generation.script_draft
+            normalized_variables = None
+            if isinstance(artifact.get('variables'), list):
+                try:
+                    from .execution_variables import normalize_variable_definitions
+                    from .generation_workspace import _without_persisted_secret_values
+                    normalized_variables = _without_persisted_secret_values(
+                        normalize_variable_definitions(artifact['variables']),
+                    )
+                except ValueError:
+                    # Invalid agent metadata remains in the artifact for
+                    # review, but must not replace the editable variable set.
+                    normalized_variables = None
+            previous_snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
+            previous_artifact = previous_snapshot.get('artifact') if isinstance(previous_snapshot.get('artifact'), dict) else {}
+            changed = (
+                effective_script != generation.script_draft
+                or (
+                    normalized_variables is not None
+                    and normalized_variables != workspace.get('variables', [])
+                )
+            )
+            if artifact:
+                revision = artifact.get('revision')
+                entry = {'revision': revision, 'artifact': artifact, 'script_draft': effective_script}
+                if not history or history[-1].get('revision') != revision:
+                    history.append(entry)
+                else:
+                    history[-1] = entry
+            workspace['artifact_history'] = history[-MAX_ARTIFACT_HISTORY:]
+            if normalized_variables is not None:
+                workspace['variables'] = normalized_variables
+            if changed:
+                try:
+                    workspace['revision'] = max(0, int(workspace.get('revision') or 0)) + 1
+                except (TypeError, ValueError):
+                    workspace['revision'] = 1
+                # A checkpoint changes the draft identity.  No prior runtime
+                # verification may represent this version.
+                from .generation_workspace import _verification
+                workspace['verification'] = _verification(script=effective_script)
+            snapshot = dict(snapshot)
+            snapshot['artifact_history'] = workspace['artifact_history']
+            generation.workspace = workspace
+            generation.exploration_snapshot = snapshot
+            generation.tool_stats = snapshot.get('tool_stats') if isinstance(snapshot.get('tool_stats'), dict) else {}
+            fields = ['workspace', 'exploration_snapshot', 'tool_stats', 'updated_at']
+            if effective_script != generation.script_draft:
+                generation.script_draft = effective_script
+                fields.append('script_draft')
+            generation.save(update_fields=fields)
+            return True
+    except Exception:
+        # Do not re-raise from the callback: the agent can still return its
+        # final artifact, and final persistence will separately fail closed.
+        logger.exception(
+            '增量草稿 checkpoint 持久化失败: generation_id=%s task_id=%s generation_revision=%s',
+            generation_id, task_id, generation_revision,
+        )
+        return False
+
+
+def finalize_generation_artifact(
+    generation_id: Any,
+    *,
+    generation_revision: int,
+    task_id: str,
+    target_status: str,
+    script_draft: str,
+    snapshot: dict[str, Any],
+    quality_report: dict[str, Any],
+    variables: list[dict[str, Any]] | None,
+    warnings: list[str],
+    error_code: str,
+    error_message: str,
+    terminal_stage: str | None = None,
+) -> WebUIScriptGeneration | None:
+    """Atomically complete exactly the active agent attempt, or do nothing.
+
+    The callback and final result use the same generation revision/task marker.
+    This prevents a stale worker from restoring an old draft after cancellation,
+    retry, or a user edit made after the prior run finished.
+    """
+    should_clear_credentials = False
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        workspace = dict(generation.workspace or {})
+        run = workspace.get('_agent_run') if isinstance(workspace.get('_agent_run'), dict) else {}
+        if (
+            generation.revision != generation_revision
+            or generation.status not in {
+                WebUIScriptGeneration.Status.EXPLORING,
+                WebUIScriptGeneration.Status.GENERATING,
+                WebUIScriptGeneration.Status.VALIDATING,
+            }
+            or int(run.get('generation_revision', -1)) != generation_revision
+            or str(run.get('task_id') or '') != task_id
+            or (task_id != '<direct>' and generation.celery_task_id != task_id)
+        ):
+            return None
+        target_stage = terminal_stage or stage_for_status(target_status)
+        if target_stage not in set(WebUIScriptGeneration.Stage.values):
+            raise GenerationTransitionError('未知生成阶段')
+        validate_transition(generation.status, target_status)
+        current_snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
+        current_artifact = current_snapshot.get('artifact') if isinstance(current_snapshot.get('artifact'), dict) else {}
+        incoming_artifact = snapshot.get('artifact') if isinstance(snapshot.get('artifact'), dict) else {}
+        try:
+            current_artifact_revision = int(current_artifact.get('revision') or 0)
+            incoming_artifact_revision = int(incoming_artifact.get('revision') or 0)
+        except (TypeError, ValueError):
+            current_artifact_revision = incoming_artifact_revision = 0
+        # An exception path often has only the original snapshot.  Keep the
+        # latest checkpoint rather than downgrading observable evidence.
+        if current_artifact_revision > incoming_artifact_revision:
+            snapshot = dict(current_snapshot)
+            script_draft = generation.script_draft
+        artifact = snapshot.get('artifact') if isinstance(snapshot.get('artifact'), dict) else {}
+        history = workspace.get('artifact_history') if isinstance(workspace.get('artifact_history'), list) else []
+        effective_script = script_draft if script_draft.strip() else generation.script_draft
+        if artifact:
+            entry = {
+                'revision': artifact.get('revision'), 'artifact': artifact,
+                'script_draft': effective_script,
+            }
+            if history and history[-1].get('revision') == entry['revision']:
+                history[-1] = entry
+            else:
+                history.append(entry)
+        workspace['artifact_history'] = history[-MAX_ARTIFACT_HISTORY:]
+        if variables is not None:
+            workspace['variables'] = variables
+        normalized_snapshot = dict(snapshot)
+        normalized_snapshot['artifact_history'] = workspace['artifact_history']
+        if effective_script != generation.script_draft:
+            try:
+                workspace['revision'] = max(0, int(workspace.get('revision') or 0)) + 1
+            except (TypeError, ValueError):
+                workspace['revision'] = 1
+            from .generation_workspace import _verification
+            workspace['verification'] = _verification(script=effective_script)
+        generation.status = target_status
+        generation.current_stage = target_stage
+        generation.progress = 100
+        generation.error_code = error_code
+        generation.error_message = error_message
+        generation.exploration_snapshot = normalized_snapshot
+        generation.script_draft = effective_script
+        generation.workspace = workspace
+        generation.quality_report = quality_report
+        generation.tool_stats = normalized_snapshot.get('tool_stats') if isinstance(normalized_snapshot.get('tool_stats'), dict) else {}
+        generation.warnings = warnings
+        generation.completed_at = generation.completed_at or timezone.now()
+        generation.save(update_fields=[
+            'status', 'current_stage', 'progress', 'error_code', 'error_message',
+            'exploration_snapshot', 'script_draft', 'workspace', 'quality_report',
+            'tool_stats', 'warnings', 'completed_at', 'updated_at',
+        ])
+        should_clear_credentials = is_terminal_status(target_status)
+    if should_clear_credentials:
+        clear_temporary_credentials(generation.pk)
+    return generation

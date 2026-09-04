@@ -61,6 +61,7 @@ from .generation_workspace import (
     script_hash,
     update_draft,
     workspace_for_generation,
+    evaluate_workspace_draft,
 )
 from .models import (
     MidSceneScript,
@@ -519,10 +520,12 @@ class WebUIScriptGenerationSaveView(APIView):
                     raise Http404('生成记录不存在') from exc
                 if not _is_generation_owner(project, generation, request.user):
                     raise PermissionDenied('只能保存自己创建的生成记录')
-                requested_mode = serializer.validated_data.get('mode')
-                legacy_save = requested_mode is None
+                requested_mode = serializer.validated_data.get('mode') or 'draft'
                 workspace = workspace_for_generation(generation)
-                if requested_mode and workspace['revision'] != serializer.validated_data['expected_revision']:
+                if (
+                    'expected_revision' in serializer.validated_data
+                    and workspace['revision'] != serializer.validated_data['expected_revision']
+                ):
                     return Response(
                         {'success': False, 'message': '工作区版本已变化，请刷新后重试。', 'data': WebUIScriptGenerationSerializer(generation).data},
                         status=status.HTTP_409_CONFLICT,
@@ -536,34 +539,24 @@ class WebUIScriptGenerationSaveView(APIView):
                         {'success': False, 'message': '生成、调试或修复进行中，不能保存工作区草稿。', 'data': WebUIScriptGenerationSerializer(generation).data},
                         status=status.HTTP_409_CONFLICT,
                     )
-                if legacy_save and workspace['revision'] > 0:
+                if not (generation.script_draft or '').strip():
                     return Response(
-                        {'success': False, 'message': '该草稿已经编辑，请使用当前工作区版本保存。'},
+                        {'success': False, 'message': '没有可保存的脚本草稿。'},
                         status=status.HTTP_409_CONFLICT,
                     )
-                if legacy_save and generation.status not in {
-                    WebUIScriptGeneration.Status.READY,
-                    WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
-                }:
-                    return Response({'success': False, 'message': '当前脚本尚未通过质量检查，不能保存。'}, status=status.HTTP_409_CONFLICT)
-                finalization = (generation.exploration_snapshot or {}).get('finalization', {})
-                quality_report = generation.quality_report or {}
-                # Generated drafts retain the complete, evidence-based quality
-                # report from the generator.  Only an explicit workspace edit
-                # receives the narrower contract report produced by
-                # ``manual_draft_quality_report``; that lets a user add a real
-                # assertion without silently allowing unrelated replay/action
-                # safety failures from the original generated source.
-                quality_blockers = list(quality_report.get('blockers') or [])
-                if (
-                    not (generation.script_draft or '').strip()
-                    or finalization.get('status') != 'valid'
-                    or quality_blockers
-                ):
+                quality_report = evaluate_workspace_draft(
+                    generation.script_draft, start_path=generation.start_path,
+                    snapshot=generation.exploration_snapshot,
+                )
+                if quality_report.get('status') == 'needs_review' or quality_report.get('blockers'):
+                    generation.quality_report = quality_report
+                    generation.save(update_fields=['quality_report', 'updated_at'])
                     return Response(
-                        {'success': False, 'message': '最终路径定稿无效、存在阻断项或没有脚本草稿，不能保存。'},
+                        {'success': False, 'message': '草稿未通过静态检查，不能保存为测试用例。'},
                         status=status.HTTP_409_CONFLICT,
                     )
+                generation.quality_report = quality_report
+                generation.save(update_fields=['quality_report', 'updated_at'])
                 normalized_script = normalize_for_storage(generation.script_draft)
                 assertion_state = analyze_assertion_state(normalized_script)
                 verification = workspace['verification']

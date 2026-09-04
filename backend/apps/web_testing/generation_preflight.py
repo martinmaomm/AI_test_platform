@@ -14,7 +14,6 @@ from django.conf import settings
 
 from ai_core.models import LLMConfiguration, MCPConfiguration, ModelType
 
-from .generation_contracts import ScenarioPlan
 
 _EXTRA_RISK_ACTION_RE = re.compile(
     r'(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
@@ -278,7 +277,7 @@ def _has_environment_credentials(environment) -> bool:
     return environment_credentials(environment) is not None
 
 
-def run_safety_preflight(generation, plan: ScenarioPlan, *, credentials_available: bool) -> PreflightResult:
+def run_safety_preflight(generation, brief: Any, *, credentials_available: bool) -> PreflightResult:
     """Return a stable, user-actionable decision without starting MCP."""
     environment = generation.environment
     if not environment.is_active or not environment.is_web_environment or not (environment.config or {}).get('base_url'):
@@ -297,7 +296,7 @@ def run_safety_preflight(generation, plan: ScenarioPlan, *, credentials_availabl
     if not mcp_selection:
         return PreflightResult('failed', 'MCP_CONFIG_MISSING', '没有可用的 Playwright MCP 配置。')
 
-    if plan.credentials_required and not (credentials_available or _has_environment_credentials(environment)):
+    if bool(brief.get('credentials_required')) and not (credentials_available or _has_environment_credentials(environment)):
         return PreflightResult('needs_credentials', 'CREDENTIALS_REQUIRED', '场景需要登录，请提供本次探索登录信息或配置环境变量。')
 
     if exploration_requires_write_confirmation(generation.description_safe):
@@ -307,10 +306,11 @@ def run_safety_preflight(generation, plan: ScenarioPlan, *, credentials_availabl
             '本次探索包含审批、支付、发布或文件/外部消息操作，超出普通测试数据操作范围，请调整目标后继续。',
         )
     mcp_config_id, mcp_config = mcp_selection
-    discovery_count = len(set(plan.discovery_notes))
-    if plan.allow_test_data_writes:
+    discovery_notes = brief.get('discovery_notes') or []
+    discovery_count = len(set(discovery_notes)) if isinstance(discovery_notes, list) else 0
+    if bool(brief.get('allow_test_data_writes')):
         scope_message = '本场景仅授权处理本轮命名空间内的测试数据。'
-        if plan.cleanup_expected:
+        if bool(brief.get('cleanup_expected')):
             scope_message += '结束前必须执行清理并用后续页面观察确认。'
     else:
         scope_message = '本场景不授予测试数据写入权限。'

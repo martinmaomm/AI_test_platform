@@ -45,7 +45,7 @@ const cloneVariables = (variables) => (Array.isArray(variables) ? variables : []
 }))
 
 /**
- * Durable v4 generation state. localStorage intentionally stores only the
+ * Durable v5 generation state. localStorage intentionally stores only the
  * generation UUID. Draft source and secret/runtime values stay in memory.
  */
 export function useWebUIScriptGeneration({ projectId, userId }) {
@@ -438,7 +438,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const retryGeneration = async () => {
-    if (!generation.value?.id || resolving.value) return null
+    if (!generation.value?.id || resolving.value || isActive.value || isWorkspaceBusy.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion

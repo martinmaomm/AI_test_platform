@@ -18,7 +18,12 @@ TRACE_SCHEMA_VERSION = 4
 FINALIZATION_TOOL_NAME = 'aits_finalize_path'
 _MAX_EVENTS = 120
 _MAX_EXCERPT = 1200
+_MAX_RAW_OUTPUT = 20000
 _ABSOLUTE_URL_RE = re.compile(r'https?://[^\s\'"<>]+', re.I)
+_SCREENSHOT_DATA_URI_RE = re.compile(
+    r'data:image/[^;,\s]+;base64,[a-z0-9+/=\s]+', re.I,
+)
+_LARGE_BASE64_RE = re.compile(r'(?<![a-z0-9+/=])[a-z0-9+/]{2048,}={0,2}', re.I)
 _OBSERVATION_TOOLS = frozenset({
     'playwright_get_visible_text', 'playwright_get_visible_html', 'playwright_snapshot',
 })
@@ -48,14 +53,51 @@ def _relative_path(value: Any) -> str:
     return path if path.startswith('/') else ''
 
 
-def _output_text(value: Any) -> str:
-    if hasattr(value, 'content'):
-        return _output_text(value.content)
+def _output_text(value: Any, *, _seen: set[int] | None = None) -> str:
+    """Extract MCP text payloads without treating normal page copy as an error.
+
+    MCP SDK versions return tool output as plain strings, ``ToolMessage``
+    objects, content blocks, or nested ``result``/``structuredContent``
+    dictionaries.  Prefer their human-readable payload instead of serializing
+    wrapper metadata; the fallback retains unfamiliar output for diagnostics.
+    """
+
+    if value is None:
+        return ''
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return ''
+    seen.add(identity)
     if isinstance(value, Mapping):
+        for key in (
+            'text', 'message', 'output', 'result', 'data', 'structuredContent',
+            'structured_content', 'content',
+        ):
+            if key in value and value[key] is not value:
+                text = _output_text(value[key], _seen=seen)
+                if text:
+                    return text
         return json.dumps(value, ensure_ascii=False, default=str)
     if isinstance(value, (list, tuple)):
-        return ' '.join(_output_text(item) for item in value)
-    return str(value or '')
+        return ' '.join(
+            text for item in value
+            if (text := _output_text(item, _seen=seen))
+        )
+    for attribute in (
+        'text', 'message', 'output', 'result', 'data', 'structuredContent',
+        'structured_content', 'content',
+    ):
+        if hasattr(value, attribute):
+            try:
+                text = _output_text(getattr(value, attribute), _seen=seen)
+            except Exception:
+                continue
+            if text:
+                return text
+    return str(value)
 
 
 def _replace_runtime_values(
@@ -93,7 +135,27 @@ def _safe_text(
         _output_text(value), runtime_values, credential_refs,
     )
     text = _ABSOLUTE_URL_RE.sub(lambda item: _relative_path(item.group(0)) or '<url>', text)
+    text = _SCREENSHOT_DATA_URI_RE.sub('<screenshot-data>', text)
+    text = _LARGE_BASE64_RE.sub('<base64-omitted>', text)
     return _restore_runtime_markers(re.sub(r'\s+', ' ', text).strip(), replacements)[:limit]
+
+
+def _safe_raw_text(
+    value: Any,
+    *,
+    limit: int,
+    runtime_values: Mapping[str, str],
+    credential_refs: frozenset[str],
+) -> str:
+    """Keep a bounded recoverable payload; UI summaries use ``_safe_text``."""
+
+    text, replacements = _replace_runtime_values(
+        _output_text(value), runtime_values, credential_refs,
+    )
+    text = _ABSOLUTE_URL_RE.sub(lambda item: _relative_path(item.group(0)) or '<url>', text)
+    text = _SCREENSHOT_DATA_URI_RE.sub('<screenshot-data>', text)
+    text = _LARGE_BASE64_RE.sub('<base64-omitted>', text)
+    return _restore_runtime_markers(text.replace('\x00', '')[:limit], replacements)
 
 
 def _safe_locator_value(
@@ -183,6 +245,17 @@ def _tool_failed(output: Any, *, tool_name: str = '') -> bool:
         r'error executing tool|tool[ _-]?error|'
         r'(^|[\r\n])\s*(?:error|exception)\s*:|traceback',
         text, re.I,
+    ):
+        return True
+    # An observation can legitimately include a user's "not found" copy, but
+    # the MCP server's selector failure is structurally different and must not
+    # be recorded as a successful page state.
+    if _action(tool_name) == 'observe' and re.search(
+        r'(?:element|locator)\s+(?:with\s+)?(?:selector|role|text|label|'
+        r'placeholder)?[^\r\n]{0,500}\bnot found\b|'
+        r'element with selector[^\r\n]{0,500}\bnot found\b',
+        text,
+        re.I,
     ):
         return True
     # Bare failure wording is only authoritative for an interaction. Observation
@@ -340,6 +413,9 @@ class ExplorationEvent(BaseModel):
     before_state_id: str = ''
     after_state_id: str = ''
     result_excerpt: str = Field(default='', max_length=_MAX_EXCERPT)
+    # The UI can display ``result_excerpt`` while v5 exploration retains a
+    # bounded raw observation for code repair and audit recovery.
+    raw_output: str = Field(default='', max_length=_MAX_RAW_OUTPUT)
     screenshot_path: str = Field(default='', max_length=500)
 
 
@@ -1087,6 +1163,10 @@ class ExplorationTraceRecorder:
             raw_output, limit=_MAX_EXCERPT, runtime_values=runtime_values,
             credential_refs=self._credential_refs,
         )
+        raw_observation = _safe_raw_text(
+            raw_output, limit=_MAX_RAW_OUTPUT, runtime_values=runtime_values,
+            credential_refs=self._credential_refs,
+        )
         state_id = ''
         if action == 'observe' and status == 'succeeded' and excerpt:
             fingerprint = hashlib.sha256(f'{path}|{excerpt}'.encode()).hexdigest()[:16]
@@ -1127,6 +1207,7 @@ class ExplorationTraceRecorder:
             before_state_id=active['before_state_id'],
             after_state_id=state_id or self._last_state_id,
             result_excerpt=excerpt,
+            raw_output=raw_observation,
             screenshot_path=screenshot_path,
         )
         self._events.append(event)

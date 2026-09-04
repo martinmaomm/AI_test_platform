@@ -27,6 +27,7 @@
         <p>删除 <code>AITS_PENDING_ASSERTION</code> 注释本身不会完成验证。请补入真实 <code>await expect(...)</code> 或非纯常量 <code>assert</code>，然后重新运行。</p>
       </template>
     </el-alert>
+    <el-alert v-if="hasPendingStep" type="warning" :closable="false" show-icon title="草稿仍含 AITS_PENDING_STEP；后端会将本次调试判定为未完成。" />
 
     <section class="workspace-section">
       <div class="section-heading"><div><h5>配置变量</h5><p>变量可用于脚本运行；调试覆盖值优先于草稿变量。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
@@ -92,6 +93,7 @@ const displayVerificationLabel = computed(() => verification.value.status === 'p
   : workspaceVerificationLabel(displayVerificationStatus.value))
 const canSaveDraft = computed(() => Boolean(form.script_draft.trim()) && !form.variables.some(item => !item.name.trim()))
 const canDebug = computed(() => canSaveDraft.value && !props.draftSaving)
+const hasPendingStep = computed(() => form.script_draft.includes('AITS_PENDING_STEP'))
 
 const copyVariables = (variables) => (variables || []).map(item => ({
   name: item?.name || '', value: item?.value || '', is_secret: Boolean(item?.is_secret),

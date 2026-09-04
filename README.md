@@ -1,5 +1,16 @@
 # AI_test_platform
 
+## WebUI 脚本生成（当前流程）
+
+填写测试目标后，一个智能体在同一 Playwright MCP 会话中探索页面，并逐步保存完整 Python 草稿。平台记录操作证据、未完成步骤和终止原因，不再要求模型先提交 ScenarioPlan 或最终路径 JSON。
+
+- 草稿通过静态检查后可以编辑、调试、保存到独立测试用例；草稿生成成功不等于测试通过。
+- `AITS_PENDING_STEP` / `AITS_PENDING_ASSERTION` 表示待补充操作或断言，有这些标记不能显示为调试通过。
+- 超时、失败或取消后保留最近已保存的草稿；“基于轨迹整理脚本”只处理已有证据，不重新打开浏览器、不重复业务写入。
+- 使用测试账号，请勿使用生产账号。更新本次代码需重启后端和 Celery，无新增数据库迁移。
+
+设计和验收说明见 [脚本优先生成](docs/superpowers/specs/2026-09-04-webui-script-first-generation.md)。
+
 ## 部署依赖
 
 项目的 WebUI AI 脚本生成和 Python 测试执行分别使用两套 Playwright 运行时。两套浏览器版本可以共存，但不要只安装其中一套。

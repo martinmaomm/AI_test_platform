@@ -20,11 +20,19 @@
         <div v-else class="field-help">服务器默认值暂不可用；可留空，创建时由服务器 env 决定。</div>
       </el-form-item>
       <el-form-item label="测试描述" required>
-        <div class="description-actions"><span>必须写明一个完整 http(s) URL；如需登录，请在此写入测试账号和密码。再说明目标、主要步骤、成功标准、数据范围和清理约束。</span><el-button text type="primary" :disabled="busy || paused" @click="insertExample">插入示例</el-button></div>
-        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy || paused" placeholder="例如：访问 https://example.test/login，使用测试账号登录后完成指定流程并验证最终页面状态。" />
+        <div class="description-actions"><span>按“网址、测试账号、页面路径、探索操作、脚本验证要求”填写。可先插入示例，再替换为你的测试目标。</span><el-button text type="primary" :disabled="busy || paused" @click="insertExample">插入示例</el-button></div>
+        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy || paused" placeholder="先填写完整 http(s) 网址；例如：使用 Playwright MCP 登录后进入“权限 > 菜单列表”，探索新增、编辑、删除流程，再生成逐步验证的 Python Playwright 脚本。" />
       </el-form-item>
       <el-collapse class="input-collapse">
-        <el-collapse-item title="编写提示" name="tips"><ol><li>说明测试目标和要进入的页面。</li><li>按顺序列出主要操作，并写明每一步如何判断成功。</li><li>涉及改变页面数据时，说明唯一测试数据和清理要求；未特别说明时，默认只操作本轮测试数据。</li><li>如目标要求仅只读，请在描述中明确；系统会尊重该限制，不执行写操作。审批、付款、发布、上传等额外动作目前不在授权范围，请修改测试目标。</li></ol></el-collapse-item>
+        <el-collapse-item title="编写提示" name="tips">
+          <ol>
+            <li>第一行填写目标网站的完整 http(s) 网址；需要登录时，写明测试账号和密码。示例中的网址和账号请按实际情况替换，不要使用生产账号。</li>
+            <li>说明登录后进入的页面路径，例如“权限 > 菜单列表”；可替换为其他网站的模块和页面。</li>
+            <li>列出需要 AI 探索的操作，例如新增、编辑、删除。页面元素和定位方式由 Playwright MCP 探索，无需手动提供。</li>
+            <li>涉及新增、编辑数据时，说明哪些字段需要唯一，例如菜单名；唯一数据使用 time.time_ns() 生成，默认只操作本轮测试数据。</li>
+            <li>最后写明：探索完成后生成完整的 Python Playwright 脚本。按顺序列出验证要求，例如新增后验证存在、编辑后验证更新内容、删除后查询验证不存在；具体元素和断言可由 AI 根据页面观察确定。</li>
+          </ol>
+        </el-collapse-item>
       </el-collapse>
       <el-form-item label="本次使用模型">
         <el-select v-model="form.modelConfigId" :loading="loadingModels" :disabled="busy || paused" placeholder="请选择启用的 LLM">
@@ -44,23 +52,19 @@ import { ElMessage } from 'element-plus'
 import { modelConfigurationLabel } from '@/composables/webUIScriptGenerationPresentation'
 import { EXPLORATION_TIMEOUT_MAX_SECONDS, EXPLORATION_TIMEOUT_MIN_SECONDS, explorationTimeoutPayload, isExplorationTimeoutValid } from '@/composables/webuiExplorationTimeout'
 
-const EXAMPLE_DESCRIPTION = `目标：验证“权限 > 用户列表”的新增、查询、编辑和删除流程。
+const EXAMPLE_DESCRIPTION = `http://192.168.31.188:9990/
+使用 Playwright MCP 打开目标页面并登录权限模块。
+登录账号：test，密码：123456。
+登录后进入“权限 > 菜单列表”，
+进行新增、编辑、删除菜单的探索操作。
 
-目标地址：https://example.test/admin/users
-测试账号：username=webui_demo_user，password=webui_demo_password（仅示例，非真实账号）。
+探索完成后，生成完整的 Python Playwright 脚本：
 
-步骤：
-1. 登录后进入“权限 > 用户列表”；
-2. 使用唯一名称和账号新增用户，并验证列表中出现该用户；
-3. 编辑本轮新增用户的昵称，并验证更新成功；
-4. 删除本轮新增用户，并查询验证该用户不存在。
-
-约束：
-- 唯一数据使用 time.time_ns() 生成；
-- 不操作已有业务数据；
-- 使用 try/finally 清理本轮创建的数据；
-- 清理失败或发现残留时，保留草稿并明确报告；
-- 测试环境凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。`
+1. 新增、编辑的菜单名需要确保唯一性，唯一数据使用 time.time_ns() 生成；
+2. 执行新增并验证；
+3. 执行编辑并验证更新内容；
+4. 执行删除；
+5. 查询并验证数据不存在。`
 
 const props = defineProps({ projectId: { type: [Number, String], default: null }, modules: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, explorationSettings: { type: Object, default: null }, loadingModules: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean })
 const emit = defineEmits(['submit', 'cancel'])

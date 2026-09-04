@@ -250,12 +250,28 @@ test('a terminal failure marks its current stage only and never marks all stages
 
 test('description-only input carries test credentials and target URL without legacy controls', () => {
   const inputPanel = readFileSync(new URL('../src/components/webui-generation/GenerationInputPanel.vue', import.meta.url), 'utf8')
-  assert.match(inputPanel, /凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号/)
-  assert.match(inputPanel, /https:\/\/example\.test\/admin\/users/)
+  assert.match(inputPanel, /账号密码可能出现在生成记录、日志、截图或脚本，请勿使用生产账号/)
+  assert.match(inputPanel, /http:\/\/192\.168\.31\.188:9990\//)
   assert.doesNotMatch(inputPanel, /form\.environmentId/)
   assert.doesNotMatch(inputPanel, /form\.startPath/)
   assert.doesNotMatch(inputPanel, /temporary_credentials/)
   assert.doesNotMatch(inputPanel, /<el-input v-model="form\.username"/)
+})
+
+test('inserted example follows menu exploration and numbered script verification requirements', () => {
+  const inputPanel = readFileSync(new URL('../src/components/webui-generation/GenerationInputPanel.vue', import.meta.url), 'utf8')
+  const example = inputPanel.match(/const EXAMPLE_DESCRIPTION = `([\s\S]*?)`/)?.[1]
+  assert.ok(example && example.length <= 2000)
+  assert.ok(example.startsWith('http://192.168.31.188:9990/\n'))
+  assert.ok(example.includes('登录账号：test，密码：123456。'))
+  assert.ok(example.includes('权限 > 菜单列表'))
+  assert.ok(example.includes('探索完成后，生成完整的 Python Playwright 脚本'))
+  assert.ok(example.includes('time.time_ns()'))
+  assert.deepEqual(example.match(/^\d\./gm), ['1.', '2.', '3.', '4.', '5.'])
+  assert.ok(example.includes('5. 查询并验证数据不存在'))
+  assert.match(inputPanel, /const insertExample = \(\) => \{ form\.description = EXAMPLE_DESCRIPTION \}/)
+  assert.match(inputPanel, /页面元素和定位方式由 Playwright MCP 探索，无需手动提供/)
+  assert.match(inputPanel, /可替换为其他网站的模块和页面/)
 })
 
 test('generation output displays target_url and never uses the retired safe field', () => {

@@ -375,6 +375,30 @@ class FinalizedAssertion(BaseModel):
     model_config = ConfigDict(extra='forbid')
     assertion_id: str = Field(pattern=r'^A[1-9][0-9]*$')
     event_id: str = Field(pattern=r'^E[0-9]{6}$')
+    # Concrete requirements use their plan semantics.  A deferred requirement
+    # must provide one verified, concrete meaning selected from this callback.
+    kind: str = Field(
+        default='',
+        pattern=r'^(?:|visible|contains_ref|not_contains_ref|contains_literal|not_contains_literal)$',
+    )
+    input_ref: str = Field(default='', max_length=128)
+    literal: str = Field(default='', max_length=300)
+
+
+class FinalizedPendingAssertion(BaseModel):
+    """A target deliberately left for a human instead of faking an expect."""
+
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    assertion_id: str = Field(pattern=r'^A[1-9][0-9]*$')
+    reason: str = Field(min_length=1, max_length=300)
+    after_event_id: str = Field(pattern=r'^E[0-9]{6}$')
+
+    @field_validator('reason')
+    @classmethod
+    def _safe_reason(cls, value: str) -> str:
+        from .generation_contracts import _validate_safe_value
+        _validate_safe_value(value, 'pending_assertion_reason', reject_absolute_url=True)
+        return value
 
 
 class PathFinalization(BaseModel):
@@ -385,6 +409,7 @@ class PathFinalization(BaseModel):
     entry_event_id: str = Field(default='', pattern=r'^(?:|E[0-9]{6})$')
     main_actions: list[FinalizedAction] = Field(default_factory=list, max_length=_MAX_EVENTS)
     assertions: list[FinalizedAssertion] = Field(default_factory=list, max_length=20)
+    pending_assertions: list[FinalizedPendingAssertion] = Field(default_factory=list, max_length=20)
     cleanup_actions: list[FinalizedAction] = Field(default_factory=list, max_length=_MAX_EVENTS)
     invalidation_event_id: str = Field(default='', pattern=r'^(?:|E[0-9]{6})$')
     error_code: str = Field(default='', max_length=80)
@@ -395,7 +420,7 @@ class PathFinalization(BaseModel):
         if self.status == 'valid' and (self.invalidation_event_id or self.error_code):
             raise ValueError('有效最终路径不能包含失效信息')
         if self.status == 'missing' and any((
-            self.entry_event_id, self.main_actions, self.assertions, self.cleanup_actions,
+            self.entry_event_id, self.main_actions, self.assertions, self.pending_assertions, self.cleanup_actions,
             self.invalidation_event_id, self.error_code, self.message,
         )):
             raise ValueError('缺失最终路径不能保留选择结果')
@@ -668,6 +693,7 @@ class ExplorationTraceRecorder:
         self._dynamic_input_specs: dict[str, InputSpec] = {}
         self._credential_refs: frozenset[str] = frozenset()
         self._assertion_requirements: dict[str, AssertionRequirement] = {}
+        self._original_user_target = ''
         self._cleanup_expected = False
         self._finalization = PathFinalization()
         self._candidate_summary_sequence: int | None = None
@@ -686,6 +712,7 @@ class ExplorationTraceRecorder:
         self._assertion_requirements = {
             item.assertion_id: item for item in plan.assertion_requirements
         }
+        self._original_user_target = plan.original_user_target
         self._plan_input_sources = plan.input_sources()
         self._plan_input_value_kinds = {
             item.name: item.value_kind for item in plan.input_refs
@@ -804,12 +831,75 @@ class ExplorationTraceRecorder:
             contains = expected in text
         return contains if requirement.kind.startswith('contains_') else not contains
 
+    def _resolved_assertion(
+        self,
+        requirement: AssertionRequirement,
+        selection: FinalizedAssertion,
+        event: ExplorationEvent,
+    ) -> tuple[str, str, str]:
+        """Return callback-backed concrete semantics without weakening fixed goals."""
+        if requirement.kind != 'deferred':
+            if any((
+                selection.kind and selection.kind != requirement.kind,
+                selection.input_ref and selection.input_ref != requirement.input_ref,
+                selection.literal and selection.literal != requirement.literal,
+            )) or not self._assertion_matches(requirement, event):
+                raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+            return requirement.kind, requirement.input_ref, requirement.literal
+
+        kind, input_ref, literal = selection.kind, selection.input_ref, selection.literal
+        if kind not in {
+            'visible', 'contains_ref', 'not_contains_ref',
+            'contains_literal', 'not_contains_literal',
+        }:
+            raise GenerationContractError('FINALIZATION_DEFERRED_ASSERTION_KIND_INVALID')
+        if event.status != 'succeeded' or event.action != 'observe' or _evidence_locator(event) is None:
+            raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+        text = event.result_excerpt
+        if not text:
+            raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+        if kind == 'visible' and (input_ref or literal):
+            raise GenerationContractError('FINALIZATION_DEFERRED_ASSERTION_SHAPE_INVALID')
+        if kind in {'contains_ref', 'not_contains_ref'}:
+            if not input_ref or literal or input_ref not in self._plan_input_sources:
+                raise GenerationContractError('FINALIZATION_DEFERRED_ASSERTION_SHAPE_INVALID')
+            expected = self._runtime_values.get(input_ref, '')
+            expected = expected if input_ref in self._credential_refs else f'{{{{{input_ref}}}}}'
+            contains = bool(expected and expected in text)
+            if (kind == 'contains_ref' and not contains) or (kind == 'not_contains_ref' and contains):
+                raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+        if kind in {'contains_literal', 'not_contains_literal'}:
+            if input_ref or not literal:
+                raise GenerationContractError('FINALIZATION_DEFERRED_ASSERTION_SHAPE_INVALID')
+            # A negative literal cannot be proven from its absence unless it
+            # was user-owned or was observed before the asserted transition.
+            # This prevents an agent from inventing a harmless string just to
+            # obtain an always-passing negative expectation.
+            observed_before = any(
+                item.sequence < event.sequence
+                and item.status == 'succeeded'
+                and item.action == 'observe'
+                and literal in item.result_excerpt
+                for item in self._events
+            )
+            if (
+                kind == 'not_contains_literal'
+                and literal not in self._original_user_target
+                and not observed_before
+            ):
+                raise GenerationContractError('FINALIZATION_DEFERRED_ASSERTION_LITERAL_UNPROVEN')
+            contains = literal in text
+            if (kind == 'contains_literal' and not contains) or (kind == 'not_contains_literal' and contains):
+                raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+        return kind, input_ref, literal
+
     def finalize_path(
         self,
         *,
         main_actions: list[FinalizedAction],
         assertions: list[FinalizedAssertion],
         cleanup_actions: list[FinalizedAction],
+        pending_assertions: list[FinalizedPendingAssertion] | None = None,
     ) -> dict[str, str]:
         """Validate a one-shot selection against callback-owned facts only."""
         try:
@@ -821,6 +911,7 @@ class ExplorationTraceRecorder:
             entry = next((item for item in self._events if item.action == 'navigate' and item.status == 'succeeded'), None)
             if entry is None:
                 raise GenerationContractError('FINALIZATION_ENTRY_NAVIGATE_MISSING')
+            pending_assertions = list(pending_assertions or [])
             selected = [*(item.event_id for item in main_actions), *(item.event_id for item in cleanup_actions)]
             if len(selected) != len(set(selected)):
                 raise GenerationContractError('FINALIZATION_DUPLICATE_EVENT')
@@ -828,6 +919,8 @@ class ExplorationTraceRecorder:
                 raise GenerationContractError('FINALIZATION_ENTRY_NAVIGATE_AUTOMATIC')
             main_events = [self._require_action(item.event_id, cleanup=False) for item in main_actions]
             cleanup_events = [self._require_action(item.event_id, cleanup=True) for item in cleanup_actions]
+            if not main_events and not assertions:
+                raise GenerationContractError('FINALIZATION_MAIN_ACTION_MISSING')
             if any(item.sequence <= entry.sequence for item in main_events):
                 raise GenerationContractError('FINALIZATION_MAIN_BEFORE_ENTRY')
             if [item.sequence for item in main_events] != sorted(item.sequence for item in main_events):
@@ -850,7 +943,11 @@ class ExplorationTraceRecorder:
                 raise GenerationContractError('FINALIZATION_NON_RUNTIME_INPUT_MISSING')
             required_ids = set(self._assertion_requirements)
             submitted_ids = [item.assertion_id for item in assertions]
-            if set(submitted_ids) != required_ids or len(submitted_ids) != len(set(submitted_ids)):
+            pending_ids = [item.assertion_id for item in pending_assertions]
+            if (
+                set([*submitted_ids, *pending_ids]) != required_ids
+                or len([*submitted_ids, *pending_ids]) != len(set([*submitted_ids, *pending_ids]))
+            ):
                 raise GenerationContractError('FINALIZATION_ASSERTION_COVERAGE_INVALID')
             assertion_evidence: list[AssertionEvidence] = []
             for selection in assertions:
@@ -858,17 +955,16 @@ class ExplorationTraceRecorder:
                 event = next((item for item in self._events if item.event_id == selection.event_id), None)
                 if event is None:
                     raise GenerationContractError('FINALIZATION_UNKNOWN_EVENT')
-                if not self._assertion_matches(requirement, event):
-                    raise GenerationContractError('FINALIZATION_ASSERTION_EVIDENCE_INVALID')
+                kind, input_ref, literal = self._resolved_assertion(requirement, selection, event)
                 if requirement.phase == 'main' and event.sequence <= entry.sequence:
                     raise GenerationContractError('FINALIZATION_ASSERTION_ORDER_INVALID')
                 if requirement.phase == 'cleanup':
                     if not cleanup_events or event.sequence <= cleanup_events[-1].sequence:
                         raise GenerationContractError('FINALIZATION_CLEANUP_VERIFICATION_INVALID')
-                if requirement.input_ref and not any(
+                if input_ref and not any(
                     action.sequence < event.sequence
                     and action.action in {'fill', 'select'}
-                    and action.input_refs == [requirement.input_ref]
+                    and action.input_refs == [input_ref]
                     for action in selected_actions
                 ):
                     raise GenerationContractError('FINALIZATION_ASSERTION_INPUT_DEPENDENCY_MISSING')
@@ -876,9 +972,15 @@ class ExplorationTraceRecorder:
                     assertion_id=requirement.assertion_id,
                     criterion_index=requirement.criterion_index,
                     phase=requirement.phase, event_id=event.event_id,
-                    kind=requirement.kind, input_ref=requirement.input_ref,
-                    literal=requirement.literal,
+                    kind=kind, input_ref=input_ref, literal=literal,
                 ))
+            main_action_ids = {item.event_id for item in main_actions}
+            cleanup_action_ids = {item.event_id for item in cleanup_actions}
+            for pending in pending_assertions:
+                requirement = self._assertion_requirements[pending.assertion_id]
+                anchors = cleanup_action_ids if requirement.phase == 'cleanup' else main_action_ids
+                if pending.after_event_id not in anchors:
+                    raise GenerationContractError('FINALIZATION_PENDING_ASSERTION_ANCHOR_INVALID')
             if [next(event.sequence for event in self._events if event.event_id == item.event_id) for item in assertion_evidence] != sorted(
                 next(event.sequence for event in self._events if event.event_id == item.event_id) for item in assertion_evidence
             ):
@@ -894,7 +996,8 @@ class ExplorationTraceRecorder:
                 raise GenerationContractError('FINALIZATION_CLEANUP_MISSING')
             self._finalization = PathFinalization(
                 status='valid', entry_event_id=entry.event_id, main_actions=main_actions,
-                assertions=assertions, cleanup_actions=cleanup_actions,
+                assertions=assertions, pending_assertions=pending_assertions,
+                cleanup_actions=cleanup_actions,
             )
             return {'status': 'accepted', 'entry_event_id': entry.event_id}
         except GenerationContractError as exc:
@@ -907,10 +1010,12 @@ class ExplorationTraceRecorder:
         evidence: list[AssertionEvidence] = []
         for selection in self._finalization.assertions:
             requirement = self._assertion_requirements[selection.assertion_id]
+            event = next(item for item in self._events if item.event_id == selection.event_id)
+            kind, input_ref, literal = self._resolved_assertion(requirement, selection, event)
             evidence.append(AssertionEvidence(
                 assertion_id=requirement.assertion_id, criterion_index=requirement.criterion_index,
-                phase=requirement.phase, event_id=selection.event_id, kind=requirement.kind,
-                input_ref=requirement.input_ref, literal=requirement.literal,
+                phase=requirement.phase, event_id=selection.event_id,
+                kind=kind, input_ref=input_ref, literal=literal,
             ))
         return sorted(evidence, key=lambda item: next(
             event.sequence for event in self._events if event.event_id == item.event_id
@@ -1183,7 +1288,13 @@ def required_replay_evidence_gaps(
                 'reason': f'{item.assertion_id} 缺少稳定的 callback 断言定位证据',
             })
     if plan is not None:
-        covered = {item.assertion_id for item in trace.assertion_evidence}
+        requirements = {
+            item.assertion_id: item for item in plan.assertion_requirements
+        }
+        covered = {
+            *(item.assertion_id for item in trace.assertion_evidence),
+            *(item.assertion_id for item in trace.finalization.pending_assertions),
+        }
         for requirement in plan.assertion_requirements:
             if requirement.assertion_id not in covered:
                 gaps.append({
@@ -1195,7 +1306,15 @@ def required_replay_evidence_gaps(
                 'event_id': 'cleanup',
                 'reason': '计划要求清理，但没有成功 cleanup callback 证据',
             })
-        elif plan.cleanup_expected and not trace.cleanup_verification_event_ids:
+        elif (
+            plan.cleanup_expected
+            and not trace.cleanup_verification_event_ids
+            and not any(
+                requirements.get(item.assertion_id)
+                and requirements[item.assertion_id].phase == 'cleanup'
+                for item in trace.finalization.pending_assertions
+            )
+        ):
             gaps.append({
                 'event_id': 'cleanup-verification',
                 'reason': '清理动作已尝试，但没有后续语义观察 callback 确认清理结果',

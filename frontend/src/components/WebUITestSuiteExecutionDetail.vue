@@ -71,6 +71,10 @@
                     <div class="stat-number">{{ execution.passed_cases || 0 }}</div>
                     <div class="stat-label">通过</div>
                   </div>
+                  <div class="stat-item">
+                    <div class="stat-number">{{ execution.incomplete_cases || 0 }}</div>
+                    <div class="stat-label">验证未完成</div>
+                  </div>
                   <div class="stat-item failed">
                     <div class="stat-number">{{ execution.failed_cases || 0 }}</div>
                     <div class="stat-label">失败</div>
@@ -298,6 +302,7 @@ const getStatusType = (status) => ({
   pending: 'info',
   running: 'warning',
   passed: 'success',
+  incomplete: 'warning',
   failed: 'danger',
   error: 'danger',
   skipped: 'info',
@@ -308,6 +313,7 @@ const getStatusText = (status) => ({
   pending: '待执行',
   running: '执行中',
   passed: '执行通过',
+  incomplete: '验证未完成',
   failed: '执行失败',
   error: '执行错误',
   skipped: '已跳过',
@@ -324,6 +330,7 @@ const executionPieChartOption = computed(() => {
   const total = props.execution.total_cases || 0
   const passed = props.execution.passed_cases || 0
   const failed = props.execution.failed_cases || 0
+  const incomplete = props.execution.incomplete_cases || 0
   const skipped = props.execution.skipped_cases || 0
 
   return {
@@ -351,6 +358,7 @@ const executionPieChartOption = computed(() => {
       labelLine: { show: false },
       data: [
         { value: passed, name: '成功', itemStyle: { color: '#67c23a' } },
+        ...(incomplete > 0 ? [{ value: incomplete, name: '验证未完成', itemStyle: { color: '#e6a23c' } }] : []),
         { value: failed, name: '失败', itemStyle: { color: '#f56c6c' } },
         ...(skipped > 0 ? [{ value: skipped, name: '跳过', itemStyle: { color: '#909399' } }] : [])
       ]

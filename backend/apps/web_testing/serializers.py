@@ -28,6 +28,7 @@ from .generation_security import (
     validate_temporary_credentials,
 )
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
+from .assertion_state import analyze_assertion_state
 from .execution_diagnostics import safe_screenshot_relative_path
 from .execution_variables import ExecutionVariableError, normalize_variable_definitions
 from .generation_workspace import workspace_for_response
@@ -367,6 +368,10 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
         queryset=WebUITestModule.objects.all(), required=False, allow_null=True, source='module'
     )
     has_script = serializers.BooleanField(read_only=True)
+    assertion_state = serializers.SerializerMethodField()
+
+    def get_assertion_state(self, obj):
+        return analyze_assertion_state(obj.test_script_content)
     
     class Meta:
         model = WebUITestCase
@@ -374,7 +379,7 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
             'id', 'title', 'description', 'created_by_username',
             'module_id', 'module_name', 'has_script', 'variables',
             'script_source', 'script_status', 'script_framework', 'script_version',
-            'script_validation_error', 'generation_metadata',
+            'script_validation_error', 'generation_metadata', 'assertion_state',
             'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
         ]
@@ -394,6 +399,10 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
         queryset=WebUITestModule.objects.all(), required=False, allow_null=True, source='module'
     )
     has_script = serializers.BooleanField(read_only=True)
+    assertion_state = serializers.SerializerMethodField()
+
+    def get_assertion_state(self, obj):
+        return analyze_assertion_state(obj.test_script_content)
 
     def validate_test_script_content(self, value):
         if value in (None, ''):
@@ -415,7 +424,7 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
             'id', 'title', 'description', 'created_by_username',
             'module_id', 'module_name', 'has_script', 'variables',
             'test_script_content', 'script_source', 'script_status', 'script_framework',
-            'script_version', 'script_validation_error', 'generation_metadata',
+            'script_version', 'script_validation_error', 'generation_metadata', 'assertion_state',
             'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
         ]
@@ -553,7 +562,7 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
         model = WebUITestSuiteExecutionDetail
         fields = [
             'id', 'execution', 'project_id', 'test_suite', 'test_suite_name',
-            'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',
+            'total_cases', 'passed_cases', 'incomplete_cases', 'failed_cases', 'skipped_cases',
             'pass_rate', 'browser', 'environment_name', 'environment_base_url',
             'start_time', 'end_time', 'duration', 'allure_report', 'allure_report_url',
             'error_message', 'log'
@@ -628,6 +637,7 @@ class WebUITestSuiteSerializer(serializers.ModelSerializer):
                 'description': item.test_case.description,
                 'order': item.order,
                 'script_status': item.test_case.script_status,
+                'assertion_state': analyze_assertion_state(item.test_case.test_script_content),
             }
             for item in memberships
         ]

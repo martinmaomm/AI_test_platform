@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .constants import WEBUI_BROWSER_ENGINE
+from .assertion_state import instrument_runtime_assertions
 from .script_extraction import extract_playwright_metadata
 
 
@@ -194,6 +195,7 @@ def store_script_content(
                 "extracted_steps",
                 "locator_candidates",
                 "assertion_candidates",
+                "assertion_state",
                 "extraction_version",
             )
         })
@@ -249,6 +251,7 @@ def materialize_script(
     base_url: Optional[str] = None,
     suite_name: Optional[str] = None,
     failure_screenshot_path: Optional[str] = None,
+    runtime_assertion_count_path: Optional[str] = None,
 ) -> str:
     """Create the pytest file content for one async business script.
 
@@ -277,6 +280,7 @@ def materialize_script(
     browser_literal = repr(WEBUI_BROWSER_ENGINE)
     base_url_literal = repr(base_url) if base_url else "None"
     screenshot_path_literal = repr(failure_screenshot_path) if failure_screenshot_path else "None"
+    runtime_count_path_literal = repr(runtime_assertion_count_path) if runtime_assertion_count_path else "None"
     suite_decorator = f"@allure.suite({suite_name!r})\n" if suite_name else ""
     allure_import = "import allure\n" if suite_name else ""
 
@@ -295,12 +299,68 @@ import asyncio
 
     run_args = [item.arg for item in _function(module, "run").args.args]
     run_call = 'await run(page, runtime_variables)' if run_args == ['page', 'variables'] else 'await run(page)'
+    # This temporary instrumentation records only assertions that returned
+    # successfully.  It neither changes the saved source nor catches a user
+    # assertion exception; explicit asserts are followed by a counter only
+    # after Python has evaluated them successfully.
+    instrumented_content = instrument_runtime_assertions(normalized.content)
+    runtime_support = f'''
+
+import inspect
+_aits_runtime_assertion_count = 0
+
+def _aits_record_assertion():
+    global _aits_runtime_assertion_count
+    _aits_runtime_assertion_count += 1
+
+def _aits_write_assertion_count():
+    if not {runtime_count_path_literal}:
+        return
+    try:
+        with open({runtime_count_path_literal}, "w", encoding="utf-8") as __aits_handle:
+            json.dump({{"runtime_assertion_count": _aits_runtime_assertion_count}}, __aits_handle)
+    except OSError:
+        pass
+
+try:
+    _aits_original_expect = expect
+except NameError:
+    _aits_original_expect = None
+
+if _aits_original_expect is not None:
+    class _AITSExpectationProxy:
+        def __init__(self, value):
+            self._aits_value = value
+
+        def __getattr__(self, name):
+            original = getattr(self._aits_value, name)
+            if not name.startswith(("to_", "not_to_")):
+                return original
+
+            def tracked(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if not inspect.isawaitable(result):
+                    return result
+
+                async def await_and_record():
+                    value = await result
+                    globals()["_aits_record_assertion"]()
+                    return value
+
+                return await_and_record()
+
+            return tracked
+
+    def expect(*args, **kwargs):
+        return _AITSExpectationProxy(_aits_original_expect(*args, **kwargs))
+'''
     wrapper = f'''
 
 import asyncio
 import json
 import logging
 import os
+import sys
 from playwright.async_api import async_playwright
 {allure_import}
 async def _run_with_managed_browser():
@@ -331,10 +391,35 @@ async def _run_with_managed_browser():
                     )
             raise
         finally:
-            await context.close()
-            await browser.close()
+            _aits_active_exception = sys.exc_info()[0] is not None
+            _aits_close_error = None
+            try:
+                await context.close()
+            except Exception as close_error:
+                _aits_close_error = close_error
+                if _aits_active_exception:
+                    logging.getLogger(__name__).warning(
+                        "上下文关闭失败（保留原始执行异常）: %s", close_error
+                    )
+            try:
+                await browser.close()
+            except Exception as close_error:
+                if _aits_active_exception:
+                    logging.getLogger(__name__).warning(
+                        "浏览器关闭失败（保留原始执行异常）: %s", close_error
+                    )
+                elif _aits_close_error is None:
+                    _aits_close_error = close_error
+                else:
+                    logging.getLogger(__name__).warning(
+                        "浏览器关闭失败（保留先前关闭异常）: %s", close_error
+                    )
+            finally:
+                _aits_write_assertion_count()
+            if _aits_close_error is not None and not _aits_active_exception:
+                raise _aits_close_error
 
 {suite_decorator}def {safe_name}():
     asyncio.run(_run_with_managed_browser())
 '''
-    return textwrap.dedent(normalized.content + wrapper).strip() + "\n"
+    return textwrap.dedent(instrumented_content + runtime_support + wrapper).strip() + "\n"

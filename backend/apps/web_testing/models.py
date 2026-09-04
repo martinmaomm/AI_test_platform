@@ -332,6 +332,7 @@ class WebUITestExecution(models.Model):
         ('pending', '待执行'),
         ('running', '执行中'),
         ('passed', '执行通过'),
+        ('incomplete', '验证未完成'),
         ('failed', '执行失败'),
         ('error', '执行错误'),
         ('stopped', '已停止'),
@@ -439,6 +440,7 @@ class WebUITestCaseExecutionDetail(models.Model):
         ('pending', '待执行'),
         ('running', '执行中'),
         ('passed', '执行通过'),
+        ('incomplete', '验证未完成'),
         ('failed', '执行失败'),
         ('error', '执行错误'),
         ('skipped', '已跳过'),
@@ -500,6 +502,7 @@ class WebUITestSuiteExecutionDetail(models.Model):
     total_cases = models.PositiveIntegerField(default=0, verbose_name="总用例数")
     passed_cases = models.PositiveIntegerField(default=0, verbose_name="通过用例数")
     failed_cases = models.PositiveIntegerField(default=0, verbose_name="失败用例数")
+    incomplete_cases = models.PositiveIntegerField(default=0, verbose_name="验证未完成用例数")
     skipped_cases = models.PositiveIntegerField(default=0, verbose_name="跳过用例数")
     
     # 时间信息
@@ -536,6 +539,7 @@ class WebUITestSuiteCaseExecution(models.Model):
         ('pending', '待执行'),
         ('running', '执行中'),
         ('passed', '执行通过'),
+        ('incomplete', '验证未完成'),
         ('failed', '执行失败'),
         ('error', '执行错误'),
         ('skipped', '已跳过'),

@@ -14,6 +14,7 @@ from .execution_variables import ExecutionVariableError, validate_variable_name
 SCENARIO_PLAN_SCHEMA_VERSION = 4
 _SAFE_DIAGNOSTIC_PATH_SEGMENTS = frozenset({
     'schema_version', 'title', 'objective', 'instructions', 'success_criteria',
+    'original_user_target',
     'assertion_requirements', 'assertion_id', 'criterion_index', 'phase', 'kind',
     'input_ref', 'literal', 'input_refs', 'name', 'source', 'value_kind', 'credential_slot',
     'preconditions', 'forbidden_actions', 'credentials_required',
@@ -25,6 +26,7 @@ _SAFE_CUSTOM_ERROR_TYPES = (
     ('ref 断言必须且只能声明 input_ref', 'assertion_ref_shape'),
     ('literal 断言必须且只能声明 literal', 'assertion_literal_shape'),
     ('visible 断言不能声明 ref 或 literal', 'assertion_visible_shape'),
+    ('deferred 断言不能声明 ref 或 literal', 'assertion_deferred_shape'),
     ('input ref 不可重复', 'duplicate_input_ref'),
     ('assertion_id 不可重复', 'duplicate_assertion_id'),
     ('每条 success criterion 只能声明一个机器断言', 'duplicate_criterion_assertion'),
@@ -146,13 +148,13 @@ class InputSpec(_StrictContract):
 
 
 class AssertionRequirement(_StrictContract):
-    """Machine-compilable meaning for one user success criterion."""
+    """A fixed or exploration-deferred meaning for one user success criterion."""
 
     assertion_id: str = Field(pattern=r'^A[1-9][0-9]*$')
     criterion_index: int = Field(ge=0, le=19)
     phase: str = Field(default='main', pattern=r'^(?:main|cleanup)$')
     kind: str = Field(
-        pattern=r'^(?:visible|contains_ref|not_contains_ref|contains_literal|not_contains_literal)$'
+        pattern=r'^(?:visible|contains_ref|not_contains_ref|contains_literal|not_contains_literal|deferred)$'
     )
     input_ref: str = Field(default='', max_length=128)
     literal: str = Field(default='', max_length=300)
@@ -165,8 +167,8 @@ class AssertionRequirement(_StrictContract):
             raise ValueError('ref 断言必须且只能声明 input_ref')
         if uses_literal != bool(self.literal):
             raise ValueError('literal 断言必须且只能声明 literal')
-        if self.kind == 'visible' and (self.input_ref or self.literal):
-            raise ValueError('visible 断言不能声明 ref 或 literal')
+        if self.kind in {'visible', 'deferred'} and (self.input_ref or self.literal):
+            raise ValueError(f'{self.kind} 断言不能声明 ref 或 literal')
         return self
 
 
@@ -175,6 +177,10 @@ class ScenarioPlan(_StrictContract):
     schema_version: int = Field(default=SCENARIO_PLAN_SCHEMA_VERSION, frozen=True)
     title: str = Field(min_length=2, max_length=200)
     objective: str = Field(min_length=2, max_length=1000)
+    # Set by normalisation from the submitted description, never from a model
+    # summary.  Exploration uses it to distinguish a user's fixed semantics
+    # from convenient but unsupported criterion wording.
+    original_user_target: str = ''
     instructions: list[str] = Field(min_length=1, max_length=40)
     success_criteria: list[str] = Field(min_length=1, max_length=20)
     assertion_requirements: list[AssertionRequirement] = Field(min_length=1, max_length=20)
@@ -330,6 +336,8 @@ def _normalize_assertion_requirement_shapes(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
     requirements = payload.get('assertion_requirements')
+    if requirements is None:
+        requirements = []
     if not isinstance(requirements, list):
         return payload
     normalized = dict(payload)
@@ -345,6 +353,9 @@ def _normalize_assertion_requirement_shapes(payload: Any) -> Any:
         if kind == 'visible':
             item['input_ref'] = ''
             item['literal'] = ''
+        elif kind == 'deferred':
+            item['input_ref'] = ''
+            item['literal'] = ''
         elif kind in {'contains_ref', 'not_contains_ref'}:
             item['literal'] = ''
             if not input_ref and literal:
@@ -356,6 +367,30 @@ def _normalize_assertion_requirement_shapes(payload: Any) -> Any:
                 item['kind'] = kind.replace('_literal', '_ref')
                 item['input_ref'] = input_ref
         items.append(item)
+    criteria = normalized.get('success_criteria')
+    if isinstance(criteria, list):
+        declared_indexes = {
+            item.get('criterion_index') for item in items
+            if isinstance(item, dict) and isinstance(item.get('criterion_index'), int)
+        }
+        used_numbers = {
+            int(match.group(1))
+            for item in items if isinstance(item, dict)
+            for match in [re.fullmatch(r'A([1-9][0-9]*)', str(item.get('assertion_id') or ''))]
+            if match
+        }
+        next_number = 1
+        for index in range(len(criteria)):
+            if index in declared_indexes:
+                continue
+            while next_number in used_numbers:
+                next_number += 1
+            items.append({
+                'assertion_id': f'A{next_number}', 'criterion_index': index,
+                'phase': 'main', 'kind': 'deferred', 'input_ref': '', 'literal': '',
+            })
+            used_numbers.add(next_number)
+            next_number += 1
     normalized['assertion_requirements'] = items
     return normalized
 

@@ -11,6 +11,8 @@ from typing import Any
 from django.db import transaction
 
 from .execution_variables import normalize_variable_definitions, validate_variable_name
+from .assertion_state import analyze_assertion_state
+from .script_contract import ScriptContractError, normalize_for_storage
 from .models import WebUIScriptGeneration
 
 
@@ -55,10 +57,57 @@ def _verification(*, status: str = 'unverified', script: str = '', **values: Any
         'message': '',
         'error_message': '',
         'runtime_variables_present': False,
+        'runtime_assertion_count': 0,
         'diagnostics': [],
+        'assertion_state': analyze_assertion_state(script),
     }
     result.update(values)
     return result
+
+
+def manual_draft_quality_report(script: str) -> dict[str, Any]:
+    """Re-check an edited draft without treating generated replay AST as immutable.
+
+    This is intentionally narrower than the generator's evidence-quality report:
+    once a user edits a draft, AST equality with the original replay plan is no
+    longer meaningful.  The executable contract and variable definitions still
+    gate saving/debugging, while evidence-quality blockers on an unedited
+    generated draft continue to be enforced by the save view.
+    """
+    assertion_state = analyze_assertion_state(script)
+    report: dict[str, Any] = {
+        'status': 'ready',
+        'source': 'manual_draft',
+        'blockers': [],
+        'warnings': [],
+        'assertion_state': assertion_state,
+    }
+    try:
+        normalize_for_storage(script)
+    except ScriptContractError as exc:
+        report['status'] = 'needs_review'
+        report['blockers'].append({
+            'level': 'blocker',
+            'code': 'MANUAL_SCRIPT_CONTRACT_INVALID',
+            'message': str(exc),
+        })
+    if assertion_state['pending_count']:
+        if not report['blockers']:
+            report['status'] = 'ready_with_warnings'
+        report['warnings'].append({
+            'level': 'warning',
+            'code': 'PENDING_ASSERTIONS',
+            'message': f"仍有 {assertion_state['pending_count']} 项断言待补充。",
+        })
+    elif assertion_state['confirmed_count'] == 0:
+        if not report['blockers']:
+            report['status'] = 'ready_with_warnings'
+        report['warnings'].append({
+            'level': 'warning',
+            'code': 'NO_REAL_ASSERTION',
+            'message': '当前脚本尚无真实断言，运行完成后仍只能显示为验证未完成。',
+        })
+    return report
 
 
 def _repair(**values: Any) -> dict[str, Any]:
@@ -155,6 +204,15 @@ def workspace_for_response(generation: WebUIScriptGeneration) -> dict[str, Any]:
     """Expose a passed badge only while its script and environment still match."""
     workspace = workspace_for_generation(generation)
     verification = workspace['verification']
+    assertion_state = analyze_assertion_state(generation.script_draft)
+    verification['assertion_state'] = assertion_state
+    if verification.get('status') == 'passed' and (
+        assertion_state['status'] != 'complete'
+        or int(verification.get('runtime_assertion_count') or 0) == 0
+    ):
+        verification['status'] = 'incomplete'
+        verification['message'] = '当前脚本仍有待补充项，或缺少有效断言及实际执行记录，不能显示为已通过。'
+        verification['error_message'] = verification['message']
     if verification.get('status') == 'passed' and (
         verification.get('locked_revision') != workspace['revision']
         or verification.get('script_hash') != script_hash(generation.script_draft)
@@ -261,7 +319,7 @@ def update_draft(generation_id: Any, *, expected_revision: int, script_draft: st
         workspace['verification'] = _verification(script=script_draft)
         workspace['repair'] = _repair(count=int(workspace['repair'].get('count') or 0))
         generation.workspace = workspace
-        generation.quality_report = {'status': 'stale', 'message': '草稿已修改，原检查结果已失效。'}
+        generation.quality_report = manual_draft_quality_report(script_draft)
         generation.save(update_fields=['script_draft', 'workspace', 'quality_report', 'updated_at'])
     return generation
 
@@ -318,7 +376,7 @@ def mark_debug_running(generation_id: Any, *, execution_id: int, locked_revision
         return generation
 
 
-def finish_debug(generation_id: Any, *, execution_id: int, locked_revision: int, locked_hash: str, status: str, diagnostics: list[dict[str, Any]], task_id: str | None = None):
+def finish_debug(generation_id: Any, *, execution_id: int, locked_revision: int, locked_hash: str, status: str, diagnostics: list[dict[str, Any]], runtime_assertion_count: int = 0, task_id: str | None = None):
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         workspace = workspace_for_generation(generation)
@@ -329,9 +387,30 @@ def finish_debug(generation_id: Any, *, execution_id: int, locked_revision: int,
             or not _task_matches(verification, task_id)
         ):
             return False
+        current_state = analyze_assertion_state(generation.script_draft)
+        try:
+            verified_runtime_count = max(0, int(runtime_assertion_count or 0))
+        except (TypeError, ValueError):
+            verified_runtime_count = 0
+        if status == 'passed' and (
+            current_state['status'] != 'complete' or verified_runtime_count == 0
+        ):
+            status = 'incomplete'
         verification['status'] = status
+        verification['runtime_assertion_count'] = verified_runtime_count
+        verification['assertion_state'] = current_state
         verification['diagnostics'] = diagnostics
         message = '' if status == 'passed' else str((diagnostics or [{}])[0].get('message') or '')
+        if status == 'incomplete' and not message:
+            if current_state['pending_count']:
+                message = (
+                    f"操作已完成，但仍有 {current_state['pending_count']} 项断言待补充；"
+                    '删除对应 marker 并补入真实断言后重跑。'
+                )
+            elif verified_runtime_count == 0:
+                message = '操作已完成，但本次未成功执行任何真实断言，验证未完成。'
+            else:
+                message = '操作已完成，但当前脚本验证条件未完成。'
         verification['message'] = message
         verification['error_message'] = message
         _set_workspace(generation, workspace)

@@ -46,6 +46,18 @@ class ReplayAssertion(BaseModel):
     criterion: str = Field(default='', max_length=500)
 
 
+class ReplayPendingAssertion(BaseModel):
+    """A deliberately incomplete target anchored to a real replay action."""
+
+    model_config = ConfigDict(extra='forbid')
+    assertion_id: str = Field(pattern=r'^A[1-9][0-9]*$')
+    criterion_index: int = Field(ge=0, le=19)
+    phase: str = Field(pattern=r'^(?:main|cleanup)$')
+    after_event_id: str = Field(pattern=r'^E[0-9]{6}$')
+    criterion: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=300)
+
+
 ReplayStep = Annotated[
     ReplayAction | ReplayAssertion,
     Field(discriminator='step_type'),
@@ -59,6 +71,7 @@ class ReplayPlan(BaseModel):
     cleanup_actions: list[ReplayAction] = Field(default_factory=list)
     assertions: list[ReplayAssertion] = Field(default_factory=list)
     cleanup_assertions: list[ReplayAssertion] = Field(default_factory=list)
+    pending_assertions: list[ReplayPendingAssertion] = Field(default_factory=list)
     main_steps: list[ReplayStep] = Field(default_factory=list)
     cleanup_steps: list[ReplayStep] = Field(default_factory=list)
     assertion_event_ids: list[str] = Field(default_factory=list)
@@ -77,6 +90,15 @@ class ReplayPlan(BaseModel):
         )
         if self.main_steps != expected_main or self.cleanup_steps != expected_cleanup:
             raise ValueError('ReplayPlan steps 必须精确保持 callback sequence 顺序')
+        action_ids = {item.event_id for item in self.actions}
+        cleanup_action_ids = {item.event_id for item in self.cleanup_actions}
+        pending_ids = [item.assertion_id for item in self.pending_assertions]
+        if len(pending_ids) != len(set(pending_ids)):
+            raise ValueError('待补充 assertion_id 必须唯一')
+        for pending in self.pending_assertions:
+            anchors = cleanup_action_ids if pending.phase == 'cleanup' else action_ids
+            if pending.after_event_id not in anchors:
+                raise ValueError('待补充断言必须锚定对应成功业务步骤')
         seen_cleanup_action = False
         for step in self.cleanup_steps:
             if isinstance(step, ReplayAction):
@@ -164,6 +186,9 @@ class ReplayPlanner:
         if requirement is None or any((
             assertion.criterion_index != requirement.criterion_index,
             assertion.phase != requirement.phase,
+        )):
+            raise GenerationContractError('assertion_evidence_plan_mismatch')
+        if requirement.kind != 'deferred' and any((
             assertion.kind != requirement.kind,
             assertion.input_ref != requirement.input_ref,
             assertion.literal != requirement.literal,
@@ -215,7 +240,24 @@ class ReplayPlanner:
         ]
         assertions = [item for item in compiled_assertions if item.phase == 'main']
         cleanup_assertions = [item for item in compiled_assertions if item.phase == 'cleanup']
-        covered = {item.assertion_id for item in compiled_assertions}
+        requirements = {item.assertion_id: item for item in plan.assertion_requirements}
+        pending_assertions = []
+        for pending in trace.finalization.pending_assertions:
+            requirement = requirements.get(pending.assertion_id)
+            if requirement is None:
+                raise GenerationContractError('pending_assertion_requirement_missing')
+            pending_assertions.append(ReplayPendingAssertion(
+                assertion_id=pending.assertion_id,
+                criterion_index=requirement.criterion_index,
+                phase=requirement.phase,
+                after_event_id=pending.after_event_id,
+                criterion=plan.success_criteria[requirement.criterion_index],
+                reason=pending.reason,
+            ))
+        covered = {
+            *(item.assertion_id for item in compiled_assertions),
+            *(item.assertion_id for item in pending_assertions),
+        }
         for requirement in plan.assertion_requirements:
             if requirement.assertion_id not in covered:
                 warnings.append(
@@ -236,6 +278,7 @@ class ReplayPlanner:
             cleanup_actions=cleanup_actions,
             assertions=assertions,
             cleanup_assertions=cleanup_assertions,
+            pending_assertions=pending_assertions,
             main_steps=main_steps,
             cleanup_steps=cleanup_steps,
             assertion_event_ids=[item.event_id for item in compiled_assertions],
@@ -267,6 +310,10 @@ class PythonReplayCompiler:
                 ensure_ascii=False,
             ),
             '',
+            *(
+                ['# AITS_PENDING_ASSERTIONS: 请手工补充真实 expect 后删除对应标记。', '']
+                if replay_plan.pending_assertions else []
+            ),
             'import hashlib',
             'import re',
             'import secrets',
@@ -339,12 +386,18 @@ class PythonReplayCompiler:
             body_indent = '        '
         action_number = 0
         assertion_number = 0
+        pending_by_event = {}
+        for pending in replay_plan.pending_assertions:
+            pending_by_event.setdefault(pending.after_event_id, []).append(pending)
         for step in replay_plan.main_steps:
             if isinstance(step, ReplayAction):
                 action_number += 1
                 lines.extend(PythonReplayCompiler._action_lines(
                     step, evidence[step.evidence_id], action_number,
                     replay_plan.input_sources, replay_plan.input_value_kinds, body_indent, label='步骤',
+                ))
+                lines.extend(PythonReplayCompiler._pending_assertion_lines(
+                    pending_by_event.get(step.event_id, ()), body_indent,
                 ))
             else:
                 assertion_number += 1
@@ -364,6 +417,9 @@ class PythonReplayCompiler:
                     lines.extend(PythonReplayCompiler._action_lines(
                         step, evidence[step.evidence_id], cleanup_action_number,
                         replay_plan.input_sources, replay_plan.input_value_kinds, '        ', label='清理',
+                    ))
+                    lines.extend(PythonReplayCompiler._pending_assertion_lines(
+                        pending_by_event.get(step.event_id, ()), '        ',
                     ))
                 else:
                     cleanup_assertion_number += 1
@@ -473,4 +529,19 @@ class PythonReplayCompiler:
             else 'not_to_contain_text'
         )
         lines.append(f'{indent}await expect({locator}).{method}({expected})')
+        return lines
+
+    @staticmethod
+    def _pending_assertion_lines(
+        pending_assertions: list[ReplayPendingAssertion] | tuple[ReplayPendingAssertion, ...],
+        indent: str,
+    ) -> list[str]:
+        lines = []
+        for item in pending_assertions:
+            marker = json.dumps({
+                "assertion_id": item.assertion_id,
+                "criterion": item.criterion,
+                "reason": item.reason,
+            }, ensure_ascii=False, separators=(",", ":"))
+            lines.append(f'{indent}# AITS_PENDING_ASSERTION: {marker}')
         return lines

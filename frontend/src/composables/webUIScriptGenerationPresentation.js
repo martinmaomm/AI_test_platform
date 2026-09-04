@@ -65,11 +65,21 @@ export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has
 const WORKSPACE_ACTIVITY_STATUSES = new Set(['pending', 'running'])
 export const workspaceVerificationLabel = (status) => ({
   unverified: '尚未实际调试', pending: '等待调试', running: '正在真实调试',
-  passed: '本版调试通过', failed: '本版调试失败', error: '调试异常'
+  passed: '本版调试通过', incomplete: '验证未完成', failed: '本版调试失败', error: '调试异常'
 })[status] || '调试状态未知'
 export const workspaceVerificationTagType = (status) => ({
-  unverified: 'info', pending: 'warning', running: 'warning', passed: 'success', failed: 'danger', error: 'danger'
+  unverified: 'info', pending: 'warning', running: 'warning', passed: 'success', incomplete: 'warning', failed: 'danger', error: 'danger'
 })[status] || 'info'
+export const assertionStateTagType = (state) => {
+  if (!state) return 'info'
+  return state.status === 'complete' ? 'success' : 'warning'
+}
+export const assertionStateLabel = (state) => {
+  if (!state) return '未检查'
+  if (state.status === 'complete') return '断言已补齐'
+  if (Number(state.pending_count || 0) > 0) return `${state.pending_count} 项待补充`
+  return '缺少有效断言'
+}
 export const isWorkspaceActive = (workspace) => (
   WORKSPACE_ACTIVITY_STATUSES.has(workspace?.verification?.status) ||
   WORKSPACE_ACTIVITY_STATUSES.has(workspace?.repair?.status)
@@ -77,7 +87,7 @@ export const isWorkspaceActive = (workspace) => (
 export const isCurrentRevisionVerified = (workspace, revision, environmentId = undefined) => {
   const verification = workspace?.verification || {}
   const verifiedRevision = verification.locked_revision ?? verification.revision ?? verification.verified_revision
-  return verification.status === 'passed' && Number(verifiedRevision) === Number(revision) && (
+  return verification.status === 'passed' && Number(verification.runtime_assertion_count || 0) > 0 && Number(verifiedRevision) === Number(revision) && (
     environmentId === undefined || Number(verification.environment_id) === Number(environmentId)
   )
 }

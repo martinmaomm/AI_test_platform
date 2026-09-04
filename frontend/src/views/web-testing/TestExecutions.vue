@@ -38,6 +38,18 @@
         </div>
       </div>
 
+      <div class="stat-card incomplete">
+        <div class="stat-icon">
+          <el-icon>
+            <Document />
+          </el-icon>
+        </div>
+        <div class="stat-info">
+          <div class="stat-number">{{ stats.incompleteRuns }}</div>
+          <div class="stat-label">验证未完成</div>
+        </div>
+      </div>
+
       <div class="stat-card rate">
         <div class="stat-icon">
           <el-icon>
@@ -92,6 +104,7 @@
               <el-option label="待执行" value="pending" />
               <el-option label="执行中" value="running" />
               <el-option label="执行通过" value="passed" />
+              <el-option label="验证未完成" value="incomplete" />
               <el-option label="执行失败" value="failed" />
               <el-option label="执行错误" value="error" />
               <el-option label="已停止" value="stopped" />
@@ -278,6 +291,7 @@ const resetDetailDialogSize = () => {
 const stats = reactive({
   totalRuns: 0,
   passedRuns: 0,
+  incompleteRuns: 0,
   failedRuns: 0,
   successRate: 0
 })
@@ -335,6 +349,7 @@ const statusMap = {
   pending: { type: 'info', text: '待执行' },
   running: { type: 'warning', text: '执行中' },
   passed: { type: 'success', text: '执行通过' },
+  incomplete: { type: 'warning', text: '验证未完成' },
   failed: { type: 'danger', text: '执行失败' },
   error: { type: 'danger', text: '执行错误' },
   stopped: { type: 'info', text: '已停止' }
@@ -415,6 +430,7 @@ const formatDateTime = (dateTime) => {
 // 获取表格行样式类名
 const getRowClassName = ({ row }) => {
   if (row.status === 'passed') return 'success-row'
+  if (row.status === 'incomplete') return 'running-row'
   if (row.status === 'failed' || row.status === 'error') return 'failed-row'
   if (row.status === 'running') return 'running-row'
   if (row.status === 'pending') return 'pending-row'
@@ -433,6 +449,7 @@ const loadStatistics = async () => {
       // 更新统计数据（后端返回 passed 表示成功次数，非 completed）
       stats.totalRuns = statsData.total || 0
       stats.passedRuns = statsData.passed || 0
+      stats.incompleteRuns = statsData.incomplete || 0
       stats.failedRuns = statsData.failed || 0
       stats.successRate = statsData.success_rate || 0
     }

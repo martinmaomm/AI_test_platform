@@ -18,6 +18,7 @@
       <el-table-column label="用例" min-width="260"><template #default="{ row }"><div class="case-title">{{ row.title }}</div><div class="case-desc">{{ row.description }}</div></template></el-table-column>
       <el-table-column prop="module_name" label="业务模块" width="150"><template #default="{ row }"><el-tag effect="plain">{{ row.module_name || '默认模块' }}</el-tag></template></el-table-column>
       <el-table-column label="脚本" width="120"><template #default="{ row }"><el-tag :type="scriptTagType(row.script_status)">{{ scriptStatusText(row.script_status) }}</el-tag></template></el-table-column>
+      <el-table-column label="断言" width="130"><template #default="{ row }"><el-tag :type="assertionTagType(row.assertion_state)" effect="plain">{{ assertionStatusText(row.assertion_state) }}</el-tag></template></el-table-column>
       <el-table-column label="最近执行" width="130"><template #default="{ row }"><el-tag :type="runTagType(row.last_execute_status)" effect="plain">{{ runStatusText(row.last_execute_status) }}</el-tag></template></el-table-column>
       <el-table-column prop="updated_at" label="更新时间" width="170"><template #default="{ row }">{{ formatTime(row.updated_at) }}</template></el-table-column>
       <el-table-column label="操作" width="210" fixed="right"><template #default="{ row }"><el-button text type="primary" @click="openEdit(row)">编辑</el-button><el-button text type="success" :disabled="row.script_status !== 'ready'" @click="openRun(row)">运行</el-button><el-button text type="danger" @click="removeCase(row)">删除</el-button></template></el-table-column>
@@ -44,6 +45,7 @@
 </template>
 
 <script setup>
+import { assertionStateTagType as assertionTagType, assertionStateLabel as assertionStatusText } from '@/composables/webUIScriptGenerationPresentation'
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
@@ -132,8 +134,8 @@ const removeModule = async row => { try { await ElMessageBox.confirm(`删除模�
 
 const scriptTagType = status => ({ ready: 'success', invalid: 'danger', none: 'info' }[status] || 'info')
 const scriptStatusText = status => ({ ready: '可执行', invalid: '无效', none: '无脚本' }[status] || status)
-const runTagType = status => ({ passed: 'success', failed: 'danger', running: 'warning', untested: 'info' }[status] || 'info')
-const runStatusText = status => ({ passed: '通过', failed: '失败', running: '执行中', untested: '未执行' }[status] || status)
+const runTagType = status => ({ passed: 'success', incomplete: 'warning', failed: 'danger', running: 'warning', untested: 'info' }[status] || 'info')
+const runStatusText = status => ({ passed: '通过', incomplete: '验证未完成', failed: '失败', running: '执行中', untested: '未执行' }[status] || status)
 const formatTime = value => value ? new Date(value).toLocaleString() : '-'
 </script>
 

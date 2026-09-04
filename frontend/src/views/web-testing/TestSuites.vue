@@ -21,7 +21,7 @@
         <div class="form-grid"><el-form-item label="套件名称" required><el-input v-model.trim="form.name" /></el-form-item><el-form-item label="状态"><el-select v-model="form.status"><el-option label="启用" value="active" /><el-option label="停用" value="inactive" /><el-option label="归档" value="archived" /></el-select></el-form-item></div>
         <el-form-item label="说明"><el-input v-model="form.description" type="textarea" :rows="3" resize="vertical" /></el-form-item>
         <section class="section-card"><div class="section-heading"><div><h4>套件变量</h4><p>优先级高于用例变量；运行时覆盖变量的优先级最高。</p></div><el-button type="primary" plain @click="addSuiteVariable">添加变量</el-button></div><div v-for="(item, index) in form.variables" :key="index" class="variable-row"><el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="变量值" /><el-input v-model="item.description" placeholder="说明" /><el-switch v-model="item.required" active-text="必填" /><el-switch v-model="item.is_secret" active-text="敏感" /><el-button text type="danger" @click="form.variables.splice(index, 1)">删除</el-button></div><el-empty v-if="!form.variables.length" :image-size="64" description="暂无套件变量" /></section>
-        <section class="section-card"><div class="section-heading"><div><h4>执行顺序</h4><p>每个脚本使用独立浏览器执行环境，失败不会阻止后续脚本。</p></div><el-select v-model="caseToAdd" filterable placeholder="选择脚本加入套件" @change="addSelectedCase"><el-option v-for="item in availableCases" :key="item.id" :label="item.title" :value="item.id" /></el-select></div><div v-for="(item, index) in form.testCases" :key="item.id" class="case-row"><span class="order-index">{{ index + 1 }}</span><div><strong>{{ item.title }}</strong><p>{{ item.description || '暂无描述' }}</p></div><div class="order-actions"><el-button size="small" :disabled="index === 0" @click="moveCase(index, -1)">上移</el-button><el-button size="small" :disabled="index === form.testCases.length - 1" @click="moveCase(index, 1)">下移</el-button><el-button size="small" type="danger" plain @click="form.testCases.splice(index, 1)">移除</el-button></div></div><el-empty v-if="!form.testCases.length" :image-size="72" description="请添加至少一个可执行脚本" /></section>
+        <section class="section-card"><div class="section-heading"><div><h4>执行顺序</h4><p>每个脚本使用独立浏览器执行环境，失败不会阻止后续脚本。</p></div><el-select v-model="caseToAdd" filterable placeholder="选择脚本加入套件" @change="addSelectedCase"><el-option v-for="item in availableCases" :key="item.id" :label="item.title" :value="item.id" /></el-select></div><div v-for="(item, index) in form.testCases" :key="item.id" class="case-row"><span class="order-index">{{ index + 1 }}</span><div><strong>{{ item.title }}</strong><p>{{ item.description || '暂无描述' }} · {{ assertionStatusText(item.assertion_state) }}</p></div><div class="order-actions"><el-button size="small" :disabled="index === 0" @click="moveCase(index, -1)">上移</el-button><el-button size="small" :disabled="index === form.testCases.length - 1" @click="moveCase(index, 1)">下移</el-button><el-button size="small" type="danger" plain @click="form.testCases.splice(index, 1)">移除</el-button></div></div><el-empty v-if="!form.testCases.length" :image-size="72" description="请添加至少一个可执行脚本" /></section>
       </el-form>
     </el-drawer>
 
@@ -84,6 +84,12 @@ const openEdit = async row => { try { const result = await getWebUITestSuite(pro
 const addSuiteVariable = () => form.variables.push({ name: '', value: '', description: '', required: false, is_secret: false })
 const addSelectedCase = caseId => { const item = allCases.value.find(entry => entry.id === caseId); if (item) form.testCases.push(item); caseToAdd.value = null }
 const moveCase = (index, offset) => { const target = index + offset; if (target < 0 || target >= form.testCases.length) return; const [item] = form.testCases.splice(index, 1); form.testCases.splice(target, 0, item) }
+const assertionStatusText = state => {
+  if (!state) return '断言未检查'
+  if (state.status === 'complete') return '断言已补齐'
+  if (state.pending_count) return `${state.pending_count} 项断言待补充`
+  return '缺少有效断言'
+}
 
 const saveSuite = async () => {
   if (!form.name) return ElMessage.warning('请填写套件名称')

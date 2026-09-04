@@ -96,6 +96,15 @@ def _terminal_cancel(generation_id: str, task_id: str | None) -> bool:
     return bool(task_id and cache.get(f'celery:cancel:{task_id}')) or is_cancel_requested(generation_id)
 
 
+def _normalization_diagnostics(exc: GenerationContractError) -> list[dict[str, str]]:
+    """Keep a structured reason even for locally-raised contract failures."""
+    diagnostics = list(exc.diagnostics)
+    return diagnostics or [{
+        'path': '<contract>', 'type': str(exc) or 'contract_invalid',
+        'stage': 'normalizing',
+    }]
+
+
 def _compile_persisted(generation: WebUIScriptGeneration, plan: ScenarioPlan, trace: ExplorationTrace) -> dict[str, Any]:
     generation = transition_generation(
         generation.pk, WebUIScriptGeneration.Status.VALIDATING, progress=85,
@@ -188,11 +197,15 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
     except ScenarioInputInsufficientError:
         return _fail(str(generation.pk), 'INPUT_AMBIGUOUS', '描述缺少明确测试对象，请补充目标。')
     except GenerationContractError as exc:
+        diagnostics = _normalization_diagnostics(exc)
         logger.warning(
-            'WebUI v4 ScenarioPlan rejected: generation_id=%s stage=normalizing diagnostics=%s',
-            generation.pk, list(exc.diagnostics),
+            'WebUI v4 ScenarioPlan rejected: generation_id=%s stage=normalizing reason=%s diagnostics=%s',
+            generation.pk, str(exc), diagnostics,
         )
-        return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v4 ScenarioPlan。')
+        return _fail(
+            str(generation.pk), 'MODEL_OUTPUT_INVALID',
+            f'模型未返回有效的 v4 ScenarioPlan：{diagnostics[0]["type"]}。',
+        )
     except (KeyError, ValueError):
         return _fail(str(generation.pk), 'MODEL_OUTPUT_INVALID', '模型未返回有效的 v4 ScenarioPlan。')
     except Exception as exc:

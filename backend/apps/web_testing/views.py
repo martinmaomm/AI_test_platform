@@ -22,6 +22,7 @@ from common.api import response
 from projects.models import Environment
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
+from .assertion_state import analyze_assertion_state
 from .execution_diagnostics import safe_screenshot_relative_path
 from .execution_variables import (
     ExecutionVariableError,
@@ -546,7 +547,14 @@ class WebUIScriptGenerationSaveView(APIView):
                 }:
                     return Response({'success': False, 'message': '当前脚本尚未通过质量检查，不能保存。'}, status=status.HTTP_409_CONFLICT)
                 finalization = (generation.exploration_snapshot or {}).get('finalization', {})
-                quality_blockers = (generation.quality_report or {}).get('blockers', [])
+                quality_report = generation.quality_report or {}
+                # Generated drafts retain the complete, evidence-based quality
+                # report from the generator.  Only an explicit workspace edit
+                # receives the narrower contract report produced by
+                # ``manual_draft_quality_report``; that lets a user add a real
+                # assertion without silently allowing unrelated replay/action
+                # safety failures from the original generated source.
+                quality_blockers = list(quality_report.get('blockers') or [])
                 if (
                     not (generation.script_draft or '').strip()
                     or finalization.get('status') != 'valid'
@@ -557,9 +565,12 @@ class WebUIScriptGenerationSaveView(APIView):
                         status=status.HTTP_409_CONFLICT,
                     )
                 normalized_script = normalize_for_storage(generation.script_draft)
+                assertion_state = analyze_assertion_state(normalized_script)
                 verification = workspace['verification']
                 if requested_mode == 'verified' and not (
                     verification.get('status') == 'passed'
+                    and assertion_state['status'] == 'complete'
+                    and int(verification.get('runtime_assertion_count') or 0) > 0
                     and generation.environment.is_active
                     and verification.get('script_hash') == script_hash(normalized_script)
                     and verification.get('environment_id') == generation.environment_id
@@ -568,7 +579,7 @@ class WebUIScriptGenerationSaveView(APIView):
                     and verification.get('base_url_fingerprint') == base_url_fingerprint(generation.environment.config)
                 ):
                     return Response(
-                        {'success': False, 'message': '当前脚本尚无同版本、同环境的实际调试通过记录。', 'data': WebUIScriptGenerationSerializer(generation).data},
+                        {'success': False, 'message': '当前脚本尚无同版本、同环境且已实际执行断言的调试通过记录。', 'data': WebUIScriptGenerationSerializer(generation).data},
                         status=status.HTTP_409_CONFLICT,
                     )
                 test_case = generation.test_case
@@ -628,6 +639,7 @@ class WebUIScriptGenerationSaveView(APIView):
                         'model_name': (generation.model_info or {}).get('model_name', ''),
                     },
                     'quality_status': (generation.quality_report or {}).get('status', ''),
+                    'assertion_state': assertion_state,
                     'repair_count': (workspace['repair'] or {}).get('count', 0),
                     'verification': {
                         'status': 'passed' if requested_mode == 'verified' else 'unverified',
@@ -783,9 +795,9 @@ class TaskStatusView(APIView):
 def get_webui_test_execution_statistics(request, project_id):
     queryset = WebUITestExecution.objects.filter(project_id=project_id)
     stats = {'total': queryset.count()}
-    for state in ('pending', 'running', 'passed', 'failed', 'error', 'stopped'):
+    for state in ('pending', 'running', 'passed', 'incomplete', 'failed', 'error', 'stopped'):
         stats[state] = queryset.filter(status=state).count()
-    completed = stats['passed'] + stats['failed'] + stats['error']
+    completed = stats['passed'] + stats['incomplete'] + stats['failed'] + stats['error']
     stats['success_rate'] = round(stats['passed'] / completed * 100, 2) if completed else 0
     return response(kind='success', data=stats, message='获取执行统计成功')
 
@@ -1290,7 +1302,7 @@ class ExecuteWebUITestSuiteView(APIView):
 def get_webui_test_suite_statistics(request, project_id):
     suites = WebUITestSuite.objects.filter(project_id=project_id)
     executions = WebUITestExecution.objects.filter(project_id=project_id, exec_type='suite')
-    completed = executions.filter(status__in=['passed', 'failed', 'error']).count()
+    completed = executions.filter(status__in=['passed', 'incomplete', 'failed', 'error']).count()
     passed = executions.filter(status='passed').count()
     return response(
         kind='success',
@@ -1299,6 +1311,7 @@ def get_webui_test_suite_statistics(request, project_id):
             'active_suites': suites.filter(status='active').count(),
             'total_suite_executions': executions.count(),
             'passed_suite_executions': passed,
+            'incomplete_suite_executions': executions.filter(status='incomplete').count(),
             'failed_suite_executions': executions.filter(status__in=['failed', 'error']).count(),
             'total_suite_cases': WebUITestSuiteCase.objects.filter(suite__project_id=project_id).count(),
             'suite_success_rate': round(passed / completed * 100, 2) if completed else 0,
@@ -1319,7 +1332,7 @@ class TestExecutionListView(generics.ListAPIView):
         )
         if self.request.GET.get('exec_type') in {'case', 'suite'}:
             queryset = queryset.filter(exec_type=self.request.GET['exec_type'])
-        if self.request.GET.get('status') in {'pending', 'running', 'passed', 'failed', 'error', 'stopped'}:
+        if self.request.GET.get('status') in {'pending', 'running', 'passed', 'incomplete', 'failed', 'error', 'stopped'}:
             queryset = queryset.filter(status=self.request.GET['status'])
         if self.request.GET.get('trigger_type'):
             queryset = queryset.filter(trigger_type=self.request.GET['trigger_type'])
@@ -1415,6 +1428,7 @@ class TestExecutionCasesView(APIView):
                     'total_cases': detail.total_cases,
                     'passed_cases': detail.passed_cases,
                     'failed_cases': detail.failed_cases,
+                    'incomplete_cases': detail.incomplete_cases,
                     'skipped_cases': detail.skipped_cases,
                     'pass_rate': detail.pass_rate,
                     'start_time': detail.start_time,

@@ -7,6 +7,8 @@ import io
 import tokenize
 from typing import Any
 
+from .assertion_state import analyze_assertion_state
+
 
 EXTRACTION_VERSION = 'webui-playwright-ast-v1'
 ACTION_METHODS = {
@@ -156,6 +158,9 @@ def extract_playwright_metadata(content: str, description: str = '') -> dict[str
         'extracted_steps': extracted_steps,
         'locator_candidates': locator_candidates,
         'assertion_candidates': assertion_candidates,
+        # This is always derived from the supplied source, never from an older
+        # generation record.  Runtime proof is added by the execution service.
+        'assertion_state': analyze_assertion_state(content),
         'extraction_version': EXTRACTION_VERSION,
         'expected_result': expected_result,
     }

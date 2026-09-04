@@ -156,7 +156,12 @@ class ScriptAssetFlowTests(TestCase):
 
     def test_suite_runs_in_membership_order_and_continues_after_failure(self):
         first_script = 'async def run(page):\n    return "first"\n'
-        second_script = 'async def run(page):\n    return "second"\n'
+        second_script = (
+            'from playwright.async_api import expect\n'
+            'async def run(page):\n'
+            '    await expect(page).to_have_title("Second")\n'
+            '    return "second"\n'
+        )
         first_case = self.make_case(
             '第一个失败用例',
             first_script,
@@ -204,6 +209,7 @@ class ScriptAssetFlowTests(TestCase):
         }
         passed_result = {
             'success': True,
+            'runtime_assertion_count': 1,
             'error': '',
             'result': {'stdout': 'second passed', 'stderr': '', 'return_code': 0},
         }

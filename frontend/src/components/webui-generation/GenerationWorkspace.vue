@@ -1,7 +1,7 @@
 <template>
   <div class="workspace">
     <el-alert type="warning" :closable="false" show-icon title="测试环境模式下，凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" />
-    <el-alert type="info" :closable="false" show-icon title="生成完成仅表示已得到脚本草稿；只有“本版调试通过”才表示该版本在约定测试数据上实际执行成功。" />
+    <el-alert type="info" :closable="false" show-icon title="生成完成仅表示已得到脚本草稿；只有“本版调试通过”才表示该版本实际成功执行过断言。待补充断言不阻止保存、编辑或调试。" />
 
     <div class="workspace-status">
       <div>
@@ -15,6 +15,18 @@
       <div class="section-heading"><div><h5>Python Playwright 脚本草稿</h5><p>可直接编辑；拖动右下角调整高度。保存或调试前会校验并保存当前草稿。</p></div><el-button size="small" @click="copyScript">复制脚本</el-button></div>
       <div class="script-editor"><MonacoEditor :value="form.script_draft" language="python" theme="vs-dark" :read-only="busy" height="100%" @update:value="updateScript" /></div>
     </section>
+
+    <el-alert v-if="assertionState.pending_count" type="warning" :closable="false" show-icon title="草稿已生成，仍有待补充断言">
+      <template #default>
+        <p>补入真实 <code>await expect(...)</code> 或 <code>assert</code> 后，请删除对应 <code>AITS_PENDING_ASSERTION</code> 注释并重新运行。</p>
+        <ul><li v-for="item in assertionState.pending" :key="`${item.assertion_id}-${item.line}`">{{ item.assertion_id }}：{{ item.criterion || '未填写验证目标' }}（{{ item.reason }}）</li></ul>
+      </template>
+    </el-alert>
+    <el-alert v-else-if="assertionState.status === 'incomplete' && assertionState.confirmed_count === 0" type="warning" :closable="false" show-icon title="草稿缺少有效断言">
+      <template #default>
+        <p>删除 <code>AITS_PENDING_ASSERTION</code> 注释本身不会完成验证。请补入真实 <code>await expect(...)</code> 或非纯常量 <code>assert</code>，然后重新运行。</p>
+      </template>
+    </el-alert>
 
     <section class="workspace-section">
       <div class="section-heading"><div><h5>配置变量</h5><p>变量可用于脚本运行；调试覆盖值优先于草稿变量。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
@@ -70,6 +82,7 @@ const form = reactive({ script_draft: '', variables: [] })
 const runtimeVariables = reactive([])
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
 const verification = computed(() => workspace.value.verification || {})
+const assertionState = computed(() => verification.value.assertion_state || { status: '', pending: [], pending_count: 0, confirmed_count: 0 })
 const hasPassed = computed(() => !props.draft?.dirty && isCurrentRevisionVerified(
   workspace.value, props.draft?.revision ?? workspace.value.revision, props.generation?.environment_id
 ))

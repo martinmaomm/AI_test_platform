@@ -2,6 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
+  assertionStateLabel,
+  assertionStateTagType,
   buildGenerationTimeline,
   explorationCleanupPresentation,
   generationActionRequired,
@@ -16,7 +18,9 @@ import {
   isWorkspaceActive,
   matchesGenerationWebSocketEvent,
   modelConfigurationLabel,
-  modelInfoLabel
+  modelInfoLabel,
+  workspaceVerificationLabel,
+  workspaceVerificationTagType
 } from '../src/composables/webUIScriptGenerationPresentation.js'
 
 test('v4 storage state is isolated from old generation state', () => {
@@ -86,10 +90,30 @@ test('failed status is visibly distinct from incomplete exploration evidence', (
 })
 
 test('workspace activity and revision verification remain explicit', () => {
-  const workspace = { verification: { status: 'passed', locked_revision: 4, environment_id: 12 }, repair: { status: 'idle' } }
+  const workspace = { verification: { status: 'passed', locked_revision: 4, environment_id: 12, runtime_assertion_count: 2 }, repair: { status: 'idle' } }
   assert.equal(isCurrentRevisionVerified(workspace, 4, 12), true)
   assert.equal(isCurrentRevisionVerified(workspace, 4, 13), false)
+  assert.equal(isCurrentRevisionVerified({ verification: { status: 'passed', locked_revision: 4, environment_id: 12, runtime_assertion_count: 0 } }, 4, 12), false)
+  assert.equal(isCurrentRevisionVerified({ verification: { status: 'passed', locked_revision: 4, environment_id: 12 } }, 4, 12), false)
   assert.equal(isWorkspaceActive({ verification: { status: 'running' }, repair: { status: 'idle' } }), true)
+})
+
+test('incomplete verification and assertion-state rows never use a passed presentation', () => {
+  assert.equal(workspaceVerificationLabel('incomplete'), '验证未完成')
+  assert.equal(workspaceVerificationTagType('incomplete'), 'warning')
+  assert.deepEqual(
+    [assertionStateTagType({ status: 'complete', pending_count: 0 }), assertionStateLabel({ status: 'complete', pending_count: 0 })],
+    ['success', '断言已补齐']
+  )
+  assert.deepEqual(
+    [assertionStateTagType({ status: 'incomplete', pending_count: 2 }), assertionStateLabel({ status: 'incomplete', pending_count: 2 })],
+    ['warning', '2 项待补充']
+  )
+  assert.deepEqual(
+    [assertionStateTagType({ status: 'incomplete', pending_count: 0, confirmed_count: 0 }), assertionStateLabel({ status: 'incomplete', pending_count: 0, confirmed_count: 0 })],
+    ['warning', '缺少有效断言']
+  )
+  assert.deepEqual([assertionStateTagType(), assertionStateLabel()], ['info', '未检查'])
 })
 
 test('model labels prefer display names and retain provider fallback', () => {

@@ -218,7 +218,7 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
                 RequirementNormalizer(8).normalize('请帮我生成测试')
         manager.invoke.assert_not_called()
 
-    def test_literal_assertion_must_come_from_user_input(self):
+    def test_user_literal_stays_fixed_and_model_literal_waits_for_exploration(self):
         literal_payload = plan_payload(
             success_criteria=['页面包含 READY'],
             assertion_requirements=[{
@@ -228,8 +228,10 @@ class RequirementNormalizerRegressionTests(SimpleTestCase):
         )
         plan = self._normalize('确认页面显示 READY。', literal_payload)
         self.assertEqual(plan.assertion_requirements[0].literal, 'READY')
-        with self.assertRaises(Exception):
-            self._normalize('确认页面显示完成状态。', literal_payload)
+        deferred = self._normalize('确认页面显示完成状态。', literal_payload)
+        self.assertEqual(deferred.assertion_requirements[0].kind, 'deferred')
+        self.assertEqual(deferred.assertion_requirements[0].literal, '')
+        self.assertEqual(deferred.assertion_requirements[0].input_ref, '')
 
     def test_native_structured_output_uses_low_randomness_without_json_fallback(self):
         structured_model = Mock()

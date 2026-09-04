@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import ast
 import builtins
+import json
 import re
 from typing import Any
 
+from .assertion_state import analyze_assertion_state
 from .exploration_trace import ExplorationTrace
 from .generation_contracts import ScenarioPlan
 from .replay_plan import PythonReplayCompiler, ReplayPlan, ReplayPlanner
@@ -23,6 +25,11 @@ _STEP_COMMENT_RE = re.compile(r'^\s*#\s*步骤\s+(\d+)\s*[:：]')
 _ASSERTION_COMMENT_RE = re.compile(r'^\s*#\s*断言\s+(\d+)\s*[:：]')
 _CLEANUP_COMMENT_RE = re.compile(r'^\s*#\s*清理\s+(\d+)\s*[:：]')
 _CLEANUP_ASSERTION_COMMENT_RE = re.compile(r'^\s*#\s*清理验证\s+(\d+)\s*[:：]')
+_PENDING_ASSERTION_PREFIX = '# AITS_PENDING_ASSERTION:'
+_PLACEHOLDER_COMMENT_RE = re.compile(
+    r'^\s*#\s*(?:TODO\b|待补充(?:\b|[:：])|待确认(?:\b|[:：])|占位(?:\b|[:：]))',
+    re.I,
+)
 
 
 def _issue(level: str, code: str, message: str, line: int | None = None) -> dict[str, Any]:
@@ -119,7 +126,14 @@ def _has_unresolved_placeholder(tree: ast.AST, lines: list[str]) -> bool:
             and node.exc.func.id == 'NotImplementedError'
         ):
             return True
-    return any(re.search(r'(?i)\bTODO\b|待补充|待确认|占位', line) for line in lines)
+    return any(
+        _PLACEHOLDER_COMMENT_RE.match(line)
+        for line in lines if not line.lstrip().startswith(_PENDING_ASSERTION_PREFIX)
+    )
+
+
+def _assertion_state(source: str) -> dict[str, Any]:
+    return analyze_assertion_state(source)
 
 
 def _finally_shapes(run: ast.AsyncFunctionDef, *, assertions: bool) -> list[str]:
@@ -228,6 +242,7 @@ def evaluate_script(
 
     action_calls = _action_calls(tree)
     assertion_calls = _assertion_calls(tree)
+    assertion_state = _assertion_state(source)
     expected_action_calls = _action_calls(expected_tree)
     expected_assertion_calls = _assertion_calls(expected_tree)
     if _call_shapes(action_calls) != _call_shapes(expected_action_calls):
@@ -245,7 +260,37 @@ def evaluate_script(
             'blocker', 'SCRIPT_NOT_DETERMINISTIC_REPLAY',
             '脚本包含确定性 callback 编译结果之外的可执行代码。',
         ))
-    if not assertion_calls:
+    expected_pending = [
+        {
+            'assertion_id': item.assertion_id,
+            'criterion': item.criterion,
+            'reason': item.reason,
+        }
+        for item in plan_value.pending_assertions
+    ]
+    actual_pending = [
+        {
+            'assertion_id': item['assertion_id'],
+            'criterion': item['criterion'],
+            'reason': item['reason'],
+        }
+        for item in assertion_state['pending']
+    ]
+    if (
+        len(actual_pending) != len(expected_pending)
+        or {json.dumps(item, ensure_ascii=False, sort_keys=True) for item in actual_pending}
+        != {json.dumps(item, ensure_ascii=False, sort_keys=True) for item in expected_pending}
+    ):
+        blockers.append(_issue(
+            'blocker', 'PENDING_ASSERTION_MARKER_MISMATCH',
+            '脚本待补断言标记与 ReplayPlan 不一致。',
+        ))
+    if assertion_state['pending_count']:
+        warnings.append(_issue(
+            'warning', 'PENDING_ASSERTIONS',
+            f"存在 {assertion_state['pending_count']} 项待补充断言，流程草稿未完成验证。",
+        ))
+    if not assertion_calls and not assertion_state['pending_count']:
         blockers.append(_issue('blocker', 'EXPECT_MISSING', '脚本至少需要一个真实语义 expect 断言。'))
 
     all_actions = [*plan_value.actions, *plan_value.cleanup_actions]
@@ -336,7 +381,10 @@ def evaluate_script(
             ))
 
     expected_assertion_ids = {item.assertion_id for item in plan.assertion_requirements}
-    compiled_assertion_ids = {item.assertion_id for item in all_assertions}
+    compiled_assertion_ids = {
+        *(item.assertion_id for item in all_assertions),
+        *(item.assertion_id for item in plan_value.pending_assertions),
+    }
     if expected_assertion_ids != compiled_assertion_ids:
         missing = ', '.join(sorted(expected_assertion_ids - compiled_assertion_ids))
         blockers.append(_issue(
@@ -372,14 +420,22 @@ def evaluate_script(
             not plan_value.cleanup_assertions
             or trace.cleanup.get('status') != 'completed'
         ):
-            blockers.append(_issue(
-                'blocker', 'CLEANUP_VERIFICATION_MISSING',
-                '清理动作没有后续真实页面观察确认，不能标记为已清理。',
-            ))
+            if any(item.phase == 'cleanup' for item in plan_value.pending_assertions):
+                warnings.append(_issue(
+                    'warning', 'PENDING_CLEANUP_VERIFICATION',
+                    '清理操作已完成，但清理验证仍需人工补充。',
+                ))
+            else:
+                blockers.append(_issue(
+                    'blocker', 'CLEANUP_VERIFICATION_MISSING',
+                    '清理动作没有后续真实页面观察确认，不能标记为已清理。',
+                ))
 
     for message in plan_value.warnings:
         warnings.append(_issue('warning', 'EXPLORATION_EVIDENCE_INCOMPLETE', message))
-    return _report(blockers, warnings)
+    report = _report(blockers, warnings)
+    report['assertion_state'] = assertion_state
+    return report
 
 
 def _report(

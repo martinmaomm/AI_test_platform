@@ -35,8 +35,11 @@ from .views import (
 
 
 VALID_SCRIPT = '''"""Check the users page."""
+from playwright.async_api import expect
+
 async def run(page):
     await page.goto('/users')
+    await expect(page.locator('main')).to_be_visible()
 '''
 
 
@@ -134,7 +137,7 @@ async def run(page):
         generation.save(update_fields=['script_draft', 'workspace', 'updated_at'])
         self.assertFalse(finish_debug(
             generation.id, execution_id=91, locked_revision=0, locked_hash=script_hash(VALID_SCRIPT),
-            status='passed', diagnostics=[],
+            status='passed', diagnostics=[], runtime_assertion_count=1,
         ))
         generation.refresh_from_db()
         self.assertEqual(workspace_for_generation(generation)['verification']['status'], 'unverified')
@@ -169,7 +172,7 @@ async def run(page):
         WebUITestCaseExecutionDetail.objects.create(execution=execution, test_case=None, status='pending')
         _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=execution.id)
         attach_debug_task(generation.id, execution_id=execution.id, locked_revision=0, locked_hash=digest, task_id='worker-once')
-        result = {'success': True, 'result': {'stdout': '', 'stderr': '', 'test_file': '', 'allure_report': '', 'screenshot_path': None}}
+        result = {'success': True, 'runtime_assertion_count': 1, 'result': {'runtime_assertion_count': 1, 'stdout': '', 'stderr': '', 'test_file': '', 'allure_report': '', 'screenshot_path': None}}
         with patch('web_testing.tasks._run_test_script', return_value=result) as runner:
             debug_webui_script_generation_task.apply(args=(str(generation.id), execution.id, 0, digest), task_id='worker-once')
             debug_webui_script_generation_task.apply(args=(str(generation.id), execution.id, 0, digest), task_id='worker-once')
@@ -227,7 +230,7 @@ async def run(page):
     def test_saving_unchanged_draft_does_not_invalidate_passed_revision(self):
         generation = self.generation()
         _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=4)
-        finish_debug(generation.id, execution_id=4, locked_revision=0, locked_hash=digest, status='passed', diagnostics=[])
+        finish_debug(generation.id, execution_id=4, locked_revision=0, locked_hash=digest, status='passed', diagnostics=[], runtime_assertion_count=1)
         response = WebUIScriptGenerationDraftView.as_view()(
             self.request(self.user, 'PATCH', '/draft/', {'script_draft': VALID_SCRIPT, 'expected_revision': 0, 'variables': []}),
             project_id=self.project.id, generation_id=generation.id,
@@ -262,7 +265,7 @@ async def run(page):
                 self.environment.save()
                 generation = self.generation()
                 _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=4)
-                finish_debug(generation.id, execution_id=4, locked_revision=0, locked_hash=digest, status='passed', diagnostics=[])
+                finish_debug(generation.id, execution_id=4, locked_revision=0, locked_hash=digest, status='passed', diagnostics=[], runtime_assertion_count=1)
                 generation.refresh_from_db()
                 self.assertEqual(WebUIScriptGenerationSerializer(generation).data['workspace']['verification']['status'], 'passed')
                 if change is None:
@@ -313,7 +316,7 @@ async def run(page):
         _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=4)
         self.assertTrue(finish_debug(
             generation.id, execution_id=4, locked_revision=0, locked_hash=digest,
-            status='passed', diagnostics=[],
+            status='passed', diagnostics=[], runtime_assertion_count=1,
         ))
         second = WebUIScriptGenerationSaveView.as_view()(
             self.request(self.user, 'POST', '/save/', {'mode': 'verified', 'expected_revision': 0}),

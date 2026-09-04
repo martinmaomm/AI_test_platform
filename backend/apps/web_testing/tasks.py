@@ -24,6 +24,7 @@ from common.task import (
 from projects.models import Environment, Project
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
+from .assertion_state import evaluation_status
 from .execution_diagnostics import friendly_failure_summary
 from .execution_variables import merge_execution_variables, pop_runtime_variables
 from .models import (
@@ -147,8 +148,18 @@ def _run_test_script(
         failure_screenshot_path=failure_screenshot_path,
         environment_variables=environment_variables or {},
     )
+    operation_success = bool(result.get('operation_success', result.get('success')))
+    status, assertion_state, runtime_assertion_count = evaluation_status(
+        script_content,
+        operation_success=operation_success,
+        runtime_assertion_count=result.get('runtime_assertion_count'),
+    )
     payload = {
-        'status': 'passed' if result.get('success') else 'failed',
+        'status': status,
+        'operation_success': operation_success,
+        'evaluation_status': status,
+        'assertion_state': assertion_state,
+        'runtime_assertion_count': runtime_assertion_count,
         'script_id': script_id,
         'stdout': result.get('stdout', ''),
         'stderr': result.get('stderr', ''),
@@ -158,11 +169,24 @@ def _run_test_script(
         'screenshot_path': result.get('screenshot_path'),
     }
     return {
-        'success': bool(result.get('success')),
-        'error': result.get('error', '') if not result.get('success') else '',
+        'success': operation_success,
+        'operation_success': operation_success,
+        'evaluation_status': status,
+        'assertion_state': assertion_state,
+        'runtime_assertion_count': runtime_assertion_count,
+        'error': result.get('error', '') if not operation_success else '',
         'result': payload,
         'log': result.get('stdout') or result.get('stderr') or '测试执行完成',
     }
+
+
+def _incomplete_message(assertion_state: dict[str, Any], runtime_assertion_count: int) -> str:
+    pending_count = int(assertion_state.get('pending_count') or 0)
+    if pending_count:
+        return f'操作已完成，但仍有 {pending_count} 项断言待补充；删除对应 marker 并补入真实断言后重跑。'
+    if runtime_assertion_count == 0:
+        return '操作已完成，但本次未成功执行任何真实断言，验证未完成。'
+    return '操作已完成，但当前脚本验证条件未完成。'
 
 
 def _raw_execution_log(result_data: dict[str, Any]) -> str:
@@ -253,14 +277,21 @@ def _execute_webui_test_case_logic(
         result_data = result.get('result') or {}
         end_time = timezone.now()
         duration = (end_time - execution.start_time).total_seconds()
-        succeeded = bool(result.get('success'))
-        error_message = '' if succeeded else friendly_failure_summary(
+        operation_success = bool(result.get('operation_success', result.get('success')))
+        execution_status, assertion_state, runtime_assertion_count = evaluation_status(
+            script_content,
+            operation_success=operation_success,
+            runtime_assertion_count=result.get('runtime_assertion_count'),
+        )
+        error_message = '' if operation_success else friendly_failure_summary(
             result_data.get('stdout', ''),
             result_data.get('stderr', ''),
             result.get('error', ''),
         )
+        if execution_status == 'incomplete':
+            error_message = _incomplete_message(assertion_state, runtime_assertion_count)
 
-        execution.status = 'passed' if succeeded else 'failed'
+        execution.status = execution_status
         execution.error_message = error_message
         execution.end_time = end_time
         execution.duration = duration
@@ -289,9 +320,17 @@ def _execute_webui_test_case_logic(
         )
         update_task_progress(task_instance, 100, '测试用例执行完成')
         return {
-            'success': succeeded,
+            'success': operation_success,
+            'operation_success': operation_success,
+            'evaluation_status': execution_status,
+            'assertion_state': assertion_state,
+            'runtime_assertion_count': runtime_assertion_count,
             'status': 'completed',
-            'message': f'WebUI 测试用例执行{"成功" if succeeded else "失败"}',
+            'message': (
+                'WebUI 测试用例验证通过' if execution_status == 'passed'
+                else 'WebUI 测试用例验证未完成' if execution_status == 'incomplete'
+                else 'WebUI 测试用例执行失败'
+            ),
             'execution_id': execution.id,
             'execution_status': execution.status,
             'result': result_data,
@@ -393,11 +432,18 @@ def debug_webui_script_generation_task(
         )
         result_data = result.get('result') or {}
         end_time = timezone.now()
-        succeeded = bool(result.get('success'))
-        error_message = '' if succeeded else friendly_failure_summary(
+        operation_success = bool(result.get('operation_success', result.get('success')))
+        execution_status, assertion_state, runtime_assertion_count = evaluation_status(
+            script,
+            operation_success=operation_success,
+            runtime_assertion_count=result.get('runtime_assertion_count'),
+        )
+        error_message = '' if operation_success else friendly_failure_summary(
             result_data.get('stdout', ''), result_data.get('stderr', ''), result.get('error', ''),
         )
-        execution.status = 'passed' if succeeded else 'failed'
+        if execution_status == 'incomplete':
+            error_message = _incomplete_message(assertion_state, runtime_assertion_count)
+        execution.status = execution_status
         execution.error_message = error_message
         execution.end_time = end_time
         execution.duration = (end_time - execution.start_time).total_seconds()
@@ -415,11 +461,20 @@ def debug_webui_script_generation_task(
         detail.save()
         finish_debug(
             generation_id, execution_id=execution.id, locked_revision=locked_revision, locked_hash=locked_hash,
-            status='passed' if succeeded else 'failed',
-            diagnostics=[] if succeeded else [{'code': 'RUNTIME_FAILURE', 'message': error_message}],
+            status=execution_status,
+            diagnostics=[] if operation_success else [{'code': 'RUNTIME_FAILURE', 'message': error_message}],
+            runtime_assertion_count=runtime_assertion_count,
             task_id=self.request.id,
         )
-        return {'success': succeeded, 'execution_id': execution.id, 'execution_status': execution.status}
+        return {
+            'success': operation_success,
+            'operation_success': operation_success,
+            'evaluation_status': execution_status,
+            'assertion_state': assertion_state,
+            'runtime_assertion_count': runtime_assertion_count,
+            'execution_id': execution.id,
+            'execution_status': execution.status,
+        }
     except Exception as exc:
         message = f'生成草稿调试失败: {exc}'
         logger.error('%s', message)
@@ -579,6 +634,7 @@ def _finalize_scheduled_execution(
     total_cases: int,
     passed_cases: int,
     failed_cases: int,
+    incomplete_cases: int,
     skipped_cases: int,
     log: str,
 ) -> None:
@@ -605,19 +661,30 @@ def _finalize_scheduled_execution(
                 )
             )
         execution_log = TaskExecutionLog.objects.get(id=scheduled_log_id)
-        execution_log.status = 'success' if execution_log.failed_cases == 0 else 'failed'
+        prior_incomplete = str(execution_log.error_message or '').startswith('验证未完成：')
+        has_incomplete = incomplete_cases > 0 or prior_incomplete
+        # The scheduled-task log has only success/failed states.  Preserve the
+        # true per-suite failed count, but never mark an incomplete validation
+        # as success or emit a passing notification.
+        execution_log.status = 'success' if execution_log.failed_cases == 0 and not has_incomplete else 'failed'
+        if has_incomplete:
+            execution_log.error_message = (
+                f'验证未完成：本次有 {incomplete_cases} 个 WebUI 用例尚未完成完整断言验证。'
+                if incomplete_cases else '验证未完成：此前已有 WebUI 用例尚未完成完整断言验证。'
+            )
         execution_log.end_time = timezone.now()
         execution_log.total_cases = execution_log.total_cases or total_cases
-        execution_log.save(update_fields=['status', 'end_time', 'total_cases'])
-        trigger_notification(
-            scheduled_task_id=execution_log.task_id,
-            execution_log=execution_log,
-            result={
-                'total_cases': execution_log.total_cases,
-                'passed_cases': execution_log.passed_cases,
-                'failed_cases': execution_log.failed_cases,
-            },
-        )
+        execution_log.save(update_fields=['status', 'error_message', 'end_time', 'total_cases'])
+        if not has_incomplete or execution_log.failed_cases > 0:
+            trigger_notification(
+                scheduled_task_id=execution_log.task_id,
+                execution_log=execution_log,
+                result={
+                    'total_cases': execution_log.total_cases,
+                    'passed_cases': execution_log.passed_cases,
+                    'failed_cases': execution_log.failed_cases,
+                },
+            )
     except Exception:
         logger.error('回填定时任务日志或触发通知失败', exc_info=True)
 
@@ -694,13 +761,14 @@ def _execute_webui_test_suite_logic(
         suite_detail.total_cases = len(memberships)
         suite_detail.passed_cases = 0
         suite_detail.failed_cases = 0
+        suite_detail.incomplete_cases = 0
         suite_detail.skipped_cases = 0
         suite_detail.case_executions.all().delete()
         suite_detail.save()
 
         runtime_variables = pop_runtime_variables(execution.id)
         environment_variables = (environment.config or {}).get('variables') or {}
-        passed_cases = failed_cases = skipped_cases = 0
+        passed_cases = failed_cases = incomplete_cases = skipped_cases = 0
         execution_results = []
         log_sections = [f'=== 测试套件：{suite.name} ===']
 
@@ -756,21 +824,31 @@ def _execute_webui_test_suite_logic(
                     environment_variables=variables,
                 )
                 result_data = result.get('result') or {}
-                succeeded = bool(result.get('success'))
-                error_message = '' if succeeded else friendly_failure_summary(
+                operation_success = bool(result.get('operation_success', result.get('success')))
+                case_status, assertion_state, runtime_assertion_count = evaluation_status(
+                    script_content,
+                    operation_success=operation_success,
+                    runtime_assertion_count=result.get('runtime_assertion_count'),
+                )
+                error_message = '' if operation_success else friendly_failure_summary(
                     result_data.get('stdout', ''),
                     result_data.get('stderr', ''),
                     result.get('error', ''),
                 )
+                if case_status == 'incomplete':
+                    error_message = _incomplete_message(assertion_state, runtime_assertion_count)
             except Exception as exc:
                 logger.error('套件用例执行异常: case_id=%s', test_case.id, exc_info=True)
                 result = {'success': False, 'error': str(exc)}
                 result_data = {}
-                succeeded = False
+                operation_success = False
+                case_status = 'failed'
+                assertion_state = {}
+                runtime_assertion_count = 0
                 error_message = f'执行准备失败: {exc}'
 
             case_ended_at = timezone.now()
-            case_execution.status = 'passed' if succeeded else 'failed'
+            case_execution.status = case_status
             case_execution.duration = (case_ended_at - case_started_at).total_seconds()
             case_execution.error_message = error_message or None
             case_execution.log = _raw_execution_log(result_data)
@@ -783,8 +861,10 @@ def _execute_webui_test_suite_logic(
                 case_execution.screenshot_path = persisted
             case_execution.save()
 
-            if succeeded:
+            if case_status == 'passed':
                 passed_cases += 1
+            elif case_status == 'incomplete':
+                incomplete_cases += 1
             else:
                 failed_cases += 1
             test_case.last_execute_status = case_execution.status
@@ -797,6 +877,9 @@ def _execute_webui_test_suite_logic(
                 'test_case_id': test_case.id,
                 'test_case_title': test_case.title,
                 'status': case_execution.status,
+                'operation_success': operation_success,
+                'assertion_state': assertion_state,
+                'runtime_assertion_count': runtime_assertion_count,
                 'error_message': error_message,
                 'result': result_data,
             })
@@ -807,24 +890,34 @@ def _execute_webui_test_suite_logic(
 
         ended_at = timezone.now()
         duration = (ended_at - started_at).total_seconds()
-        all_skipped = passed_cases == 0 and failed_cases == 0
-        succeeded = failed_cases == 0 and not all_skipped
-        summary = (
-            f'测试套件执行完成：通过 {passed_cases}，失败 {failed_cases}，跳过 {skipped_cases}'
+        all_skipped = passed_cases == 0 and failed_cases == 0 and incomplete_cases == 0
+        operation_success = failed_cases == 0 and not all_skipped
+        execution_status = (
+            'failed' if failed_cases else
+            'incomplete' if incomplete_cases else
+            'passed' if operation_success else
+            'failed'
         )
-        error_message = '' if succeeded else (
-            '测试套件没有可执行脚本' if all_skipped else f'测试套件中有 {failed_cases} 个用例失败'
+        summary = (
+            f'测试套件执行完成：通过 {passed_cases}，验证未完成 {incomplete_cases}，失败 {failed_cases}，跳过 {skipped_cases}'
+        )
+        error_message = (
+            '' if execution_status == 'passed' else
+            '测试套件没有可执行脚本' if all_skipped else
+            f'测试套件中有 {failed_cases} 个用例失败' if failed_cases else
+            f'测试套件中有 {incomplete_cases} 个用例尚未完成验证'
         )
         full_log = '\n'.join(log_sections)
 
         suite_detail.passed_cases = passed_cases
         suite_detail.failed_cases = failed_cases
+        suite_detail.incomplete_cases = incomplete_cases
         suite_detail.skipped_cases = skipped_cases
         suite_detail.end_time = ended_at
         suite_detail.duration = duration
         suite_detail.log = full_log
         suite_detail.save()
-        execution.status = 'passed' if succeeded else 'failed'
+        execution.status = execution_status
         execution.error_message = error_message
         execution.end_time = ended_at
         execution.duration = duration
@@ -835,18 +928,22 @@ def _execute_webui_test_suite_logic(
             total_cases=len(memberships),
             passed_cases=passed_cases,
             failed_cases=failed_cases,
+            incomplete_cases=incomplete_cases,
             skipped_cases=skipped_cases,
             log=full_log,
         )
         update_task_progress(task_instance, 100, summary)
         return {
-            'success': succeeded,
+            'success': operation_success,
+            'operation_success': operation_success,
+            'evaluation_status': execution_status,
             'status': 'completed',
             'message': summary,
             'execution_id': execution.id,
             'total_cases': len(memberships),
             'passed_cases': passed_cases,
             'failed_cases': failed_cases,
+            'incomplete_cases': incomplete_cases,
             'skipped_cases': skipped_cases,
             'pass_rate': execution.pass_rate,
             'execution_results': execution_results,
@@ -871,6 +968,7 @@ def _execute_webui_test_suite_logic(
             total_cases=suite_detail.total_cases if suite_detail else 0,
             passed_cases=0,
             failed_cases=1,
+            incomplete_cases=0,
             skipped_cases=0,
             log=error_message,
         )

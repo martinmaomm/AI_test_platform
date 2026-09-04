@@ -5,7 +5,7 @@
       <!-- 主内容区域 -->
       <div class="main-content">
         <div v-if="execution.error_message" class="execution-error">
-          <strong>失败摘要</strong>
+          <strong>{{ execution.status === 'incomplete' ? '验证提示' : '失败摘要' }}</strong>
           <pre>{{ execution.error_message }}</pre>
         </div>
         <!-- 概览内容 -->
@@ -176,6 +176,7 @@ const getStatusType = (status) => {
     'pending': 'info',
     'running': 'warning', 
     'passed': 'success',
+    'incomplete': 'warning',
     'failed': 'danger',
     'error': 'danger',
     'stopped': 'warning'
@@ -188,6 +189,7 @@ const getStatusText = (status) => {
     'pending': '待执行',
     'running': '执行中',
     'passed': '执行通过',
+    'incomplete': '验证未完成',
     'failed': '执行失败', 
     'error': '执行错误',
     'stopped': '已停止'

@@ -674,7 +674,8 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             if call.args and call.args[0].startswith('WebUI v4 ScenarioPlan rejected:')
         ]
         self.assertEqual(len(diagnostic_calls), 1)
-        self.assertEqual(diagnostic_calls[0].args[2], list(error.diagnostics))
+        self.assertEqual(diagnostic_calls[0].args[2], 'scenario_plan_invalid')
+        self.assertEqual(diagnostic_calls[0].args[3], list(error.diagnostics))
 
     def test_generation_exposes_normalizing_state_before_model_call(self):
         from .generation_orchestrator import run_generation

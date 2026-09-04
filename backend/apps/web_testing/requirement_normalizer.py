@@ -40,6 +40,7 @@ _CONTRACT_REPAIR_GUIDANCE = {
     'assertion_ref_shape': 'contains_ref/not_contains_ref 只声明 input_ref，literal 留空。',
     'assertion_literal_shape': 'contains_literal/not_contains_literal 只声明 literal，input_ref 留空。',
     'assertion_visible_shape': 'visible 断言的 input_ref 和 literal 都必须留空。',
+    'assertion_deferred_shape': 'deferred 断言的 input_ref 和 literal 都必须留空，等待探索阶段确认。',
     'duplicate_input_ref': '删除重复 input_refs，保留唯一的变量声明。',
     'duplicate_assertion_id': '为每条断言分配唯一且连续的 A1、A2、A3 编号。',
     'duplicate_criterion_assertion': '每个 criterion_index 只保留一条 assertion_requirement。',
@@ -70,7 +71,7 @@ _CONTRACT_REPAIR_GUIDANCE = {
 NORMALIZER_SYSTEM_PROMPT = """你是 WebUI 自动化测试目标整理器。将用户已明确表达的完整测试场景整理为严格 JSON。
 不得编造页面字段、按钮、定位器、接口、登录流程或业务结果。页面入口、控件和路径属于后续真实探索，不要求用户预先提供。
 instructions 是同一个智能体在同一浏览器会话里连续完成的业务流程清单，不得拆成独立子任务、状态边界或独立执行单元。
-success_criteria 是用户可验证结果。assertion_requirements 必须与 success_criteria 一一对应，criterion_index 从 0 开始，assertion_id 使用 A1/A2；phase 只能为 main 或 cleanup，kind 只能为 visible、contains_ref、not_contains_ref、contains_literal、not_contains_literal。ref 类只引用 input_refs；literal 类只能使用用户描述或测试用例上下文中原样出现的短文本，不得猜页面提示语。cleanup_expected=true 时必须增加一条能由清理动作后页面观察确认的 cleanup success criterion/requirement；不能把点击清理控件当成清理完成。
+success_criteria 是用户可验证结果。assertion_requirements 必须与 success_criteria 一一对应，criterion_index 从 0 开始，assertion_id 使用 A1/A2；phase 只能为 main 或 cleanup，kind 只能为 visible、contains_ref、not_contains_ref、contains_literal、not_contains_literal、deferred。ref 类只引用 input_refs；literal 类只能使用用户描述或测试用例上下文中原样出现的短文本，不得猜页面提示语。用户没有给出可固定的页面验证细节时，使用 deferred，input_ref 和 literal 均留空，交由后续真实探索确认或标记待补充；不要为了满足合约猜测页面提示语。cleanup_expected=true 时必须增加一条能由清理动作后页面观察确认的 cleanup success criterion/requirement；不能把点击清理控件当成清理完成。
 input_refs 的 name 必须是大写执行变量名，source 只能为 generated/runtime/credential，且每个 input ref 都必须声明 value_kind=text、email、password 或 integer。仅依据用户已明确的值类型选择；未知时用 text，不得依据网站字段名或业务词表猜测。generated 表示脚本运行时自动生成该类型合法的新值，runtime 表示运行前提供该类型的值。
 credential source 必须提供 credential_slot=username 或 password；需要登录时 credentials_required=true，并同时声明 UI_TEST_USERNAME 和 UI_TEST_PASSWORD。UI_TEST_USERNAME 的 value_kind 必须为 text，UI_TEST_PASSWORD 的 value_kind 必须为 password。用户提供的测试环境凭据可原样保留在场景语义中；如声明 credential input ref，脚本仍通过对应运行变量读取其值。
 allow_test_data_writes 必须根据用户完整场景的语义判断：只要完成目标可能改变被测系统持久状态，且用户未明确限定为只读，就必须为 true。不得使用有限动作词表或描述关键词扫描代替语义判断；显式只读约束优先。cleanup_expected 仅在这类写入后要求恢复测试数据时为 true。
@@ -80,7 +81,7 @@ forbidden_actions 描述用户禁止或平台必须阻止的高风险行为。�
 {
   "schema_version":4,"title":"","objective":"","instructions":[""],
   "success_criteria":[""],
-  "assertion_requirements":[{"assertion_id":"A1","criterion_index":0,"phase":"main","kind":"visible","input_ref":"","literal":""}],
+  "assertion_requirements":[{"assertion_id":"A1","criterion_index":0,"phase":"main","kind":"deferred","input_ref":"","literal":""}],
   "input_refs":[{"name":"TEST_INPUT","source":"generated","value_kind":"text","credential_slot":""}],
   "preconditions":[],"forbidden_actions":[],"credentials_required":false,
   "allow_test_data_writes":false,"cleanup_expected":false,"discovery_notes":[],"risk_level":"low|medium|high"
@@ -116,8 +117,7 @@ class RequirementNormalizer:
             ),
         )
         plan = _apply_explicit_read_only_override(plan, description)
-        _validate_assertion_literals(plan, description, test_case_context or {})
-        return plan
+        return _apply_user_assertion_ownership(plan, description, test_case_context or {})
 
     def _invoke_structured_plan(self, messages: list[SystemMessage | HumanMessage]) -> Any:
         """Use native LangChain structured output, but only fall back on capability gaps."""
@@ -316,11 +316,35 @@ def _apply_explicit_read_only_override(plan: ScenarioPlan, description: str) -> 
     return ScenarioPlan.model_validate({**plan.model_dump(mode='json'), **updates})
 
 
-def _validate_assertion_literals(plan: ScenarioPlan, description: str, test_case_context: dict[str, Any]) -> None:
+def _apply_user_assertion_ownership(
+    plan: ScenarioPlan, description: str, test_case_context: dict[str, Any],
+) -> ScenarioPlan:
+    """Keep user-owned literals fixed, but never fail on a model-invented one.
+
+    A generated literal has no user semantic authority.  Reclassifying only
+    that requirement as ``deferred`` preserves the success criterion and lets
+    the explorer either prove a real result or emit a pending marker.
+    """
     source = f'{description}\n{json.dumps(test_case_context, ensure_ascii=False)}'
-    invented = [
-        item.assertion_id for item in plan.assertion_requirements
-        if item.literal and item.literal not in source
+    requirements = [
+        {
+            **item.model_dump(mode='json'),
+            'kind': 'deferred',
+            'input_ref': '',
+            'literal': '',
+        }
+        if item.literal and item.literal not in source else item.model_dump(mode='json')
+        for item in plan.assertion_requirements
     ]
-    if invented:
-        raise GenerationContractError('assertion_literal_not_user_owned')
+    if (
+        requirements == [item.model_dump(mode='json') for item in plan.assertion_requirements]
+        and plan.original_user_target == _prepare_model_text(description)
+    ):
+        return plan
+    return ScenarioPlan.model_validate({
+        **plan.model_dump(mode='json'),
+        # ScenarioPlan rejects absolute URLs.  Keep the user-owned semantics
+        # in the same transport-safe form the explorer already receives.
+        'original_user_target': _prepare_model_text(description),
+        'assertion_requirements': requirements,
+    })

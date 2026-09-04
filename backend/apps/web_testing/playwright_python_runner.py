@@ -21,6 +21,7 @@ from .constants import (
     normalize_webui_execution_options,
 )
 from .script_contract import materialize_script
+from .assertion_state import analyze_assertion_state, evaluation_status, read_runtime_assertion_count
 from .execution_diagnostics import diagnose_failure
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class ExecutionConfig:
     suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
     failure_screenshot_path: Optional[str] = None
     failure_screenshot_dir: Optional[str] = None
+    runtime_assertion_count_path: Optional[str] = None
     environment_variables: Dict[str, str] = field(default_factory=dict)
 
 
@@ -58,6 +60,7 @@ class ExecutionResult:
     config: ExecutionConfig
     test_summary: Optional[Dict[str, Any]] = None
     case_results: Optional[List[Dict[str, Any]]] = None
+    runtime_assertion_count: int = 0
 
 
 class PlaywrightRunner:
@@ -71,6 +74,7 @@ class PlaywrightRunner:
     def run_single_test(self, script_id: str, script_content: str, config: ExecutionConfig) -> ExecutionResult:
         """执行单个测试脚本"""
         work_dir = self._create_work_dir(f"playwright_python_{script_id}_")
+        config.runtime_assertion_count_path = os.path.join(work_dir, 'runtime_assertions.json')
         
         try:
             self._create_test_file(work_dir, script_content, config)
@@ -142,6 +146,7 @@ class PlaywrightRunner:
                 headed=config.headed,
                 base_url=config.base_url,
                 failure_screenshot_path=config.failure_screenshot_path,
+                runtime_assertion_count_path=config.runtime_assertion_count_path,
             ))
         return test_file
     
@@ -450,6 +455,7 @@ python_functions = test_*
                                case_results: Optional[List[Dict[str, Any]]] = None) -> ExecutionResult:
         """构建执行结果"""
         test_summary = self._extract_test_summary(result.stdout) if result.stdout else None
+        runtime_assertion_count = read_runtime_assertion_count(config.runtime_assertion_count_path)
         
         return ExecutionResult(
             success=result.returncode == 0,
@@ -460,7 +466,8 @@ python_functions = test_*
             allure_report=self._normalize_allure_report_path(allure_report_path),
             config=config,
             test_summary=test_summary,
-            case_results=case_results
+            case_results=case_results,
+            runtime_assertion_count=runtime_assertion_count,
         )
     
     def _build_error_result(self, error_msg: str, work_dir: str, config: ExecutionConfig) -> ExecutionResult:
@@ -694,9 +701,20 @@ def playwright_runner(
     
     result = _runner.run_single_test(script_id, script_content, config)
     
-    error = None if result.success else diagnose_failure(result.stdout, result.stderr).summary
+    operation_success = bool(result.success)
+    evaluation, assertion_state, runtime_assertion_count = evaluation_status(
+        script_content,
+        operation_success=operation_success,
+        runtime_assertion_count=result.runtime_assertion_count,
+    )
+    error = None if operation_success else diagnose_failure(result.stdout, result.stderr).summary
     return {
-        'success': result.success,
+        # Keep raw browser/process success separate from verification status.
+        'success': operation_success,
+        'operation_success': operation_success,
+        'evaluation_status': evaluation,
+        'assertion_state': assertion_state,
+        'runtime_assertion_count': runtime_assertion_count,
         'error': error,
         'return_code': result.return_code,
         'stdout': result.stdout,
@@ -707,7 +725,7 @@ def playwright_runner(
         'browser': result.config.browser,
         'headed': result.config.headed,
         'timeout': result.config.timeout,
-        'status': 'passed' if result.success else 'failed',
+        'status': evaluation,
         'test_summary': result.test_summary,
         'screenshot_path': (
             result.config.failure_screenshot_path
@@ -740,6 +758,7 @@ def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]]
 
     return {
         'success': result.success,
+        'operation_success': bool(result.success),
         'stdout': result.stdout,
         'stderr': result.stderr,
         'error': error_msg,

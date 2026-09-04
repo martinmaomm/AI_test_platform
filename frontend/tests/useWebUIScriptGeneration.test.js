@@ -160,6 +160,39 @@ test('no execution is started until the explicit debug action', async t => {
   assert.equal(state.isWorkspaceBusy.value, true)
 })
 
+test('debug saves unified variable defaults first and sends only one-time overrides', async t => {
+  const { state, handlers, calls } = await harness(t)
+  const variables = [{ name: 'TEST_LABEL', value: 'saved-default', description: '测试名称', required: false, is_secret: false }]
+  state.updateLocalDraft({ ...state.localDraft.value, variables })
+  handlers.updateWebUIScriptGenerationDraft = async (_project, _id, payload) => ({
+    data: { ...record({ revision: 1, variables: payload.variables }), script_draft: payload.script_draft }
+  })
+  handlers.debugWebUIScriptGeneration = async () => ({ data: record({ revision: 1, variables, verification: { status: 'pending' } }) })
+
+  await state.debug([{ name: 'TEST_LABEL', value: 'only-this-debug' }])
+
+  const writes = calls.filter(call => ['updateWebUIScriptGenerationDraft', 'debugWebUIScriptGeneration'].includes(call.name))
+  assert.deepEqual(writes.map(call => call.name), ['updateWebUIScriptGenerationDraft', 'debugWebUIScriptGeneration'])
+  assert.equal(writes[0].args[2].variables[0].value, 'saved-default')
+  assert.deepEqual(writes[1].args[2].runtime_variables, [{ name: 'TEST_LABEL', value: 'only-this-debug', is_secret: false }])
+  assert.equal(writes[1].args[2].expected_revision, 1)
+  assert.equal(state.localDraft.value.variables[0].value, 'saved-default')
+})
+
+test('unified variable table can supply inferred password via transient debug override', async t => {
+  const variables = [{ name: 'TEST_PASSWORD', value: '', description: '', required: true, is_secret: true }]
+  const { state, handlers, calls, storage } = await harness(t, record({ variables }))
+  handlers.debugWebUIScriptGeneration = async () => ({ data: record({ variables, verification: { status: 'pending' } }) })
+
+  await state.debug([{ name: 'TEST_PASSWORD', value: 'fixture-password' }])
+
+  const debugCall = calls.find(call => call.name === 'debugWebUIScriptGeneration')
+  assert.deepEqual(debugCall.args[2].runtime_variables, [{ name: 'TEST_PASSWORD', value: 'fixture-password', is_secret: true }])
+  assert.equal(calls.some(call => call.name === 'updateWebUIScriptGenerationDraft'), false)
+  assert.equal(state.localDraft.value.variables[0].value, '')
+  assert.deepEqual([...storage.values()], ['test-generation'])
+})
+
 test('saving an unexecuted script sends draft mode, not verified mode', async t => {
   const { state, handlers, calls } = await harness(t)
   handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 10 } })

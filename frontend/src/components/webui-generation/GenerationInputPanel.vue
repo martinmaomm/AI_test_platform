@@ -9,19 +9,19 @@
 
     <el-form class="generation-form" label-position="top" @submit.prevent="submit">
       <el-form-item label="业务模块">
-        <el-select v-model="form.moduleId" :loading="loadingModules" :disabled="busy || paused" placeholder="未选择时保存到默认模块" clearable>
+        <el-select v-model="form.moduleId" :loading="loadingModules" :disabled="isInputBusy || paused" placeholder="未选择时保存到默认模块" clearable>
           <el-option v-for="module in flatModules" :key="module.id" :label="module.label" :value="module.id" />
         </el-select>
         <div class="field-help">业务模块只用于分类，不参与页面探索、元素定位或脚本复用。</div>
       </el-form-item>
       <el-form-item label="页面探索总超时时间（秒）">
-        <el-input-number v-model="form.explorationTimeoutSeconds" :min="explorationTimeoutMin" :max="explorationTimeoutMax" :step="60" :disabled="busy || paused" placeholder="服务器默认值" />
+        <el-input-number v-model="form.explorationTimeoutSeconds" :min="explorationTimeoutMin" :max="explorationTimeoutMax" :step="60" :disabled="isInputBusy || paused" placeholder="服务器默认值" />
         <div v-if="explorationSettings" class="field-help">有效范围 {{ explorationTimeoutMin }}-{{ explorationTimeoutMax }} 秒；仅影响本次任务，默认值来自服务器 env。</div>
         <div v-else class="field-help">服务器默认值暂不可用；可留空，创建时由服务器 env 决定。</div>
       </el-form-item>
       <el-form-item label="测试描述" required>
-        <div class="description-actions"><span>按“网址、测试账号、页面路径、探索操作、脚本验证要求”填写。可先插入示例，再替换为你的测试目标。</span><el-button text type="primary" :disabled="busy || paused" @click="insertExample">插入示例</el-button></div>
-        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="busy || paused" placeholder="先填写完整 http(s) 网址；例如：使用 Playwright MCP 登录后进入“权限 > 菜单列表”，探索新增、编辑、删除流程，再生成逐步验证的 Python Playwright 脚本。" />
+        <div class="description-actions"><span>按“网址、测试账号、页面路径、探索操作、脚本验证要求”填写。可先插入示例，再替换为你的测试目标。</span><el-button text type="primary" :disabled="isInputBusy || paused" @click="insertExample">插入示例</el-button></div>
+        <el-input v-model="form.description" type="textarea" :rows="11" resize="vertical" maxlength="2000" show-word-limit :disabled="isInputBusy || paused" placeholder="先填写完整 http(s) 网址；例如：使用 Playwright MCP 登录后进入“权限 > 菜单列表”，探索新增、编辑、删除流程，再生成逐步验证的 Python Playwright 脚本。" />
       </el-form-item>
       <el-collapse class="input-collapse">
         <el-collapse-item title="编写提示" name="tips">
@@ -35,13 +35,13 @@
         </el-collapse-item>
       </el-collapse>
       <el-form-item label="本次使用模型">
-        <el-select v-model="form.modelConfigId" :loading="loadingModels" :disabled="busy || paused" placeholder="请选择启用的 LLM">
+        <el-select v-model="form.modelConfigId" :loading="loadingModels" :disabled="isInputBusy || paused" placeholder="请选择启用的 LLM">
           <el-option v-for="model in modelConfigs" :key="model.id" :label="modelLabel(model)" :value="model.id" />
         </el-select>
         <div class="field-help">只显示已启用的语言模型；平台会锁定本次选择，生成中不会自动切换模型。</div>
       </el-form-item>
       <el-alert class="execution-scope-alert" type="warning" :closable="false" show-icon title="开始后会按测试目标在页面中执行真实操作。默认只操作本轮测试数据并尝试清理；清理失败或发现残留会明确告知，并保留已获得的证据及已有草稿供人工处理。测试描述明确仅只读时，不执行写操作。审批、付款、发布、上传等额外高风险动作目前不在授权范围。" />
-      <div class="form-actions"><el-button v-if="paused" type="warning" size="large" disabled>请先处理当前暂停任务</el-button><el-button v-else-if="!busy" type="primary" size="large" :disabled="!formValid" :loading="submitting" native-type="submit">分析并生成脚本</el-button><el-button v-else type="danger" size="large" :loading="cancelling" :disabled="cancelling" @click="emit('cancel')">取消生成</el-button></div>
+      <div class="form-actions"><el-button v-if="paused" type="warning" size="large" disabled>请先处理当前暂停任务</el-button><el-button v-else-if="generationActive" type="danger" size="large" :loading="cancelling" :disabled="isCancelBlocked" @click="handleCancel">取消生成</el-button><el-button v-else type="primary" size="large" :disabled="!formValid || isSubmitBlocked" :loading="submitting" native-type="submit">分析并生成脚本</el-button></div>
     </el-form>
   </section>
 </template>
@@ -66,9 +66,12 @@ const EXAMPLE_DESCRIPTION = `http://192.168.31.188:9990/
 4. 执行删除；
 5. 查询并验证数据不存在。`
 
-const props = defineProps({ projectId: { type: [Number, String], default: null }, modules: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, explorationSettings: { type: Object, default: null }, loadingModules: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean })
+const props = defineProps({ projectId: { type: [Number, String], default: null }, modules: { type: Array, default: () => [] }, modelConfigs: { type: Array, default: () => [] }, explorationSettings: { type: Object, default: null }, loadingModules: Boolean, loadingModels: Boolean, busy: Boolean, paused: Boolean, submitting: Boolean, cancelling: Boolean, generationActive: Boolean })
 const emit = defineEmits(['submit', 'cancel'])
 const form = reactive({ moduleId: null, description: '', modelConfigId: null, explorationTimeoutSeconds: null })
+const isInputBusy = computed(() => props.generationActive || props.busy || props.submitting || props.cancelling)
+const isSubmitBlocked = computed(() => isInputBusy.value || props.paused)
+const isCancelBlocked = computed(() => !props.generationActive || props.cancelling || props.submitting || props.paused || props.busy)
 const flattenModules = (items, depth = 0) => items.flatMap(item => [
   { ...item, label: `${'　'.repeat(depth)}${item.name}${item.is_default ? '（默认）' : ''}` },
   ...flattenModules(item.children || [], depth + 1)
@@ -86,7 +89,12 @@ watch(() => props.modules, (items) => {
 watch(() => props.projectId, () => { form.moduleId = null; form.explorationTimeoutSeconds = null })
 watch(() => props.explorationSettings, (settings) => { if (form.explorationTimeoutSeconds === null && settings) form.explorationTimeoutSeconds = settings.timeout }, { immediate: true })
 const insertExample = () => { form.description = EXAMPLE_DESCRIPTION }
+const handleCancel = () => {
+  if (isCancelBlocked.value) return
+  emit('cancel')
+}
 const submit = () => {
+  if (isSubmitBlocked.value) return
   if (!formValid.value) return ElMessage.warning('请先选择模型，并填写包含完整 URL 的测试描述。')
   emit('submit', { description: form.description.trim(), ...(form.moduleId ? { module_id: Number(form.moduleId) } : {}), model_config_id: Number(form.modelConfigId), ...explorationTimeoutPayload(form.explorationTimeoutSeconds, props.explorationSettings) })
 }

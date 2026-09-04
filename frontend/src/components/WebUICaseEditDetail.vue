@@ -36,15 +36,13 @@
 
       <section class="section-card">
         <div class="section-heading">
-          <div><h4>配置变量</h4><p>脚本通过 <code>os.getenv("VARIABLE_NAME")</code> 读取。执行时可覆盖，敏感值可标记为密码。</p></div>
+          <div><h4>配置变量</h4><p>脚本先 <code>import os</code>，再通过 <code>os.getenv("VARIABLE_NAME")</code> 读取。默认值保存到用例后可在执行时覆盖。</p></div>
           <el-button type="primary" plain @click="addVariable">添加变量</el-button>
         </div>
         <el-table :data="form.variables" empty-text="暂无变量；脚本也可以不使用变量">
           <el-table-column label="变量名" min-width="170"><template #default="{ row }"><el-input v-model="row.name" placeholder="UI_TEST_USERNAME" /></template></el-table-column>
-          <el-table-column label="默认值" min-width="190"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" show-password /></template></el-table-column>
+          <el-table-column label="默认值" min-width="190"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" :show-password="row.is_secret" /></template></el-table-column>
           <el-table-column label="说明" min-width="180"><template #default="{ row }"><el-input v-model="row.description" /></template></el-table-column>
-          <el-table-column label="必填" width="70" align="center"><template #default="{ row }"><el-switch v-model="row.required" /></template></el-table-column>
-          <el-table-column label="敏感" width="70" align="center"><template #default="{ row }"><el-switch v-model="row.is_secret" /></template></el-table-column>
           <el-table-column width="64" align="center"><template #default="{ $index }"><el-button text type="danger" @click="form.variables.splice($index, 1)">删除</el-button></template></el-table-column>
         </el-table>
       </section>

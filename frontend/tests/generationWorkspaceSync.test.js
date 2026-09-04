@@ -169,7 +169,7 @@ const createWorkspaceHarness = async ({
     const defineEmits = () => (...value) => emitted.push(value)
     ${scriptSource}
     export const __testHooks = {
-      runtimeVariables: () => runtimeVariables,
+      runtimeOverrides: () => runtimeOverrides,
       getFormScript: () => form.script_draft,
       emitted,
       setDraft: (value) => { globalThis[token].props.draft = value },
@@ -214,8 +214,7 @@ test('GenerationWorkspace 连续 rev1→rev2→rev3 同步且同 revision 内容
       { name: 'RUN', value: '', is_secret: false, required: false, description: '' }
     ])
   })
-  const runtimeVars = hooks.runtimeVariables()
-  runtimeVars[0].value = 'runtime-override'
+  hooks.runtimeOverrides().RUN = 'runtime-override'
   assert.equal(hooks.getFormScript(), 'rev-1')
   assert.equal(hooks.emitted.length, 0)
 
@@ -223,17 +222,17 @@ test('GenerationWorkspace 连续 rev1→rev2→rev3 同步且同 revision 内容
   await vueNextTick()
   assert.equal(hooks.getFormScript(), 'rev-2')
   await vueNextTick()
-  assert.equal(hooks.runtimeVariables()[0].value, 'runtime-override')
+  assert.equal(hooks.runtimeOverrides().RUN, 'runtime-override')
 
   hooks.setDraft(draftRecord(3, 'rev-3', [{ name: 'RUN', value: '', is_secret: false, required: false, description: '' }], false))
   await vueNextTick()
   assert.equal(hooks.getFormScript(), 'rev-3')
-  assert.equal(hooks.runtimeVariables()[0].value, 'runtime-override')
+  assert.equal(hooks.runtimeOverrides().RUN, 'runtime-override')
 
   hooks.setDraft(draftRecord(3, 'rev-3-fresh', [{ name: 'RUN', value: '', is_secret: false, required: false, description: '' }], false))
   await vueNextTick()
   assert.equal(hooks.getFormScript(), 'rev-3-fresh')
-  assert.equal(hooks.runtimeVariables()[0].value, 'runtime-override')
+  assert.equal(hooks.runtimeOverrides().RUN, 'runtime-override')
   assert.equal(hooks.emitted.length, 0)
 })
 
@@ -279,15 +278,14 @@ test('GenerationWorkspace 同一 generation 下同步新 script 内容保留本�
     ])
   })
 
-  const runtimeVars = hooks.runtimeVariables()
-  runtimeVars[0].value = 'runtime-override'
+  hooks.runtimeOverrides().RUN = 'runtime-override'
   await vueNextTick()
 
   hooks.setDraft(draftRecord(1, 'rev-1-fresh', [{ name: 'RUN', value: '', is_secret: false, required: false, description: '' }], false))
   await vueNextTick()
-  assert.equal(hooks.runtimeVariables()[0].value, 'runtime-override')
+  assert.equal(hooks.runtimeOverrides().RUN, 'runtime-override')
 
   hooks.setDraft({ ...draftRecord(2, 'rev-2', [{ name: 'RUN', value: '', is_secret: false, required: false, description: '' }], false), generationId: 'g2' })
   await vueNextTick()
-  assert.equal(hooks.runtimeVariables()[0].value, '')
+  assert.equal(hooks.runtimeOverrides().RUN, '')
 })

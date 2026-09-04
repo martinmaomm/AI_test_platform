@@ -36,26 +36,15 @@
     </el-alert>
 
     <section class="workspace-section">
-      <div class="section-heading"><div><h5>配置变量</h5><p>变量可用于脚本运行；调试覆盖值优先于草稿变量。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
+      <div class="section-heading"><div><h5>配置变量</h5><p>脚本先 <code>import os</code>，再通过 <code>os.getenv("VARIABLE_NAME")</code> 读取。调试覆盖值仅本次生效，留空使用默认值；保存到用例后可在执行时覆盖。</p></div><el-button size="small" plain :disabled="busy" @click="addVariable">添加变量</el-button></div>
       <el-table :data="form.variables" size="small" empty-text="暂无变量">
         <el-table-column label="变量名" min-width="145"><template #default="{ row }"><el-input v-model="row.name" :disabled="busy" placeholder="UI_TEST_USERNAME" @input="emitDraft" /></template></el-table-column>
-        <el-table-column label="默认值" min-width="160"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" show-password :disabled="busy" @input="emitDraft" /></template></el-table-column>
+        <el-table-column label="默认值" min-width="190"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" :show-password="row.is_secret" :disabled="busy || row.is_secret" :placeholder="row.is_secret ? '仅在本次调试覆盖值中填写' : ''" @input="emitDraft" /></template></el-table-column>
+        <el-table-column label="本次调试覆盖值" min-width="190"><template #default="{ row }"><el-input v-model="runtimeOverrides[row.name]" :type="row.is_secret ? 'password' : 'text'" :show-password="row.is_secret" :disabled="busy || !row.name" placeholder="留空使用默认值" /></template></el-table-column>
         <el-table-column label="说明" min-width="160"><template #default="{ row }"><el-input v-model="row.description" :disabled="busy" @input="emitDraft" /></template></el-table-column>
-        <el-table-column label="必填" width="68"><template #default="{ row }"><el-switch v-model="row.required" :disabled="busy" @change="emitDraft" /></template></el-table-column>
-        <el-table-column label="敏感" width="68"><template #default="{ row }"><el-switch v-model="row.is_secret" :disabled="busy" @change="emitDraft" /></template></el-table-column>
         <el-table-column width="64"><template #default="{ $index }"><el-button text type="danger" :disabled="busy" @click="removeVariable($index)">删除</el-button></template></el-table-column>
       </el-table>
     </section>
-
-    <el-collapse class="runtime-variables">
-      <el-collapse-item title="本次调试变量（可选）" name="runtime">
-        <p>这里的值会覆盖草稿变量并用于本次真实调试。</p>
-        <el-table :data="runtimeVariables" size="small" empty-text="先在上方配置变量">
-          <el-table-column prop="name" label="变量" min-width="160" />
-          <el-table-column label="本次覆盖值" min-width="220"><template #default="{ row }"><el-input v-model="row.value" :type="row.is_secret ? 'password' : 'text'" show-password :disabled="busy" /></template></el-table-column>
-        </el-table>
-      </el-collapse-item>
-    </el-collapse>
 
     <div class="workspace-actions">
       <el-button :loading="draftSaving" :disabled="busy || !canSaveDraft" @click="emit('save-draft')">保存草稿</el-button>
@@ -86,7 +75,7 @@ const props = defineProps({
 })
 const emit = defineEmits(['update-draft', 'save-draft', 'debug'])
 const form = reactive({ script_draft: '', variables: [] })
-const runtimeVariables = reactive([])
+const runtimeOverrides = reactive({})
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
 const verification = computed(() => workspace.value.verification || {})
 const draftDirty = computed(() => Boolean(props.draft?.dirty))
@@ -110,17 +99,20 @@ const copyVariables = (variables) => (variables || []).map(item => ({
   name: item?.name || '', value: item?.value || '', is_secret: Boolean(item?.is_secret),
   required: Boolean(item?.required), description: item?.description || ''
 }))
+const replaceRuntimeOverrides = (values = new Map()) => {
+  Object.keys(runtimeOverrides).forEach(name => delete runtimeOverrides[name])
+  form.variables.forEach(item => {
+    const name = item.name || ''
+    if (name.trim()) runtimeOverrides[name] = values.get(name) ?? ''
+  })
+}
 const reset = () => {
   const nextGenerationId = props.draft?.generationId || null
   const shouldClearRuntimeValues = lastSyncedGenerationId !== null && lastSyncedGenerationId !== nextGenerationId
-  const existingRuntimeMap = shouldClearRuntimeValues
-    ? new Map()
-    : new Map(runtimeVariables.map(item => [item.name, item.value]))
+  const existingRuntimeMap = shouldClearRuntimeValues ? new Map() : new Map(Object.entries(runtimeOverrides))
   form.script_draft = props.draft?.script_draft || ''
   form.variables = copyVariables(props.draft?.variables)
-  runtimeVariables.splice(0, runtimeVariables.length, ...form.variables
-    .filter(item => item.name)
-    .map(item => ({ name: item.name, value: existingRuntimeMap.get(item.name) || '', is_secret: item.is_secret })))
+  replaceRuntimeOverrides(existingRuntimeMap)
   lastSyncedGenerationId = nextGenerationId
 }
 // Do not watch `dirty`: the first edit changes it and must not reset the
@@ -135,10 +127,7 @@ watch(
   { deep: true, immediate: true }
 )
 watch(() => form.variables, () => {
-  const existing = new Map(runtimeVariables.map(item => [item.name, item.value]))
-  runtimeVariables.splice(0, runtimeVariables.length, ...form.variables
-    .filter(item => item.name)
-    .map(item => ({ name: item.name, value: existing.get(item.name) || '', is_secret: item.is_secret })))
+  replaceRuntimeOverrides(new Map(Object.entries(runtimeOverrides)))
 }, { deep: true })
 const emitDraft = () => emit('update-draft', {
   generationId: props.generation?.id,
@@ -159,9 +148,11 @@ const requestDebug = async () => {
   if (!canDebug.value) return ElMessage.warning('请先填写有效脚本和变量名。')
   try {
     await ElMessageBox.confirm('将真实执行当前脚本，并只允许操作约定的测试数据。系统不会自动重试业务写操作。是否确认继续？', '确认真实调试', { type: 'warning', confirmButtonText: '确认真实执行', cancelButtonText: '取消' })
-    const values = runtimeVariables.filter(item => item.name && item.value !== '').map(item => ({ name: item.name, value: item.value }))
+    const values = form.variables
+      .map(item => ({ name: item.name?.trim(), value: runtimeOverrides[item.name] }))
+      .filter(item => item.name && item.value !== undefined && item.value !== null && item.value !== '')
     emit('debug', values)
-    runtimeVariables.forEach(item => { item.value = '' })
+    replaceRuntimeOverrides()
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error('调试确认失败，请重试。')
   }
@@ -169,5 +160,5 @@ const requestDebug = async () => {
 </script>
 
 <style scoped>
-.workspace { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; max-width: 100%; }.workspace-status, .section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; min-width: 0; }.workspace-status h5, .section-heading h5 { margin: 0; color: var(--app-text-primary); font-size: 14px; }.workspace-status p, .section-heading p, .runtime-variables p { margin: 5px 0 0; color: var(--app-text-secondary); font-size: 13px; line-height: 1.6; }.workspace-section, .script-section, .script-editor, .runtime-variables { min-width: 0; max-width: 100%; }.workspace-section { padding: 16px; border: 1px solid var(--app-border); border-radius: 8px; }.script-editor { height: clamp(520px, 64vh, 820px); min-height: 420px; resize: vertical; overflow: hidden; margin-top: 12px; }.runtime-variables { margin-top: -4px; }.workspace-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.verification-message { margin-top: -4px; }.execution-section { padding: 0; overflow: hidden; }.execution-section > .section-heading { padding: 16px 16px 0; }.workspace :deep(.el-table) { width: 100%; max-width: 100%; }.workspace :deep(.el-table__body-wrapper), .workspace :deep(.el-scrollbar__wrap) { overflow-x: auto; }.workspace :deep(.monaco-editor-container) { min-width: 0; max-width: 100%; } @media (max-width: 640px) { .workspace-status, .section-heading { flex-direction: column; }.workspace-actions :deep(.el-button) { flex: 1 1 100%; margin-left: 0; } }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; max-width: 100%; }.workspace-status, .section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; min-width: 0; }.workspace-status h5, .section-heading h5 { margin: 0; color: var(--app-text-primary); font-size: 14px; }.workspace-status p, .section-heading p { margin: 5px 0 0; color: var(--app-text-secondary); font-size: 13px; line-height: 1.6; }.workspace-section, .script-section, .script-editor { min-width: 0; max-width: 100%; }.workspace-section { padding: 16px; border: 1px solid var(--app-border); border-radius: 8px; }.script-editor { height: clamp(520px, 64vh, 820px); min-height: 420px; resize: vertical; overflow: hidden; margin-top: 12px; }.workspace-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.verification-message { margin-top: -4px; }.execution-section { padding: 0; overflow: hidden; }.execution-section > .section-heading { padding: 16px 16px 0; }.workspace :deep(.el-table) { width: 100%; max-width: 100%; }.workspace :deep(.el-table__body-wrapper), .workspace :deep(.el-scrollbar__wrap) { overflow-x: auto; }.workspace :deep(.monaco-editor-container) { min-width: 0; max-width: 100%; } @media (max-width: 640px) { .workspace-status, .section-heading { flex-direction: column; }.workspace-actions :deep(.el-button) { flex: 1 1 100%; margin-left: 0; } }
 </style>

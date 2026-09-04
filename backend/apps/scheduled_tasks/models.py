@@ -52,11 +52,13 @@ class ScheduledTask(models.Model):
         help_text="格式: 分 时 日 月 周 (如: 0 9 * * 1-5 表示工作日9点执行)"
     )
     
-    # 环境配置
+    # API/App schedules use a shared environment; WebUI scripts own full URLs.
     environment = models.ForeignKey(
-        Environment, 
-        on_delete=models.CASCADE, 
-        verbose_name="执行环境"
+        Environment,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        verbose_name="执行环境",
     )
     
     # 任务状态
@@ -265,6 +267,5 @@ class TaskExecutionLog(models.Model):
         if self.total_cases > 0:
             return round((self.passed_cases / self.total_cases) * 100, 2)
         return 0
-
 
 

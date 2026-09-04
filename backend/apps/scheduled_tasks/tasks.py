@@ -192,7 +192,6 @@ def _execute_web_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
                 trigger_type='schedule',
                 executor=task.user,
                 project=suite.project,
-                environment=task.environment,
                 browser='chromium'  # 默认浏览器
             )
             

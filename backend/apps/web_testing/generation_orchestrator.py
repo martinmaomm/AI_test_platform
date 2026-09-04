@@ -12,10 +12,10 @@ from ai_core.model_manager import get_llm_manager
 
 from .exploration_timeout import exploration_total_timeout_seconds
 from .generation_events import publish_stage_changed, publish_terminal
-from .generation_preflight import environment_credentials, run_safety_preflight
+from .generation_preflight import run_safety_preflight
 from .generation_repository import (
     PAUSED_GENERATION_STATUSES, claim_generation_worker, claim_trace_generation_retry,
-    finalize_generation_artifact, get_generation_temporary_credentials, is_cancel_requested,
+    finalize_generation_artifact, is_cancel_requested,
     persist_generation_checkpoint, transition_generation,
 )
 from .generation_workspace import evaluate_workspace_draft, workspace_for_generation
@@ -150,7 +150,7 @@ def _persist_agent_result(
     if script_draft.strip():
         try:
             report = evaluate_workspace_draft(
-                script_draft, start_path=generation.start_path, snapshot=snapshot,
+                script_draft, target_url=generation.target_url, snapshot=snapshot,
             )
         except Exception as exc:
             logger.exception('脚本静态检查不可用: generation_id=%s', generation.pk)
@@ -214,7 +214,7 @@ def _persist_agent_result(
 
 def _run_agent(
     generation: WebUIScriptGeneration, *, celery_task_id: str | None, brief: dict[str, Any],
-    credentials: dict[str, str] | None, mcp_config: dict[str, Any], code_only: bool,
+    mcp_config: dict[str, Any], code_only: bool,
 ) -> dict[str, Any]:
     from .script_exploration_agent import ScriptExplorationAgent
 
@@ -233,8 +233,8 @@ def _run_agent(
             checkpoint_callback=_checkpoint_callback(generation),
         )
         result = asyncio.run(agent.generate(
-            brief=brief, start_path=generation.start_path, target_url=generation.target_url_safe,
-            credentials=credentials, saved_snapshot=generation.exploration_snapshot if code_only else None,
+            brief=brief, target_url=generation.target_url,
+            saved_snapshot=generation.exploration_snapshot if code_only else None,
             script_draft=generation.script_draft if code_only else '', code_only=code_only,
         ))
     except Exception as exc:
@@ -263,7 +263,7 @@ def _run_agent(
 def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> dict[str, Any]:
     """Run a fresh v5 generation without ScenarioPlan normalization or finalization."""
     try:
-        generation = WebUIScriptGeneration.objects.select_related('environment', 'test_case', 'user').get(pk=generation_id)
+        generation = WebUIScriptGeneration.objects.select_related('test_case', 'user').get(pk=generation_id)
     except Exception:
         return {'generation_id': str(generation_id), 'status': 'failed', 'error_code': 'TRANSIENT_SERVICE_ERROR'}
     if _terminal_cancel(str(generation.pk), celery_task_id):
@@ -288,7 +288,7 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
             return _fail(str(generation.pk), 'INPUT_INVALID', '无法整理测试目标，请检查描述后重试。')
         generation = transition_generation(
             generation.pk, WebUIScriptGeneration.Status.PREFLIGHTING, progress=25,
-            updates={'scenario_spec': brief, 'credentials_required': bool(brief.get('credentials_required'))},
+            updates={'scenario_spec': brief},
         )
     elif generation.status == WebUIScriptGeneration.Status.PREFLIGHTING:
         brief = generation.scenario_spec if isinstance(generation.scenario_spec, dict) else {}
@@ -296,11 +296,9 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
             return _fail(str(generation.pk), 'LEGACY_GENERATION_UNSUPPORTED', '旧版生成记录不能自动恢复，请手动处理已有源码。')
     else:
         return _fail(str(generation.pk), 'TRANSIENT_SERVICE_ERROR', '当前生成阶段不能继续。')
-    credentials = get_generation_temporary_credentials(generation.pk) or environment_credentials(generation.environment)
-    preflight = run_safety_preflight(generation, brief, credentials_available=credentials is not None)
+    preflight = run_safety_preflight(generation, brief)
     if preflight.outcome != 'continue':
         target = {
-            'needs_credentials': WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
             'needs_confirmation': WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
             'failed': WebUIScriptGeneration.Status.FAILED,
         }[preflight.outcome]
@@ -312,7 +310,7 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
             publish_terminal(paused)
         return {'generation_id': str(paused.pk), 'status': paused.status, 'error_code': paused.error_code}
     return _run_agent(
-        generation, celery_task_id=celery_task_id, brief=brief, credentials=credentials,
+        generation, celery_task_id=celery_task_id, brief=brief,
         mcp_config=preflight.mcp_config or {}, code_only=False,
     )
 
@@ -328,5 +326,5 @@ def run_generation_from_trace(generation_id: str, *, celery_task_id: str | None 
         return _fail(str(generation.pk), 'LEGACY_GENERATION_UNSUPPORTED', '旧版记录不能自动恢复，请手动处理已有源码。')
     return _run_agent(
         generation, celery_task_id=celery_task_id, brief=brief,
-        credentials=None, mcp_config={}, code_only=True,
+        mcp_config={}, code_only=True,
     )

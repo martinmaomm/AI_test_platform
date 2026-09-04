@@ -40,13 +40,9 @@
                   <span class="label">开始时间：</span>
                     <span class="value">{{ formatTime(execution.start_time) }}</span>
                   </div>
-                  <div class="info-item">
-                  <span class="label">测试环境：</span>
-                  <span class="value">{{ getEnvironmentText(execution.environment_name, execution.environment_base_url) }}</span>
-                </div>
-                <div class="info-item">
-                  <span class="label">Base URL：</span>
-                  <span class="value value-url">{{ execution.environment_base_url || '未配置' }}</span>
+                <div v-if="actualUrl" class="info-item">
+                  <span class="label">实际访问地址：</span>
+                  <span class="value value-url">{{ actualUrl }}</span>
                 </div>
                 <div class="info-item">
                   <span class="label">执行时长：</span>
@@ -290,13 +286,7 @@ const formatDuration = (duration) => {
   return duration
 }
 
-const getEnvironmentText = (name, baseUrl) => {
-  if (!name && !baseUrl) return 'N/A'
-  if (name && baseUrl) {
-    return `${name} (${baseUrl})`
-  }
-  return name || baseUrl || 'N/A'
-}
+const actualUrl = computed(() => props.execution?.diagnostics?.actual_url || props.execution?.actual_url || '')
 
 const getStatusType = (status) => ({
   pending: 'info',

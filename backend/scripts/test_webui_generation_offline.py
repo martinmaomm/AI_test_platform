@@ -48,11 +48,12 @@ def main():
         django.setup()
         from django.core.management import call_command
         from django.test.runner import DiscoverRunner
-        call_command('makemigrations', 'ai_core', 'web_testing', dry_run=True, check=True, verbosity=1)
+        call_command('makemigrations', 'ai_core', 'web_testing', 'scheduled_tasks', dry_run=True, check=True, verbosity=1)
         labels = sys.argv[1:] or [
             'ai_core.tests.test_webui_playwright_agent',
             'ai_core.tests.test_mcp_output_connections',
             'ai_core.tests.test_mcp_agent_budget',
+            'scheduled_tasks.test_environment_contract',
             'web_testing',
         ]
         return bool(DiscoverRunner(verbosity=1, interactive=False).run_tests(labels))

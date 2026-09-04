@@ -13,7 +13,7 @@ from playwright.async_api import expect
 
 async def run(page, variables):
     # 打开目标页面
-    await page.goto('/')
+    await page.goto('https://example.test/')
     # 使用本轮唯一数据填表
     name = variables.get('NAME') or f'user_{time.time_ns()}'
     await page.get_by_label('Display name').fill(name)
@@ -30,7 +30,7 @@ class GenerationBriefTests(SimpleTestCase):
         self.assertEqual(brief.original_user_target, text)
         self.assertEqual(brief.model_dump()['schema_version'], 5)
         self.assertNotIn('assertion_requirements', brief.model_dump())
-        self.assertFalse(brief.credentials_required)
+        self.assertNotIn('credentials_required', brief.model_dump())
 
     def test_no_site_specific_action_vocabulary(self):
         for text in ['探索工作流归档与恢复', 'Explore the telescope calibration panel', '搜索并查看商品']:
@@ -74,7 +74,7 @@ class AgentDraftQualityTests(SimpleTestCase):
         self.assertEqual(evaluation_status(script, operation_success=False, runtime_assertion_count=1)[0], 'failed')
 
     def test_missing_navigation_cannot_be_saved_as_executable_case(self):
-        report = evaluate_draft(SCRIPT.replace("    await page.goto('/')\n", ''))
+        report = evaluate_draft(SCRIPT.replace("    await page.goto('https://example.test/')\n", ''))
         self.assertIn('ENTRY_NAVIGATION_MISSING', [item['code'] for item in report['blockers']])
 
     def test_dangerous_imports_and_calls_are_blocked(self):
@@ -95,9 +95,23 @@ class AgentDraftQualityTests(SimpleTestCase):
         self.assertIn('UNDEFINED_NAME', [item['code'] for item in report['blockers']])
 
     def test_external_navigation_and_top_level_execution_are_blocked(self):
-        report = evaluate_draft(SCRIPT.replace("page.goto('/')", "page.goto('https://outside.test/')"))
-        self.assertIn('NAVIGATION_OUTSIDE_ENVIRONMENT', [item['code'] for item in report['blockers']])
+        report = evaluate_draft(SCRIPT.replace("page.goto('https://example.test/')", "page.goto('https://outside.test/')"), target_url='https://example.test/')
+        self.assertIn('NAVIGATION_OUTSIDE_TARGET', [item['code'] for item in report['blockers']])
         self.assertIn('TOP_LEVEL_EXECUTION', [item['code'] for item in evaluate_draft(SCRIPT + '\nprint("import work")')['blockers']])
+
+    def test_relative_navigation_is_not_a_complete_address(self):
+        for navigation in ("page.goto('/')", "page.goto(url='/catalog')"):
+            report = evaluate_draft(SCRIPT.replace("page.goto('https://example.test/')", navigation))
+            self.assertTrue(report['blockers'])
+
+    def test_exact_entry_including_query_and_hash_is_preserved(self):
+        target = 'https://example.test/ui?mode=test#/catalog'
+        script = SCRIPT.replace('https://example.test/', target)
+        report = evaluate_draft(script, target_url=target)
+        self.assertEqual(report['blockers'], [])
+        self.assertNotIn('TARGET_URL_CHANGED', [item['code'] for item in report['warnings']])
+        changed = evaluate_draft(script, target_url='https://example.test/other')
+        self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in changed['warnings']])
 
     def test_no_assertion_is_editable_but_not_complete(self):
         script = SCRIPT.replace("    await expect(page.locator('#result')).to_have_text(name)\n", '')

@@ -13,7 +13,7 @@ const methods = [
   'resolveWebUIScriptGeneration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
 ]
 const record = (workspace = {}) => ({
-  id: 'test-generation', status: 'ready', environment_id: 4, script_draft: 'async def run(page):\n    pass',
+  id: 'test-generation', status: 'ready', target_url: 'https://example.test/', script_draft: 'async def run(page):\n    pass',
   workspace: { revision: 0, variables: [], verification: { status: 'unverified' }, repair: { status: 'idle' }, ...workspace }
 })
 const deferred = () => {
@@ -176,6 +176,23 @@ test('failed creation keeps the previous editable draft', async t => {
   await assert.rejects(state.create({ description: 'another generation' }))
   assert.equal(state.localDraft.value.script_draft, 'keep these edits')
   assert.equal(state.hasUnsavedDraft.value, true)
+})
+
+test('creation forwards only the environment-free generation contract', async t => {
+  const { state, calls } = await harness(t, record(), { create: false })
+  await state.create({
+    description: '目标网址：https://example.test/login\\n测试账号：demo / demo-password',
+    module_id: 8,
+    model_config_id: 12,
+    exploration_timeout_seconds: 600
+  })
+  const created = calls.find(call => call.name === 'createWebUIScriptGeneration')
+  assert.deepEqual(created.args, [1, {
+    description: '目标网址：https://example.test/login\\n测试账号：demo / demo-password',
+    module_id: 8,
+    model_config_id: 12,
+    exploration_timeout_seconds: 600
+  }])
 })
 
 test('old polling cannot resume while a replacement generation is being created', async t => {

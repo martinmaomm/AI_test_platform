@@ -75,8 +75,8 @@ const SCRIPT_TEMPLATE = `from playwright.async_api import expect
 
 async def run(page):
     """场景：请在这里描述本用例验证的业务流程。"""
-    # 步骤 1：打开起始页面
-    await page.goto("/")
+    # 步骤 1：替换为实际测试页面的完整网址（包含需要的路径、查询参数）
+    await page.goto("https://example.test/admin/users")
 
     # 验证：页面已成功打开
     await expect(page.locator("body")).to_be_visible()

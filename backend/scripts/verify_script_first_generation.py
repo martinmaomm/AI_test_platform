@@ -131,18 +131,21 @@ def main():
                 generation_id=str(uuid.uuid4()), cancel_check=lambda: False,
                 exploration_timeout_seconds=args.timeout, checkpoint_callback=checkpoint,
             )
+            description = f'目标网址：{base_url + path}\n{goal}'
+            if credentials:
+                description += f'\n测试登录账号 {credentials["username"]}，密码 {credentials["password"]}。'
             result = asyncio.run(agent.generate(
-                brief=build_generation_brief(goal, title=name).model_dump(),
-                start_path=path, target_url=base_url + path, credentials=credentials,
+                brief=build_generation_brief(description, title=name).model_dump(),
+                target_url=base_url + path,
             ))
             (directory / 'generated.py').write_text(result.script_draft, encoding='utf-8')
             (directory / 'snapshot.json').write_text(json.dumps(result.snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
-            quality = evaluate_draft(result.script_draft, start_path=path, snapshot=result.snapshot)
+            quality = evaluate_draft(result.script_draft, target_url=base_url + path, snapshot=result.snapshot)
             (directory / 'quality.json').write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding='utf-8')
             outcome = {'scenario': name, 'error_code': result.error_code, 'completion': result.completion, 'checkpoints': checkpoint_count, 'script_chars': len(result.script_draft), 'stats': result.snapshot.get('tool_stats'), 'blockers': quality['blockers'], 'runs': []}
             if result.script_draft and not quality['blockers']:
                 for run in range(2):
-                    config = ExecutionConfig(base_url=base_url, timeout=60, generate_allure=False, failure_screenshot_path=str(directory / f'failure-{run + 1}.png'), environment_variables={'UI_TEST_USERNAME': 'fixture-user', 'UI_TEST_PASSWORD': 'fixture-pass'})
+                    config = ExecutionConfig(timeout=60, generate_allure=False, failure_screenshot_path=str(directory / f'failure-{run + 1}.png'), environment_variables={'UI_TEST_USERNAME': 'fixture-user', 'UI_TEST_PASSWORD': 'fixture-pass'})
                     execution = PlaywrightRunner().run_single_test(f'smoke-{name}-{run}', result.script_draft, config)
                     status, _, count = evaluation_status(result.script_draft, operation_success=execution.success, runtime_assertion_count=execution.runtime_assertion_count)
                     outcome['runs'].append({'status': status, 'runtime_assertion_count': count})

@@ -27,8 +27,8 @@
 
     <el-dialog v-model="runVisible" title="运行测试套件" width="640px">
       <el-alert title="套件会按顺序独立执行所有脚本；单个脚本失败后仍继续执行。" type="info" :closable="false" show-icon />
-      <el-form label-position="top" class="run-form"><el-form-item label="测试环境" required><el-select v-model="runForm.environmentId"><el-option v-for="item in environments" :key="item.id" :label="`${item.name} · ${item.config?.base_url || ''}`" :value="item.id" /></el-select></el-form-item><div class="form-grid"><el-form-item label="运行模式"><el-switch v-model="runForm.headed" active-text="显示浏览器" inactive-text="无头模式" /></el-form-item><el-form-item label="超时时间（每个脚本/秒）"><el-input-number v-model="runForm.timeout" :min="30" :max="1800" /></el-form-item></div></el-form>
-      <div class="section-heading"><div><h4>本次覆盖变量</h4><p>优先级：本次覆盖 &gt; 套件变量 &gt; 用例变量 &gt; 环境变量。</p></div><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div><div v-for="(item, index) in runForm.variables" :key="index" class="runtime-row"><el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="本次值" /><el-switch v-model="item.is_secret" active-text="敏感" /><el-button text type="danger" @click="runForm.variables.splice(index, 1)">删除</el-button></div>
+      <el-form label-position="top" class="run-form"><div class="form-grid"><el-form-item label="运行模式"><el-switch v-model="runForm.headed" active-text="显示浏览器" inactive-text="无头模式" /></el-form-item><el-form-item label="超时时间（每个脚本/秒）"><el-input-number v-model="runForm.timeout" :min="30" :max="1800" /></el-form-item></div></el-form>
+      <div class="section-heading"><div><h4>本次覆盖变量</h4><p>优先级：本次覆盖 &gt; 套件变量 &gt; 用例变量。</p></div><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div><div v-for="(item, index) in runForm.variables" :key="index" class="runtime-row"><el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="本次值" /><el-switch v-model="item.is_secret" active-text="敏感" /><el-button text type="danger" @click="runForm.variables.splice(index, 1)">删除</el-button></div>
       <template #footer><el-button @click="runVisible = false">取消</el-button><el-button type="primary" :loading="running" @click="runSuite">开始运行</el-button></template>
     </el-dialog>
   </div>
@@ -38,7 +38,6 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
-import { getProjectEnvironments } from '@/api/projects'
 import {
   addTestCasesToSuite,
   createWebUITestSuite,
@@ -56,7 +55,6 @@ const projectStore = useProjectStore()
 const projectId = computed(() => projectStore.currentProject?.id)
 const suites = ref([])
 const allCases = ref([])
-const environments = ref([])
 const loading = ref(false)
 const saving = ref(false)
 const running = ref(false)
@@ -68,15 +66,14 @@ const caseToAdd = ref(null)
 const filters = reactive({ search: '', status: null })
 const pagination = reactive({ page: 1, pageSize: 20, total: 0 })
 const form = reactive({ name: '', description: '', status: 'active', variables: [], testCases: [], originalCaseIds: [] })
-const runForm = reactive({ environmentId: null, headed: true, timeout: 300, variables: [] })
+const runForm = reactive({ headed: true, timeout: 300, variables: [] })
 const unwrap = result => result?.data ?? result ?? {}
 const asList = result => { const body = unwrap(result); if (Array.isArray(body)) return body; if (Array.isArray(body.results)) return body.results; if (Array.isArray(body.items)) return body.items; if (Array.isArray(body.data)) return body.data; if (Array.isArray(body.data?.results)) return body.data.results; return [] }
 const availableCases = computed(() => allCases.value.filter(item => !form.testCases.some(selected => selected.id === item.id)))
 
 const loadSuites = async () => { if (!projectId.value) return; loading.value = true; try { const result = await getWebUITestSuites(projectId.value, { page: pagination.page, page_size: pagination.pageSize, search: filters.search || undefined, status: filters.status || undefined }); const body = unwrap(result); suites.value = asList(result); pagination.total = body.count ?? body.total ?? body.data?.count ?? suites.value.length } catch { ElMessage.error('加载测试套件失败') } finally { loading.value = false } }
 const loadCases = async () => { allCases.value = asList(await getWebUITestCases(projectId.value, { page_size: 100, script_status: 'ready' })) }
-const loadEnvironments = async () => { environments.value = asList(await getProjectEnvironments(projectId.value, { category: 'web' })).filter(item => item.is_active); runForm.environmentId = environments.value[0]?.id || null }
-watch(projectId, async () => { if (!projectId.value) return; await Promise.all([loadSuites(), loadCases(), loadEnvironments()]) }, { immediate: true })
+watch(projectId, async () => { if (!projectId.value) return; await Promise.all([loadSuites(), loadCases()]) }, { immediate: true })
 
 const resetForm = source => { editingId.value = source?.id || null; form.name = source?.name || ''; form.description = source?.description || ''; form.status = source?.status || 'active'; form.variables = (source?.variables || []).map(item => ({ ...item })); form.testCases = (source?.test_cases || []).map(item => ({ ...item })); form.originalCaseIds = form.testCases.map(item => item.id) }
 const openCreate = () => { resetForm(null); editorVisible.value = true }
@@ -115,7 +112,7 @@ const removeSuite = async row => { try { await ElMessageBox.confirm(`确定删�
 
 const openRun = async row => { const result = await getWebUITestSuite(projectId.value, row.id); runningSuite.value = unwrap(result); runForm.variables = []; runVisible.value = true }
 const addRuntimeVariable = () => runForm.variables.push({ name: '', value: '', is_secret: false })
-const runSuite = async () => { if (!runForm.environmentId) return ElMessage.warning('请选择测试环境'); if (runForm.variables.some(item => !item.name.trim())) return ElMessage.warning('变量名不能为空'); running.value = true; try { const result = await executeWebUITestSuite(projectId.value, runningSuite.value.id, { environment_id: runForm.environmentId, options: { headed: runForm.headed, timeout: runForm.timeout }, runtime_variables: runForm.variables }); runVisible.value = false; ElMessage.success(`套件执行已启动${unwrap(result).task_id ? `：${unwrap(result).task_id}` : ''}`) } catch (error) { ElMessage.error(error?.response?.data?.message || '启动套件执行失败') } finally { running.value = false } }
+const runSuite = async () => { if (runForm.variables.some(item => !item.name.trim())) return ElMessage.warning('变量名不能为空'); running.value = true; try { const result = await executeWebUITestSuite(projectId.value, runningSuite.value.id, { options: { headed: runForm.headed, timeout: runForm.timeout }, runtime_variables: runForm.variables }); runVisible.value = false; ElMessage.success(`套件执行已启动${unwrap(result).task_id ? `：${unwrap(result).task_id}` : ''}`) } catch (error) { ElMessage.error(error?.response?.data?.message || '启动套件执行失败') } finally { running.value = false } }
 const formatTime = value => value ? new Date(value).toLocaleString() : '-'
 </script>
 

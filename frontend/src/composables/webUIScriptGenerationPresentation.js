@@ -12,7 +12,7 @@ export const ACTIVE_GENERATION_STATUSES = new Set([
 ])
 
 export const PAUSED_GENERATION_STATUSES = new Set([
-  'needs_input', 'needs_confirmation', 'needs_credentials'
+  'needs_input', 'needs_confirmation'
 ])
 
 export const TERMINAL_GENERATION_STATUSES = new Set([
@@ -29,7 +29,6 @@ const STATUS_LABELS = {
   repairing: '正在整理脚本草稿',
   needs_input: '需要补充场景信息',
   needs_confirmation: '需要确认目标范围',
-  needs_credentials: '需要本轮测试登录信息',
   needs_review: '需要人工检查',
   ready: '草稿已就绪（未代表测试通过）',
   ready_with_warnings: '草稿已就绪（有警告，未代表测试通过）',
@@ -82,15 +81,13 @@ export const isWorkspaceActive = (workspace) => (
   WORKSPACE_ACTIVITY_STATUSES.has(workspace?.verification?.status) ||
   WORKSPACE_ACTIVITY_STATUSES.has(workspace?.repair?.status)
 )
-export const isCurrentRevisionVerified = (workspace, revision, environmentId = undefined) => {
+export const isCurrentRevisionVerified = (workspace, revision) => {
   const verification = workspace?.verification || {}
   const verifiedRevision = verification.locked_revision ?? verification.revision ?? verification.verified_revision
   return verification.status === 'passed'
     && Number(verification.runtime_assertion_count || 0) > 0
     && verification.assertion_state?.status === 'complete'
-    && Number(verifiedRevision) === Number(revision) && (
-    environmentId === undefined || Number(verification.environment_id) === Number(environmentId)
-  )
+    && Number(verifiedRevision) === Number(revision)
 }
 
 export const generationHasStaticBlockers = (generation) => {
@@ -138,11 +135,9 @@ export const canRetryScriptFromTrace = (generation, busy = false) => {
 
 const GENERATION_FIELD_LABELS = {
   description: '测试描述',
-  environment_id: 'WebUI 测试环境',
   module_id: '业务模块',
-  start_path: '起始相对路径',
   model_config_id: '本次使用模型',
-  temporary_credentials: '本次探索登录信息',
+  exploration_timeout_seconds: '页面探索总超时时间',
   non_field_errors: '生成配置'
 }
 
@@ -173,13 +168,6 @@ export const generationActionRequired = (generation) => {
   const errorCode = generation?.error_code || ''
   const remainingAttempts = Math.max(0, 3 - Number(generation?.resume_count || 0))
 
-  if (status === 'needs_credentials') {
-    return {
-      kind: 'credentials', title: '需要本轮测试登录信息',
-      description: generation?.error_message || '登录信息缺失或已过期，请重新提供后继续。',
-      questions: [], primaryLabel: '提交登录信息并继续', remainingAttempts
-    }
-  }
   if (status === 'needs_input') {
     return {
       kind: 'description', title: '场景信息不足',
@@ -251,7 +239,6 @@ export const generationResolutionHint = (generation) => {
   const status = generation?.status
   if (status === 'needs_input') return '请补充明确的测试目标、操作步骤和至少一个可验证结果后重新分析。页面元素和平台默认清理策略不需要填写。'
   if (status === 'needs_confirmation') return '请确认本次测试目标范围。平台会在一个连续会话中自行探索页面元素；额外高风险操作仍需单独调整目标。'
-  if (status === 'needs_credentials') return '请在“本轮测试登录信息”中填写临时账号和密码后重新发起。'
   if (status === 'needs_review') {
     const reason = generationFailureReason(generation)
     const completion = generationDraftCompletion(generation)

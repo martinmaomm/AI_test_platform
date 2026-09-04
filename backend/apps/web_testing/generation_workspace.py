@@ -45,16 +45,27 @@ def script_hash(script: str | None) -> str:
     return hashlib.sha256((script or '').strip().encode('utf-8')).hexdigest()
 
 
+def variables_fingerprint(variables: Any) -> str:
+    """Fingerprint the persisted variable definitions without retaining secrets."""
+    try:
+        payload = json.dumps(
+            normalize_variable_definitions(variables),
+            ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+        )
+    except (TypeError, ValueError):
+        payload = '[]'
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
 def _verification(*, status: str = 'unverified', script: str = '', **values: Any) -> dict[str, Any]:
     result = {
         'status': status,
         'script_hash': script_hash(script) if script else '',
-        'environment_id': None,
         'execution_id': None,
         'task_id': '',
         'locked_revision': None,
-        'environment_fingerprint': '',
-        'base_url_fingerprint': '',
+        'target_url_fingerprint': '',
+        'variables_fingerprint': '',
         'message': '',
         'error_message': '',
         'runtime_variables_present': False,
@@ -67,7 +78,7 @@ def _verification(*, status: str = 'unverified', script: str = '', **values: Any
 
 
 def evaluate_workspace_draft(
-    script: str, *, start_path: str = '/', snapshot: dict[str, Any] | None = None,
+    script: str, *, target_url: str, snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the shared static draft gate for generated and manually edited code.
 
@@ -77,7 +88,7 @@ def evaluate_workspace_draft(
     """
     from .draft_quality import evaluate_draft
 
-    report = evaluate_draft(script, start_path=start_path, snapshot=snapshot)
+    report = evaluate_draft(script, target_url=target_url, snapshot=snapshot)
     if not isinstance(report, dict):
         raise ValueError('脚本静态检查未返回有效结果。')
     report = deepcopy(report)
@@ -129,7 +140,7 @@ def normalize_workspace(value: Any, *, script: str = '') -> dict[str, Any]:
     if isinstance(raw.get('verification'), dict):
         verification.update({
             key: deepcopy(value) for key, value in raw['verification'].items()
-            if key in verification or key in {'message', 'error_message', 'completed_at', 'started_at', 'locked_revision', 'environment_fingerprint', 'base_url_fingerprint', 'runtime_variables_present'}
+            if key in verification or key in {'message', 'error_message', 'completed_at', 'started_at', 'locked_revision', 'runtime_variables_present'}
         })
     repair = _repair()
     if isinstance(raw.get('repair'), dict):
@@ -197,7 +208,7 @@ def variable_definitions_for_scenario_plan(plan: Any) -> list[dict[str, Any]]:
 
 
 def workspace_for_response(generation: WebUIScriptGeneration) -> dict[str, Any]:
-    """Expose a passed badge only while its script and environment still match."""
+    """Expose a passed badge only while script, variables, and URL still match."""
     workspace = workspace_for_generation(generation)
     verification = workspace['verification']
     assertion_state = analyze_assertion_state(generation.script_draft)
@@ -212,12 +223,11 @@ def workspace_for_response(generation: WebUIScriptGeneration) -> dict[str, Any]:
     if verification.get('status') == 'passed' and (
         verification.get('locked_revision') != workspace['revision']
         or verification.get('script_hash') != script_hash(generation.script_draft)
-        or verification.get('environment_id') != generation.environment_id
-        or verification.get('environment_fingerprint') != environment_fingerprint(generation.environment.config)
-        or not generation.environment.is_active
+        or verification.get('variables_fingerprint') != variables_fingerprint(workspace['variables'])
+        or verification.get('target_url_fingerprint') != script_hash(generation.target_url)
     ):
         verification['status'] = 'unverified'
-        verification['message'] = '脚本版本或环境配置已变化，旧调试结果不能代表当前配置。'
+        verification['message'] = '脚本版本、变量定义或目标网址已变化，旧调试结果不能代表当前配置。'
     return workspace
 
 
@@ -226,22 +236,8 @@ def _set_workspace(generation: WebUIScriptGeneration, workspace: dict[str, Any])
     generation.save(update_fields=['workspace', 'updated_at'])
 
 
-def environment_fingerprint(config: Any) -> str:
-    """Stable configuration identity without persisting environment values themselves."""
-    try:
-        payload = json.dumps(config or {}, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
-    except (TypeError, ValueError):
-        payload = '{}'
-    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
-
-
-def base_url_fingerprint(config: Any) -> str:
-    base_url = ((config or {}).get('base_url') or '').rstrip('/') if isinstance(config, dict) else ''
-    return hashlib.sha256(base_url.encode('utf-8')).hexdigest()
-
-
 def infer_script_variables(script: str) -> list[dict[str, Any]]:
-    """Offer environment variables referenced by a generated draft without values."""
+    """Offer script variables referenced by a generated draft without values."""
     try:
         module = ast.parse(script or '')
     except SyntaxError:
@@ -316,7 +312,7 @@ def update_draft(generation_id: Any, *, expected_revision: int, script_draft: st
         workspace['repair'] = _repair(count=int(workspace['repair'].get('count') or 0))
         generation.workspace = workspace
         generation.quality_report = evaluate_workspace_draft(
-            script_draft, start_path=generation.start_path, snapshot=generation.exploration_snapshot,
+            script_draft, target_url=generation.target_url, snapshot=generation.exploration_snapshot,
         )
         generation.save(update_fields=['script_draft', 'workspace', 'quality_report', 'updated_at'])
     return generation
@@ -324,7 +320,7 @@ def update_draft(generation_id: Any, *, expected_revision: int, script_draft: st
 
 def prepare_debug(generation_id: Any, *, expected_revision: int, execution_id: int, runtime_variables_present: bool = False):
     with transaction.atomic():
-        generation = WebUIScriptGeneration.objects.select_for_update().select_related('environment').get(pk=generation_id)
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         if generation.status in ACTIVE_GENERATION_STATUSES:
             raise WorkspaceConflict('生成任务仍在处理中，暂不能调试草稿。', generation)
         workspace = workspace_for_generation(generation)
@@ -335,7 +331,7 @@ def prepare_debug(generation_id: Any, *, expected_revision: int, execution_id: i
         if workspace['repair']['status'] in BUSY_REPAIR_STATUSES:
             raise WorkspaceConflict('修复正在生成，暂不能调试。', generation)
         report = evaluate_workspace_draft(
-            generation.script_draft, start_path=generation.start_path, snapshot=generation.exploration_snapshot,
+            generation.script_draft, target_url=generation.target_url, snapshot=generation.exploration_snapshot,
         )
         if report.get('status') == 'needs_review' or report.get('blockers'):
             generation.quality_report = report
@@ -346,10 +342,10 @@ def prepare_debug(generation_id: Any, *, expected_revision: int, execution_id: i
         current_hash = script_hash(generation.script_draft)
         workspace['verification'] = _verification(
             status='pending', script=generation.script_draft,
-            environment_id=generation.environment_id, execution_id=execution_id,
+            execution_id=execution_id,
             locked_revision=expected_revision,
-            environment_fingerprint=environment_fingerprint(generation.environment.config),
-            base_url_fingerprint=base_url_fingerprint(generation.environment.config),
+            target_url_fingerprint=script_hash(generation.target_url),
+            variables_fingerprint=variables_fingerprint(workspace['variables']),
             runtime_variables_present=bool(runtime_variables_present),
         )
         _set_workspace(generation, workspace)

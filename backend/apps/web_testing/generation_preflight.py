@@ -162,8 +162,7 @@ def prepare_playwright_mcp_output_config(
     env[_AITS_MCP_SCREENSHOT_DIR_ENV] = str(
         resolved_base_dir / 'temp' / 'playwright-mcp' / output_id / 'screenshots'
     )
-    # Test-environment mode deliberately retains MCP artifacts, including
-    # credential-bearing requests, for generation diagnostics.
+    # The test workflow deliberately retains MCP artifacts for generation diagnostics.
     env[_AITS_MCP_DISABLE_FILE_LOG_ENV] = '0'
     if resolved_cwd is not None:
         env[_AITS_MCP_WORKING_DIR_ENV] = resolved_cwd
@@ -196,7 +195,7 @@ def exploration_requires_write_confirmation(description: str) -> bool:
 
 @dataclass(frozen=True)
 class PreflightResult:
-    outcome: Literal['continue', 'needs_confirmation', 'needs_credentials', 'failed']
+    outcome: Literal['continue', 'needs_confirmation', 'failed']
     error_code: str = ''
     message: str = ''
     warnings: list[str] = field(default_factory=list)
@@ -261,28 +260,8 @@ def resolve_active_playwright_mcp_config(user_id: int) -> tuple[int, dict[str, A
     return None
 
 
-def environment_credentials(environment) -> dict[str, str] | None:
-    """Return the two supported login slots without copying them into artifacts."""
-    variables = (environment.config or {}).get('variables') or {}
-    if not isinstance(variables, dict):
-        return None
-    username = variables.get('UI_TEST_USERNAME') or variables.get('ui_test_username')
-    password = variables.get('UI_TEST_PASSWORD') or variables.get('ui_test_password')
-    if username in (None, '') or password in (None, ''):
-        return None
-    return {'username': str(username), 'password': str(password)}
-
-
-def _has_environment_credentials(environment) -> bool:
-    return environment_credentials(environment) is not None
-
-
-def run_safety_preflight(generation, brief: Any, *, credentials_available: bool) -> PreflightResult:
+def run_safety_preflight(generation, brief: Any) -> PreflightResult:
     """Return a stable, user-actionable decision without starting MCP."""
-    environment = generation.environment
-    if not environment.is_active or not environment.is_web_environment or not (environment.config or {}).get('base_url'):
-        return PreflightResult('failed', 'INPUT_INVALID', '所选 WebUI 环境不可用或未配置 Base URL。')
-
     config_id = (generation.model_info or {}).get('config_id')
     active_model = LLMConfiguration.objects.filter(
         id=config_id,
@@ -295,9 +274,6 @@ def run_safety_preflight(generation, brief: Any, *, credentials_available: bool)
     mcp_selection = resolve_active_playwright_mcp_config(generation.user_id)
     if not mcp_selection:
         return PreflightResult('failed', 'MCP_CONFIG_MISSING', '没有可用的 Playwright MCP 配置。')
-
-    if bool(brief.get('credentials_required')) and not (credentials_available or _has_environment_credentials(environment)):
-        return PreflightResult('needs_credentials', 'CREDENTIALS_REQUIRED', '场景需要登录，请提供本次探索登录信息或配置环境变量。')
 
     if exploration_requires_write_confirmation(generation.description_safe):
         return PreflightResult(

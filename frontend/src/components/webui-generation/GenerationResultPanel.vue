@@ -8,7 +8,7 @@
     <el-alert v-else-if="resolutionHint" :title="resolutionHint" :type="hintType" :closable="false" show-icon class="resolution-hint" />
     <el-alert v-if="draftCompletion.isPartial" title="当前草稿未完成：可继续编辑或基于已保存证据整理脚本，不能视为测试通过。" type="warning" :closable="false" show-icon class="resolution-hint" />
     <el-tabs v-model="activeTab">
-      <el-tab-pane label="场景摘要" name="scenario"><GenerationScenarioSummary :scenario="generation?.scenario_spec" /></el-tab-pane>
+      <el-tab-pane label="场景摘要" name="scenario"><GenerationScenarioSummary :scenario="generation?.scenario_spec" :target-url="generation?.target_url" /></el-tab-pane>
       <el-tab-pane label="脚本工作区" name="script"><el-alert v-if="draftConflict" type="warning" :closable="false" show-icon title="工作区已更新；你的本地编辑仍保留，刷新会丢弃这些未保存内容。"><template #default><el-button size="small" type="warning" plain @click="emit('discard-local-draft')">丢弃本地编辑并刷新</el-button></template></el-alert><GenerationWorkspace v-if="generation?.script_draft || draft?.script_draft" :generation="generation" :draft="draft" :busy="busy" :draft-saving="draftSaving" :debugging="debugging" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @update-draft="emit('update-draft', $event)" @save-draft="emit('save-draft')" @debug="emit('debug', $event)" /><el-empty v-else description="脚本草稿尚未生成" :image-size="70" /></el-tab-pane>
       <el-tab-pane label="探索轨迹" name="evidence"><GenerationEvidence :snapshot="generation?.exploration_snapshot" :tool-stats="generation?.tool_stats" :failure-message="failureReason" /></el-tab-pane>
       <el-tab-pane label="质量报告" name="quality"><GenerationQualityReport :report="generation?.quality_report" /></el-tab-pane>
@@ -33,7 +33,7 @@ const activeTab = ref('scenario')
 const paused = computed(() => isPausedGeneration(props.generation?.status))
 const statusLabel = computed(() => generationStatusLabel(props.generation?.status))
 const resolutionHint = computed(() => generationResolutionHint(props.generation))
-const hintType = computed(() => props.generation?.status === 'failed' ? 'error' : ['needs_review', 'needs_confirmation', 'needs_credentials', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
+const hintType = computed(() => props.generation?.status === 'failed' ? 'error' : ['needs_review', 'needs_confirmation', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
 const canSave = computed(() => canSaveGeneratedDraft(props.generation, props.draft, props.busy))
 const canRetryGeneration = computed(() => canRetryScriptFromTrace(props.generation, props.busy))
 const draftCompletion = computed(() => generationDraftCompletion(props.generation))

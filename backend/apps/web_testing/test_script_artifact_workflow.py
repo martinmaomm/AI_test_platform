@@ -9,7 +9,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from ai_core.models import LLMConfiguration, ModelType
-from projects.models import Environment, Project
+from projects.models import Project
 
 from .generation_repository import (
     finalize_generation_artifact, persist_generation_checkpoint, claim_trace_generation_retry,
@@ -22,7 +22,7 @@ SCRIPT = '''\
 from playwright.async_api import expect
 
 async def run(page, variables):
-    await page.goto('/items')
+    await page.goto('https://web.example.test/items')
     await expect(page.locator('#result')).to_be_visible()
 '''
 PARTIAL_SCRIPT = SCRIPT + '\n    # AITS_PENDING_STEP: {"reason":"后续详情页尚未观察"}\n'
@@ -32,7 +32,7 @@ from playwright.async_api import expect
 
 async def run(page, variables):
     # 打开列表页并验证结果区域。
-    await page.goto('/')
+    await page.goto('https://web.example.test/items')
     await expect(page.locator('#result')).to_be_visible()
 '''
 
@@ -62,10 +62,6 @@ class ScriptArtifactWorkflowTests(TestCase):
         self.project = Project.objects.create(
             name='v5 artifact', project_type='web', owner=self.user, created_by=self.user,
         )
-        self.environment = Environment.objects.create(
-            project=self.project, name='Web', category=Environment.EnvironmentCategory.WEB,
-            config={'base_url': 'https://web.example.test'}, is_active=True,
-        )
         self.model = LLMConfiguration.objects.create(
             model_type=ModelType.LLM, provider='openai', provider_name='test', api_key='key',
             base_url='https://llm.example.test', model_name='test-model', is_active=True,
@@ -74,10 +70,10 @@ class ScriptArtifactWorkflowTests(TestCase):
 
     def generation(self, *, task_id: str = 'worker-a'):
         return WebUIScriptGeneration.objects.create(
-            project=self.project, user=self.user, environment=self.environment,
+            project=self.project, user=self.user,
             status=WebUIScriptGeneration.Status.EXPLORING,
             current_stage=WebUIScriptGeneration.Stage.EXPLORING,
-            description_safe='检查列表', target_url_safe='https://web.example.test/items',
+            description_safe='检查列表', target_url='https://web.example.test/items',
             model_info={'config_id': self.model.id}, celery_task_id=task_id,
             workspace={'revision': 0, '_agent_run': {'generation_revision': 0, 'task_id': task_id}},
         )

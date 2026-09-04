@@ -71,8 +71,8 @@
         </el-col>
       </el-row>
 
-      <!-- 执行环境 -->
-      <el-form-item label="执行环境" prop="environment">
+      <!-- WebUI 套件从脚本自身取得目标地址；其他测试类型仍需选择执行环境。 -->
+      <el-form-item v-if="requiresEnvironment" label="执行环境" prop="environment">
         <el-select 
           v-model="form.environment" 
           placeholder="请选择执行环境"
@@ -302,6 +302,7 @@ const form = reactive({
   notice_targets: [],
   trigger_condition: 'always'
 })
+const requiresEnvironment = computed(() => form.suite_type !== 'web')
 
 // 选项数据
 const environments = ref([])
@@ -347,7 +348,13 @@ const rules = {
     { pattern: /^(\S+\s+){4}\S+$/, message: 'Cron表达式须为空格分隔的 5 段（分 时 日 月 周）', trigger: 'blur' }
   ],
   environment: [
-    { required: true, message: '请选择执行环境', trigger: 'change' }
+    {
+      validator: (_rule, value, callback) => {
+        if (requiresEnvironment.value && !value) callback(new Error('请选择执行环境'))
+        else callback()
+      },
+      trigger: 'change'
+    }
   ]
 }
 
@@ -426,12 +433,17 @@ const loadTaskData = () => {
 }
 
 const loadEnvironments = async () => {
+  if (!requiresEnvironment.value) {
+    environments.value = []
+    form.environment = null
+    return
+  }
   if (!selectedProject.value) return
   
   try {
     loadingEnvironments.value = true
-    // 根据测试类型设置category参数
-    const category = form.suite_type || 'web' // 默认为web
+    // API/App 保持按测试类型获取执行环境；WebUI 不使用项目环境。
+    const category = form.suite_type
     const response = await getProjectEnvironments(projectStore.currentProjectId, {
       category: category
     })
@@ -481,7 +493,12 @@ const loadChannels = async () => {
 const handleSuiteTypeChange = () => {
   form.suite_ids = [] // 改为数组
   suites.value = []
-  // 当测试类型改变时，重新加载环境和套件
+  if (!requiresEnvironment.value) {
+    form.environment = null
+    environments.value = []
+    formRef.value?.clearValidate('environment')
+  }
+  // 当测试类型改变时，重新加载需要的选项。
   if (selectedProject.value) {
     loadEnvironments()
     loadSuites()
@@ -510,8 +527,10 @@ const handleSubmit = async () => {
     
     submitting.value = true
     
-    const data = { 
-      ...form,
+    const { environment, ...taskFields } = form
+    const data = {
+      ...taskFields,
+      ...(requiresEnvironment.value ? { environment } : {}),
       project: projectStore.currentProjectId // 添加当前项目ID
     }
     

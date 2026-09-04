@@ -1,6 +1,6 @@
 <template>
   <div class="workspace">
-    <el-alert type="warning" :closable="false" show-icon title="测试环境模式下，凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" />
+    <el-alert type="warning" :closable="false" show-icon title="仅供测试使用，账号密码可能出现在生成记录、日志、截图或脚本，请勿使用生产账号。" />
     <el-alert type="info" :closable="false" show-icon title="生成完成仅表示已得到脚本草稿；只有“本版调试通过”才表示该版本实际成功执行过断言。待补充断言不阻止保存、编辑或调试。" />
 
     <div class="workspace-status">
@@ -85,7 +85,7 @@ const workspace = computed(() => props.generation?.workspace || { revision: 0, v
 const verification = computed(() => workspace.value.verification || {})
 const assertionState = computed(() => verification.value.assertion_state || { status: '', pending: [], pending_count: 0, confirmed_count: 0 })
 const hasPassed = computed(() => !props.draft?.dirty && isCurrentRevisionVerified(
-  workspace.value, props.draft?.revision ?? workspace.value.revision, props.generation?.environment_id
+  workspace.value, props.draft?.revision ?? workspace.value.revision
 ))
 const displayVerificationStatus = computed(() => verification.value.status === 'passed' && !hasPassed.value ? 'unverified' : verification.value.status)
 const displayVerificationLabel = computed(() => verification.value.status === 'passed' && !hasPassed.value

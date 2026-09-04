@@ -7,13 +7,11 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from projects.models import Environment, Project, ProjectMember
+from projects.models import Project, ProjectMember
 
 from .generation_workspace import (
     attach_debug_task,
     attach_repair_task,
-    base_url_fingerprint,
-    environment_fingerprint,
     infer_script_variables,
     finish_debug,
     mark_debug_running,
@@ -38,7 +36,7 @@ VALID_SCRIPT = '''"""Check the users page."""
 from playwright.async_api import expect
 
 async def run(page):
-    await page.goto('/users')
+    await page.goto('https://web.example.test/users')
     await expect(page.locator('main')).to_be_visible()
 '''
 
@@ -48,17 +46,14 @@ class GenerationWorkspaceTests(TestCase):
         self.user = get_user_model().objects.create_user(username='workspace-owner', email='workspace-owner@example.test', password='pw')
         self.member = get_user_model().objects.create_user(username='workspace-member', email='workspace-member@example.test', password='pw')
         self.project = Project.objects.create(name='Workspace', project_type='web', owner=self.user, created_by=self.user)
-        self.environment = Environment.objects.create(
-            project=self.project, name='web', category=Environment.EnvironmentCategory.WEB,
-            config={'base_url': 'https://web.example.test'}, is_active=True,
-        )
         ProjectMember.objects.create(project=self.project, user=self.member, role='viewer', can_edit=False)
         self.factory = APIRequestFactory()
 
     def generation(self, **overrides):
         values = {
-            'project': self.project, 'user': self.user, 'environment': self.environment,
+            'project': self.project, 'user': self.user,
             'status': WebUIScriptGeneration.Status.NEEDS_REVIEW,
+            'target_url': 'https://web.example.test/users',
             'description_safe': 'Check users.', 'script_draft': VALID_SCRIPT,
             'scenario_spec': {}, 'exploration_snapshot': {'finalization': {'status': 'valid'}},
         }
@@ -95,7 +90,7 @@ async def run(page):
     def test_draft_edit_invalidates_verification_and_never_persists_secret_value(self):
         generation = self.generation(workspace={
             'revision': 0, 'variables': [],
-            'verification': {'status': 'passed', 'script_hash': script_hash(VALID_SCRIPT), 'environment_id': self.environment.id, 'execution_id': 7, 'locked_revision': 0},
+            'verification': {'status': 'passed', 'script_hash': script_hash(VALID_SCRIPT), 'execution_id': 7, 'locked_revision': 0},
         })
         changed = 'async def broken(page):\n'
         response = WebUIScriptGenerationDraftView.as_view()(
@@ -130,7 +125,7 @@ async def run(page):
     def test_stale_task_completion_cannot_mark_new_draft_passed(self):
         generation = self.generation(workspace={
             'revision': 0, 'variables': [],
-            'verification': {'status': 'running', 'script_hash': script_hash(VALID_SCRIPT), 'environment_id': self.environment.id, 'execution_id': 91, 'locked_revision': 0},
+            'verification': {'status': 'running', 'script_hash': script_hash(VALID_SCRIPT), 'execution_id': 91, 'locked_revision': 0},
         })
         generation.script_draft = VALID_SCRIPT + '\n# changed\n'
         generation.workspace = {'revision': 1, 'variables': [], 'verification': {'status': 'unverified'}}
@@ -167,7 +162,7 @@ async def run(page):
         generation = self.generation()
         execution = WebUITestExecution.objects.create(
             exec_type='case', name='debug', executor=self.user, project=self.project,
-            environment=self.environment, status='pending', trigger_type='manual',
+            status='pending', trigger_type='manual',
         )
         WebUITestCaseExecutionDetail.objects.create(execution=execution, test_case=None, status='pending')
         _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=execution.id)
@@ -180,10 +175,54 @@ async def run(page):
         generation.refresh_from_db()
         self.assertEqual(workspace_for_generation(generation)['verification']['status'], 'passed')
 
+    def test_debug_worker_rejects_target_url_or_variable_changes_after_queueing(self):
+        def queue_debug(generation):
+            execution = WebUITestExecution.objects.create(
+                exec_type='case', name='debug', executor=self.user, project=self.project,
+                status='pending', trigger_type='manual',
+            )
+            WebUITestCaseExecutionDetail.objects.create(
+                execution=execution, test_case=None, status='pending',
+            )
+            _, digest = prepare_debug(
+                generation.id, expected_revision=0, execution_id=execution.id,
+            )
+            attach_debug_task(
+                generation.id, execution_id=execution.id, locked_revision=0,
+                locked_hash=digest, task_id=f'queued-{execution.id}',
+            )
+            return execution, digest
+
+        for mutation in ('target_url', 'variables'):
+            with self.subTest(mutation=mutation):
+                generation = self.generation()
+                execution, digest = queue_debug(generation)
+                generation.refresh_from_db()
+                if mutation == 'target_url':
+                    generation.target_url = 'https://web.example.test/changed'
+                    generation.save(update_fields=['target_url', 'updated_at'])
+                else:
+                    generation.workspace['variables'] = [{
+                        'name': 'CHANGED', 'value': 'value', 'required': False,
+                        'is_secret': False, 'description': '',
+                    }]
+                    generation.save(update_fields=['workspace', 'updated_at'])
+
+                with patch('web_testing.tasks._run_test_script') as runner:
+                    result = debug_webui_script_generation_task.apply(
+                        args=(str(generation.id), execution.id, 0, digest),
+                        task_id=f'queued-{execution.id}',
+                    ).get()
+
+                self.assertFalse(result['success'])
+                runner.assert_not_called()
+                execution.refresh_from_db()
+                self.assertEqual(execution.status, 'error')
+
     def test_repair_worker_transition_is_one_shot(self):
         generation = self.generation(workspace={
             'revision': 0, 'variables': [],
-            'verification': {'status': 'failed', 'script_hash': script_hash(VALID_SCRIPT), 'environment_id': self.environment.id, 'execution_id': 1, 'locked_revision': 0, 'diagnostics': [{'code': 'RUNTIME_FAILURE', 'message': 'failed'}]},
+            'verification': {'status': 'failed', 'script_hash': script_hash(VALID_SCRIPT), 'execution_id': 1, 'locked_revision': 0, 'diagnostics': [{'code': 'RUNTIME_FAILURE', 'message': 'failed'}]},
         })
         _, digest = prepare_repair(generation.id, expected_revision=0)
         attach_repair_task(generation.id, locked_revision=0, locked_hash=digest, task_id='repair-once')
@@ -258,28 +297,21 @@ async def run(page):
         self.assertEqual(response.status_code, 409)
         self.assertFalse(WebUITestCase.objects.exists())
 
-    def test_environment_change_invalidates_badge_and_verified_save(self):
-        for change in ({'base_url': 'https://changed.example.test'}, None):
-            with self.subTest(change=change):
-                self.environment.is_active = True
-                self.environment.save()
-                generation = self.generation()
-                _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=4)
-                finish_debug(generation.id, execution_id=4, locked_revision=0, locked_hash=digest, status='passed', diagnostics=[], runtime_assertion_count=1)
-                generation.refresh_from_db()
-                self.assertEqual(WebUIScriptGenerationSerializer(generation).data['workspace']['verification']['status'], 'passed')
-                if change is None:
-                    self.environment.is_active = False
-                else:
-                    self.environment.config = change
-                self.environment.save()
-                generation.refresh_from_db()
-                self.assertEqual(WebUIScriptGenerationSerializer(generation).data['workspace']['verification']['status'], 'unverified')
-                response = WebUIScriptGenerationSaveView.as_view()(
-                    self.request(self.user, 'POST', '/save/', {'mode': 'verified', 'expected_revision': 0}),
-                    project_id=self.project.id, generation_id=generation.id,
-                )
-                self.assertEqual(response.status_code, 409)
+    def test_target_url_change_invalidates_badge_and_verified_save(self):
+        generation = self.generation()
+        _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=4)
+        finish_debug(generation.id, execution_id=4, locked_revision=0, locked_hash=digest, status='passed', diagnostics=[], runtime_assertion_count=1)
+        generation.refresh_from_db()
+        self.assertEqual(WebUIScriptGenerationSerializer(generation).data['workspace']['verification']['status'], 'passed')
+        generation.target_url = 'https://changed.example.test/users'
+        generation.save(update_fields=['target_url', 'updated_at'])
+        generation.refresh_from_db()
+        self.assertEqual(WebUIScriptGenerationSerializer(generation).data['workspace']['verification']['status'], 'unverified')
+        response = WebUIScriptGenerationSaveView.as_view()(
+            self.request(self.user, 'POST', '/save/', {'mode': 'verified', 'expected_revision': 0}),
+            project_id=self.project.id, generation_id=generation.id,
+        )
+        self.assertEqual(response.status_code, 409)
 
     def test_case_script_or_variables_edit_invalidates_previous_execution(self):
         for changes in (

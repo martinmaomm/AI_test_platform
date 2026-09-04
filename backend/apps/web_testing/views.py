@@ -19,7 +19,6 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.api import response
-from projects.models import Environment
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .assertion_state import analyze_assertion_state
@@ -46,19 +45,17 @@ from .generation_repository import (
     transition_generation,
 )
 from .generation_save_state import generation_reference, is_generation_saved
-from .generation_security import store_temporary_credentials
 from .generation_workspace import (
     ACTIVE_GENERATION_STATUSES,
     BUSY_REPAIR_STATUSES,
     BUSY_VERIFICATION_STATUSES,
-    base_url_fingerprint,
-    environment_fingerprint,
     WorkspaceConflict,
     attach_debug_task,
     attach_repair_task,
     prepare_debug,
     prepare_repair,
     script_hash,
+    variables_fingerprint,
     update_draft,
     workspace_for_generation,
     evaluate_workspace_draft,
@@ -258,8 +255,8 @@ class WebUIScriptGenerationResolveView(APIView):
                 expected_revision=values['expected_revision'],
                 user_id=request.user.id,
                 description_safe=values.get('safe_description'),
+                target_url=values.get('target_url'),
                 clarification_answers=values.get('safe_answers'),
-                credentials_provided=bool(values.get('temporary_credentials')),
             )
         except GenerationResolutionConflict as exc:
             return Response(
@@ -282,8 +279,6 @@ class WebUIScriptGenerationResolveView(APIView):
             )
 
         try:
-            if values.get('temporary_credentials'):
-                store_temporary_credentials(generation.pk, values['temporary_credentials'])
             task = generate_webui_script_generation_task.delay(str(generation.pk))
             generation = attach_celery_task(generation.pk, task.id)
         except Exception:
@@ -396,19 +391,11 @@ class WebUIScriptGenerationDebugView(APIView):
             normalize_for_storage(generation.script_draft)
         except ScriptContractError as exc:
             return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_400_BAD_REQUEST)
-        environment = Environment.objects.filter(
-            id=generation.environment_id,
-            project_id=project_id,
-            category=Environment.EnvironmentCategory.WEB,
-            is_active=True,
-        ).first()
-        if environment is None or not ((environment.config or {}).get('base_url') or '').strip():
-            return Response({'success': False, 'message': '所选 WebUI 环境不可用或未配置 Base URL。', 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_400_BAD_REQUEST)
         try:
             with transaction.atomic():
                 execution = WebUITestExecution.objects.create(
                     exec_type='case', name='生成草稿调试', description=generation.description_safe,
-                    executor=request.user, project=project, environment=environment,
+                    executor=request.user, project=project,
                     browser=WEBUI_BROWSER_ENGINE, status='pending', trigger_type='manual',
                 )
                 WebUITestCaseExecutionDetail.objects.create(execution=execution, test_case=None, status='pending')
@@ -545,7 +532,7 @@ class WebUIScriptGenerationSaveView(APIView):
                         status=status.HTTP_409_CONFLICT,
                     )
                 quality_report = evaluate_workspace_draft(
-                    generation.script_draft, start_path=generation.start_path,
+                    generation.script_draft, target_url=generation.target_url,
                     snapshot=generation.exploration_snapshot,
                 )
                 if quality_report.get('status') == 'needs_review' or quality_report.get('blockers'):
@@ -564,15 +551,13 @@ class WebUIScriptGenerationSaveView(APIView):
                     verification.get('status') == 'passed'
                     and assertion_state['status'] == 'complete'
                     and int(verification.get('runtime_assertion_count') or 0) > 0
-                    and generation.environment.is_active
                     and verification.get('script_hash') == script_hash(normalized_script)
-                    and verification.get('environment_id') == generation.environment_id
                     and verification.get('locked_revision') == workspace['revision']
-                    and verification.get('environment_fingerprint') == environment_fingerprint(generation.environment.config)
-                    and verification.get('base_url_fingerprint') == base_url_fingerprint(generation.environment.config)
+                    and verification.get('variables_fingerprint') == variables_fingerprint(workspace['variables'])
+                    and verification.get('target_url_fingerprint') == script_hash(generation.target_url)
                 ):
                     return Response(
-                        {'success': False, 'message': '当前脚本尚无同版本、同环境且已实际执行断言的调试通过记录。', 'data': WebUIScriptGenerationSerializer(generation).data},
+                        {'success': False, 'message': '当前脚本尚无同版本、同变量定义和同目标网址且已实际执行断言的调试通过记录。', 'data': WebUIScriptGenerationSerializer(generation).data},
                         status=status.HTTP_409_CONFLICT,
                     )
                 test_case = generation.test_case
@@ -637,7 +622,6 @@ class WebUIScriptGenerationSaveView(APIView):
                     'verification': {
                         'status': 'passed' if requested_mode == 'verified' else 'unverified',
                         'script_hash': script_hash(normalized_script),
-                        'environment_id': generation.environment_id if requested_mode == 'verified' else None,
                         'execution_id': verification.get('execution_id') if requested_mode == 'verified' else None,
                     },
                     'unresolved_step_count': len((generation.exploration_snapshot or {}).get('unresolved_steps') or []),
@@ -1008,17 +992,6 @@ class ExecuteWebUITestCaseView(APIView):
         test_case = get_object_or_404(WebUITestCase, pk=pk, project_id=project_id)
         if not test_case.test_script_content:
             return response(kind='error', message='测试用例没有可执行脚本', status_code=400)
-        environment_id = request.data.get('environment_id')
-        environment = get_object_or_404(
-            Environment,
-            id=environment_id,
-            project_id=project_id,
-            category=Environment.EnvironmentCategory.WEB,
-            is_active=True,
-        )
-        base_url = ((environment.config or {}).get('base_url') or '').rstrip('/')
-        if not base_url:
-            return response(kind='error', message='WebUI 测试环境缺少基础 URL', status_code=400)
         try:
             options = normalize_webui_execution_options(request.data.get('options'))
             runtime_variables = normalize_variable_definitions(
@@ -1032,7 +1005,6 @@ class ExecuteWebUITestCaseView(APIView):
             description=test_case.description,
             executor=request.user,
             project=test_case.project,
-            environment=environment,
             browser=WEBUI_BROWSER_ENGINE,
             status='pending',
             trigger_type='manual',
@@ -1047,7 +1019,6 @@ class ExecuteWebUITestCaseView(APIView):
             execution.id,
             options,
             test_case.test_script_content,
-            base_url,
         )
         execution.task_id = task.id
         execution.save(update_fields=['task_id', 'updated_at'])
@@ -1242,13 +1213,6 @@ class ExecuteWebUITestSuiteView(APIView):
         total_cases = suite.case_memberships.count()
         if not total_cases:
             return response(kind='error', message='测试套件中没有测试用例', status_code=400)
-        environment = get_object_or_404(
-            Environment,
-            id=request.data.get('environment_id'),
-            project_id=project_id,
-            category=Environment.EnvironmentCategory.WEB,
-            is_active=True,
-        )
         try:
             options = normalize_webui_execution_options(request.data.get('options'))
             runtime_variables = normalize_variable_definitions(
@@ -1262,7 +1226,6 @@ class ExecuteWebUITestSuiteView(APIView):
             description=suite.description,
             executor=request.user,
             project=suite.project,
-            environment=environment,
             browser=WEBUI_BROWSER_ENGINE,
             status='pending',
             trigger_type='manual',
@@ -1321,7 +1284,7 @@ class TestExecutionListView(generics.ListAPIView):
         project_id = self.kwargs.get('project_id')
         get_project_for_user(project_id, self.request.user, REPORT)
         queryset = WebUITestExecution.objects.filter(project_id=project_id).select_related(
-            'executor', 'environment', 'project'
+            'executor', 'project'
         )
         if self.request.GET.get('exec_type') in {'case', 'suite'}:
             queryset = queryset.filter(exec_type=self.request.GET['exec_type'])

@@ -54,16 +54,16 @@ test('generic generation status boundaries remain mapped', () => {
   assert.equal(generationStatusLabel('exploring'), '正在连续探索页面')
   assert.equal(generationStatusLabel('unexpected'), '状态未知')
   assert.equal(isActiveGeneration('validating'), true)
-  assert.equal(isPausedGeneration('needs_credentials'), true)
+  assert.equal(isPausedGeneration('needs_credentials'), false)
   assert.equal(isTerminalGeneration('needs_review'), true)
 })
 
 test('field validation errors are shown instead of a generic transport error', () => {
   const message = generationApiErrorMessage({
     message: 'Request failed with status code 400',
-    response: { data: { error: { details: { description: ['请补充测试目标'], start_path: ['必须是相对路径'] } } } }
+    response: { data: { error: { details: { description: ['描述中必须包含一个完整 http(s) URL'] } } } }
   }, '创建失败')
-  assert.equal(message, '测试描述：请补充测试目标；起始相对路径：必须是相对路径')
+  assert.equal(message, '测试描述：描述中必须包含一个完整 http(s) URL')
 })
 
 test('paused states expose generic actions without Goal boundaries', () => {
@@ -87,11 +87,11 @@ test('failed status is visibly distinct from incomplete exploration evidence', (
 })
 
 test('workspace activity and revision verification remain explicit', () => {
-  const workspace = { verification: { status: 'passed', locked_revision: 4, environment_id: 12, runtime_assertion_count: 2, assertion_state: { status: 'complete' } }, repair: { status: 'idle' } }
-  assert.equal(isCurrentRevisionVerified(workspace, 4, 12), true)
-  assert.equal(isCurrentRevisionVerified(workspace, 4, 13), false)
-  assert.equal(isCurrentRevisionVerified({ verification: { status: 'passed', locked_revision: 4, environment_id: 12, runtime_assertion_count: 0, assertion_state: { status: 'complete' } } }, 4, 12), false)
-  assert.equal(isCurrentRevisionVerified({ verification: { status: 'passed', locked_revision: 4, environment_id: 12, runtime_assertion_count: 2, assertion_state: { status: 'incomplete' } } }, 4, 12), false)
+  const workspace = { verification: { status: 'passed', locked_revision: 4, runtime_assertion_count: 2, assertion_state: { status: 'complete' } }, repair: { status: 'idle' } }
+  assert.equal(isCurrentRevisionVerified(workspace, 4), true)
+  assert.equal(isCurrentRevisionVerified(workspace, 3), false)
+  assert.equal(isCurrentRevisionVerified({ verification: { status: 'passed', locked_revision: 4, runtime_assertion_count: 0, assertion_state: { status: 'complete' } } }, 4), false)
+  assert.equal(isCurrentRevisionVerified({ verification: { status: 'passed', locked_revision: 4, runtime_assertion_count: 2, assertion_state: { status: 'incomplete' } } }, 4), false)
   assert.equal(isWorkspaceActive({ verification: { status: 'running' }, repair: { status: 'idle' } }), true)
 })
 
@@ -194,9 +194,21 @@ test('a terminal failure marks its current stage only and never marks all stages
   assert.equal(timeline[3].state, 'wait')
 })
 
-test('credential entry warns about retained test-environment artifacts', () => {
+test('description-only input carries test credentials and target URL without legacy controls', () => {
   const inputPanel = readFileSync(new URL('../src/components/webui-generation/GenerationInputPanel.vue', import.meta.url), 'utf8')
   assert.match(inputPanel, /凭据可能出现在生成记录、日志、截图或脚本，请勿使用生产账号/)
-  assert.doesNotMatch(inputPanel, /不会写入脚本、生成记录或本地存储/)
-  assert.doesNotMatch(inputPanel, /登录密码不得写入脚本、日志、截图或报告/)
+  assert.match(inputPanel, /https:\/\/example\.test\/admin\/users/)
+  assert.doesNotMatch(inputPanel, /form\.environmentId/)
+  assert.doesNotMatch(inputPanel, /form\.startPath/)
+  assert.doesNotMatch(inputPanel, /temporary_credentials/)
+  assert.doesNotMatch(inputPanel, /<el-input v-model="form\.username"/)
+})
+
+test('generation output displays target_url and never uses the retired safe field', () => {
+  const resultPanel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
+  const summary = readFileSync(new URL('../src/components/webui-generation/GenerationScenarioSummary.vue', import.meta.url), 'utf8')
+  assert.match(resultPanel, /generation\?\.target_url/)
+  assert.match(summary, /targetUrl/)
+  assert.doesNotMatch(resultPanel, /target_url_safe/)
+  assert.doesNotMatch(summary, /target_url_safe/)
 })

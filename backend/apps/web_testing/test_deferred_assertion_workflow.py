@@ -36,14 +36,14 @@ from .tasks import (
 
 
 PENDING_SCRIPT = '''async def run(page):
-    await page.goto('/details')
+    await page.goto('https://fixture.example.test/details')
     # AITS_PENDING_ASSERTION: {"assertion_id":"A1","criterion":"详情内容正确","reason":"探索未能确认详情字段"}
 '''
 
 CONFIRMED_SCRIPT = '''from playwright.async_api import expect
 
 async def run(page):
-    await page.goto('/details')
+    await page.goto('https://fixture.example.test/details')
     await expect(page.locator('#details')).to_be_visible()
 '''
 
@@ -171,7 +171,6 @@ async def run(page):
                 source,
                 'test_runtime_expect',
                 headed=False,
-                base_url='https://fixture.example.test',
                 runtime_assertion_count_path=count_path,
             ), namespace)
             namespace['test_runtime_expect']()
@@ -193,7 +192,6 @@ async def run(page):
                 source,
                 'test_runtime_branch',
                 headed=False,
-                base_url='https://fixture.example.test',
                 runtime_assertion_count_path=count_path,
             ), namespace)
             namespace['test_runtime_branch']()
@@ -218,7 +216,6 @@ async def run(page):
                 source,
                 'test_runtime_literal_assert',
                 headed=False,
-                base_url='https://fixture.example.test',
                 runtime_assertion_count_path=count_path,
             ), namespace)
             namespace['test_runtime_literal_assert']()
@@ -248,7 +245,6 @@ async def run(page):
                 source,
                 'test_runtime_close_failure',
                 headed=False,
-                base_url='https://fixture.example.test',
                 runtime_assertion_count_path=count_path,
             ), namespace)
             with self.assertRaisesRegex(RuntimeError, 'original run failure'):
@@ -291,7 +287,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
     def make_case_execution(self, test_case):
         execution = WebUITestExecution.objects.create(
             exec_type='case', name=test_case.title, executor=self.user,
-            project=self.project, environment=self.environment, status='pending',
+            project=self.project, status='pending',
         )
         WebUITestCaseExecutionDetail.objects.create(
             execution=execution, test_case=test_case, status='pending',
@@ -315,7 +311,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
             operation_success=True, runtime_assertion_count=1,
         )), patch('web_testing.tasks._failure_screenshot_paths', return_value=('/tmp/unused.png', None)):
             result = _execute_webui_test_case_logic(
-                _OfflineTask(), execution.id, {}, base_url='https://fixture.example.test',
+                _OfflineTask(), execution.id, {},
             )
         execution.refresh_from_db()
         test_case.refresh_from_db()
@@ -331,7 +327,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
             operation_success=False, runtime_assertion_count=0,
         )), patch('web_testing.tasks._failure_screenshot_paths', return_value=('/tmp/unused.png', None)):
             result = _execute_webui_test_case_logic(
-                _OfflineTask(), execution.id, {}, base_url='https://fixture.example.test',
+                _OfflineTask(), execution.id, {},
             )
         execution.refresh_from_db()
         self.assertFalse(result['operation_success'])
@@ -348,7 +344,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
         WebUITestSuiteCase.objects.create(suite=suite, test_case=confirmed_case, order=2)
         execution = WebUITestExecution.objects.create(
             exec_type='suite', name=suite.name, executor=self.user,
-            project=self.project, environment=self.environment, status='pending',
+            project=self.project, status='pending',
         )
         detail = WebUITestSuiteExecutionDetail.objects.create(
             execution=execution, test_suite=suite, total_cases=2,

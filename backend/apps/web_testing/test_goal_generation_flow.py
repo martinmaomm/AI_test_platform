@@ -649,9 +649,12 @@ class TraceSecurityAndReplayRegressionTests(SimpleTestCase):
         source = PythonReplayCompiler.compile(plan, trace, replay)
         self.assertIn('[aria-label="query"]', source)
         self.assertIn(".press('Enter')", source)
-        self.assertFalse(evaluate_script(
+        # Retired v4 replay still preserves callback arguments, but its relative
+        # navigation must not pass the environment-free storage contract.
+        report = evaluate_script(
             source, plan=plan, trace=trace, replay_plan=replay,
-        )['blockers'])
+        )
+        self.assertEqual([item['code'] for item in report['blockers']], ['SCRIPT_CONTRACT_INVALID'])
 
 
 class ScenarioPolicyRegressionTests(SimpleTestCase):

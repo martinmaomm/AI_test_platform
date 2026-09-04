@@ -14,7 +14,6 @@ from .generation_contracts import (
     stage_for_status,
     validate_transition,
 )
-from .generation_security import clear_temporary_credentials, get_temporary_credentials
 from .models import WebUIScriptGeneration
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,6 @@ MAX_ARTIFACT_HISTORY = 8
 PAUSED_GENERATION_STATUSES = frozenset({
     WebUIScriptGeneration.Status.NEEDS_INPUT,
     WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
-    WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
 })
 
 
@@ -43,7 +41,7 @@ def create_generation(**kwargs: Any) -> WebUIScriptGeneration:
 
 def get_generation_for_project(generation_id: Any, project_id: int) -> WebUIScriptGeneration:
     return WebUIScriptGeneration.objects.select_related(
-        'project', 'user', 'environment', 'test_case', 'module'
+        'project', 'user', 'test_case', 'module'
     ).get(pk=generation_id, project_id=project_id)
 
 
@@ -58,7 +56,6 @@ def transition_generation(
 ) -> WebUIScriptGeneration:
     """Apply an idempotent, validated status update under a row lock."""
     updates = updates or {}
-    should_clear_credentials = False
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         validate_transition(generation.status, target_status)
@@ -105,9 +102,6 @@ def transition_generation(
             changed_fields.add('updated_at')
             generation.save(update_fields=sorted(changed_fields))
 
-        should_clear_credentials = is_terminal_status(target_status)
-    if should_clear_credentials:
-        clear_temporary_credentials(generation.pk)
     return generation
 
 
@@ -172,8 +166,8 @@ def prepare_generation_resolution(
     expected_revision: int,
     user_id: int,
     description_safe: str | None = None,
+    target_url: str | None = None,
     clarification_answers: list[dict[str, str]] | None = None,
-    credentials_provided: bool = False,
 ) -> tuple[WebUIScriptGeneration, bool]:
     """Atomically record one user resolution and select the safe resume stage.
 
@@ -182,7 +176,6 @@ def prepare_generation_resolution(
     ``needs_review`` without another model or browser call.
     """
     clarification_answers = clarification_answers or []
-    should_clear_credentials = False
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         if generation.status != expected_status or generation.revision != expected_revision:
@@ -201,7 +194,6 @@ def prepare_generation_resolution(
                 'status', 'current_stage', 'error_code', 'error_message',
                 'completed_at', 'updated_at',
             ])
-            should_clear_credentials = True
             should_schedule = False
         else:
             source_status = generation.status
@@ -216,8 +208,7 @@ def prepare_generation_resolution(
             )
             target_status = (
                 WebUIScriptGeneration.Status.PREFLIGHTING
-                if source_status == WebUIScriptGeneration.Status.NEEDS_CREDENTIALS or auto_explore_resume
-                else WebUIScriptGeneration.Status.NORMALIZING
+                if auto_explore_resume else WebUIScriptGeneration.Status.NORMALIZING
             )
             validate_transition(source_status, target_status)
 
@@ -245,15 +236,12 @@ def prepare_generation_resolution(
             generation.completed_at = None
             if description_safe is not None:
                 generation.description_safe = description_safe
-            if credentials_provided:
-                generation.credentials_provided = True
-                generation.credentials_expired = False
-
+            if target_url is not None:
+                generation.target_url = target_url
             reset_fields = [
                 'clarifications', 'revision', 'resume_count', 'status',
                 'current_stage', 'progress', 'celery_task_id', 'error_code',
-                'error_message', 'warnings', 'completed_at', 'description_safe',
-                'credentials_provided', 'credentials_expired',
+                'error_message', 'warnings', 'completed_at', 'description_safe', 'target_url',
             ]
             if target_status == WebUIScriptGeneration.Status.NORMALIZING:
                 generation.scenario_spec = {}
@@ -262,17 +250,13 @@ def prepare_generation_resolution(
                 generation.quality_report = {}
                 generation.tool_stats = {}
                 generation.repair_count = 0
-                generation.credentials_required = False
                 reset_fields.extend([
                     'scenario_spec', 'exploration_snapshot', 'script_draft',
                     'quality_report', 'tool_stats', 'repair_count',
-                    'credentials_required',
                 ])
             generation.save(update_fields=sorted(set([*reset_fields, 'updated_at'])))
             should_schedule = True
 
-    if should_clear_credentials:
-        clear_temporary_credentials(generation.pk)
     return generation, should_schedule
 
 
@@ -291,7 +275,6 @@ def cancel_generation(generation_id: Any) -> WebUIScriptGeneration:
             'cancel_requested_at', 'status', 'current_stage', 'progress',
             'completed_at', 'updated_at',
         ])
-    clear_temporary_credentials(generation.pk)
     return generation
 
 
@@ -300,19 +283,6 @@ def is_cancel_requested(generation_id: Any) -> bool:
         pk=generation_id,
         status=WebUIScriptGeneration.Status.CANCELLED,
     ).exists()
-
-
-def get_generation_temporary_credentials(generation_id: Any) -> dict[str, str] | None:
-    """Read short-lived credentials and durably mark their expiry when absent."""
-    credentials = get_temporary_credentials(generation_id)
-    if credentials is not None:
-        return credentials
-    WebUIScriptGeneration.objects.filter(
-        pk=generation_id,
-        credentials_provided=True,
-        credentials_expired=False,
-    ).update(credentials_expired=True)
-    return None
 
 
 def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int) -> WebUIScriptGeneration:
@@ -499,7 +469,6 @@ def finalize_generation_artifact(
     This prevents a stale worker from restoring an old draft after cancellation,
     retry, or a user edit made after the prior run finished.
     """
-    should_clear_credentials = False
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         workspace = dict(generation.workspace or {})
@@ -574,7 +543,4 @@ def finalize_generation_artifact(
             'exploration_snapshot', 'script_draft', 'workspace', 'quality_report',
             'tool_stats', 'warnings', 'completed_at', 'updated_at',
         ])
-        should_clear_credentials = is_terminal_status(target_status)
-    if should_clear_credentials:
-        clear_temporary_credentials(generation.pk)
     return generation

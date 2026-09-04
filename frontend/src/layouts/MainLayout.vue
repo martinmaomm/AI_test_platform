@@ -247,7 +247,6 @@ const MENU_CONFIG = {
         group: true,
         label: '项目配置',
         children: [
-          { path: '/web-testing/environments', label: '测试环境' },
           { path: '/web-testing/knowledge-base', label: '知识库' },
           { path: '/web-testing/notification-receivers', label: '通知设置' }
         ]

@@ -29,7 +29,7 @@
           <el-descriptions-item label="测试套件">
             {{ task.suite_name }}
           </el-descriptions-item>
-          <el-descriptions-item label="执行环境">
+          <el-descriptions-item v-if="task.suite_type !== 'web'" label="执行环境">
             {{ task.environment_name }}
           </el-descriptions-item>
           <el-descriptions-item label="Cron表达式">

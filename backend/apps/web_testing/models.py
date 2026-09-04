@@ -6,7 +6,7 @@ import uuid
 
 from django.db import models, transaction
 from django.contrib.auth import get_user_model
-from projects.models import Project, Environment
+from projects.models import Project
 
 User = get_user_model()
 
@@ -200,7 +200,6 @@ class WebUIScriptGeneration(models.Model):
         REPAIRING = 'repairing', '修复脚本中'
         NEEDS_INPUT = 'needs_input', '需要补充输入'
         NEEDS_CONFIRMATION = 'needs_confirmation', '需要确认'
-        NEEDS_CREDENTIALS = 'needs_credentials', '需要登录信息'
         NEEDS_REVIEW = 'needs_review', '需要人工检查'
         READY = 'ready', '生成完成'
         READY_WITH_WARNINGS = 'ready_with_warnings', '生成完成（有警告）'
@@ -229,12 +228,6 @@ class WebUIScriptGeneration(models.Model):
         on_delete=models.CASCADE,
         related_name='webui_script_generations',
         verbose_name='发起用户',
-    )
-    environment = models.ForeignKey(
-        Environment,
-        on_delete=models.PROTECT,
-        related_name='webui_script_generations',
-        verbose_name='WebUI 环境',
     )
     test_case = models.ForeignKey(
         WebUITestCase,
@@ -272,8 +265,7 @@ class WebUIScriptGeneration(models.Model):
         verbose_name='当前阶段',
     )
     progress = models.PositiveSmallIntegerField(default=0, verbose_name='进度百分比')
-    start_path = models.CharField(max_length=500, default='/', verbose_name='环境内起始路径')
-    target_url_safe = models.TextField(blank=True, default='', verbose_name='脱敏目标地址')
+    target_url = models.TextField(blank=True, default='', verbose_name='目标网址')
     description_safe = models.TextField(blank=True, default='', verbose_name='脱敏场景描述')
     exploration_timeout_seconds = models.PositiveSmallIntegerField(
         null=True,
@@ -292,9 +284,6 @@ class WebUIScriptGeneration(models.Model):
     revision = models.PositiveIntegerField(default=0, verbose_name='暂停处理版本')
     resume_count = models.PositiveSmallIntegerField(default=0, verbose_name='已恢复次数')
     clarifications = models.JSONField(default=list, blank=True, verbose_name='脱敏补充确认记录')
-    credentials_required = models.BooleanField(default=False, verbose_name='是否需要登录信息')
-    credentials_provided = models.BooleanField(default=False, verbose_name='是否已提供临时登录信息')
-    credentials_expired = models.BooleanField(default=False, verbose_name='临时登录信息是否已失效')
     error_code = models.CharField(max_length=64, blank=True, default='', verbose_name='稳定错误码')
     error_message = models.TextField(blank=True, default='', verbose_name='用户可读错误信息')
     cancel_requested_at = models.DateTimeField(null=True, blank=True, verbose_name='取消请求时间')
@@ -372,8 +361,6 @@ class WebUITestExecution(models.Model):
         verbose_name='所属项目',
     )
     
-    # 环境信息
-    environment = models.ForeignKey(Environment, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="执行环境")
     browser = models.CharField(max_length=20, default='chromium', verbose_name="浏览器类型")
     
     # 任务信息

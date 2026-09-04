@@ -1,8 +1,9 @@
 <template>
-  <div v-if="scenario && Object.keys(scenario).length" class="summary-grid">
-    <div class="summary-item full"><span>标题</span><strong>{{ scenario.title || '未提供' }}</strong></div>
-    <div class="summary-item full"><span>目标</span><strong>{{ scenario.objective || '未提供' }}</strong></div>
-    <div v-if="scenario.original_user_target" class="summary-item full"><span>原始目标</span><strong>{{ scenario.original_user_target }}</strong></div>
+  <div v-if="targetUrl || (scenario && Object.keys(scenario).length)" class="summary-grid">
+    <div v-if="targetUrl" class="summary-item full"><span>目标地址</span><strong>{{ targetUrl }}</strong></div>
+    <div class="summary-item full"><span>标题</span><strong>{{ scenario?.title || '未提供' }}</strong></div>
+    <div class="summary-item full"><span>目标</span><strong>{{ scenario?.objective || '未提供' }}</strong></div>
+    <div v-if="scenario?.original_user_target" class="summary-item full"><span>原始目标</span><strong>{{ scenario.original_user_target }}</strong></div>
     <div class="summary-item full"><span>连续场景步骤</span><ol v-if="instructions.length"><li v-for="item in instructions" :key="item">{{ item }}</li></ol><strong v-else>尚未拆分步骤</strong></div>
     <div v-if="successCriteria.length" class="summary-item full"><span>成功标准</span><ul><li v-for="item in successCriteria" :key="item">{{ item }}</li></ul></div>
   </div>
@@ -12,7 +13,7 @@
 <script setup>
 import { computed } from 'vue'
 
-const props = defineProps({ scenario: { type: Object, default: () => ({}) } })
+const props = defineProps({ scenario: { type: Object, default: () => ({}) }, targetUrl: { type: String, default: '' } })
 const instructions = computed(() => Array.isArray(props.scenario?.instructions) ? props.scenario.instructions : [])
 const successCriteria = computed(() => Array.isArray(props.scenario?.success_criteria) ? props.scenario.success_criteria : [])
 </script>

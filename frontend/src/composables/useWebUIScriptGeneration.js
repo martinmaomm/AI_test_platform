@@ -267,7 +267,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       if (hasUnsavedDraft.value) await saveDraft()
       if (!isCurrentScope(requestScope, requestProjectId) || String(generation.value?.id) !== String(generationId)) return null
       const revision = Number(localDraft.value?.revision ?? generation.value?.workspace?.revision ?? 0)
-      const mode = isCurrentRevisionVerified(generation.value?.workspace, revision, generation.value?.environment_id) ? 'verified' : 'draft'
+      const mode = isCurrentRevisionVerified(generation.value?.workspace, revision) ? 'verified' : 'draft'
       const response = await saveWebUIScriptGeneration(requestProjectId, generationId, {
         ...(title ? { title } : {}), mode, expected_revision: revision
       })

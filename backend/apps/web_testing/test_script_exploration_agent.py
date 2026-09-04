@@ -17,7 +17,7 @@ from .script_exploration_agent import ScriptExplorationAgent, ScriptExplorationT
 
 PARTIAL_SCRIPT = '''\
 async def run(page, variables):
-    await page.goto('/catalog')
+    await page.goto('https://example.test/catalog')
     # AITS_PENDING_STEP: {"reason":"详情页操作尚未在当前 trace 中观察到。"}
 '''
 
@@ -25,7 +25,7 @@ COMPLETE_SCRIPT = '''\
 from playwright.async_api import expect
 
 async def run(page, variables):
-    await page.goto('/catalog')
+    await page.goto('https://example.test/catalog')
     await expect(page.get_by_role("heading")).to_be_visible()
 '''
 
@@ -39,7 +39,6 @@ def brief(**overrides):
         'instructions': ['打开目录'],
         'allow_test_data_writes': True,
         'explicit_read_only': False,
-        'credentials_required': False,
         'cleanup_expected': False,
         'forbidden_actions': [],
     }
@@ -73,7 +72,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             'web_testing.script_exploration_agent.MCPAgent', agent_type,
         ):
             result = asyncio.run(self.make_agent(callback).generate(
-                brief=brief(), start_path='/', target_url='https://example.test/catalog', credentials=None,
+                brief=brief(), target_url='https://example.test/catalog',
             ))
         return result, client
 
@@ -316,7 +315,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         result, _ = self.run_with(Agent)
         self.assertEqual(result.error_code, '')
         self.assertIn('场景：', result.script_draft)
-        self.assertIn("await page.goto('/')", result.script_draft)
+        self.assertIn("await page.goto('https://example.test/catalog')", result.script_draft)
         self.assertIn('AITS_PENDING_STEP:', result.script_draft)
         self.assertNotIn('expect(', result.script_draft)
         self.assertEqual(result.completion, 'partial')
@@ -332,7 +331,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
 
         result, _ = self.run_with(Agent, callback=checkpoints.append)
         self.assertEqual(result.error_code, 'transient')
-        self.assertIn("await page.goto('/')", result.script_draft)
+        self.assertIn("await page.goto('https://example.test/catalog')", result.script_draft)
         self.assertIn('AITS_PENDING_STEP:', result.script_draft)
         self.assertTrue(checkpoints)
         self.assertIn('仅生成入口', checkpoints[0]['snapshot']['artifact']['remaining_steps'][0])
@@ -343,9 +342,31 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             cancel_check=None, exploration_timeout_seconds=10,
         )
         agent._brief = {'title': '测试标题', 'objective': '检查 C:\\Users\\test 和 """引号"""'}
+        agent._target_url = 'https://example.test/catalog?sort=name#/users'
         agent._install_entry_seed()
         compile(agent._last_valid_script, '<entry-seed>', 'exec')
         self.assertEqual(agent._quality_report(agent._last_valid_script)['blockers'], [])
+
+    def test_invalid_entry_does_not_create_browser_or_slash_seed(self):
+        with patch('web_testing.script_exploration_agent.MCPClient.from_dict') as client:
+            result = asyncio.run(self.make_agent().generate(brief=brief(), target_url='/'))
+        client.assert_not_called()
+        self.assertEqual(result.error_code, 'INVALID_TARGET_URL')
+        self.assertEqual(result.script_draft, '')
+
+    def test_prompt_uses_only_description_for_login_and_preserves_full_url(self):
+        agent = self.make_agent()
+        goal = '目标网址：https://example.test/catalog?sort=name#/users\n登录账号 fixture-user 密码 fixture-pass'
+        agent._brief = brief(original_user_target=goal)
+        agent._target_url = 'https://example.test/catalog?sort=name#/users'
+        import json
+        prompt = json.loads(agent._prompt())
+        self.assertEqual(prompt['target_url'], agent._target_url)
+        self.assertEqual(prompt['brief']['original_user_target'], goal)
+        self.assertNotIn('credentials', prompt)
+        self.assertNotIn('start_path', prompt)
+        agent._install_entry_seed()
+        self.assertIn(repr(agent._target_url), agent._last_valid_script)
 
     def test_final_text_is_partial_fallback_instead_of_complete_claim(self):
         class Agent:
@@ -370,7 +391,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         agent = self.make_agent(llm_model=LLM())
         with patch('web_testing.script_exploration_agent.MCPClient.from_dict') as client_factory:
             result = asyncio.run(agent.generate(
-                brief=brief(), start_path='/', target_url='https://example.test/catalog', credentials=None,
+                brief=brief(), target_url='https://example.test/catalog',
                 saved_snapshot={'schema_version': 5, 'events': [{'event_id': 'saved'}], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
                 script_draft=PARTIAL_SCRIPT, code_only=True,
             ))
@@ -407,7 +428,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             'web_testing.script_exploration_agent.MCPAgent', Agent,
         ):
             result = asyncio.run(self.make_agent().generate(
-                brief=brief(), start_path='/', target_url='https://example.test/catalog', credentials=None,
+                brief=brief(), target_url='https://example.test/catalog',
             ))
             trace_files = list((Path(temp_dir) / 'logs' / 'playwright-mcp').glob('*.script-v5.trace.jsonl'))
             trace_text = trace_files[0].read_text(encoding='utf-8') if trace_files else ''
@@ -468,7 +489,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         agent = self.make_agent(llm_model=LLM())
         with patch('web_testing.script_exploration_agent.MCPClient.from_dict') as client_factory:
             result = asyncio.run(agent.generate(
-                brief=brief(), start_path='/', target_url='https://example.test/catalog', credentials=None,
+                brief=brief(), target_url='https://example.test/catalog',
                 saved_snapshot={'schema_version': 5, 'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
                 script_draft='', code_only=True,
             ))
@@ -499,7 +520,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         }
         agent = self.make_agent(llm_model=LLM())
         result = asyncio.run(agent.generate(
-            brief=brief(), start_path='/', target_url='https://example.test/catalog', credentials=None,
+            brief=brief(), target_url='https://example.test/catalog',
             saved_snapshot=snapshot, script_draft='', code_only=True,
         ))
         self.assertIn('SYNTAX_ERROR', LLM.prompt)

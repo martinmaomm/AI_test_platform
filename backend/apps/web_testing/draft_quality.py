@@ -11,10 +11,10 @@ import builtins
 import re
 import symtable
 from typing import Any
-from urllib.parse import urlsplit
 
 from .assertion_state import analyze_assertion_state
 from .script_contract import ScriptContractError, normalize_for_storage
+from .target_urls import target_origin, validate_target_url
 
 
 _ALLOWED_IMPORTS = frozenset({
@@ -63,7 +63,7 @@ def _undefined_globals(source: str) -> list[str]:
     return sorted(missing)
 
 
-def evaluate_draft(script: str, *, start_path: str = '/', snapshot: dict | None = None) -> dict[str, Any]:
+def evaluate_draft(script: str, *, target_url: str = '', snapshot: dict | None = None) -> dict[str, Any]:
     source = str(script or '').strip()
     state = analyze_assertion_state(source)
     blockers: list[dict] = []
@@ -118,11 +118,14 @@ def evaluate_draft(script: str, *, start_path: str = '/', snapshot: dict | None 
             gotos.append(node)
             target = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == 'url'), None)
             if isinstance(target, ast.Constant) and isinstance(target.value, str):
-                parsed = urlsplit(target.value)
-                if parsed.scheme or parsed.netloc or not target.value.startswith('/'):
-                    blockers.append(_issue('NAVIGATION_OUTSIDE_ENVIRONMENT', '脚本导航应使用环境内相对路径，不能切换到独立站点。', line=node.lineno))
+                try:
+                    validate_target_url(target.value)
+                    if target_url and target_origin(target.value) != target_origin(target_url):
+                        blockers.append(_issue('NAVIGATION_OUTSIDE_TARGET', '脚本导航地址不属于描述中的目标站点，请确认测试范围。', line=node.lineno))
+                except ValueError:
+                    blockers.append(_issue('ABSOLUTE_URL_REQUIRED', '脚本导航必须填写完整 HTTP(S) 网址，不能依赖相对路径或环境地址。', line=node.lineno))
             else:
-                warnings.append(_issue('DYNAMIC_NAVIGATION_REVIEW', '动态导航地址需要人工确认仍属于本次测试环境。', level='warning', line=node.lineno))
+                warnings.append(_issue('DYNAMIC_NAVIGATION_REVIEW', '动态导航地址需要人工确认最终为完整 HTTP(S) 网址，并属于本次测试目标。', level='warning', line=node.lineno))
         if short in {'wait_for_timeout', 'sleep'}:
             warnings.append(_issue('FIXED_WAIT', '建议使用页面状态或 expect 等待，减少固定等待。', level='warning', line=node.lineno))
         if short == 'screenshot':
@@ -150,8 +153,9 @@ def evaluate_draft(script: str, *, start_path: str = '/', snapshot: dict | None 
         blockers.append(_issue('ENTRY_NAVIGATION_MISSING', '脚本缺少打开目标页面的 page.goto 操作。'))
     else:
         first = min(gotos, key=lambda node: node.lineno)
-        if first.args and isinstance(first.args[0], ast.Constant) and first.args[0].value != start_path:
-            warnings.append(_issue('START_PATH_CHANGED', '脚本起始路径与生成时的入口不同，请确认。', level='warning', line=first.lineno))
+        first_target = first.args[0] if first.args else next((kw.value for kw in first.keywords if kw.arg == 'url'), None)
+        if target_url and isinstance(first_target, ast.Constant) and first_target.value != target_url:
+            warnings.append(_issue('TARGET_URL_CHANGED', '脚本入口与描述中的完整目标网址不同，请确认路径、参数和 # 路由。', level='warning', line=first.lineno))
 
     missing = _undefined_globals(source)
     if missing:

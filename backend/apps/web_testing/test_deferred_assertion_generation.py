@@ -44,6 +44,16 @@ def _event(recorder, run_id, tool_name, inputs, output):
 
 
 class DeferredAssertionGenerationTests(SimpleTestCase):
+    def assert_retired_relative_replay_rejected(self, report):
+        # v4 compilation is no longer an executable generation path: it emits
+        # relative goto URLs. Keep testing its evidence/marker semantics, but
+        # never restore an environment fallback to make its output executable.
+        self.assertEqual(report['status'], 'needs_review')
+        self.assertEqual(
+            [item['code'] for item in report['blockers']],
+            ['SCRIPT_CONTRACT_INVALID'],
+        )
+
     def test_missing_assertion_requirements_are_completed_as_deferred(self):
         plan = parse_scenario_plan_json(json.dumps(_plan_payload(
             success_criteria=['第一目标', '第二目标'], assertion_requirements=[],
@@ -107,7 +117,7 @@ class DeferredAssertionGenerationTests(SimpleTestCase):
         report = evaluate_script(source, plan=plan, trace=trace, replay_plan=replay)
         self.assertIn('to_contain_text', source)
         self.assertEqual(report['assertion_state']['status'], 'complete')
-        self.assertFalse(report['blockers'])
+        self.assert_retired_relative_replay_rejected(report)
 
     def test_pending_assertion_compiles_as_comment_and_quality_warning(self):
         plan = ScenarioPlan.model_validate(_plan_payload())
@@ -132,9 +142,8 @@ class DeferredAssertionGenerationTests(SimpleTestCase):
             '# AITS_PENDING_ASSERTION: {"assertion_id":"A1","criterion":"目标结果符合预期","reason":"未能确认页面业务结果。"}',
             source,
         )
-        self.assertEqual(report['status'], 'ready_with_warnings')
         self.assertEqual(report['assertion_state']['pending_count'], 1)
-        self.assertFalse(report['blockers'])
+        self.assert_retired_relative_replay_rejected(report)
 
     def test_pure_navigation_with_only_pending_assertions_is_rejected(self):
         plan = ScenarioPlan.model_validate(_plan_payload())
@@ -199,8 +208,8 @@ class DeferredAssertionGenerationTests(SimpleTestCase):
             PythonReplayCompiler.compile(plan, trace, replay),
             plan=plan, trace=trace, replay_plan=replay,
         )
-        self.assertEqual(report['status'], 'ready_with_warnings')
-        self.assertFalse(report['blockers'])
+        self.assert_retired_relative_replay_rejected(report)
+        self.assertEqual(report['assertion_state']['pending_count'], 2)
 
     def test_deferred_negative_literal_needs_user_or_earlier_observation_evidence(self):
         plan = ScenarioPlan.model_validate(_plan_payload(
@@ -280,7 +289,7 @@ class DeferredAssertionGenerationTests(SimpleTestCase):
         replay = ReplayPlanner.build(plan, trace)
         source = PythonReplayCompiler.compile(plan, trace, replay)
         report = evaluate_script(source, plan=plan, trace=trace, replay_plan=replay)
-        self.assertEqual(report['status'], 'ready_with_warnings')
+        self.assert_retired_relative_replay_rejected(report)
         self.assertTrue(any(item['code'] == 'PENDING_ASSERTIONS' for item in report['warnings']))
         source_without_marker = '\n'.join(
             line for line in source.splitlines()

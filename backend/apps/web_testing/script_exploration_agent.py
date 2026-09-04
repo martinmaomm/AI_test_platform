@@ -47,6 +47,7 @@ from .mcp_page_explorer import (
     suppress_mcp_raw_query_logs,
 )
 from .draft_quality import evaluate_draft
+from .target_urls import target_origin, validate_target_url
 
 
 logger = logging.getLogger(__name__)
@@ -251,8 +252,8 @@ def _visible_login_form_state(output: Any) -> bool | None:
 EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览器上下文中探索并增量编写 Python 草稿。
 浏览器调用上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，模型调用上限 {MCP_MAX_STEPS} 次；接近预算时停止浏览器操作，使用 aits_save_script 保存当前完整草稿和真实剩余步骤。
 每次得到足够的页面证据或修复草稿后，都必须调用 aits_save_script。该工具会返回静态检查反馈；按反馈继续完善，而不是只在最终文本一次性给代码。
-aits_save_script 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本 page.goto 必须使用相对路径；MCP 的 playwright_navigate 必须显式传 JSON 布尔值 headless: true。固定数据值和 variables 可以混用，不要求每次 fill 都预先声明 input ref；仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
-任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口、返回 start_path 或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 aits_save_script 持久化最新完整草稿，不要等到最终回复。
+aits_save_script 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
+任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 aits_save_script 持久化最新完整草稿，不要等到最终回复。
 只根据真实观察生成 goto、定位器和断言。未实际完成的操作必须在代码中保留 # AITS_PENDING_STEP: {{\"reason\":\"...\"}}；未知断言使用 # AITS_PENDING_ASSERTION: ...。存在 pending step 或 remaining_steps 时不可声称 complete。
 不得伪造按钮、页面文字、定位器或断言。禁止 playwright_evaluate、上传、关闭浏览器、外域导航，以及审批、付款、发布、下载等未授权高风险操作。浏览器只可访问本次目标站点。
 无需也不得调用任何路径定稿工具或基于 event id 的完成协议。最终回复只简短说明；草稿的权威版本来自 aits_save_script。"""
@@ -309,11 +310,7 @@ class ScriptExplorationToolGuard(ReadOnlyMCPBrowserToolGuard):
             policy=policy,
             trace_recorder=trace_recorder,
         )
-        parsed = urlsplit(target_url)
-        self._allowed_origin = (
-            f'{parsed.scheme.lower()}://{parsed.netloc.lower()}'
-            if parsed.scheme and parsed.netloc else ''
-        )
+        self._allowed_origin = target_origin(target_url)
         self._progress_notifier = progress_notifier
         self._stop_check = stop_check
 
@@ -323,9 +320,14 @@ class ScriptExplorationToolGuard(ReadOnlyMCPBrowserToolGuard):
         tool_name = str((serialized or {}).get('name') or '').lower()
         if tool_name == 'playwright_navigate' and isinstance(inputs, dict):
             candidate = str(inputs.get('url') or inputs.get('target') or inputs.get('href') or '')
-            parsed = urlsplit(candidate)
-            origin = f'{parsed.scheme.lower()}://{parsed.netloc.lower()}' if parsed.scheme and parsed.netloc else ''
-            if origin and origin != self._allowed_origin:
+            try:
+                origin = target_origin(candidate)
+            except ValueError:
+                self._raise_guard(
+                    'invalid_target_url', '页面导航必须使用完整 HTTP(S) 网址，不能使用相对路径。',
+                    blocked_before_execution=True, tool_name=tool_name,
+                )
+            if origin != self._allowed_origin:
                 self._raise_guard(
                     'external_domain_blocked', '页面探索不允许导航到目标站点以外的域名。',
                     blocked_before_execution=True, tool_name=tool_name,
@@ -454,17 +456,23 @@ class ScriptExplorationAgent:
         self,
         *,
         brief: dict,
-        start_path: str,
         target_url: str,
-        credentials: dict | None,
         saved_snapshot: dict | None = None,
         script_draft: str = '',
         code_only: bool = False,
     ) -> ScriptExplorationResult:
         self._reset_run_state()
         self._brief = dict(brief or {})
-        self._start_path = self._relative_path(start_path)
-        self._target_url = str(target_url or '')
+        try:
+            self._target_url = validate_target_url(target_url)
+        except ValueError as exc:
+            return self._result('INVALID_TARGET_URL', str(exc))
+        parsed = urlsplit(self._target_url)
+        self._start_path = parsed.path or '/'
+        if parsed.query:
+            self._start_path += '?' + parsed.query
+        if parsed.fragment:
+            self._start_path += '#' + parsed.fragment
         self._restore_snapshot(saved_snapshot)
         self._last_valid_script = str(script_draft or self._restored_last_valid_script or '').strip()
         if self._last_valid_script:
@@ -489,7 +497,7 @@ class ScriptExplorationAgent:
                 if not await self._persist_checkpoint(force=True):
                     return self._result('CHECKPOINT_FAILED', self._checkpoint_failure)
             output_generation_id = validate_generation_output_id(self.generation_id or None)
-            self._configure_trace(credentials, output_generation_id=output_generation_id)
+            self._configure_trace(output_generation_id=output_generation_id)
             deadline = time.monotonic() + self.exploration_timeout_seconds
             client = MCPClient.from_dict(prepare_playwright_mcp_output_config(
                 self.mcp_config, output_generation_id,
@@ -509,7 +517,7 @@ class ScriptExplorationAgent:
             )
             with suppress_mcp_raw_query_logs():
                 model_result = await self._await_task(
-                    asyncio.create_task(agent.run(self._prompt(credentials), manage_connector=False)),
+                    asyncio.create_task(agent.run(self._prompt(), manage_connector=False)),
                     deadline,
                 )
             self._record_model_output(model_result)
@@ -533,7 +541,7 @@ class ScriptExplorationAgent:
                 except Exception:
                     logger.warning('v5 MCP 会话清理失败', exc_info=True)
 
-    def _configure_trace(self, credentials: dict | None, *, output_generation_id: str) -> None:
+    def _configure_trace(self, *, output_generation_id: str) -> None:
         explicit_read_only = bool(self._brief.get('explicit_read_only'))
         policy = ExplorationPolicy(
             namespace=f'aits-script-{self.generation_id or "local"}',
@@ -546,14 +554,6 @@ class ScriptExplorationAgent:
         trace_file.parent.mkdir(parents=True, exist_ok=True)
         self._trace_recorder = ExplorationTraceRecorder(
             self._start_path, runtime_namespace=policy.namespace, trace_file=trace_file,
-        )
-        runtime_values = {
-            str(name): str(value) for name, value in (credentials or {}).items()
-            if value is not None
-        }
-        self._trace_recorder.configure_runtime(
-            runtime_values,
-            {name: 'credential' for name in runtime_values},
         )
         self._guard = ScriptExplorationToolGuard(
             policy=policy,
@@ -698,7 +698,7 @@ class ScriptExplorationAgent:
         prompt = json.dumps({
             'mode': 'code_only',
             'brief': self._brief,
-            'start_path': self._start_path,
+            'target_url': self._target_url,
             'saved_trace': self._saved_trace_data,
             'existing_script_draft': self._last_valid_script,
             'diagnostics': diagnostics,
@@ -707,7 +707,7 @@ class ScriptExplorationAgent:
                 '只能整理、修复已有草稿和 saved_trace 中实际观察到的操作。',
                 '不得创建 MCP/client/browser，不得补造未知定位器、按钮、断言或业务操作。',
                 '输出完整 Python 草稿；保留或补充顶部中文场景说明和步骤注释。',
-                'page.goto 只能使用相对路径；未知操作或断言必须保留 AITS_PENDING_STEP 或 AITS_PENDING_ASSERTION 注释。',
+                'page.goto 必须使用完整 HTTP(S) 网址，首次打开 target_url，保留原路径、参数和 # 路由；不依赖 base_url 或测试环境。未知操作或断言必须保留 AITS_PENDING_STEP 或 AITS_PENDING_ASSERTION 注释。',
             ],
         }, ensure_ascii=False)
         try:
@@ -838,7 +838,7 @@ class ScriptExplorationAgent:
         raw_output = self._bounded_raw(self._raw_model_output)
         return {
             'schema_version': 5,
-            'start_path': self._start_path,
+            'target_url': self._target_url,
             'events': events,
             'page_states': page_states,
             'locator_evidence': locator_evidence,
@@ -879,12 +879,10 @@ class ScriptExplorationAgent:
         self._raw_model_output = self._bounded_raw(text)
         self._final_message = self._summary(text)
 
-    def _prompt(self, credentials: dict | None) -> str:
+    def _prompt(self) -> str:
         return json.dumps({
             'brief': self._brief,
-            'start_path': self._start_path,
             'target_url': self._target_url,
-            'credentials': dict(credentials or {}),
             'saved_snapshot': self._saved_trace_data,
             'existing_script_draft': self._last_valid_script,
             'artifact': self._artifact,
@@ -941,7 +939,7 @@ class ScriptExplorationAgent:
             repr(f'场景：{title}\n目标：{objective}') + '\n\n'
             'async def run(page, variables):\n'
             '    # 步骤 1：进入已知入口（尚未确认页面状态）\n'
-            f"    await page.goto({self._start_path!r})\n"
+            f"    await page.goto({self._target_url!r})\n"
             f'    {_PENDING_STEP_PREFIX} {json.dumps({"reason": reason}, ensure_ascii=False)}\n'
         )
         self._latest_candidate = self._last_valid_script
@@ -956,11 +954,6 @@ class ScriptExplorationAgent:
             'status': 'accepted', 'source': 'entry_seed', 'completion': 'partial',
             'message': '已保存仅含入口的草稿；页面元素、业务操作与断言仍待真实探索。',
         }
-
-    @staticmethod
-    def _relative_path(value: str) -> str:
-        text = str(value or '/').strip()
-        return text if text.startswith('/') else '/'
 
     @staticmethod
     def _string_list(values: list[str]) -> list[str]:
@@ -983,7 +976,7 @@ class ScriptExplorationAgent:
 
     def _quality_report(self, script: str) -> dict[str, Any]:
         try:
-            report = evaluate_draft(script, start_path=self._start_path, snapshot=self._snapshot_without_quality())
+            report = evaluate_draft(script, target_url=self._target_url, snapshot=self._snapshot_without_quality())
         except Exception as exc:
             return {
                 'status': 'needs_review',
@@ -1004,7 +997,7 @@ class ScriptExplorationAgent:
         trace = self._trace_recorder.build(tool_stats=self._guard.get_stats())
         data = trace.model_dump(mode='json')
         return {
-            'schema_version': 5, 'start_path': self._start_path,
+            'schema_version': 5, 'target_url': self._target_url,
             'events': data['events'], 'page_states': data['page_states'],
             'locator_evidence': data['locator_evidence'], 'tool_stats': data['tool_stats'],
         }

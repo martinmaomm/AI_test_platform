@@ -15,8 +15,8 @@ class GenerationBrief:
     schema_version: int = 5
     explicit_read_only: bool = False
     allow_test_data_writes: bool = True
-    # No pre-exploration guess about login requirements or cleanup semantics.
-    credentials_required: bool = False
+    # No pre-exploration guess about cleanup semantics. Login instructions stay
+    # in the original description, not in a separate credential contract.
     cleanup_expected: bool = False
     cleanup_policy: str = '按用户目标决定，未明确要求时不额外推断'
     forbidden_actions: list[str] = field(default_factory=list)

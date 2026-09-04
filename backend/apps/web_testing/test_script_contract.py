@@ -26,7 +26,7 @@ from .script_contract import (
 
 class ScriptContractTests(unittest.TestCase):
     def test_valid_run_script_is_kept_without_browser_lifecycle(self):
-        script = "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('/')\n    await expect(page).to_have_title('Home')\n"
+        script = "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('https://web.example.test/')\n    await expect(page).to_have_title('Home')\n"
 
         result = validate_script(script)
 
@@ -58,7 +58,7 @@ class ScriptContractTests(unittest.TestCase):
                     validate_script(script)
 
     def test_v3_variable_aware_run_is_storable_and_receives_runtime_mapping(self):
-        script = "async def run(page, variables):\n    await page.goto('/')\n"
+        script = "async def run(page, variables):\n    await page.goto('https://web.example.test/')\n"
         self.assertEqual(normalize_for_storage(script), script.strip())
         materialized = materialize_script(script, 'v3_variables')
         self.assertIn('await run(page, runtime_variables)', materialized)
@@ -101,13 +101,14 @@ async def main():
         await p.chromium.launch()
 
 async def run(page):
-    await page.goto('/')
+    await page.goto('https://web.example.test/')
 """
 
-        materialized = materialize_script(script, "test_mixed", headed=True, base_url="http://managed.test")
+        materialized = materialize_script(script, "test_mixed", headed=True)
 
         self.assertIn("browser_type.launch(headless=False)", materialized)
-        self.assertIn('context_kwargs["base_url"]', materialized)
+        self.assertIn("context = await browser.new_context()", materialized)
+        self.assertNotIn("PLAYWRIGHT_BASE_URL", materialized)
         self.assertIn("await run(page)", materialized)
         self.assertNotIn("asyncio.run(main())", materialized)
 
@@ -142,6 +143,26 @@ async def main(page):
                 with self.assertRaises(ScriptContractError):
                     normalize_for_storage(script)
 
+    def test_storage_validation_rejects_invalid_static_goto_urls(self):
+        for target, use_keyword in (
+            ('/login', False),
+            ('relative/path', True),
+            ('http://', False),
+            ('https://web.example.test:99999/', False),
+            ('https://web.example.test/a b', False),
+            ('http://user:pass@web.example.test/', False),
+        ):
+            argument = f"url={target!r}" if use_keyword else repr(target)
+            script = f"async def run(page):\n    await page.goto({argument})\n"
+            with self.subTest(target=target, use_keyword=use_keyword):
+                with self.assertRaisesRegex(ScriptContractError, "完整的 http\\(s\\) 地址"):
+                    normalize_for_storage(script)
+
+    def test_storage_validation_allows_dynamic_goto_url_for_manual_variables(self):
+        script = "async def run(page, variables):\n    await page.goto(variables['TARGET_URL'])\n"
+
+        self.assertEqual(normalize_for_storage(script), script.strip())
+
     def test_both_write_serializers_use_strict_storage_validation(self):
         from django.conf import settings
         if not settings.configured:
@@ -159,12 +180,12 @@ async def main(page):
         headed_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
         headless_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
         try:
-            script = "async def run(page):\n    await page.goto('/')\n"
+            script = "async def run(page):\n    await page.goto('https://web.example.test/')\n"
             headed_file = runner._create_test_file(
-                headed_dir, script, ExecutionConfig(headed=True, base_url="http://headed.test")
+                headed_dir, script, ExecutionConfig(headed=True)
             )
             headless_file = runner._create_test_file(
-                headless_dir, script, ExecutionConfig(headed=False, base_url="http://headless.test")
+                headless_dir, script, ExecutionConfig(headed=False)
             )
 
             with open(headed_file, encoding="utf-8") as file:
@@ -172,11 +193,11 @@ async def main(page):
             with open(headless_file, encoding="utf-8") as file:
                 headless_content = file.read()
             self.assertIn("headless=False", headed_content)
-            self.assertIn("http://headed.test", headed_content)
             self.assertIn("headless=True", headless_content)
-            self.assertIn("http://headless.test", headless_content)
-            self.assertNotIn("http://headless.test", headed_content)
-            self.assertNotIn("http://headed.test", headless_content)
+            self.assertIn("https://web.example.test/", headed_content)
+            self.assertIn("https://web.example.test/", headless_content)
+            self.assertNotIn("PLAYWRIGHT_BASE_URL", headed_content)
+            self.assertNotIn("PLAYWRIGHT_BASE_URL", headless_content)
         finally:
             shutil.rmtree(headed_dir, ignore_errors=True)
             shutil.rmtree(headless_dir, ignore_errors=True)
@@ -231,7 +252,7 @@ async def main(page):
         work_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
         completed = SimpleNamespace(returncode=0, stdout="", stderr="")
         try:
-            with patch(
+            with patch.dict(os.environ, {'PLAYWRIGHT_BASE_URL': 'https://leaked.example.test'}, clear=True), patch(
                 "web_testing.playwright_python_runner.subprocess.run",
                 return_value=completed,
             ) as run:
@@ -250,7 +271,7 @@ async def main(page):
                 'UI_TEST_USERNAME': 'tester',
                 'USER_NAME': 'generated-override',
             })
-            self.assertEqual(child_env['PLAYWRIGHT_BASE_URL'], '')
+            self.assertNotIn('PLAYWRIGHT_BASE_URL', child_env)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -282,25 +303,24 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
             'playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceeded.',
         )
 
-    def test_materialized_script_owns_browser_and_uses_context_base_url(self):
+    def test_materialized_script_owns_browser_without_context_base_url(self):
         headed_materialized = materialize_script(
-            "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('/')\n",
+            "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('https://web.example.test/')\n",
             "test_case_1",
             headed=True,
-            base_url="http://example.test",
         )
         headless_materialized = materialize_script(
-            "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('/')\n",
+            "from playwright.async_api import expect\n\nasync def run(page):\n    await page.goto('https://web.example.test/')\n",
             "test_case_2",
             headed=False,
-            base_url="http://example.test",
         )
 
         tree = ast.parse(headed_materialized)
         self.assertTrue(any(isinstance(node, ast.AsyncFunctionDef) and node.name == "run" for node in tree.body))
         self.assertIn("browser_type.launch(headless=False)", headed_materialized)
         self.assertIn("browser_type.launch(headless=True)", headless_materialized)
-        self.assertIn('context_kwargs["base_url"]', headed_materialized)
+        self.assertIn("context = await browser.new_context()", headed_materialized)
+        self.assertNotIn("PLAYWRIGHT_BASE_URL", headed_materialized)
         self.assertIn("asyncio.run(_run_with_managed_browser())", headed_materialized)
         self.assertNotIn("--base-url", headed_materialized)
 
@@ -309,7 +329,6 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
             "async def run(page):\n    await page.click('#missing')\n",
             "test_failure",
             headed=False,
-            base_url="http://example.test",
             failure_screenshot_path="/controlled/execution_1/single_case.png",
         )
 
@@ -386,20 +405,13 @@ E   playwright._impl._errors.TimeoutError: Locator.click: Timeout 30000ms exceed
         self.assertTrue(context.closed)
         self.assertTrue(browser.closed)
 
-    def test_runner_writes_real_base_url_and_rejects_empty_or_multiline_values(self):
+    def test_runner_writes_pytest_config_without_base_url(self):
         runner = PlaywrightRunner()
         work_dir = tempfile.mkdtemp(dir=runner.temp_base_dir)
         try:
-            runner._create_pytest_config(
-                work_dir, ExecutionConfig(base_url="https://web.example.test/root")
-            )
+            runner._create_pytest_config(work_dir)
             with open(os.path.join(work_dir, "pytest.ini"), encoding="utf-8") as file:
-                self.assertIn("base_url = https://web.example.test/root", file.read())
-
-            with self.assertRaisesRegex(ValueError, "基础 URL"):
-                runner._create_pytest_config(work_dir, ExecutionConfig(base_url=""))
-            with self.assertRaisesRegex(ValueError, "换行"):
-                runner._create_pytest_config(work_dir, ExecutionConfig(base_url="https://bad.test\nbase_url = evil"))
+                self.assertNotIn("base_url", file.read())
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -433,10 +445,7 @@ FAILED test_case_12.py::test_case_12
                     {'test_case_id': 11, 'test_case_title': '登录'},
                     {'test_case_id': 12, 'test_case_title': '输入用户'},
                 ],
-                ExecutionConfig(
-                    base_url='https://web.example.test',
-                    failure_screenshot_dir=screenshot_dir,
-                ),
+                ExecutionConfig(failure_screenshot_dir=screenshot_dir),
             )
 
             first, second = results

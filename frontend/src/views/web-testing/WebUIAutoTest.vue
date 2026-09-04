@@ -6,7 +6,7 @@
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
     <div class="generation-layout">
-      <GenerationInputPanel :project-id="selectedProject.id" :environments="environments" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-environments="loadingEnvironments" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="isActive || submitting || isWorkspaceBusy" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" :credential-clear-version="credentialClearVersion" @submit="handleCreate" @cancel="handleCancel" />
+      <GenerationInputPanel :project-id="selectedProject.id" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="isActive || submitting || isWorkspaceBusy" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
         <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
@@ -23,7 +23,6 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
 import { useAuthStore } from '@/stores/auth'
-import { getProjectEnvironments } from '@/api/projects'
 import { getLLMConfigurations } from '@/api/aiConfig'
 import { getWebUIScriptGenerationSettings, getWebUITestModules } from '@/api/webTesting'
 import { WebSocketManager } from '@/config/websocket'
@@ -39,15 +38,12 @@ const authStore = useAuthStore()
 const selectedProject = computed(() => projectStore.currentProject)
 const projectId = computed(() => selectedProject.value?.id || null)
 const userId = computed(() => authStore.user?.id || authStore.user?.username || null)
-const environments = ref([])
 const modules = ref([])
 const modelConfigs = ref([])
 const explorationSettings = ref(null)
-const loadingEnvironments = ref(false)
 const loadingModules = ref(false)
 const loadingModels = ref(false)
 const isConnected = ref(false)
-const credentialClearVersion = ref(0)
 let websocketManager = null
 
 const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, debugExecution, debugExecutionLoading, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, create, cancel, resolve: resolveGeneration, retryGeneration, save, saveDraft, debug, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
@@ -60,11 +56,6 @@ const asList = (response) => {
   if (Array.isArray(body.data)) return body.data
   if (Array.isArray(body.data?.items)) return body.data.items
   return []
-}
-const loadEnvironments = async () => {
-  if (!projectId.value) { environments.value = []; return }
-  loadingEnvironments.value = true
-  try { environments.value = asList(await getProjectEnvironments(projectId.value, { category: 'web' })).filter(item => item.is_active) } catch { environments.value = []; ElMessage.error('加载 WebUI 环境失败') } finally { loadingEnvironments.value = false }
 }
 const loadModels = async () => {
   loadingModels.value = true
@@ -98,7 +89,6 @@ const handleCreate = async (payload) => {
     }
     const result = await create(payload)
     if (!result) return
-    credentialClearVersion.value += 1
     ElMessage.success('已创建生成记录，正在按阶段处理。')
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '创建生成任务失败')
@@ -114,7 +104,7 @@ const handleSaveDraft = async () => { try { const result = await saveDraft(); if
 const handleDebug = async (runtimeVariables) => { try { const result = await debug(runtimeVariables); if (result) ElMessage.success('已启动真实调试；不会自动重试业务写操作。') } catch { ElMessage.error(lastError.value || '启动调试失败') } }
 const handleDiscardLocalDraft = async () => { try { await ElMessageBox.confirm('将丢弃当前未保存的本地脚本和变量编辑，并刷新服务端版本。', '确认刷新工作区', { type: 'warning', confirmButtonText: '丢弃并刷新', cancelButtonText: '保留本地编辑' }); const result = await discardLocalDraftAndRefresh(); if (result) ElMessage.success('已刷新服务端工作区版本') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '刷新工作区失败') } }
 
-watch(projectId, () => { loadEnvironments(); loadModules(); loadModels(); loadExplorationSettings() }, { immediate: true })
+watch(projectId, () => { loadModules(); loadModels(); loadExplorationSettings() }, { immediate: true })
 watch(() => authStore.accessToken, initWebSocket)
 onMounted(initWebSocket)
 onUnmounted(closeWebSocket)

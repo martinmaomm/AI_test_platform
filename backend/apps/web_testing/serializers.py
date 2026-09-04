@@ -2,8 +2,9 @@
 Web Testing Serializers
 用于Web UI自动化测试的序列化器
 """
+from collections.abc import Mapping
+
 from rest_framework import serializers
-from projects.models import Environment
 from ai_core.models import LLMConfiguration, ModelType
 from .models import (
     WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
@@ -18,15 +19,7 @@ from .exploration_timeout import (
     exploration_total_timeout_seconds,
 )
 from .generation_save_state import is_generation_saved
-from .generation_security import (
-    GenerationInputSecurityError,
-    build_safe_target_url,
-    clear_temporary_credentials,
-    extract_inline_login_credentials,
-    normalize_start_path,
-    store_temporary_credentials,
-    validate_temporary_credentials,
-)
+from .target_urls import extract_target_url
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 from .assertion_state import analyze_assertion_state
 from .execution_diagnostics import safe_screenshot_relative_path
@@ -37,8 +30,6 @@ from .generation_workspace import workspace_for_response
 class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
     """Safe, persistent view of one WebUI script-generation task."""
 
-    environment_id = serializers.IntegerField(read_only=True)
-    environment_name = serializers.CharField(source='environment.name', read_only=True)
     test_case_id = serializers.IntegerField(read_only=True, allow_null=True)
     module_id = serializers.IntegerField(read_only=True, allow_null=True)
     module_name = serializers.CharField(source='module.name', read_only=True, allow_null=True)
@@ -54,38 +45,35 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebUIScriptGeneration
         fields = [
-            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id',
+            'id', 'project', 'user', 'test_case_id',
             'module_id', 'module_name', 'is_saved',
             'celery_task_id', 'status', 'current_stage', 'progress',
-            'start_path', 'target_url_safe', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
+            'target_url', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'workspace',
-            'model_info', 'tool_stats', 'repair_count', 'credentials_required',
+            'model_info', 'tool_stats', 'repair_count',
             'revision', 'resume_count', 'clarifications',
-            'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
+            'error_code', 'error_message',
             'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'id', 'project', 'user', 'environment_id', 'environment_name', 'test_case_id',
+            'id', 'project', 'user', 'test_case_id',
             'module_id', 'module_name', 'is_saved',
             'celery_task_id', 'status', 'current_stage', 'progress',
-            'start_path', 'target_url_safe', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
+            'target_url', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
             'workspace',
-            'model_info', 'tool_stats', 'repair_count', 'credentials_required',
+            'model_info', 'tool_stats', 'repair_count',
             'revision', 'resume_count', 'clarifications',
-            'credentials_provided', 'credentials_expired', 'error_code', 'error_message',
+            'error_code', 'error_message',
             'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
         ]
 
 
 class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
-    """Validate a new v4 generation request for the isolated test environment."""
+    """Validate a new generation request with an explicit description URL."""
 
     description = serializers.CharField(max_length=2000, trim_whitespace=True)
-    environment_id = serializers.IntegerField(min_value=1)
-    start_path = serializers.CharField(max_length=500, required=False, allow_blank=False)
-    url = serializers.CharField(max_length=1000, required=False, allow_blank=False, write_only=True)
     module_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     model_config_id = serializers.IntegerField(min_value=1, required=False, write_only=True)
     exploration_timeout_seconds = serializers.IntegerField(
@@ -93,40 +81,26 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
         max_value=EXPLORATION_TIMEOUT_MAX_SECONDS,
         required=False,
     )
-    temporary_credentials = serializers.DictField(required=False, write_only=True)
 
-    def validate_temporary_credentials(self, value):
-        try:
-            return validate_temporary_credentials(value)
-        except GenerationInputSecurityError as exc:
-            raise serializers.ValidationError(str(exc)) from exc
-
+    def to_internal_value(self, data):
+        # Let DRF render malformed JSON (for example a top-level list) as a
+        # standard 400 validation response instead of raising TypeError here.
+        if not isinstance(data, Mapping):
+            return super().to_internal_value(data)
+        unknown = set(data.keys()) - set(self.fields)
+        if unknown:
+            raise serializers.ValidationError({
+                field: '该字段不属于当前 WebUI 生成请求。'
+                for field in sorted(unknown)
+            })
+        return super().to_internal_value(data)
     def validate(self, attrs):
         project = self.context['project']
         description = attrs['description']
-        if not attrs.get('temporary_credentials'):
-            inline_credentials = extract_inline_login_credentials(description)
-            if inline_credentials:
-                attrs['temporary_credentials'] = inline_credentials
-        supplied_start = attrs.get('start_path')
-        supplied_url = attrs.get('url')
-        if supplied_start and supplied_url and supplied_start != supplied_url:
-            raise serializers.ValidationError('start_path 与 url 不能同时传入不同值')
-        raw_target = supplied_start or supplied_url
-
         try:
-            environment = project.environments.get(pk=attrs['environment_id'])
-        except Environment.DoesNotExist as exc:
-            raise serializers.ValidationError({'environment_id': 'WebUI 环境必须属于当前项目'}) from exc
-        if not environment.is_web_environment:
-            raise serializers.ValidationError({'environment_id': '请选择 WebUI 类型的环境'})
-        if not environment.is_active:
-            raise serializers.ValidationError({'environment_id': '所选 WebUI 环境已停用'})
-        base_url = (environment.config or {}).get('base_url', '')
-        try:
-            start_path = normalize_start_path(raw_target, base_url)
-        except GenerationInputSecurityError as exc:
-            raise serializers.ValidationError({'start_path': str(exc)}) from exc
+            attrs['target_url'] = extract_target_url(description)
+        except ValueError as exc:
+            raise serializers.ValidationError({'description': str(exc)}) from exc
 
         module = None
         if attrs.get('module_id') is not None:
@@ -147,58 +121,37 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
             field = 'model_config_id' if requested_model_id is not None else 'non_field_errors'
             raise serializers.ValidationError({field: '没有可用的启用 LLM 配置'})
 
-        attrs['environment'] = environment
         attrs['module'] = module
-        attrs['normalized_start_path'] = start_path
-        attrs['base_url'] = base_url
         attrs['model_config'] = model_config
         return attrs
 
     def create(self, validated_data):
         project = self.context['project']
         user = self.context['request'].user
-        credentials = validated_data.pop('temporary_credentials', None)
-        environment = validated_data.pop('environment')
         module = validated_data.pop('module')
-        start_path = validated_data.pop('normalized_start_path')
-        base_url = validated_data.pop('base_url')
         model_config = validated_data.pop('model_config')
         exploration_timeout_seconds = validated_data.pop('exploration_timeout_seconds', None)
         if exploration_timeout_seconds is None:
             exploration_timeout_seconds = exploration_total_timeout_seconds()
-        validated_data.pop('environment_id', None)
         validated_data.pop('module_id', None)
-        validated_data.pop('url', None)
         validated_data.pop('model_config_id', None)
         description = validated_data.pop('description')
 
-        generation = None
-        try:
-            generation = create_generation(
-                project=project,
-                user=user,
-                environment=environment,
-                module=module,
-                start_path=start_path,
-                target_url_safe=build_safe_target_url(base_url, start_path),
-                description_safe=description,
-                exploration_timeout_seconds=exploration_timeout_seconds,
-                credentials_provided=credentials is not None,
-                model_info={
-                    'config_id': model_config.id,
-                    'provider': model_config.provider,
-                    'provider_name': model_config.provider_name,
-                    'model_name': model_config.model_name,
-                },
-            )
-            if credentials is not None:
-                store_temporary_credentials(generation.pk, credentials)
-            return generation
-        except Exception:
-            if generation is not None:
-                clear_temporary_credentials(generation.pk)
-                generation.delete()
-            raise
+        target_url = validated_data.pop('target_url')
+        return create_generation(
+            project=project,
+            user=user,
+            module=module,
+            target_url=target_url,
+            description_safe=description,
+            exploration_timeout_seconds=exploration_timeout_seconds,
+            model_info={
+                'config_id': model_config.id,
+                'provider': model_config.provider,
+                'provider_name': model_config.provider_name,
+                'model_name': model_config.model_name,
+            },
+        )
 
 
 class WebUIScriptGenerationSaveSerializer(serializers.Serializer):
@@ -262,12 +215,11 @@ class WebUIScriptGenerationClarificationAnswerSerializer(serializers.Serializer)
 
 
 class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
-    """Validate one user response to a paused generation in test-environment mode."""
+    """Validate one user response to a paused generation."""
 
     expected_status = serializers.ChoiceField(choices=[
         WebUIScriptGeneration.Status.NEEDS_INPUT,
         WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
-        WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
     ])
     expected_revision = serializers.IntegerField(min_value=0)
     description = serializers.CharField(
@@ -280,14 +232,6 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
         many=True,
         required=False,
     )
-    temporary_credentials = serializers.DictField(required=False, write_only=True)
-
-    def validate_temporary_credentials(self, value):
-        try:
-            return validate_temporary_credentials(value)
-        except GenerationInputSecurityError as exc:
-            raise serializers.ValidationError(str(exc)) from exc
-
     @staticmethod
     def _questions(generation):
         scenario_questions = (generation.scenario_spec or {}).get('ambiguities') or []
@@ -298,20 +242,9 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
         generation = self.context['generation']
         description = attrs.get('description')
         answers = attrs.get('clarification_answers') or []
-        credentials = attrs.get('temporary_credentials')
-
-        if description and not credentials:
-            inline_credentials = extract_inline_login_credentials(description)
-            if inline_credentials:
-                attrs['temporary_credentials'] = inline_credentials
-                credentials = inline_credentials
-
         if generation.status == WebUIScriptGeneration.Status.NEEDS_INPUT:
             if not description:
                 raise serializers.ValidationError({'description': '请补充完整的测试描述。'})
-        elif generation.status == WebUIScriptGeneration.Status.NEEDS_CREDENTIALS:
-            if not credentials:
-                raise serializers.ValidationError({'temporary_credentials': '请提供本次探索登录信息。'})
         elif generation.status == WebUIScriptGeneration.Status.NEEDS_CONFIRMATION:
             if generation.error_code in {'EXPLORATION_WRITE_CONFIRMATION_REQUIRED', 'EXPLORATION_EXTRA_RISK_BLOCKED'}:
                 if generation.error_code == 'EXPLORATION_EXTRA_RISK_BLOCKED' and not description:
@@ -337,6 +270,11 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
                     raise serializers.ValidationError({'description': '请修订测试描述后继续。'})
 
         attrs['safe_description'] = description or None
+        if description:
+            try:
+                attrs['target_url'] = extract_target_url(description)
+            except ValueError as exc:
+                raise serializers.ValidationError({'description': str(exc)}) from exc
         attrs['safe_answers'] = [dict(item) for item in answers]
         return attrs
 
@@ -526,7 +464,6 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
 class WebUITestExecutionListSerializer(serializers.ModelSerializer):
     """WebUI测试执行列表序列化器 - 用于列表页面"""
     executor_name = serializers.CharField(source='executor.username', read_only=True)
-    environment_name = serializers.CharField(source='environment.name', read_only=True)
     pass_rate = serializers.FloatField(read_only=True)
     execution_duration = serializers.FloatField(read_only=True)
     project_id = serializers.IntegerField(read_only=True)
@@ -536,7 +473,7 @@ class WebUITestExecutionListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'exec_type', 'name', 'description',
             'status', 'error_message', 'trigger_type',
-            'executor_name', 'environment_name',
+            'executor_name',
             'project_id',
             'browser', 'task_id', 'start_time', 'end_time', 'duration',
             'log_path', 'report_path', 'pass_rate', 'execution_duration',
@@ -551,8 +488,6 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
     """WebUI测试套件执行详情序列化器 - 用于套件执行详情页面"""
     test_suite_name = serializers.CharField(source='execution.name', read_only=True)
     browser = serializers.CharField(source='execution.browser', read_only=True)
-    environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
-    environment_base_url = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
     allure_report_url = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
@@ -563,18 +498,11 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'execution', 'project_id', 'test_suite', 'test_suite_name',
             'total_cases', 'passed_cases', 'incomplete_cases', 'failed_cases', 'skipped_cases',
-            'pass_rate', 'browser', 'environment_name', 'environment_base_url',
+            'pass_rate', 'browser',
             'start_time', 'end_time', 'duration', 'allure_report', 'allure_report_url',
             'error_message', 'log'
         ]
         read_only_fields = ['id', 'execution']
-    
-    def get_environment_base_url(self, obj):
-        """获取环境base_url"""
-        if obj.execution.environment:
-            web_config = obj.execution.environment.get_web_config()
-            return web_config.get('base_url', '') if web_config else ''
-        return ''
     
     def get_allure_report_url(self, obj):
         """生成Allure报告访问URL - 优先返回持久化 media 路径"""
@@ -726,8 +654,6 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     test_case_title = serializers.CharField(source='execution.name', read_only=True)
     test_case_description = serializers.CharField(source='execution.description', read_only=True)
     browser = serializers.CharField(source='execution.browser', read_only=True)
-    environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
-    environment_base_url = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
     screenshot_path = serializers.SerializerMethodField()
     
@@ -735,19 +661,12 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
         model = WebUITestCaseExecutionDetail
         fields = [
             'id', 'execution', 'project_id', 'test_case', 'test_case_title', 'test_case_description',
-            'status', 'browser', 'environment_name', 'environment_base_url',
+            'status', 'browser',
             'start_time', 'end_time', 'duration',
             'error_message', 'log', 'screenshot_path', 'video_path'
         ]
         read_only_fields = ['id', 'execution']
     
-    def get_environment_base_url(self, obj):
-        """获取环境base_url"""
-        if obj.execution.environment:
-            web_config = obj.execution.environment.get_web_config()
-            return web_config.get('base_url', '') if web_config else ''
-        return ''
-
     def get_screenshot_path(self, obj):
         return safe_screenshot_relative_path(obj.screenshot_path)
 

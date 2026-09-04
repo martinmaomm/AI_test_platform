@@ -23,7 +23,7 @@ from common.task import (
     execute_async_task_with_websocket,
     update_task_progress,
 )
-from projects.models import Environment, Project
+from projects.models import Project
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .assertion_state import evaluation_status
@@ -125,7 +125,6 @@ def retry_webui_script_generation_from_trace_task(self, generation_id: str):
 
 def _run_test_script(
     script_content: str,
-    base_url: str,
     options: dict | None = None,
     failure_screenshot_path: str | None = None,
     environment_variables: dict[str, str] | None = None,
@@ -145,7 +144,6 @@ def _run_test_script(
     result = playwright_runner(
         script_id=script_id,
         script_content=script_content,
-        base_url=base_url,
         options=execution_options,
         failure_screenshot_path=failure_screenshot_path,
         environment_variables=environment_variables or {},
@@ -206,7 +204,6 @@ def execute_webui_test_case_task(
     execution_id: int,
     options: dict | None = None,
     script_content: str | None = None,
-    base_url: str | None = None,
 ):
     return execute_async_task_with_progress(
         self,
@@ -215,7 +212,6 @@ def execute_webui_test_case_task(
         execution_id,
         options or {},
         script_content,
-        base_url,
     )
 
 
@@ -224,7 +220,6 @@ def _execute_webui_test_case_logic(
     execution_id: int,
     options: dict | None = None,
     script_content: str | None = None,
-    base_url: str | None = None,
 ) -> Dict[str, Any]:
     """Execute one saved test case with one-time variable overrides."""
     execution = None
@@ -232,7 +227,7 @@ def _execute_webui_test_case_logic(
     test_case = None
     try:
         update_task_progress(task_instance, 10, '正在读取测试用例...')
-        execution = WebUITestExecution.objects.select_related('environment').get(id=execution_id)
+        execution = WebUITestExecution.objects.get(id=execution_id)
         case_detail = execution.case_execution_detail
         test_case = case_detail.test_case
         if test_case is None:
@@ -256,10 +251,6 @@ def _execute_webui_test_case_logic(
         script_content = (script_content or test_case.test_script_content or '').strip()
         if not script_content:
             raise ValueError('测试脚本内容为空，无法执行')
-        base_url = (base_url or '').rstrip('/')
-        if not base_url:
-            raise ValueError('WebUI 测试环境缺少基础 URL')
-
         update_task_progress(task_instance, 45, '正在执行测试脚本...')
         screenshot_absolute, screenshot_relative = _failure_screenshot_paths(
             execution.id, 'single_case.png'
@@ -267,11 +258,9 @@ def _execute_webui_test_case_logic(
         runtime_variables = pop_runtime_variables(execution.id)
         result = _run_test_script(
             script_content,
-            base_url,
             options,
             failure_screenshot_path=screenshot_absolute,
             environment_variables=merge_execution_variables(
-                (execution.environment.config or {}).get('variables') or {},
                 test_case.variables,
                 runtime_variables,
             ),
@@ -374,7 +363,7 @@ def debug_webui_script_generation_task(
 ):
     """Run an explicitly approved draft without creating a WebUITestCase."""
     from .generation_workspace import (
-        base_url_fingerprint, environment_fingerprint, finish_debug, mark_debug_running, script_hash,
+        finish_debug, mark_debug_running, script_hash, variables_fingerprint, workspace_for_generation,
     )
 
     execution = None
@@ -385,26 +374,20 @@ def debug_webui_script_generation_task(
             generation_id, execution_id=execution_id,
             locked_revision=locked_revision, locked_hash=locked_hash, task_id=self.request.id,
         )
-        execution = WebUITestExecution.objects.select_related('environment').get(
+        execution = WebUITestExecution.objects.get(
             pk=execution_id, exec_type='case', project_id=WebUIScriptGeneration.objects.get(pk=generation_id).project_id,
         )
         detail = execution.case_execution_detail
         if generation is None:
             return build_error_result(self.request.id, '调试任务重复或已过期，未再次执行。')
 
-        environment = Environment.objects.get(
-            id=generation.environment_id, project_id=generation.project_id,
-            category=Environment.EnvironmentCategory.WEB, is_active=True,
-        )
         verification = (generation.workspace or {}).get('verification') or {}
+        current_workspace = workspace_for_generation(generation)
         if (
-            verification.get('environment_fingerprint') != environment_fingerprint(environment.config)
-            or verification.get('base_url_fingerprint') != base_url_fingerprint(environment.config)
+            verification.get('target_url_fingerprint') != script_hash(generation.target_url)
+            or verification.get('variables_fingerprint') != variables_fingerprint(current_workspace['variables'])
         ):
-            raise ValueError('调试环境配置已变化，过期调试任务未执行。')
-        base_url = ((environment.config or {}).get('base_url') or '').rstrip('/')
-        if not base_url:
-            raise ValueError('WebUI 测试环境缺少基础 URL')
+            raise ValueError('草稿变量定义或目标网址已变化，过期调试任务未执行。')
         script = (generation.script_draft or '').strip()
         if script_hash(script) != locked_hash:
             raise ValueError('草稿内容已变化，过期调试任务未执行')
@@ -425,9 +408,8 @@ def debug_webui_script_generation_task(
             raise ValueError('一次性运行变量已过期，调试任务未执行。')
         screenshot_absolute, screenshot_relative = _failure_screenshot_paths(execution.id, 'generation_draft.png')
         result = _run_test_script(
-            script, base_url, {}, failure_screenshot_path=screenshot_absolute,
+            script, {}, failure_screenshot_path=screenshot_absolute,
             environment_variables=merge_execution_variables(
-                (environment.config or {}).get('variables') or {},
                 generation.workspace.get('variables') if isinstance(generation.workspace, dict) else [],
                 runtime_variables,
             ),
@@ -547,9 +529,7 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         )
         result = asyncio.run(agent.generate(
             brief=repair_brief,
-            start_path=generation.start_path,
-            target_url=generation.target_url_safe,
-            credentials=None,
+            target_url=generation.target_url,
             saved_snapshot=snapshot,
             script_draft=generation.script_draft,
             code_only=True,
@@ -558,7 +538,7 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         if not candidate.strip():
             raise ValueError(str(getattr(result, 'error_message', '') or '修复代理没有返回候选脚本。'))
         quality = evaluate_workspace_draft(
-            candidate, start_path=generation.start_path,
+            candidate, target_url=generation.target_url,
             snapshot=getattr(result, 'snapshot', None) or snapshot,
         )
         diff = ''.join(unified_diff(
@@ -788,7 +768,6 @@ def _execute_webui_test_suite_logic(
     scheduled_log_id = options.pop('scheduled_log_id', None)
     try:
         query = WebUITestExecution.objects.select_related(
-            'environment',
             'suite_execution_detail__test_suite',
         ).filter(id=execution_id, exec_type='suite')
         if user_id is not None:
@@ -803,18 +782,6 @@ def _execute_webui_test_suite_logic(
         )
         if not memberships:
             raise ValueError('测试套件中没有测试用例')
-        if execution.environment is None:
-            raise ValueError('执行 WebUI 测试套件必须指定测试环境')
-        environment = Environment.objects.get(
-            id=execution.environment_id,
-            project_id=suite.project_id,
-            category=Environment.EnvironmentCategory.WEB,
-            is_active=True,
-        )
-        base_url = ((environment.config or {}).get('base_url') or '').rstrip('/')
-        if not base_url:
-            raise ValueError('WebUI 测试环境缺少基础 URL')
-
         options = normalize_webui_execution_options(options)
         started_at = timezone.now()
         execution.task_id = task_instance.request.id
@@ -833,7 +800,6 @@ def _execute_webui_test_suite_logic(
         suite_detail.save()
 
         runtime_variables = pop_runtime_variables(execution.id)
-        environment_variables = (environment.config or {}).get('variables') or {}
         passed_cases = failed_cases = incomplete_cases = skipped_cases = 0
         execution_results = []
         log_sections = [f'=== 测试套件：{suite.name} ===']
@@ -877,14 +843,12 @@ def _execute_webui_test_suite_logic(
             )
             try:
                 variables = merge_execution_variables(
-                    environment_variables,
                     test_case.variables,
                     suite.variables,
                     runtime_variables,
                 )
                 result = _run_test_script(
                     script_content,
-                    base_url,
                     options,
                     failure_screenshot_path=screenshot_absolute,
                     environment_variables=variables,

@@ -22,10 +22,10 @@ from openai import APIStatusError, OpenAIError
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from ai_core.models import LLMConfiguration, ModelType
-from projects.models import Environment, Project
+from projects.models import Project
 
 from .exploration_trace import ExplorationTraceRecorder, FinalizedAction, FinalizedAssertion
-from .generation_contracts import GenerationContractError, GenerationTransitionError, ScenarioPlan
+from .generation_contracts import GenerationTransitionError, ScenarioPlan
 from .generation_events import publish_terminal
 from .generation_preflight import (
     exploration_requires_write_confirmation,
@@ -37,18 +37,10 @@ from .generation_repository import (
     cancel_generation,
     claim_generation_worker,
     claim_trace_generation_retry,
-    get_generation_temporary_credentials,
     prepare_trace_generation_retry,
     transition_generation,
 )
 from .generation_save_state import generation_reference, is_generation_saved
-from .generation_security import (
-    GenerationInputSecurityError,
-    get_temporary_credentials,
-    normalize_start_path,
-    store_temporary_credentials,
-)
-from .mcp_page_explorer import EXPLORER_CONSTRAINTS, MCPPageExplorer, MCPPageExplorerError
 from .models import WebUIScriptGeneration
 from .replay_plan import PythonReplayCompiler, ReplayPlanner
 from .script_quality import evaluate_script
@@ -57,6 +49,7 @@ from .serializers import (
     WebUIScriptGenerationCreateSerializer,
     WebUIScriptGenerationResolveSerializer,
 )
+from .target_urls import extract_target_url
 from .views import WebUIScriptGenerationCreateView
 
 
@@ -81,7 +74,7 @@ def plan_payload(*, cleanup: bool = False):
         'assertion_requirements': assertions,
         'input_refs': [{'name': 'ITEM_NAME', 'source': 'generated'}],
         'preconditions': [], 'forbidden_actions': [],
-        'credentials_required': False, 'allow_test_data_writes': True,
+        'allow_test_data_writes': True,
         'cleanup_expected': cleanup, 'discovery_notes': [], 'risk_level': 'low',
     }
 
@@ -134,99 +127,6 @@ def replay_fixture(*, verify_cleanup: bool = True):
     return plan, recorder.build(tool_stats={'total_tool_calls': 5})
 
 
-class V4ExplorerLifecycleRegressionTests(SimpleTestCase):
-    def test_timeout_and_agent_failure_close_the_single_session(self):
-        class Client:
-            opened = closed = 0
-
-            async def create_all_sessions(self):
-                self.opened += 1
-
-            async def close_all_sessions(self):
-                self.closed += 1
-
-        class BrokenAgent:
-            def __init__(self, **_kwargs):
-                pass
-
-            async def initialize(self):
-                raise RuntimeError('connector failed')
-
-            async def register_local_tools(self, _tools):
-                raise AssertionError('initialization did not finish')
-
-            async def run(self, *_args, **_kwargs):
-                raise AssertionError('must not run')
-
-        plan = ScenarioPlan.model_validate(plan_payload())
-        client = Client()
-        with override_settings(BASE_DIR='/tmp'), patch(
-            'web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client,
-        ), patch('web_testing.mcp_page_explorer.MCPAgent', BrokenAgent):
-            explorer = MCPPageExplorer(
-                llm_model=Mock(), mcp_config={'mcpServers': {}},
-                generation_id=str(uuid4()), exploration_timeout_seconds=10,
-            )
-            with self.assertRaises(MCPPageExplorerError):
-                asyncio.run(explorer.explore_until_complete(
-                    plan=plan, start_path='/', target_url_safe='/',
-                ))
-        self.assertEqual((client.opened, client.closed), (1, 1))
-
-    def test_sync_database_cancel_check_runs_off_event_loop(self):
-        class Client:
-            opened = closed = 0
-
-            async def create_all_sessions(self):
-                self.opened += 1
-
-            async def close_all_sessions(self):
-                self.closed += 1
-
-        class Agent:
-            def __init__(self, **kwargs):
-                self.guard = kwargs['callbacks'][0]
-
-            async def initialize(self):
-                self.guard.on_chat_model_start({}, [])
-
-            async def register_local_tools(self, _tools):
-                return None
-
-            async def run(self, *_args, **_kwargs):
-                self.guard.on_tool_start(
-                    {'name': 'playwright_get_visible_html'}, '', run_id='observe',
-                    inputs={'selector': '#main'},
-                )
-                self.guard.on_tool_end('<main>visible</main>', run_id='observe')
-
-        calls = {'count': 0}
-
-        def cancel_check():
-            from django.db import connection
-
-            calls['count'] += 1
-            with connection.cursor() as cursor:
-                cursor.execute('SELECT 1')
-                return cursor.fetchone()[0] != 1
-
-        plan = ScenarioPlan.model_validate(plan_payload())
-        client = Client()
-        with override_settings(BASE_DIR='/tmp'), patch(
-            'web_testing.mcp_page_explorer.MCPClient.from_dict', return_value=client,
-        ), patch('web_testing.mcp_page_explorer.MCPAgent', Agent):
-            explorer = MCPPageExplorer(
-                llm_model=Mock(), mcp_config={'mcpServers': {}},
-                generation_id=str(uuid4()), cancel_check=cancel_check,
-            )
-            trace = asyncio.run(explorer.explore_until_complete(
-                plan=plan, start_path='/', target_url_safe='/',
-            ))
-        self.assertGreaterEqual(calls['count'], 1)
-        self.assertEqual((client.opened, client.closed), (1, 1))
-        self.assertGreater(trace.tool_stats['duration_seconds'], 0)
-
-
 class V4ScriptQualityRegressionTests(SimpleTestCase):
     def test_compiled_script_has_callback_provenance_cleanup_verification_and_signature(self):
         plan, trace = replay_fixture()
@@ -238,7 +138,10 @@ class V4ScriptQualityRegressionTests(SimpleTestCase):
         self.assertIn('[A2/E000005]', source)
         self.assertIn('[name=password]', source)
         self.assertNotIn('runtime-item', source)
-        self.assertFalse(report['blockers'])
+        self.assertIn(
+            'SCRIPT_CONTRACT_INVALID',
+            {item['code'] for item in report['blockers']},
+        )
 
     def test_quality_restores_general_safety_executability_and_provenance_checks(self):
         plan, trace = replay_fixture()
@@ -280,25 +183,21 @@ class V4ScriptQualityRegressionTests(SimpleTestCase):
             source.replace('    variables = variables or {}', '    password = "test-only-password"'),
             plan=plan, trace=trace, replay_plan=replay,
         )
-        self.assertEqual(
-            {item['code'] for item in credential_report['blockers']},
-            {'SCRIPT_NOT_DETERMINISTIC_REPLAY'},
+        self.assertTrue(
+            {
+                'SCRIPT_CONTRACT_INVALID',
+                'SCRIPT_NOT_DETERMINISTIC_REPLAY',
+            }.issubset({item['code'] for item in credential_report['blockers']}),
         )
 
 
 class V4SafeOutputPathRegressionTests(SimpleTestCase):
-    def test_plaintext_credentials_do_not_weaken_target_or_high_risk_guards(self):
-        with self.assertRaisesRegex(GenerationInputSecurityError, '同源'):
-            normalize_start_path(
-                'https://other.example.test/items',
-                'https://web.example.test',
-            )
+    def test_explicit_target_url_and_high_risk_guards(self):
+        with self.assertRaisesRegex(ValueError, '目标网址'):
+            extract_target_url('检查 https://one.example.test 与 https://two.example.test。')
         self.assertEqual(
-            normalize_start_path(
-                'https://web.example.test/items',
-                'https://web.example.test',
-            ),
-            '/items',
+            extract_target_url('目标网址：https://web.example.test/items?tab=all#details\n检查详情。'),
+            'https://web.example.test/items?tab=all#details',
         )
         self.assertTrue(exploration_requires_write_confirmation('提交付款并发布结果。'))
         self.assertFalse(exploration_requires_write_confirmation('不要付款或发布，只检查页面。'))
@@ -332,9 +231,6 @@ class V4SafeOutputPathRegressionTests(SimpleTestCase):
         self.assertIn(generation_id, environment['AITS_MCP_SCREENSHOT_DIR'])
         self.assertNotIn('..', environment['AITS_MCP_SCREENSHOT_DIR'])
         self.assertEqual(environment['AITS_MCP_DISABLE_FILE_LOG'], '0')
-        self.assertIn('测试环境模式允许凭据随 callback、日志和截图保留', EXPLORER_CONSTRAINTS)
-        self.assertNotIn('不得输出用户名、密码、Token', EXPLORER_CONSTRAINTS)
-        self.assertNotIn('不要调用截图工具', EXPLORER_CONSTRAINTS)
 
 
 class V4GenerationPersistenceRegressionTests(TestCase):
@@ -347,11 +243,6 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             name='V4 regressions', project_type='web', owner=self.user,
             created_by=self.user,
         )
-        self.environment = Environment.objects.create(
-            project=self.project, name='Web',
-            category=Environment.EnvironmentCategory.WEB,
-            config={'base_url': 'https://web.example.test'}, is_active=True,
-        )
         self.model = LLMConfiguration.objects.create(
             model_type=ModelType.LLM, provider='openai',
             provider_name='Test provider', api_key='key',
@@ -362,9 +253,9 @@ class V4GenerationPersistenceRegressionTests(TestCase):
 
     def make_generation(self, **overrides):
         values = {
-            'project': self.project, 'user': self.user, 'environment': self.environment,
+            'project': self.project, 'user': self.user,
             'description_safe': '检查目标页面。',
-            'target_url_safe': 'https://web.example.test/items',
+            'target_url': 'https://web.example.test/items',
             'model_info': {'config_id': self.model.id},
         }
         values.update(overrides)
@@ -383,7 +274,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             password='test-password',
         )
         denied = self.api_request(outsider, {
-            'description': '检查目标页面。', 'environment_id': self.environment.id,
+            'description': '目标网址：https://web.example.test/items\n检查目标页面。',
         })
         self.assertEqual(denied.status_code, 404)
 
@@ -397,9 +288,8 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             return_value=SimpleNamespace(id='v4-create-task'),
         ) as delay:
             response = self.api_request(self.user, {
-                'description': '检查目标页面。',
-                'environment_id': self.environment.id,
-                'start_path': '/items', 'model_config_id': other.id,
+                'description': '目标网址：https://web.example.test/items\n检查目标页面。',
+                'model_config_id': other.id,
             })
         self.assertEqual(response.status_code, 201, response.data)
         generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
@@ -409,22 +299,19 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         other.is_active = False
         other.save(update_fields=['is_active'])
         rejected = self.api_request(self.user, {
-            'description': '检查目标页面。',
-            'environment_id': self.environment.id,
-            'start_path': '/items', 'model_config_id': other.id,
+            'description': '目标网址：https://web.example.test/items\n检查目标页面。',
+            'model_config_id': other.id,
         })
         self.assertEqual(rejected.status_code, 400)
 
-    def test_create_and_resolution_accept_plaintext_test_credentials(self):
-        description = '使用用户名 test-user、密码 test-password 和 token=token-for-test 登录后检查首页。'
+    def test_create_and_resolution_preserve_raw_login_description(self):
+        description = '目标网址：https://web.example.test/items\n使用用户名 test-user、密码 test-password 和 token=token-for-test 登录后检查首页。'
         with patch(
             'web_testing.views.generate_webui_script_generation_task.delay',
             return_value=SimpleNamespace(id='plaintext-credential-task'),
         ):
             response = self.api_request(self.user, {
                 'description': description,
-                'environment_id': self.environment.id,
-                'start_path': '/items',
             })
         self.assertEqual(response.status_code, 201, response.data)
         generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
@@ -451,89 +338,71 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             '用户名 test-user，密码 test-password，token=token-for-test。',
         )
 
-    def test_create_uses_inline_login_pair_when_structured_credentials_are_absent(self):
-        description = '登录账号 inline-user inline-password 后检查首页。'
+    def test_create_keeps_login_text_without_structured_credential_cache(self):
+        description = '目标网址：https://web.example.test/items\n登录账号 inline-user inline-password 后检查首页。'
         with patch(
             'web_testing.views.generate_webui_script_generation_task.delay',
             return_value=SimpleNamespace(id='inline-credential-task'),
         ):
             response = self.api_request(self.user, {
                 'description': description,
-                'environment_id': self.environment.id,
-                'start_path': '/items',
             })
         self.assertEqual(response.status_code, 201, response.data)
         generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
         self.assertEqual(generation.description_safe, description)
-        self.assertEqual(get_temporary_credentials(generation.pk), {
-            'username': 'inline-user',
-            'password': 'inline-password',
-        })
+        self.assertEqual(generation.target_url, 'https://web.example.test/items')
+        self.assertFalse(hasattr(generation, 'credentials_required'))
 
-    def test_structured_credentials_override_inline_login_pair_without_rejection(self):
+    def test_create_rejects_removed_structured_credential_field(self):
         with patch(
             'web_testing.views.generate_webui_script_generation_task.delay',
             return_value=SimpleNamespace(id='structured-credential-task'),
         ):
             response = self.api_request(self.user, {
-                'description': '登录账号 inline-user inline-password 后检查首页。',
-                'environment_id': self.environment.id,
-                'start_path': '/items',
+                'description': '目标网址：https://web.example.test/items\n登录账号 inline-user inline-password 后检查首页。',
                 'temporary_credentials': {
                     'username': 'form-user',
                     'password': 'form-password',
                 },
             })
-        self.assertEqual(response.status_code, 201, response.data)
-        generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
-        self.assertEqual(get_temporary_credentials(generation.pk), {
-            'username': 'form-user',
-            'password': 'form-password',
-        })
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn('temporary_credentials', response.data['error']['details'])
 
-    def test_needs_credentials_resolution_accepts_inline_login_pair(self):
+    def test_resolution_description_updates_target_url(self):
         generation = self.make_generation(
-            status=WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+            status=WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
         )
         serializer = WebUIScriptGenerationResolveSerializer(
             data={
-                'expected_status': WebUIScriptGeneration.Status.NEEDS_CREDENTIALS,
+                'expected_status': WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
                 'expected_revision': generation.revision,
-                'description': '登录账号 resume-user resume-password 后继续。',
+                'description': '目标网址：https://web.example.test/orders?tab=open#detail\n登录后继续。',
             },
             context={'generation': generation},
         )
         serializer.is_valid(raise_exception=True)
-        self.assertEqual(serializer.validated_data['temporary_credentials'], {
-            'username': 'resume-user',
-            'password': 'resume-password',
-        })
+        self.assertEqual(
+            serializer.validated_data['target_url'],
+            'https://web.example.test/orders?tab=open#detail',
+        )
 
-    def test_dispatch_failure_clears_credentials_and_marks_generation_failed(self):
+    def test_dispatch_failure_marks_generation_failed_without_credential_cache(self):
         with patch(
             'web_testing.views.generate_webui_script_generation_task.delay',
             side_effect=RuntimeError('broker unavailable'),
         ):
             response = self.api_request(self.user, {
-                'description': '检查目标页面。',
-                'environment_id': self.environment.id,
-                'start_path': '/items',
-                'temporary_credentials': {
-                    'username': 'test-user', 'password': 'temporary-value',
-                },
+                'description': '目标网址：https://web.example.test/items\n登录账号 test-user temporary-value 后检查。',
             })
         self.assertEqual(response.status_code, 503, response.data)
         generation = WebUIScriptGeneration.objects.get(pk=response.data['data']['id'])
         self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
-        self.assertIsNone(get_temporary_credentials(generation.pk))
-        self.assertNotIn('temporary-value', str(response.data))
-        self.assertNotIn('temporary-value', str(generation.exploration_snapshot))
+        self.assertIn('temporary-value', generation.description_safe)
+        self.assertFalse(hasattr(generation, 'credentials_provided'))
 
-    def test_credential_cache_failure_rolls_back_generation(self):
+    def test_removed_credential_field_does_not_create_generation(self):
         payload = {
-            'description': '检查目标页面。',
-            'environment_id': self.environment.id,
-            'start_path': '/items',
+            'description': '目标网址：https://web.example.test/items\n检查目标页面。',
             'temporary_credentials': {
                 'username': 'test-user', 'password': 'temporary-value',
             },
@@ -544,13 +413,8 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         serializer = WebUIScriptGenerationCreateSerializer(
             data=payload, context={'request': request, 'project': self.project},
         )
-        serializer.is_valid(raise_exception=True)
-        with patch(
-            'web_testing.serializers.store_temporary_credentials',
-            side_effect=RuntimeError('cache unavailable'),
-        ):
-            with self.assertRaises(RuntimeError):
-                serializer.save()
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('temporary_credentials', serializer.errors)
         self.assertFalse(WebUIScriptGeneration.objects.filter(project=self.project).exists())
 
     def test_transitions_worker_claims_and_v5_artifact_retry_are_idempotent(self):
@@ -604,27 +468,19 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         self.assertIsNotNone(claim_trace_generation_retry(retried.pk, 'trace-worker'))
         self.assertIsNone(claim_trace_generation_retry(retried.pk, 'trace-worker'))
 
-    def test_cancel_is_durable_idempotent_and_clears_credentials(self):
+    def test_cancel_is_durable_and_idempotent(self):
         generation = self.make_generation()
-        store_temporary_credentials(generation.pk, {
-            'username': 'test-user', 'password': 'temporary-value',
-        })
         cancelled = cancel_generation(generation.pk)
         again = cancel_generation(generation.pk)
         self.assertEqual(cancelled.status, WebUIScriptGeneration.Status.CANCELLED)
         self.assertEqual(again.status, WebUIScriptGeneration.Status.CANCELLED)
-        self.assertIsNone(get_generation_temporary_credentials(generation.pk))
 
-    def test_terminal_transition_clears_credentials_and_event_dedupes_or_retries(self):
+    def test_terminal_transition_and_event_deduplication(self):
         generation = self.make_generation()
-        store_temporary_credentials(generation.pk, {
-            'username': 'test-user', 'password': 'temporary-value',
-        })
         transition_generation(
             generation.pk, WebUIScriptGeneration.Status.FAILED,
             error_code='MODEL_UNAVAILABLE',
         )
-        self.assertIsNone(get_generation_temporary_credentials(generation.pk))
 
         event = SimpleNamespace(
             pk=f'event-{uuid4()}', user_id=self.user.id, celery_task_id='',
@@ -693,9 +549,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
     def test_agent_exception_persists_needs_review_and_publishes_terminal(self):
         from .generation_orchestrator import run_generation
 
-        generation = self.make_generation(
-            start_path='/items', target_url_safe='https://web.example.test/items',
-        )
+        generation = self.make_generation(target_url='https://web.example.test/items')
         class BrokenAgent:
             def __init__(self, **_kwargs):
                 pass
@@ -736,7 +590,6 @@ class V4GenerationPersistenceRegressionTests(TestCase):
             return {
                 'schema_version': 5, 'title': '本地 brief', 'objective': '检查目标页面。',
                 'original_user_target': '检查目标页面。', 'instructions': ['检查目标页面。'],
-                'credentials_required': False,
             }
 
         with patch(
@@ -832,9 +685,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
     def test_real_cancelled_generation_returns_terminal_state_without_starting_agent(self):
         from .generation_orchestrator import run_generation
 
-        generation = self.make_generation(
-            start_path='/items', target_url_safe='https://web.example.test/items',
-        )
+        generation = self.make_generation(target_url='https://web.example.test/items')
         cancelled = cancel_generation(generation.pk)
 
         class NeverStartedAgent:
@@ -945,11 +796,6 @@ class V5RunningCancellationRegressionTests(TransactionTestCase):
             name='V5 running cancellation', project_type='web', owner=self.user,
             created_by=self.user,
         )
-        self.environment = Environment.objects.create(
-            project=self.project, name='Web',
-            category=Environment.EnvironmentCategory.WEB,
-            config={'base_url': 'https://web.example.test'}, is_active=True,
-        )
         self.model = LLMConfiguration.objects.create(
             model_type=ModelType.LLM, provider='openai', provider_name='Test provider',
             api_key='key', base_url='https://llm.example.test', model_name='v5-model',
@@ -1001,9 +847,9 @@ async def run(page, variables):
             },
         }
         generation = WebUIScriptGeneration.objects.create(
-            project=self.project, user=self.user, environment=self.environment,
-            description_safe='探索详情页并保存当前可用草稿。',
-            start_path='/items', target_url_safe='https://web.example.test/items',
+            project=self.project, user=self.user,
+            description_safe='目标网址：https://web.example.test/items\n探索详情页并保存当前可用草稿。',
+            target_url='https://web.example.test/items',
             model_info={'config_id': self.model.id},
         )
 

@@ -40,7 +40,6 @@ class ExecutionConfig:
     headed: bool = WEBUI_DEFAULT_HEADED
     timeout: int = WEBUI_DEFAULT_TIMEOUT
     generate_allure: bool = False
-    base_url: Optional[str] = None
     suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
     failure_screenshot_path: Optional[str] = None
     failure_screenshot_dir: Optional[str] = None
@@ -78,7 +77,7 @@ class PlaywrightRunner:
         
         try:
             self._create_test_file(work_dir, script_content, config)
-            self._create_pytest_config(work_dir, config)
+            self._create_pytest_config(work_dir)
             result = self._run_pytest_command(work_dir, config)
             allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
             execution_result = self._build_execution_result(result, work_dir, allure_report_path, config)
@@ -107,10 +106,16 @@ class PlaywrightRunner:
 
             if py_count == 0:
                 error_msg = "脚本生成失败，未发现可执行的测试文件"
+                skipped_errors = [
+                    item.get('error_message', '') for item in skipped_results
+                    if item.get('error_message')
+                ]
+                if skipped_errors:
+                    error_msg = f"{error_msg}：{skipped_errors[0]}"
                 logger.error(f"[套件执行] {error_msg}，跳过 Pytest 启动")
                 return self._build_error_result(error_msg, work_dir, config)
 
-            self._create_pytest_config(work_dir, config)
+            self._create_pytest_config(work_dir)
             result = self._run_pytest_command(work_dir, config)
             allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
             parsed_case_results = self._parse_suite_test_results(result.stdout, test_cases_data, config)
@@ -144,7 +149,6 @@ class PlaywrightRunner:
                 script_content,
                 "test_webui_case",
                 headed=config.headed,
-                base_url=config.base_url,
                 failure_screenshot_path=config.failure_screenshot_path,
                 runtime_assertion_count_path=config.runtime_assertion_count_path,
             ))
@@ -183,23 +187,24 @@ class PlaywrightRunner:
 
             try:
                 test_file = os.path.join(work_dir, f"test_case_{test_case_id}.py")
-                test_files.append(test_file)
                 with open(test_file, 'w', encoding='utf-8') as f:
                     f.write(materialize_script(
                         script_content,
                         f"test_case_{test_case_id}",
                         headed=config.headed,
-                        base_url=config.base_url,
                         suite_name=suite_name,
                         failure_screenshot_path=(
                             os.path.join(config.failure_screenshot_dir, f'case_{test_case_id}.png')
                             if config.failure_screenshot_dir else None
                         ),
                     ))
+                test_files.append(test_file)
                 logger.info(
                     f"[脚本生成] 用例 #{idx + 1} (id={test_case_id}, title={test_case_title}): 成功写入 {os.path.basename(test_file)}"
                 )
             except Exception as e:
+                if os.path.exists(test_file):
+                    os.remove(test_file)
                 logger.error(
                     f"[脚本生成] 用例 #{idx + 1} (id={test_case_id}, title={test_case_title}): 写入失败, 异常: {e}",
                     exc_info=True
@@ -273,17 +278,10 @@ class PlaywrightRunner:
         
         return script_content
     
-    def _create_pytest_config(self, work_dir: str, config: ExecutionConfig) -> None:
+    def _create_pytest_config(self, work_dir: str) -> None:
         """创建pytest配置文件"""
-        raw_base_url = config.base_url or ''
-        if '\n' in raw_base_url or '\r' in raw_base_url:
-            raise ValueError('基础 URL 不能包含换行')
-        base_url = raw_base_url.strip()
-        if not base_url:
-            raise ValueError('测试环境缺少基础 URL')
         pytest_ini = os.path.join(work_dir, "pytest.ini")
-        config_content = f"""[pytest]
-base_url = {base_url}
+        config_content = """[pytest]
 testpaths = .
 python_files = test_*.py
 python_classes = Test*
@@ -334,11 +332,11 @@ python_functions = test_*
             cmd.extend(["--alluredir", allure_results_dir])
         
         env = os.environ.copy()
+        env.pop('PLAYWRIGHT_BASE_URL', None)
         env.update({
             'PLAYWRIGHT_BROWSER': config.browser,
             'PLAYWRIGHT_HEADED': str(config.headed).lower(),
             'PYTEST_TIMEOUT': str(config.timeout),
-            'PLAYWRIGHT_BASE_URL': config.base_url or '',
             'PYTHONIOENCODING': 'utf-8',  # 防止 Windows GBK 编码报错
         })
         # Values intentionally never appear in command arguments or logs.  The
@@ -683,7 +681,6 @@ def extract_execution_error(stdout: str = '', stderr: str = '') -> str:
 def playwright_runner(
     script_id: str,
     script_content: str,
-    base_url: str = None,
     options: Dict[str, Any] = None,
     failure_screenshot_path: Optional[str] = None,
     environment_variables: Dict[str, str] | None = None,
@@ -694,7 +691,6 @@ def playwright_runner(
         headed=normalized_options['headed'],
         timeout=normalized_options['timeout'],
         generate_allure=True,
-        base_url=base_url,
         failure_screenshot_path=failure_screenshot_path,
         environment_variables=environment_variables or {},
     )
@@ -735,14 +731,13 @@ def playwright_runner(
     }
 
 
-def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]], base_url: str = None, options: Dict[str, Any] = None, environment_variables: Dict[str, str] | None = None) -> Dict[str, Any]:
+def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]], options: Dict[str, Any] = None, environment_variables: Dict[str, str] | None = None) -> Dict[str, Any]:
     """使用pytest批量执行多个Playwright Python测试脚本并生成Allure报告"""
     normalized_options = normalize_webui_execution_options(options)
     config = ExecutionConfig(
         headed=normalized_options['headed'],
         timeout=normalized_options['timeout'],
         generate_allure=True,
-        base_url=base_url,
         suite_name=options.get('suite_name') if options else None,
         failure_screenshot_dir=(options or {}).get('failure_screenshot_dir'),
         environment_variables=environment_variables or {},

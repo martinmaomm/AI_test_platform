@@ -427,13 +427,13 @@ _STATUS_STAGE = {
     'created': 'created', 'normalizing': 'normalizing', 'preflighting': 'preflighting',
     'exploring': 'exploring', 'generating': 'generating', 'validating': 'validating',
     'repairing': 'repairing', 'needs_input': 'normalizing', 'needs_confirmation': 'preflighting',
-    'needs_credentials': 'preflighting', 'needs_review': 'completed', 'ready': 'completed',
+    'needs_review': 'completed', 'ready': 'completed',
     'ready_with_warnings': 'completed', 'failed': 'completed', 'cancelled': 'completed',
 }
 _NEXT_STATUS = {
     'created': {'created', 'normalizing', 'preflighting', 'failed', 'cancelled'},
     'normalizing': {'normalizing', 'preflighting', 'needs_input', 'failed', 'cancelled'},
-    'preflighting': {'preflighting', 'exploring', 'needs_confirmation', 'needs_credentials', 'failed', 'cancelled'},
+    'preflighting': {'preflighting', 'exploring', 'needs_confirmation', 'failed', 'cancelled'},
     'exploring': {
         'exploring', 'generating', 'validating', 'needs_review',
         'ready', 'ready_with_warnings', 'failed', 'cancelled',
@@ -443,7 +443,6 @@ _NEXT_STATUS = {
     'repairing': {'repairing', 'needs_review', 'ready', 'ready_with_warnings', 'failed', 'cancelled'},
     'needs_input': {'normalizing', 'needs_review', 'cancelled'},
     'needs_confirmation': {'normalizing', 'preflighting', 'needs_review', 'cancelled'},
-    'needs_credentials': {'preflighting', 'needs_review', 'cancelled'},
     'failed': {'generating'},
     'needs_review': set(), 'ready': set(), 'ready_with_warnings': set(), 'cancelled': set(),
 }

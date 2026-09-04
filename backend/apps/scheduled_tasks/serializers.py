@@ -117,6 +117,10 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
 
 class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
     """定时任务创建序列化器"""
+
+    environment = serializers.PrimaryKeyRelatedField(
+        queryset=Environment.objects.all(), required=False, allow_null=True,
+    )
     
     class Meta:
         model = ScheduledTask
@@ -155,6 +159,21 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
         if not ScheduledTask._validate_cron_expression(value):
             raise serializers.ValidationError("Cron表达式格式不正确")
         return value
+
+    def validate(self, attrs):
+        suite_type = attrs.get('suite_type') or getattr(self.instance, 'suite_type', '')
+        environment_provided = 'environment' in attrs
+        environment = attrs.get('environment') if environment_provided else getattr(self.instance, 'environment', None)
+        if suite_type == 'web':
+            if environment_provided and environment is not None:
+                raise serializers.ValidationError({'environment': 'WebUI 定时任务由脚本内完整网址执行，不接受环境。'})
+            # An API/App task may be switched to WebUI by PATCH without an
+            # explicit environment field. Clear its former shared environment.
+            attrs['environment'] = None
+            return attrs
+        if environment is None:
+            raise serializers.ValidationError({'environment': 'API/App 定时任务必须选择执行环境。'})
+        return attrs
     
     def create(self, validated_data):
         """创建定时任务"""
@@ -285,4 +304,3 @@ class SuiteChoiceSerializer(serializers.Serializer):
     name = serializers.CharField()
     description = serializers.CharField(required=False)
     total_cases = serializers.IntegerField(required=False)
-

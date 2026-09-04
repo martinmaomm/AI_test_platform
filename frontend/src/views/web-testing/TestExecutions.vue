@@ -488,7 +488,6 @@ const loadTestRuns = async () => {
           status: item.status,
           trigger_type: item.trigger_type,
           executor_name: item.executor_name,
-          environment_name: item.environment_name,
           browser: item.browser,
           start_time: item.start_time,
           end_time: item.end_time,

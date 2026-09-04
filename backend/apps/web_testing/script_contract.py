@@ -16,6 +16,7 @@ from typing import Optional
 from .constants import WEBUI_BROWSER_ENGINE
 from .assertion_state import instrument_runtime_assertions
 from .script_extraction import extract_playwright_metadata
+from .target_urls import validate_target_url
 
 
 class ScriptContractError(ValueError):
@@ -80,6 +81,36 @@ def _valid_run_signature(run: ast.AsyncFunctionDef) -> bool:
     )
 
 
+def _validate_static_goto_urls(module: ast.Module) -> None:
+    """Require literal navigation targets to be absolute HTTP(S) URLs.
+
+    Dynamic expressions remain valid so a manually maintained script can use
+    its explicit ``variables`` mapping.  Their runtime value cannot be
+    established from the stored source alone.
+    """
+    for node in ast.walk(module):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "goto"
+        ):
+            continue
+        target = node.args[0] if node.args else next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "url"),
+            None,
+        )
+        if target is None:
+            continue
+        if not isinstance(target, ast.Constant) or not isinstance(target.value, str):
+            continue
+        try:
+            validate_target_url(target.value)
+        except ValueError as exc:
+            raise ScriptContractError(
+                "保存脚本中的 page.goto 静态 URL 必须是完整的 http(s) 地址；不要使用相对路径"
+            ) from exc
+
+
 def validate_script(content: str) -> NormalizedScript:
     """Validate a script and return its contract metadata.
 
@@ -142,6 +173,7 @@ def normalize_for_storage(content: str) -> str:
         raise ScriptContractError("保存脚本不得包含 pytest test_* 入口")
     if _uses_browser_lifecycle(module):
         raise ScriptContractError("保存脚本不得创建或管理浏览器，请交由统一执行器管理")
+    _validate_static_goto_urls(module)
     if any(
         isinstance(node, ast.If)
         and isinstance(node.test, ast.Compare)
@@ -248,7 +280,6 @@ def materialize_script(
     test_name: str,
     *,
     headed: bool = True,
-    base_url: Optional[str] = None,
     suite_name: Optional[str] = None,
     failure_screenshot_path: Optional[str] = None,
     runtime_assertion_count_path: Optional[str] = None,
@@ -256,11 +287,12 @@ def materialize_script(
     """Create the pytest file content for one async business script.
 
     The generated wrapper is synchronous for pytest, but drives the async
-    Playwright API with ``asyncio.run``.  Browser/context/page lifecycle and
-    the optional context base URL are owned exclusively by this wrapper.
+    Playwright API with ``asyncio.run``.  Browser/context/page lifecycle is
+    owned exclusively by this wrapper; business scripts provide full URLs.
     """
 
     original = validate_script(content)
+    _validate_static_goto_urls(_parse(content))
     original_has_run = _function(_parse(content), "run") is not None
     original_main = _function(_parse(content), "main")
     if (
@@ -278,7 +310,6 @@ def materialize_script(
     if safe_name[0].isdigit() or keyword.iskeyword(safe_name) or not safe_name.isidentifier():
         safe_name = f"test_{safe_name}"
     browser_literal = repr(WEBUI_BROWSER_ENGINE)
-    base_url_literal = repr(base_url) if base_url else "None"
     screenshot_path_literal = repr(failure_screenshot_path) if failure_screenshot_path else "None"
     runtime_count_path_literal = repr(runtime_assertion_count_path) if runtime_assertion_count_path else "None"
     suite_decorator = f"@allure.suite({suite_name!r})\n" if suite_name else ""
@@ -367,11 +398,7 @@ async def _run_with_managed_browser():
     async with async_playwright() as playwright:
         browser_type = getattr(playwright, {browser_literal})
         browser = await browser_type.launch(headless={not headed!r})
-        context_kwargs = {{}}
-        base_url = {base_url_literal} or os.environ.get("PLAYWRIGHT_BASE_URL")
-        if base_url:
-            context_kwargs["base_url"] = base_url.rstrip("/")
-        context = await browser.new_context(**context_kwargs)
+        context = await browser.new_context()
         page = await context.new_page()
         try:
             runtime_variables = json.loads(os.environ.get("WEBUI_RUNTIME_VARIABLES", "{{}}"))

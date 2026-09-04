@@ -6,7 +6,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from projects.models import Environment, Project
+from projects.models import Project
 
 from .execution_variables import merge_execution_variables, store_runtime_variables
 from .models import (
@@ -37,19 +37,6 @@ class ScriptAssetFlowTests(TestCase):
             owner=self.user,
             created_by=self.user,
         )
-        self.environment = Environment.objects.create(
-            project=self.project,
-            name='WebUI',
-            category=Environment.EnvironmentCategory.WEB,
-            config={
-                'base_url': 'https://web.example.test',
-                'variables': {
-                    'SHARED_VALUE': 'environment',
-                    'ENV_ONLY': 'environment-only',
-                },
-            },
-        )
-
     def make_case(self, title, script, variables=None):
         return WebUITestCase.objects.create(
             title=title,
@@ -89,9 +76,8 @@ class ScriptAssetFlowTests(TestCase):
             1,
         )
 
-    def test_variable_layers_merge_from_low_to_high_and_allow_late_required_value(self):
+    def test_variable_layers_merge_from_case_to_suite_to_runtime(self):
         merged = merge_execution_variables(
-            {'SHARED_VALUE': 'environment', 'ENV_ONLY': 'environment-only'},
             [
                 {'name': 'SHARED_VALUE', 'value': 'case'},
                 {'name': 'REQUIRED_VALUE', 'value': '', 'required': True},
@@ -109,7 +95,6 @@ class ScriptAssetFlowTests(TestCase):
 
         self.assertEqual(merged['SHARED_VALUE'], 'runtime')
         self.assertEqual(merged['REQUIRED_VALUE'], 'provided-at-runtime')
-        self.assertEqual(merged['ENV_ONLY'], 'environment-only')
         self.assertEqual(merged['CASE_ONLY'], 'case-only')
         self.assertEqual(merged['SUITE_ONLY'], 'suite-only')
 
@@ -121,7 +106,6 @@ class ScriptAssetFlowTests(TestCase):
             description=test_case.description,
             executor=self.user,
             project=self.project,
-            environment=self.environment,
         )
         case_detail = WebUITestCaseExecutionDetail.objects.create(
             execution=case_execution,
@@ -137,7 +121,6 @@ class ScriptAssetFlowTests(TestCase):
             name=suite.name,
             executor=self.user,
             project=self.project,
-            environment=self.environment,
         )
         suite_detail = WebUITestSuiteExecutionDetail.objects.create(
             execution=suite_execution,
@@ -187,7 +170,6 @@ class ScriptAssetFlowTests(TestCase):
             name=suite.name,
             executor=self.user,
             project=self.project,
-            environment=self.environment,
         )
         detail = WebUITestSuiteExecutionDetail.objects.create(
             execution=execution,

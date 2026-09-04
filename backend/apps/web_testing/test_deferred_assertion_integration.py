@@ -6,7 +6,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from projects.models import Environment, Project
+from projects.models import Project
 
 from .generation_orchestrator import _persist_agent_result
 from .generation_workspace import finish_debug, prepare_debug
@@ -23,11 +23,6 @@ class DeferredAssertionIntegrationTests(TestCase):
             name='Deferred integration', project_type='web',
             owner=self.user, created_by=self.user,
         )
-        self.environment = Environment.objects.create(
-            project=self.project, name='Offline fixture',
-            category=Environment.EnvironmentCategory.WEB,
-            config={'base_url': 'https://fixture.example.test'}, is_active=True,
-        )
         self.factory = APIRequestFactory()
 
     def request(self, view, generation, payload, *, method='post'):
@@ -41,16 +36,17 @@ class DeferredAssertionIntegrationTests(TestCase):
         draft = '''"""场景：查看详细信息。目标：进入详情并验证显示结果。"""
 async def run(page, variables):
     # 进入入口页面
-    await page.goto('/items')
+    await page.goto('https://fixture.example.test/items')
     # 打开详情
     await page.locator('#open-details').click()
     # AITS_PENDING_ASSERTION: {"reason":"观察结果不足以确定业务字段的正确预期"}
 '''
         generation = WebUIScriptGeneration.objects.create(
-            project=self.project, user=self.user, environment=self.environment,
+            project=self.project, user=self.user,
             status=WebUIScriptGeneration.Status.EXPLORING,
             current_stage=WebUIScriptGeneration.Stage.EXPLORING,
             celery_task_id='deferred-agent-task',
+            target_url='https://fixture.example.test/items',
             workspace={'_agent_run': {'generation_revision': 0, 'task_id': 'deferred-agent-task'}},
         )
         snapshot = {

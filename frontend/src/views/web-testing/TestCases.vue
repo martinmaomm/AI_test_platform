@@ -29,7 +29,6 @@
 
     <el-dialog v-model="runVisible" title="运行测试用例" width="620px">
       <el-form label-position="top">
-        <el-form-item label="测试环境" required><el-select v-model="runForm.environmentId" placeholder="请选择 WebUI 环境"><el-option v-for="item in environments" :key="item.id" :label="`${item.name} · ${item.config?.base_url || ''}`" :value="item.id" /></el-select></el-form-item>
         <div class="run-grid"><el-form-item label="运行模式"><el-switch v-model="runForm.headed" active-text="显示浏览器" inactive-text="无头模式" /></el-form-item><el-form-item label="超时时间（秒）"><el-input-number v-model="runForm.timeout" :min="30" :max="1800" /></el-form-item></div>
         <div class="variables-heading"><div><strong>本次覆盖变量</strong><span>仅本次执行有效，不会保存到用例。</span></div><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div>
         <div v-for="(item, index) in runForm.variables" :key="index" class="variable-row"><el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="本次值" /><el-switch v-model="item.is_secret" active-text="敏感" /><el-button text type="danger" @click="runForm.variables.splice(index, 1)">删除</el-button></div>
@@ -49,7 +48,6 @@ import { assertionStateTagType as assertionTagType, assertionStateLabel as asser
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
-import { getProjectEnvironments } from '@/api/projects'
 import {
   batchDeleteWebUITestCases,
   createWebUITestModule,
@@ -69,7 +67,6 @@ const loading = ref(false)
 const running = ref(false)
 const cases = ref([])
 const modules = ref([])
-const environments = ref([])
 const selectedIds = ref([])
 const editorVisible = ref(false)
 const editingCase = ref(null)
@@ -79,7 +76,7 @@ const moduleDialogVisible = ref(false)
 const newModuleName = ref('')
 const filters = reactive({ search: '', moduleId: null, scriptStatus: null })
 const pagination = reactive({ page: 1, pageSize: 20, total: 0 })
-const runForm = reactive({ environmentId: null, headed: true, timeout: 300, variables: [] })
+const runForm = reactive({ headed: true, timeout: 300, variables: [] })
 
 const unwrap = (result) => result?.data ?? result ?? {}
 const asList = (result) => {
@@ -109,8 +106,7 @@ const loadCases = async () => {
   } catch { ElMessage.error('加载测试用例失败') } finally { loading.value = false }
 }
 const loadModules = async () => { modules.value = asList(await getWebUITestModules(projectId.value)) }
-const loadEnvironments = async () => { environments.value = asList(await getProjectEnvironments(projectId.value, { category: 'web' })).filter(item => item.is_active); runForm.environmentId = environments.value[0]?.id || null }
-const reload = async () => { if (!projectId.value) return; await Promise.all([loadCases(), loadModules(), loadEnvironments()]) }
+const reload = async () => { if (!projectId.value) return; await Promise.all([loadCases(), loadModules()]) }
 watch(projectId, reload, { immediate: true })
 
 const openCreate = () => { editingCase.value = null; editorVisible.value = true }
@@ -122,10 +118,9 @@ const batchRemove = async () => { try { await ElMessageBox.confirm(`确定删除
 const openRun = async row => { const result = await getWebUITestCase(projectId.value, row.id); runningCase.value = unwrap(result); runForm.variables = []; runVisible.value = true }
 const addRuntimeVariable = () => runForm.variables.push({ name: '', value: '', is_secret: false })
 const runCase = async () => {
-  if (!runForm.environmentId) return ElMessage.warning('请选择测试环境')
   if (runForm.variables.some(item => !item.name.trim())) return ElMessage.warning('变量名不能为空')
   running.value = true
-  try { const result = await executeWebUITestCase(projectId.value, runningCase.value.id, { environment_id: runForm.environmentId, options: { headed: runForm.headed, timeout: runForm.timeout }, runtime_variables: runForm.variables }); runVisible.value = false; ElMessage.success(`执行任务已启动${unwrap(result).task_id ? `：${unwrap(result).task_id}` : ''}`); loadCases() } catch (error) { ElMessage.error(error?.response?.data?.message || '启动执行失败') } finally { running.value = false }
+  try { const result = await executeWebUITestCase(projectId.value, runningCase.value.id, { options: { headed: runForm.headed, timeout: runForm.timeout }, runtime_variables: runForm.variables }); runVisible.value = false; ElMessage.success(`执行任务已启动${unwrap(result).task_id ? `：${unwrap(result).task_id}` : ''}`); loadCases() } catch (error) { ElMessage.error(error?.response?.data?.message || '启动执行失败') } finally { running.value = false }
 }
 
 const addModule = async () => { if (!newModuleName.value) return; try { await createWebUITestModule(projectId.value, { name: newModuleName.value }); newModuleName.value = ''; await loadModules(); ElMessage.success('模块已创建') } catch { ElMessage.error('创建模块失败') } }

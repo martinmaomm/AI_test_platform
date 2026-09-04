@@ -163,10 +163,59 @@ test('no execution is started until the explicit debug action', async t => {
 test('saving an unexecuted script sends draft mode, not verified mode', async t => {
   const { state, handlers, calls } = await harness(t)
   handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 10 } })
-  await state.save('测试草稿')
+  const result = await state.save('测试草稿')
+  assert.equal(result.test_case_id, 10)
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
   const saved = calls.find(call => call.name === 'saveWebUIScriptGeneration')
   assert.equal(saved.args[2].mode, 'draft')
   assert.equal(saved.args[2].expected_revision, 0)
+})
+
+test('successful save clears generation workspace state and removes local pointer', async t => {
+  const { state, handlers, storage } = await harness(t, record({ verification: { status: 'incomplete', execution_id: 14 } }))
+  state.debugExecution.value = { id: 9, execution: 14, project_id: 1, status: 'incomplete', log: 'old debug detail' }
+  handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 20 } })
+  const result = await state.save('测试草稿')
+  assert.equal(result.test_case_id, 20)
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
+  assert.equal(state.debugExecution.value, null)
+  assert.equal(state.draftConflict.value, false)
+  assert.equal(state.lastError.value, '')
+  assert.equal(storage.size, 0)
+})
+
+test('save without test_case_id treats response as malformed and keeps workspace', async t => {
+  const { state, handlers } = await harness(t)
+  handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record() } })
+  await assert.rejects(state.save('测试草稿'), /保存响应缺少测试用例标识/)
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.equal(state.localDraft.value !== null, true)
+})
+
+test('save failure keeps workspace and draft state', async t => {
+  const { state, handlers } = await harness(t)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'keep these edits' })
+  handlers.updateWebUIScriptGenerationDraft = async (_project, _generationId, payload) => ({ data: { ...record(), script_draft: payload.script_draft } })
+  handlers.saveWebUIScriptGeneration = async () => ({ success: false, message: '保存失败' })
+  await assert.rejects(state.save('测试草稿'))
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.equal(state.localDraft.value.script_draft, 'keep these edits')
+  assert.equal(state.hasUnsavedDraft.value, false)
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(state.draftConflict.value, false)
+})
+
+test('invalid saved case identifiers never clear the draft or restore pointer', async t => {
+  const { state, handlers, storage } = await harness(t)
+  for (const testCaseId of [null, '', ' ', NaN, Infinity, 0, -1, 1.5, 'invalid', {}, true]) {
+    handlers.saveWebUIScriptGeneration = async () => ({ success: true, data: { test_case_id: testCaseId } })
+    await assert.rejects(state.save('测试草稿'), /无法确认保存结果/)
+    assert.equal(state.localDraft.value.generationId, 'test-generation')
+    assert.equal(storage.get(state.storageKey.value), 'test-generation')
+    assert.equal(state.saving.value, false)
+  }
 })
 
 test('failed creation keeps the previous editable draft', async t => {
@@ -206,6 +255,146 @@ test('old polling cannot resume while a replacement generation is being created'
   request.resolve({ data: { ...record(), id: 'replacement' } })
   await pending
   assert.equal(state.generation.value.id, 'replacement')
+})
+
+test('a delayed poll response cannot restore state after save success', async t => {
+  const { state, handlers } = await harness(t, { ...record(), status: 'exploring' })
+  const pollRequest = deferred()
+  handlers.getWebUIScriptGeneration = () => pollRequest.promise
+  const poll = state.refresh()
+  handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 21 } })
+  await state.save('测试草稿')
+  pollRequest.resolve({ data: record({ status: 'failed', script_draft: 'stale poll content' }) })
+  await poll
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
+})
+
+test('a delayed debug detail response cannot restore debugExecution after save success', async t => {
+  const { state, handlers } = await harness(t, { ...record(), status: 'exploring', verification: { status: 'incomplete', execution_id: 14 } })
+  const detailRequest = deferred()
+  handlers.getWebUIScriptGeneration = async () => ({
+    data: {
+      ...record(),
+      workspace: {
+        verification: { status: 'incomplete', execution_id: 14 }
+      }
+    }
+  })
+  handlers.getWebUITestCaseExecution = () => detailRequest.promise
+  await state.refresh()
+  await new Promise(resolve => setImmediate(resolve))
+  handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 22 } })
+  await state.save('测试草稿')
+  detailRequest.resolve({ data: { execution: 14, status: 'incomplete', log: 'stale debug detail' } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(state.debugExecution.value, null)
+})
+
+test('saveDraft success preserves generation workspace and localStorage', async t => {
+  const { state, handlers, storage } = await harness(t)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'draft draft' })
+  handlers.updateWebUIScriptGenerationDraft = async (_project, _generationId, payload) => ({
+    data: { ...record(), script_draft: payload.script_draft }
+  })
+  const result = await state.saveDraft()
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.equal(state.localDraft.value?.generationId, 'test-generation')
+  assert.equal(state.localDraft.value?.script_draft, 'draft draft')
+  assert.equal(state.localDraft.value?.dirty, false)
+  assert.equal(storage.get('aits:webui-script-generation:v5:1:1'), 'test-generation')
+  assert.equal(result.workspace?.verification?.status, 'unverified')
+})
+
+test('successful clear workspace prevents later restore from issuing generation GET', async t => {
+  const { state, handlers, calls, storage } = await harness(t)
+  handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 20 } })
+  await state.save('测试草稿')
+  calls.length = 0
+  await state.restore()
+  assert.equal(calls.some(call => call.name === 'getWebUIScriptGeneration'), false)
+  assert.equal(storage.size, 0)
+  assert.equal(state.generation.value, null)
+})
+
+test('a stale websocket event after save success cannot rehydrate workspace state', async t => {
+  const { state, calls, handlers } = await harness(t)
+  handlers.saveWebUIScriptGeneration = async () => ({ data: { generation: record(), test_case_id: 24 } })
+  await state.save('测试草稿')
+  const handled = state.handleWebSocketEvent({ generation_id: 'test-generation' })
+  assert.equal(handled, false)
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
+  assert.equal(calls.some(call => call.name === 'getWebUIScriptGeneration'), false)
+})
+
+test('old save completion should not clear a new save in progress', async t => {
+  const { state, projectId, handlers, storage } = await harness(t)
+  const oldSave = deferred()
+  handlers.saveWebUIScriptGeneration = () => oldSave.promise
+  const savingOld = state.save('旧任务待清理')
+  projectId.value = 2
+  await nextTick()
+  handlers.createWebUIScriptGeneration = async () => ({ data: { ...record(), id: 'replacement' } })
+  await state.create({ description: 'switch project and new task' })
+  const newSave = deferred()
+  handlers.saveWebUIScriptGeneration = () => newSave.promise
+  const savingNew = state.save('新任务保存')
+  assert.equal(state.saving.value, true)
+  oldSave.resolve({ data: { test_case_id: 30 } })
+  await savingOld
+  assert.equal(state.generation.value.id, 'replacement')
+  assert.equal(storage.get('aits:webui-script-generation:v5:1:2'), 'replacement')
+  assert.equal(state.saving.value, true)
+  newSave.resolve({ data: { test_case_id: 31 } })
+  await savingNew
+  assert.equal(state.saving.value, false)
+  assert.equal(state.generation.value, null)
+})
+
+test('old save completion should not clear a new save after user switch', async t => {
+  const { state, userId, handlers, storage } = await harness(t)
+  const oldSave = deferred()
+  handlers.saveWebUIScriptGeneration = () => oldSave.promise
+  const savingOld = state.save('旧任务待清理')
+
+  userId.value = 2
+  await nextTick()
+
+  handlers.createWebUIScriptGeneration = async () => ({ data: { ...record(), id: 'replacement-by-user' } })
+  await state.create({ description: 'switch user and new task' })
+
+  const newSave = deferred()
+  handlers.saveWebUIScriptGeneration = () => newSave.promise
+  const savingNew = state.save('新任务保存')
+  assert.equal(state.saving.value, true)
+
+  oldSave.resolve({ data: { test_case_id: 30 } })
+  await savingOld
+  assert.equal(state.generation.value.id, 'replacement-by-user')
+  assert.equal(storage.get('aits:webui-script-generation:v5:2:1'), 'replacement-by-user')
+  assert.equal(state.saving.value, true)
+
+  newSave.resolve({ data: { test_case_id: 31 } })
+  await savingNew
+  assert.equal(state.saving.value, false)
+  assert.equal(state.generation.value, null)
+})
+
+test('old save result cannot clear generation after project switch and recreate', async t => {
+  const { state, projectId, handlers, storage } = await harness(t)
+  const saveRequest = deferred()
+  handlers.saveWebUIScriptGeneration = () => saveRequest.promise
+  const saving = state.save('待清理旧任务')
+  projectId.value = 2
+  await nextTick()
+  handlers.createWebUIScriptGeneration = async () => ({ data: { ...record(), id: 'replacement' } })
+  await state.create({ description: 'switch project and new task' })
+  saveRequest.resolve({ data: { test_case_id: 23 } })
+  await saving
+  assert.equal(state.generation.value.id, 'replacement')
+  assert.equal(state.localDraft.value?.generationId, 'replacement')
+  assert.equal(storage.get('aits:webui-script-generation:v5:1:2'), 'replacement')
 })
 
 test('incomplete debug runs load their real logs and screenshot on refresh and restore', async t => {

@@ -10,7 +10,7 @@
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
         <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :busy="isActive || isWorkspaceBusy" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
-        <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。生成记录会在刷新页面后自动恢复。" class="empty-result" />
+        <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。未保存到测试用例的生成记录可在刷新后恢复；保存成功后会清空当前工作区。" class="empty-result" />
       </div>
     </div>
   </div>

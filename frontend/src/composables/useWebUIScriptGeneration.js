@@ -83,6 +83,19 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     pollingTimer = null
   }
 
+  const resetGenerationWorkspace = ({ removeStorageKey = false } = {}) => {
+    invalidateScope()
+    stopPolling()
+    generation.value = null
+    localDraft.value = null
+    draftConflict.value = false
+    debugExecution.value = null
+    lastError.value = ''
+    refreshPromise = null
+    refreshScope = ''
+    if (removeStorageKey) clearStoredGeneration()
+  }
+
   const clearStoredGeneration = () => {
     if (typeof window !== 'undefined') window.localStorage.removeItem(storageKey.value)
   }
@@ -157,6 +170,14 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const isCurrentGenerationScope = (requestScope, requestProjectId, generationId) => (
     isCurrentScope(requestScope, requestProjectId) && String(generation.value?.id || '') === String(generationId || '')
   )
+  const hasPersistedSaveResult = (payload) => {
+    const testCaseId = payload?.test_case_id
+    if (testCaseId === null || testCaseId === undefined) return false
+    if (typeof testCaseId !== 'number' && typeof testCaseId !== 'string') return false
+    if (typeof testCaseId === 'string' && testCaseId.trim() === '') return false
+    const normalizedId = Number(testCaseId)
+    return Number.isSafeInteger(normalizedId) && normalizedId > 0
+  }
 
   const refresh = async (generationId = generation.value?.id) => {
     const requestProjectId = currentProjectId.value
@@ -195,13 +216,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const restore = async () => {
-    invalidateScope()
-    stopPolling()
-    generation.value = null
-    localDraft.value = null
-    draftConflict.value = false
-    debugExecution.value = null
-    lastError.value = ''
+    resetGenerationWorkspace()
     if (!currentProjectId.value || !currentUserId.value || typeof window === 'undefined') return null
     const generationId = window.localStorage.getItem(storageKey.value)
     return generationId ? refresh(generationId) : null
@@ -274,8 +289,11 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       if (!isCurrentScope(requestScope, requestProjectId) || String(generation.value?.id) !== String(generationId)) return null
       const data = apiData(response)
       if (response?.success === false) throw new Error(response?.message || '保存失败')
-      if (data?.generation) applyGeneration(data.generation, { forceDraftSync: true })
-      return data
+      if (hasPersistedSaveResult(data)) {
+        resetGenerationWorkspace({ removeStorageKey: true })
+        return data
+      }
+      throw new Error('保存响应缺少测试用例标识，无法确认保存结果')
     } catch (error) {
       if (!isCurrentGenerationScope(requestScope, requestProjectId, generationId)) return null
       lastError.value = generationApiErrorMessage(error, '保存失败')

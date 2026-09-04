@@ -23,7 +23,7 @@ const generationRecord = (scriptDraft = 'rev1', revision = 1) => ({
     revision,
     variables: [],
     verification: { status: 'unverified' },
-    repair: { status: 'idle', count: 0 }
+    repair: { status: 'idle' }
   },
   script_draft: scriptDraft
 })

@@ -8,7 +8,9 @@ import { effectScope, nextTick, ref } from 'vue'
 const dataModule = source => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 let moduleId = 0
 const methods = [
+  'applyWebUIScriptGenerationRepair',
   'cancelWebUIScriptGeneration', 'createWebUIScriptGeneration', 'debugWebUIScriptGeneration',
+  'discardWebUIScriptGenerationRepair',
   'getWebUIScriptGeneration', 'getWebUITestCaseExecution', 'repairWebUIScriptGeneration',
   'resolveWebUIScriptGeneration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
 ]
@@ -177,6 +179,255 @@ test('debug saves unified variable defaults first and sends only one-time overri
   assert.deepEqual(writes[1].args[2].runtime_variables, [{ name: 'TEST_LABEL', value: 'only-this-debug', is_secret: false }])
   assert.equal(writes[1].args[2].expected_revision, 1)
   assert.equal(state.localDraft.value.variables[0].value, 'saved-default')
+})
+
+test('AI repair only starts from a clean failed revision with diagnostics and forwards merged one-time variables', async t => {
+  const variables = [{ name: 'UI_TEST_PASSWORD', value: '', description: '测试密码', required: true, is_secret: true }]
+  const failed = record({
+    revision: 3,
+    variables,
+    verification: { status: 'failed', locked_revision: 3, diagnostics: [{ code: 'ASSERTION_FAILURE', message: '登录后页面未出现' }] }
+  })
+  const { state, handlers, calls, storage } = await harness(t, failed)
+  assert.equal(state.canStartRepair.value, true)
+  handlers.repairWebUIScriptGeneration = async () => ({ data: record({
+    revision: 3,
+    variables,
+    verification: failed.workspace.verification,
+    repair: { status: 'pending', phase: 'collecting', attempt_count: 0 }
+  }) })
+
+  await state.repair([{ name: 'UI_TEST_PASSWORD', value: 'fixture-only-password' }])
+
+  const repairCall = calls.find(call => call.name === 'repairWebUIScriptGeneration')
+  assert.deepEqual(repairCall.args, [1, 'test-generation', {
+    expected_revision: 3,
+    confirm_execution: true,
+    runtime_variables: [{ name: 'UI_TEST_PASSWORD', value: 'fixture-only-password', is_secret: true }]
+  }])
+  assert.equal(state.workspace.value.repair.status, 'pending')
+  assert.equal(state.isWorkspaceBusy.value, true)
+  assert.equal(state.canStartRepair.value, false)
+  assert.deepEqual([...storage.values()], ['test-generation'])
+  assert.doesNotMatch([...storage.values()].join(','), /fixture-only-password/)
+
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'local edit must block repair' })
+  assert.equal(state.hasUnsavedDraft.value, true)
+  assert.equal(state.canStartRepair.value, false)
+})
+
+test('an active generation cannot start repair even if a stale failure diagnostic is present', async t => {
+  const activeFailure = {
+    ...record({ verification: { status: 'failed', diagnostics: [{ code: 'ASSERTION_FAILURE', message: 'stale diagnostic' }] } }),
+    status: 'generating'
+  }
+  const { state, calls } = await harness(t, activeFailure)
+  assert.equal(state.isActive.value, true)
+  assert.equal(state.canStartRepair.value, false)
+  assert.equal(await state.repair([]), null)
+  assert.equal(calls.some(call => call.name === 'repairWebUIScriptGeneration'), false)
+})
+
+test('applying a repair candidate uses its hash and synchronizes the returned revision only after success', async t => {
+  const candidate = 'async def run(page):\n    await page.goto("https://example.test/fixed")'
+  const source = record({
+    revision: 3,
+    verification: { status: 'failed', diagnostics: [{ code: 'ASSERTION_FAILURE', message: 'failed' }] },
+    repair: { status: 'candidate_passed', candidate_hash: 'sha256-candidate', candidate_script: candidate, attempt_count: 1 }
+  })
+  const { state, handlers, calls } = await harness(t, source)
+  assert.equal(state.localDraft.value.script_draft, source.script_draft)
+  assert.equal(state.hasRepairCandidate.value, true)
+  assert.equal(await state.save('候选未采用前不得保存'), null)
+  assert.equal(await state.debug([]), null)
+  assert.equal(calls.some(call => ['saveWebUIScriptGeneration', 'debugWebUIScriptGeneration'].includes(call.name)), false)
+  handlers.applyWebUIScriptGenerationRepair = async () => ({ data: {
+    ...record({ revision: 4, repair: { status: 'idle' }, verification: { status: 'passed', locked_revision: 4 } }),
+    script_draft: candidate
+  } })
+
+  await state.applyRepairCandidate('sha256-candidate')
+
+  const applyCall = calls.find(call => call.name === 'applyWebUIScriptGenerationRepair')
+  assert.deepEqual(applyCall.args, [1, 'test-generation', { expected_revision: 3, candidate_hash: 'sha256-candidate' }])
+  assert.equal(state.workspace.value.revision, 4)
+  assert.equal(state.localDraft.value.revision, 4)
+  assert.equal(state.localDraft.value.script_draft, candidate)
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(state.hasRepairCandidate.value, false)
+})
+
+test('a candidate without script cannot be applied, and a 409 keeps the original local draft intact', async t => {
+  const originalScript = 'async def run(page):\n    await page.goto("https://example.test/original")'
+  const noScriptCandidate = { ...record({ revision: 3, repair: { status: 'candidate_ready', candidate_hash: 'sha256-missing' } }), script_draft: originalScript }
+  const first = await harness(t, noScriptCandidate)
+  assert.equal(first.state.canApplyRepairCandidate.value, false)
+  await first.state.refresh()
+  assert.equal(first.state.localDraft.value.script_draft, originalScript)
+  assert.equal(await first.state.applyRepairCandidate('sha256-missing'), null)
+  assert.equal(first.calls.some(call => call.name === 'applyWebUIScriptGenerationRepair'), false)
+
+  const candidate = { ...record({
+    revision: 3,
+    repair: { status: 'candidate_ready', candidate_hash: 'sha256-candidate', candidate_script: 'candidate script' }
+  }), script_draft: originalScript }
+  const second = await harness(t, candidate)
+  second.handlers.applyWebUIScriptGenerationRepair = async () => {
+    throw { response: { status: 409, data: { data: { ...candidate, script_draft: 'must never replace local draft' } } } }
+  }
+  await assert.rejects(second.state.applyRepairCandidate('sha256-candidate'))
+  assert.equal(second.state.draftConflict.value, true)
+  assert.equal(second.state.localDraft.value.script_draft, originalScript)
+})
+
+test('discarding a candidate preserves the original script and revision, while a 409 preserves the local draft', async t => {
+  const originalScript = 'async def run(page):\n    await page.goto("https://example.test/original")'
+  const source = {
+    ...record({
+      revision: 3,
+      verification: { status: 'failed', diagnostics: [{ code: 'ASSERTION_FAILURE', message: '原脚本失败' }] },
+      repair: { status: 'candidate_ready', candidate_hash: 'sha256-candidate', candidate_script: 'candidate script' }
+    }),
+    script_draft: originalScript
+  }
+  const { state, handlers, calls } = await harness(t, source)
+  handlers.discardWebUIScriptGenerationRepair = async () => ({ data: {
+    ...record({ revision: 3, verification: source.workspace.verification, repair: { status: 'idle' } }),
+    script_draft: originalScript
+  } })
+
+  await state.discardRepairCandidate('sha256-candidate')
+
+  const discardCall = calls.find(call => call.name === 'discardWebUIScriptGenerationRepair')
+  assert.deepEqual(discardCall.args, [1, 'test-generation', { expected_revision: 3, candidate_hash: 'sha256-candidate' }])
+  assert.equal(state.localDraft.value.script_draft, originalScript)
+  assert.equal(state.localDraft.value.revision, 3)
+  assert.equal(state.hasRepairCandidate.value, false)
+  assert.equal(state.canStartRepair.value, true)
+
+  const conflict = await harness(t, source)
+  conflict.handlers.discardWebUIScriptGenerationRepair = async () => {
+    throw { response: { status: 409, data: { data: { ...source, script_draft: 'must not replace original draft' } } } }
+  }
+  await assert.rejects(conflict.state.discardRepairCandidate('sha256-candidate'))
+  assert.equal(conflict.state.draftConflict.value, true)
+  assert.equal(conflict.state.localDraft.value.script_draft, originalScript)
+  assert.equal(conflict.state.localDraft.value.revision, 3)
+})
+
+test('repair execution details default to the latest attempt and can switch between both rounds', async t => {
+  const withAttempt = record({
+    repair: {
+      status: 'candidate_passed',
+      attempt_count: 2,
+      attempts: [
+        { execution_id: 31, execution_status: 'failed', failure_summary: '首轮定位器失败' },
+        { execution_id: 32, execution_status: 'passed' }
+      ]
+    }
+  })
+  const { state, handlers, calls } = await harness(t, withAttempt)
+  const details = {
+    31: { id: 91, execution: 31, project_id: 1, status: 'failed', log: 'first candidate run log', screenshot_path: 'candidate-first.png' },
+    32: { id: 92, execution: 32, project_id: 1, status: 'passed', log: 'second candidate run log', screenshot_path: 'candidate-second.png' }
+  }
+  handlers.getWebUIScriptGeneration = async () => ({ success: true, data: withAttempt })
+  handlers.getWebUITestCaseExecution = async (_projectId, executionId) => ({ success: true, data: details[executionId] })
+
+  await state.refresh()
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(state.selectedRepairExecutionId.value, 32)
+  assert.deepEqual(state.repairExecution.value, details[32])
+  assert.deepEqual(calls.filter(call => call.name === 'getWebUITestCaseExecution').at(-1).args, [1, 32])
+
+  await state.loadRepairExecution(31)
+  assert.equal(state.selectedRepairExecutionId.value, 31)
+  assert.deepEqual(state.repairExecution.value, details[31])
+  assert.deepEqual(calls.filter(call => call.name === 'getWebUITestCaseExecution').at(-1).args, [1, 31])
+
+  await state.loadRepairExecution('32')
+  assert.equal(state.selectedRepairExecutionId.value, 32)
+  assert.deepEqual(state.repairExecution.value, details[32])
+})
+
+test('a late first-round response cannot replace the second round selected by the user', async t => {
+  const withAttempts = record({
+    repair: {
+      status: 'candidate_passed',
+      attempts: [
+        { execution_id: 31, execution_status: 'failed' },
+        { execution_id: 32, execution_status: 'passed' }
+      ]
+    }
+  })
+  const { state, handlers } = await harness(t, withAttempts)
+  const delayedFirstRound = deferred()
+  const secondRoundDetail = { id: 92, execution: 32, project_id: 1, status: 'passed', screenshot_path: 'second-round.png' }
+  handlers.getWebUITestCaseExecution = async (_projectId, executionId) => (
+    executionId === 31 ? delayedFirstRound.promise : { success: true, data: secondRoundDetail }
+  )
+
+  const firstRequest = state.loadRepairExecution(31)
+  await state.loadRepairExecution(32)
+  delayedFirstRound.resolve({ success: true, data: { id: 91, execution: 31, project_id: 1, status: 'failed', screenshot_path: 'late-first-round.png' } })
+  await firstRequest
+
+  assert.equal(state.selectedRepairExecutionId.value, 32)
+  assert.deepEqual(state.repairExecution.value, secondRoundDetail)
+  assert.equal(state.repairExecutionLoading.value, false)
+})
+
+test('repair execution loading rejects ids outside current attempts and late responses from another generation', async t => {
+  const oldGeneration = record({
+    repair: { status: 'candidate_ready', attempts: [{ execution_id: 31, execution_status: 'failed' }] }
+  })
+  const { state, handlers, calls } = await harness(t, oldGeneration)
+  const oldResponse = deferred()
+  let executionRequestCount = 0
+  handlers.getWebUITestCaseExecution = async () => {
+    executionRequestCount += 1
+    if (executionRequestCount === 1) return oldResponse.promise
+    return { success: true, data: { id: 193, execution: 31, project_id: 1, status: 'passed', screenshot_path: 'new-generation.png' } }
+  }
+
+  const invalidResult = await state.loadRepairExecution(999)
+  assert.equal(invalidResult, null)
+  assert.equal(calls.some(call => call.name === 'getWebUITestCaseExecution'), false)
+
+  const pendingOldRequest = state.loadRepairExecution(31)
+  handlers.createWebUIScriptGeneration = async () => ({ success: true, data: {
+    ...oldGeneration,
+    id: 'next-generation',
+    workspace: { ...oldGeneration.workspace, repair: { status: 'candidate_passed', attempts: [{ execution_id: 31, execution_status: 'passed' }] } }
+  } })
+  await state.create({ description: 'next task' })
+  oldResponse.resolve({ success: true, data: { id: 93, execution: 31, project_id: 1, status: 'failed', screenshot_path: 'stale-generation.png' } })
+  await pendingOldRequest
+
+  assert.equal(state.generation.value.id, 'next-generation')
+  assert.equal(state.selectedRepairExecutionId.value, 31)
+  assert.equal(state.repairExecution.value, null)
+
+  await state.loadRepairExecution(31)
+  assert.equal(state.repairExecution.value.screenshot_path, 'new-generation.png')
+})
+
+test('candidate_ready also loads the last failed execution detail through the standard execution_status field', async t => {
+  const candidateReady = record({
+    repair: {
+      status: 'candidate_ready', candidate_hash: 'sha256-candidate', candidate_script: 'candidate',
+      attempts: [{ execution_id: 44, execution_status: 'failed', summary: '候选定位器失败' }]
+    }
+  })
+  const { state, handlers } = await harness(t, candidateReady)
+  const detail = { id: 144, execution: 44, project_id: 1, status: 'failed', screenshot_path: 'candidate-failed.png' }
+  handlers.getWebUIScriptGeneration = async () => ({ success: true, data: candidateReady })
+  handlers.getWebUITestCaseExecution = async () => ({ success: true, data: detail })
+  await state.refresh()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(state.selectedRepairExecutionId.value, 44)
+  assert.deepEqual(state.repairExecution.value, detail)
 })
 
 test('unified variable table can supply inferred password via transient debug override', async t => {

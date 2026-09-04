@@ -27,8 +27,13 @@ ACTIVE_GENERATION_STATUSES = frozenset({
 })
 BUSY_VERIFICATION_STATUSES = frozenset({'pending', 'running'})
 BUSY_REPAIR_STATUSES = frozenset({'pending', 'running'})
-MAX_WORKSPACE_REPAIRS = 2
+REPAIR_CANDIDATE_STATUSES = frozenset({'candidate_ready', 'candidate_passed'})
 MAX_ARTIFACT_HISTORY = 8
+MAX_REPAIR_CANDIDATE_CHARS = 200000
+MAX_REPAIR_DIFF_CHARS = 20000
+MAX_REPAIR_SUMMARY_CHARS = 2000
+MAX_REPAIR_BLOCKERS = 20
+MAX_REPAIR_ERROR_CODE_CHARS = 96
 _SECRET_VARIABLE_RE = re.compile(r'(?i)(password|passwd|token|secret|api[_-]?key|credential)')
 
 
@@ -108,7 +113,9 @@ def evaluate_workspace_draft(
 def _repair(**values: Any) -> dict[str, Any]:
     result = {
         'status': 'idle',
-        'count': 0,
+        'phase': '',
+        'attempt_count': 0,
+        'attempts': [],
         'task_id': '',
         'source_revision': None,
         'script_hash': '',
@@ -119,6 +126,8 @@ def _repair(**values: Any) -> dict[str, Any]:
         'candidate_quality_report': {},
         'candidate_error_code': '',
         'candidate_error_message': '',
+        'summary': '',
+        'runtime_variables_present': False,
     }
     result.update(values)
     return result
@@ -148,6 +157,13 @@ def normalize_workspace(value: Any, *, script: str = '') -> dict[str, Any]:
             key: deepcopy(value) for key, value in raw['repair'].items()
             if key in repair or key in {'completed_at', 'started_at', 'candidate_hash'}
         })
+    repair['attempts'] = _sanitize_repair_attempts(repair.get('attempts'))
+    repair['attempt_count'] = len(repair['attempts'])
+    repair['summary'] = str(repair.get('summary') or '')[:MAX_REPAIR_SUMMARY_CHARS]
+    repair['message'] = str(repair.get('message') or '')[:MAX_REPAIR_SUMMARY_CHARS]
+    repair['blockers'] = _sanitize_repair_blockers(repair.get('blockers'))
+    repair['candidate_script'] = str(repair.get('candidate_script') or '')[:MAX_REPAIR_CANDIDATE_CHARS]
+    repair['candidate_diff'] = str(repair.get('candidate_diff') or '')[:MAX_REPAIR_DIFF_CHARS]
     if 'variables' not in raw:
         variables = infer_script_variables(script)
     artifact_history = raw.get('artifact_history') if isinstance(raw.get('artifact_history'), list) else []
@@ -158,6 +174,47 @@ def normalize_workspace(value: Any, *, script: str = '') -> dict[str, Any]:
         'repair': repair, 'artifact_history': artifact_history,
         '_agent_run': deepcopy(agent_run),
     }
+
+
+def _sanitize_repair_attempts(value: Any) -> list[dict[str, Any]]:
+    items = value if isinstance(value, list) else []
+    allowed = {
+        'round', 'candidate_hash', 'mcp_checked', 'static_status', 'execution_id',
+        'execution_status', 'summary', 'has_screenshot', 'runtime_assertion_count',
+    }
+    cleaned = []
+    for item in items[-2:]:
+        if not isinstance(item, dict):
+            continue
+        entry = {key: deepcopy(item[key]) for key in allowed if key in item}
+        entry['round'] = min(2, max(1, int(entry.get('round') or 1)))
+        entry['candidate_hash'] = str(entry.get('candidate_hash') or '')[:64]
+        entry['mcp_checked'] = bool(entry.get('mcp_checked'))
+        entry['static_status'] = str(entry.get('static_status') or '')[:64]
+        entry['execution_id'] = entry.get('execution_id') if isinstance(entry.get('execution_id'), int) else None
+        entry['execution_status'] = str(entry.get('execution_status') or '')[:32]
+        entry['summary'] = str(entry.get('summary') or '')[:MAX_REPAIR_SUMMARY_CHARS]
+        entry['has_screenshot'] = bool(entry.get('has_screenshot'))
+        entry['runtime_assertion_count'] = max(0, int(entry.get('runtime_assertion_count') or 0))
+        cleaned.append(entry)
+    return cleaned
+
+
+def _sanitize_repair_blockers(value: Any) -> list[dict[str, str]]:
+    items = value if isinstance(value, list) else []
+    return [
+        {
+            'severity': str(item.get('severity') or '')[:32],
+            'code': str(item.get('code') or '')[:96],
+            'message': str(item.get('message') or '')[:MAX_REPAIR_SUMMARY_CHARS],
+        }
+        for item in items[:MAX_REPAIR_BLOCKERS] if isinstance(item, dict)
+    ]
+
+
+def _sanitize_repair_text(value: Any, *, limit: int = MAX_REPAIR_SUMMARY_CHARS) -> str:
+    """Constrain task-provided text before it reaches the durable workspace."""
+    return str(value or '')[:limit]
 
 
 def _without_persisted_secret_values(variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -302,6 +359,8 @@ def update_draft(generation_id: Any, *, expected_revision: int, script_draft: st
             raise WorkspaceConflict('调试正在执行，不能同时编辑脚本。', generation)
         if workspace['repair']['status'] in BUSY_REPAIR_STATUSES:
             raise WorkspaceConflict('修复正在生成，不能同时编辑脚本。', generation)
+        if workspace['repair']['status'] in REPAIR_CANDIDATE_STATUSES:
+            raise WorkspaceConflict('请先采用或放弃当前候选。', generation)
         persisted_variables = _without_persisted_secret_values(variables)
         if generation.script_draft == script_draft and workspace['variables'] == persisted_variables:
             return generation
@@ -309,7 +368,7 @@ def update_draft(generation_id: Any, *, expected_revision: int, script_draft: st
         workspace['revision'] += 1
         workspace['variables'] = persisted_variables
         workspace['verification'] = _verification(script=script_draft)
-        workspace['repair'] = _repair(count=int(workspace['repair'].get('count') or 0))
+        workspace['repair'] = _repair()
         generation.workspace = workspace
         generation.quality_report = evaluate_workspace_draft(
             script_draft, target_url=generation.target_url, snapshot=generation.exploration_snapshot,
@@ -330,6 +389,8 @@ def prepare_debug(generation_id: Any, *, expected_revision: int, execution_id: i
             raise WorkspaceConflict('当前草稿正在调试。', generation)
         if workspace['repair']['status'] in BUSY_REPAIR_STATUSES:
             raise WorkspaceConflict('修复正在生成，暂不能调试。', generation)
+        if workspace['repair']['status'] in REPAIR_CANDIDATE_STATUSES:
+            raise WorkspaceConflict('请先采用或放弃当前候选。', generation)
         report = evaluate_workspace_draft(
             generation.script_draft, target_url=generation.target_url, snapshot=generation.exploration_snapshot,
         )
@@ -420,7 +481,7 @@ def finish_debug(generation_id: Any, *, execution_id: int, locked_revision: int,
         return True
 
 
-def prepare_repair(generation_id: Any, *, expected_revision: int):
+def prepare_repair(generation_id: Any, *, expected_revision: int, runtime_variables_present: bool = False):
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         if generation.status in ACTIVE_GENERATION_STATUSES:
@@ -434,14 +495,16 @@ def prepare_repair(generation_id: Any, *, expected_revision: int):
             raise WorkspaceConflict('调试正在执行，完成后才能请求修复。', generation)
         if repair['status'] in BUSY_REPAIR_STATUSES:
             raise WorkspaceConflict('修复任务已经在执行。', generation)
-        if repair['count'] >= MAX_WORKSPACE_REPAIRS:
-            raise WorkspaceConflict('同一草稿最多只能请求 2 次修复，请人工审核。', generation)
+        if repair['status'] in REPAIR_CANDIDATE_STATUSES:
+            raise WorkspaceConflict('请先采用或放弃当前候选。', generation)
         if verification['status'] not in {'failed', 'error'} or not verification.get('diagnostics'):
             raise WorkspaceConflict('缺少本草稿的失败诊断，不能凭空生成修复。', generation)
         locked_hash = script_hash(generation.script_draft)
         workspace['repair'] = _repair(
-            status='pending', count=repair['count'], source_revision=expected_revision,
-            script_hash=locked_hash,
+            status='pending', source_revision=expected_revision,
+            script_hash=locked_hash, phase='collecting',
+            message='正在收集失败证据。',
+            runtime_variables_present=bool(runtime_variables_present),
         )
         _set_workspace(generation, workspace)
     return generation, locked_hash
@@ -471,6 +534,8 @@ def mark_repair_running(generation_id: Any, *, locked_revision: int, locked_hash
         ):
             return None
         repair['status'] = 'running'
+        repair['phase'] = 'analyzing'
+        repair['message'] = '正在分析失败证据。'
         _set_workspace(generation, workspace)
         return generation
 
@@ -490,84 +555,121 @@ def finish_repair_failure(generation_id: Any, *, locked_revision: int, locked_ha
         ):
             return False
         workspace['repair'] = _repair(
-            status='failed', count=min(MAX_WORKSPACE_REPAIRS, int(repair.get('count') or 0) + 1),
+            status='failed', phase='completed',
             source_revision=locked_revision, script_hash=locked_hash, task_id=repair.get('task_id', ''),
-            message=message, blockers=blockers or [],
+            message=_sanitize_repair_text(message), blockers=_sanitize_repair_blockers(blockers),
         )
         _set_workspace(generation, workspace)
         return True
 
 
-def accept_repair_candidate(generation_id: Any, *, locked_revision: int, locked_hash: str, candidate_script: str, task_id: str | None = None):
+def update_repair_state(generation_id: Any, *, locked_revision: int, locked_hash: str,
+                        phase: str | None = None, message: str | None = None,
+                        attempts: list[dict[str, Any]] | None = None,
+                        candidate_script: str | None = None, candidate_diff: str | None = None,
+                        candidate_quality_report: dict[str, Any] | None = None,
+                        candidate_error_code: str | None = None, candidate_error_message: str | None = None,
+                        final_status: str | None = None, summary: str | None = None,
+                        task_id: str | None = None) -> bool:
+    """Persist only review-safe repair progress while retaining the original draft."""
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         workspace = workspace_for_generation(generation)
         repair = workspace['repair']
-        if (
-            repair.get('source_revision') != locked_revision
-            or repair.get('script_hash') != locked_hash
-            or repair.get('status') != 'running'
-            or not _task_matches(repair, task_id)
-        ):
+        if (repair.get('source_revision') != locked_revision or repair.get('script_hash') != locked_hash
+                or workspace['revision'] != locked_revision or script_hash(generation.script_draft) != locked_hash
+                or repair.get('status') not in {'pending', 'running'} or not _task_matches(repair, task_id)):
             return False
-        if workspace['revision'] != locked_revision or script_hash(generation.script_draft) != locked_hash:
-            return False
-        generation.script_draft = candidate_script
-        generation.quality_report = {'status': 'stale', 'message': '修复候选已生成，原检查结果已失效，需人工审核。'}
+        if phase is not None:
+            repair['phase'] = phase
+        if message is not None:
+            repair['message'] = _sanitize_repair_text(message)
+        if attempts is not None:
+            repair['attempts'] = _sanitize_repair_attempts(attempts)
+            repair['attempt_count'] = len(repair['attempts'])
+        if candidate_script is not None:
+            candidate_script = str(candidate_script)
+            if len(candidate_script) > MAX_REPAIR_CANDIDATE_CHARS:
+                raise ValueError('修复候选脚本超过允许长度，已拒绝保存。')
+            repair['candidate_script'] = candidate_script
+            repair['candidate_hash'] = script_hash(candidate_script)
+        if candidate_diff is not None:
+            candidate_diff = str(candidate_diff)
+            if len(candidate_diff) > MAX_REPAIR_DIFF_CHARS:
+                raise ValueError('修复候选差异超过允许长度，已拒绝保存。')
+            repair['candidate_diff'] = candidate_diff
+        if candidate_quality_report is not None:
+            repair['candidate_quality_report'] = deepcopy(candidate_quality_report)
+        if candidate_error_code is not None:
+            repair['candidate_error_code'] = _sanitize_repair_text(
+                candidate_error_code, limit=MAX_REPAIR_ERROR_CODE_CHARS,
+            )
+        if candidate_error_message is not None:
+            repair['candidate_error_message'] = _sanitize_repair_text(candidate_error_message)
+        if summary is not None:
+            repair['summary'] = _sanitize_repair_text(summary)
+        if final_status is not None:
+            repair['status'] = final_status
+            repair['phase'] = 'completed'
+        _set_workspace(generation, workspace)
+        return True
+
+
+def apply_repair_candidate(generation_id: Any, *, expected_revision: int, candidate_hash: str):
+    """Atomically adopt a reviewed proposal and retain only valid execution proof."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        workspace = workspace_for_generation(generation)
+        repair = workspace['repair']
+        source_hash = script_hash(generation.script_draft)
+        candidate = str(repair.get('candidate_script') or '')
+        if (workspace['revision'] != expected_revision or repair.get('source_revision') != expected_revision
+                or repair.get('script_hash') != source_hash or repair.get('candidate_hash') != candidate_hash
+                or script_hash(candidate) != candidate_hash or repair.get('status') not in {'candidate_ready', 'candidate_passed'}):
+            raise WorkspaceConflict('草稿或候选已变化，请刷新后重试。', generation)
+        generation.script_draft = candidate
         workspace['revision'] += 1
-        workspace['verification'] = _verification(script=candidate_script)
+        if repair.get('status') == 'candidate_passed':
+            passed_attempt = next((item for item in reversed(repair.get('attempts') or [])
+                                   if item.get('candidate_hash') == candidate_hash and item.get('execution_status') == 'passed'), None)
+            candidate_state = analyze_assertion_state(candidate)
+            proof_complete = bool(passed_attempt and int(passed_attempt.get('runtime_assertion_count') or 0) > 0 and candidate_state.get('status') == 'complete')
+            workspace['verification'] = _verification(
+                status='passed' if proof_complete else 'unverified', script=candidate,
+                execution_id=(passed_attempt or {}).get('execution_id'),
+                locked_revision=workspace['revision'],
+                target_url_fingerprint=script_hash(generation.target_url),
+                variables_fingerprint=variables_fingerprint(workspace['variables']),
+                runtime_assertion_count=int((passed_attempt or {}).get('runtime_assertion_count') or 0),
+                message='已继承候选的实际验证证据。' if proof_complete else '候选缺少完整的实际断言证据，采用后需重新调试验证。',
+            )
+        else:
+            workspace['verification'] = _verification(script=candidate)
         workspace['repair'] = _repair(
-            status='ready', count=min(MAX_WORKSPACE_REPAIRS, int(repair.get('count') or 0) + 1),
-            source_revision=locked_revision, script_hash=locked_hash, task_id=repair.get('task_id', ''),
-            candidate_hash=script_hash(candidate_script), message='修复草稿已生成，需人工审核后再调试。',
+            message='候选已采用。' if workspace['verification']['status'] == 'passed' else '候选已采用，需重新调试验证。'
         )
         generation.workspace = workspace
+        generation.quality_report = deepcopy(repair.get('candidate_quality_report') or {})
         generation.save(update_fields=['script_draft', 'workspace', 'quality_report', 'updated_at'])
-        return True
+        return generation
 
 
-def store_repair_candidate(
-    generation_id: Any,
-    *,
-    locked_revision: int,
-    locked_hash: str,
-    candidate_script: str,
-    candidate_diff: str,
-    quality_report: dict[str, Any],
-    candidate_error_code: str = '',
-    candidate_error_message: str = '',
-    task_id: str | None = None,
-) -> bool:
-    """Store a repair proposal without replacing the user-owned draft."""
+def discard_repair_candidate(generation_id: Any, *, expected_revision: int, candidate_hash: str):
+    """Discard one review proposal without changing the user-owned draft."""
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         workspace = workspace_for_generation(generation)
         repair = workspace['repair']
-        if (
-            repair.get('source_revision') != locked_revision
-            or repair.get('script_hash') != locked_hash
-            or workspace['revision'] != locked_revision
-            or script_hash(generation.script_draft) != locked_hash
-            or repair.get('status') not in {'pending', 'running'}
-            or not _task_matches(repair, task_id)
-        ):
-            return False
-        workspace['repair'] = _repair(
-            status='ready', count=min(MAX_WORKSPACE_REPAIRS, int(repair.get('count') or 0) + 1),
-            source_revision=locked_revision, script_hash=locked_hash,
-            task_id=repair.get('task_id', ''), candidate_hash=script_hash(candidate_script),
-            candidate_script=candidate_script, candidate_diff=candidate_diff,
-            candidate_quality_report=quality_report,
-            candidate_error_code=candidate_error_code,
-            candidate_error_message=candidate_error_message,
-            message=(
-                '修复代理返回了候选和异常信息；原草稿未改动，请人工比较、确认后再处理。'
-                if candidate_error_code else
-                '已生成修复候选；原草稿未改动，请人工比较、确认后再手动应用和调试。'
-            ),
-        )
-        _set_workspace(generation, workspace)
-        return True
+        source_hash = script_hash(generation.script_draft)
+        if (workspace['revision'] != expected_revision or repair.get('source_revision') != expected_revision
+                or repair.get('script_hash') != source_hash or repair.get('candidate_hash') != candidate_hash
+                or script_hash(str(repair.get('candidate_script') or '')) != candidate_hash
+                or repair.get('status') not in {'candidate_ready', 'candidate_passed'}):
+            raise WorkspaceConflict('草稿或候选已变化，请刷新后重试。', generation)
+        workspace['repair'] = _repair(message='候选已丢弃。')
+        generation.workspace = workspace
+        generation.save(update_fields=['workspace', 'updated_at'])
+        return generation
 
 
 def _matches(verification: dict[str, Any], execution_id: int, revision: int, digest: str) -> bool:

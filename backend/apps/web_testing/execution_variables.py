@@ -109,3 +109,22 @@ def pop_runtime_variables(execution_id: int) -> list[dict[str, Any]]:
     value = cache.get(key) or []
     cache.delete(key)
     return normalize_variable_definitions(value)
+
+
+def _repair_runtime_key(generation_id: object, revision: int, digest: str) -> str:
+    return f'webui:repair:{generation_id}:{int(revision)}:{digest}:runtime_variables'
+
+
+def store_repair_runtime_variables(generation_id: object, revision: int, digest: str, value: Any) -> None:
+    """One repair request may reuse values across at most two local attempts.
+
+    Values deliberately never enter workspace JSON or Celery task arguments.
+    """
+    cache.set(_repair_runtime_key(generation_id, revision, digest), normalize_variable_definitions(value), timeout=RUNTIME_VARIABLE_TTL_SECONDS)
+
+
+def pop_repair_runtime_variables(generation_id: object, revision: int, digest: str) -> list[dict[str, Any]]:
+    key = _repair_runtime_key(generation_id, revision, digest)
+    value = cache.get(key) or []
+    cache.delete(key)
+    return normalize_variable_definitions(value)

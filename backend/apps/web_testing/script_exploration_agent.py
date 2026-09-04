@@ -560,6 +560,21 @@ class ScriptExplorationAgent:
         self._trace_recorder = ExplorationTraceRecorder(
             self._start_path, runtime_namespace=policy.namespace, trace_file=trace_file,
         )
+        # Repair is the sole flow allowed to pass one-time execution values to
+        # the model/MCP.  Register them as runtime (never credential) values
+        # before any callback so trace files and snapshots retain {{NAME}}, not
+        # their concrete value.  Ordinary generation intentionally keeps its
+        # existing test-environment credential behavior unchanged.
+        if self._brief.get('repair_only'):
+            supplied = self._brief.get('runtime_input_values')
+            if isinstance(supplied, dict):
+                runtime_values = {
+                    str(name): str(value) for name, value in supplied.items()
+                    if str(name).strip() and value not in (None, '')
+                }
+                self._trace_recorder.configure_runtime(
+                    runtime_values, {name: 'runtime' for name in runtime_values},
+                )
         self._guard = ScriptExplorationToolGuard(
             policy=policy,
             trace_recorder=self._trace_recorder,
@@ -747,7 +762,9 @@ class ScriptExplorationAgent:
                     completed_steps=self._artifact['completed_steps'],
                     remaining_steps=self._artifact['remaining_steps'],
                     variables=self._artifact['variables'],
-                    completion='partial',
+                    # Repair candidates may already be complete.  Static quality
+                    # never proves that claim; the independent runner does.
+                    completion='complete' if self._brief.get('repair_only') else 'partial',
                     source='code_only_model',
                 )
                 if feedback['status'] == 'rejected':

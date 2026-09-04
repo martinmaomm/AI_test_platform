@@ -62,7 +62,10 @@ async function createWorkspaceHarness(initialDraft = draft()) {
       emitted,
       emitDraft: () => emitDraft(),
       requestDebug: () => requestDebug(),
-      setDraft: value => { globalThis[token].props.draft = value }
+      requestRepair: () => requestRepair(),
+      canRepair: () => canRepair.value,
+      setDraft: value => { globalThis[token].props.draft = value },
+      setGeneration: value => { globalThis[token].props.generation = value }
     }
   `
     .replace("from 'vue'", `from '${vueModule}'`)
@@ -134,4 +137,35 @@ test('带空格的变量名使用同一原始覆盖键，提交时归一且不�
   const debugPayload = hooks.emitted.find(([event]) => event === 'debug')[1]
   assert.deepEqual(debugPayload, [{ name: 'ACCOUNT', value: 'one-time-account' }])
   assert.deepEqual({ ...hooks.runtimeOverrides() }, { '  ACCOUNT  ': '', UNSET: '' })
+})
+
+test('AI 修复按钮仅在干净的失败诊断上可用，并复用变量表的本次覆盖值', async () => {
+  const hooks = await createWorkspaceHarness(draft('g1', 3, [
+    { name: 'UI_TEST_USERNAME', value: '', is_secret: false, required: false, description: '' }
+  ]))
+  hooks.setGeneration({
+    id: 'g1',
+    workspace: { revision: 3, repair: {}, verification: { status: 'failed', diagnostics: [{ code: 'ASSERTION_FAILURE', message: '登录失败' }] } }
+  })
+  await nextTick()
+  assert.equal(hooks.canRepair(), true)
+  hooks.runtimeOverrides().UI_TEST_USERNAME = 'fixture-user'
+  await hooks.requestRepair()
+  const repairPayload = hooks.emitted.find(([event]) => event === 'repair')[1]
+  assert.deepEqual(repairPayload, [{ name: 'UI_TEST_USERNAME', value: 'fixture-user' }])
+  assert.deepEqual({ ...hooks.runtimeOverrides() }, { UI_TEST_USERNAME: '' })
+
+  hooks.setDraft({ ...draft('g1', 3), dirty: true })
+  await nextTick()
+  assert.equal(hooks.canRepair(), false)
+})
+
+test('生成仍在进行时，即使存在失败诊断也不显示 AI 修复入口', async () => {
+  const hooks = await createWorkspaceHarness(draft('g1', 3))
+  hooks.setGeneration({
+    id: 'g1', status: 'generating',
+    workspace: { revision: 3, repair: {}, verification: { status: 'failed', diagnostics: [{ code: 'STALE', message: '旧失败信息' }] } }
+  })
+  await nextTick()
+  assert.equal(hooks.canRepair(), false)
 })

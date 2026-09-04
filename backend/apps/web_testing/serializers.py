@@ -207,6 +207,28 @@ class WebUIScriptGenerationDebugSerializer(serializers.Serializer):
 
 class WebUIScriptGenerationRepairSerializer(serializers.Serializer):
     expected_revision = serializers.IntegerField(min_value=0)
+    confirm_execution = serializers.BooleanField()
+    runtime_variables = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+    def validate_confirm_execution(self, value):
+        if value is not True:
+            raise serializers.ValidationError('修复会访问目标网站并执行候选，必须明确确认 confirm_execution=true。')
+        return value
+
+    def validate_runtime_variables(self, value):
+        try:
+            return normalize_variable_definitions(value)
+        except ExecutionVariableError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+
+class WebUIScriptGenerationRepairApplySerializer(serializers.Serializer):
+    expected_revision = serializers.IntegerField(min_value=0)
+    candidate_hash = serializers.RegexField(r'^[0-9a-f]{64}$')
+
+
+class WebUIScriptGenerationRepairDiscardSerializer(WebUIScriptGenerationRepairApplySerializer):
+    pass
 
 
 class WebUIScriptGenerationClarificationAnswerSerializer(serializers.Serializer):

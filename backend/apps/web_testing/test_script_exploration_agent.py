@@ -302,6 +302,26 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertGreater(len(event['raw_output']), len(event['result_excerpt']))
         self.assertLessEqual(len(event['raw_output']), 20000)
 
+    def test_repair_runtime_values_are_templated_in_trace_and_snapshot(self):
+        secret = 'repair-runtime-secret'
+        agent = self.make_agent()
+        agent._brief = brief(repair_only=True, runtime_input_values={'UI_TEST_PASSWORD': secret})
+        agent._target_url = 'https://example.test/catalog'
+        with tempfile.TemporaryDirectory() as temp_dir, override_settings(BASE_DIR=temp_dir):
+            agent._configure_trace(output_generation_id=str(uuid4()))
+            agent._guard.on_tool_start(
+                {'name': 'playwright_fill'}, '', run_id='fill',
+                inputs={'selector': 'input[type=password]', 'value': secret},
+            )
+            agent._guard.on_tool_end(f'filled {secret}', run_id='fill')
+            snapshot = agent._snapshot()
+            trace_files = list((Path(temp_dir) / 'logs' / 'playwright-mcp').glob('*.script-v5.trace.jsonl'))
+            trace_text = trace_files[0].read_text(encoding='utf-8') if trace_files else ''
+        self.assertNotIn(secret, str(snapshot))
+        self.assertNotIn(secret, trace_text)
+        self.assertIn('{{UI_TEST_PASSWORD}}', str(snapshot))
+        self.assertIn('{{UI_TEST_PASSWORD}}', trace_text)
+
     def test_empty_exploration_starts_with_honest_entry_seed_not_a_false_pass(self):
         class Agent:
             def __init__(self, **kwargs): pass

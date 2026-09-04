@@ -27,6 +27,8 @@ from .execution_variables import (
     ExecutionVariableError,
     normalize_variable_definitions,
     pop_runtime_variables,
+    pop_repair_runtime_variables,
+    store_repair_runtime_variables,
     store_runtime_variables,
 )
 from .exploration_timeout import (
@@ -49,11 +51,14 @@ from .generation_workspace import (
     ACTIVE_GENERATION_STATUSES,
     BUSY_REPAIR_STATUSES,
     BUSY_VERIFICATION_STATUSES,
+    REPAIR_CANDIDATE_STATUSES,
     WorkspaceConflict,
     attach_debug_task,
     attach_repair_task,
     prepare_debug,
     prepare_repair,
+    apply_repair_candidate,
+    discard_repair_candidate,
     script_hash,
     variables_fingerprint,
     update_draft,
@@ -89,6 +94,8 @@ from .serializers import (
     WebUIScriptGenerationDebugSerializer,
     WebUIScriptGenerationDraftSerializer,
     WebUIScriptGenerationRepairSerializer,
+    WebUIScriptGenerationRepairApplySerializer,
+    WebUIScriptGenerationRepairDiscardSerializer,
     WebUIScriptGenerationRetrySerializer,
     WebUIScriptGenerationResolveSerializer,
     WebUIScriptGenerationSaveSerializer,
@@ -464,10 +471,15 @@ class WebUIScriptGenerationRepairView(APIView):
         try:
             generation, locked_hash = prepare_repair(
                 generation.pk, expected_revision=serializer.validated_data['expected_revision'],
+                runtime_variables_present=bool(serializer.validated_data['runtime_variables']),
             )
         except WorkspaceConflict as exc:
             return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
         try:
+            store_repair_runtime_variables(
+                generation.pk, serializer.validated_data['expected_revision'], locked_hash,
+                serializer.validated_data['runtime_variables'],
+            )
             task = repair_webui_script_generation_task.delay(
                 str(generation.pk), serializer.validated_data['expected_revision'], locked_hash,
             )
@@ -477,6 +489,10 @@ class WebUIScriptGenerationRepairView(APIView):
             )
         except Exception:
             logger.exception('生成草稿修复任务调度失败: generation_id=%s', generation.pk)
+            try:
+                pop_repair_runtime_variables(generation.pk, serializer.validated_data['expected_revision'], locked_hash)
+            except Exception:
+                logger.warning('无法清理修复临时变量，将等待缓存过期: generation_id=%s', generation.pk)
             from .generation_workspace import finish_repair_failure
             finish_repair_failure(
                 generation.pk, locked_revision=serializer.validated_data['expected_revision'], locked_hash=locked_hash,
@@ -486,6 +502,54 @@ class WebUIScriptGenerationRepairView(APIView):
             generation.refresh_from_db()
             return Response({'success': False, 'message': '修复任务暂时无法调度，请稍后重试。', 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_202_ACCEPTED)
+
+
+class WebUIScriptGenerationRepairApplyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能采用自己创建的修复候选')
+        serializer = WebUIScriptGenerationRepairApplySerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            generation = apply_repair_candidate(
+                generation.pk, expected_revision=serializer.validated_data['expected_revision'],
+                candidate_hash=serializer.validated_data['candidate_hash'],
+            )
+        except WorkspaceConflict as exc:
+            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
+        return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
+
+
+class WebUIScriptGenerationRepairDiscardView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能丢弃自己创建的修复候选')
+        serializer = WebUIScriptGenerationRepairDiscardSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        try:
+            generation = discard_repair_candidate(
+                generation.pk, expected_revision=serializer.validated_data['expected_revision'],
+                candidate_hash=serializer.validated_data['candidate_hash'],
+            )
+        except WorkspaceConflict as exc:
+            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
+        return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
 
 
 class WebUIScriptGenerationSaveView(APIView):
@@ -524,6 +588,11 @@ class WebUIScriptGenerationSaveView(APIView):
                 ):
                     return Response(
                         {'success': False, 'message': '生成、调试或修复进行中，不能保存工作区草稿。', 'data': WebUIScriptGenerationSerializer(generation).data},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                if workspace['repair'].get('status') in REPAIR_CANDIDATE_STATUSES:
+                    return Response(
+                        {'success': False, 'message': '请先采用或放弃当前候选。', 'data': WebUIScriptGenerationSerializer(generation).data},
                         status=status.HTTP_409_CONFLICT,
                     )
                 if not (generation.script_draft or '').strip():
@@ -618,7 +687,6 @@ class WebUIScriptGenerationSaveView(APIView):
                     },
                     'quality_status': (generation.quality_report or {}).get('status', ''),
                     'assertion_state': assertion_state,
-                    'repair_count': (workspace['repair'] or {}).get('count', 0),
                     'verification': {
                         'status': 'passed' if requested_mode == 'verified' else 'unverified',
                         'script_hash': script_hash(normalized_script),

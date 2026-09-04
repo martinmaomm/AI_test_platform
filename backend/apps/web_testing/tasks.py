@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import shutil
+import traceback
 import uuid
 from difflib import unified_diff
 from typing import Any, Dict
@@ -26,9 +27,11 @@ from common.task import (
 from projects.models import Project
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
-from .assertion_state import evaluation_status
+from .assertion_state import analyze_assertion_state, evaluation_status
 from .execution_diagnostics import friendly_failure_summary
-from .execution_variables import merge_execution_variables, pop_runtime_variables
+from .execution_variables import (
+    merge_execution_variables, pop_runtime_variables, pop_repair_runtime_variables,
+)
 from .models import (
     MidSceneScript,
     WebUIScriptGeneration,
@@ -369,6 +372,8 @@ def debug_webui_script_generation_task(
     execution = None
     detail = None
     runtime_variables = []
+    active_execution = None
+    active_detail = None
     try:
         generation = mark_debug_running(
             generation_id, execution_id=execution_id,
@@ -486,94 +491,388 @@ def debug_webui_script_generation_task(
 
 @shared_task(bind=True, name='web_testing.repair_webui_script_generation')
 def repair_webui_script_generation_task(self, generation_id: str, locked_revision: int, locked_hash: str):
-    """Generate a code-only repair proposal; never replace or execute the draft."""
+    """Generate and independently validate at most two reviewable candidates."""
     from ai_core.model_manager import get_llm_manager
-    from .generation_workspace import evaluate_workspace_draft
+    from .ai_assisted_debugging import (
+        MAX_CANDIDATE_SCRIPT_CHARS, bounded_candidate_diff, candidate_leaks_runtime_values,
+        failure_evidence, is_non_code_failure, redact_runtime_values, requires_directed_mcp,
+    )
+    from .generation_workspace import evaluate_workspace_draft, script_hash, update_repair_state
     from .model_service_errors import classify_model_service_error
     from .script_exploration_agent import ScriptExplorationAgent
     from .generation_workspace import (
-        finish_repair_failure, mark_repair_running, store_repair_candidate,
+        finish_repair_failure, mark_repair_running,
     )
 
+    active_execution = None
+    active_detail = None
     generation = mark_repair_running(generation_id, locked_revision=locked_revision, locked_hash=locked_hash, task_id=self.request.id)
     if generation is None:
         return build_error_result(self.request.id, '草稿已变化，过期修复任务未执行。')
+    runtime_variables = []
+    attempts = []
+    latest = None
+    active_round = 0
+    active_mcp_checked = False
+
+    def apply_assertion_regression_blocker(
+        quality_report: dict[str, Any], candidate_script: str, baseline_script: str,
+    ) -> bool:
+        baseline_assertions = analyze_assertion_state(baseline_script)
+        candidate_assertions = analyze_assertion_state(candidate_script)
+        if (
+            candidate_assertions['confirmed_count'] >= baseline_assertions['confirmed_count']
+            and candidate_assertions['pending_count'] <= baseline_assertions['pending_count']
+        ):
+            return False
+        quality_report['status'] = 'needs_review'
+        quality_report['assertion_state'] = candidate_assertions
+        quality_report['blockers'] = list(quality_report.get('blockers') or []) + [{
+            'level': 'blocker', 'code': 'ASSERTION_REGRESSION',
+            'message': '候选减少了已确认断言或增加了待补充断言，不能执行验证。',
+        }]
+        return True
+
     try:
+        runtime_variables = pop_repair_runtime_variables(generation_id, locked_revision, locked_hash)
         workspace = generation.workspace if isinstance(generation.workspace, dict) else {}
         verification = workspace.get('verification') if isinstance(workspace.get('verification'), dict) else {}
+        execution_id = verification.get('execution_id')
+        detail = None
+        if execution_id:
+            detail = WebUITestCaseExecutionDetail.objects.filter(execution_id=execution_id).first()
         issues = verification.get('diagnostics') or []
-        if not issues:
+        if repair_runtime_required := bool((workspace.get('repair') or {}).get('runtime_variables_present')):
+            if not runtime_variables:
+                raise ValueError('一次性运行变量已过期，修复任务未执行。')
+        effective_execution_variables = merge_execution_variables(
+            workspace.get('variables') or [], runtime_variables,
+        )
+        if not issues and detail is None:
             raise ValueError('缺少运行失败诊断，需要人工补充证据或重新调试。')
+        evidence = failure_evidence(
+            stdout='', stderr='',
+            log=(detail.log if detail else ''),
+            fallback=str((issues[0] if issues else {}).get('message') or ''),
+            runtime_variables=runtime_variables,
+        )
+        if is_non_code_failure(evidence):
+            if not update_repair_state(
+                generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
+                message='检测到网络、账号、环境依赖或任务取消等非代码问题，已停止自动修改脚本。',
+                summary=evidence['summary'], final_status='failed', task_id=self.request.id,
+            ):
+                return build_error_result(self.request.id, '草稿已变化，过期修复任务未写回。')
+            return build_error_result(self.request.id, '非代码错误不能通过自动改写脚本解决。')
         brief = generation.scenario_spec if isinstance(generation.scenario_spec, dict) else {}
         snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
         if brief.get('schema_version') != 5 or snapshot.get('schema_version') != 5:
             raise ValueError('仅支持当前 v5 草稿的代码修复；旧版记录请人工处理源码。')
-        repair_brief = {
-            **brief,
-            'debug_diagnostics': [
-                {
-                    'code': str(item.get('code') or ''),
-                    'message': str(item.get('message') or ''),
-                }
-                for item in issues if isinstance(item, dict)
-            ],
-        }
         manager = get_llm_manager(config_id=generation.model_info['config_id'])
-        agent = ScriptExplorationAgent(
-            llm_model=manager.current_llm,
-            mcp_config={},
-            generation_id=str(generation.pk),
-            cancel_check=lambda: bool(cache.get(f'celery:cancel:{self.request.id}')),
-            exploration_timeout_seconds=generation.exploration_timeout_seconds,
-            checkpoint_callback=None,
-        )
-        result = asyncio.run(agent.generate(
-            brief=repair_brief,
-            target_url=generation.target_url,
-            saved_snapshot=snapshot,
-            script_draft=generation.script_draft,
-            code_only=True,
-        ))
-        candidate = str(getattr(result, 'script_draft', '') or '')
-        if not candidate.strip():
-            raise ValueError(str(getattr(result, 'error_message', '') or '修复代理没有返回候选脚本。'))
-        quality = evaluate_workspace_draft(
-            candidate, target_url=generation.target_url,
-            snapshot=getattr(result, 'snapshot', None) or snapshot,
-        )
-        diff = ''.join(unified_diff(
-            generation.script_draft.splitlines(keepends=True), candidate.splitlines(keepends=True),
-            fromfile='原草稿', tofile='修复候选', n=3,
-        ))[:20000]
-        result_error_code = str(getattr(result, 'error_code', '') or '')
-        result_error_message = str(getattr(result, 'error_message', '') or '')
-        if not store_repair_candidate(
-            generation.pk, locked_revision=locked_revision, locked_hash=locked_hash,
-            candidate_script=candidate, candidate_diff=diff, quality_report=quality,
-            candidate_error_code=result_error_code, candidate_error_message=result_error_message,
-            task_id=self.request.id,
-        ):
-            return build_error_result(self.request.id, '草稿已变化，过期修复候选未保存。')
-        if result_error_code:
-            return {
-                'success': False, 'status': 'candidate_needs_review', 'generation_id': str(generation.pk),
-                'error_code': result_error_code,
-                'message': result_error_message or '修复代理返回了候选，但未完成整个修复过程，请人工审核。',
+        attempt_script = generation.script_draft
+        attempt_snapshot = snapshot
+        for round_number in range(1, 3):
+            active_round = round_number
+            use_mcp = requires_directed_mcp(evidence)
+            active_mcp_checked = use_mcp
+            mcp_config = {}
+            if use_mcp:
+                from .generation_preflight import run_safety_preflight
+                preflight = run_safety_preflight(generation, brief)
+                if preflight.outcome != 'continue':
+                    raise ValueError(preflight.message)
+                mcp_config = preflight.mcp_config or {}
+            phase = 'exploring' if use_mcp else 'analyzing'
+            if not update_repair_state(generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
+                                       phase=phase, message=f'正在生成第 {round_number} 轮候选。', attempts=attempts, task_id=self.request.id):
+                return build_error_result(self.request.id, '草稿已变化，过期修复任务未执行。')
+            repair_brief = {
+                **brief, 'repair_only': True, 'debug_diagnostics': evidence,
+                # This dictionary is task-local.  It is never copied to snapshot/workspace.
+                'runtime_input_values': effective_execution_variables,
+                'repair_rules': ['不得删除、弱化或跳过原有断言以通过验证。', '不得在输出脚本、摘要或日志中回显 runtime_input_values。'],
             }
-        return {
-            'success': True, 'status': 'candidate_ready', 'generation_id': str(generation.pk),
-            'message': '修复候选已保存；原草稿未修改，需人工比较确认后再调试。',
-        }
+            repair_agent_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f'aits:webui-repair:{generation.pk}:{self.request.id}:{round_number}',
+            ))
+            agent = ScriptExplorationAgent(
+                llm_model=manager.current_llm, mcp_config=mcp_config, generation_id=repair_agent_id,
+                cancel_check=lambda: bool(cache.get(f'celery:cancel:{self.request.id}')),
+                exploration_timeout_seconds=generation.exploration_timeout_seconds, checkpoint_callback=None,
+            )
+            result = asyncio.run(agent.generate(
+                brief=repair_brief, target_url=generation.target_url, saved_snapshot=attempt_snapshot,
+                script_draft=attempt_script, code_only=not use_mcp,
+            ))
+            candidate = str(getattr(result, 'script_draft', '') or '')
+            agent_error_code = str(getattr(result, 'error_code', '') or '')
+            agent_error_message = redact_runtime_values(
+                str(getattr(result, 'error_message', '') or ''), runtime_variables,
+            )
+            if agent_error_code:
+                if not candidate.strip() or script_hash(candidate) == script_hash(attempt_script):
+                    raise ValueError(agent_error_message or '修复智能体未生成新的候选脚本。')
+                if len(candidate) > MAX_CANDIDATE_SCRIPT_CHARS:
+                    raise ValueError('修复候选脚本超过允许长度，已拒绝保存。')
+                if candidate_leaks_runtime_values(
+                    candidate, runtime_variables, baseline_script=generation.script_draft,
+                ):
+                    raise ValueError('修复候选包含一次性运行变量，已拒绝保存。')
+                quality = evaluate_workspace_draft(candidate, target_url=generation.target_url, snapshot=getattr(result, 'snapshot', None) or attempt_snapshot)
+                apply_assertion_regression_blocker(
+                    quality, candidate, generation.script_draft,
+                )
+                diff = bounded_candidate_diff(''.join(unified_diff(generation.script_draft.splitlines(keepends=True), candidate.splitlines(keepends=True), fromfile='原草稿', tofile='修复候选', n=3)))
+                attempts.append({'round': round_number, 'candidate_hash': script_hash(candidate), 'mcp_checked': use_mcp,
+                                 'static_status': quality.get('status'), 'execution_id': None,
+                                 'execution_status': 'not_run', 'summary': agent_error_message or '修复智能体异常，候选未执行。',
+                                 'has_screenshot': False, 'runtime_assertion_count': 0})
+                if not update_repair_state(
+                    generation_id, locked_revision=locked_revision, locked_hash=locked_hash, attempts=attempts,
+                    candidate_script=candidate, candidate_diff=diff, candidate_quality_report=quality,
+                    candidate_error_code=agent_error_code, candidate_error_message=agent_error_message,
+                    summary=agent_error_message or '修复智能体异常，已保留新候选供人工审核。',
+                    message='修复已完成：智能体异常，但新候选已保留供人工审核。',
+                    final_status='candidate_ready', task_id=self.request.id,
+                ):
+                    return build_error_result(self.request.id, '草稿已变化，候选结果未写回。')
+                return {'success': False, 'status': 'candidate_ready', 'generation_id': str(generation.pk)}
+            if not candidate.strip() or script_hash(candidate) == script_hash(attempt_script):
+                raise ValueError('修复智能体未生成有变化的候选脚本。')
+            if len(candidate) > MAX_CANDIDATE_SCRIPT_CHARS:
+                raise ValueError('修复候选脚本超过允许长度，已拒绝保存。')
+            if candidate_leaks_runtime_values(
+                candidate, runtime_variables, baseline_script=generation.script_draft,
+            ):
+                raise ValueError('修复候选包含一次性运行变量，已拒绝保存。')
+            candidate_snapshot = getattr(result, 'snapshot', None) or attempt_snapshot
+            quality = evaluate_workspace_draft(candidate, target_url=generation.target_url, snapshot=candidate_snapshot)
+            diff = bounded_candidate_diff(''.join(unified_diff(generation.script_draft.splitlines(keepends=True), candidate.splitlines(keepends=True), fromfile='原草稿', tofile='修复候选', n=3)))
+            attempt = {'round': round_number, 'candidate_hash': script_hash(candidate), 'mcp_checked': use_mcp,
+                       'static_status': quality.get('status'), 'execution_id': None, 'execution_status': 'not_run',
+                       'summary': '', 'has_screenshot': False, 'runtime_assertion_count': 0}
+            if apply_assertion_regression_blocker(
+                quality, candidate, generation.script_draft,
+            ):
+                attempt['static_status'] = quality['status']
+                attempt['summary'] = '候选减少了已确认断言或增加了待补充断言，未执行浏览器验证。'
+            latest = (candidate, diff, quality)
+            if quality.get('blockers') or quality.get('status') == 'needs_review':
+                attempt['summary'] = '候选未通过静态检查，未执行浏览器验证。'
+                attempts.append(attempt)
+                attempt_script, attempt_snapshot = candidate, candidate_snapshot
+                continue
+            if not update_repair_state(
+                generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
+                phase='validating', message=f'正在验证第 {round_number} 轮候选。',
+                attempts=attempts, task_id=self.request.id,
+            ):
+                return build_error_result(self.request.id, '草稿已变化，过期修复任务未执行。')
+            execution = active_execution = WebUITestExecution.objects.create(
+                exec_type='case',
+                name=f'AI 修复候选第 {round_number} 轮',
+                description=generation.description_safe,
+                executor=generation.user,
+                project=generation.project,
+                browser=WEBUI_BROWSER_ENGINE,
+                status='running',
+                trigger_type='llm',
+                start_time=timezone.now(),
+            )
+            detail = active_detail = WebUITestCaseExecutionDetail.objects.create(
+                execution=execution,
+                test_case=None,
+                status='running',
+                start_time=execution.start_time,
+            )
+            screenshot_absolute, screenshot_relative = _failure_screenshot_paths(execution.id, f'repair_candidate_{round_number}.png')
+            try:
+                runner_result = _run_test_script(candidate, {}, failure_screenshot_path=screenshot_absolute,
+                                                 environment_variables=effective_execution_variables)
+            except Exception as runner_exc:
+                ended = timezone.now()
+                message = redact_runtime_values(f'候选执行器异常：{runner_exc}', runtime_variables)
+                execution.status = 'error'
+                execution.error_message = message
+                execution.end_time = ended
+                execution.duration = (ended - execution.start_time).total_seconds()
+                detail.status = 'error'
+                detail.error_message = message
+                detail.end_time = ended
+                detail.duration = execution.duration
+                detail_update_fields = [
+                    'status', 'error_message', 'end_time', 'duration',
+                ]
+                if os.path.exists(screenshot_absolute):
+                    detail.screenshot_path = screenshot_relative
+                    detail_update_fields.append('screenshot_path')
+                execution.save(update_fields=[
+                    'status', 'error_message', 'end_time', 'duration', 'updated_at',
+                ])
+                detail.save(update_fields=detail_update_fields)
+                attempt.update({
+                    'execution_id': execution.id,
+                    'execution_status': 'error',
+                    'summary': failure_evidence(
+                        fallback=message, runtime_variables=runtime_variables,
+                    )['summary'],
+                    'has_screenshot': bool(detail.screenshot_path),
+                    'runtime_assertion_count': 0,
+                })
+                attempts.append(attempt)
+                active_execution = None
+                active_detail = None
+                evidence = failure_evidence(fallback=message, runtime_variables=runtime_variables)
+                attempt_script, attempt_snapshot = candidate, candidate_snapshot
+                if is_non_code_failure(evidence):
+                    break
+                continue
+            result_data = runner_result.get('result') or {}
+            safe_result_data = {
+                **result_data,
+                'stdout': redact_runtime_values(result_data.get('stdout', ''), runtime_variables),
+                'stderr': redact_runtime_values(result_data.get('stderr', ''), runtime_variables),
+            }
+            operation_success = bool(runner_result.get('operation_success', runner_result.get('success')))
+            execution_status, assertion_state, runtime_assertion_count = evaluation_status(candidate, operation_success=operation_success, runtime_assertion_count=runner_result.get('runtime_assertion_count'))
+            error_message = '' if operation_success else friendly_failure_summary(safe_result_data.get('stdout', ''), safe_result_data.get('stderr', ''), redact_runtime_values(runner_result.get('error', ''), runtime_variables))
+            if execution_status == 'incomplete':
+                error_message = _incomplete_message(
+                    assertion_state, runtime_assertion_count,
+                )
+            persisted = _normalize_persisted_screenshot_path(
+                execution.id,
+                safe_result_data.get('screenshot_path') or screenshot_relative,
+            )
+            if persisted and os.path.exists(
+                os.path.join(str(settings.MEDIA_ROOT), persisted),
+            ):
+                detail.screenshot_path = persisted
+            ended = timezone.now()
+            execution.status = execution_status
+            execution.error_message = error_message
+            execution.end_time = ended
+            execution.duration = (ended - execution.start_time).total_seconds()
+            execution.log_path = safe_result_data.get('test_file') or ''
+            execution.report_path = safe_result_data.get('allure_report') or ''
+            execution.save()
+            detail.status = execution_status
+            detail.end_time = ended
+            detail.duration = execution.duration
+            detail.error_message = error_message or None
+            detail.log = _raw_execution_log(safe_result_data)
+            detail.save()
+            safe_error_message = failure_evidence(fallback=error_message, runtime_variables=runtime_variables)['summary'] if error_message else ''
+            attempt.update({'execution_id': execution.id, 'execution_status': execution_status, 'summary': safe_error_message or '候选验证通过。', 'has_screenshot': bool(detail.screenshot_path), 'runtime_assertion_count': runtime_assertion_count})
+            attempts.append(attempt)
+            active_execution = None
+            active_detail = None
+            if execution_status == 'passed':
+                if not update_repair_state(generation_id, locked_revision=locked_revision, locked_hash=locked_hash, attempts=attempts, candidate_script=candidate, candidate_diff=diff, candidate_quality_report=quality, summary='候选已通过实际验证。', message='修复已完成：候选已通过实际验证。', final_status='candidate_passed', task_id=self.request.id):
+                    return build_error_result(self.request.id, '草稿已变化，候选结果未写回。')
+                return {'success': True, 'status': 'candidate_passed', 'generation_id': str(generation.pk)}
+            evidence = failure_evidence(
+                stdout=safe_result_data.get('stdout', ''),
+                stderr=safe_result_data.get('stderr', ''),
+                fallback=error_message,
+                runtime_variables=runtime_variables,
+            )
+            attempt_script, attempt_snapshot = candidate, candidate_snapshot
+            if is_non_code_failure(evidence):
+                break
+        if latest is None:
+            raise ValueError('修复代理没有返回可审核候选脚本。')
+        candidate, diff, quality = latest
+        if not update_repair_state(generation_id, locked_revision=locked_revision, locked_hash=locked_hash, attempts=attempts, candidate_script=candidate, candidate_diff=diff, candidate_quality_report=quality, summary='候选未通过验证或验证被环境问题终止；原草稿未变。', message='修复已完成：候选未通过验证，保留供人工审核。', final_status='candidate_ready', task_id=self.request.id):
+            return build_error_result(self.request.id, '草稿已变化，候选结果未写回。')
+        return {'success': False, 'status': 'candidate_ready', 'generation_id': str(generation.pk)}
     except Exception as exc:
         model_error = classify_model_service_error(exc, stage='repairing')
         code = model_error[0] if model_error else 'REPAIR_CANDIDATE_UNAVAILABLE'
-        message = model_error[1] if model_error else '修复服务未能生成可审核候选，请人工审核或重新调试。'
-        logger.error('生成草稿修复失败: generation_id=%s', generation_id)
-        finish_repair_failure(
+        message = (
+            model_error[1]
+            if model_error else (
+                redact_runtime_values(str(exc), runtime_variables)
+                or '修复服务未能生成可审核候选，请人工审核或重新调试。'
+            )
+        )
+        logger.error('生成草稿修复失败: generation_id=%s\n%s', generation_id, redact_runtime_values(traceback.format_exc(), runtime_variables))
+        active_execution_id = active_execution.pk if active_execution is not None else None
+        active_has_screenshot = bool(active_detail is not None and active_detail.screenshot_path)
+        if active_execution is not None:
+            ended_at = timezone.now()
+            try:
+                duration = max(0.0, (ended_at - active_execution.start_time).total_seconds())
+            except (TypeError, ValueError):
+                duration = 0.0
+            active_execution.status = 'error'
+            active_execution.error_message = message
+            active_execution.end_time = ended_at
+            active_execution.duration = duration
+            try:
+                # QuerySet.update is intentional: a failed instance save must not
+                # leave the previously-created execution running in the database.
+                WebUITestExecution.objects.filter(pk=active_execution.pk).update(
+                    status='error', error_message=message, end_time=ended_at,
+                    duration=duration, updated_at=ended_at,
+                )
+            except Exception:
+                logger.exception('修复候选执行异常后无法回填 execution: execution_id=%s', active_execution_id)
+            if active_detail is not None:
+                active_detail.status = 'error'
+                active_detail.error_message = message
+                active_detail.end_time = ended_at
+                active_detail.duration = duration
+                try:
+                    detail_updates = {
+                        'status': 'error',
+                        'error_message': message,
+                        'end_time': ended_at,
+                        'duration': duration,
+                    }
+                    if active_detail.screenshot_path:
+                        detail_updates['screenshot_path'] = active_detail.screenshot_path
+                    WebUITestCaseExecutionDetail.objects.filter(pk=active_detail.pk).update(
+                        **detail_updates,
+                    )
+                except Exception:
+                    logger.exception('修复候选执行异常后无法回填 detail: execution_id=%s', active_execution_id)
+        if latest is not None:
+            candidate, diff, quality = latest
+            if active_round and not any(item.get('round') == active_round for item in attempts):
+                attempts.append({
+                    'round': active_round, 'candidate_hash': script_hash(candidate),
+                    'mcp_checked': active_mcp_checked, 'static_status': 'error',
+                    'execution_id': active_execution_id,
+                    'execution_status': (
+                        'error' if active_execution_id is not None else 'not_run'
+                    ),
+                    'summary': message, 'has_screenshot': active_has_screenshot,
+                    'runtime_assertion_count': 0,
+                })
+            if not update_repair_state(
+                generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
+                attempts=attempts, candidate_script=candidate, candidate_diff=diff,
+                candidate_quality_report=quality, candidate_error_code=code,
+                candidate_error_message=message,
+                summary=f'后续第 {active_round or 2} 轮修复未完成：{message}；已保留最近候选供人工审核。',
+                message='修复已完成：后续修复异常，已保留已有候选供人工审核。',
+                final_status='candidate_ready', task_id=self.request.id,
+            ):
+                logger.warning('过期修复任务未能保留已有候选: generation_id=%s', generation_id)
+                return build_error_result(self.request.id, '草稿已变化，过期修复任务未写回。')
+            return {
+                'success': False, 'status': 'candidate_ready', 'generation_id': str(generation_id),
+                'message': '后续修复异常，已保留已有候选供人工审核。',
+            }
+        if not finish_repair_failure(
             generation_id, locked_revision=locked_revision, locked_hash=locked_hash,
             message=message, task_id=self.request.id,
             blockers=[{'severity': 'blocker', 'code': code, 'message': message}],
-        )
+        ):
+            logger.warning('过期修复任务未能回填失败状态: generation_id=%s', generation_id)
+            return build_error_result(self.request.id, '草稿已变化，过期修复任务未写回。')
         return build_error_result(self.request.id, message)
 
 

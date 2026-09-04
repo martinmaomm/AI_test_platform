@@ -74,6 +74,12 @@ export const debugWebUIScriptGeneration = async (projectId, generationId, data) 
 export const repairWebUIScriptGeneration = async (projectId, generationId, data) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/repair/`, data)).data
 
+export const applyWebUIScriptGenerationRepair = async (projectId, generationId, data) =>
+  (await api.post(`${base(projectId)}/script-generations/${generationId}/repair/apply/`, data)).data
+
+export const discardWebUIScriptGenerationRepair = async (projectId, generationId, data) =>
+  (await api.post(`${base(projectId)}/script-generations/${generationId}/repair/discard/`, data)).data
+
 export const saveWebUIScriptGeneration = async (projectId, generationId, data = {}) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/save/`, data)).data
 

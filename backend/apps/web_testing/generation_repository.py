@@ -15,6 +15,7 @@ from .generation_contracts import (
     validate_transition,
 )
 from .models import WebUIScriptGeneration
+from .generation_workspace import REPAIR_CANDIDATE_STATUSES, workspace_for_generation
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +290,9 @@ def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int
     """Retry code-only drafting from a v5 artifact; never reopen the browser."""
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        workspace = workspace_for_generation(generation)
+        if workspace['repair'].get('status') in REPAIR_CANDIDATE_STATUSES:
+            raise GenerationResolutionConflict('请先采用或放弃当前候选。', generation)
         snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
         retryable_statuses = {
             WebUIScriptGeneration.Status.FAILED,

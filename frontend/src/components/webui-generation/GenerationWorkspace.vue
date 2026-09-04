@@ -12,7 +12,7 @@
     </div>
 
     <section class="workspace-section script-section">
-      <div class="section-heading"><div><h5>Python Playwright 脚本草稿</h5><p>可直接编辑；拖动右下角调整高度。保存或调试前会校验并保存当前草稿。</p></div><el-button size="small" @click="copyScript">复制脚本</el-button></div>
+      <div class="section-heading"><div><h5>Python Playwright 脚本草稿</h5><p>可直接编辑；拖动右下角调整高度。保存或调试前会校验并保存当前草稿。</p></div><el-button size="small" :disabled="busy" @click="copyScript">复制脚本</el-button></div>
       <div class="script-editor"><MonacoEditor :value="form.script_draft" language="python" theme="vs-dark" :read-only="busy" height="100%" @update:value="updateScript" /></div>
     </section>
 
@@ -49,6 +49,7 @@
     <div class="workspace-actions">
       <el-button :loading="draftSaving" :disabled="busy || !canSaveDraft" @click="emit('save-draft')">保存草稿</el-button>
       <el-button type="warning" :loading="debugging" :disabled="busy || !canDebug" @click="requestDebug">真实调试</el-button>
+      <el-button v-if="canRepair" type="danger" plain :loading="repairing" :disabled="busy" @click="requestRepair">AI 分析并修复</el-button>
     </div>
 
     <el-alert v-if="verification.message || verification.error_message" class="verification-message" type="warning" :closable="false" show-icon :title="verification.message || verification.error_message" />
@@ -66,14 +67,14 @@ import { computed, reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MonacoEditor from '@/components/MonacoEditor.vue'
 import WebUITestCaseExecutionDetail from '@/components/WebUITestCaseExecutionDetail.vue'
-import { generationUserMessage, isCurrentRevisionVerified, workspaceVerificationLabel, workspaceVerificationTagType } from '@/composables/webUIScriptGenerationPresentation'
+import { generationUserMessage, isActiveGeneration, isCurrentRevisionVerified, workspaceVerificationLabel, workspaceVerificationTagType } from '@/composables/webUIScriptGenerationPresentation'
 
 const props = defineProps({
   generation: { type: Object, default: null }, draft: { type: Object, default: null }, busy: Boolean,
-  draftSaving: Boolean, debugging: Boolean,
+  draftSaving: Boolean, debugging: Boolean, repairing: Boolean,
   debugExecution: { type: Object, default: null }, debugExecutionLoading: Boolean
 })
-const emit = defineEmits(['update-draft', 'save-draft', 'debug'])
+const emit = defineEmits(['update-draft', 'save-draft', 'debug', 'repair'])
 const form = reactive({ script_draft: '', variables: [] })
 const runtimeOverrides = reactive({})
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
@@ -93,6 +94,15 @@ const displayVerificationLabel = computed(() => verification.value.status === 'p
   : workspaceVerificationLabel(displayVerificationStatus.value))
 const canSaveDraft = computed(() => Boolean(form.script_draft.trim()) && !form.variables.some(item => !item.name.trim()))
 const canDebug = computed(() => canSaveDraft.value && !props.draftSaving)
+const canRepair = computed(() => {
+  const diagnostics = verification.value.diagnostics
+  return ['failed', 'error'].includes(verification.value.status)
+    && Array.isArray(diagnostics)
+    && diagnostics.length > 0
+    && !isActiveGeneration(props.generation?.status)
+    && !draftDirty.value
+    && !props.busy
+})
 let lastSyncedGenerationId = null
 
 const copyVariables = (variables) => (variables || []).map(item => ({
@@ -155,6 +165,19 @@ const requestDebug = async () => {
     replaceRuntimeOverrides()
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error('调试确认失败，请重试。')
+  }
+}
+const executionVariables = () => form.variables
+  .map(item => ({ name: item.name?.trim(), value: runtimeOverrides[item.name] }))
+  .filter(item => item.name && item.value !== undefined && item.value !== null && item.value !== '')
+const requestRepair = async () => {
+  if (!canRepair.value) return
+  try {
+    await ElMessageBox.confirm('AI 会读取本次失败证据，必要时访问目标网站，并实际运行候选脚本验证。单次请求最多尝试 2 轮。覆盖值不会作为变量配置写入工作区，但会发送给当前模型服务商、MCP 和目标网站，开发日志或截图也可能出现，只能使用测试账号。是否确认继续？', '确认 AI 分析并修复', { type: 'warning', confirmButtonText: '确认并开始', cancelButtonText: '取消' })
+    emit('repair', executionVariables())
+    replaceRuntimeOverrides()
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error('修复确认失败，请重试。')
   }
 }
 </script>

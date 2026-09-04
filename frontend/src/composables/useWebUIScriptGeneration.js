@@ -379,7 +379,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     const executionId = verification.execution_id
     if (
       !executionId ||
-      !['passed', 'failed', 'error'].includes(verification.status) ||
+      !['passed', 'incomplete', 'failed', 'error'].includes(verification.status) ||
       (debugExecutionLoading.value && String(debugExecutionRequestId) === String(executionId))
     ) return null
     const requestProjectId = currentProjectId.value

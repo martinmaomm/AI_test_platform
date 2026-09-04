@@ -207,3 +207,31 @@ test('old polling cannot resume while a replacement generation is being created'
   await pending
   assert.equal(state.generation.value.id, 'replacement')
 })
+
+test('incomplete debug runs load their real logs and screenshot on refresh and restore', async t => {
+  const { state, handlers, calls } = await harness(t)
+  const detail = { id: 41, execution: 14, project_id: 1, status: 'incomplete', log: 'pytest: 3 assertions passed', screenshot_path: 'webui_failure_screenshots/execution_14/generation_draft.png' }
+  handlers.getWebUIScriptGeneration = async () => ({ success: true, data: record({ verification: { status: 'incomplete', execution_id: 14 } }) })
+  handlers.getWebUITestCaseExecution = async () => ({ success: true, data: detail })
+  await state.refresh()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(state.debugExecution.value, detail)
+  assert.equal(state.workspace.value.verification.status, 'incomplete')
+  await state.restore()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(state.debugExecution.value, detail)
+  assert.deepEqual(calls.filter(call => call.name === 'getWebUITestCaseExecution').map(call => call.args), [[1, 14], [1, 14]])
+})
+
+test('all completed debug outcomes load details but in-progress runs do not', async t => {
+  const { state, handlers, calls } = await harness(t)
+  for (const status of ['pending', 'running', 'passed', 'failed', 'error']) {
+    const before = calls.filter(call => call.name === 'getWebUITestCaseExecution').length
+    handlers.getWebUIScriptGeneration = async () => ({ success: true, data: record({ verification: { status, execution_id: 14 } }) })
+    handlers.getWebUITestCaseExecution = async () => ({ success: true, data: { execution: 14, status, log: status } })
+    await state.refresh()
+    await new Promise(resolve => setImmediate(resolve))
+    const after = calls.filter(call => call.name === 'getWebUITestCaseExecution').length
+    assert.equal(after - before, ['pending', 'running'].includes(status) ? 0 : 1)
+  }
+})

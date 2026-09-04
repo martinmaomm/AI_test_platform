@@ -546,25 +546,20 @@ const viewDetails = async (row) => {
       return
     }
 
-    // API调用成功，直接使用响应数据（Django REST Framework直接返回序列化器数据）
-    console.log('API响应数据:', response)
-    console.log('allure_report_url字段:', response.allure_report_url)
-
-    // 确保正确合并数据
-    selectedRun.value = {
-      ...row,  // 先使用原始行数据
-      ...response  // 然后用API响应数据覆盖
+    if (!response?.success || !response.data || typeof response.data !== 'object' || Array.isArray(response.data)) {
+      ElMessage.error(response?.message || '获取执行详情失败')
+      return
     }
 
-    console.log('合并后的selectedRun:', selectedRun.value)
-    console.log('合并后的allure_report_url:', selectedRun.value.allure_report_url)
+    selectedRun.value = {
+      ...row,  // 先使用原始行数据
+      ...response.data  // 合并业务数据
+    }
 
     detailDialogVisible.value = true
   } catch (error) {
     console.error('获取执行详情失败:', error)
     ElMessage.error('获取执行详情失败')
-    selectedRun.value = row
-    detailDialogVisible.value = true
   }
 }
 

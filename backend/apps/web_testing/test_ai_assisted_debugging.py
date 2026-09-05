@@ -377,10 +377,12 @@ class AssistedDebuggingTests(TestCase):
         candidates = [
             '''async def run(page):
     await page.goto("https://web.example.test/users")
+    await expect(page.locator("main")).to_be_hidden()
 ''',
             '''async def run(page):
     await page.goto("https://web.example.test/users")
-    # 第二轮仍未恢复原断言
+    return
+    await expect(page.locator("main")).to_be_visible()
 ''',
         ]
         agent_calls = 0
@@ -420,6 +422,44 @@ class AssistedDebuggingTests(TestCase):
             item.get('code') == 'ASSERTION_REGRESSION'
             for item in repair['candidate_quality_report']['blockers']
         ))
+
+    def test_agent_error_semantic_regression_is_review_only_and_not_executed(self):
+        generation = self.generation()
+        digest = self._queue_repair(generation)
+        candidate = SCRIPT.replace('.to_be_visible()', '.to_be_hidden()')
+
+        class Agent:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def generate(self, **_kwargs):
+                return SimpleNamespace(
+                    script_draft=candidate, snapshot={'schema_version': 5},
+                    error_code='MODEL_TIMEOUT', error_message='模型超时',
+                )
+
+        with patch('web_testing.script_exploration_agent.ScriptExplorationAgent', Agent), patch(
+            'ai_core.model_manager.get_llm_manager', return_value=SimpleNamespace(current_llm=object()),
+        ), patch('web_testing.generation_workspace.evaluate_workspace_draft', return_value={'status': 'ready', 'blockers': []}), patch(
+            'web_testing.tasks._run_test_script',
+        ) as runner:
+            result = repair_webui_script_generation_task.apply(
+                args=(str(generation.id), 0, digest), task_id='repair-worker',
+            ).get()
+
+        self.assertEqual(result['status'], 'candidate_ready')
+        runner.assert_not_called()
+        generation.refresh_from_db()
+        repair = workspace_for_generation(generation)['repair']
+        self.assertEqual(generation.script_draft, SCRIPT)
+        self.assertEqual(repair['candidate_script'], candidate)
+        self.assertEqual(repair['candidate_quality_report']['status'], 'needs_review')
+        self.assertTrue(any(
+            item.get('code') == 'ASSERTION_REGRESSION'
+            for item in repair['candidate_quality_report']['blockers']
+        ))
+        self.assertEqual(repair['attempts'][0]['execution_status'], 'not_run')
+        self.assertEqual(repair['attempts'][0]['runtime_assertion_count'], 0)
 
     def test_unchanged_agent_output_is_not_executed_as_a_repair_candidate(self):
         generation = self.generation()

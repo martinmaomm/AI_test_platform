@@ -499,6 +499,7 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
     )
     from .generation_workspace import evaluate_workspace_draft, script_hash, update_repair_state
     from .model_service_errors import classify_model_service_error
+    from .script_repair_policy import validate_assertion_preservation
     from .script_exploration_agent import ScriptExplorationAgent
     from .generation_workspace import (
         finish_repair_failure, mark_repair_running,
@@ -520,16 +521,25 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
     ) -> bool:
         baseline_assertions = analyze_assertion_state(baseline_script)
         candidate_assertions = analyze_assertion_state(candidate_script)
-        if (
+        semantic_blockers = validate_assertion_preservation(
+            baseline_script, candidate_script,
+        )
+        if not semantic_blockers and (
             candidate_assertions['confirmed_count'] >= baseline_assertions['confirmed_count']
             and candidate_assertions['pending_count'] <= baseline_assertions['pending_count']
         ):
             return False
         quality_report['status'] = 'needs_review'
         quality_report['assertion_state'] = candidate_assertions
+        messages = [item['message'] for item in semantic_blockers]
+        if (
+            candidate_assertions['confirmed_count'] < baseline_assertions['confirmed_count']
+            or candidate_assertions['pending_count'] > baseline_assertions['pending_count']
+        ):
+            messages.append('候选减少了已确认断言或增加了待补充断言。')
         quality_report['blockers'] = list(quality_report.get('blockers') or []) + [{
             'level': 'blocker', 'code': 'ASSERTION_REGRESSION',
-            'message': '候选减少了已确认断言或增加了待补充断言，不能执行验证。',
+            'message': ' '.join(messages) or '候选断言保护检查未通过，不能执行验证。',
         }]
         return True
 

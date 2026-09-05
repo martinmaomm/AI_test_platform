@@ -15,23 +15,41 @@ from .execution_diagnostics import diagnose_failure, friendly_failure_summary
 
 
 PAGE_RELATED_CATEGORIES = frozenset({'action_timeout', 'strict_mode', 'assertion_failure'})
-NON_CODE_CATEGORIES = frozenset({'navigation_error', 'target_closed'})
+NON_CODE_CATEGORIES = frozenset({
+    'navigation_error', 'target_closed', 'browser_unavailable',
+    'authentication_error', 'network_error', 'cancelled',
+})
 MAX_REPAIR_LOG_CHARS = 12000
 MAX_CANDIDATE_SCRIPT_CHARS = 200000
 MAX_CANDIDATE_DIFF_CHARS = 20000
-NON_CODE_MARKERS = (
-    'err_connection_', 'err_name_not_resolved', 'err_internet_disconnected',
-    'connection refused', 'network is unreachable', 'authentication failed',
-    'invalid credentials', '账号或密码错误', '用户名或密码错误',
-    'invalid username or password', 'incorrect username or password',
-    'executable doesn\'t exist', 'browser executable', 'playwright install',
-    'task_cancelled', '用户已取消',
-)
 DIFF_TRUNCATION_MARKER = '\n… 差异过长，已省略；请查看完整候选脚本。\n'
+FAILURE_CONTEXT_TRUNCATION_MARKER = '\n… 已省略无关日志；保留实际失败附近与末尾上下文。\n'
 
 
 def bounded_text(value: Any, limit: int = MAX_REPAIR_LOG_CHARS) -> str:
     return str(value or '')[:max(0, limit)]
+
+
+def bounded_failure_context(value: Any, *, focus: str = '', limit: int = MAX_REPAIR_LOG_CHARS) -> str:
+    """Keep a bounded failure excerpt and the log tail for the repair model."""
+
+    text = str(value or '')
+    if len(text) <= limit:
+        return text
+    marker = FAILURE_CONTEXT_TRUNCATION_MARKER
+    if not focus:
+        return marker + text[-(limit - len(marker)):]
+    tail_limit = max(1, limit // 3)
+    focus_limit = max(1, limit - tail_limit - len(marker))
+    position = text.rfind(str(focus))
+    if position < 0:
+        return marker + text[-(limit - len(marker)):]
+    start = max(0, position - focus_limit // 3)
+    excerpt = text[start:start + focus_limit]
+    tail = text[-tail_limit:]
+    if tail in excerpt:
+        return excerpt[-limit:]
+    return excerpt + marker + tail
 
 
 def redact_runtime_values(value: Any, runtime_variables: list[dict[str, Any]]) -> str:
@@ -60,15 +78,23 @@ def redact_runtime_values(value: Any, runtime_variables: list[dict[str, Any]]) -
 
 def failure_evidence(*, stdout: str = '', stderr: str = '', log: str = '', fallback: str = '', runtime_variables: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     runtime_variables = runtime_variables or []
-    stdout = bounded_text(redact_runtime_values(stdout, runtime_variables))
-    stderr = bounded_text(redact_runtime_values(stderr, runtime_variables))
-    log = bounded_text(redact_runtime_values(log, runtime_variables))
-    fallback = bounded_text(redact_runtime_values(fallback, runtime_variables), 2000)
-    diagnostic = diagnose_failure(stdout, stderr or log)
+    safe_stdout = redact_runtime_values(stdout, runtime_variables)
+    safe_stderr = redact_runtime_values(stderr, runtime_variables)
+    safe_log = redact_runtime_values(log, runtime_variables)
+    safe_fallback = redact_runtime_values(fallback, runtime_variables)
+    # Diagnose the full redacted output first: a terminal Playwright error is
+    # commonly beyond the model-context limit.
+    diagnostic_source = safe_stderr or safe_log or safe_fallback
+    diagnostic = diagnose_failure(safe_stdout, diagnostic_source)
+    focus = diagnostic.technical_message
+    stdout = bounded_failure_context(safe_stdout, focus=focus)
+    stderr = bounded_failure_context(safe_stderr, focus=focus)
+    log = bounded_failure_context(safe_log, focus=focus)
+    fallback = bounded_text(safe_fallback, 2000)
     return {
         'category': diagnostic.category,
-        'summary': friendly_failure_summary(stdout, stderr or log, fallback),
-        'technical_message': redact_runtime_values(diagnostic.technical_message, runtime_variables),
+        'summary': friendly_failure_summary(safe_stdout, diagnostic_source, fallback),
+        'technical_message': focus,
         'stdout': stdout,
         'stderr': stderr,
         'log': log,
@@ -80,10 +106,18 @@ def requires_directed_mcp(evidence: dict[str, Any]) -> bool:
 
 
 def is_non_code_failure(evidence: dict[str, Any]) -> bool:
-    if str(evidence.get('category') or '') in NON_CODE_CATEGORIES:
+    category = str(evidence.get('category') or '')
+    if category in PAGE_RELATED_CATEGORIES:
+        return False
+    if category in NON_CODE_CATEGORIES:
         return True
-    text = ' '.join(str(evidence.get(key) or '') for key in ('summary', 'technical_message', 'stdout', 'stderr', 'log')).lower()
-    return any(marker in text for marker in NON_CODE_MARKERS)
+    diagnostic = diagnose_failure(
+        str(evidence.get('stdout') or ''),
+        str(evidence.get('stderr') or evidence.get('log') or evidence.get('technical_message') or ''),
+    )
+    return diagnostic.category in NON_CODE_CATEGORIES
+
+
 def bounded_candidate_diff(value: Any) -> str:
     """Limit a display-only diff without discarding its complete candidate."""
     text = str(value or '')

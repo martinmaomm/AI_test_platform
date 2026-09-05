@@ -436,7 +436,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         agent._install_entry_seed()
         self.assertIn(repr(agent._target_url), agent._last_valid_script)
 
-    def test_final_text_is_partial_fallback_instead_of_complete_claim(self):
+    def test_final_text_static_complete_fallback_stays_partial_without_generic_pending_step(self):
         class Agent:
             def __init__(self, **kwargs): pass
 
@@ -447,8 +447,9 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             async def run(self, *_args, **_kwargs): return f'```python\n{COMPLETE_SCRIPT}\n```'
 
         result, _ = self.run_with(Agent)
-        self.assertIn('AITS_PENDING_STEP:', result.script_draft)
         self.assertEqual(result.completion, 'partial')
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], [])
+        self.assertNotIn('智能体未确认完成', result.script_draft)
         self.assertIn('partial 回退', result.snapshot['warnings'][0])
 
     def test_code_only_never_creates_mcp_client_or_browser(self):
@@ -467,6 +468,166 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertEqual(result.completion, 'partial')
         self.assertIn('AITS_PENDING_STEP:', result.script_draft)
         self.assertEqual(result.snapshot['events'], [{'event_id': 'saved'}])
+
+    def test_code_only_repair_uses_current_complete_candidate_not_old_pending_steps(self):
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return f'```python\n{COMPLETE_SCRIPT}\n```'
+
+        snapshot = {
+            'schema_version': 5,
+            'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {},
+            'artifact': {
+                'completion': 'partial',
+                'remaining_steps': ['旧草稿的详情页待办'],
+            },
+        }
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(repair_only=True), target_url='https://example.test/catalog',
+            saved_snapshot=snapshot, script_draft=PARTIAL_SCRIPT, code_only=True,
+        ))
+        self.assertEqual(result.script_draft, COMPLETE_SCRIPT.strip())
+        self.assertEqual(result.completion, 'complete')
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], [])
+        self.assertNotIn('AITS_PENDING_STEP:', result.script_draft)
+
+    def test_code_only_keeps_current_pending_marker_not_old_snapshot_pending_step(self):
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return f'```python\n{PARTIAL_SCRIPT}\n```'
+
+        snapshot = {
+            'schema_version': 5,
+            'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {},
+            'artifact': {'completion': 'partial', 'remaining_steps': ['过期待办']},
+        }
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(repair_only=True), target_url='https://example.test/catalog',
+            saved_snapshot=snapshot, script_draft=COMPLETE_SCRIPT, code_only=True,
+        ))
+        self.assertEqual(result.completion, 'partial')
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['详情页操作尚未在当前 trace 中观察到。'])
+        self.assertNotIn('过期待办', result.script_draft)
+
+    def test_code_only_records_all_current_pending_marker_reasons_once(self):
+        script = COMPLETE_SCRIPT + '''\
+    # AITS_PENDING_STEP: {"reason":"补充筛选操作"}
+    # AITS_PENDING_ASSERTION: {"reason":"补充筛选结果断言"}
+    # AITS_PENDING_STEP: {"reason":"补充筛选操作"}
+'''
+
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return f'```python\n{script}\n```'
+
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(repair_only=True), target_url='https://example.test/catalog',
+            saved_snapshot={'schema_version': 5, 'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
+            script_draft=PARTIAL_SCRIPT, code_only=True,
+        ))
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['补充筛选操作', '补充筛选结果断言'])
+
+    def test_code_only_without_assertion_stays_partial_with_pending_assertion(self):
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return "```python\nasync def run(page, variables):\n    await page.goto('https://example.test/catalog')\n```"
+
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(repair_only=True), target_url='https://example.test/catalog',
+            saved_snapshot={'schema_version': 5, 'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
+            script_draft=PARTIAL_SCRIPT, code_only=True,
+        ))
+        self.assertEqual(result.completion, 'partial')
+        self.assertIn('AITS_PENDING_ASSERTION:', result.script_draft)
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['草稿尚无真实断言，需补充可验证结果。'])
+
+    def test_code_only_static_complete_candidate_remains_partial_without_generic_pending_step(self):
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return f'```python\n{COMPLETE_SCRIPT}\n```'
+
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(), target_url='https://example.test/catalog',
+            saved_snapshot={'schema_version': 5, 'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
+            script_draft=PARTIAL_SCRIPT, code_only=True,
+        ))
+        self.assertEqual(result.completion, 'partial')
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], [])
+        self.assertNotIn('智能体未确认完成', result.script_draft)
+
+    def test_code_only_extracts_full_fenced_code_while_snapshot_stays_bounded(self):
+        encoded = 'A' * 21_000
+        script = COMPLETE_SCRIPT + f"\n    payload = {encoded!r}\n"
+
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return f'```python\n{script}\n```'
+
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(), target_url='https://example.test/catalog',
+            saved_snapshot={'schema_version': 5, 'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
+            script_draft=PARTIAL_SCRIPT, code_only=True,
+        ))
+        self.assertIn(encoded, result.script_draft)
+        self.assertLessEqual(len(result.snapshot['model_output_raw']), 20_000)
+        self.assertIn('<base64-omitted>', result.snapshot['model_output_raw'])
+
+    def test_code_only_rejects_oversized_fenced_candidate_and_keeps_original_draft(self):
+        oversized = 'A' * 200_001
+        script = COMPLETE_SCRIPT + f"\n    payload = {oversized!r}\n"
+
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return f'```python\n{script}\n```'
+
+        result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+            brief=brief(), target_url='https://example.test/catalog',
+            saved_snapshot={'schema_version': 5, 'events': [], 'page_states': [], 'locator_evidence': [], 'tool_stats': {}},
+            script_draft=PARTIAL_SCRIPT, code_only=True,
+        ))
+        self.assertEqual(result.script_draft, PARTIAL_SCRIPT.strip())
+        self.assertEqual(result.error_code, 'SCRIPT_TOO_LONG')
+        self.assertIn('超过 200000 字符', result.error_message)
+        feedback = result.snapshot['draft_state']['latest_candidate_feedback']
+        self.assertEqual(feedback['error_code'], 'SCRIPT_TOO_LONG')
+        self.assertIn('超过 200000 字符', feedback['message'])
+        self.assertTrue(any('超过 200000 字符' in warning for warning in result.snapshot['warnings']))
+
+    def test_final_text_fallback_extracts_full_fenced_code_while_snapshot_stays_bounded(self):
+        encoded = 'A' * 21_000
+        script = COMPLETE_SCRIPT + f"\n    payload = {encoded!r}\n"
+
+        class Agent:
+            def __init__(self, **kwargs): pass
+
+            async def initialize(self): pass
+
+            async def register_local_tools(self, tools): pass
+
+            async def run(self, *_args, **_kwargs): return f'```python\n{script}\n```'
+
+        result, _ = self.run_with(Agent)
+        self.assertIn(encoded, result.script_draft)
+        self.assertLessEqual(len(result.snapshot['model_output_raw']), 20_000)
+        self.assertIn('<base64-omitted>', result.snapshot['model_output_raw'])
+
+    def test_final_text_fallback_rejects_oversized_candidate_with_result_error(self):
+        oversized = 'A' * 200_001
+        script = COMPLETE_SCRIPT + f"\n    payload = {oversized!r}\n"
+
+        class Agent:
+            def __init__(self, **kwargs): pass
+
+            async def initialize(self): pass
+
+            async def register_local_tools(self, tools): pass
+
+            async def run(self, *_args, **_kwargs): return f'```python\n{script}\n```'
+
+        result, _ = self.run_with(Agent)
+        self.assertEqual(result.error_code, 'SCRIPT_TOO_LONG')
+        self.assertIn('超过 200000 字符', result.error_message)
+        self.assertIn('仅生成入口', result.script_draft)
 
     def test_prepares_task_scoped_mcp_output_and_keeps_trace_file(self):
         prepared_ids = []
@@ -594,7 +755,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertIn('SYNTAX_ERROR', LLM.prompt)
         self.assertEqual(result.snapshot['artifact']['revision'], 7)
         self.assertEqual(result.snapshot['artifact']['completed_steps'], ['打开目录'])
-        self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['补充断言'])
+        self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['详情页操作尚未在当前 trace 中观察到。'])
         self.assertEqual(result.snapshot['artifact']['variables'][0]['name'], 'fixed_name')
         self.assertEqual(result.snapshot['repair_diagnostics']['line'], 3)
 

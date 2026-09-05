@@ -56,6 +56,7 @@ SCRIPT_SAVE_TOOL_NAME = 'aits_save_script'
 _CHECKPOINT_INTERVAL_SECONDS = 3.0
 _RAW_MODEL_OUTPUT_LIMIT = 20000
 _MODEL_OUTPUT_SUMMARY_LIMIT = 2000
+_MAX_SCRIPT_CHARS = 200000
 _PENDING_STEP_PREFIX = '# AITS_PENDING_STEP:'
 _PENDING_ASSERTION_PREFIX = '# AITS_PENDING_ASSERTION:'
 _BASE64_RE = re.compile(r'(?<![a-z0-9+/=])[a-z0-9+/]{2048,}={0,2}', re.I)
@@ -277,7 +278,7 @@ class ScriptExplorationResult:
 class ScriptSaveInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    code: str = Field(min_length=1, max_length=200000)
+    code: str = Field(min_length=1, max_length=_MAX_SCRIPT_CHARS)
     completed_steps: list[str] = Field(default_factory=list, max_length=100)
     remaining_steps: list[str] = Field(default_factory=list, max_length=100)
     variables: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
@@ -443,6 +444,11 @@ class ScriptExplorationAgent:
         }
         self._final_message = ''
         self._raw_model_output = ''
+        # Keep the unmodified model reply only for immediate local extraction.
+        # Checkpoints and snapshots must use ``_raw_model_output`` instead.
+        self._model_output_for_extraction = ''
+        self._candidate_error_code = ''
+        self._candidate_error_message = ''
         self._warnings: list[str] = []
         self._termination_reason = ''
         self._checkpoint_failure = ''
@@ -529,7 +535,7 @@ class ScriptExplorationAgent:
             await self._submit_final_text_candidate()
             if not await self._persist_checkpoint(force=True):
                 return self._result('CHECKPOINT_FAILED', self._checkpoint_failure)
-            return self._result()
+            return self._result(self._candidate_error_code, self._candidate_error_message)
         except Exception as exc:
             logger.exception('连续探索中断，保留已保存草稿: generation_id=%s', self.generation_id)
             error_code = exc.error_code if isinstance(exc, ScriptExplorationAgentError) else _classify_mcp_error(exc)
@@ -631,6 +637,20 @@ class ScriptExplorationAgent:
         source: str,
     ) -> dict[str, Any]:
         candidate = str(code or '').strip()
+        if len(candidate) > _MAX_SCRIPT_CHARS:
+            # Direct model-text fallbacks do not pass through ScriptSaveInput,
+            # so enforce the same source-size contract before storing or
+            # parsing an oversized candidate.  Do not retain a truncated copy
+            # as though it were a usable draft.
+            feedback = {
+                'status': 'rejected', 'source': source,
+                'error_code': 'SCRIPT_TOO_LONG',
+                'message': f'候选 Python 草稿超过 {_MAX_SCRIPT_CHARS} 字符，已拒绝保存并保留原草稿。',
+                'retained_revision': self._artifact['revision'],
+                'retained_completion': self._artifact['completion'],
+            }
+            self._latest_candidate_feedback = feedback
+            return feedback
         self._latest_candidate = candidate
         report = self._quality_report(candidate)
         blockers = list(report.get('blockers') or [])
@@ -658,13 +678,20 @@ class ScriptExplorationAgent:
                 candidate = self._append_pending_step(candidate, remaining[0])
                 auto_pending_step = True
             elif not remaining and pending_items:
-                reason = next((str(item.get('reason') or '').strip() for item in pending_items if isinstance(item, dict) and item.get('reason')), '')
-                remaining = [reason or '草稿保留了待补充项，请根据对应标记完成后重新检查。']
+                reasons = self._pending_reasons(pending_items)
+                remaining = reasons or ['草稿保留了待补充项，请根据对应标记完成后重新检查。']
             elif not remaining and int(assertion_state.get('confirmed_count') or 0) == 0:
                 reason = '草稿尚无真实断言，需补充可验证结果。'
                 candidate = self._append_pending_assertion(candidate, reason)
                 remaining = [reason]
-            elif not remaining:
+            elif not remaining and not (
+                source in {'code_only_model', 'final_text_fallback'}
+                and report.get('completion') == 'complete'
+            ):
+                # A static-complete model-text candidate is still unverified
+                # until the independent runner executes it.  Keep its partial
+                # status, but do not manufacture a generic pending step solely
+                # from the fallback's fixed ``completion='partial'``.
                 reason = '智能体未确认完成，未说明具体缺少项。'
                 candidate = self._append_pending_step(candidate, reason)
                 remaining = [reason]
@@ -705,21 +732,27 @@ class ScriptExplorationAgent:
     async def _submit_final_text_candidate(self) -> None:
         # A locally saved draft is authoritative.  An extra final reply must
         # not downgrade or replace it merely because the reply is incomplete.
-        if (self._last_valid_script and not self._seed_is_current) or not self._raw_model_output:
+        if (self._last_valid_script and not self._seed_is_current) or not self._model_output_for_extraction:
             return
-        candidate = extract_python_from_output(self._raw_model_output)
+        candidate = extract_python_from_output(self._model_output_for_extraction)
         if not candidate or candidate.strip() == self._last_valid_script:
             return
         feedback = self._consider_candidate(
             candidate,
             completed_steps=self._artifact['completed_steps'],
-            remaining_steps=self._artifact['remaining_steps'] or ['根据已保存 trace 复核最终文本'],
+            # Pending markers in this candidate, not an earlier artifact,
+            # describe what remains after a text-only repair.
+            remaining_steps=[],
             variables=self._artifact['variables'],
             completion='partial',
             source='final_text_fallback',
         )
         if feedback['status'] == 'accepted':
             self._warnings.append('最终文本草稿仅作为增量保存失败时的 partial 回退，未声明已完成。')
+        elif feedback.get('error_code') == 'SCRIPT_TOO_LONG':
+            self._warnings.append(str(feedback['message']))
+            self._candidate_error_code = str(feedback['error_code'])
+            self._candidate_error_message = str(feedback['message'])
 
     async def _generate_code_only(self) -> ScriptExplorationResult:
         """Ask the configured model to repair only callback-owned saved evidence.
@@ -755,12 +788,14 @@ class ScriptExplorationAgent:
                 asyncio.create_task(self.llm_model.ainvoke(prompt)), deadline,
             )
             self._record_model_output(model_result)
-            candidate = extract_python_from_output(self._raw_model_output)
+            candidate = extract_python_from_output(self._model_output_for_extraction)
             if candidate:
                 feedback = self._consider_candidate(
                     candidate,
                     completed_steps=self._artifact['completed_steps'],
-                    remaining_steps=self._artifact['remaining_steps'],
+                    # Only pending markers still present in the current
+                    # candidate may carry into the repaired artifact.
+                    remaining_steps=[],
                     variables=self._artifact['variables'],
                     # Repair candidates may already be complete.  Static quality
                     # never proves that claim; the independent runner does.
@@ -768,12 +803,17 @@ class ScriptExplorationAgent:
                     source='code_only_model',
                 )
                 if feedback['status'] == 'rejected':
-                    self._warnings.append('code_only 模型候选未通过静态检查，已保留原草稿。')
+                    self._warnings.append(str(feedback.get(
+                        'message', 'code_only 模型候选未通过静态检查，已保留原草稿。',
+                    )))
+                    if feedback.get('error_code') == 'SCRIPT_TOO_LONG':
+                        self._candidate_error_code = str(feedback['error_code'])
+                        self._candidate_error_message = str(feedback['message'])
             else:
                 self._warnings.append('code_only 模型未返回可提取的 Python 草稿，已保留原草稿。')
             if not await self._persist_checkpoint(force=True):
                 return self._result('CHECKPOINT_FAILED', self._checkpoint_failure)
-            return self._result()
+            return self._result(self._candidate_error_code, self._candidate_error_message)
         except Exception as exc:
             logger.exception('基于证据整理脚本中断: generation_id=%s', self.generation_id)
             error_code = exc.error_code if isinstance(exc, ScriptExplorationAgentError) else _classify_mcp_error(exc)
@@ -876,7 +916,7 @@ class ScriptExplorationAgent:
             page_states = data['page_states']
             locator_evidence = data['locator_evidence']
             stats = data['tool_stats']
-        raw_output = self._bounded_raw(self._raw_model_output)
+        raw_output = self._raw_model_output
         return {
             'schema_version': 5,
             'target_url': self._target_url,
@@ -917,8 +957,9 @@ class ScriptExplorationAgent:
 
     def _record_model_output(self, value: Any) -> None:
         text = self._output_text(value)
+        self._model_output_for_extraction = text
         self._raw_model_output = self._bounded_raw(text)
-        self._final_message = self._summary(text)
+        self._final_message = self._summary(self._raw_model_output)
 
     def _prompt(self) -> str:
         return json.dumps({
@@ -1014,6 +1055,18 @@ class ScriptExplorationAgent:
                 'description': str(item.get('description') or '').strip()[:500],
             })
         return result
+
+    def _pending_reasons(self, pending_items: list[Any]) -> list[str]:
+        reasons: list[str] = []
+        seen: set[str] = set()
+        for item in pending_items:
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get('reason') or '').strip()
+            if reason and reason not in seen:
+                seen.add(reason)
+                reasons.append(reason)
+        return reasons[:100]
 
     def _quality_report(self, script: str) -> dict[str, Any]:
         try:

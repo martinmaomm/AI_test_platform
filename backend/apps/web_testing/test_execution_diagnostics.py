@@ -31,6 +31,41 @@ class FailureDiagnosticTests(unittest.TestCase):
         self.assertNotIn('按钮', diagnostic.summary)
         self.assertIn('输入元素超时', diagnostic.summary)
 
+    def test_latest_pytest_failure_beats_historical_successful_action_logs(self):
+        diagnostic = diagnose_failure(stdout=(
+            'test_case.py::test_login FAILED\n'
+            '    await page.get_by_role("button", name="已完成按钮").click()\n'
+            '>   await page.get_by_label("名称").fill("a")\n'
+            'E   playwright._impl._errors.TimeoutError: Locator.fill: Timeout 5000ms exceeded.\n'
+            'E   Call log:\n'
+            'E     - waiting for get_by_label("名称")\n'
+        ))
+
+        self.assertEqual(diagnostic.category, 'action_timeout')
+        self.assertEqual(diagnostic.action, '输入')
+        self.assertEqual(diagnostic.target, '标签为“名称”的输入项')
+
+    def test_bare_playwright_and_generic_error_lines_are_trusted_failure_primaries(self):
+        playwright = diagnose_failure(stdout=(
+            'await page.get_by_role("button", name="保存").click()\n'
+            'playwright._impl._errors.Error: Locator.fill: Timeout 5000ms exceeded.\n'
+        ))
+        generic = diagnose_failure(stdout=(
+            'await page.get_by_role("button", name="保存").click()\n'
+            'E   AttributeError: page fixture is None\n'
+        ))
+        type_error = diagnose_failure(stdout=(
+            'await page.get_by_role("button", name="保存").click()\n'
+            'E   TypeError: timeout must be an integer\n'
+        ))
+
+        self.assertEqual(playwright.category, 'action_timeout')
+        self.assertEqual(playwright.action, '输入')
+        self.assertEqual(generic.category, 'unknown')
+        self.assertEqual(generic.technical_message, 'AttributeError: page fixture is None')
+        self.assertEqual(type_error.category, 'unknown')
+        self.assertEqual(type_error.technical_message, 'TypeError: timeout must be an integer')
+
     def test_assertion_strict_mode_and_navigation_errors_are_classified(self):
         cases = [
             (

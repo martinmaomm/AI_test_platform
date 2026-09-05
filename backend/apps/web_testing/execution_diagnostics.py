@@ -30,6 +30,78 @@ _ACTIONS = {
 }
 
 
+_DIRECT_FAILURE_LINE = re.compile(
+    r'^(?:'
+    r'(?:[\w.]*?(?:Error|Exception))\b'
+    r'|(?:page\.goto:.*net::ERR_)'
+    r'|(?:Target page, context or browser has been closed)'
+    r'|(?:BrowserType\.launch:.*(?:Executable doesn\'t exist|browser executable))'
+    r'|(?:(?:[\w.]*Error:\s*)?Locator\.(?:click|fill|check|select_option|press|hover):\s*Timeout)'
+    r'|(?:strict mode violation)'
+    r'|(?:authentication failed|invalid credentials)\b'
+    r'|(?:TaskCancelled|task_cancelled)\b'
+    r'|(?:用户已取消)'
+    r')',
+    re.I,
+)
+
+
+def _failure_line_indexes(lines: list[str]) -> list[int]:
+    """Return error lines emitted by the current test runner, not source snippets."""
+
+    indexes = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        candidate = stripped[4:].strip() if stripped.startswith('E   ') else stripped
+        if stripped.startswith('E   ') and _DIRECT_FAILURE_LINE.search(candidate):
+            indexes.append(index)
+        elif _DIRECT_FAILURE_LINE.search(candidate):
+            indexes.append(index)
+    return indexes
+
+
+def _current_failure_parts(stdout: str = '', stderr: str = '') -> tuple[str, str, bool]:
+    """Return the terminal exception, its target context, and whether it is trusted.
+
+    Category selection must never inspect the full failed test function: source
+    snippets and earlier successful calls can contain the same Playwright words.
+    Only pytest's final exception line is authoritative.  Its ``E`` continuation
+    lines and Call log are retained solely to identify the target for the user.
+    """
+
+    text = '\n'.join(part for part in (stdout or '', stderr or '') if part)
+    lines = text.splitlines()
+    indexes = _failure_line_indexes(lines)
+    if not indexes:
+        return text, text, False
+    failure_index = indexes[-1]
+    primary = lines[failure_index].strip()
+    context = [primary]
+    in_call_log = False
+    for line in lines[failure_index + 1:]:
+        stripped = line.strip()
+        if 'Call log:' in stripped:
+            in_call_log = True
+            context.append(stripped)
+            continue
+        if stripped.startswith('E   '):
+            context.append(stripped)
+            continue
+        if in_call_log and (not stripped or stripped.startswith('-')):
+            context.append(stripped)
+            continue
+        if stripped:
+            break
+    return primary, '\n'.join(context), True
+
+
+def current_failure_block(stdout: str = '', stderr: str = '') -> str:
+    """Return only the current exception and its Call log/pytest continuation."""
+
+    _, context, _ = _current_failure_parts(stdout, stderr)
+    return context
+
+
 def _technical_message(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -81,13 +153,16 @@ def _format_summary(title: str, action: Optional[str], target: Optional[str], ti
 def diagnose_failure(stdout: str = '', stderr: str = '') -> FailureDiagnostic:
     """Classify known Playwright/Pytest failures without guessing missing details."""
 
-    text = '\n'.join(part for part in (stdout or '', stderr or '') if part)
-    technical = _technical_message(text)
+    primary, context, has_failure_signal = _current_failure_parts(stdout, stderr)
+    # Categories and timeout originate from the exception line alone.  Call log
+    # text is permitted only for the user-facing locator target.
+    text = primary if has_failure_signal else ''
+    technical = _technical_message(primary if has_failure_signal else context)
     timeout_ms = _extract_timeout(text)
-    target = _extract_target(text)
+    target = _extract_target(context)
 
     for operation, (action, title, suggestion) in _ACTIONS.items():
-        if re.search(rf'(?:Locator\.)?{re.escape(operation)}\b', text, re.I) and re.search(
+        if has_failure_signal and re.search(rf'(?:Locator\.)?{re.escape(operation)}\b', text, re.I) and re.search(
             r'(TimeoutError|Timeout\s+\d+\s*ms)', text, re.I
         ):
             return FailureDiagnostic(
@@ -97,7 +172,7 @@ def diagnose_failure(stdout: str = '', stderr: str = '') -> FailureDiagnostic:
                 summary=_format_summary(title, action, target, timeout_ms, suggestion),
             )
 
-    if re.search(r'expect\s*\(|to_be_|to_have_|AssertionError', text, re.I):
+    if has_failure_signal and re.search(r'expect\s*\(|to_be_|to_have_|AssertionError', text, re.I):
         title = '页面校验未通过'
         suggestion = '请检查页面实际状态是否符合断言条件'
         return FailureDiagnostic(
@@ -106,7 +181,7 @@ def diagnose_failure(stdout: str = '', stderr: str = '') -> FailureDiagnostic:
             summary=_format_summary(title, None, target, timeout_ms, suggestion),
         )
 
-    if re.search(r'strict mode violation', text, re.I):
+    if has_failure_signal and re.search(r'strict mode violation', text, re.I):
         title = '定位元素不唯一'
         suggestion = '请缩小定位范围，确保定位器只匹配一个元素'
         return FailureDiagnostic(
@@ -129,6 +204,42 @@ def diagnose_failure(stdout: str = '', stderr: str = '') -> FailureDiagnostic:
         suggestion = '请检查脚本是否提前关闭了页面或浏览器'
         return FailureDiagnostic(
             category='target_closed', title=title, suggestion=suggestion,
+            technical_message=technical,
+            summary=_format_summary(title, None, None, None, suggestion),
+        )
+
+    if re.search(r'BrowserType\.launch:.*(?:Executable doesn\'t exist|browser executable)|playwright install', text, re.I):
+        title = '浏览器运行环境不可用'
+        suggestion = '请安装匹配的 Playwright 浏览器或检查浏览器路径配置'
+        return FailureDiagnostic(
+            category='browser_unavailable', title=title, suggestion=suggestion,
+            technical_message=technical,
+            summary=_format_summary(title, None, None, None, suggestion),
+        )
+
+    if re.search(r'connection refused|network is unreachable', text, re.I):
+        title = '网络连接失败'
+        suggestion = '请检查测试环境网络连接和目标服务状态'
+        return FailureDiagnostic(
+            category='network_error', title=title, suggestion=suggestion,
+            technical_message=technical,
+            summary=_format_summary(title, None, None, None, suggestion),
+        )
+
+    if re.search(r'(?:AuthenticationError\b|(?:^|\n)\s*(?:E\s+)?(?:Error:\s*)?authentication failed\b|(?:^|\n)\s*(?:E\s+)?(?:Error:\s*)?invalid credentials\b)', text, re.I):
+        title = '认证或账号配置失败'
+        suggestion = '请检查测试环境账号、凭据和认证配置'
+        return FailureDiagnostic(
+            category='authentication_error', title=title, suggestion=suggestion,
+            technical_message=technical,
+            summary=_format_summary(title, None, None, None, suggestion),
+        )
+
+    if re.search(r'(?:CancelledError|TaskCancelled|task_cancelled|用户已取消)', text, re.I):
+        title = '任务已取消'
+        suggestion = '请重新发起调试任务后再尝试修复'
+        return FailureDiagnostic(
+            category='cancelled', title=title, suggestion=suggestion,
             technical_message=technical,
             summary=_format_summary(title, None, None, None, suggestion),
         )

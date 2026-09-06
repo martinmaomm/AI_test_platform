@@ -44,6 +44,7 @@ from .script_assistant import (
     case_edit_version,
     expire_if_needed,
     model_info,
+    repair_adoption_state,
 )
 from .tasks import run_script_assistant_operation_task
 
@@ -72,6 +73,7 @@ def assistant_payload(item: WebUIScriptAssistant) -> dict:
         "messages": item.messages,
         "attempts": item.attempts,
         "verification": item.verification,
+        "adoption": repair_adoption_state(item),
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -682,6 +684,18 @@ class ScriptAssistantApplyView(APIView):
         )
         try:
             expected_revision = int(request.data.get("expected_revision"))
+        except (TypeError, ValueError):
+            return response(
+                kind="error", message="expected_revision 必填。", status_code=400
+            )
+        acknowledge_review = request.data.get("acknowledge_review", False)
+        if not isinstance(acknowledge_review, bool):
+            return response(
+                kind="error",
+                message="acknowledge_review 必须是布尔值。",
+                status_code=400,
+            )
+        try:
             case = __import__(
                 "web_testing.script_assistant", fromlist=["apply_repair"]
             ).apply_repair(
@@ -691,6 +705,7 @@ class ScriptAssistantApplyView(APIView):
                     request.data.get("expected_edit_version") or ""
                 ),
                 expected_hash=str(request.data.get("candidate_hash") or ""),
+                acknowledge_review=acknowledge_review,
             )
         except (TypeError, ValueError, ScriptAssistantConflict) as exc:
             return response(kind="error", message=str(exc), status_code=409)

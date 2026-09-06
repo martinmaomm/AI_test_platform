@@ -12,6 +12,7 @@ import {
   canVerifyCandidate,
   expandedAssistantRowIds,
   isAssistantActive,
+  repairAdoptionState,
   verificationLabel
 } from '../src/composables/webUIScriptAssistantPresentation.js'
 
@@ -43,7 +44,7 @@ test('assistant recovery stays in its mode and candidate controls enforce active
   assert.deepEqual(assistantsForContext([edit, repair], { mode: 'edit' }), [edit])
   assert.deepEqual(assistantListParams({ mode: 'repair', executionId: 4 }), { mode: 'repair', execution_id: 4 })
 
-  const readyRepair = { mode: 'repair', status: 'candidate_ready', candidate_hash: 'hash', candidate_script: 'async def run(page): pass', blockers: [] }
+  const readyRepair = { mode: 'repair', status: 'candidate_ready', candidate_hash: 'hash', candidate_script: 'async def run(page): pass', blockers: [], adoption: { kind: 'automatic', can_apply: true, requires_acknowledge_review: false } }
   assert.equal(canContinueCandidate(readyRepair), true)
   assert.equal(canVerifyCandidate(readyRepair), true)
   assert.equal(canApplyRepairCandidate(readyRepair), true)
@@ -52,6 +53,19 @@ test('assistant recovery stays in its mode and candidate controls enforce active
   assert.equal(canApplyRepairCandidate({ ...readyRepair, status: 'applied' }), false)
   assert.equal(canVerifyCandidate({ ...readyRepair, status: 'failed' }), false)
   assert.equal(canApplyRepairCandidate({ ...readyRepair, status: 'cancelled' }), false)
+})
+
+test('scope-only repair can be manually saved but never automatically verified', () => {
+  const manualRepair = {
+    mode: 'repair', status: 'candidate_ready', candidate_hash: 'hash',
+    candidate_script: 'async def run(page): pass',
+    blockers: [{ code: 'REPAIR_SCOPE_CHANGED' }],
+    adoption: { kind: 'manual_review', can_apply: true, requires_acknowledge_review: true }
+  }
+  assert.equal(canVerifyCandidate(manualRepair), false)
+  assert.equal(canApplyRepairCandidate(manualRepair), true)
+  assert.deepEqual(repairAdoptionState(manualRepair), manualRepair.adoption)
+  assert.equal(canApplyRepairCandidate({ ...manualRepair, adoption: { kind: 'unavailable', can_apply: false, requires_acknowledge_review: false } }), false)
 })
 
 test('opening a suite repair row preserves existing expanded rows and makes the chosen row visible', () => {
@@ -67,6 +81,12 @@ test('assistant attempt statuses remain Chinese while the full candidate stays s
   assert.match(source, /候选修改差异/)
   assert.match(source, /完整候选代码/)
   assert.match(source, /candidateView === 'full' \? assistant\.candidate_script/)
+  assert.match(source, /人工确认并保存/)
+  assert.match(source, /保存不会运行/)
+  assert.match(source, /acknowledge_review: frozen\.acknowledgeReview/)
+  assert.match(source, /已人工确认保存/)
+  assert.match(source, /const frozen = \{[\s\S]*candidateHash: assistant\.value\.candidate_hash/)
+  assert.match(source, /候选已变化，请刷新后重新确认。/)
 })
 
 test('assistant panel supports the first edit message and keeps repair out of the edit-only message path', async () => {

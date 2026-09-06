@@ -53,14 +53,14 @@
       </section>
 
       <section v-if="assistant.candidate_script || assistant.candidate_diff" class="candidate-section">
-        <div class="candidate-heading"><h5>候选修改差异</h5><el-tag :type="assistant.candidate_hash ? 'warning' : 'info'" effect="plain">{{ assistant.candidate_hash ? '候选待确认' : '候选生成中' }}</el-tag></div>
+        <div class="candidate-heading"><h5>候选修改差异</h5><el-tag :type="candidateTagType" effect="plain">{{ candidateTagLabel }}</el-tag></div>
         <el-radio-group v-model="candidateView" size="small" aria-label="候选内容视图"><el-radio-button label="diff">修改差异</el-radio-button><el-radio-button label="full">完整候选代码</el-radio-button></el-radio-group>
         <pre>{{ candidateView === 'full' ? assistant.candidate_script : (assistant.candidate_diff || assistant.candidate_script) }}</pre>
         <div class="candidate-actions">
           <el-button v-if="isEdit" type="primary" :disabled="!canContinue || acting" @click="applyToEditor">采用到编辑器</el-button>
           <el-button v-if="isEdit" :disabled="!canContinue || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
           <el-button v-if="isEdit" type="warning" plain :disabled="!canVerify || acting" @click="requestVerify">调试验证</el-button>
-          <el-button v-if="isRepair" type="primary" :disabled="!canApplyRepair || acting" :loading="acting" @click="requestApply">采用并保存</el-button>
+          <el-button v-if="isRepair" :type="requiresManualReview ? 'warning' : 'primary'" :disabled="!canApplyRepair || acting" :loading="acting" @click="requestApply">{{ requiresManualReview ? '人工确认并保存' : '采用并保存' }}</el-button>
         </div>
       </section>
 
@@ -94,7 +94,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from 'vue
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getWebUITestCaseExecution } from '@/api/webTesting'
 import { useWebUIScriptAssistant } from '@/composables/useWebUIScriptAssistant'
-import { assistantAttemptStatusLabel, assistantModelLabel, assistantPanelContext, canApplyRepairCandidate, canContinueCandidate, canVerifyCandidate, verificationLabel, verificationTagType } from '@/composables/webUIScriptAssistantPresentation'
+import { assistantAttemptStatusLabel, assistantModelLabel, assistantPanelContext, canApplyRepairCandidate, canContinueCandidate, canVerifyCandidate, repairAdoptionState, verificationLabel, verificationTagType } from '@/composables/webUIScriptAssistantPresentation'
 
 const WebUITestCaseExecutionDetail = defineAsyncComponent(() => import('@/components/WebUITestCaseExecutionDetail.vue'))
 const props = defineProps({
@@ -127,6 +127,18 @@ const hasCandidate = computed(() => Boolean(assistant.value?.candidate_hash && a
 const canContinue = computed(() => canContinueCandidate(assistant.value))
 const canVerify = computed(() => canVerifyCandidate(assistant.value))
 const canApplyRepair = computed(() => canApplyRepairCandidate(assistant.value))
+const adoption = computed(() => repairAdoptionState(assistant.value))
+const requiresManualReview = computed(() => adoption.value.requires_acknowledge_review)
+const wasManuallyAdopted = computed(() => assistant.value?.quality_report?.manual_adoption?.reason === 'REPAIR_SCOPE_CHANGED')
+const candidateTagLabel = computed(() => {
+  if (assistant.value?.status === 'applied') return wasManuallyAdopted.value ? '已人工确认保存' : '已保存'
+  if (requiresManualReview.value) return '需人工确认保存'
+  return assistant.value?.candidate_hash ? '候选已生成' : '候选生成中'
+})
+const candidateTagType = computed(() => {
+  if (assistant.value?.status === 'applied') return 'success'
+  return requiresManualReview.value ? 'warning' : 'info'
+})
 const canSend = computed(() => Boolean(messageText.value.trim() && assistant.value && !active.value && !acting.value))
 const canStartEdit = computed(() => Boolean(messageText.value.trim() && modelConfigId.value && props.editContext?.testCaseId && !acting.value))
 
@@ -210,11 +222,27 @@ const requestVerify = async () => {
   } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '启动调试验证失败') }
 }
 const requestApply = async () => {
-  if (!canApplyRepair.value) return ElMessage.warning('候选正在处理、已采用或存在安全限制，不能采用并保存。')
+  if (!canApplyRepair.value) return ElMessage.warning('候选正在处理、已采用或不符合保存条件，不能采用并保存。')
+  const frozen = {
+    id: assistant.value.id,
+    revision: assistant.value.revision,
+    candidateHash: assistant.value.candidate_hash,
+    sourceEditVersion: assistant.value.source_edit_version,
+    acknowledgeReview: requiresManualReview.value
+  }
   try {
-    await ElMessageBox.confirm('确认采用候选并保存到测试用例？历史失败执行不会被改写。', '确认采用并保存', { type: 'warning', confirmButtonText: '采用并保存', cancelButtonText: '取消' })
-    await apply({ expected_revision: assistant.value.revision, candidate_hash: assistant.value.candidate_hash, expected_edit_version: assistant.value.source_edit_version })
-    ElMessage.success('候选已采用并保存。')
+    if (frozen.acknowledgeReview) {
+      await ElMessageBox.confirm('该候选未通过自动修复范围检查，尚未实际验证，请检查完整代码，保存不会运行。确认后将保存到测试用例；历史失败执行不会被改写。', '人工确认并保存', { type: 'warning', confirmButtonText: '人工确认并保存', cancelButtonText: '取消' })
+    } else {
+      await ElMessageBox.confirm('确认采用候选并保存到测试用例？历史失败执行不会被改写。', '确认采用并保存', { type: 'warning', confirmButtonText: '采用并保存', cancelButtonText: '取消' })
+    }
+    const current = assistant.value
+    if (!current || String(current.id) !== String(frozen.id) || current.revision !== frozen.revision || current.candidate_hash !== frozen.candidateHash || current.source_edit_version !== frozen.sourceEditVersion || requiresManualReview.value !== frozen.acknowledgeReview || !canApplyRepair.value) {
+      ElMessage.warning('候选已变化，请刷新后重新确认。')
+      return
+    }
+    await apply({ expected_revision: frozen.revision, candidate_hash: frozen.candidateHash, expected_edit_version: frozen.sourceEditVersion, acknowledge_review: frozen.acknowledgeReview })
+    ElMessage.success(frozen.acknowledgeReview ? '已人工确认并保存；候选未实际验证。' : '候选已采用并保存。')
   } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '采用候选失败') }
 }
 const requestCancel = async () => {

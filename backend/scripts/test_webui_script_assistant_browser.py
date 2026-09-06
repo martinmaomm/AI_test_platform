@@ -33,6 +33,10 @@ async def run(page):
     print(time.time_ns())
 """
 CANDIDATE = SCRIPT.replace("import os", "import os\nimport time")
+REVIEW_CANDIDATE = CANDIDATE.replace(
+    "    print(time.time_ns())",
+    '    await page.locator("#status").click()\n    print(time.time_ns())',
+)
 UNSAVED = "# 当前编辑器尚未保存的备注\n" + SCRIPT
 RUNS = []
 MODEL_CALLS = []
@@ -119,7 +123,18 @@ def add_fixtures(fixture):
     from ai_core.models import LLMConfiguration, ModelType
     from projects.models import Project
     from web_testing.execution_snapshots import capture_suite_snapshot
-    from web_testing.models import WebUITestCase, WebUITestExecution, WebUITestSuite
+    from web_testing.models import (
+        WebUIScriptAssistant,
+        WebUITestCase,
+        WebUITestCaseExecutionDetail,
+        WebUITestExecution,
+        WebUITestSuite,
+    )
+    from web_testing.script_assistant import (
+        _validate_candidate,
+        candidate_hash,
+        model_info,
+    )
     from web_testing.views import ExecuteWebUITestCaseView
 
     user = get_user_model().objects.get(pk=fixture["user_id"])
@@ -134,7 +149,12 @@ def add_fixtures(fixture):
         created_by=user,
     )
     cases = []
-    for name in ("对话编辑验收", "单用例修复验收", "套件子项修复验收"):
+    for name in (
+        "对话编辑验收",
+        "单用例修复验收",
+        "套件子项修复验收",
+        "人工确认修复验收",
+    ):
         case = WebUITestCase.objects.create(
             title=name,
             description="验证页面状态并输出中文日志",
@@ -196,6 +216,55 @@ def add_fixtures(fixture):
         execution.error_message,
     )
     suite_case.save()
+    review_execution = WebUITestExecution.objects.create(
+        name=cases[3].title,
+        project=project,
+        executor=user,
+        exec_type="case",
+        status="failed",
+        error_message=execution.error_message,
+    )
+    WebUITestCaseExecutionDetail.objects.create(
+        execution=review_execution,
+        test_case=cases[3],
+        status="failed",
+        error_message=execution.error_message,
+        log=execution.error_message,
+        source_script=cases[3].test_script_content,
+        source_script_version=cases[3].script_version,
+        source_edit_version=cases[3].edit_version,
+        source_variables=cases[3].variables,
+        execution_options={"timeout": 60, "headed": False},
+    )
+    # Reproduce an already-generated candidate: its actual scope checker rejects
+    # the added action, but syntax and original assertions remain unchanged.
+    review_session = WebUIScriptAssistant.objects.create(
+        mode="repair",
+        user=user,
+        project=project,
+        test_case=cases[3],
+        execution=review_execution,
+        model_config_id=model.id,
+        model_info=model_info(model),
+        source_script=cases[3].test_script_content,
+        source_script_version=cases[3].script_version,
+        source_edit_version=cases[3].edit_version,
+        source_variables=cases[3].variables,
+        source_options={"timeout": 60, "headed": False},
+        candidate_script=REVIEW_CANDIDATE,
+        candidate_hash=candidate_hash(REVIEW_CANDIDATE),
+        status="candidate_ready",
+        verification={
+            "status": "unverified",
+            "candidate_hash": candidate_hash(REVIEW_CANDIDATE),
+        },
+        message="候选脚本已生成",
+    )
+    review_session.blockers = _validate_candidate(review_session, REVIEW_CANDIDATE)
+    assert {item["code"] for item in review_session.blockers} == {
+        "REPAIR_SCOPE_CHANGED"
+    }
+    review_session.save(update_fields=["blockers"])
     fixture.update(
         project={"id": project.pk, "name": project.name, "project_type": "web"},
         model_id=model.pk,
@@ -205,6 +274,9 @@ def add_fixtures(fixture):
         suite_execution_id=suite_execution.pk,
         suite_case_id=suite_case.pk,
         suite_test_case_id=cases[2].pk,
+        review_execution_id=review_execution.pk,
+        review_case_id=cases[3].pk,
+        review_session_id=str(review_session.id),
     )
 
 
@@ -420,6 +492,73 @@ def verify_ui(origin, fixture, output):
                 full_page=True,
                 animations="disabled",
             )
+            page.goto(origin + "/web-testing/test-executions")
+            page.get_by_role("row").filter(has_text="人工确认修复验收").get_by_role(
+                "button", name="查看详情", exact=True
+            ).click()
+            calls_before_review = len(MODEL_CALLS)
+            page.get_by_role("button", name="AI 修复", exact=True).click()
+            panel = page.get_by_label("AI 脚本助手", exact=True)
+            manual_save = panel.get_by_role("button", name="人工确认并保存", exact=True)
+            expect(manual_save).to_be_enabled(timeout=10000)
+            panel.get_by_text("完整候选代码", exact=True).click()
+            expect(panel.locator(".candidate-section pre")).to_contain_text(
+                'await page.locator("#status").click()'
+            )
+            review_path = f'/script-assistants/{fixture["review_session_id"]}/apply/'
+            manual_save.click()
+            confirmation = page.locator(".el-message-box")
+            expect(confirmation).to_contain_text("验证")
+            confirmation.get_by_role("button", name="取消", exact=True).click()
+            assert not [
+                r
+                for r in requests
+                if r.method == "POST" and r.url.endswith(review_path)
+            ]
+            manual_save.click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith(review_path)
+            ) as manually_adopted:
+                confirmation.get_by_role(
+                    "button", name="人工确认并保存", exact=True
+                ).click()
+            assert manually_adopted.value.status == 200, manually_adopted.value.text()
+            assert (
+                manually_adopted.value.request.post_data_json["acknowledge_review"]
+                is True
+            )
+            body = manually_adopted.value.json()["data"]
+            assert body["status"] == "applied", body
+            expect(confirmation).not_to_be_visible()
+            assert body["verification"]["status"] == "unverified", body
+            assert {item["code"] for item in body["blockers"]} == {
+                "REPAIR_SCOPE_CHANGED"
+            }
+            assert (
+                body["quality_report"]["manual_adoption"]["acknowledged_by"]
+                == fixture["user_id"]
+            )
+            assert (
+                body["quality_report"]["manual_adoption"]["candidate_hash"]
+                == body["candidate_hash"]
+            )
+            assert body["adoption"]["can_apply"] is False
+            expect(panel.get_by_text("尚未实际验证", exact=True)).to_be_visible()
+            assert len(RUNS) == 3, "Manual adoption must not execute a candidate"
+            assert (
+                len(MODEL_CALLS) == calls_before_review
+            ), "Restoring and adopting must not regenerate"
+            page.screenshot(
+                path=str(output / "repair-manually-adopted.png"),
+                full_page=True,
+                animations="disabled",
+            )
+            panel.get_by_role("button", name="最近会话", exact=True).click()
+            expect(
+                panel.get_by_role("button", name="采用并保存", exact=True)
+            ).to_be_disabled()
+            expect(panel.get_by_text("尚未实际验证", exact=True)).to_be_visible()
             page.goto(origin + "/web-testing/test-cases")
             page.get_by_role("row").filter(has_text="对话编辑验收").get_by_role(
                 "button", name="编辑", exact=True
@@ -500,7 +639,11 @@ def main():
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
-        from web_testing.models import WebUITestCase, WebUITestExecution
+        from web_testing.models import (
+            WebUIScriptAssistant,
+            WebUITestCase,
+            WebUITestExecution,
+        )
 
         assert (
             "import time"
@@ -526,6 +669,21 @@ def main():
                 pk=fixture["suite_test_case_id"]
             ).test_script_content
         )
+        assert (
+            WebUITestCase.objects.get(pk=fixture["review_case_id"]).test_script_content
+            == REVIEW_CANDIDATE.strip()
+        )
+        assert (
+            WebUITestExecution.objects.get(pk=fixture["review_execution_id"]).status
+            == "failed"
+        )
+        review = WebUIScriptAssistant.objects.get(pk=fixture["review_session_id"])
+        assert (
+            review.status == "applied" and review.verification["status"] == "unverified"
+        )
+        assert (
+            not review.attempts
+        ), "Manual adoption must not fabricate an execution record"
     print("PASS: isolated saved-script assistant browser integration")
 
 

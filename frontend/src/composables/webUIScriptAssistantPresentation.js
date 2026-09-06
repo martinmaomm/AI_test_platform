@@ -52,7 +52,23 @@ export const canVerifyCandidate = assistant => (
   && !hasAssistantBlockers(assistant)
 )
 
-export const canApplyRepairCandidate = assistant => canVerifyCandidate(assistant) && assistant?.mode === 'repair'
+export const repairAdoptionState = assistant => {
+  const state = assistant?.adoption
+  if (!state || typeof state !== 'object') return { kind: 'unavailable', can_apply: false, requires_acknowledge_review: false }
+  return {
+    kind: state.kind || 'unavailable',
+    can_apply: state.can_apply === true,
+    requires_acknowledge_review: state.requires_acknowledge_review === true
+  }
+}
+
+// Manual saving is deliberately separate from automatic verification.  The
+// server-computed adoption state remains the authority for both paths.
+export const canApplyRepairCandidate = assistant => (
+  assistant?.mode === 'repair'
+  && ['candidate_ready', 'candidate_passed'].includes(assistant?.status)
+  && repairAdoptionState(assistant).can_apply
+)
 
 export const expandedAssistantRowIds = (expandedIds, rowId, open) => {
   const id = String(rowId)

@@ -1165,21 +1165,45 @@ def run_script_assistant_operation(session_id, revision, task_id):
 
 
 def apply_repair(
-    session, *, expected_edit_version, expected_hash, expected_revision=None
+    session,
+    *,
+    expected_edit_version,
+    expected_hash,
+    expected_revision=None,
+    acknowledge_review=False,
 ):
+    """Persist a repair candidate after automatic or explicit manual review.
+
+    Scope changes remain blocked from every automatic repair and verification
+    path.  This function only permits a user to save that narrow, already
+    generated candidate after a separate explicit acknowledgement.
+    """
     if session.mode != "repair":
         raise ScriptAssistantConflict("编辑会话只能采用到编辑器，不能直接写入用例。")
+    if not isinstance(acknowledge_review, bool):
+        raise ScriptAssistantConflict("acknowledge_review 必须是布尔值。")
     with transaction.atomic():
         session = WebUIScriptAssistant.objects.select_for_update().get(pk=session.pk)
         if expected_revision is not None and session.revision != expected_revision:
             raise ScriptAssistantConflict("会话已变化，请刷新后重试。")
         if (
-            session.status not in {"candidate_ready", "candidate_passed"}
-            or session.blockers
+            expected_hash != session.candidate_hash
+            or not session.candidate_script
+            or candidate_hash(session.candidate_script) != session.candidate_hash
         ):
-            raise ScriptAssistantConflict("当前会话不能采用候选。")
-        if expected_hash != session.candidate_hash or not session.candidate_script:
             raise ScriptAssistantConflict("候选脚本已变化，请刷新后重试。")
+        try:
+            normalize_for_storage(session.candidate_script)
+        except ScriptContractError as exc:
+            raise ScriptAssistantConflict(f"候选脚本不符合保存契约：{exc}") from exc
+
+        adoption = repair_adoption_state(session)
+        if not adoption["can_apply"]:
+            raise ScriptAssistantConflict("当前会话不能采用候选。")
+        if adoption["requires_acknowledge_review"] and not acknowledge_review:
+            raise ScriptAssistantConflict(
+                "该候选未通过自动修复范围检查，必须人工确认完整代码后才能保存。"
+            )
         if (
             session.status == "candidate_passed"
             and (session.verification or {}).get("candidate_hash")
@@ -1197,6 +1221,56 @@ def apply_repair(
                 "用例已被其他编辑修改，请保留当前编辑并刷新后处理。"
             )
         store_script_content(case, session.candidate_script, source="manual")
+        if adoption["requires_acknowledge_review"]:
+            quality_report = dict(session.quality_report or {})
+            quality_report["manual_adoption"] = {
+                "acknowledged_by": session.user_id,
+                "acknowledged_at": timezone.now().isoformat(),
+                "candidate_hash": session.candidate_hash,
+                "reason": "REPAIR_SCOPE_CHANGED",
+            }
+            session.quality_report = quality_report
         session.status = "applied"
-        session.save(update_fields=["status", "updated_at"])
+        session.save(update_fields=["status", "quality_report", "updated_at"])
         return case
+
+
+def repair_adoption_state(session) -> dict[str, Any]:
+    """Return the server-authoritative save path for a repair candidate."""
+    valid_candidate = bool(session.candidate_script and session.candidate_hash)
+    if valid_candidate:
+        valid_candidate = (
+            candidate_hash(session.candidate_script) == session.candidate_hash
+        )
+    if valid_candidate:
+        try:
+            normalize_for_storage(session.candidate_script)
+        except ScriptContractError:
+            valid_candidate = False
+
+    blockers = list(session.blockers or [])
+    blocker_codes = [
+        item.get("code") if isinstance(item, dict) else None for item in blockers
+    ]
+    automatic = (
+        session.mode == "repair"
+        and session.status in {"candidate_ready", "candidate_passed"}
+        and valid_candidate
+        and not blockers
+    )
+    manual_review = (
+        session.mode == "repair"
+        and session.status == "candidate_ready"
+        and valid_candidate
+        and bool(blocker_codes)
+        and all(code == "REPAIR_SCOPE_CHANGED" for code in blocker_codes)
+    )
+    return {
+        "kind": (
+            "automatic"
+            if automatic
+            else ("manual_review" if manual_review else "unavailable")
+        ),
+        "can_apply": automatic or manual_review,
+        "requires_acknowledge_review": manual_review,
+    }

@@ -718,6 +718,193 @@ class ScriptAssistantApiTests(TestCase):
         self.assertEqual(response.data["data"]["id"], str(session.id))
         self.assertEqual(apply.call_args.kwargs["expected_revision"], session.revision)
 
+    def _repair_candidate_session(self, *, blockers, candidate=None):
+        candidate = candidate or SCRIPT.replace(
+            '    await expect(page).to_have_title("Home")',
+            '    await page.locator("#save").click()\n'
+            '    await expect(page).to_have_title("Home")',
+        )
+        execution = self._failed_case_execution()
+        return WebUIScriptAssistant.objects.create(
+            project=self.project,
+            user=self.user,
+            test_case=self.case,
+            execution=execution,
+            mode="repair",
+            model_config_id=self.model.id,
+            status="candidate_ready",
+            revision=7,
+            source_script=SCRIPT,
+            source_script_version=self.case.script_version,
+            source_edit_version=case_edit_version(self.case),
+            source_variables=self.case.variables,
+            source_options=normalize_webui_execution_options({"headed": False}),
+            candidate_script=candidate,
+            candidate_hash=candidate_hash(candidate),
+            blockers=blockers,
+            verification={"status": "unverified"},
+        )
+
+    def test_scope_only_candidate_requires_acknowledgement_then_saves_without_running(
+        self,
+    ):
+        session = self._repair_candidate_session(
+            blockers=[{"code": "REPAIR_SCOPE_CHANGED", "message": "新增点击"}],
+        )
+        original_case_script = self.case.test_script_content
+        execution_count = WebUITestExecution.objects.count()
+        rejected = self._post(
+            ScriptAssistantApplyView,
+            {
+                "expected_revision": session.revision,
+                "expected_edit_version": case_edit_version(self.case),
+                "candidate_hash": session.candidate_hash,
+            },
+            session_id=session.id,
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        detail = self._get(ScriptAssistantDetailView, session_id=session.id)
+        self.assertEqual(detail.data["data"]["adoption"]["kind"], "manual_review")
+        self.case.refresh_from_db()
+        session.refresh_from_db()
+        self.assertEqual(self.case.test_script_content, original_case_script)
+        self.assertEqual(session.status, "candidate_ready")
+        self.assertEqual(session.verification, {"status": "unverified"})
+        self.assertEqual(WebUITestExecution.objects.count(), execution_count)
+
+        accepted = self._post(
+            ScriptAssistantApplyView,
+            {
+                "expected_revision": session.revision,
+                "expected_edit_version": case_edit_version(self.case),
+                "candidate_hash": session.candidate_hash,
+                "acknowledge_review": True,
+            },
+            session_id=session.id,
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.data)
+        self.assertEqual(accepted.data["data"]["adoption"]["kind"], "unavailable")
+        self.case.refresh_from_db()
+        session.refresh_from_db()
+        self.assertEqual(
+            self.case.test_script_content, session.candidate_script.strip()
+        )
+        self.assertEqual(session.status, "applied")
+        self.assertEqual(session.blockers[0]["code"], "REPAIR_SCOPE_CHANGED")
+        self.assertEqual(session.verification, {"status": "unverified"})
+        self.assertEqual(
+            session.quality_report["manual_adoption"]["candidate_hash"],
+            session.candidate_hash,
+        )
+        self.assertEqual(
+            session.quality_report["manual_adoption"]["acknowledged_by"], self.user.id
+        )
+        self.assertTrue(session.quality_report["manual_adoption"]["acknowledged_at"])
+        self.assertEqual(WebUITestExecution.objects.count(), execution_count)
+
+    def test_manual_apply_rejects_non_scope_blockers_invalid_contract_and_conflicts(
+        self,
+    ):
+        cases = [
+            ([{"code": "UNKNOWN", "message": "unknown"}], SCRIPT),
+            ([{"code": "ASSERTION_REMOVED", "message": "assertion"}], SCRIPT),
+            ([{"code": "RUNTIME_VALUE_LEAK", "message": "leak"}], SCRIPT),
+            (
+                [{"code": "REPAIR_SCOPE_CHANGED", "message": "scope"}],
+                "async def run(page):\n    invalid syntax",
+            ),
+        ]
+        for blockers, candidate in cases:
+            session = self._repair_candidate_session(
+                blockers=blockers,
+                candidate=candidate,
+            )
+            response = self._post(
+                ScriptAssistantApplyView,
+                {
+                    "expected_revision": session.revision,
+                    "expected_edit_version": case_edit_version(self.case),
+                    "candidate_hash": session.candidate_hash,
+                    "acknowledge_review": True,
+                },
+                session_id=session.id,
+            )
+            self.assertEqual(response.status_code, 409, response.data)
+            session.refresh_from_db()
+            self.assertEqual(session.status, "candidate_ready")
+
+        session = self._repair_candidate_session(
+            blockers=[{"code": "REPAIR_SCOPE_CHANGED", "message": "scope"}],
+        )
+        wrong_hash = self._post(
+            ScriptAssistantApplyView,
+            {
+                "expected_revision": session.revision,
+                "expected_edit_version": case_edit_version(self.case),
+                "candidate_hash": "wrong-hash",
+                "acknowledge_review": True,
+            },
+            session_id=session.id,
+        )
+        self.assertEqual(wrong_hash.status_code, 409, wrong_hash.data)
+        stale_revision = self._post(
+            ScriptAssistantApplyView,
+            {
+                "expected_revision": session.revision + 1,
+                "expected_edit_version": case_edit_version(self.case),
+                "candidate_hash": session.candidate_hash,
+                "acknowledge_review": True,
+            },
+            session_id=session.id,
+        )
+        self.assertEqual(stale_revision.status_code, 409, stale_revision.data)
+        invalid_acknowledgement = self._post(
+            ScriptAssistantApplyView,
+            {
+                "expected_revision": session.revision,
+                "expected_edit_version": case_edit_version(self.case),
+                "candidate_hash": session.candidate_hash,
+                "acknowledge_review": "true",
+            },
+            session_id=session.id,
+        )
+        self.assertEqual(
+            invalid_acknowledgement.status_code, 400, invalid_acknowledgement.data
+        )
+
+    def test_manual_apply_rejects_changed_candidate_and_changed_source_case(self):
+        session = self._repair_candidate_session(
+            blockers=[{"code": "REPAIR_SCOPE_CHANGED", "message": "scope"}],
+        )
+        original_candidate = session.candidate_script
+        original_case_script = self.case.test_script_content
+        payload = {
+            "expected_revision": session.revision,
+            "expected_edit_version": case_edit_version(self.case),
+            "candidate_hash": session.candidate_hash,
+            "acknowledge_review": True,
+        }
+        session.candidate_script += "\n# changed after candidate hash was recorded\n"
+        session.save(update_fields=["candidate_script"])
+        corrupt_candidate = self._post(
+            ScriptAssistantApplyView, payload, session_id=session.id
+        )
+        self.assertEqual(corrupt_candidate.status_code, 409, corrupt_candidate.data)
+
+        session.candidate_script = original_candidate
+        session.save(update_fields=["candidate_script"])
+        self.case.description = "Edited after the repair source was frozen"
+        self.case.save(update_fields=["description"])
+        payload["expected_edit_version"] = case_edit_version(self.case)
+        changed_source = self._post(
+            ScriptAssistantApplyView, payload, session_id=session.id
+        )
+        self.assertEqual(changed_source.status_code, 409, changed_source.data)
+        self.case.refresh_from_db()
+        session.refresh_from_db()
+        self.assertEqual(self.case.test_script_content, original_case_script)
+        self.assertEqual(session.status, "candidate_ready")
+
     def test_suite_snapshot_freezes_normalized_options_version_and_variables(self):
         suite = WebUITestSuite.objects.create(
             name="suite",

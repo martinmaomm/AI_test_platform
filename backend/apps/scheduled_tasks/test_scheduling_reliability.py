@@ -16,6 +16,7 @@ from projects.models import Environment, Project
 
 from .models import ScheduledTask, TaskExecutionLog
 from .scheduling import (
+    _notify_finished_run,
     dispatch_scheduled_suite,
     finish_scheduled_suite,
     reserve_scheduled_run,
@@ -232,7 +233,7 @@ class ScheduledRunReliabilityTests(TestCase):
 
     def test_final_suite_notifies_once_and_closes_parent(self):
         log, _ = self.reserve()
-        with patch('notifications.services.trigger_notification') as notify, patch(
+        with patch('notifications.services.trigger_notification', return_value=True) as notify, patch(
             'scheduled_tasks.scheduling._enqueue_suite_dispatch',
         ), self.captureOnCommitCallbacks(execute=True):
             for link in log.linked_executions:
@@ -245,3 +246,17 @@ class ScheduledRunReliabilityTests(TestCase):
         self.assertEqual(log.passed_cases, 2)
         self.assertIsNotNone(log.end_time)
         notify.assert_called_once()
+
+    def test_notification_marker_requires_explicit_true_delivery_result(self):
+        log, _ = self.reserve()
+        TaskExecutionLog.objects.filter(pk=log.pk).update(status='failed')
+
+        with patch('notifications.services.trigger_notification', return_value=1):
+            _notify_finished_run(log.id)
+        log.refresh_from_db()
+        self.assertIsNone(log.notification_sent_at)
+
+        with patch('notifications.services.trigger_notification', return_value=True):
+            _notify_finished_run(log.id)
+        log.refresh_from_db()
+        self.assertIsNotNone(log.notification_sent_at)

@@ -399,12 +399,17 @@ def _notify_finished_run(scheduled_log_id: int) -> None:
             return
         try:
             from notifications.services import trigger_notification
-            trigger_notification(scheduled_task_id=execution_log.task_id, execution_log=execution_log, result=None)
+            sent = trigger_notification(
+                scheduled_task_id=execution_log.task_id,
+                execution_log=execution_log,
+                result=None,
+            )
         except Exception:
             logger.error('发送定时任务完成通知失败: log=%s', scheduled_log_id, exc_info=True)
             return
-        execution_log.notification_sent_at = timezone.now()
-        execution_log.save(update_fields=['notification_sent_at'])
+        if sent is True:
+            execution_log.notification_sent_at = timezone.now()
+            execution_log.save(update_fields=['notification_sent_at'])
 
 
 def _failure_result(error: str) -> str:

@@ -60,7 +60,7 @@
           </el-table-column>
           <el-table-column label="操作" width="220" fixed="right">
             <template #default="scope">
-              <el-button type="success" size="small" link :loading="testingId === scope.row.id" @click="testChannelById(scope.row)">
+              <el-button type="success" size="small" link :loading="testingId === scope.row.id" :disabled="testingId !== null || scope.row.is_active === false" @click="testChannelById(scope.row)">
                 测试
               </el-button>
               <el-button type="primary" size="small" link @click="openEditDialog(scope.row)">
@@ -100,6 +100,7 @@
               :key="item.id"
               :label="item.channel_name"
               :value="item.id"
+              :disabled="item.is_active === false || !isSupportedNotificationChannel(item.channel_code)"
             />
           </el-select>
         </el-form-item>
@@ -143,6 +144,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Bell, Plus } from '@element-plus/icons-vue'
 import * as notificationsApi from '@/api/notifications'
 import { maskEmailList } from '@/utils/mask'
+import { isSupportedNotificationChannel, notificationErrorMessage } from '@/utils/notificationFeedback'
 import { useProjectStore } from '@/stores/project'
 
 const route = useRoute()
@@ -156,6 +158,9 @@ const editingReceiver = ref(null)
 const saving = ref(false)
 const testingId = ref(null)
 const formRef = ref(null)
+const currentProjectId = computed(() => projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id)
+const formProjectId = ref(null)
+let receiverRequestVersion = 0
 
 const form = ref({
   name: '',
@@ -247,17 +252,15 @@ function formatDateTime(val) {
 }
 
 async function testChannelById(row) {
-  if (!row?.id) return
-  const projectId = projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id
+  if (!row?.id || testingId.value !== null) return
+  const projectId = currentProjectId.value
   if (!projectId) return
   testingId.value = row.id
   try {
     await notificationsApi.testReceiverById(projectId, row.id)
-    ElMessage.success('连接成功')
+    if (String(currentProjectId.value) === String(projectId)) ElMessage.success('测试消息已发送')
   } catch (e) {
-    const d = e?.response?.data
-    const msg = d?.detail ?? d?.message ?? d?.error?.message ?? e?.message ?? '连接失败'
-    ElMessage.error(msg)
+    if (String(currentProjectId.value) === String(projectId)) ElMessage.error(notificationErrorMessage(e, '连接失败'))
   } finally {
     testingId.value = null
   }
@@ -265,7 +268,7 @@ async function testChannelById(row) {
 
 async function loadChannels() {
   try {
-    const res = await notificationsApi.getNotificationChannels({ is_active: true })
+    const res = await notificationsApi.getNotificationChannels()
     const data = res?.data ?? res
     channelList.value = Array.isArray(data) ? data : (data?.results ?? data?.items ?? [])
   } catch (e) {
@@ -275,33 +278,34 @@ async function loadChannels() {
 }
 
 async function loadReceivers() {
-  const projectId =
-    projectStore.currentProjectId ??
-    (route.params.project_id ? Number(route.params.project_id) : null) ??
-    (route.query.project_id ? Number(route.query.project_id) : null)
+  const projectId = currentProjectId.value
+  const version = ++receiverRequestVersion
   if (!projectId) {
     receivers.value = []
+    loading.value = false
     return
   }
   loading.value = true
   try {
     const res = await notificationsApi.getNotificationReceivers(projectId)
+    if (version !== receiverRequestVersion) return
     const data = res?.data ?? res
     receivers.value = Array.isArray(data) ? data : (data?.results ?? data?.items ?? [])
   } catch (e) {
-    console.error('加载接收对象列表失败:', e)
-    ElMessage.error(e?.response?.data?.detail || e?.message || '加载接收对象列表失败')
+    if (version !== receiverRequestVersion) return
+    ElMessage.error(notificationErrorMessage(e, '加载接收对象列表失败'))
     receivers.value = []
   } finally {
-    loading.value = false
+    if (version === receiverRequestVersion) loading.value = false
   }
 }
 
 function openCreateDialog() {
+  formProjectId.value = currentProjectId.value
   editingReceiver.value = null
   form.value = {
     name: '',
-    channel: channelList.value[0]?.id ?? null,
+    channel: channelList.value.find(item => item.is_active !== false && isSupportedNotificationChannel(item.channel_code))?.id ?? null,
     webhook_url: '',
     target_address: ''
   }
@@ -309,6 +313,7 @@ function openCreateDialog() {
 }
 
 function openEditDialog(row) {
+  formProjectId.value = currentProjectId.value
   const channelId = row.channel_id ?? (typeof row.channel === 'object' && row.channel ? row.channel.id : row.channel) ?? null
   editingReceiver.value = row
   form.value = {
@@ -349,14 +354,15 @@ function sanitizeUpdatePayload(payload, isEdit) {
 }
 
 async function submitForm() {
+  if (saving.value) return
+  try { await formRef.value?.validate() } catch { return }
+  const projectId = formProjectId.value
+  if (!projectId || String(projectId) !== String(currentProjectId.value)) {
+    ElMessage.warning('项目已变化，请重新打开配置')
+    return
+  }
+  saving.value = true
   try {
-    await formRef.value?.validate()
-    saving.value = true
-    const projectId = projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id
-    if (!projectId) {
-      ElMessage.warning('请先选择项目')
-      return
-    }
     const isEmail = selectedChannel.value?.channel_code === 'email'
     let payload = { name: form.value.name, channel: form.value.channel, project: projectId }
     if (editingReceiver.value) {
@@ -380,15 +386,14 @@ async function submitForm() {
     showDialog.value = false
     loadReceivers()
   } catch (e) {
-    if (e?.message !== undefined) return
-    console.error(e)
-    ElMessage.error(editingReceiver.value ? '更新失败' : '创建失败')
+    ElMessage.error(notificationErrorMessage(e, editingReceiver.value ? '更新失败' : '创建失败'))
   } finally {
     saving.value = false
   }
 }
 
 function confirmDelete(row) {
+  const projectId = currentProjectId.value
   ElMessageBox.confirm(
     `确定要删除接收对象「${row.name}」吗？删除后不可恢复。`,
     '删除确认',
@@ -396,21 +401,24 @@ function confirmDelete(row) {
   )
     .then(async () => {
       try {
-        const projectId = projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id
+        if (String(projectId) !== String(currentProjectId.value)) return
         await notificationsApi.deleteNotificationReceiver(projectId, row.id)
         ElMessage.success('已删除')
         loadReceivers()
       } catch (e) {
-        console.error(e)
-        ElMessage.error('删除失败')
+        ElMessage.error(notificationErrorMessage(e, '删除失败'))
       }
     })
     .catch(() => {})
 }
 
 watch(
-  () => projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id,
-  () => loadReceivers(),
+  currentProjectId,
+  () => {
+    showDialog.value = false
+    receivers.value = []
+    loadReceivers()
+  },
   { immediate: true }
 )
 onMounted(async () => {

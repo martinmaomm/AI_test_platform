@@ -9,7 +9,7 @@
           </div>
           <div class="header-text">
             <h2>消息通道配置</h2>
-            <p>配置各通道类型的全局默认参数；具体接收对象请在项目内「通知接收管理」中创建</p>
+            <p>配置已接入的钉钉、企业微信和邮件通道；具体接收对象请在项目内「通知接收管理」中创建</p>
           </div>
         </div>
         <div class="header-actions">
@@ -74,19 +74,15 @@
         <el-form-item label="渠道名称" prop="channel_name">
           <el-input
             v-model="form.channel_name"
-            placeholder="如：飞书、Slack"
+            placeholder="如：钉钉、企业微信、邮件"
             maxlength="64"
             show-word-limit
           />
         </el-form-item>
         <el-form-item label="渠道标识" prop="channel_code">
-          <el-input
-            v-model="form.channel_code"
-            placeholder="英文标识，如 feishu、slack"
-            maxlength="32"
-            show-word-limit
-            :disabled="!!editingChannel"
-          />
+          <el-select v-model="form.channel_code" placeholder="选择已支持的通道" :disabled="!!editingChannel">
+            <el-option v-for="item in NOTIFICATION_CHANNELS" :key="item.code" :label="item.name" :value="item.code" />
+          </el-select>
           <div v-if="editingChannel" class="form-tip">渠道标识创建后不可修改</div>
         </el-form-item>
         <el-form-item label="接入说明" prop="description">
@@ -119,6 +115,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Bell, Plus, Edit, Delete } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
 import * as notificationsApi from '@/api/notifications'
+import { NOTIFICATION_CHANNELS, notificationErrorMessage } from '@/utils/notificationFeedback'
 
 const PRESET_CHANNELS = ['dingtalk', 'wechat_work', 'email']
 
@@ -203,9 +200,10 @@ function resetForm() {
 }
 
 async function submitForm() {
+  if (saving.value) return
+  try { await formRef.value?.validate() } catch { return }
+  saving.value = true
   try {
-    await formRef.value?.validate()
-    saving.value = true
     if (editingChannel.value) {
       await notificationsApi.updateNotificationChannel(editingChannel.value.id, {
         channel_name: form.value.channel_name,
@@ -225,9 +223,7 @@ async function submitForm() {
     showDialog.value = false
     loadChannels()
   } catch (e) {
-    if (e?.message !== undefined) return
-    console.error(e)
-    ElMessage.error(editingChannel.value ? '更新失败' : '创建失败')
+    ElMessage.error(notificationErrorMessage(e, editingChannel.value ? '更新失败' : '创建失败'))
   } finally {
     saving.value = false
   }

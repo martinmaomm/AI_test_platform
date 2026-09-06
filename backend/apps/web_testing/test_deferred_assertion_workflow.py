@@ -401,7 +401,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
             'sequence': 0, 'serial_dispatch_state': 'dispatched',
         }]
         execution_log.save(update_fields=['linked_executions'])
-        with patch('notifications.services.trigger_notification') as notify, self.captureOnCommitCallbacks(execute=True):
+        with patch('notifications.services.trigger_notification', return_value=True) as notify, self.captureOnCommitCallbacks(execute=True):
             _finalize_scheduled_execution(
                 execution_log.id,
                 execution_id=execution.id,

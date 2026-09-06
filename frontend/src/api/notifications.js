@@ -2,6 +2,7 @@
  * 消息渠道管理 API（钉钉/企微 Webhook）
  */
 import api from './index'
+import { loadNotificationPages } from '../utils/notificationFeedback'
 
 // ---------- 全局渠道（管理员） ----------
 /** 获取全局渠道列表 */
@@ -16,7 +17,7 @@ export function createNotificationChannel(data) {
 
 /** 更新全局渠道 */
 export function updateNotificationChannel(id, data) {
-  return api.put(`/notifications/channels/${id}/`, data)
+  return api.patch(`/notifications/channels/${id}/`, data)
 }
 
 /** 删除全局渠道 */
@@ -34,7 +35,9 @@ export function getNotificationReceivers(projectId, params = {}) {
   if (!projectId) {
     return api.get('/notifications/receivers/', { params })
   }
-  return api.get(`/projects/${projectId}/notification-receivers/`, { params })
+  const path = `/projects/${projectId}/notification-receivers/`
+  if (params.page) return api.get(path, { params })
+  return loadNotificationPages(page => api.get(path, { params: { ...params, page } }))
 }
 
 /** 创建接收对象 */

@@ -9,7 +9,7 @@
           </div>
           <div class="header-text">
             <h2>邮件服务配置</h2>
-            <p>配置 SMTP 服务器，供通知对象中「邮件」渠道发送执行报告</p>
+            <p>通知邮件使用最近更新的已启用 SMTP 配置；仅管理员可管理</p>
           </div>
         </div>
         <div class="header-actions">
@@ -126,6 +126,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Message, Plus } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
 import * as notificationsApi from '@/api/notifications'
+import { notificationErrorMessage } from '@/utils/notificationFeedback'
 
 const loading = ref(false)
 const configs = ref([])
@@ -251,9 +252,10 @@ async function testConfig(row) {
 }
 
 async function submitForm() {
+  if (saving.value) return
+  try { await formRef.value?.validate() } catch { return }
+  saving.value = true
   try {
-    await formRef.value?.validate()
-    saving.value = true
     const payload = {
       name: form.value.name,
       smtp_server: form.value.smtp_server,
@@ -276,9 +278,7 @@ async function submitForm() {
     showDialog.value = false
     loadConfigs()
   } catch (e) {
-    if (e?.message !== undefined) return
-    console.error(e)
-    ElMessage.error(editingConfig.value ? '更新失败' : '创建失败')
+    ElMessage.error(notificationErrorMessage(e, editingConfig.value ? '更新失败' : '创建失败'))
   } finally {
     saving.value = false
   }

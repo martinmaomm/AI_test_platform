@@ -107,6 +107,16 @@ export const getProjectKnowledgeConversations = async (
 export const createProjectKnowledgeConversation = async (projectId, payload) =>
   (await api.post(`${base(projectId)}/conversations/`, payload)).data;
 
+export const deleteProjectKnowledgeConversation = async (
+  projectId,
+  conversationId,
+) =>
+  (
+    await api.delete(
+      `${base(projectId)}/conversations/${conversationId}/`,
+    )
+  ).data;
+
 export const getProjectKnowledgeMessages = async (projectId, conversationId) =>
   (
     await api.get(

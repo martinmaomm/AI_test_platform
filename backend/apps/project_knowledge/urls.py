@@ -22,5 +22,6 @@ urlpatterns = [
     path('manual-cases/export/', views.ManualCaseExportView.as_view(), name='manual-case-export'),
     path('manual-cases/<uuid:case_id>/', views.ManualCaseDetailView.as_view(), name='manual-case-detail'),
     path('conversations/', views.ConversationListView.as_view(), name='conversation-list'),
+    path('conversations/<uuid:conversation_id>/', views.ConversationDetailView.as_view(), name='conversation-detail'),
     path('conversations/<uuid:conversation_id>/messages/', views.MessageListView.as_view(), name='message-list'),
 ]

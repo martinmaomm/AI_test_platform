@@ -22,7 +22,7 @@ from project_knowledge.serializers import (DocumentCreateSerializer,
                                            KnowledgeChunkSerializer,
                                            ManualTestCaseSerializer,
                                            MAX_KNOWLEDGE_FILE_SIZE)
-from project_knowledge.views import (CaseGenerationView, MessageListView, ConversationListView,
+from project_knowledge.views import (CaseGenerationView, MessageListView, ConversationListView, ConversationDetailView,
                                      DocumentSectionsView, KnowledgeOptionsView,
                                      SourceDetailView, TaskCancelView,
                                      CaseGenerationSaveView, DocumentListView,
@@ -188,6 +188,101 @@ class ProjectKnowledgeApiTests(TestCase):
         result = ConversationListView.as_view()(self._request('get', '/'), project_id=self.project.id)
         self.assertEqual([row['id'] for row in result.data['data']['items']], [str(own.id)])
         self.assertEqual(result.data['data']['items'][0]['first_question'], 'first question')
+
+    def test_delete_conversation_removes_only_its_messages_and_answer_tasks(self):
+        conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        other = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        task, _ = self._enqueue(self.project, self.user, 'answer', {'conversation_id': str(conversation.pk)}, 'delete-own')
+        task.status = 'completed'
+        task.save(update_fields=['status'])
+        KnowledgeMessage.objects.create(conversation=conversation, task=task, role='user', content='question')
+        KnowledgeMessage.objects.create(conversation=conversation, task=task, role='assistant', content='answer')
+        other_message = KnowledgeMessage.objects.create(conversation=other, role='user', content='keep')
+        unrelated_task, _ = self._enqueue(self.project, self.user, 'answer', {'conversation_id': str(other.pk)}, 'keep-answer')
+        generation, _ = self._enqueue(self.project, self.user, 'generate', {}, 'keep-generation')
+        manual_case = ManualTestCase.objects.create(project=self.project, created_by=self.user, source_task=generation, draft_id='keep', title='保留手工用例')
+        result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=conversation.pk)
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertFalse(KnowledgeConversation.objects.filter(pk=conversation.pk).exists())
+        self.assertFalse(KnowledgeMessage.objects.filter(conversation_id=conversation.pk).exists())
+        self.assertFalse(KnowledgeTask.objects.filter(pk=task.pk).exists())
+        self.assertTrue(KnowledgeConversation.objects.filter(pk=other.pk).exists())
+        self.assertTrue(KnowledgeMessage.objects.filter(pk=other_message.pk).exists())
+        self.assertTrue(KnowledgeTask.objects.filter(pk=unrelated_task.pk).exists())
+        self.assertTrue(KnowledgeTask.objects.filter(pk=generation.pk).exists())
+        self.assertTrue(ManualTestCase.objects.filter(pk=manual_case.pk).exists())
+        self.assertTrue(KnowledgeDocument.objects.filter(pk=self.document.pk).exists())
+        self.assertTrue(KnowledgeChunk.objects.filter(pk=self.chunk.pk).exists())
+
+    def test_delete_conversation_rejects_active_tasks_even_when_cancel_requested(self):
+        for state, cancel_requested in [('queued', False), ('running', False), ('running', True)]:
+            with self.subTest(state=state, cancel_requested=cancel_requested):
+                conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+                task, _ = self._enqueue(self.project, self.user, 'answer', {'conversation_id': str(conversation.pk)}, str(uuid.uuid4()))
+                task.status, task.cancel_requested = state, cancel_requested
+                task.save(update_fields=['status', 'cancel_requested'])
+                result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=conversation.pk)
+                self.assertEqual(result.status_code, 409, result.data)
+                self.assertTrue(KnowledgeConversation.objects.filter(pk=conversation.pk).exists())
+                self.assertTrue(KnowledgeTask.objects.filter(pk=task.pk).exists())
+
+    def test_delete_accepts_all_terminal_answer_states(self):
+        for state in ('completed', 'partial', 'failed', 'cancelled'):
+            with self.subTest(state=state):
+                conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+                task, _ = self._enqueue(self.project, self.user, 'answer', {'conversation_id': str(conversation.pk)}, str(uuid.uuid4()))
+                task.status = state
+                task.save(update_fields=['status'])
+                result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=conversation.pk)
+                self.assertEqual(result.status_code, 200, result.data)
+                self.assertFalse(KnowledgeTask.objects.filter(pk=task.pk).exists())
+
+    def test_only_conversation_owner_can_delete_even_for_project_owner(self):
+        private = KnowledgeConversation.objects.create(project=self.project, created_by=self.viewer)
+        result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=private.pk)
+        self.assertEqual(result.status_code, 404)
+        self.assertTrue(KnowledgeConversation.objects.filter(pk=private.pk).exists())
+        # Managing a personal conversation is independent of editing shared docs.
+        result = ConversationDetailView.as_view()(self._request('delete', '/', user=self.viewer), project_id=self.project.id, conversation_id=private.pk)
+        self.assertEqual(result.status_code, 200, result.data)
+
+    def test_delete_hides_cross_project_and_nonmember_conversations(self):
+        private = KnowledgeConversation.objects.create(project=self.other_project, created_by=self.viewer)
+        for project in (self.project, self.other_project):
+            result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=project.id, conversation_id=private.pk)
+            self.assertEqual(result.status_code, 404)
+            self.assertTrue(KnowledgeConversation.objects.filter(pk=private.pk).exists())
+
+    def test_delete_missing_or_already_deleted_conversation_returns_404(self):
+        conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        target = conversation.pk
+        for expected in (200, 404):
+            result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=target)
+            self.assertEqual(result.status_code, expected, result.data)
+        result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=uuid.uuid4())
+        self.assertEqual(result.status_code, 404)
+
+    def test_unauthenticated_user_cannot_delete_a_conversation(self):
+        conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        result = ConversationDetailView.as_view()(self.factory.delete('/'), project_id=self.project.id, conversation_id=conversation.pk)
+        self.assertIn(result.status_code, (401, 403))
+        self.assertTrue(KnowledgeConversation.objects.filter(pk=conversation.pk).exists())
+
+    @override_settings(PROJECT_KNOWLEDGE_ENABLED=False)
+    def test_disabled_feature_rejects_conversation_delete_without_removing_history(self):
+        conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        result = ConversationDetailView.as_view()(self._request('delete', '/'), project_id=self.project.id, conversation_id=conversation.pk)
+        self.assertEqual(result.status_code, 503)
+        self.assertTrue(KnowledgeConversation.objects.filter(pk=conversation.pk).exists())
+
+    def test_question_whose_conversation_was_deleted_before_lock_returns_404(self):
+        conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        payload = {'question': '并行请求', 'model_config_id': self.model.id, 'client_request_id': 'deleted-before-lock'}
+        with patch.object(KnowledgeConversation.objects, 'select_for_update') as locking, patch('project_knowledge.views.runtime.enqueue_task') as enqueue:
+            locking.return_value.get.side_effect = KnowledgeConversation.DoesNotExist
+            response = MessageListView.as_view()(self._request('post', '/', payload), project_id=self.project.id, conversation_id=conversation.pk)
+        self.assertEqual(response.status_code, 404, response.data)
+        enqueue.assert_not_called()
 
     def test_hashing_upload_rewinds_before_shared_service_reads_it(self):
         file = SimpleUploadedFile('rules.md', b'# rules\nread after hash')

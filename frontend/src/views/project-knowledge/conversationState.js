@@ -18,6 +18,19 @@ export const upsertConversation = (conversations, conversation) => [
   ),
 ];
 
+export const removeConversation = (conversations, conversationId) =>
+  conversations.filter((item) => conversationKey(item.id) !== conversationKey(conversationId));
+
+export const hasActiveConversationAnswerTask = (tasks, conversationId) => {
+  const key = conversationKey(conversationId);
+  return tasks.some(
+    (task) =>
+      task?.kind === "answer" &&
+      conversationKey(task?.payload?.conversation_id) === key &&
+      !["completed", "partial", "failed", "cancelled"].includes(task?.status),
+  );
+};
+
 export const getConversationDraft = (drafts, conversationId) =>
   drafts.get(conversationKey(conversationId)) || "";
 

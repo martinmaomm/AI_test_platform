@@ -5,7 +5,9 @@ import {
   conversationDisplayTitle,
   createConversationRequestState,
   getConversationDraft,
+  hasActiveConversationAnswerTask,
   mergeConversationMessages,
+  removeConversation,
   setConversationDraft,
   truncateConversationTitle,
   upsertConversation,
@@ -69,6 +71,40 @@ test("created conversations stay visible when a subsequent list refresh fails", 
   const visible = upsertConversation([{ id: "old", title: "历史会话" }], created);
 
   assert.deepEqual(visible, [created, { id: "old", title: "历史会话" }]);
+});
+
+test("deleting one conversation preserves the remaining list order", () => {
+  const conversations = [
+    { id: "current", title: "当前会话" },
+    { id: "next", title: "下一会话" },
+    { id: "other", title: "其他会话" },
+  ];
+
+  assert.deepEqual(removeConversation(conversations, "current"), [
+    conversations[1],
+    conversations[2],
+  ]);
+  assert.deepEqual(removeConversation(conversations, "missing"), conversations);
+});
+
+test("only unfinished answer tasks block deleting their own conversation", () => {
+  const tasks = [
+    { kind: "answer", status: "completed", payload: { conversation_id: "a" } },
+    { kind: "answer", status: "cancel_requested", payload: { conversation_id: "a" } },
+    { kind: "answer", status: "running", payload: { conversation_id: "b" } },
+    { kind: "generate", status: "running", payload: { conversation_id: "a" } },
+  ];
+
+  assert.equal(hasActiveConversationAnswerTask(tasks, "a"), true);
+  assert.equal(hasActiveConversationAnswerTask(tasks, "b"), true);
+  assert.equal(hasActiveConversationAnswerTask(tasks, "c"), false);
+  assert.equal(
+    hasActiveConversationAnswerTask(
+      [{ kind: "answer", status: "cancelled", payload: { conversation_id: "a" } }],
+      "a",
+    ),
+    false,
+  );
 });
 
 test("accepted answer messages merge by id while retaining already loaded history", () => {

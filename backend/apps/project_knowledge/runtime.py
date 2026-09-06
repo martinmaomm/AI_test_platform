@@ -228,6 +228,17 @@ def execute_task(task_id):
     )
     if not claimed:
         return {'task_id': str(task_id), 'status': 'skipped'}
+    try:
+        return _execute_claimed_task(task_id)
+    except KnowledgeTask.DoesNotExist:
+        # A cancelled/expired answer can be deleted with its conversation while
+        # an in-flight model call is returning. Do not recreate deleted history.
+        if KnowledgeTask.objects.filter(pk=task_id).exists():
+            raise
+        return {'task_id': str(task_id), 'status': 'skipped'}
+
+
+def _execute_claimed_task(task_id):
     task = KnowledgeTask.objects.select_related('created_by', 'project').get(pk=task_id)
     context = TaskContext(task)
     try:
@@ -256,7 +267,9 @@ def execute_task(task_id):
         status = 'cancelled' if exc.code == 'CANCELLED' else ('partial' if saved.result or saved.partial_output else 'failed')
         finished = _finish(task.id, status, code=exc.code, message=str(exc))
     except Exception as exc:
+        saved = KnowledgeTask.objects.filter(pk=task.id).first()
+        if saved is None:
+            return {'task_id': str(task.id), 'status': 'skipped'}
         logger.exception('知识库任务失败: task_id=%s kind=%s', task.id, task.kind)
-        saved = KnowledgeTask.objects.get(pk=task.id)
         finished = _finish(task.id, 'partial' if saved.result or saved.partial_output else 'failed', code='KNOWLEDGE_TASK_FAILED', message=str(exc)[:1500] or '任务处理失败，请查看技术日志。')
     return {'task_id': str(task.id), 'status': finished.status}

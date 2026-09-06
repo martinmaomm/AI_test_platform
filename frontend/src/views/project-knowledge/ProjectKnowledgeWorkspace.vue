@@ -391,12 +391,27 @@
                 v-for="item in conversations"
                 :key="item.id"
                 :index="String(item.id)"
-                ><span
-                  class="conversation-title"
-                  :title="conversationDisplayTitle(item)"
-                  >{{
-                    truncateConversationTitle(conversationDisplayTitle(item))
-                  }}</span
+                ><div class="conversation-item-main"
+                  ><span
+                    class="conversation-title"
+                    :title="conversationDisplayTitle(item)"
+                    >{{
+                      truncateConversationTitle(conversationDisplayTitle(item))
+                    }}</span
+                  ><el-tooltip
+                    :content="conversationDeleteDisabledReason(item)"
+                    :disabled="!conversationDeleteDisabledReason(item)"
+                    placement="top"
+                    ><el-button
+                      text
+                      type="danger"
+                      :icon="Delete"
+                      :aria-label="`删除会话：${conversationDisplayTitle(item)}`"
+                      :disabled="Boolean(conversationDeleteDisabledReason(item))"
+                      :loading="isDeletingConversation(item.id)"
+                      @click.stop="removeConversationById(item)"
+                    /></el-tooltip
+                  ></div
                 ><span class="conversation-time">{{
                   formatTime(item.created_at)
                 }}</span></el-menu-item
@@ -491,11 +506,13 @@
                   maxlength="4000"
                   show-word-limit
                   placeholder="针对当前项目资料提问…"
+                  :disabled="isDeletingConversation(activeConversationId)"
                   @keydown.ctrl.enter="askQuestion"
                 /><el-select
                   v-model="questionModelId"
                   clearable
                   placeholder="选择模型"
+                  :disabled="isDeletingConversation(activeConversationId)"
                   ><el-option
                     v-for="model in options.models"
                     :key="model.id"
@@ -507,7 +524,8 @@
                     !question ||
                     !readyQuestionDocuments.length ||
                     unavailableQuestionDocuments.length ||
-                    hasActiveAnswerTask
+                    hasActiveAnswerTask ||
+                    isDeletingConversation(activeConversationId)
                   "
                   :loading="asking"
                   @click="askQuestion"
@@ -978,7 +996,7 @@
 
 <script setup>
 import { computed, onUnmounted, reactive, ref, watch } from "vue";
-import { Download, Refresh, Upload } from "@element-plus/icons-vue";
+import { Delete, Download, Refresh, Upload } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useProjectStore } from "@/stores/project";
 import {
@@ -988,6 +1006,7 @@ import {
   createProjectKnowledgeConversation,
   createProjectKnowledgeDocument,
   deleteManualCase,
+  deleteProjectKnowledgeConversation,
   deleteProjectKnowledgeDocument,
   exportManualCases,
   getManualCases,
@@ -1027,7 +1046,9 @@ import {
   conversationDisplayTitle,
   createConversationRequestState,
   getConversationDraft,
+  hasActiveConversationAnswerTask,
   mergeConversationMessages,
+  removeConversation,
   setConversationDraft,
   truncateConversationTitle,
   upsertConversation,
@@ -1123,6 +1144,8 @@ const asking = computed(() =>
   askingConversationIds.value.has(String(activeConversationId.value || "")),
 );
 const creatingConversation = ref(false);
+const deletingConversationIds = ref(new Set());
+const deletedConversationIds = new Set();
 const pollers = new Map();
 const conversationRequestState = createConversationRequestState();
 let epoch = 0;
@@ -1158,6 +1181,19 @@ const hasActiveGenerationTask = computed(() =>
   Boolean(activeGenerationTask.value),
 );
 const hasActiveAnswerTask = computed(() => isActiveTask(answerTask.value));
+const isConversationDeleted = (conversationId) =>
+  deletedConversationIds.has(String(conversationId || ""));
+const isDeletingConversation = (conversationId) =>
+  deletingConversationIds.value.has(String(conversationId || ""));
+const conversationDeleteDisabledReason = (conversation) => {
+  if (!options.enabled) return "项目知识库当前不可用，暂不能删除会话。";
+  if (isDeletingConversation(conversation.id)) return "会话正在删除，请稍候。";
+  if (askingConversationIds.value.has(String(conversation.id)))
+    return "会话正在提交问题，暂不能删除。";
+  if (hasActiveConversationAnswerTask(answerTasks.value, conversation.id))
+    return "会话中的问答任务尚未结束，暂不能删除。";
+  return "";
+};
 const isDraftEditingLocked = computed(() => isActiveTask(generationTask.value));
 const isDraftEditor = computed(() => Boolean(editingDraft.value));
 const editingCaseSources = computed(
@@ -1318,7 +1354,9 @@ async function loadConversations(
       requestVersion !== conversationListRequestVersion
     )
       return false;
-    conversations.value = listItems(result);
+    conversations.value = listItems(result).filter(
+      (conversation) => !isConversationDeleted(conversation.id),
+    );
     if (!activeConversationId.value && conversations.value[0])
       await selectConversation(
         String(conversations.value[0].id),
@@ -1338,9 +1376,11 @@ async function loadMessages(
   expectedProjectId = projectId.value,
 ) {
   if (!conversationId || !expectedProjectId) return;
+  if (isConversationDeleted(conversationId)) return;
   const request = conversationRequestState.startMessageLoad(conversationId);
   const canApply = () =>
     current(token, expectedProjectId) &&
+    !isConversationDeleted(conversationId) &&
     conversationRequestState.canApplyMessageLoad(
       request,
       activeConversationId.value,
@@ -1369,7 +1409,12 @@ async function loadTasks(token = epoch, expectedProjectId = projectId.value) {
       ),
     );
     if (!current(token, expectedProjectId)) return;
-    const tasks = results.flatMap(listItems);
+    const tasks = results
+      .flatMap(listItems)
+      .filter(
+        (task) =>
+          task.kind !== "answer" || !isConversationDeleted(taskConversationId(task)),
+      );
     generationTasks.value = tasks
       .filter((task) => task.kind === "generate")
       .sort(
@@ -1464,11 +1509,18 @@ function resetProjectState() {
   savingManualCase.value = false;
   askingConversationIds.value = new Set();
   creatingConversation.value = false;
+  deletingConversationIds.value = new Set();
+  deletedConversationIds.clear();
   conversationRequestState.reset();
   conversationListRequestVersion += 1;
   Object.keys(sectionCache).forEach((key) => delete sectionCache[key]);
 }
 function pollTask(task, token = epoch, expectedProjectId = projectId.value) {
+  if (
+    task?.kind === "answer" &&
+    isConversationDeleted(taskConversationId(task))
+  )
+    return;
   if (!task?.id || isTerminalTask(task) || pollers.has(task.id)) return;
   const entry = { task, timer: null, inFlight: false, terminal: false };
   const schedule = () => {
@@ -1476,14 +1528,28 @@ function pollTask(task, token = epoch, expectedProjectId = projectId.value) {
       entry.timer = setTimeout(tick, 2000);
   };
   const tick = async () => {
-    if (entry.inFlight || entry.terminal || !current(token, expectedProjectId))
+    if (
+      entry.inFlight ||
+      entry.terminal ||
+      !current(token, expectedProjectId) ||
+      (entry.task?.kind === "answer" &&
+        isConversationDeleted(taskConversationId(entry.task)))
+    )
       return;
     entry.inFlight = true;
     try {
       const result = unwrap(
         await getProjectKnowledgeTask(expectedProjectId, task.id),
       );
-      if (!current(token, expectedProjectId) || entry.terminal) return;
+      if (
+        !current(token, expectedProjectId) ||
+        entry.terminal ||
+        (result.kind === "answer" &&
+          isConversationDeleted(taskConversationId(result)))
+      ) {
+        stopTaskPoll(task.id);
+        return;
+      }
       if (isTerminalTask(entry.task)) {
         stopTaskPoll(task.id);
         return;
@@ -1498,7 +1564,12 @@ function pollTask(task, token = epoch, expectedProjectId = projectId.value) {
       }
       schedule();
     } catch (error) {
-      if (current(token, expectedProjectId))
+      if (
+        current(token, expectedProjectId) &&
+        !entry.terminal &&
+        !(entry.task?.kind === "answer" &&
+          isConversationDeleted(taskConversationId(entry.task)))
+      )
         ElMessage.error(errorMessage(error, "查询任务状态失败"));
       stopTaskPoll(task.id);
     } finally {
@@ -1541,6 +1612,7 @@ function applyTask(task, select = false) {
     }
   }
   if (task.kind === "answer") {
+    if (isConversationDeleted(taskConversationId(task))) return;
     answerTasks.value = [
       task,
       ...answerTasks.value.filter(
@@ -1570,7 +1642,7 @@ function taskConversationId(task) {
 }
 function syncAnswerTaskForConversation() {
   const conversationId = activeConversationId.value;
-  answerTask.value = conversationId
+  answerTask.value = conversationId && !isConversationDeleted(conversationId)
     ? answerTasks.value.find(
         (task) => taskConversationId(task) === String(conversationId),
       ) || null
@@ -1578,6 +1650,11 @@ function syncAnswerTaskForConversation() {
 }
 async function completeTask(task, token, expectedProjectId) {
   if (!current(token, expectedProjectId)) return;
+  if (
+    task.kind === "answer" &&
+    isConversationDeleted(taskConversationId(task))
+  )
+    return;
   if (task.status === "failed")
     ElMessage.error(task.error_message || "任务失败");
   if (task.status === "partial")
@@ -2029,6 +2106,69 @@ async function exportCases() {
   }
 }
 
+function removeDeletedConversationState(conversationId) {
+  const key = String(conversationId);
+  const wasActive = String(activeConversationId.value) === key;
+  conversations.value = removeConversation(conversations.value, key);
+  questionDrafts.delete(key);
+  conversationRequestState.invalidateMessages(key);
+  askingConversationIds.value = new Set(
+    [...askingConversationIds.value].filter((id) => id !== key),
+  );
+  answerTasks.value = answerTasks.value.filter(
+    (task) => taskConversationId(task) !== key,
+  );
+  [...pollers.entries()].forEach(([taskId, entry]) => {
+    if (taskConversationId(entry.task) === key) stopTaskPoll(taskId);
+  });
+  if (!wasActive) return null;
+
+  messages.value = [];
+  messagesLoading.value = false;
+  answerTask.value = null;
+  activeConversationId.value = null;
+  conversationRequestState.select();
+  return conversations.value[0] || null;
+}
+async function removeConversationById(conversation) {
+  const conversationId = String(conversation.id);
+  const disabledReason = conversationDeleteDisabledReason(conversation);
+  if (disabledReason) return ElMessage.warning(disabledReason);
+  const scope = requestScope();
+  if (!scope.projectId) return;
+  deletingConversationIds.value = new Set([
+    ...deletingConversationIds.value,
+    conversationId,
+  ]);
+  try {
+    await ElMessageBox.confirm(
+      `确认删除会话“${conversationDisplayTitle(conversation)}”吗？删除后不可恢复，项目资料和手工测试用例不受影响。`,
+      "删除会话",
+      { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" },
+    );
+    if (!scopeIsCurrent(scope)) return;
+    await deleteProjectKnowledgeConversation(scope.projectId, conversationId);
+    if (!scopeIsCurrent(scope)) return;
+    deletedConversationIds.add(conversationId);
+    conversationListRequestVersion += 1;
+    const nextConversation = removeDeletedConversationState(conversationId);
+    ElMessage.success("知识问答会话已删除");
+    if (nextConversation)
+      await selectConversation(
+        String(nextConversation.id),
+        scope.token,
+        scope.projectId,
+      );
+  } catch (error) {
+    if (scopeIsCurrent(scope) && error !== "cancel" && error !== "close")
+      ElMessage.error(errorMessage(error, "删除知识问答会话失败"));
+  } finally {
+    if (scopeIsCurrent(scope))
+      deletingConversationIds.value = new Set(
+        [...deletingConversationIds.value].filter((id) => id !== conversationId),
+      );
+  }
+}
 async function createConversation() {
   if (creatingConversation.value) return;
   const scope = requestScope();
@@ -2062,7 +2202,7 @@ async function selectConversation(
   token = epoch,
   expectedProjectId = projectId.value,
 ) {
-  if (!current(token, expectedProjectId)) return;
+  if (!current(token, expectedProjectId) || isConversationDeleted(id)) return;
   const isConversationChange =
     String(activeConversationId.value) !== String(id);
   conversationRequestState.select();
@@ -2083,6 +2223,8 @@ function excludeUnavailableQuestionDocuments() {
 async function askQuestion() {
   if (!question.value) return;
   if (asking.value) return;
+  if (isDeletingConversation(activeConversationId.value))
+    return ElMessage.warning("会话正在等待删除确认，暂不能提问。");
   if (!readyQuestionDocuments.value.length)
     return ElMessage.warning("当前没有可用于问答的索引就绪资料");
   if (!questionModelId.value) return ElMessage.warning("请选择可用模型");
@@ -2114,7 +2256,7 @@ async function askQuestion() {
         payload,
       ),
     );
-    if (!scopeIsCurrent(scope)) return;
+    if (!scopeIsCurrent(scope) || isConversationDeleted(conversationId)) return;
     const task = response.task || response;
     applyTask(task);
     const createdMessages = [
@@ -2380,6 +2522,19 @@ onUnmounted(clearPollers);
   padding-bottom: 6px;
   flex-direction: column;
   align-items: stretch;
+}
+.conversation-item-main {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.conversation-item-main .conversation-title {
+  flex: 1;
+  min-width: 0;
+}
+.conversation-item-main .el-button {
+  flex-shrink: 0;
 }
 .conversation-title {
   overflow: hidden;

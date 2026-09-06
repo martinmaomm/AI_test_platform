@@ -7,6 +7,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models.deletion import RestrictedError
 from django.test import TestCase, override_settings
 from django.utils import timezone
+from rest_framework.test import APIRequestFactory, force_authenticate
 
 from projects.models import Project, UploadedFile
 from project_knowledge.models import DocumentRevision, KnowledgeDocument, KnowledgeTask, KnowledgeConversation, KnowledgeMessage
@@ -153,6 +154,36 @@ class KnowledgeRuntimeTests(TestCase):
             self.assertEqual(execute_task(task.id)['status'], 'skipped')
         self.assertEqual(KnowledgeMessage.objects.filter(task=task, role='assistant').count(), 1)
         self.assertEqual(KnowledgeMessage.objects.get(task=task).content, answer['answer'])
+
+    def test_deleted_cancelled_conversation_is_not_recreated_by_late_model_result(self):
+        from project_knowledge.views import ConversationDetailView, TaskCancelView
+
+        for failed_request in (False, True):
+            with self.subTest(failed_request=failed_request):
+                conversation = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+                task = self.task(kind='answer', payload={'conversation_id': str(conversation.id)})
+                task_id, conversation_id = task.pk, conversation.pk
+
+                def cancel_and_delete_before_model_returns(*args):
+                    cancel_request = APIRequestFactory().post('/')
+                    force_authenticate(cancel_request, self.user)
+                    cancelled = TaskCancelView.as_view()(cancel_request, project_id=self.project.pk, task_id=task_id)
+                    self.assertEqual(cancelled.status_code, 200, cancelled.data)
+                    delete_request = APIRequestFactory().delete('/')
+                    force_authenticate(delete_request, self.user)
+                    deleted = ConversationDetailView.as_view()(delete_request, project_id=self.project.pk, conversation_id=conversation_id)
+                    self.assertEqual(deleted.status_code, 200, deleted.data)
+                    if failed_request:
+                        raise RuntimeError('late model failure')
+                    return {'answer': 'late answer', 'result_type': 'answer', 'sources': []}
+
+                with patch('project_knowledge.workflows.answer_question', side_effect=cancel_and_delete_before_model_returns), patch('project_knowledge.runtime.logger.exception') as logged:
+                    self.assertEqual(execute_task(task_id)['status'], 'skipped')
+                    logged.assert_not_called()
+                self.assertFalse(KnowledgeConversation.objects.filter(pk=conversation_id).exists())
+                self.assertFalse(KnowledgeMessage.objects.filter(conversation_id=conversation_id).exists())
+                self.assertFalse(KnowledgeTask.objects.filter(pk=task_id).exists())
+                self.assertEqual(execute_task(task_id)['status'], 'skipped')
 
     def test_partial_generation_is_not_marked_complete(self):
         task = self.task(kind='generate')

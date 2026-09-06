@@ -353,6 +353,8 @@ def _ui_flow(origin: str, root: Path, artifacts_dir: Path, token: str, user, pro
             page.get_by_label("来源原文").get_by_text("角色停用后不可登录，系统必须拒绝登录。", exact=False).wait_for()
             wait_for_toasts()
             page.screenshot(path=str(qa_screenshot), animations="disabled")
+            page.keyboard.press('Escape')
+            _verify_conversation_deletion(page, artifacts_dir)
         except Exception:
             page.screenshot(path=str(artifacts_dir / "failure.png"), animations="disabled")
             raise
@@ -412,6 +414,7 @@ def _verify_conversation_history(page, artifacts_dir):
         expect(page.locator('.chat-message')).to_have_count(0)
         original.click()
         expect(page.locator('.chat-panel .task-card')).to_contain_text('排队中')
+        expect(original.get_by_role('button', name=re.compile(r'^删除会话'))).to_be_disabled()
         expect(question_box).to_have_value('')
         # Sync Playwright keeps an event loop on this thread. Run the fake
         # worker's synchronous ORM calls outside that loop, as a real worker does.
@@ -433,8 +436,63 @@ def _verify_conversation_history(page, artifacts_dir):
     page.screenshot(path=str(artifacts_dir / 'qa-restored-history.png'), animations='disabled')
 
 
+def _verify_conversation_deletion(page, artifacts_dir):
+    """Exercise only disposable conversations created by this offline run."""
+    from playwright.sync_api import expect
+
+    rows = page.locator('.conversation-panel .el-menu-item')
+    original = rows.filter(has_text='角色停用后能否登录？')
+    question_box = page.get_by_placeholder('针对当前项目资料提问…')
+    question_box.fill('删除其他会话不应影响当前草稿')
+    deletes = []
+    page.on('request', lambda request: deletes.append(request.url) if request.method == 'DELETE' else None)
+    dialog = page.locator('.el-message-box').filter(has_text='删除会话')
+
+    original.get_by_role('button', name=re.compile(r'^删除会话')).click()
+    expect(dialog).to_contain_text(re.compile(r'(无法|不可)恢复'))
+    dialog.get_by_role('button', name='取消', exact=True).click()
+    expect(dialog).to_be_hidden()
+    expect(rows).to_have_count(3)
+    expect(page.locator('.chat-message')).to_have_count(4)
+    assert not deletes, 'Cancelling the confirmation must not send a DELETE'
+
+    # Delete B while A is selected: click.stop must preserve both A's history
+    # and its unsent draft, and DELETE must not be a mere local list removal.
+    rows.nth(1).get_by_role('button', name=re.compile(r'^删除会话')).click()
+    dialog.get_by_role('button', name='删除', exact=True).click()
+    expect(rows).to_have_count(2)
+    expect(original).to_have_class(re.compile(r'\bis-active\b'))
+    expect(question_box).to_have_value('删除其他会话不应影响当前草稿')
+    expect(page.locator('.chat-message')).to_have_count(4)
+
+    original.get_by_role('button', name=re.compile(r'^删除会话')).click()
+    dialog.get_by_role('button', name='删除', exact=True).click()
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_have_class(re.compile(r'\bis-active\b'))
+    expect(question_box).to_have_value('')
+    expect(page.locator('.chat-message')).to_have_count(0)
+    rows.first.get_by_role('button', name=re.compile(r'^删除会话')).click()
+    dialog.get_by_role('button', name='删除', exact=True).click()
+    expect(rows).to_have_count(0)
+    expect(question_box).to_have_count(0)
+    expect(page.locator('.conversation-panel')).to_contain_text('暂无会话')
+    assert len(deletes) == 3
+
+    page.reload()
+    page.get_by_role('tab', name='知识问答').click()
+    expect(rows).to_have_count(0)
+    expect(page.locator('.conversation-panel')).to_contain_text('暂无会话')
+    page.get_by_role('button', name='新建', exact=True).click()
+    expect(rows).to_have_count(1)
+    expect(question_box).to_have_value('')
+    expect(page.locator('.chat-message')).to_have_count(0)
+    expect(page.locator('.chat-panel .task-card')).to_have_count(0)
+    expect(page.locator('.chat-messages .el-loading-mask:visible')).to_have_count(0)
+    page.screenshot(path=str(artifacts_dir / 'qa-deletion-new-conversation.png'), animations='disabled')
+
+
 def _assert_database(project):
-    from project_knowledge.models import KnowledgeChunk, KnowledgeConversation, KnowledgeDocument, KnowledgeMessage, ManualTestCase
+    from project_knowledge.models import KnowledgeChunk, KnowledgeConversation, KnowledgeDocument, KnowledgeMessage, KnowledgeTask, ManualTestCase
 
     document = KnowledgeDocument.objects.get(project=project)
     assert document.current_revision.parse_status == "ready"
@@ -443,12 +501,10 @@ def _assert_database(project):
     case = ManualTestCase.objects.get(project=project)
     assert case.title == "停用角色不可登录（已编辑）"
     assert case.sources and case.sources[0]["id"] == str(chunk.id)
-    assert KnowledgeConversation.objects.filter(project=project).count() == 3
-    conversation = KnowledgeConversation.objects.get(project=project, messages__role='user', messages__content='角色停用后能否登录？')
-    answer = KnowledgeMessage.objects.filter(conversation=conversation, role="assistant").first()
-    assert conversation.messages.count() == 4
-    assert answer.content == "依据当前资料，角色停用后不可登录。"
-    assert answer.sources and answer.sources[0]["id"] == str(chunk.id)
+    assert KnowledgeConversation.objects.filter(project=project).count() == 1
+    assert not KnowledgeMessage.objects.filter(conversation__project=project).exists()
+    assert not KnowledgeTask.objects.filter(project=project, kind='answer').exists()
+    assert KnowledgeTask.objects.filter(project=project, kind='generate').exists()
 
 
 def main() -> int:

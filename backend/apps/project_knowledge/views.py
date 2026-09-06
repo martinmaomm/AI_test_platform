@@ -687,7 +687,39 @@ class MessageListView(KnowledgeAPIView):
                 else:
                     user_message = KnowledgeMessage.objects.filter(conversation=conversation, task=task, role='user').first()
                 assistant, _ = KnowledgeMessage.objects.get_or_create(conversation=conversation, task=task, role='assistant', defaults={'content': ''})
+        except KnowledgeConversation.DoesNotExist:
+            return _fail('知识问答会话不存在。', status.HTTP_404_NOT_FOUND)
         except runtime.TaskConflict as exc:
             return _fail(str(exc), status.HTTP_409_CONFLICT)
         return _ok({'task': _task_data(task), 'user_message': KnowledgeMessageSerializer(user_message).data if user_message else None,
                     'assistant_message': KnowledgeMessageSerializer(assistant).data}, '知识问答任务已排队。', status.HTTP_202_ACCEPTED)
+
+
+class ConversationDetailView(KnowledgeAPIView):
+    def delete(self, request, project_id, conversation_id):
+        if (guard := _feature_guard()):
+            return guard
+        # Conversations are private: read-only project members may manage their
+        # own conversations, but even a project owner cannot delete another's.
+        project, error = self.project(request, project_id)
+        if error:
+            return error
+        with transaction.atomic():
+            # Serialize against MessageListView.post so a new answer cannot be
+            # enqueued between the active-task check and deleting its parent.
+            conversation = KnowledgeConversation.objects.select_for_update().filter(
+                pk=conversation_id, project=project, created_by=request.user,
+            ).first()
+            if conversation is None:
+                return _fail('知识问答会话不存在。', status.HTTP_404_NOT_FOUND)
+            tasks = KnowledgeTask.objects.filter(
+                project=project, created_by=request.user, kind='answer',
+                payload__conversation_id=str(conversation.id),
+            )
+            if tasks.exclude(status__in=runtime.TERMINAL).exists():
+                return _fail('当前会话仍有问答任务正在排队或回答，请等待结束或取消后再删除。', status.HTTP_409_CONFLICT)
+            conversation.delete()
+            # Remove stored question/output copies as well as the messages;
+            # never delete source documents or generated manual test cases.
+            tasks.delete()
+        return _ok(message='知识问答会话已删除。')

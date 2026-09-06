@@ -167,12 +167,23 @@ test("workspace uses the approved API scope and safe plain-text rendering", asyn
   assert.match(apiSource, /case-generations\/\$\{generationId\}\/save\//);
   assert.match(apiSource, /manual-cases\/export\//);
   assert.match(apiSource, /conversations\/\$\{conversationId\}\/messages\//);
+  assert.match(apiSource, /conversations\/\$\{conversationId\}\//);
   assert.match(apiSource, /tasks\/\$\{taskId\}\/retry-cleanup\//);
   assert.match(viewSource, /<pre v-text="message\.content">/);
   assert.match(
     viewSource,
     /@select="\(id\) => selectConversation\(id\)"/,
   );
+  assert.match(viewSource, /:aria-label="`删除会话：\$\{conversationDisplayTitle\(item\)\}`"/);
+  assert.match(viewSource, /@click\.stop="removeConversationById\(item\)"/);
+  assert.match(viewSource, /confirmButtonText: "删除"/);
+  assert.match(viewSource, /cancelButtonText: "取消"/);
+  assert.match(viewSource, /"删除会话"/);
+  assert.match(viewSource, /项目资料和手工测试用例不受影响/);
+  assert.match(viewSource, /deletedConversationIds/);
+  assert.match(viewSource, /conversationRequestState\.invalidateMessages\(key\)/);
+  assert.match(viewSource, /isDeletingConversation\(activeConversationId\)/);
+  assert.match(viewSource, /会话正在等待删除确认，暂不能提问/);
   assert.doesNotMatch(viewSource, /@select="selectConversation"/);
   assert.match(viewSource, /client_request_id: requestId\(\)/);
   assert.match(

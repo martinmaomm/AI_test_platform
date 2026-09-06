@@ -41,6 +41,38 @@ python manage.py migrate web_testing
 
 离线回归可在 `backend` 虚拟环境中运行 `python scripts/test_webui_generation_offline.py`：使用独立内存数据库、禁止网络访问，不触碰配置中的 MySQL、Redis 或被测网站。它不代替真实模型生成和浏览器业务流程验收。
 
+## 项目知识库：手工用例与项目问答
+
+UI 项目的“项目知识库”现提供“项目资料、手工测试用例、知识问答”三个页签。
+它们使用独立任务、数据表和向量集合，不接入 Playwright MCP，不修改已有自动化脚本生成、调试或执行流程。
+
+升级时先停止旧 Celery worker，在 `backend` 的虚拟环境中执行：
+
+```bash
+python -m pip install -r requirements.txt
+python manage.py migrate project_knowledge
+```
+
+然后重启后端与 Celery。前端 `npm run dev` 模式刷新即可，生产环境重新构建并发布静态文件。
+迁移只新增结构，不清空旧知识库、API 资料、脚本或向量模型。现有资料不会自动导入新工作区，请在新入口上传要使用的文件并点击“处理文档”。
+
+- 资料处理：支持 TXT、Markdown、DOCX、文本 PDF、XLSX，单文件最多 50 MiB；保留章节及原文位置。先解析正文，再建立索引。
+- 手工用例：选择主需求与章节，顺序生成草稿，可检查来源、编辑、保存和导出 XLSX。正文已解析但索引失败时，可明确选择“仅基于所选正文生成”。
+- 项目问答：使用当前项目已启用且索引就绪的资料，回答带来源；没有依据或资料冲突时提示核对。聊天模型的回答不会自动变成新资料。
+- 向量检索：沿用已启用的 RAG 配置与 embedding 模型，但使用独立 collection。若模型已在本机缓存，可复用缓存；首次加载仍会占用内存，未缓存时可能需要下载。
+
+可选配置见 `backend/env.example`：
+
+```dotenv
+AITS_PROJECT_KNOWLEDGE_ENABLED=true
+AITS_KNOWLEDGE_TOTAL_TIMEOUT_SECONDS=1200
+```
+
+知识任务总时限默认 1200 秒（允许 30–1500 秒），排队时间不计入；每次模型请求仍遵守模型配置的 `timeout` 或 `AITS_LLM_TIMEOUT_SECONDS`。
+关闭功能开关会禁止新写入与提交，但仍可查看历史、取消本人任务；不会删除资料或影响原 API RAG / WebUI 自动化。
+
+操作、测试和回退说明见 [项目知识库使用与验收](docs/project-knowledge-guide.md)。
+
 ## 部署依赖
 
 项目的 WebUI AI 脚本生成和 Python 测试执行分别使用两套 Playwright 运行时。两套浏览器版本可以共存，但不要只安装其中一套。

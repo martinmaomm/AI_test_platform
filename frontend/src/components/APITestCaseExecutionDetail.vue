@@ -113,7 +113,7 @@
                       <div class="console-header-right">
                         <span class="status-badge" :class="step.success ? 'passed' : 'failed'">
                           <i :class="step.success ? 'el-icon-check' : 'el-icon-close'"></i>
-                          {{ step.success ? 'PASSED' : 'FAILED' }}
+                          {{ apiStepLabel(step) }}
                         </span>
                         <div class="toggle-indicator">
                           <i :class="isConsoleEntryExpanded(index, reqIndex) ? 'el-icon-arrow-up' : 'el-icon-arrow-down'"></i>
@@ -421,13 +421,13 @@
                       <span class="step-error-number">{{ index + 1 }}</span>
                       <span>{{ step.name || `Step ${index + 1}` }}</span>
                     </div>
-                    <span class="status-badge failed">
-                      <i class="el-icon-close"></i>
-                      FAILED
+                    <span class="status-badge" :class="step.status === 'skipped' ? 'skipped' : 'failed'">
+                      <i :class="step.status === 'skipped' ? 'el-icon-minus' : 'el-icon-close'"></i>
+                      {{ apiStepLabel(step) }}
                     </span>
                   </div>
                   <div class="step-error-message">
-                    {{ step.error || '该步骤未生成响应快照，可能在变量替换、提取或断言阶段失败，请查看执行日志。' }}
+                    {{ step.error || (step.status === 'skipped' ? '前序步骤未通过，未发送此请求。' : '该步骤未返回响应快照，请查看执行日志。') }}
                   </div>
                 </div>
               </div>
@@ -853,7 +853,7 @@ const getHttpRunnerName = () => {
 
 const getHttpRunnerCaseId = () => {
   const rawResult = getHttpRunnerRawResult()
-  return rawResult.case_id || ''
+  return rawResult.script_id || rawResult.case_id || ''
 }
 
 const getHttpRunnerDuration = () => {
@@ -865,8 +865,8 @@ const getHttpRunnerDuration = () => {
 const getHttpRunnerStartTime = () => {
   const rawResult = getHttpRunnerRawResult()
   const timeInfo = rawResult.time || {}
-  if (timeInfo.start_at_iso_format) {
-    return dayjs(timeInfo.start_at_iso_format).format('YYYY-MM-DD HH:mm:ss')
+  if (timeInfo.start_at || timeInfo.start_at_iso_format) {
+    return dayjs(timeInfo.start_at || timeInfo.start_at_iso_format).format('YYYY-MM-DD HH:mm:ss')
   }
   return 'N/A'
 }
@@ -875,6 +875,10 @@ const getHttpRunnerStepDatas = () => {
   const rawResult = getHttpRunnerRawResult()
   return rawResult.step_datas || []
 }
+
+const apiStepLabel = (step) => ({
+  passed: '通过', failed: '断言失败', error: '执行错误', skipped: '已跳过',
+}[step.status] || (step.success ? '通过' : '失败'))
 
 const getHttpRunnerConfigVars = () => {
   const rawResult = getHttpRunnerRawResult()
@@ -1163,16 +1167,16 @@ const responseTimeChartOption = computed(() => {
 // 执行时间线图配置
 const timelineChartOption = computed(() => {
   const stepData = getHttpRunnerStepDatas()
-  const timeline = stepData.map((step, index) => ({
-    name: `步骤${index + 1}`,
-    start: index * 1000, // 模拟开始时间
-    end: (index + 1) * 1000 + (step.data?.stat?.response_time_ms || 0), // 模拟结束时间
-    status: step.success ? 'success' : 'failed'
-  }))
+  let elapsed = 0
+  const timeline = stepData.map((step, index) => {
+    const start = elapsed
+    elapsed += Number(step.data?.stat?.response_time_ms || step.data?.stat?.elapsed_ms || 0)
+    return { name: `步骤${index + 1}`, start, end: elapsed, status: step.success ? 'success' : (step.status || 'failed') }
+  })
 
   return {
     title: {
-      text: '执行时间线',
+      text: '请求耗时顺序',
       left: 'center',
       textStyle: {
         fontSize: 16,
@@ -1212,9 +1216,10 @@ const timelineChartOption = computed(() => {
         name: '执行时间',
         type: 'bar',
         data: timeline.map(item => ({
-          value: [item.start, item.end],
+          ...item,
+          value: item.end - item.start,
           itemStyle: {
-            color: item.status === 'success' ? '#67c23a' : '#f56c6c'
+            color: item.status === 'success' ? '#67c23a' : item.status === 'skipped' ? '#909399' : '#f56c6c'
           }
         })),
         barWidth: '60%'
@@ -1314,6 +1319,10 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.status-badge.skipped {
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+}
 /* 测试报告主容器 */
 .test-report-container {
   height: 500px;

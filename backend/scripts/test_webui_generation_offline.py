@@ -19,6 +19,7 @@ def main():
     os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
+    os.environ['AITS_OFFLINE_TEST_NETWORK'] = 'blocked'
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
 
@@ -48,7 +49,7 @@ def main():
         django.setup()
         from django.core.management import call_command
         from django.test.runner import DiscoverRunner
-        call_command('makemigrations', 'ai_core', 'web_testing', 'scheduled_tasks', dry_run=True, check=True, verbosity=1)
+        call_command('makemigrations', 'ai_core', 'api_testing', 'web_testing', 'scheduled_tasks', dry_run=True, check=True, verbosity=1)
         labels = sys.argv[1:] or [
             'ai_core.tests.test_webui_playwright_agent',
             'ai_core.tests.test_mcp_output_connections',

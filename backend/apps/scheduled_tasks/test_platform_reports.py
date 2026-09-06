@@ -53,7 +53,7 @@ class PlatformNativeReportTests(TestCase):
         )
         self.case = APITestCase.objects.create(
             project=self.project, endpoint=self.endpoint, title='Native case',
-            created_by=self.owner, script_content='config: {name: native}\nteststeps: []',
+            created_by=self.owner, script_content='{"config":{"name":"native"},"teststeps":[{"name":"health","request":{"method":"GET","url":"/health"}}]}',
         )
         self.scheduled_suite = APITestSuite.objects.create(
             name='Scheduled suite', user=self.owner, project=self.project,
@@ -187,7 +187,7 @@ class PlatformNativeReportTests(TestCase):
     def test_api_suite_runner_executes_each_snapshot_case_once(self):
         second_case = APITestCase.objects.create(
             project=self.project, endpoint=self.endpoint, title='Second native case',
-            created_by=self.owner, script_content='config: {name: second}\nteststeps: []',
+            created_by=self.owner, script_content=self.case.script_content,
         )
         suite = APITestSuite.objects.create(name='One-run suite', user=self.owner, project=self.project)
         suite.test_cases.add(self.case, second_case)
@@ -205,7 +205,9 @@ class PlatformNativeReportTests(TestCase):
 
         task_instance = SimpleNamespace(update_state=lambda **kwargs: None)
         runner_result = {'success': True, 'log': 'runner completed'}
-        with patch('api_testing.httprunner_runner.httprunner_runner', return_value=runner_result) as runner:
+        from api_testing.execution_snapshots import capture_suite_snapshot
+        capture_suite_snapshot(execution, suite, self.environment)
+        with patch('api_testing.execution_service.requests_runner', return_value=runner_result) as runner:
             result = _execute_api_suite_logic(
                 task_instance, execution.id, suite.id, self.environment.id,
             )

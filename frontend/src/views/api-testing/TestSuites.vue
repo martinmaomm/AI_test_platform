@@ -457,6 +457,10 @@
                 可直接输入自定义标签名并回车创建，不限于预置选项
               </div>
             </el-form-item>
+            <el-form-item label="套件变量" prop="variables">
+              <p class="suite-variables-hint">套件变量会覆盖用例变量；仅影响套件执行时的变量解析，不改变用例原始配置。</p>
+              <KeyValueRows v-model="suiteForm.variables" typed key-placeholder="变量名" value-placeholder="变量值" />
+            </el-form-item>
           </el-form>
         </el-tab-pane>
         
@@ -756,7 +760,8 @@
           </div>
           <div class="drawer-section">
             <h4 class="drawer-section-title">高级配置</h4>
-            <p class="drawer-section-desc">全局 Headers、环境变量等可在执行时或项目环境中配置。</p>
+            <p class="drawer-section-desc">套件变量会覆盖用例变量；全局 Headers、环境变量等可在执行时或项目环境中配置。</p>
+            <KeyValueRows v-model="suiteForm.variables" typed key-placeholder="变量名" value-placeholder="变量值" />
           </div>
         </el-form>
       </template>
@@ -794,6 +799,7 @@ import { getTaskStatus } from '@/api/apiTesting'
 import Draggable from 'vuedraggable'
 import TaskEditDialog from '@/components/scheduledTasks/TaskEditDialog.vue'
 import CaseSelector from '@/components/api-testing/CaseSelector.vue'
+import KeyValueRows from '@/components/api-workspace/KeyValueRows.vue'
 
 // 路由实例
 const router = useRouter()
@@ -875,7 +881,8 @@ const suiteForm = ref({
   name: '',
   description: '',
   status: 'active',
-  tags: []
+  tags: [],
+  variables: {}
 })
 
 const executeForm = ref({
@@ -1443,7 +1450,7 @@ const createScheduledTask = (suite) => {
 /** 打开新建弹窗，强制重置所有状态，防止残留上次编辑数据 */
 const openCreateDialog = () => {
   editingSuite.value  = null
-  suiteForm.value     = { name: '', description: '', status: 'active', tags: [] }
+  suiteForm.value     = { name: '', description: '', status: 'active', tags: [], variables: {} }
   activeTab.value     = 'basic'
   pendingCaseIds.value = []
   pendingCases.value   = []
@@ -1459,7 +1466,8 @@ const editTestSuite = async (suite) => {
       name: response.data.name,
       description: response.data.description || '',
       status: response.data.status,
-      tags: response.data.tags || []
+      tags: response.data.tags || [],
+      variables: response.data.variables || {}
     }
     showEditDrawer.value = true
   } catch (error) {
@@ -1590,7 +1598,7 @@ const saveTestSuite = async () => {
     editingSuite.value     = null
     pendingCaseIds.value   = []
     pendingCases.value     = []
-    suiteForm.value        = { name: '', description: '', status: 'active', tags: [] }
+    suiteForm.value        = { name: '', description: '', status: 'active', tags: [], variables: {} }
     loadTestSuites()
   } catch (error) {
     console.error('保存测试套件失败:', error)
@@ -2949,4 +2957,3 @@ onUnmounted(() => {
   }
 }
 </style>
-

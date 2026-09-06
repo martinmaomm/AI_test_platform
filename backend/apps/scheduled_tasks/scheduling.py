@@ -273,6 +273,8 @@ def _create_api_snapshot(task: ScheduledTask, suite):
         )
         for test_case in test_cases
     ])
+    from api_testing.execution_snapshots import capture_suite_snapshot
+    capture_suite_snapshot(execution, suite, task.environment)
     return execution
 
 

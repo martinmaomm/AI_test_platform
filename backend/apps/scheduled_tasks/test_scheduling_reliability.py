@@ -45,7 +45,7 @@ class ScheduledRunReliabilityTests(TestCase):
         )
         self.case = APITestCase.objects.create(
             project=self.project, endpoint=endpoint, title='Health case',
-            created_by=self.user, script_content='config: {name: health}\nteststeps: []',
+            created_by=self.user, script_content='{"config":{"name":"health"},"teststeps":[{"name":"health","request":{"method":"GET","url":"/health"}}]}',
         )
         self.first_suite = self.make_suite('First')
         self.second_suite = self.make_suite('Second')
@@ -182,12 +182,12 @@ class ScheduledRunReliabilityTests(TestCase):
         self.assertEqual(log.linked_executions[1]['serial_dispatch_state'], 'queued')
         enqueue.assert_called_once_with(log.id, second['execution_id'])
 
-    def test_api_environment_lookup_failure_marks_terminal_and_advances(self):
+    def test_api_environment_id_change_uses_snapshot_and_advances(self):
         log, _ = self.reserve()
         first, second = log.linked_executions
         task_instance = SimpleNamespace(update_state=lambda **kwargs: None)
 
-        with patch('scheduled_tasks.scheduling._enqueue_suite_dispatch') as enqueue, self.captureOnCommitCallbacks(execute=True):
+        with patch('api_testing.execution_service.requests_runner', return_value={'success': True, 'status': 'passed'}), patch('scheduled_tasks.scheduling._enqueue_suite_dispatch') as enqueue, self.captureOnCommitCallbacks(execute=True):
             result = _execute_api_test_suite(
                 task_instance,
                 first['execution_id'],
@@ -196,9 +196,9 @@ class ScheduledRunReliabilityTests(TestCase):
                 log.id,
             )
 
-        self.assertEqual(result['execution_status'], 'failed')
+        self.assertEqual(result['execution_status'], 'passed')
         log.refresh_from_db()
-        self.assertEqual(APITestExecution.objects.get(pk=first['execution_id']).status, 'failed')
+        self.assertEqual(APITestExecution.objects.get(pk=first['execution_id']).status, 'passed')
         self.assertEqual(log.linked_executions[0]['serial_dispatch_state'], 'finished')
         self.assertEqual(log.linked_executions[1]['serial_dispatch_state'], 'queued')
         enqueue.assert_called_once_with(log.id, second['execution_id'])

@@ -200,7 +200,7 @@ const MENU_CONFIG = {
     items: [
       { path: '/api-testing/function-navigation', label: 'API功能导航' },
       { path: '/api-testing/api-specs', label: 'API规范管理' },
-      { path: '/api-testing/scenario-generator', label: 'AI场景智能体' },
+      { path: '/api-testing/workspace', label: 'API对话工作区' },
       {
         path: '/api-testing/test-cases',
         label: '测试用例管理',

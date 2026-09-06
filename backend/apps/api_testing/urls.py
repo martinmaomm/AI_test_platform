@@ -7,6 +7,7 @@ from .views import (
     DebugScenarioStepsView
 )
 from rest_framework import routers
+from .workspace_urls import urlpatterns as workspace_urlpatterns
 
 app_name = 'api_testing'
 
@@ -27,12 +28,6 @@ urlpatterns = [
     path('api-specs/<int:spec_id>/endpoints/<int:endpoint_id>/test-cases/', views.EndpointTestCasesView.as_view(), name='get_endpoint_test_cases'),
     # 批量更新端点测试用例排序（拖拽后持久化）
     path('api-specs/<int:spec_id>/endpoints/<int:endpoint_id>/test-cases/order/', views.EndpointTestCasesOrderView.as_view(), name='update_endpoint_test_cases_order'),
-
-    # 生成指定API文档中的指定端点测试用例
-    path('generate-test-cases/<int:spec_id>/endpoint/<int:endpoint_id>/', views.EndpointTestGenerationView.as_view(), name='generate_endpoint_test_cases'),
-
-    # 智能场景生成
-    path('generate-scenario/', views.ScenarioGenerateView.as_view(), name='generate-scenario'),
 
     # 统一的任务状态查询接口
     path('task-status/<str:task_id>/', TaskStatusView.as_view(), name='task-status'),
@@ -66,3 +61,6 @@ urlpatterns = [
     path('debug-scenario-steps/', DebugScenarioStepsView.as_view(), name='debug-scenario-steps'),
     
 ]
+
+# Kept in a dedicated module so the durable workspace does not alter legacy views.
+urlpatterns += workspace_urlpatterns

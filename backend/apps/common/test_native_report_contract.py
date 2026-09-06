@@ -34,11 +34,13 @@ class NativeReportContractTests(SimpleTestCase):
                 raise RuntimeError('External connections forbidden in dependency smoke test')
             socket.socket.connect = blocked
             socket.socket.connect_ex = blocked
-            from httprunner import HttpRunner
-            from api_testing.httprunner_runner import ExecutionConfig as APIConfig
+            from api_testing.requests_runner import requests_runner
+            from api_testing.case_contract import export_python
             from web_testing.playwright_python_runner import ExecutionConfig as WebConfig
             from web_testing.script_contract import materialize_script
-            assert not hasattr(APIConfig(), 'generate_allure')
+            assert callable(requests_runner)
+            api_source = export_python({'config': {'name': 'health'}, 'teststeps': [{'name': 'health', 'request': {'method': 'GET', 'url': 'https://example.test'}}]})
+            compile(api_source, '<api-export>', 'exec')
             assert not hasattr(WebConfig(), 'generate_allure')
             source = materialize_script("async def run(page):\\n    await page.goto('http://127.0.0.1/')\\n    assert 1 == 1\\n", 'test_native_report')
             compile(source, '<generated>', 'exec')

@@ -17,6 +17,9 @@
 
     <!-- 右侧编排画板 -->
     <div class="right-panel" v-loading="loadingDetail">
+      <div v-if="currentScenario" class="workspace-action">
+        <el-button type="primary" plain size="small" :disabled="loadingDetail" @click="openAIWorkspace">在 AI 工作区编辑 / 查看 Python</el-button>
+      </div>
       <ScenarioOrchestrator
         v-if="currentScenario && !loadingDetail"
         :key="currentScenario.id"
@@ -38,7 +41,7 @@
 
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { Connection } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
@@ -47,6 +50,7 @@ import ScenarioList from '@/components/scenario/ScenarioList.vue'
 import ScenarioOrchestrator from '@/components/scenario/ScenarioOrchestrator.vue'
 
 const route = useRoute()
+const router = useRouter()
 const scenarioListRef = ref(null)
 
 const projectStore = useProjectStore()
@@ -55,6 +59,14 @@ const currentProjectId = computed(() => projectStore.currentProjectId)
 const currentScenario = ref(null)
 const loadingDetail = ref(false)
 const orchestratorRef = ref(null)
+
+const openAIWorkspace = () => {
+  if (orchestratorRef.value?.isDirty) {
+    ElMessage.warning('请先保存当前场景修改，再进入 AI 工作区。')
+    return
+  }
+  router.push({ path: '/api-testing/workspace', query: { case_id: currentScenario.value.id } })
+}
 
 // 左侧面板宽度（可拖动调整，默认 280，范围 200-560）
 const leftWidth = ref(280)
@@ -196,6 +208,13 @@ onMounted(async () => {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+
+.workspace-action {
+  padding: 8px 12px;
+  flex-shrink: 0;
+  text-align: right;
+  border-bottom: 1px solid var(--el-border-color-light);
 }
 
 .empty-state {

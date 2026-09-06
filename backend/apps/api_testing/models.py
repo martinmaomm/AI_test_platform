@@ -222,7 +222,7 @@ class APITestCase(models.Model):
         help_text=_('测试类型（仅端点测试用例需要）')
     )
     
-    # HttpRunner脚本内容（唯一执行逻辑数据源）
+    # 结构化 API 用例（config/teststeps，唯一执行逻辑数据源）
     script_content = models.TextField(_('script content'), blank=True)
     
     # 执行配置
@@ -304,6 +304,60 @@ class APITestCase(models.Model):
             return {}
 
 
+def default_api_workspace_draft():
+    """Return a fresh, editor-compatible API case contract."""
+    return {
+        'version': 1,
+        'config': {'name': '', 'base_url': '', 'variables': {}, 'verify': True},
+        'teststeps': [],
+    }
+
+
+class APIWorkspace(models.Model):
+    """An owner-scoped, revisioned draft for the requests-based API workspace."""
+
+    class Status(models.TextChoices):
+        IDLE = 'idle', _('Idle')
+        GENERATING = 'generating', _('Generating')
+        DEBUGGING = 'debugging', _('Debugging')
+        READY = 'ready', _('Ready')
+        FAILED = 'failed', _('Failed')
+
+    project = models.ForeignKey('projects.Project', on_delete=models.CASCADE, related_name='api_workspaces')
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='api_workspaces')
+    saved_case = models.ForeignKey(
+        APITestCase, on_delete=models.SET_NULL, null=True, blank=True, related_name='workspaces',
+    )
+    title = models.CharField(max_length=200, blank=True)
+    model_id = models.PositiveBigIntegerField(null=True, blank=True)
+    endpoint_ids = models.JSONField(default=list, blank=True)
+    draft = models.JSONField(default=default_api_workspace_draft, blank=True)
+    revision = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.IDLE, db_index=True)
+    error = models.TextField(blank=True)
+    messages = models.JSONField(default=list, blank=True)
+    candidate = models.JSONField(null=True, blank=True)
+    debug_result = models.JSONField(default=dict, blank=True)
+    # Internal queued input. It is never returned by the workspace representation.
+    debug_snapshot = models.JSONField(default=dict, blank=True)
+    debug_revision = models.PositiveIntegerField(null=True, blank=True)
+    saved_case_updated_at = models.DateTimeField(null=True, blank=True)
+    task_id = models.CharField(max_length=128, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'api_workspaces'
+        ordering = ['-updated_at']
+        indexes = [
+            models.Index(fields=['project', 'owner', '-updated_at']),
+            models.Index(fields=['status']),
+        ]
+
+    def __str__(self):
+        return self.title or f'API workspace {self.pk}'
+
+
 
 
 # ============ API测试套件 ============
@@ -325,6 +379,7 @@ class APITestSuite(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active', verbose_name="状态")
     tags = models.JSONField(default=list, blank=True, verbose_name="标签")
     test_case_order = models.JSONField(default=list, blank=True, verbose_name="用例执行顺序")
+    variables = models.JSONField(default=dict, blank=True, verbose_name="套件变量")
     
     # 关联信息
     user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="创建用户")
@@ -420,6 +475,7 @@ class APITestExecution(models.Model):
     
     # 执行日志和结果
     execution_log = models.TextField(blank=True, null=True, verbose_name="执行日志")
+    input_snapshot = models.JSONField(default=dict, blank=True, verbose_name="执行输入快照")
     error_message = models.TextField(blank=True, null=True, verbose_name="错误信息")
     retry_count = models.IntegerField(default=0, verbose_name="重试次数")
     

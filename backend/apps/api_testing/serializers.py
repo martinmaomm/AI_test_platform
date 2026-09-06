@@ -122,8 +122,7 @@ class APITestCaseSerializer(serializers.ModelSerializer):
         try:
             # 首先尝试通过APITestCaseExecutionDetail查找
             latest_execution_detail = APITestCaseExecutionDetail.objects.filter(
-                test_case__title=obj.title,  # 通过标题匹配
-                test_case__project=obj.project  # 确保是同一个项目
+                test_case=obj,
             ).order_by('-execution__created_at').first()
             
             if latest_execution_detail:
@@ -134,10 +133,10 @@ class APITestCaseSerializer(serializers.ModelSerializer):
                     'duration': execution.duration or 0,
                     'created_at': execution.created_at,
                     'httprunner_success': execution.status == 'passed',
-                    'total_steps': 1,  # 单用例执行只有1个步骤
-                    'success_steps': 1 if execution.status == 'passed' else 0,
-                    'failure_steps': 1 if execution.status == 'failed' else 0,
-                    'error_steps': 1 if execution.status == 'error' else 0
+                    'total_steps': execution.total_steps,
+                    'success_steps': execution.success_steps,
+                    'failure_steps': execution.failure_steps,
+                    'error_steps': execution.error_steps
                 }
         except Exception:
             # 如果查询失败，返回None
@@ -193,8 +192,7 @@ class APITestCaseDetailSerializer(serializers.ModelSerializer):
         try:
             # 首先尝试通过APITestCaseExecutionDetail查找
             latest_execution_detail = APITestCaseExecutionDetail.objects.filter(
-                test_case__title=obj.title,  # 通过标题匹配
-                test_case__project=obj.project  # 确保是同一个项目
+                test_case=obj,
             ).order_by('-execution__created_at').first()
             
             if latest_execution_detail:
@@ -205,10 +203,10 @@ class APITestCaseDetailSerializer(serializers.ModelSerializer):
                     'duration': execution.duration or 0,
                     'created_at': execution.created_at,
                     'httprunner_success': execution.status == 'passed',
-                    'total_steps': 1,  # 单用例执行只有1个步骤
-                    'success_steps': 1 if execution.status == 'passed' else 0,
-                    'failure_steps': 1 if execution.status == 'failed' else 0,
-                    'error_steps': 1 if execution.status == 'error' else 0
+                    'total_steps': execution.total_steps,
+                    'success_steps': execution.success_steps,
+                    'failure_steps': execution.failure_steps,
+                    'error_steps': execution.error_steps
                 }
         except Exception:
             # 如果查询失败，返回None
@@ -555,7 +553,7 @@ class APITestSuiteSerializer(serializers.ModelSerializer):
             # 关联信息
             'user', 'user_name', 'project', 'project_name',
             # 套件属性
-            'status', 'status_display', 'tags',
+            'status', 'status_display', 'tags', 'variables', 'test_case_order',
             # 统计信息
             'test_cases_count', 'active_test_cases_count', 'test_cases',
             # 时间信息
@@ -573,11 +571,12 @@ class APITestSuiteSerializer(serializers.ModelSerializer):
 
 class APITestSuiteCreateSerializer(serializers.ModelSerializer):
     """API测试套件创建序列化器"""
+    variables = serializers.DictField(required=False, default=dict)
     
     class Meta:
         model = APITestSuite
         fields = [
-            'name', 'description', 'status', 'tags'
+            'name', 'description', 'status', 'tags', 'variables'
         ]
         extra_kwargs = {
             'name': {'required': True},
@@ -595,11 +594,12 @@ class APITestSuiteCreateSerializer(serializers.ModelSerializer):
 
 class APITestSuiteUpdateSerializer(serializers.ModelSerializer):
     """API测试套件更新序列化器（含 test_case_order 用于拖拽排序）"""
+    variables = serializers.DictField(required=False)
     
     class Meta:
         model = APITestSuite
         fields = [
-            'name', 'description', 'status', 'tags', 'test_case_order'
+            'name', 'description', 'status', 'tags', 'test_case_order', 'variables'
         ]
         extra_kwargs = {
             'name': {'required': False},

@@ -96,14 +96,13 @@
 
         <template #footer>
           <div class="file-card-actions">
-            <!-- 等待处理状态：显示AI生成测试按钮 -->
+            <!-- 旧生成入口统一转入可确认的对话工作区。 -->
             <el-button v-if="spec.status === 'pending'" type="primary" size="small" plain
-              @click.stop="generateTests(spec)" :disabled="aiGeneratingStates.get(spec.id)"
-              :loading="aiGeneratingStates.get(spec.id)" class="action-btn">
-              <el-icon v-if="!aiGeneratingStates.get(spec.id)">
+              @click.stop="generateTests(spec)" class="action-btn">
+              <el-icon>
                 <Star />
               </el-icon>
-              <span>{{ aiGeneratingStates.get(spec.id) ? '正在加载中...' : 'AI生成测试' }}</span>
+              <span>进入 API 工作区</span>
             </el-button>
 
             <!-- 处理完成状态：显示AI生成测试按钮 -->
@@ -430,8 +429,7 @@ const viewSpec = (spec) => {
 
 // 跳转函数
 const goToScenarioGenerator = () => {
-  ElMessage.info('跳转到智能场景生成器')
-  router.push('/api-testing/scenario-generator')
+  router.push('/api-testing/workspace')
 }
 
 const goToAITestGenerator = () => {
@@ -446,45 +444,7 @@ const goToWorkflow = () => {
 
 // 生成测试用例
 const generateTests = async (spec) => {
-  try {
-    // 立即设置该spec的AI生成状态为true，禁用按钮并显示加载状态
-    aiGeneratingStates.value.set(spec.id, true)
-
-    // 显示成功消息
-    ElMessage.success('AI生成测试已启动，请稍候...')
-
-    selectedSpec.value = spec
-    showGeneratorDialog.value = true
-
-    // 监听任务开始事件，获取任务ID并开始轮询
-    const handleTaskStart = (event) => {
-      const taskId = event.detail?.taskId
-      const specId = event.detail?.specId
-
-      if (taskId && specId === spec.id) {
-        console.log(`开始轮询任务 ${taskId} for spec ${specId}`)
-        activeTaskIds.value.set(specId, taskId)
-        pollTaskStatus(specId, taskId)
-
-        // 移除事件监听器
-        document.removeEventListener('ai-task-started', handleTaskStart)
-      }
-    }
-
-    // 监听任务开始事件
-    document.addEventListener('ai-task-started', handleTaskStart)
-
-    // 设置超时，防止事件监听器泄漏
-    setTimeout(() => {
-      document.removeEventListener('ai-task-started', handleTaskStart)
-    }, 30000) // 30秒后清除监听器
-
-  } catch (error) {
-    console.error('启动AI生成测试失败:', error)
-    // 发生错误时也要重置状态
-    aiGeneratingStates.value.set(spec.id, false)
-    ElMessage.error('启动AI生成测试失败')
-  }
+  router.push('/api-testing/workspace')
 }
 
 // 删除规范

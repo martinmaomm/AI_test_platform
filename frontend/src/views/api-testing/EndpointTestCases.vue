@@ -10,9 +10,10 @@
           plain
           size="small"
           :icon="Connection"
+          :disabled="selectedTestCases.length !== 1"
           @click="handleGenerateScenario"
         >
-          一键编排为场景
+          AI 编辑选中用例
         </el-button>
         <el-button
           type="success"
@@ -844,102 +845,8 @@ const duplicateTestCase = async (testCase) => {
 // ===== 一键编排为场景 =====
 const handleGenerateScenario = async () => {
   const selectedList = selectedTestCases.value
-  if (!selectedList.length) return
-
-  // 第一步：提示用户输入场景名称
-  let scenarioTitle
-  try {
-    const { value } = await ElMessageBox.prompt(
-      `已选 ${selectedList.length} 个端点用例，请输入新场景名称：`,
-      '一键编排为场景',
-      {
-        confirmButtonText: '开始编排',
-        cancelButtonText: '取消',
-        inputPlaceholder: '如：注册登录下单核心链路',
-        inputValidator: (v) => (v?.trim() ? true : '场景名称不能为空'),
-      }
-    )
-    scenarioTitle = value.trim()
-  } catch {
-    return // 用户取消
-  }
-
-  // 第二步：批量拉取完整详情
-  const loading = ElLoading.service({ text: '正在拉取用例数据…', background: 'rgba(0,0,0,0.4)' })
-  try {
-    const projectId = currentProjectId.value
-    const details = await Promise.allSettled(
-      selectedList.map(tc => getAPITestCase(projectId, tc.id))
-    )
-
-    // 第三步：拼装场景 script_content
-    const scenarioScript = {
-      config: {
-        name: scenarioTitle,
-        base_url: '',
-        variables: {},
-      },
-      teststeps: [],
-    }
-
-    let skipped = 0
-    for (const result of details) {
-      if (result.status !== 'fulfilled') { skipped++; continue }
-      const tcDetail = result.value?.data ?? result.value
-      try {
-        let sc = tcDetail?.script_content
-        if (!sc) { skipped++; continue }
-        if (typeof sc === 'string') sc = JSON.parse(sc)
-        const steps = sc?.teststeps
-        if (!Array.isArray(steps) || steps.length === 0) { skipped++; continue }
-        const step = JSON.parse(JSON.stringify(steps[0])) // 深拷贝
-        scenarioScript.teststeps.push(step)
-      } catch {
-        skipped++
-      }
-    }
-
-    if (scenarioScript.teststeps.length === 0) {
-      ElMessage.warning('所有选中用例均无法解析出步骤，编排中止')
-      return
-    }
-
-    // 第四步：调用创建接口
-    loading.setText('正在创建场景用例…')
-    // 注意：序列化器 validate() 规定 scenario 类型
-    //   - endpoint 必须为空（不传）
-    //   - test_type 必须为空（不传）
-    //   否则会触发 400 校验失败
-    const payload = {
-      title: scenarioTitle,
-      test_case_type: 'scenario',
-      priority: 'medium',
-      description: '通过一键编排功能生成的场景用例',
-      timeout: 10,
-      retry_count: 0,
-      script_content: JSON.stringify(scenarioScript),
-    }
-    const importedCount = scenarioScript.teststeps.length
-    const res = await createAPITestCase(projectId, payload)
-    const newId = res?.data?.id ?? res?.id
-
-    const successMsg = skipped > 0
-      ? `场景编排成功！共导入 ${importedCount} 步（${skipped} 个用例跳过）`
-      : `场景编排成功！共导入 ${importedCount} 步`
-    ElMessage.success(successMsg)
-
-    clearSelection()
-
-    // 跳转到场景测试用例页面，并通过 query 高亮新建的场景
-    router.push({
-      name: 'ScenarioTestCases',
-      query: newId ? { scenario_id: newId } : undefined,
-    })
-  } catch (e) {
-    ElMessage.error('编排失败：' + (e?.response?.data?.detail || e?.message || '未知错误'))
-  } finally {
-    loading.close()
-  }
+  if (selectedList.length !== 1) return
+  router.push({ path: '/api-testing/workspace', query: { case_id: selectedList[0].id } })
 }
 
 // ===== 加入测试套件（含智能防呆拦截） =====

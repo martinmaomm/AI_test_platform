@@ -11,7 +11,6 @@ import logging
 import json
 import time
 
-from httprunner import HttpRunner
 from common.api import response
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,6 @@ from .models import (
     APITestSuiteExecutionDetail, APITestSuiteCaseExecution
 )
 from projects.models import Environment
-from .tasks import generate_endpoint_test_cases_async, generate_scenario_async
 from .serializers import (
     APISpecificationSerializer, APISpecificationCreateSerializer,
     APITestCaseSerializer, APITestCaseDetailSerializer, APITestCaseCreateSerializer,
@@ -439,147 +437,6 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
         )
 
 
-class EndpointTestGenerationView(APIView):
-    """端点测试用例生成视图类"""
-    
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def post(self, request, project_id, spec_id: int, endpoint_id: int):
-        """为指定API规范中的指定端点异步生成测试用例"""
-        # 1. 获取并验证API规范
-        api_spec = get_object_or_404(APISpecification, id=spec_id)
-
-        # 2. 获取并验证端点
-        endpoint = get_object_or_404(APIEndpoint, id=endpoint_id, spec=api_spec)
-
-        # 3. 检查权限 - 用户必须是项目创建者或成员
-        project = api_spec.project
-        if not (project.created_by == request.user or
-                project.members.filter(user=request.user, can_edit=True).exists()):
-            return response(
-                kind="permission_denied",
-                message="没有权限访问此API规范"
-            )
-
-        # 4. 验证请求数据
-        serializer = EndpointTestGenerationSerializer(data=request.data)
-        if not serializer.is_valid():
-            return response(
-                kind="validation_error",
-                errors=serializer.errors,
-                message="请求数据验证失败"
-            )
-
-        # 获取测试类型配置
-        test_type_configs = serializer.validated_data.get('test_type_configs', {})
-
-        # 5. 检查LLM配置是否可用
-        if not LLMConfiguration.objects.filter(is_active=True).exists():
-            return response(
-                kind="error",
-                message="数据库中没有可用的LLM配置，请先创建并配置LLM"
-            )
-
-        # 6. 启动Celery异步任务
-        logger.info(f"启动异步任务为端点 {endpoint_id} 生成测试用例，配置: {test_type_configs}")
-
-        task = generate_endpoint_test_cases_async.delay(
-            spec_id=spec_id,
-            endpoint_id=endpoint_id,
-            test_type_configs=test_type_configs,
-            user_id=request.user.id
-        )
-
-        # 7. 准备响应数据
-        response_data = {
-            'task_id': str(task.id),
-            'status': 'PROCESSING',
-            'task_info': {
-                'spec_id': spec_id,
-                'endpoint_id': endpoint_id,
-                'endpoint_path': endpoint.path,
-                'endpoint_method': endpoint.method,
-                'test_type_configs': test_type_configs,
-                'include_assertions': serializer.validated_data.get('include_assertions', True),
-                'include_negative_cases': serializer.validated_data.get('include_negative_cases', True),
-                'custom_prompt': serializer.validated_data.get('custom_prompt', '')
-            }
-        }
-
-        logger.info(f"成功启动异步任务 {task.id} 为端点 {endpoint_id} 生成测试用例")
-
-        return response(
-            kind="success",
-            data=response_data,
-            message=f"AI测试用例生成任务已启动，任务ID: {task.id}"
-        )
-
-
-class ScenarioGenerateView(APIView):
-    """智能场景生成API视图"""
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request, project_id):
-        """生成智能场景测试用例"""
-        user_request = request.data.get('user_request')
-
-        if not user_request:
-            return response(
-                kind="error",
-                message="必须提供业务场景描述"
-            )
-
-        # 使用URL路径参数中的项目ID
-        if not project_id:
-            return response(
-                kind="error",
-                message="项目ID未提供"
-            )
-
-        # 获取项目对象
-        project = get_object_or_404(Project, id=project_id)
-
-        # 检查用户权限
-        if not (project.created_by == request.user or
-                project.members.filter(user=request.user, can_edit=True).exists()):
-            return response(
-                kind="permission_denied",
-                message="您没有该项目的编辑权限"
-            )
-
-        # 检查项目资源
-        if not APISpecification.objects.filter(project=project).exists():
-            return response(
-                kind="error",
-                message="项目中没有API规范，请先上传API规范文件"
-            )
-
-        # 检查LLM配置
-        if not LLMConfiguration.objects.filter(is_active=True).exists():
-            return response(
-                kind="error",
-                message="数据库中没有可用的LLM配置，请先创建并配置LLM"
-            )
-
-        # 启动异步任务
-        task = generate_scenario_async.delay(
-            project_id=project_id,
-            user_request=user_request,
-            user_id=request.user.id
-        )
-
-        logger.info(f"智能场景生成任务已启动，任务ID: {task.id}")
-
-        return response(
-            kind="success",
-            message='智能场景生成任务已启动',
-            data={
-                'task_id': task.id,
-                'status': 'PROCESSING',
-                'progress': 0,
-                'message_detail': '正在初始化场景生成...'
-            }
-        )
 
 
 class APITestCaseListCreateView(generics.ListCreateAPIView):
@@ -836,188 +693,7 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
             )
 
 # 单个测试用例执行视图
-class ExecuteAPITestCaseView(APIView):
-    """单个API测试用例执行视图"""
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, project_id, pk):
-        """执行单个测试用例（支持同步和异步模式）"""
-        try:
-            # 获取测试用例
-            test_case = get_object_or_404(APITestCase, pk=pk)
-            
-            # 检查权限
-            if not (test_case.project.created_by == request.user or 
-                    test_case.project.members.filter(user=request.user, can_execute_tests=True).exists()):
-                return response(
-                    kind="permission_denied",
-                    message="没有权限执行此测试用例"
-                )
-            
-            # 检查是否是同步执行模式（默认为异步）
-            is_sync = request.data.get('sync', False)
-            
-            # 如果是同步模式，直接使用httprunner执行并返回结果
-            if is_sync:
-                return self._execute_sync(test_case, request.data)
-            
-            # 异步模式：使用原有的Celery任务逻辑
-            # 从请求数据中获取环境ID
-            environment_id = request.data.get('environment_id')
-            
-            if not environment_id:
-                return response(
-                    kind="error",
-                    message="必须指定测试环境ID"
-                )
-            
-            # 获取环境
-            try:
-                environment = Environment.objects.get(
-                    id=environment_id,
-                    project=test_case.project,
-                    is_active=True
-                )
-            except Environment.DoesNotExist:
-                return response(
-                    kind="error",
-                    message="指定的测试环境不存在或已被禁用"
-                )
-            
-            # 创建测试执行记录（使用新的模型结构）
-            execution_type = 'scenario' if test_case.test_case_type == 'scenario' else 'case'
-            execution = APITestExecution.objects.create(
-                exec_type=execution_type,
-                name=test_case.title,
-                description=test_case.description,
-                status='pending',
-                trigger_type='manual',
-                executor=request.user,
-                environment=environment,
-                project_id=project_id
-            )
-            
-            # 创建单用例执行详情（使用get_or_create避免重复创建）
-            case_detail, created = APITestCaseExecutionDetail.objects.get_or_create(
-                execution=execution,
-                defaults={
-                    'test_case': test_case,
-                    'name': test_case.title,
-                    'status': 'pending'
-                }
-            )
-            
-            # 如果已存在，更新基本信息（防止数据不一致）
-            if not created:
-                case_detail.test_case = test_case
-                case_detail.name = test_case.title
-                if case_detail.status == 'pending':
-                    case_detail.status = 'pending'
-                case_detail.save()
-            
-            # 启动异步任务执行测试用例
-            from api_testing.tasks import execute_api_test_case_async
-            task = execute_api_test_case_async.delay(execution.id, test_case.id, environment.id)
-            
-            # 更新执行记录的任务ID
-            execution.task_id = task.id
-            execution.save()
-            
-            logger.info(f"开始执行测试用例 {pk}, 执行记录ID: {execution.id}, 任务ID: {task.id}")
-            
-            return response(
-                kind="success",
-                data={
-                    "execution_id": execution.id,
-                    "task_id": task.id,
-                    "execution_name": test_case.title,
-                    "exec_type": execution.exec_type,
-                    "environment_name": environment.name
-                },
-                message="场景执行已开始" if execution_type == 'scenario' else "测试用例执行已开始"
-            )
-            
-        except Exception as e:
-            logger.error(f"执行测试用例失败: {e}", exc_info=True)
-            return response(
-                kind="error",
-                message=f"执行测试用例失败: {str(e)}"
-            )
-    
-    def _execute_sync(self, test_case, request_data):
-        """同步执行测试用例（用于Postman风格的立即执行）"""
-        from api_testing.httprunner_runner import execute_api_test_case
-        from projects.models import Environment
-        
-        try:
-            # 获取执行参数
-            base_url = request_data.get('base_url', '')
-            script_content = request_data.get('script_content', '')
-            environment_id = request_data.get('environment_id')
-            
-            # 如果没有提供script_content，使用测试用例的script_content
-            if not script_content:
-                script_content = test_case.script_content
-            
-            if not script_content:
-                return response(
-                    kind="error",
-                    message="测试用例没有脚本内容"
-                )
-            
-            # 构建环境配置
-            environment_config = {
-                'base_url': base_url,
-                'timeout': request_data.get('timeout', 30),
-                'headers': request_data.get('headers', {}),
-                'variables': request_data.get('variables', {}),
-            }
-
-            logger.info(f"同步执行测试用例 {test_case.id}, base_url: {base_url}")
-            
-            # 执行测试用例
-            result = execute_api_test_case(
-                test_case_id=test_case.id,
-                script_content=script_content,
-                environment=environment_config
-            )
-            
-            logger.info(f"测试用例 {test_case.id} 执行完成，success: {result.get('success')}")
-
-            # 自动保存脚本中更新的环境变量
-            try:
-                if environment_id and isinstance(result.get('pm_environment_variables'), dict):
-                    env = Environment.objects.get(id=environment_id, project=test_case.project)
-                    config = env.config or {}
-                    variables = config.get('variables') or {}
-                    if not isinstance(variables, dict):
-                        variables = {}
-                    variables.update(result.get('pm_environment_variables'))
-                    config['variables'] = variables
-                    env.config = config
-                    env.save(update_fields=['config'])
-                    
-            except Exception as save_error:
-                logger.warning(f"自动保存环境变量失败: {save_error}")
-            
-            # 返回执行结果
-            return response(
-                kind="success",
-                data=result,
-                message="测试执行完成"
-            )
-            
-        except Exception as e:
-            logger.error(f"同步执行测试用例失败: {e}", exc_info=True)
-            return response(
-                kind="error",
-                message=f"执行失败: {str(e)}",
-                data={
-                    'success': False,
-                    'error': str(e),
-                    'error_type': type(e).__name__
-                }
-            )
+from .execution_views import ExecuteAPITestCaseView
 
 
 class TestStatisticsView(APIView):
@@ -1325,11 +1001,12 @@ class APIEndpointOrderView(APIView):
 
 
 class TaskStatusView(APIView):
-    """统一任务状态查询视图 - 支持智能场景生成和端点测试用例生成"""
+    """查询当前项目可见的执行任务；工作区通过自己的详情接口查询。"""
     permission_classes = [IsAuthenticated]
 
     def get(self, request, project_id, task_id: str):
         """查询任务状态"""
+        get_object_or_404(_report_execution_queryset(request.user, project_id), task_id=task_id)
         from common.task import get_celery_task_status
         result = get_celery_task_status(task_id)
         if not result:
@@ -1617,96 +1294,7 @@ class APITestSuiteRemoveTestCaseView(APIView):
             )
 
 
-class ExecuteAPITestSuiteView(APIView):
-    """执行API测试套件视图"""
-    permission_classes = [IsAuthenticated]
-    
-    def post(self, request, project_id, pk):
-        """执行测试套件"""
-        try:
-            # 获取测试套件
-            test_suite = get_object_or_404(APITestSuite, pk=pk, user=request.user)
-            
-            # 检查套件是否有测试用例
-            if not test_suite.test_cases.exists():
-                return response(
-                    kind="error",
-                    message="测试套件中没有测试用例，无法执行"
-                )
-            
-            # 获取环境
-            environment_id = request.data.get('environment_id')
-            if not environment_id:
-                return response(
-                    kind="error",
-                    message="请选择执行环境"
-                )
-            
-            environment = get_object_or_404(Environment, pk=environment_id, project_id=project_id)
-            
-            # 创建执行记录
-            execution = APITestExecution.objects.create(
-                exec_type='suite',
-                name=test_suite.name,
-                description=test_suite.description,
-                status='pending',
-                trigger_type='manual',
-                executor=request.user,
-                environment=environment,
-                project_id=project_id
-            )
-            
-            # 创建套件执行详情
-            suite_detail = APITestSuiteExecutionDetail.objects.create(
-                execution=execution,
-                test_suite=test_suite,
-                test_suite_name=test_suite.name,
-                total_cases=test_suite.test_cases.count()
-            )
-            
-            # 创建子用例执行记录
-            order_list = test_suite.test_case_order or []
-            order_map = {case_id: index for index, case_id in enumerate(order_list)}
-            ordered_cases = sorted(
-                list(test_suite.test_cases.all()),
-                key=lambda case: (order_map.get(case.id, 10**9), case.id)
-            )
-            for test_case in ordered_cases:
-                APITestSuiteCaseExecution.objects.create(
-                    suite_execution=suite_detail,
-                    test_case=test_case,
-                    name=test_case.title,
-                    status='pending'
-                )
-            
-            # 启动异步任务执行测试套件
-            from api_testing.tasks import execute_api_test_suite_async
-            task = execute_api_test_suite_async.delay(execution.id, test_suite.id, environment.id)
-            
-            # 更新执行记录的任务ID
-            execution.task_id = task.id
-            execution.save()
-            
-            logger.info(f"开始执行测试套件 {pk}, 执行记录ID: {execution.id}, 任务ID: {task.id}")
-            
-            return response(
-                kind="success",
-                data={
-                    "execution_id": execution.id,
-                    "task_id": task.id,
-                    "test_suite_name": test_suite.name,
-                    "environment_name": environment.name,
-                    "total_cases": test_suite.test_cases.count()
-                },
-                message="测试套件执行已开始"
-            )
-            
-        except Exception as e:
-            logger.error(f"执行测试套件失败: {e}", exc_info=True)
-            return response(
-                kind="error",
-                message=f"执行测试套件失败: {str(e)}"
-            )
+from .execution_views import ExecuteAPITestSuiteView
 
 
 # ============ API测试执行记录管理视图 ============
@@ -1977,7 +1565,9 @@ class DebugScenarioStepsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, project_id):
-        from api_testing.httprunner_runner import httprunner_runner, _process_script_content
+        from api_testing.requests_runner import requests_runner
+        from .execution_views import execution_project
+        execution_project(request.user, project_id)
 
         config = request.data.get('config', {})
         teststeps = request.data.get('teststeps', [])
@@ -1986,7 +1576,7 @@ class DebugScenarioStepsView(APIView):
         if not teststeps:
             return response(kind="error", message="步骤列表不能为空")
 
-        # 构建临时 HttpRunner JSON
+        # 与持久工作区、正式执行使用相同的结构化请求契约。
         hrun_json = {
             'config': dict(config),
             'teststeps': teststeps
@@ -1998,10 +1588,9 @@ class DebugScenarioStepsView(APIView):
 
         try:
             # 从 config 中提取 headers 和 variables，通过 options 传入
-            # （HttpRunner TConfig 不支持 headers 字段，_process_script_content 需要从 options 读取）
             env_headers = config.get('headers') or {}
             env_variables = config.get('variables') or {}
-            result = httprunner_runner(
+            result = requests_runner(
                 script_id=f"debug_{project_id}",
                 script_content=script_content,
                 base_url=base_url or None,
@@ -2061,8 +1650,7 @@ class DebugScenarioStepsView(APIView):
             stat = data.get('stat') or {}
             elapsed_ms = stat.get('elapsed_ms') or stat.get('response_time_ms') or 0
 
-            # HttpRunner 将提取结果保存在 StepData.export_vars，
-            # 将断言明细保存在 SessionData.validators.validate_extractor。
+            # requests 结果沿用平台报告的提取与断言明细字段。
             extract_result = sd.get('export_vars') or {}
             validators = data.get('validators') or {}
             raw_validate_results = (
@@ -2088,6 +1676,8 @@ class DebugScenarioStepsView(APIView):
             step_responses.append({
                 'name': sd.get('name', ''),
                 'success': sd.get('success', False),
+                'status': sd.get('status', ''),
+                'error': sd.get('error', ''),
                 'extract_result': extract_result,
                 'validate_result': validate_result,
                 # --- response ---

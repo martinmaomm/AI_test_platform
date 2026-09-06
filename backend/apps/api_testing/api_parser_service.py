@@ -1,15 +1,18 @@
 """
 API规范解析服务
-使用prance库解析OpenAPI规范，并提供完整的API规范解析功能
+提供有界本地引用解析和 API 契约提取。
 """
+import copy
 import json
-import yaml
 import logging
 import os
-from typing import Dict, List, Any, Optional
-from django.core.files.storage import default_storage
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional
 
-from prance import ResolvingParser, ValidationError
+import yaml
+from django.core.files.storage import default_storage
+from django.db import transaction
+
 from openapi_spec_validator import validate_spec
 from openapi_spec_validator.exceptions import OpenAPISpecValidatorError
 
@@ -18,62 +21,89 @@ logger = logging.getLogger(__name__)
 
 class APIParserService:
     """API规范解析服务"""
-    
+
+    HTTP_METHODS = {'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'TRACE'}
+    PARAMETER_METADATA_KEYS = {
+        '$ref', 'name', 'in', 'description', 'required', 'deprecated', 'allowEmptyValue',
+        'style', 'explode', 'allowReserved', 'example', 'examples', 'content',
+    }
+    SCHEMA_MAPPING_KEYS = {
+        'additionalProperties', 'contains', 'contentSchema', 'else', 'if', 'items', 'not',
+        'propertyNames', 'then', 'unevaluatedItems', 'unevaluatedProperties',
+    }
+    SCHEMA_LIST_KEYS = {'allOf', 'anyOf', 'oneOf', 'prefixItems'}
+    SCHEMA_MAP_KEYS = {'$defs', 'dependentSchemas', 'patternProperties', 'properties'}
+
     def __init__(self):
         self.parser = None
-        self.parsed_spec = None  # 保存完整的解析后的规范，用于解析引用
-    
+        self.parsed_spec = None
+
     def _extract_structured_data(self, parsed_spec: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        从解析后的规范中提取结构化数据
-        
-        Args:
-            parsed_spec: 解析后的OpenAPI规范
-            
-        Returns:
-            结构化的API数据
-        """
-        # 支持 Swagger 2.0 的 definitions 和 OpenAPI 3.0 的 components/schemas
-        schemas = {}
-        if 'definitions' in parsed_spec:
-            # Swagger 2.0
-            schemas = parsed_spec.get('definitions', {})
-        elif 'components' in parsed_spec:
-            # OpenAPI 3.0
-            schemas = parsed_spec.get('components', {}).get('schemas', {})
-        
+        """将原始规范投影为端点数据，而不丢失可执行契约信息。"""
+        if not isinstance(parsed_spec, Mapping):
+            return {'endpoints': []}
+
+        components = parsed_spec.get('components', {})
+        components = components if isinstance(components, Mapping) else {}
+        schemas = parsed_spec.get('definitions', {}) or components.get('schemas', {}) or {}
         structured_data = {
             'info': parsed_spec.get('info', {}),
             'servers': parsed_spec.get('servers', []),
             'endpoints': [],
             'schemas': schemas,
-            'definitions': parsed_spec.get('definitions', {}),  # Swagger 2.0
-            'security_schemes': parsed_spec.get('components', {}).get('securitySchemes', {}),
-            'tags': parsed_spec.get('tags', [])
+            'definitions': parsed_spec.get('definitions', {}),
+            'security_schemes': components.get('securitySchemes', parsed_spec.get('securityDefinitions', {})),
+            'tags': parsed_spec.get('tags', []),
+            'consumes': copy.deepcopy(parsed_spec.get('consumes', [])),
+            'produces': copy.deepcopy(parsed_spec.get('produces', [])),
+            'security': copy.deepcopy(parsed_spec.get('security', [])),
         }
-        
-        # 提取端点信息
+
         paths = parsed_spec.get('paths', {})
-        for path, methods in paths.items():
-            for method, details in methods.items():
-                if method.upper() in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']:
-                    endpoint_data = self._extract_endpoint_data(path, method, details)
-                    structured_data['endpoints'].append(endpoint_data)
-        
+        if not isinstance(paths, Mapping):
+            return structured_data
+        for path, raw_path_item in paths.items():
+            path_item = self._resolve_reference_object(raw_path_item)
+            if not isinstance(path_item, Mapping):
+                continue
+            inherited_parameters = path_item.get('parameters', [])
+            for method, raw_operation in path_item.items():
+                if str(method).upper() not in self.HTTP_METHODS:
+                    continue
+                operation = self._resolve_reference_object(raw_operation)
+                if not isinstance(operation, Mapping):
+                    continue
+                structured_data['endpoints'].append(
+                    self._extract_endpoint_data(
+                        str(path), str(method), operation, inherited_parameters, parsed_spec,
+                    )
+                )
         return structured_data
-    
-    def _extract_endpoint_data(self, path: str, method: str, details: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        提取单个端点的详细信息
-        
-        Args:
-            path: 端点路径
-            method: HTTP方法
-            details: 端点详情
-            
-        Returns:
-            端点结构化数据
-        """
+
+    def _extract_endpoint_data(
+        self,
+        path: str,
+        method: str,
+        details: Dict[str, Any],
+        inherited_parameters: Any = None,
+        root_spec: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """提取一个操作，并应用 Path Item 参数覆盖规则。"""
+        root_spec = root_spec if isinstance(root_spec, Mapping) else {}
+        raw_parameters = self._merge_parameters(inherited_parameters, details.get('parameters', []))
+        parameters = self._extract_parameters(raw_parameters)
+        consumes = self._operation_value(details, root_spec, 'consumes')
+        produces = self._operation_value(details, root_spec, 'produces')
+        security = self._operation_value(details, root_spec, 'security')
+        request_body = self._extract_request_body(details.get('requestBody', {}))
+        request_body = self._convert_body_param_to_request_body(parameters, request_body, consumes)
+        operation_metadata = {
+            'consumes': consumes,
+            'produces': produces,
+            'security': security,
+        }
+        # APIEndpoint 没有独立 operation 元数据列；采用 JSON 扩展避免污染参数或媒体类型。
+        request_body['x-aits-operation'] = operation_metadata
         endpoint_data = {
             'path': path,
             'method': method.upper(),
@@ -81,137 +111,128 @@ class APIParserService:
             'description': details.get('description', ''),
             'operation_id': details.get('operationId', ''),
             'tags': details.get('tags', []),
-            'parameters': self._extract_parameters(details.get('parameters', [])),
-            'request_body': self._extract_request_body(details.get('requestBody', {})),
-            'responses': self._extract_responses(details.get('responses', {})),
-            'security': details.get('security', []),
-            'deprecated': details.get('deprecated', False)
+            'parameters': parameters,
+            'request_body': request_body,
+            'responses': self._extract_responses(details.get('responses', {}), produces),
+            'consumes': consumes,
+            'produces': produces,
+            'security': security,
+            'deprecated': details.get('deprecated', False),
         }
-        
         return endpoint_data
-    
+
+    def _operation_value(self, operation: Mapping[str, Any], root: Mapping[str, Any], key: str) -> Any:
+        """操作字段存在时（包含空数组）覆盖根级字段。"""
+        if key in operation:
+            return copy.deepcopy(operation[key])
+        return copy.deepcopy(root.get(key, []))
+
+    def _merge_parameters(self, inherited: Any, operation_parameters: Any) -> List[Any]:
+        """按 OpenAPI 的 ``in + name`` 规则合并 Path Item 与操作参数。"""
+        merged: List[Any] = []
+        positions: Dict[tuple[str, str], int] = {}
+        for parameter in list(inherited or []) + list(operation_parameters or []):
+            resolved = self._resolve_reference_object(parameter)
+            identity = self._parameter_identity(resolved)
+            if identity is not None and identity in positions:
+                merged[positions[identity]] = parameter
+            else:
+                if identity is not None:
+                    positions[identity] = len(merged)
+                merged.append(parameter)
+        return merged
+
+    @staticmethod
+    def _parameter_identity(parameter: Any) -> Optional[tuple[str, str]]:
+        if not isinstance(parameter, Mapping):
+            return None
+        location, name = parameter.get('in'), parameter.get('name')
+        if isinstance(location, str) and isinstance(name, str):
+            return location, name
+        return None
+
     def _extract_parameters(self, parameters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        提取参数信息
-        
-        Args:
-            parameters: 参数列表
-            
-        Returns:
-            结构化的参数数据
-        """
+        """保留 Swagger 2 顶层类型约束和 OpenAPI 3 参数语义。"""
         extracted_params = []
-        
-        for param in parameters:
-            param_in = param.get('in', '')
-            
-            # Swagger 2.0 中，请求体参数在 parameters 中，in='body'
-            # 需要特殊处理，解析 schema 中的 $ref
-            schema = param.get('schema', {})
-            
-            param_data = {
-                'name': param.get('name', ''),
-                'in': param_in,  # path, query, header, cookie, body
-                'required': param.get('required', False),
-                'description': param.get('description', ''),
-                'schema': self._extract_schema(schema),
-                'example': param.get('example'),
-                'deprecated': param.get('deprecated', False)
-            }
-            
-            # 如果是 body 参数，且包含 $ref，需要解析引用的字段
-            if param_in == 'body' and schema and '$ref' in schema:
-                resolved_schema = self._resolve_ref(schema['$ref'])
-                if resolved_schema:
-                    # 将解析后的 schema 信息合并到 param_data 中
-                    param_data['schema'] = self._extract_schema(resolved_schema)
-                    param_data['resolved_ref'] = True
-            
+        for raw_parameter in parameters:
+            parameter = self._resolve_reference_object(raw_parameter)
+            if not isinstance(parameter, Mapping):
+                continue
+            param_data = copy.deepcopy(dict(parameter))
+            schema = parameter.get('schema')
+            if isinstance(schema, Mapping):
+                param_data['schema'] = self._extract_schema(schema)
+            elif 'content' not in parameter:
+                # Swagger 2.0 的非 body 参数把 type/format/enum/minimum 等放在顶层。
+                param_schema = {
+                    key: copy.deepcopy(value)
+                    for key, value in parameter.items()
+                    if key not in self.PARAMETER_METADATA_KEYS and not key.startswith('x-')
+                }
+                param_data['schema'] = self._extract_schema(param_schema)
+            if isinstance(parameter.get('content'), Mapping):
+                param_data['content'] = {
+                    content_type: self._extract_media_type(media)
+                    for content_type, media in parameter['content'].items()
+                    if isinstance(media, Mapping)
+                }
             extracted_params.append(param_data)
-        
         return extracted_params
-    
+
     def _extract_request_body(self, request_body: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        提取请求体信息
-        
-        Args:
-            request_body: 请求体定义
-            
-        Returns:
-            结构化的请求体数据
-        """
+        """提取 OpenAPI 3 Request Body，保留每种媒体类型而不强制 JSON。"""
         if not request_body:
             return {}
-        
-        body_data = {
-            'required': request_body.get('required', False),
-            'description': request_body.get('description', ''),
-            'content': {}
-        }
-        
-        # 提取不同内容类型
+        request_body = self._resolve_reference_object(request_body)
+        if not isinstance(request_body, Mapping):
+            return {}
+        body_data = copy.deepcopy(dict(request_body))
+        body_data['content'] = {}
         content = request_body.get('content', {})
-        for content_type, content_schema in content.items():
-            body_data['content'][content_type] = {
-                'schema': self._extract_schema(content_schema.get('schema', {})),
-                'example': content_schema.get('example'),
-                'examples': content_schema.get('examples', {})
-            }
-        
+        if isinstance(content, Mapping):
+            for content_type, media in content.items():
+                if isinstance(media, Mapping):
+                    body_data['content'][content_type] = self._extract_media_type(media)
         return body_data
-    
-    def _extract_responses(self, responses: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        提取响应信息（同时支持Swagger 2.0和OpenAPI 3.0格式）
-        
-        Args:
-            responses: 响应定义
-            
-        Returns:
-            结构化的响应数据
-        """
+
+    def _extract_media_type(self, media: Mapping[str, Any]) -> Dict[str, Any]:
+        """复制 Media Type Object，明确示例即使为假值也原样保留。"""
+        extracted = copy.deepcopy(dict(media))
+        schema = media.get('schema')
+        if isinstance(schema, Mapping):
+            extracted['schema'] = self._extract_schema(schema)
+        return extracted
+
+    def _extract_responses(self, responses: Dict[str, Any], produces: Any = None) -> Dict[str, Any]:
+        """提取 Swagger 2 / OpenAPI 3 响应，不合成可被当作 oracle 的示例。"""
         extracted_responses = {}
-        
-        for status_code, response in responses.items():
-            response_data = {
-                'description': response.get('description', ''),
-                'headers': response.get('headers', {}),
-                'content': {}
-            }
-            
-            # OpenAPI 3.0 格式：使用 content 字段
-            if 'content' in response:
-                content = response.get('content', {})
-                for content_type, content_schema in content.items():
-                    response_data['content'][content_type] = {
-                        'schema': self._extract_schema(content_schema.get('schema', {})),
-                        'example': content_schema.get('example'),
-                        'examples': content_schema.get('examples', {})
-                    }
-            
-            # Swagger 2.0 格式：使用 schema 字段
-            elif 'schema' in response:
-                # Swagger 2.0 默认使用 application/json
-                content_type = 'application/json'
-                schema = response.get('schema', {})
-                extracted_schema = self._extract_schema(schema)
-                
-                # 尝试从schema生成示例数据
-                generated_example = self._generate_example_from_schema(extracted_schema)
-                
-                # 优先使用response中的examples，否则使用生成的示例
-                existing_examples = response.get('examples', {})
-                example_data = existing_examples.get(content_type) if isinstance(existing_examples, dict) else None
-                
-                response_data['content'][content_type] = {
-                    'schema': extracted_schema,
-                    'example': example_data or generated_example,  # 使用现有的或生成的示例
-                    'examples': existing_examples
+        if not isinstance(responses, Mapping):
+            return extracted_responses
+        media_types = [item for item in (produces or []) if isinstance(item, str)] or ['application/json']
+        for status_code, raw_response in responses.items():
+            response = self._resolve_reference_object(raw_response)
+            if not isinstance(response, Mapping):
+                continue
+            response_data = copy.deepcopy(dict(response))
+            response_data['content'] = {}
+            if isinstance(response.get('content'), Mapping):
+                response_data['content'] = {
+                    content_type: self._extract_media_type(media)
+                    for content_type, media in response['content'].items()
+                    if isinstance(media, Mapping)
                 }
-            
+            elif 'schema' in response or isinstance(response.get('examples'), Mapping):
+                explicit_examples = response.get('examples', {})
+                for content_type in media_types:
+                    media: Dict[str, Any] = {}
+                    if isinstance(response.get('schema'), Mapping):
+                        media['schema'] = self._extract_schema(response['schema'])
+                    # Swagger 2 examples is keyed by MIME type; ``in`` preserves null/false/0 values.
+                    if isinstance(explicit_examples, Mapping) and content_type in explicit_examples:
+                        media['example'] = copy.deepcopy(explicit_examples[content_type])
+                    if media:
+                        response_data['content'][content_type] = media
             extracted_responses[status_code] = response_data
-        
         return extracted_responses
     
     def _validate_swagger_spec(self, content: Dict[str, Any]) -> None:
@@ -234,7 +255,7 @@ class APIParserService:
         # 检查是否有paths字段
         if 'paths' not in content:
             raise Exception('OpenAPI/Swagger文件缺少paths字段')
-        
+
         # 使用openapi-spec-validator验证规范合规性
         try:
             validate_spec(content)
@@ -243,178 +264,117 @@ class APIParserService:
             error_msg = f"OpenAPI规范验证失败: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg)
+
+    def _reject_external_refs(self, value: Any) -> None:
+        """拒绝所有外部或非 JSON Pointer 的 $ref，保证入口不会触发外部解析。"""
+        external_refs: List[str] = []
+
+        def visit(item: Any) -> None:
+            if isinstance(item, Mapping):
+                reference = item.get('$ref')
+                if isinstance(reference, str) and reference != '#' and not reference.startswith('#/'):
+                    external_refs.append(reference)
+                for child in item.values():
+                    visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(value)
+        if external_refs:
+            sample = ', '.join(repr(reference) for reference in external_refs[:3])
+            suffix = ' 等' if len(external_refs) > 3 else ''
+            raise Exception(
+                f'OpenAPI/Swagger规范包含不支持的外部 $ref: {sample}{suffix}；'
+                '仅支持当前文件内的 # 或 #/... JSON Pointer 引用。'
+            )
     
     def _resolve_ref(self, ref_path: str) -> Optional[Dict[str, Any]]:
-        """
-        解析 $ref 引用
-        
-        Args:
-            ref_path: 引用路径，如 "#/definitions/UserDto" 或 "#/components/schemas/UserDto"
-            
-        Returns:
-            解析后的Schema定义，如果无法解析则返回None
-        """
-        if not ref_path or not ref_path.startswith('#'):
+        """仅解析当前规范内的 JSON Pointer；外部引用永不读取网络或文件系统。"""
+        if not isinstance(ref_path, str) or not ref_path.startswith('#') or not isinstance(self.parsed_spec, Mapping):
             return None
-        
-        if not self.parsed_spec:
+        if ref_path != '#' and not ref_path.startswith('#/'):
             return None
-        
+        current: Any = self.parsed_spec
         try:
-            # 移除开头的 # 和 /，然后按 / 分割
-            parts = ref_path.lstrip('#/').split('/')
-            
-            # 根据路径类型解析
-            if parts[0] == 'definitions':
-                # Swagger 2.0: #/definitions/UserDto
-                definitions = self.parsed_spec.get('definitions', {})
-                if len(parts) > 1:
-                    return definitions.get(parts[1])
-            elif parts[0] == 'components' and len(parts) > 2 and parts[1] == 'schemas':
-                # OpenAPI 3.0: #/components/schemas/UserDto
-                schemas = self.parsed_spec.get('components', {}).get('schemas', {})
-                if len(parts) > 2:
-                    return schemas.get(parts[2])
-            
+            for raw_part in ref_path[2:].split('/') if ref_path.startswith('#/') else []:
+                part = raw_part.replace('~1', '/').replace('~0', '~')
+                if isinstance(current, Mapping):
+                    current = current[part]
+                elif isinstance(current, list):
+                    current = current[int(part)]
+                else:
+                    return None
+            return copy.deepcopy(current) if isinstance(current, Mapping) else None
+        except (KeyError, IndexError, TypeError, ValueError):
             return None
-        except Exception as e:
-            logger.warning(f"解析引用失败: {ref_path}, 错误: {str(e)}")
-            return None
-    
-    def _extract_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        提取Schema信息，支持解析 $ref 引用
-        
-        Args:
-            schema: Schema定义
-            
-        Returns:
-            结构化的Schema数据
-        """
-        if not schema:
+
+    def _resolve_reference_object(self, value: Any, resolving: frozenset[str] = frozenset()) -> Any:
+        """解析 Parameter/Response/RequestBody/PathItem 等本地引用并保留来源。"""
+        if not isinstance(value, Mapping):
+            return value
+        ref = value.get('$ref')
+        if not isinstance(ref, str):
+            return copy.deepcopy(dict(value))
+        if ref in resolving:
+            result = copy.deepcopy(dict(value))
+            result['x-aits-ref-status'] = 'cyclic'
+            return result
+        target = self._resolve_ref(ref)
+        if not isinstance(target, Mapping):
+            result = copy.deepcopy(dict(value))
+            result['x-aits-ref-status'] = 'unresolved'
+            return result
+        resolved = self._resolve_reference_object(target, resolving | {ref})
+        result = copy.deepcopy(dict(resolved)) if isinstance(resolved, Mapping) else {}
+        result.update(copy.deepcopy(dict(value)))
+        result['x-aits-ref-status'] = 'resolved'
+        return result
+
+    def _extract_schema(
+        self,
+        schema: Dict[str, Any],
+        resolving: frozenset[str] = frozenset(),
+    ) -> Dict[str, Any]:
+        """保留 JSON Schema/OpenAPI 字段，并有界展开本地 ``$ref``。"""
+        if not isinstance(schema, Mapping):
             return {}
-        
-        # 如果包含 $ref，先解析引用
-        if '$ref' in schema:
-            resolved_schema = self._resolve_ref(schema['$ref'])
-            if resolved_schema:
-                # 递归解析解析后的 schema
-                resolved_data = self._extract_schema(resolved_schema)
-                # 保留原始引用路径
-                resolved_data['$ref'] = schema['$ref']
-                resolved_data['resolved'] = True
-                return resolved_data
-            else:
-                # 无法解析引用，只返回引用路径
-                return {
-                    '$ref': schema['$ref'],
-                    'resolved': False
+
+        schema_data = copy.deepcopy(dict(schema))
+        for key in self.SCHEMA_MAPPING_KEYS:
+            child = schema.get(key)
+            if isinstance(child, Mapping):
+                schema_data[key] = self._extract_schema(child, resolving)
+        for key in self.SCHEMA_LIST_KEYS:
+            child = schema.get(key)
+            if isinstance(child, list):
+                schema_data[key] = [
+                    self._extract_schema(item, resolving) if isinstance(item, Mapping) else copy.deepcopy(item)
+                    for item in child
+                ]
+        for key in self.SCHEMA_MAP_KEYS:
+            child = schema.get(key)
+            if isinstance(child, Mapping):
+                schema_data[key] = {
+                    name: self._extract_schema(item, resolving) if isinstance(item, Mapping) else copy.deepcopy(item)
+                    for name, item in child.items()
                 }
-        
-        schema_data = {
-            'type': schema.get('type', ''),
-            'format': schema.get('format', ''),
-            'description': schema.get('description', ''),
-            'example': schema.get('example'),  # 提取example字段
-            'nullable': schema.get('nullable', False),
-            'deprecated': schema.get('deprecated', False)
-        }
-        
-        # 处理不同类型的Schema
-        schema_type = schema.get('type', '')
-        
-        if schema_type == 'object':
-            # 递归处理 properties 中的每个字段
-            properties = schema.get('properties', {})
-            resolved_properties = {}
-            for prop_name, prop_schema in properties.items():
-                resolved_properties[prop_name] = self._extract_schema(prop_schema)
-            
-            schema_data.update({
-                'properties': resolved_properties,
-                'required': schema.get('required', []),
-                'additional_properties': schema.get('additionalProperties', True)
-            })
-        elif schema_type == 'array':
-            items_schema = schema.get('items', {})
-            schema_data.update({
-                'items': self._extract_schema(items_schema),
-                'min_items': schema.get('minItems'),
-                'max_items': schema.get('maxItems'),
-                'unique_items': schema.get('uniqueItems', False)
-            })
-        elif schema_type in ['string', 'number', 'integer', 'boolean']:
-            # 处理基本类型的约束
-            if schema_type == 'string':
-                schema_data.update({
-                    'min_length': schema.get('minLength'),
-                    'max_length': schema.get('maxLength'),
-                    'pattern': schema.get('pattern'),
-                    'enum': schema.get('enum', [])
-                })
-            elif schema_type in ['number', 'integer']:
-                schema_data.update({
-                    'minimum': schema.get('minimum'),
-                    'maximum': schema.get('maximum'),
-                    'exclusive_minimum': schema.get('exclusiveMinimum'),
-                    'exclusive_maximum': schema.get('exclusiveMaximum'),
-                    'multiple_of': schema.get('multipleOf')
-                })
-        
-        return schema_data
-    
-    def _generate_example_from_schema(self, schema: Dict[str, Any]) -> Any:
-        """
-        根据Schema生成示例数据
-        
-        Args:
-            schema: Schema定义
-            
-        Returns:
-            生成的示例数据
-        """
-        if not schema:
-            return None
-        
-        # 如果schema本身有example，直接返回
-        if 'example' in schema and schema['example'] is not None:
-            return schema['example']
-        
-        schema_type = schema.get('type', '')
-        
-        if schema_type == 'object':
-            # 为对象类型生成示例
-            example_obj = {}
-            properties = schema.get('properties', {})
-            for prop_name, prop_schema in properties.items():
-                prop_example = self._generate_example_from_schema(prop_schema)
-                if prop_example is not None:
-                    example_obj[prop_name] = prop_example
-            return example_obj if example_obj else None
-        
-        elif schema_type == 'array':
-            # 为数组类型生成示例
-            items_schema = schema.get('items', {})
-            item_example = self._generate_example_from_schema(items_schema)
-            return [item_example] if item_example is not None else None
-        
-        elif schema_type == 'string':
-            # 字符串类型的默认值
-            enum = schema.get('enum')
-            if enum and len(enum) > 0:
-                return enum[0]
-            return schema.get('example', 'string')
-        
-        elif schema_type == 'integer':
-            return schema.get('example', 0)
-        
-        elif schema_type == 'number':
-            return schema.get('example', 0.0)
-        
-        elif schema_type == 'boolean':
-            return schema.get('example', False)
-        
-        return None
+
+        ref = schema.get('$ref')
+        if not isinstance(ref, str):
+            return schema_data
+        if ref in resolving:
+            schema_data['x-aits-ref-status'] = 'cyclic'
+            return schema_data
+        target = self._resolve_ref(ref)
+        if not isinstance(target, Mapping):
+            schema_data['x-aits-ref-status'] = 'unresolved'
+            return schema_data
+        resolved = self._extract_schema(target, resolving | {ref})
+        # 保留 $ref 和所有同级字段，同时使本地消费者可读取已解析 properties/constraints。
+        resolved.update(schema_data)
+        resolved['x-aits-ref-status'] = 'resolved'
+        return resolved
     
     def parse_api_specification_from_file(self, spec, uploaded_file) -> Dict[str, Any]:
         """
@@ -446,37 +406,19 @@ class APIParserService:
             # 验证内容格式
             if not content:
                 raise Exception('文件内容为空')
+
+            # 所有完整入口均只支持当前文件的 JSON Pointer，且必须早于官方 validator。
+            self._reject_external_refs(content)
             
             # 验证OpenAPI/Swagger格式并校验规范合规性
             if spec.spec_type == 'swagger':
                 self._validate_swagger_spec(content)
             
-            # 使用prance解析器解析规范（用于解析引用）
-            try:
-                # 将内容转换为字符串以便prance解析
-                if file_extension in ['.yaml', '.yml']:
-                    spec_content_str = yaml.dump(content, default_flow_style=False)
-                else:
-                    spec_content_str = json.dumps(content, ensure_ascii=False)
-                
-                self.parser = ResolvingParser(spec_string=spec_content_str)
-                parsed_spec = self.parser.specification
-                self.parsed_spec = parsed_spec  # 保存完整规范用于解析引用
-                
-                # 提取结构化信息（包含解析后的引用）
-                structured_data = self._extract_structured_data(parsed_spec)
-            except Exception as e:
-                logger.warning(f"使用prance解析器解析失败，使用原始内容: {str(e)}")
-                # 如果prance解析失败，使用原始内容
-                self.parsed_spec = content
-                structured_data = None
-            
-            # 解析并创建API端点（使用解析后的结构化数据）
-            if structured_data:
-                endpoints_created = self._create_api_endpoints_from_structured_data(spec, structured_data)
-            else:
-                # 降级使用原始方法
-                endpoints_created = self._create_api_endpoints(spec, content)
+            # 只从上传的文档解析本地 JSON Pointer；不委托解析器读取外部 $ref。
+            # 正常和降级路径共用同一投影逻辑，避免其中一条遗漏参数继承或媒体类型。
+            self.parsed_spec = content
+            structured_data = self._extract_structured_data(content)
+            endpoints_created = self._create_api_endpoints_from_structured_data(spec, structured_data)
             
             # 更新文件状态为已处理
             uploaded_file.upload_status = 'uploaded'  # 使用正确的字段名
@@ -560,8 +502,12 @@ class APIParserService:
         except Exception as e:
             raise Exception(f'文件读取失败: {str(e)}')
     
-    def _convert_body_param_to_request_body(self, parameters: List[Dict[str, Any]], 
-                                           existing_request_body: Dict[str, Any] = None) -> Dict[str, Any]:
+    def _convert_body_param_to_request_body(
+        self,
+        parameters: List[Dict[str, Any]],
+        existing_request_body: Optional[Dict[str, Any]] = None,
+        consumes: Any = None,
+    ) -> Dict[str, Any]:
         """
         将 Swagger 2.0 中 in: body 的参数转换为 request_body 格式
         
@@ -572,38 +518,46 @@ class APIParserService:
         Returns:
             转换后的 request_body
         """
-        if existing_request_body:
-            return existing_request_body
-        
-        # 查找 body 参数
-        body_param = None
-        for param in parameters:
-            if param.get('in') == 'body':
-                body_param = param
-                break
-        
-        # 如果有 body 参数，将其转换为 request_body 格式
-        if body_param:
-            # 尝试解析其中的 $ref
-            schema = body_param.get('schema', {})
-            if schema and '$ref' in schema:
-                ref_path = schema['$ref']
-                resolved_schema = self._resolve_ref(ref_path)
-                if resolved_schema:
-                    schema = resolved_schema
-                    schema['$ref'] = ref_path  # 保留原始引用
-            
+        body = copy.deepcopy(existing_request_body) if isinstance(existing_request_body, Mapping) else {}
+        if body:
+            return body
+
+        media_types = [item for item in (consumes or []) if isinstance(item, str)] or ['application/json']
+        body_param = next((item for item in parameters if item.get('in') == 'body'), None)
+        if isinstance(body_param, Mapping):
+            media = {'schema': copy.deepcopy(body_param.get('schema', {}))}
+            if 'example' in body_param:
+                media['example'] = copy.deepcopy(body_param['example'])
             return {
-                'required': body_param.get('required', False),
+                'required': bool(body_param.get('required', False)),
                 'description': body_param.get('description', ''),
-                'content': {
-                    'application/json': {
-                        'schema': schema
-                    }
-                }
+                'content': {content_type: copy.deepcopy(media) for content_type in media_types},
             }
-        
-        return {}
+
+        form_parameters = [item for item in parameters if item.get('in') == 'formData']
+        if not form_parameters:
+            return {}
+        form_media_types = [
+            content_type for content_type in media_types
+            if content_type in {'application/x-www-form-urlencoded', 'multipart/form-data'}
+        ]
+        if not form_media_types:
+            form_media_types = ['multipart/form-data' if any(
+                item.get('type') == 'file' or item.get('schema', {}).get('type') == 'file'
+                for item in form_parameters
+            ) else 'application/x-www-form-urlencoded']
+        properties = {
+            item.get('name', ''): copy.deepcopy(item.get('schema', {}))
+            for item in form_parameters if item.get('name')
+        }
+        required = [item['name'] for item in form_parameters if item.get('required') and item.get('name')]
+        schema: Dict[str, Any] = {'type': 'object', 'properties': properties}
+        if required:
+            schema['required'] = required
+        return {
+            'required': bool(required),
+            'content': {content_type: {'schema': copy.deepcopy(schema)} for content_type in form_media_types},
+        }
     
     def _create_single_endpoint(self, spec, endpoint_info: Dict[str, Any]) -> bool:
         """
@@ -618,41 +572,43 @@ class APIParserService:
         """
         from .models import APIEndpoint, APIModule
         
-        try:
-            parameters = endpoint_info.get('parameters', [])
-            request_body = endpoint_info.get('request_body', endpoint_info.get('requestBody', {}))
-            
-            # 处理 Swagger 2.0 中 in: body 的参数
-            request_body = self._convert_body_param_to_request_body(parameters, request_body)
-            
-            # 根据 tags 获取或创建模块
-            tags = endpoint_info.get('tags', [])
-            tag_name = tags[0] if tags else '未分类'
-            module, _ = APIModule.objects.get_or_create(
-                project_id=spec.project_id,
-                name=tag_name,
-                defaults={'sort_order': 0}
-            )
-            
-            APIEndpoint.objects.create(
-                spec=spec,
-                module=module,
-                path=endpoint_info.get('path', ''),
-                method=endpoint_info.get('method', '').upper(),
-                summary=endpoint_info.get('summary', ''),
-                description=endpoint_info.get('description', ''),
-                parameters=parameters,
-                request_body=request_body,
-                responses=endpoint_info.get('responses', {}),
-                tags=tags,
-                operation_id=endpoint_info.get('operation_id', endpoint_info.get('operationId', ''))
-            )
-            return True
-        except Exception as e:
-            method = endpoint_info.get('method', 'UNKNOWN')
-            path = endpoint_info.get('path', 'UNKNOWN')
-            logger.error(f"创建端点失败: {method} {path}, 错误: {str(e)}")
-            return False
+        parameters = endpoint_info.get('parameters', [])
+        request_body = endpoint_info.get('request_body', endpoint_info.get('requestBody', {}))
+
+        # 处理 Swagger 2.0 中 in: body 的参数
+        request_body = self._convert_body_param_to_request_body(
+            parameters, request_body, endpoint_info.get('consumes'),
+        )
+        if 'x-aits-operation' not in request_body:
+            request_body['x-aits-operation'] = {
+                'consumes': copy.deepcopy(endpoint_info.get('consumes', [])),
+                'produces': copy.deepcopy(endpoint_info.get('produces', [])),
+                'security': copy.deepcopy(endpoint_info.get('security', [])),
+            }
+
+        # 根据 tags 获取或创建模块
+        tags = endpoint_info.get('tags', [])
+        tag_name = tags[0] if tags else '未分类'
+        module, _ = APIModule.objects.get_or_create(
+            project_id=spec.project_id,
+            name=tag_name,
+            defaults={'sort_order': 0}
+        )
+
+        APIEndpoint.objects.create(
+            spec=spec,
+            module=module,
+            path=endpoint_info.get('path', ''),
+            method=endpoint_info.get('method', '').upper(),
+            summary=endpoint_info.get('summary', ''),
+            description=endpoint_info.get('description', ''),
+            parameters=parameters,
+            request_body=request_body,
+            responses=endpoint_info.get('responses', {}),
+            tags=tags,
+            operation_id=endpoint_info.get('operation_id', endpoint_info.get('operationId', ''))
+        )
+        return True
     
     def _create_api_endpoints_from_structured_data(self, spec, structured_data: Dict[str, Any]) -> int:
         """
@@ -665,12 +621,12 @@ class APIParserService:
         Returns:
             创建的端点数量
         """
-        endpoints_created = 0
         endpoints = structured_data.get('endpoints', [])
-        
-        for endpoint_data in endpoints:
-            if self._create_single_endpoint(spec, endpoint_data):
-                endpoints_created += 1
+        with transaction.atomic():
+            for endpoint_data in endpoints:
+                self._create_single_endpoint(spec, endpoint_data)
+
+        endpoints_created = len(endpoints)
         
         logger.info(f"成功创建了 {endpoints_created} 个API端点")
         return endpoints_created
@@ -686,25 +642,7 @@ class APIParserService:
         Returns:
             创建的端点数量
         """
-        endpoints_created = 0
-        
-        if 'paths' in content:
-            for path, methods in content['paths'].items():
-                for method, details in methods.items():
-                    if method.upper() in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']:
-                        endpoint_info = {
-                            'path': path,
-                            'method': method,
-                            'summary': details.get('summary', ''),
-                            'description': details.get('description', ''),
-                            'parameters': details.get('parameters', []),
-                            'requestBody': details.get('requestBody', {}),
-                            'responses': details.get('responses', {}),
-                            'tags': details.get('tags', []),
-                            'operationId': details.get('operationId', '')
-                        }
-                        if self._create_single_endpoint(spec, endpoint_info):
-                            endpoints_created += 1
-        
-        logger.info(f"成功创建了 {endpoints_created} 个API端点")
-        return endpoints_created
+        self.parsed_spec = content
+        return self._create_api_endpoints_from_structured_data(
+            spec, self._extract_structured_data(content),
+        )

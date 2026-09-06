@@ -28,8 +28,8 @@
               </el-icon>
             </div>
             <div class="function-content">
-              <h4>🤖 智能场景生成器</h4>
-              <p>用自然语言描述业务场景，AI自动生成完整的端到端测试脚本</p>
+              <h4>🤖 API 对话工作区</h4>
+              <p>用自然语言提出需求，AI 提供候选草稿，再由你可视化确认、调试和保存</p>
               <el-tag type="success" size="small">AI驱动</el-tag>
             </div>
           </div>
@@ -214,7 +214,7 @@ const goToApiSpecs = () => {
 }
 
 const goToScenarioGenerator = () => {
-  router.push('/api-testing/scenario-generator')
+  router.push('/api-testing/workspace')
 }
 
 const goToTestCases = () => {

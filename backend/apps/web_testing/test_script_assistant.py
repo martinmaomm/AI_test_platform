@@ -802,6 +802,118 @@ class ScriptAssistantApiTests(TestCase):
         self.assertTrue(session.quality_report["manual_adoption"]["acknowledged_at"])
         self.assertEqual(WebUITestExecution.objects.count(), execution_count)
 
+    def test_repair_verify_action_requires_fresh_scope_acknowledgement(self):
+        session = self._repair_candidate_session(
+            blockers=[{"code": "REPAIR_SCOPE_CHANGED", "message": "新增点击"}],
+        )
+        session.summary = "上次候选已实际验证通过。"
+        session.save(update_fields=["summary"])
+        detail = self._get(ScriptAssistantDetailView, session_id=session.id)
+        self.assertEqual(detail.data["data"]["verify_action"]["can_verify"], True)
+        self.assertTrue(
+            detail.data["data"]["verify_action"]["requires_acknowledge_review"]
+        )
+        payload = {
+            "expected_revision": session.revision,
+            "candidate_hash": session.candidate_hash,
+            "confirm_execution": True,
+            "runtime_variables": [],
+        }
+        with patch("web_testing.script_assistant_views._dispatch") as dispatch:
+            rejected = self._post(
+                ScriptAssistantVerifyView, payload, session_id=session.id
+            )
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        dispatch.assert_not_called()
+        payload["acknowledge_review"] = "true"
+        invalid = self._post(ScriptAssistantVerifyView, payload, session_id=session.id)
+        self.assertEqual(invalid.status_code, 400, invalid.data)
+        payload["acknowledge_review"] = True
+        with patch("web_testing.script_assistant_views._dispatch"):
+            accepted = self._post(
+                ScriptAssistantVerifyView, payload, session_id=session.id
+            )
+        self.assertEqual(accepted.status_code, 202, accepted.data)
+        session.refresh_from_db()
+        self.assertEqual(session.status, "queued")
+        self.assertEqual(session.summary, "已发起本次候选验证，请以本次运行结果为准。")
+        self.assertEqual(
+            session.verification["authorization"]["candidate_hash"],
+            session.candidate_hash,
+        )
+        self.assertEqual(
+            session.verification["authorization"]["revision"], session.revision
+        )
+        self.assertEqual(
+            session.verification["authorization"]["task_id"], session.task_id
+        )
+        self.assertTrue(session.verification["authorization"]["acknowledge_review"])
+        self.assertEqual(
+            session.verification["authorization"]["acknowledged_by"], self.user.id
+        )
+        self.assertTrue(session.verification["authorization"]["acknowledged_at"])
+
+    def test_repair_verify_rejects_unknown_blockers_and_stale_hash_or_revision(self):
+        session = self._repair_candidate_session(
+            blockers=[{"code": "UNKNOWN", "message": "unknown"}],
+        )
+        payload = {
+            "expected_revision": session.revision,
+            "candidate_hash": session.candidate_hash,
+            "confirm_execution": True,
+            "acknowledge_review": True,
+            "runtime_variables": [],
+        }
+        rejected = self._post(ScriptAssistantVerifyView, payload, session_id=session.id)
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+
+        session = self._repair_candidate_session(blockers=[])
+        payload.update(
+            expected_revision=session.revision,
+            candidate_hash="wrong-hash",
+        )
+        wrong_hash = self._post(
+            ScriptAssistantVerifyView, payload, session_id=session.id
+        )
+        self.assertEqual(wrong_hash.status_code, 409, wrong_hash.data)
+        payload.update(
+            candidate_hash=session.candidate_hash,
+            expected_revision=session.revision + 1,
+        )
+        stale_revision = self._post(
+            ScriptAssistantVerifyView, payload, session_id=session.id
+        )
+        self.assertEqual(stale_revision.status_code, 409, stale_revision.data)
+
+    def test_verified_scope_candidate_can_be_saved_without_erasing_verification(self):
+        session = self._repair_candidate_session(
+            blockers=[{"code": "REPAIR_SCOPE_CHANGED", "message": "scope"}],
+        )
+        session.status = "candidate_passed"
+        session.verification = {
+            "status": "passed",
+            "candidate_hash": session.candidate_hash,
+            "execution_id": 99,
+            "summary": "本次候选已实际验证通过。",
+        }
+        session.save(update_fields=["status", "verification"])
+        response = self._post(
+            ScriptAssistantApplyView,
+            {
+                "expected_revision": session.revision,
+                "expected_edit_version": case_edit_version(self.case),
+                "candidate_hash": session.candidate_hash,
+                "acknowledge_review": True,
+            },
+            session_id=session.id,
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        session.refresh_from_db()
+        self.assertEqual(session.status, "applied")
+        self.assertEqual(session.verification["status"], "passed")
+        self.assertEqual(session.verification["execution_id"], 99)
+        self.assertEqual(session.blockers[0]["code"], "REPAIR_SCOPE_CHANGED")
+
     def test_manual_apply_rejects_non_scope_blockers_invalid_contract_and_conflicts(
         self,
     ):

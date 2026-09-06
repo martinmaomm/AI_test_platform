@@ -46,10 +46,19 @@ export const canContinueCandidate = assistant => (
   && assistant.status !== 'applied'
 )
 
+export const verifyActionState = assistant => {
+  const state = assistant?.verify_action
+  if (!state || typeof state !== 'object') return { can_verify: false, requires_acknowledge_review: false }
+  return {
+    can_verify: state.can_verify === true,
+    requires_acknowledge_review: state.requires_acknowledge_review === true
+  }
+}
+
 export const canVerifyCandidate = assistant => (
   canContinueCandidate(assistant)
   && ['candidate_ready', 'candidate_passed'].includes(assistant.status)
-  && !hasAssistantBlockers(assistant)
+  && verifyActionState(assistant).can_verify
 )
 
 export const repairAdoptionState = assistant => {
@@ -78,18 +87,30 @@ export const expandedAssistantRowIds = (expandedIds, rowId, open) => {
 
 export const assistantModelLabel = model => `${model?.provider_name || model?.provider || 'LLM'} · ${model?.model_name || '未命名模型'}`
 
-export const verificationLabel = verification => ({
-  passed: '实际验证通过',
-  pending: '等待实际验证',
-  running: '正在实际验证',
-  failed: '实际验证失败',
-  error: '实际验证异常',
-  unverified: '尚未实际验证'
-})[verification?.status] || '尚未实际验证'
+const isVerificationInterrupted = (verification, sessionStatus) => (
+  ['queued', 'pending', 'running'].includes(verification?.status)
+  && ['cancelled', 'failed'].includes(sessionStatus)
+)
 
-export const verificationTagType = verification => ({
-  passed: 'success', pending: 'warning', running: 'warning', failed: 'danger', error: 'danger', unverified: 'info'
-})[verification?.status] || 'info'
+export const verificationLabel = (verification, sessionStatus) => isVerificationInterrupted(verification, sessionStatus)
+  ? (sessionStatus === 'cancelled' ? '本次验证已取消' : '本次验证已中止')
+  : ({
+      passed: '实际验证通过',
+      pending: '已排队等待实际验证',
+      queued: '已排队等待实际验证',
+      running: '正在实际验证',
+      failed: '实际验证失败',
+      error: '实际验证异常',
+      incomplete: '已实际运行但验证不完整',
+      stopped: '实际验证已停止',
+      unverified: '尚未实际验证'
+    })[verification?.status] || '尚未实际验证'
+
+export const verificationTagType = (verification, sessionStatus) => isVerificationInterrupted(verification, sessionStatus)
+  ? (sessionStatus === 'cancelled' ? 'info' : 'danger')
+  : ({
+      passed: 'success', pending: 'warning', queued: 'warning', running: 'warning', failed: 'danger', error: 'danger', incomplete: 'warning', stopped: 'warning', unverified: 'info'
+    })[verification?.status] || 'info'
 
 export const assistantAttemptStatusLabel = status => ({
   passed: '执行通过',

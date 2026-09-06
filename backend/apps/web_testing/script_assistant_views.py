@@ -45,6 +45,7 @@ from .script_assistant import (
     expire_if_needed,
     model_info,
     repair_adoption_state,
+    verify_action_state,
 )
 from .tasks import run_script_assistant_operation_task
 
@@ -74,6 +75,7 @@ def assistant_payload(item: WebUIScriptAssistant) -> dict:
         "attempts": item.attempts,
         "verification": item.verification,
         "adoption": repair_adoption_state(item),
+        "verify_action": verify_action_state(item),
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -130,6 +132,7 @@ def _queue(
     expected_revision: int | None = None,
     updates: dict | None = None,
     verify_candidate_hash: str | None = None,
+    verify_acknowledge_review: bool = False,
 ) -> WebUIScriptAssistant:
     task_id = str(uuid.uuid4())
     with transaction.atomic():
@@ -139,23 +142,21 @@ def _queue(
         if locked.status in {"queued", "running"}:
             raise ScriptAssistantConflict("当前会话已有操作在运行，请等待完成或取消。")
         if operation == "verify":
-            if (
-                locked.status
-                not in {
-                    WebUIScriptAssistant.Status.CANDIDATE_READY,
-                    WebUIScriptAssistant.Status.CANDIDATE_PASSED,
-                }
-                or not locked.candidate_script
-                or not locked.candidate_hash
-            ):
+            action = verify_action_state(locked)
+            if not action["can_verify"]:
                 raise ScriptAssistantConflict("当前没有可验证的候选脚本。")
             if (
                 not verify_candidate_hash
                 or verify_candidate_hash != locked.candidate_hash
             ):
                 raise ScriptAssistantConflict("候选已变化，请刷新后验证。")
-            if locked.blockers:
-                raise ScriptAssistantConflict("候选存在安全限制，不能自动验证。")
+            if (
+                action["requires_acknowledge_review"]
+                and verify_acknowledge_review is not True
+            ):
+                raise ScriptAssistantConflict(
+                    "该候选未通过自动修复范围检查，必须确认风险后才能运行验证。"
+                )
         if (
             operation == "edit"
             and (updates or {}).get("pending_use_candidate") is True
@@ -176,10 +177,19 @@ def _queue(
         )
         names = runtime_variable_names(runtime_variables or [])
         if operation == "verify":
+            locked.summary = "已发起本次候选验证，请以本次运行结果为准。"
             locked.verification = {
                 "status": "queued",
                 "runtime_variables_present": bool(runtime_variables),
                 "runtime_variable_names": names,
+                "authorization": {
+                    "candidate_hash": locked.candidate_hash,
+                    "revision": locked.revision,
+                    "task_id": task_id,
+                    "acknowledge_review": verify_acknowledge_review,
+                    "acknowledged_by": locked.user_id,
+                    "acknowledged_at": timezone.now().isoformat(),
+                },
             }
         elif operation == "edit":
             locked.verification = {
@@ -203,6 +213,7 @@ def _queue(
                     "cancel_requested_at",
                     "deadline_at",
                     "verification",
+                    "summary",
                     "quality_report",
                     "updated_at",
                 }
@@ -578,6 +589,9 @@ class ScriptAssistantVerifyView(APIView):
             expected = int(request.data.get("expected_revision"))
             if request.data.get("confirm_execution") is not True:
                 raise ValueError("验证前必须确认会实际操作测试网站。")
+            acknowledge_review = request.data.get("acknowledge_review", False)
+            if not isinstance(acknowledge_review, bool):
+                raise ValueError("acknowledge_review 必须是布尔值。")
             runtime = normalize_variable_definitions(
                 request.data.get("runtime_variables") or []
             )
@@ -599,6 +613,7 @@ class ScriptAssistantVerifyView(APIView):
                     ),
                 },
                 verify_candidate_hash=str(request.data.get("candidate_hash") or ""),
+                verify_acknowledge_review=acknowledge_review,
             )
         except (
             TypeError,

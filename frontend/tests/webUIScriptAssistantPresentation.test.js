@@ -13,8 +13,23 @@ import {
   expandedAssistantRowIds,
   isAssistantActive,
   repairAdoptionState,
+  verifyActionState,
+  verificationTagType,
   verificationLabel
 } from '../src/composables/webUIScriptAssistantPresentation.js'
+
+test('verification labels distinguish execution results and interrupted pending work', () => {
+  assert.equal(verificationLabel({ status: 'incomplete' }), '已实际运行但验证不完整')
+  assert.equal(verificationLabel({ status: 'stopped' }), '实际验证已停止')
+  assert.equal(verificationLabel({ status: 'queued' }), '已排队等待实际验证')
+  assert.equal(verificationLabel({ status: 'running' }, 'running'), '正在实际验证')
+  assert.equal(verificationLabel({ status: 'running' }, 'cancelled'), '本次验证已取消')
+  assert.equal(verificationLabel({ status: 'queued' }, 'failed'), '本次验证已中止')
+  assert.equal(verificationTagType({ status: 'running' }, 'cancelled'), 'info')
+  assert.equal(verificationTagType({ status: 'running' }, 'failed'), 'danger')
+  assert.equal(verificationLabel({ status: 'failed' }, 'failed'), '实际验证失败')
+  assert.equal(verificationLabel({ status: 'passed' }, 'applied'), '实际验证通过')
+})
 
 test('assistant list uses only the approved context identifiers', () => {
   assert.deepEqual(assistantListParams({ testCaseId: 7 }), { test_case_id: 7 })
@@ -36,6 +51,9 @@ test('assistant envelopes and lifecycle never call an unverified candidate passe
   assert.equal(isAssistantActive({ status: 'candidate_ready' }), false)
   assert.equal(verificationLabel({ status: 'unverified' }), '尚未实际验证')
   assert.equal(verificationLabel({ status: 'passed' }), '实际验证通过')
+  assert.equal(verificationLabel({ status: 'queued' }), '已排队等待实际验证')
+  assert.equal(verificationLabel({ status: 'incomplete' }), '已实际运行但验证不完整')
+  assert.equal(verificationLabel({ status: 'stopped' }), '实际验证已停止')
 })
 
 test('assistant recovery stays in its mode and candidate controls enforce active, blocker and applied boundaries', () => {
@@ -44,27 +62,29 @@ test('assistant recovery stays in its mode and candidate controls enforce active
   assert.deepEqual(assistantsForContext([edit, repair], { mode: 'edit' }), [edit])
   assert.deepEqual(assistantListParams({ mode: 'repair', executionId: 4 }), { mode: 'repair', execution_id: 4 })
 
-  const readyRepair = { mode: 'repair', status: 'candidate_ready', candidate_hash: 'hash', candidate_script: 'async def run(page): pass', blockers: [], adoption: { kind: 'automatic', can_apply: true, requires_acknowledge_review: false } }
+  const readyRepair = { mode: 'repair', status: 'candidate_ready', candidate_hash: 'hash', candidate_script: 'async def run(page): pass', blockers: [], adoption: { kind: 'automatic', can_apply: true, requires_acknowledge_review: false }, verify_action: { can_verify: true, requires_acknowledge_review: false } }
   assert.equal(canContinueCandidate(readyRepair), true)
   assert.equal(canVerifyCandidate(readyRepair), true)
   assert.equal(canApplyRepairCandidate(readyRepair), true)
   assert.equal(canContinueCandidate({ ...readyRepair, status: 'running' }), false)
-  assert.equal(canVerifyCandidate({ ...readyRepair, blockers: ['unsafe'] }), false)
+  assert.equal(canVerifyCandidate({ ...readyRepair, blockers: ['unsafe'], verify_action: { can_verify: false, requires_acknowledge_review: false } }), false)
   assert.equal(canApplyRepairCandidate({ ...readyRepair, status: 'applied' }), false)
   assert.equal(canVerifyCandidate({ ...readyRepair, status: 'failed' }), false)
   assert.equal(canApplyRepairCandidate({ ...readyRepair, status: 'cancelled' }), false)
 })
 
-test('scope-only repair can be manually saved but never automatically verified', () => {
+test('scope-only repair can be manually saved and run only with server-required review', () => {
   const manualRepair = {
     mode: 'repair', status: 'candidate_ready', candidate_hash: 'hash',
     candidate_script: 'async def run(page): pass',
     blockers: [{ code: 'REPAIR_SCOPE_CHANGED' }],
-    adoption: { kind: 'manual_review', can_apply: true, requires_acknowledge_review: true }
+    adoption: { kind: 'manual_review', can_apply: true, requires_acknowledge_review: true },
+    verify_action: { can_verify: true, requires_acknowledge_review: true }
   }
-  assert.equal(canVerifyCandidate(manualRepair), false)
+  assert.equal(canVerifyCandidate(manualRepair), true)
   assert.equal(canApplyRepairCandidate(manualRepair), true)
   assert.deepEqual(repairAdoptionState(manualRepair), manualRepair.adoption)
+  assert.deepEqual(verifyActionState(manualRepair), manualRepair.verify_action)
   assert.equal(canApplyRepairCandidate({ ...manualRepair, adoption: { kind: 'unavailable', can_apply: false, requires_acknowledge_review: false } }), false)
 })
 
@@ -87,6 +107,13 @@ test('assistant attempt statuses remain Chinese while the full candidate stays s
   assert.match(source, /已人工确认保存/)
   assert.match(source, /const frozen = \{[\s\S]*candidateHash: assistant\.value\.candidate_hash/)
   assert.match(source, /候选已变化，请刷新后重新确认。/)
+  assert.match(source, /运行验证/)
+  assert.match(source, /确认风险并运行/)
+  assert.match(source, /acknowledge_review: frozen\.acknowledgeReview/)
+  assert.match(source, /clearAttempt\(\)\s+await verify/)
+  assert.match(source, /已实际验证通过，但仍未通过自动修复范围检查/)
+  assert.match(source, /已实际运行但未通过或验证不完整/)
+  assert.match(source, /manualSaveToast\(frozen\.verificationState\)/)
 })
 
 test('assistant panel supports the first edit message and keeps repair out of the edit-only message path', async () => {

@@ -56,7 +56,7 @@ created_at, updated_at
 ### 操作
 
 - `POST /script-assistants/{id}/messages/`：`expected_revision`、`message`、`script_content`、`description`、`variables`、`use_candidate`。默认基于当前编辑器；继续调整候选时 `use_candidate=true`，仍保留源编辑器原文用于采用时核对。每次最多一个操作在运行；候选不直接写用例。
-- `POST /script-assistants/{id}/verify/`：`expected_revision`、`candidate_hash`、`confirm_execution: true`、`runtime_variables`、可选 `options`。只运行当前候选一次，不自动再修改。
+- `POST /script-assistants/{id}/verify/`：`expected_revision`、`candidate_hash`、`confirm_execution: true`、`runtime_variables`、可选 `options`。只运行当前候选一次，不自动再修改。修复页可直接验证尚未保存的候选；只有 `REPAIR_SCOPE_CHANGED` 警告时需额外传入布尔值 `acknowledge_review: true`。每次确认绑定当前候选 hash、任务 revision 和 task_id，不可复用于新的候选或任务。
 - `POST /script-assistants/{id}/cancel/`：终止助手后续步骤、阻止迟到结果写入；对正在运行的浏览器/模型尽力停止，并明确已发生的网站操作不会回滚。不得提前承诺底层进程已终止。
 - `POST /script-assistants/{id}/apply/`：`expected_revision`、`candidate_hash`、`expected_edit_version`。仅 repair 模式写用例，使用事务核对当前可编辑字段指纹，必须用户确认。edit 模式由前端采用到编辑器，正常保存时再次检查版本。
 - 若候选仅有 `REPAIR_SCOPE_CHANGED`，可在检查完整代码后以布尔值 `acknowledge_review: true` 人工确认保存。语法、断言变动、未知拦截等不能使用此入口绕过。API 返回计算所得的 `adoption` 状态，保存能力不再复用自动验证能力；保存会保留原警告及真实验证状态，并记录人工确认信息，不启动任务或操作网站。
@@ -138,3 +138,15 @@ python manage.py migrate web_testing
 修复“候选待审核但保存按钮永久置灰”的流程问题：仅有自动修复范围警告时，按钮改为「人工确认并保存」，确认框明确尚未实际验证。原有会话重新获取即可使用，无需重新调用模型或变更数据库结构。自动验证规则不放宽，原失败记录不变，采用后的新脚本仍需用户调试验收。
 
 本轮回归：427 项后端测试、151 项前端测试及构建通过。隔离浏览器使用实际范围检查产生受限候选，已验证旧前端复现按钮禁用、新前端取消确认不保存、确认后保存成功、保留未验证状态和失败历史，且不增加模型调用或执行记录。真实网站和模型未参与本轮测试。
+
+### 修复页运行验证（2026-09-06）
+
+- 候选生成后可点击「运行验证」，配置本次覆盖变量和超时，运行一次当前候选，再看本轮日志和截图；失败后可再次明确确认重试。此操作不调用模型/MCP、不继续自动修复、不覆盖原用例，原失败记录不变。
+- 正常候选需要执行确认；只有范围警告的候选需要「确认风险并运行」。语法、断言变动、未知拦截仍不可绕过，AI 自动修复的原拦截规则不放宽。
+- API 返回与实际结果 `verification` 分离的 `verify_action` 能力；服务端和 worker 均核对本次确认、候选及任务版本。验证已有代码不要求模型配置仍处于启用状态。
+- 满意后再单独保存。范围警告保留，已实际验证通过的候选可人工确认保存，并保留对应 hash 的真实验证结果；通过之后不能继续显示“尚未实际验证”。
+- 无数据库结构变化。部署需重启后端和 Celery，前端开发模式刷新；本次未对真实测试网站执行任何操作。
+
+本轮验收：433 项后端测试、152 项前端测试和生产构建通过，`git diff --check` 通过。构建仅保留既有大包体积提示。隔离浏览器已验证：取消风险确认不运行；在模型配置停用后仍可验证已有候选；首次失败、第二次通过都能读取日志和截图；两次运行均绑定独立确认记录；保存前原用例未改写，保存后保留通过结果和范围警告。原失败执行记录未被改写，手动验证及保存未额外调用模型。
+
+重新验证会替换旧摘要，已运行未通过不会写成“尚未实际验证”；取消或中止后不再继续显示正在验证。验收使用真实前端/API/worker/临时数据库，但模型和被测脚本执行为隔离替身，只证明平台流程与结果展示，不代表真实候选脚本已通过业务验证。

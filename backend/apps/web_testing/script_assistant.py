@@ -157,8 +157,27 @@ def _claim(session_id, revision, task_id):
             or item.status != "queued"
         ):
             return None
-        item.status, item.phase, item.message = "running", "model", "正在生成候选脚本"
-        item.save(update_fields=["status", "phase", "message", "updated_at"])
+        update_fields = ["status", "phase", "message", "updated_at"]
+        if item.operation == "verify":
+            verification = dict(item.verification or {})
+            # Keep the queue authorization intact while the worker is running;
+            # _verify_candidate consumes it before replacing verification with
+            # the immutable result.
+            verification["status"] = "running"
+            item.verification = verification
+            item.status, item.phase, item.message = (
+                "running",
+                "verifying",
+                "正在运行候选验证",
+            )
+            update_fields.append("verification")
+        else:
+            item.status, item.phase, item.message = (
+                "running",
+                "model",
+                "正在生成候选脚本",
+            )
+        item.save(update_fields=update_fields)
         return item
 
 
@@ -787,11 +806,21 @@ def _execute_candidate(session, candidate, variables, round_number, *, label="AI
 
 
 def _verify_candidate(session, revision, task_id):
+    authorization = (session.verification or {}).get("authorization") or {}
+    action = verify_action_state(session, allow_running=True)
     if (
         session.status != "running"
         or not session.candidate_script
         or candidate_hash(session.candidate_script) != session.candidate_hash
-        or session.blockers
+        or not action["can_verify"]
+        or authorization.get("candidate_hash") != session.candidate_hash
+        or authorization.get("revision") != revision
+        or authorization.get("task_id") != task_id
+        or not isinstance(authorization.get("acknowledge_review"), bool)
+        or (
+            action["requires_acknowledge_review"]
+            and authorization.get("acknowledge_review") is not True
+        )
     ):
         raise ScriptAssistantConflict("当前候选已变化或存在限制，不能执行验证。")
     attempt = _execute_candidate(
@@ -811,6 +840,9 @@ def _verify_candidate(session, revision, task_id):
         "has_screenshot": attempt["has_screenshot"],
         "runtime_assertion_count": attempt["runtime_assertion_count"],
         "diagnostics": attempt["diagnostics"],
+        # verification is replaced by the result below; retain the exact
+        # one-time queue authorization with this immutable attempt record.
+        "authorization": dict(authorization),
     }
     verification = {
         "status": attempt["status"],
@@ -831,12 +863,9 @@ def _verify_candidate(session, revision, task_id):
         phase="verified",
         message="候选验证通过" if passed else "候选验证未通过，请查看执行详情。",
         summary=_summary(
-            session.summary,
-            (
-                "候选已实际验证通过。"
-                if passed
-                else "候选实际验证未通过，请查看执行详情。"
-            ),
+            "本次候选已实际验证通过。"
+            if passed
+            else f"本次候选实际验证未通过：{attempt['summary']}"
         ),
     )
     return {
@@ -1039,11 +1068,13 @@ def run_script_assistant_operation(session_id, revision, task_id):
     if session is None:
         return {"success": False, "ignored": True}
     try:
+        # Verification executes the already persisted candidate only.  It must
+        # remain available after a model configuration is disabled.
+        if session.operation == "verify":
+            return _verify_candidate(session, revision, task_id)
         config = LLMConfiguration.objects.get(
             id=session.model_config_id, is_active=True, model_type=ModelType.LLM
         )
-        if session.operation == "verify":
-            return _verify_candidate(session, revision, task_id)
         variables = []
         evidence = None
         if session.mode == "repair":
@@ -1260,7 +1291,7 @@ def repair_adoption_state(session) -> dict[str, Any]:
     )
     manual_review = (
         session.mode == "repair"
-        and session.status == "candidate_ready"
+        and session.status in {"candidate_ready", "candidate_passed"}
         and valid_candidate
         and bool(blocker_codes)
         and all(code == "REPAIR_SCOPE_CHANGED" for code in blocker_codes)
@@ -1272,5 +1303,39 @@ def repair_adoption_state(session) -> dict[str, Any]:
             else ("manual_review" if manual_review else "unavailable")
         ),
         "can_apply": automatic or manual_review,
+        "requires_acknowledge_review": manual_review,
+    }
+
+
+def verify_action_state(session, *, allow_running: bool = False) -> dict[str, Any]:
+    """Return the server-authoritative permission for one candidate run."""
+    valid_candidate = bool(session.candidate_script and session.candidate_hash)
+    if valid_candidate:
+        valid_candidate = (
+            candidate_hash(session.candidate_script) == session.candidate_hash
+        )
+    if valid_candidate:
+        try:
+            normalize_for_storage(session.candidate_script)
+        except ScriptContractError:
+            valid_candidate = False
+
+    valid_statuses = {"candidate_ready", "candidate_passed"}
+    if allow_running:
+        valid_statuses.add("running")
+    candidate_state = session.status in valid_statuses and valid_candidate
+    blockers = list(session.blockers or [])
+    blocker_codes = [
+        item.get("code") if isinstance(item, dict) else None for item in blockers
+    ]
+    automatic = candidate_state and not blockers
+    manual_review = (
+        candidate_state
+        and session.mode == "repair"
+        and bool(blocker_codes)
+        and all(code == "REPAIR_SCOPE_CHANGED" for code in blocker_codes)
+    )
+    return {
+        "can_verify": automatic or manual_review,
         "requires_acknowledge_review": manual_review,
     }

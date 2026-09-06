@@ -44,7 +44,7 @@
       <div class="session-status">
         <el-tag :type="statusTagType(assistant.status)" effect="plain">{{ statusLabel(assistant.status) }}</el-tag>
         <span>{{ assistant.message || '会话状态已恢复。' }}</span>
-        <el-tag :type="verificationTagType(assistant.verification)" effect="plain">{{ verificationLabel(assistant.verification) }}</el-tag>
+        <el-tag :type="verificationTagType(assistant.verification, assistant.status)" effect="plain">{{ verificationLabel(assistant.verification, assistant.status) }}</el-tag>
       </div>
 
       <section v-if="assistant.summary || assistant.blockers?.length" class="assistant-summary">
@@ -60,12 +60,13 @@
           <el-button v-if="isEdit" type="primary" :disabled="!canContinue || acting" @click="applyToEditor">采用到编辑器</el-button>
           <el-button v-if="isEdit" :disabled="!canContinue || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
           <el-button v-if="isEdit" type="warning" plain :disabled="!canVerify || acting" @click="requestVerify">调试验证</el-button>
+          <el-button v-if="isRepair" type="warning" plain :disabled="!canVerify || acting" :loading="acting" @click="requestVerify">运行验证</el-button>
           <el-button v-if="isRepair" :type="requiresManualReview ? 'warning' : 'primary'" :disabled="!canApplyRepair || acting" :loading="acting" @click="requestApply">{{ requiresManualReview ? '人工确认并保存' : '采用并保存' }}</el-button>
         </div>
       </section>
 
-      <section v-if="isEdit && hasCandidate" class="verification-options">
-        <div class="runtime-heading"><strong>调试验证的本次变量</strong><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div>
+      <section v-if="(isEdit || isRepair) && hasCandidate && canVerify" class="verification-options">
+        <div class="runtime-heading"><strong>{{ isRepair ? '运行验证的本次变量' : '调试验证的本次变量' }}</strong><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div>
         <div v-for="(item, index) in runtimeVariables" :key="index" class="runtime-row"><el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="本次值" /><el-button text type="danger" @click="runtimeVariables.splice(index, 1)">删除</el-button></div>
         <el-form-item label="调试超时（秒）"><el-input-number v-model="runtimeTimeout" :min="30" :max="1800" /></el-form-item>
       </section>
@@ -94,7 +95,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from 'vue
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getWebUITestCaseExecution } from '@/api/webTesting'
 import { useWebUIScriptAssistant } from '@/composables/useWebUIScriptAssistant'
-import { assistantAttemptStatusLabel, assistantModelLabel, assistantPanelContext, canApplyRepairCandidate, canContinueCandidate, canVerifyCandidate, repairAdoptionState, verificationLabel, verificationTagType } from '@/composables/webUIScriptAssistantPresentation'
+import { assistantAttemptStatusLabel, assistantModelLabel, assistantPanelContext, canApplyRepairCandidate, canContinueCandidate, canVerifyCandidate, repairAdoptionState, verificationLabel, verificationTagType, verifyActionState } from '@/composables/webUIScriptAssistantPresentation'
 
 const WebUITestCaseExecutionDetail = defineAsyncComponent(() => import('@/components/WebUITestCaseExecutionDetail.vue'))
 const props = defineProps({
@@ -126,10 +127,32 @@ const selectedAssistantId = computed({ get: () => assistant.value?.id || null, s
 const hasCandidate = computed(() => Boolean(assistant.value?.candidate_hash && assistant.value?.candidate_script))
 const canContinue = computed(() => canContinueCandidate(assistant.value))
 const canVerify = computed(() => canVerifyCandidate(assistant.value))
+const verifyAction = computed(() => verifyActionState(assistant.value))
+const requiresVerifyReview = computed(() => verifyAction.value.requires_acknowledge_review)
 const canApplyRepair = computed(() => canApplyRepairCandidate(assistant.value))
 const adoption = computed(() => repairAdoptionState(assistant.value))
 const requiresManualReview = computed(() => adoption.value.requires_acknowledge_review)
 const wasManuallyAdopted = computed(() => assistant.value?.quality_report?.manual_adoption?.reason === 'REPAIR_SCOPE_CHANGED')
+const candidateVerificationState = computed(() => {
+  const verification = assistant.value?.verification
+  if (!verification || verification.candidate_hash !== assistant.value?.candidate_hash) return 'unverified'
+  if (verification.status === 'passed') return 'passed'
+  if (['failed', 'error', 'incomplete', 'stopped'].includes(verification.status)) return 'ran_not_passed'
+  if (['queued', 'pending', 'running'].includes(verification.status)) return 'pending'
+  return 'unverified'
+})
+const manualSaveConfirmation = state => ({
+  passed: '该候选已实际验证通过，但仍未通过自动修复范围检查。请检查完整代码后人工确认保存；保存不会再次运行。',
+  ran_not_passed: '该候选已实际运行但未通过或验证不完整，仍未通过自动修复范围检查。请检查完整代码后人工确认保存；保存不会再次运行。',
+  pending: '该候选正在或已排队进行实际验证，请等待本次结果后再保存。',
+  unverified: '该候选未通过自动修复范围检查，尚未实际验证，请检查完整代码，保存不会运行。确认后将保存到测试用例；历史失败执行不会被改写。'
+})[state]
+const manualSaveToast = state => ({
+  passed: '已人工确认并保存；该候选已实际验证通过。',
+  ran_not_passed: '已人工确认并保存；该候选此前实际运行未通过或验证不完整。',
+  pending: '已人工确认并保存。',
+  unverified: '已人工确认并保存；该候选尚未实际验证。'
+})[state]
 const candidateTagLabel = computed(() => {
   if (assistant.value?.status === 'applied') return wasManuallyAdopted.value ? '已人工确认保存' : '已保存'
   if (requiresManualReview.value) return '需人工确认保存'
@@ -217,8 +240,26 @@ const requestVerify = async () => {
   if (!canVerify.value) return ElMessage.warning('候选正在处理、已采用或存在安全限制，不能调试验证。')
   try {
     const runtime = runtimePayload()
-    await ElMessageBox.confirm('调试验证会实际运行当前候选脚本，可能写入测试数据。确认仅使用测试账号和测试数据？', '确认调试验证', { type: 'warning', confirmButtonText: '确认执行', cancelButtonText: '取消' })
-    await verify({ expected_revision: assistant.value.revision, candidate_hash: assistant.value.candidate_hash, confirm_execution: true, runtime_variables: runtime, options: { timeout: runtimeTimeout.value } })
+    const frozen = {
+      id: assistant.value.id,
+      revision: assistant.value.revision,
+      candidateHash: assistant.value.candidate_hash,
+      acknowledgeReview: requiresVerifyReview.value,
+      runtime: runtime.map(item => ({ ...item })),
+      options: { timeout: runtimeTimeout.value }
+    }
+    if (frozen.acknowledgeReview) {
+      await ElMessageBox.confirm('该候选未通过自动修复范围检查。运行验证会实际执行当前候选脚本，可能写入测试数据；请检查完整代码后确认风险。', '确认风险并运行', { type: 'warning', confirmButtonText: '确认风险并运行', cancelButtonText: '取消' })
+    } else {
+      await ElMessageBox.confirm('运行验证会实际执行当前候选脚本，可能写入测试数据。确认仅使用测试账号和测试数据？', isRepair.value ? '确认运行验证' : '确认调试验证', { type: 'warning', confirmButtonText: '确认执行', cancelButtonText: '取消' })
+    }
+    const current = assistant.value
+    if (!current || String(current.id) !== String(frozen.id) || current.revision !== frozen.revision || current.candidate_hash !== frozen.candidateHash || requiresVerifyReview.value !== frozen.acknowledgeReview || !canVerify.value) {
+      ElMessage.warning('候选已变化，请刷新后重新确认。')
+      return
+    }
+    clearAttempt()
+    await verify({ expected_revision: frozen.revision, candidate_hash: frozen.candidateHash, confirm_execution: true, acknowledge_review: frozen.acknowledgeReview, runtime_variables: frozen.runtime, options: frozen.options })
   } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '启动调试验证失败') }
 }
 const requestApply = async () => {
@@ -228,11 +269,12 @@ const requestApply = async () => {
     revision: assistant.value.revision,
     candidateHash: assistant.value.candidate_hash,
     sourceEditVersion: assistant.value.source_edit_version,
-    acknowledgeReview: requiresManualReview.value
+    acknowledgeReview: requiresManualReview.value,
+    verificationState: candidateVerificationState.value
   }
   try {
     if (frozen.acknowledgeReview) {
-      await ElMessageBox.confirm('该候选未通过自动修复范围检查，尚未实际验证，请检查完整代码，保存不会运行。确认后将保存到测试用例；历史失败执行不会被改写。', '人工确认并保存', { type: 'warning', confirmButtonText: '人工确认并保存', cancelButtonText: '取消' })
+      await ElMessageBox.confirm(manualSaveConfirmation(frozen.verificationState), '人工确认并保存', { type: 'warning', confirmButtonText: '人工确认并保存', cancelButtonText: '取消' })
     } else {
       await ElMessageBox.confirm('确认采用候选并保存到测试用例？历史失败执行不会被改写。', '确认采用并保存', { type: 'warning', confirmButtonText: '采用并保存', cancelButtonText: '取消' })
     }
@@ -242,7 +284,7 @@ const requestApply = async () => {
       return
     }
     await apply({ expected_revision: frozen.revision, candidate_hash: frozen.candidateHash, expected_edit_version: frozen.sourceEditVersion, acknowledge_review: frozen.acknowledgeReview })
-    ElMessage.success(frozen.acknowledgeReview ? '已人工确认并保存；候选未实际验证。' : '候选已采用并保存。')
+    ElMessage.success(frozen.acknowledgeReview ? manualSaveToast(frozen.verificationState) : '候选已采用并保存。')
   } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '采用候选失败') }
 }
 const requestCancel = async () => {

@@ -99,18 +99,25 @@ def fake_runner(script, options=None, **kwargs):
         target = Path(screenshot)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(PNG)
+    fail = kwargs.get("environment_variables", {}).get("QA_LABEL") == "force-failure"
+    status = "failed" if fail else "passed"
     return {
-        "success": True,
-        "operation_success": True,
+        "success": not fail,
+        "operation_success": not fail,
         "runtime_assertion_count": 1,
-        "evaluation_status": "passed",
+        "evaluation_status": status,
+        "error": "AssertionError: 隔离候选验证失败" if fail else "",
         "result": {
-            "stdout": "验证 状态为 ok 通过\n测试用例执行完毕",
-            "stderr": "",
+            "stdout": (
+                "开始验证候选（隔离执行器）"
+                if fail
+                else "验证 状态为 ok 通过\n测试用例执行完毕"
+            ),
+            "stderr": "AssertionError: 隔离候选验证失败" if fail else "",
             "screenshot_path": screenshot,
             "test_file": "",
-            "evaluation_status": "passed",
-            "operation_success": True,
+            "evaluation_status": status,
+            "operation_success": not fail,
             "runtime_assertion_count": 1,
         },
     }
@@ -146,6 +153,15 @@ def add_fixtures(fixture):
         model_name="offline-assistant",
         api_key="offline-only",
         is_active=True,
+        created_by=user,
+    )
+    disabled_model = LLMConfiguration.objects.create(
+        model_type=ModelType.LLM,
+        provider="openai",
+        provider_name="已停用的隔离提供商",
+        model_name="disabled-model-not-needed-for-running",
+        api_key="offline-only",
+        is_active=False,
         created_by=user,
     )
     cases = []
@@ -244,8 +260,8 @@ def add_fixtures(fixture):
         project=project,
         test_case=cases[3],
         execution=review_execution,
-        model_config_id=model.id,
-        model_info=model_info(model),
+        model_config_id=disabled_model.id,
+        model_info=model_info(disabled_model),
         source_script=cases[3].test_script_content,
         source_script_version=cases[3].script_version,
         source_edit_version=cases[3].edit_version,
@@ -505,10 +521,112 @@ def verify_ui(origin, fixture, output):
             expect(panel.locator(".candidate-section pre")).to_contain_text(
                 'await page.locator("#status").click()'
             )
+            run_candidate = panel.get_by_role("button", name="运行验证", exact=True)
+            expect(run_candidate).to_be_enabled()
+            options = panel.locator(".verification-options")
+            options.get_by_role("button", name="添加", exact=True).click()
+            options.get_by_placeholder("变量名", exact=True).fill("QA_LABEL")
+            options.get_by_placeholder("本次值", exact=True).fill("force-failure")
+            verify_path = f'/script-assistants/{fixture["review_session_id"]}/verify/'
+            run_candidate.click()
+            confirmation = page.locator(".el-message-box")
+            expect(confirmation).to_contain_text("范围")
+            confirmation.get_by_role("button", name="取消", exact=True).click()
+            assert not [
+                r
+                for r in requests
+                if r.method == "POST" and r.url.endswith(verify_path)
+            ]
+            assert len(RUNS) == 3
+
+            run_candidate.click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith(verify_path)
+            ) as first_verification:
+                confirmation.get_by_role(
+                    "button", name="确认风险并运行", exact=True
+                ).click()
+            assert (
+                first_verification.value.status == 202
+            ), first_verification.value.text()
+            verify_payload = first_verification.value.request.post_data_json
+            assert (
+                verify_payload["confirm_execution"] is True
+                and verify_payload["acknowledge_review"] is True
+            )
+            expect(panel.get_by_text("实际验证失败", exact=True)).to_be_visible(
+                timeout=20000
+            )
+            assert len(RUNS) == 4, (RUNS, WORKER_RESULTS)
+            panel.get_by_role("button", name=re.compile("第 1 轮")).click()
+            expect(panel.get_by_role("img").first).to_be_visible()
+            panel.get_by_role(
+                "button", name="查看原始 stdout / stderr / log", exact=True
+            ).click()
+            expect(
+                panel.get_by_text("AssertionError: 隔离候选验证失败", exact=False).last
+            ).to_be_visible()
+            page.screenshot(
+                path=str(output / "repair-manual-verification-failed.png"),
+                full_page=True,
+                animations="disabled",
+            )
+            manual_save.click()
+            expect(confirmation).to_contain_text("未通过")
+            expect(confirmation).not_to_contain_text("尚未实际验证")
+            confirmation.get_by_role("button", name="取消", exact=True).click()
+
+            # Retry is another explicit single run, not a new model repair.
+            options.get_by_placeholder("本次值", exact=True).fill("review-value")
+            expect(run_candidate).to_be_enabled()
+            run_candidate.click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith(verify_path)
+            ) as second_verification:
+                confirmation.get_by_role(
+                    "button", name="确认风险并运行", exact=True
+                ).click()
+            assert (
+                second_verification.value.status == 202
+            ), second_verification.value.text()
+            expect(panel.get_by_text("实际验证通过", exact=True)).to_be_visible(
+                timeout=20000
+            )
+            assert len(RUNS) == 5, (RUNS, WORKER_RESULTS)
+            assert RUNS[-1]["script"] == REVIEW_CANDIDATE
+            assert RUNS[-1]["options"]["headed"] is False
+            assert RUNS[-1]["environment_variables"]["QA_LABEL"] == "review-value"
+            panel.get_by_role("button", name=re.compile("第 2 轮")).click()
+            expect(panel.get_by_role("img").first).to_be_visible()
+            panel.get_by_role(
+                "button", name="查看原始 stdout / stderr / log", exact=True
+            ).click()
+            expect(panel.get_by_text("测试用例执行完毕", exact=False)).to_be_visible()
+            original_case = context.request.get(
+                origin
+                + f'/api/v1/projects/{fixture["project_id"]}/web-testing/test-cases/{fixture["review_case_id"]}/',
+                headers={"Authorization": f'Bearer {fixture["token"]}'},
+            )
+            assert original_case.status == 200, original_case.text()
+            assert (
+                original_case.json()["data"]["test_script_content"] == SCRIPT.strip()
+            ), "Verifying a candidate must not overwrite the saved case"
+            assert (
+                len(MODEL_CALLS) == calls_before_review
+            ), "Candidate verification must not call the model again"
+            page.screenshot(
+                path=str(output / "repair-manual-verification-passed.png"),
+                full_page=True,
+                animations="disabled",
+            )
+
             review_path = f'/script-assistants/{fixture["review_session_id"]}/apply/'
             manual_save.click()
             confirmation = page.locator(".el-message-box")
             expect(confirmation).to_contain_text("验证")
+            expect(confirmation).not_to_contain_text("尚未实际验证")
             confirmation.get_by_role("button", name="取消", exact=True).click()
             assert not [
                 r
@@ -531,7 +649,7 @@ def verify_ui(origin, fixture, output):
             body = manually_adopted.value.json()["data"]
             assert body["status"] == "applied", body
             expect(confirmation).not_to_be_visible()
-            assert body["verification"]["status"] == "unverified", body
+            assert body["verification"]["status"] == "passed", body
             assert {item["code"] for item in body["blockers"]} == {
                 "REPAIR_SCOPE_CHANGED"
             }
@@ -544,8 +662,8 @@ def verify_ui(origin, fixture, output):
                 == body["candidate_hash"]
             )
             assert body["adoption"]["can_apply"] is False
-            expect(panel.get_by_text("尚未实际验证", exact=True)).to_be_visible()
-            assert len(RUNS) == 3, "Manual adoption must not execute a candidate"
+            expect(panel.get_by_text("实际验证通过", exact=True)).to_be_visible()
+            assert len(RUNS) == 5, "Manual adoption must not execute a candidate"
             assert (
                 len(MODEL_CALLS) == calls_before_review
             ), "Restoring and adopting must not regenerate"
@@ -558,7 +676,7 @@ def verify_ui(origin, fixture, output):
             expect(
                 panel.get_by_role("button", name="采用并保存", exact=True)
             ).to_be_disabled()
-            expect(panel.get_by_text("尚未实际验证", exact=True)).to_be_visible()
+            expect(panel.get_by_text("实际验证通过", exact=True)).to_be_visible()
             page.goto(origin + "/web-testing/test-cases")
             page.get_by_role("row").filter(has_text="对话编辑验收").get_by_role(
                 "button", name="编辑", exact=True
@@ -580,7 +698,7 @@ def verify_ui(origin, fixture, output):
             STREAM_RELEASE.set()
             panel.get_by_role("button", name="最近会话", exact=True).click()
             expect(panel.get_by_text("已取消", exact=True)).to_be_visible()
-            assert len(RUNS) == 3, "Cancelling a conversation must not start a browser"
+            assert len(RUNS) == 5, "Cancelling a conversation must not start a browser"
             page.screenshot(
                 path=str(output / "cancelled-conversation.png"),
                 full_page=True,
@@ -678,12 +796,23 @@ def main():
             == "failed"
         )
         review = WebUIScriptAssistant.objects.get(pk=fixture["review_session_id"])
-        assert (
-            review.status == "applied" and review.verification["status"] == "unverified"
+        assert review.status == "applied" and review.verification["status"] == "passed"
+        assert [attempt["execution_status"] for attempt in review.attempts] == [
+            "failed",
+            "passed",
+        ]
+        assert all(attempt["has_screenshot"] for attempt in review.attempts)
+        assert review.verification["candidate_hash"] == review.candidate_hash
+        authorizations = [attempt["authorization"] for attempt in review.attempts]
+        assert len({item["task_id"] for item in authorizations}) == 2
+        assert len({item["revision"] for item in authorizations}) == 2
+        assert all(
+            item["acknowledge_review"] is True
+            and item["candidate_hash"] == review.candidate_hash
+            and item["acknowledged_by"] == fixture["user_id"]
+            and item["acknowledged_at"]
+            for item in authorizations
         )
-        assert (
-            not review.attempts
-        ), "Manual adoption must not fabricate an execution record"
     print("PASS: isolated saved-script assistant browser integration")
 
 

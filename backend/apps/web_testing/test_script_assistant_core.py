@@ -25,6 +25,7 @@ from .script_assistant import (
     _run_repair_rounds,
     _stream_text,
     _validate_candidate,
+    _verify_candidate,
     directed_mcp_inspect,
     candidate_hash,
     run_script_assistant_operation,
@@ -113,6 +114,134 @@ class ScriptAssistantCoreTests(TestCase):
         self.assertEqual(attempt["status"], "passed")
         self.assertEqual(execution.error_message, "")
         self.assertEqual(execution.case_execution_detail.error_message, None)
+
+    def test_verify_uses_fresh_authorization_without_an_active_model(self):
+        self.session.status = "queued"
+        self.session.operation = "verify"
+        self.session.revision = 2
+        self.session.task_id = "verify-task"
+        self.session.candidate_script = SCRIPT
+        self.session.candidate_hash = candidate_hash(SCRIPT)
+        self.session.blockers = [{"code": "REPAIR_SCOPE_CHANGED", "message": "scope"}]
+        self.session.verification = {
+            "status": "queued",
+            "authorization": {
+                "candidate_hash": self.session.candidate_hash,
+                "revision": self.session.revision,
+                "task_id": self.session.task_id,
+                "acknowledge_review": True,
+                "acknowledged_by": self.session.user_id,
+                "acknowledged_at": "2026-09-06T10:00:00+08:00",
+            },
+        }
+        self.session.save()
+        attempt = {
+            "status": "passed",
+            "execution_id": 801,
+            "summary": "验证通过",
+            "has_screenshot": True,
+            "runtime_assertion_count": 1,
+            "diagnostics": [],
+        }
+
+        def execute_candidate(*args, **kwargs):
+            self.session.refresh_from_db()
+            self.assertEqual(self.session.phase, "verifying")
+            self.assertEqual(self.session.message, "正在运行候选验证")
+            self.assertEqual(self.session.verification["status"], "running")
+            self.assertEqual(
+                self.session.verification["authorization"]["task_id"], "verify-task"
+            )
+            return attempt
+
+        with patch(
+            "web_testing.script_assistant.LLMConfiguration.objects.get",
+            side_effect=AssertionError("验证不应读取模型配置"),
+        ), patch(
+            "web_testing.script_assistant._execute_candidate",
+            side_effect=execute_candidate,
+        ) as execute:
+            result = run_script_assistant_operation(
+                str(self.session.id), self.session.revision, self.session.task_id
+            )
+        self.assertTrue(result["success"])
+        execute.assert_called_once()
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, "candidate_passed")
+        self.assertEqual(self.session.blockers[0]["code"], "REPAIR_SCOPE_CHANGED")
+        self.assertEqual(
+            self.session.verification["candidate_hash"], candidate_hash(SCRIPT)
+        )
+        self.assertEqual(
+            self.session.attempts[-1]["authorization"]["task_id"], "verify-task"
+        )
+        self.assertTrue(
+            self.session.attempts[-1]["authorization"]["acknowledge_review"]
+        )
+        self.assertEqual(
+            self.session.attempts[-1]["authorization"]["acknowledged_by"],
+            self.session.user_id,
+        )
+        self.assertEqual(
+            self.session.attempts[-1]["authorization"]["acknowledged_at"],
+            "2026-09-06T10:00:00+08:00",
+        )
+
+    def test_verify_rejects_old_authorization_before_running_candidate(self):
+        self.session.status = "running"
+        self.session.operation = "verify"
+        self.session.revision = 3
+        self.session.task_id = "verify-task-new"
+        self.session.candidate_script = SCRIPT
+        self.session.candidate_hash = candidate_hash(SCRIPT)
+        self.session.blockers = [{"code": "REPAIR_SCOPE_CHANGED", "message": "scope"}]
+        self.session.verification = {
+            "status": "queued",
+            "authorization": {
+                "candidate_hash": self.session.candidate_hash,
+                "revision": 2,
+                "task_id": "verify-task-old",
+                "acknowledge_review": True,
+            },
+        }
+        self.session.save()
+        with self.assertRaisesRegex(ScriptAssistantConflict, "当前候选已变化"):
+            _verify_candidate(self.session, self.session.revision, self.session.task_id)
+
+    def test_verify_summary_replaces_stale_verification_state(self):
+        self.session.status = "running"
+        self.session.operation = "verify"
+        self.session.revision = 4
+        self.session.task_id = "verify-summary-task"
+        self.session.candidate_script = SCRIPT
+        self.session.candidate_hash = candidate_hash(SCRIPT)
+        self.session.summary = "候选尚未执行验证；上次验证通过。"
+        self.session.verification = {
+            "status": "queued",
+            "authorization": {
+                "candidate_hash": self.session.candidate_hash,
+                "revision": self.session.revision,
+                "task_id": self.session.task_id,
+                "acknowledge_review": False,
+            },
+        }
+        self.session.save()
+        attempt = {
+            "status": "failed",
+            "execution_id": 802,
+            "summary": "页面断言超时",
+            "has_screenshot": True,
+            "runtime_assertion_count": 1,
+            "diagnostics": [],
+        }
+        with patch(
+            "web_testing.script_assistant._execute_candidate", return_value=attempt
+        ):
+            _verify_candidate(self.session, self.session.revision, self.session.task_id)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, "candidate_ready")
+        self.assertEqual(self.session.summary, "本次候选实际验证未通过：页面断言超时")
+        self.assertNotIn("上次验证通过", self.session.summary)
 
     def test_non_code_second_failure_stops_before_another_model_round(self):
         first = {

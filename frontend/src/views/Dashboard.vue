@@ -511,7 +511,7 @@ function getPortalTitle(i) {
 function getPortalDesc(i) {
   const map = {
     'portal-api': '多协议接口测试、复杂场景链路编排。',
-    'portal-web': '基于 Playwright 的 UI 自动化，录制与回放。',
+    'portal-web': '基于 Playwright MCP 自动生成自动化代码，支持自动修复和运行。',
     'portal-app': '移动端 UI 自动化、POM 解析与智能体。',
     'portal-perf': '负载压测、性能分析与专项测试。',
     'portal-ai-config': 'LLM 厂商对接、RAG 向量库配置、MCP 协议管理。',

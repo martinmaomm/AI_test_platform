@@ -21,15 +21,10 @@
           <el-descriptions-item label="任务名称">
             {{ task.name }}
           </el-descriptions-item>
-          <el-descriptions-item label="测试类型">
-            <el-tag :type="getSuiteTypeTagType(task.suite_type)">
-              {{ getSuiteTypeLabel(task.suite_type) }}
-            </el-tag>
-          </el-descriptions-item>
           <el-descriptions-item label="测试套件">
             {{ task.suite_name }}
           </el-descriptions-item>
-          <el-descriptions-item v-if="task.suite_type !== 'web'" label="执行环境">
+          <el-descriptions-item v-if="task.environment_name" label="执行环境">
             {{ task.environment_name }}
           </el-descriptions-item>
           <el-descriptions-item label="Cron表达式">
@@ -159,7 +154,7 @@
           <el-table-column prop="status" label="状态" width="80">
             <template #default="{ row }">
               <el-tag :type="getExecutionStatusTagType(row.status)" size="small">
-                {{ getExecutionStatusLabel(row.status) }}
+                {{ getRecentLogStatusLabel(row) }}
               </el-tag>
             </template>
           </el-table-column>
@@ -269,6 +264,9 @@
 import { ref, computed, watch } from 'vue'
 import { Link } from '@element-plus/icons-vue'
 import { getTaskExecutionLogs } from '../../api/scheduledTasks'
+import { useProjectStore } from '@/stores/project'
+
+const projectStore = useProjectStore()
 
 // Props
 const props = defineProps({
@@ -295,6 +293,7 @@ const loadingLogs = ref(false)
 const recentLogs = ref([])
 const showLogDetail = ref(false)
 const selectedLog = ref(null)
+let logRequestId = 0
 
 // 监听对话框显示
 watch(visible, (newVal) => {
@@ -305,16 +304,21 @@ watch(visible, (newVal) => {
 
 // 方法
 const loadRecentLogs = async () => {
-  if (!props.task) return
+  const projectId = projectStore.currentProjectId
+  const taskId = props.task?.id
+  const requestId = ++logRequestId
+  if (!projectId || !taskId) return
   
   try {
     loadingLogs.value = true
-    const response = await getTaskExecutionLogs(props.task.id, { page_size: 5 })
-    recentLogs.value = response.results || response
+    const response = await getTaskExecutionLogs(projectId, taskId, { page_size: 5 })
+    if (requestId !== logRequestId || taskId !== props.task?.id || projectId !== projectStore.currentProjectId) return
+    const data = response?.data ?? response
+    recentLogs.value = data?.items ?? data?.results ?? data ?? []
   } catch (error) {
     console.error('Load recent logs error:', error)
   } finally {
-    loadingLogs.value = false
+    if (requestId === logRequestId) loadingLogs.value = false
   }
 }
 
@@ -333,29 +337,10 @@ const handleClose = () => {
 }
 
 // 工具方法
-const getSuiteTypeLabel = (type) => {
-  const labels = {
-    web: 'Web测试',
-    api: 'API测试',
-    app: 'App测试'
-  }
-  return labels[type] || type
-}
-
-const getSuiteTypeTagType = (type) => {
-  const types = {
-    web: 'primary',
-    api: 'success',
-    app: 'warning'
-  }
-  return types[type] || 'info'
-}
-
 const getStatusLabel = (status) => {
   const labels = {
     active: '启用',
-    paused: '暂停',
-    disabled: '禁用'
+    paused: '暂停'
   }
   return labels[status] || status
 }
@@ -363,8 +348,7 @@ const getStatusLabel = (status) => {
 const getStatusTagType = (status) => {
   const types = {
     active: 'success',
-    paused: 'warning',
-    disabled: 'danger'
+    paused: 'warning'
   }
   return types[status] || 'info'
 }
@@ -374,8 +358,8 @@ const getExecutionStatusLabel = (status) => {
     success: '成功',
     failed: '失败',
     running: '执行中',
-    pending: '等待中',
-    cancelled: '已取消'
+    pending: '未完成',
+    cancelled: '已跳过'
   }
   return labels[status] || status
 }
@@ -389,6 +373,14 @@ const getExecutionStatusTagType = (status) => {
     cancelled: 'info'
   }
   return types[status] || 'info'
+}
+
+const getRecentLogStatusLabel = (row) => {
+  const totalCases = Number(row.total_cases) || 0
+  const skippedCases = Number(row.skipped_cases) || 0
+  if (row.status === 'pending' || row.status === 'running' || Number(row.incomplete_cases) > 0) return '未完成'
+  if (row.status === 'cancelled' || (totalCases > 0 && skippedCases === totalCases)) return '已跳过'
+  return getExecutionStatusLabel(row.status)
 }
 
 const getNotificationTypeLabel = (type) => {

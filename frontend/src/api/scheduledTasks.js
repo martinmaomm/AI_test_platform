@@ -30,6 +30,12 @@ export const updateScheduledTask = async (projectId, id, data) => {
   return response.data
 }
 
+// 仅切换任务状态；暂停不经过套件/环境表单校验。
+export const updateScheduledTaskStatus = async (projectId, id, status) => {
+  const response = await api.patch(`/projects/${projectId}/scheduled-tasks/tasks/${id}/status/`, { status })
+  return response.data
+}
+
 // 删除任务
 export const deleteScheduledTask = async (projectId, id) => {
   const response = await api.delete(`/projects/${projectId}/scheduled-tasks/tasks/${id}/`)
@@ -71,10 +77,8 @@ export const getTaskExecutionLogs = async (projectId, taskId, params = {}) => {
 // ============ 辅助接口相关 ============
 
 // 获取测试套件选择列表
-export const getSuiteChoices = async (projectId, suiteType) => {
-  const response = await api.get(`/projects/${projectId}/scheduled-tasks/suite-choices/`, {
-    params: { suite_type: suiteType }
-  })
+export const getSuiteChoices = async (projectId) => {
+  const response = await api.get(`/projects/${projectId}/scheduled-tasks/suite-choices/`)
   return response.data
 }
 

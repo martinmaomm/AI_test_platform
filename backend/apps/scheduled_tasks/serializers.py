@@ -4,8 +4,10 @@ Scheduled Tasks Serializers
 """
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from projects.models import Project, Environment
+from projects.models import Environment
 from .models import ScheduledTask, TaskExecutionLog
+from .contracts import validate_suites, get_schedule_project
+from .cron import next_run_time
 
 User = get_user_model()
 
@@ -23,6 +25,7 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
     total_executions = serializers.SerializerMethodField(read_only=True)
     success_rate = serializers.SerializerMethodField(read_only=True)
     last_execution_status = serializers.SerializerMethodField(read_only=True)
+    last_report_status = serializers.SerializerMethodField(read_only=True)
     last_passed_cases = serializers.SerializerMethodField(read_only=True)
     last_failed_cases = serializers.SerializerMethodField(read_only=True)
     last_total_cases = serializers.SerializerMethodField(read_only=True)
@@ -37,7 +40,7 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
             'notice_targets', 'trigger_condition',
             'last_run_time', 'next_run_time', 'user', 'user_name', 'project', 'project_name',
             'created_at', 'updated_at',
-            'total_executions', 'success_rate', 'last_execution_status',
+            'total_executions', 'success_rate', 'last_execution_status', 'last_report_status',
             'last_passed_cases', 'last_failed_cases', 'last_total_cases',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'last_run_time', 'next_run_time']
@@ -67,6 +70,17 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
         """获取最近一次执行状态"""
         last_log = self._get_last_log(obj)
         return last_log.status if last_log else None
+
+    def get_last_report_status(self, obj):
+        last_log = self._get_last_log(obj)
+        if not last_log:
+            return None
+        if last_log.status in {'pending', 'running', 'cancelled'}:
+            return last_log.status
+        if last_log.linked_executions:
+            from .reporting import summarize_linked_executions
+            return summarize_linked_executions(last_log)['report_status']
+        return 'error' if last_log.status == 'failed' else 'skipped'
 
     def get_last_passed_cases(self, obj):
         last_log = self._get_last_log(obj)
@@ -121,6 +135,7 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
     environment = serializers.PrimaryKeyRelatedField(
         queryset=Environment.objects.all(), required=False, allow_null=True,
     )
+    suite_type = serializers.CharField(read_only=True)
     
     class Meta:
         model = ScheduledTask
@@ -130,49 +145,44 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
         ]
     
     def validate_suite_ids(self, value):
-        """验证测试套件ID列表是否存在"""
-        if not value or len(value) == 0:
-            raise serializers.ValidationError("至少需要选择一个测试套件")
-        
-        suite_type = self.initial_data.get('suite_type')
-        
-        if suite_type == 'web':
-            from web_testing.models import WebUITestSuite
-            existing_ids = WebUITestSuite.objects.filter(id__in=value).values_list('id', flat=True)
-            missing_ids = set(value) - set(existing_ids)
-            if missing_ids:
-                raise serializers.ValidationError(f"Web测试套件不存在: {list(missing_ids)}")
-        elif suite_type == 'api':
-            from api_testing.models import APITestSuite
-            existing_ids = APITestSuite.objects.filter(id__in=value).values_list('id', flat=True)
-            missing_ids = set(value) - set(existing_ids)
-            if missing_ids:
-                raise serializers.ValidationError(f"API测试套件不存在: {list(missing_ids)}")
-        elif suite_type == 'app':
-            # App测试套件模型待实现
-            pass
-        
+        if not isinstance(value, list) or not value:
+            raise serializers.ValidationError('至少选择一个测试套件')
         return value
     
     def validate_cron_expression(self, value):
         """验证cron表达式"""
-        if not ScheduledTask._validate_cron_expression(value):
-            raise serializers.ValidationError("Cron表达式格式不正确")
-        return value
+        try:
+            next_run_time(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+        return ' '.join(value.split())
 
     def validate(self, attrs):
-        suite_type = attrs.get('suite_type') or getattr(self.instance, 'suite_type', '')
+        project = self.context.get('project') or getattr(self.instance, 'project', None)
+        if project is None or project.project_type not in {'web', 'api'}:
+            raise serializers.ValidationError('缺少有效的当前项目')
+        suite_type = project.project_type
+        if self.initial_data.get('suite_type', suite_type) != suite_type:
+            raise serializers.ValidationError({'suite_type': '测试类型由当前项目确定，不能跨类型选择'})
+        attrs['suite_type'] = suite_type
+        request = self.context.get('request')
+        if request and attrs.get('status', getattr(self.instance, 'status', 'active')) == 'active':
+            get_schedule_project(project.pk, request.user, 'execute')
+        validate_suites(project, attrs.get('suite_ids', getattr(self.instance, 'suite_ids', [])))
+        for target in attrs.get('notice_targets', []):
+            if target.project_id != project.pk:
+                raise serializers.ValidationError({'notice_targets': '通知对象必须属于当前项目'})
         environment_provided = 'environment' in attrs
         environment = attrs.get('environment') if environment_provided else getattr(self.instance, 'environment', None)
         if suite_type == 'web':
             if environment_provided and environment is not None:
                 raise serializers.ValidationError({'environment': 'WebUI 定时任务由脚本内完整网址执行，不接受环境。'})
-            # An API/App task may be switched to WebUI by PATCH without an
-            # explicit environment field. Clear its former shared environment.
             attrs['environment'] = None
             return attrs
         if environment is None:
-            raise serializers.ValidationError({'environment': 'API/App 定时任务必须选择执行环境。'})
+            raise serializers.ValidationError({'environment': 'API 定时任务必须选择执行环境。'})
+        if environment.project_id != project.pk or environment.category != 'api' or not environment.is_active:
+            raise serializers.ValidationError({'environment': '请选择当前项目已启用的 API 环境'})
         return attrs
     
     def create(self, validated_data):
@@ -197,7 +207,30 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
         return instance
 
 
-class TaskExecutionLogSerializer(serializers.ModelSerializer):
+class ExecutionLogSummaryMixin:
+    def _summary(self, obj):
+        cache = self.__dict__.setdefault('_report_summary_cache', {})
+        key = obj.pk if obj.pk is not None else id(obj)
+        if key not in cache:
+            from .reporting import ExecutionSummary, summarize_linked_executions
+            if obj.linked_executions:
+                cache[key] = summarize_linked_executions(obj)
+            else:
+                # Preflight failures have no child executions.  No cases must
+                # never be presented as a successful test run.
+                cache[key] = ExecutionSummary(
+                    total_cases=obj.total_cases,
+                    passed_cases=obj.passed_cases,
+                    failed_cases=obj.failed_cases,
+                    skipped_cases=obj.skipped_cases,
+                    incomplete_cases=max(obj.total_cases - obj.passed_cases - obj.failed_cases - obj.skipped_cases, 0),
+                    execution_errors=int(obj.status == 'failed'),
+                    is_running=obj.status in {'pending', 'running'},
+                ).as_dict()
+        return cache[key]
+
+
+class TaskExecutionLogSerializer(ExecutionLogSummaryMixin, serializers.ModelSerializer):
     """任务执行日志序列化器"""
     
     task_name = serializers.CharField(source='task.name', read_only=True)
@@ -235,29 +268,6 @@ class TaskExecutionLogSerializer(serializers.ModelSerializer):
         """获取成功率"""
         return self._summary(obj)['success_rate']
 
-    def _summary(self, obj):
-        cache = getattr(self, '_report_summary_cache', None)
-        if cache is None:
-            cache = self._report_summary_cache = {}
-        cache_key = obj.pk if obj.pk is not None else id(obj)
-        if cache_key in cache:
-            return cache[cache_key]
-        from .reporting import summarize_linked_executions
-        summary = summarize_linked_executions(obj) if obj.linked_executions else {
-            'total_cases': obj.total_cases,
-            'passed_cases': obj.passed_cases,
-            'failed_cases': obj.failed_cases,
-            'skipped_cases': obj.skipped_cases,
-            'success_rate': obj.success_rate,
-            'incomplete_cases': 0,
-            'error_cases': 0,
-            'execution_errors': 0,
-            'is_running': obj.status in {'pending', 'running'},
-            'report_status': 'running' if obj.status in {'pending', 'running'} else ('passed' if obj.status == 'success' and obj.total_cases else 'skipped' if obj.status == 'success' else 'failed'),
-        }
-        cache[cache_key] = summary
-        return summary
-
     def get_total_cases(self, obj):
         return self._summary(obj)['total_cases']
 
@@ -286,7 +296,7 @@ class TaskExecutionLogSerializer(serializers.ModelSerializer):
         return 'running' if self._summary(obj).get('is_running') else 'completed'
 
 
-class TaskExecutionLogListSerializer(serializers.ModelSerializer):
+class TaskExecutionLogListSerializer(ExecutionLogSummaryMixin, serializers.ModelSerializer):
     """任务执行日志列表序列化器（简化版）"""
     
     task_name = serializers.CharField(source='task.name', read_only=True)
@@ -299,13 +309,14 @@ class TaskExecutionLogListSerializer(serializers.ModelSerializer):
     incomplete_cases = serializers.SerializerMethodField(read_only=True)
     success_rate = serializers.SerializerMethodField(read_only=True)
     task_status = serializers.SerializerMethodField(read_only=True)
+    report_status = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = TaskExecutionLog
         fields = [
             'id', 'task_name', 'suite_type', 'start_time', 'end_time', 'duration',
             'status', 'total_cases', 'passed_cases', 'failed_cases',
-            'skipped_cases', 'incomplete_cases', 'task_status', 'success_rate', 'report_url', 'linked_executions'
+            'skipped_cases', 'incomplete_cases', 'task_status', 'report_status', 'success_rate', 'report_url', 'linked_executions'
         ]
     
     def get_duration(self, obj):
@@ -323,23 +334,8 @@ class TaskExecutionLogListSerializer(serializers.ModelSerializer):
     def get_task_status(self, obj):
         return 'running' if self._summary(obj)['is_running'] else 'completed'
 
-    def _summary(self, obj):
-        cache = getattr(self, '_report_summary_cache', None)
-        if cache is None:
-            cache = self._report_summary_cache = {}
-        cache_key = obj.pk if obj.pk is not None else id(obj)
-        if cache_key not in cache:
-            from .reporting import summarize_linked_executions
-            cache[cache_key] = summarize_linked_executions(obj) if obj.linked_executions else {
-                'total_cases': obj.total_cases,
-                'passed_cases': obj.passed_cases,
-                'failed_cases': obj.failed_cases,
-                'skipped_cases': obj.skipped_cases,
-                'incomplete_cases': 0,
-                'success_rate': obj.success_rate,
-                'is_running': obj.status in {'pending', 'running'},
-            }
-        return cache[cache_key]
+    def get_report_status(self, obj):
+        return self._summary(obj)['report_status']
 
     def get_total_cases(self, obj):
         return self._summary(obj)['total_cases']
@@ -361,8 +357,9 @@ class TaskRunSerializer(serializers.Serializer):
         """验证任务是否可以执行"""
         task = self.context['task']
         
-        if task.status != 'active':
-            raise serializers.ValidationError("只有启用状态的任务才能手动执行")
+        if task.status not in {'active', 'paused'}:
+            raise serializers.ValidationError('当前任务状态不支持手动执行')
+        validate_suites(task.project, task.suite_ids)
         
         return attrs
 
@@ -386,3 +383,6 @@ class SuiteChoiceSerializer(serializers.Serializer):
     name = serializers.CharField()
     description = serializers.CharField(required=False)
     total_cases = serializers.IntegerField(required=False)
+    status = serializers.CharField()
+    selectable = serializers.BooleanField()
+    unavailable_reason = serializers.CharField(allow_blank=True)

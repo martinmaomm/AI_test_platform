@@ -66,18 +66,10 @@
         <div class="card-header-right">
           <!-- 筛选器 -->
           <div class="card-header-filters">
-            <el-select v-model="filters.suite_type" placeholder="测试类型" clearable @change="loadTasks" style="width: 120px;">
-              <el-option label="全部" value="" />
-              <el-option label="Web测试" value="web" />
-              <el-option label="API测试" value="api" />
-              <el-option label="App测试" value="app" />
-            </el-select>
-            
             <el-select v-model="filters.status" placeholder="任务状态" clearable @change="loadTasks" style="width: 120px;">
               <el-option label="全部" value="" />
               <el-option label="启用" value="active" />
               <el-option label="暂停" value="paused" />
-              <el-option label="禁用" value="disabled" />
             </el-select>
             
             <el-input
@@ -120,14 +112,6 @@
           </template>
         </el-table-column>
         
-        <el-table-column prop="suite_type" label="测试类型" width="100">
-          <template #default="{ row }">
-            <el-tag :type="getSuiteTypeTagType(row.suite_type)">
-              {{ getSuiteTypeLabel(row.suite_type) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        
         <el-table-column prop="suite_name" label="测试套件" min-width="150" />
         
         <el-table-column prop="cron_expression" label="执行时间" min-width="180">
@@ -167,18 +151,18 @@
         
         <el-table-column label="最近执行结果" width="180">
           <template #default="{ row }">
-            <div v-if="row.last_total_cases > 0" class="last-result">
+            <div v-if="row.last_execution_status" class="last-result">
               <span class="lr-pass">{{ row.last_passed_cases }}</span>
               <span class="lr-sep">/</span>
               <span class="lr-fail">{{ row.last_failed_cases }}</span>
               <span class="lr-sep">/</span>
               <span class="lr-total">{{ row.last_total_cases }}</span>
               <el-tag
-                :type="row.last_failed_cases > 0 ? 'danger' : 'success'"
+                :type="getLastReportResult(row).type"
                 size="small"
                 style="margin-left:6px;"
               >
-                {{ row.last_failed_cases > 0 ? '未通过' : '通过' }}
+                {{ getLastReportResult(row).label }}
               </el-tag>
             </div>
             <span v-else class="no-data">未执行</span>
@@ -232,6 +216,14 @@
                   <Edit />
                 </el-icon>
                 编辑
+              </el-button>
+              <el-button
+                size="small"
+                :type="row.status === 'active' ? 'warning' : 'success'"
+                :loading="statusChangingTaskId === row.id"
+                @click="changeTaskStatus(row)"
+              >
+                {{ row.status === 'active' ? '暂停' : '启用' }}
               </el-button>
               <el-button 
                 type="primary" 
@@ -290,6 +282,7 @@ import { Plus, Clock, Search, Refresh, Delete, Close, Edit, VideoPlay, Loading }
 import { 
   getScheduledTasks, 
   runScheduledTask, 
+  updateScheduledTaskStatus,
   deleteScheduledTask,
   getExecutionLog
 } from '../../api/scheduledTasks'
@@ -312,6 +305,7 @@ const showCreateDialog = ref(false)
 const showDetailDialog = ref(false)
 const editingTask = ref(null)
 const viewingTask = ref(null)
+const statusChangingTaskId = ref(null)
 
 // 计算属性
 const selectedProject = computed(() => projectStore.currentProject)
@@ -328,7 +322,6 @@ const getCronDescription = (cron) => {
 
 // 筛选条件
 const filters = reactive({
-  suite_type: '',
   status: '',
   search: ''
 })
@@ -345,6 +338,7 @@ let searchTimeout = null
 
 // 异步任务完成轮询（组件销毁时须清除，防止内存泄漏）
 let executionPollingTimerId = null
+let taskRequestId = 0
 
 const stopExecutionPolling = () => {
   if (executionPollingTimerId != null) {
@@ -397,12 +391,14 @@ onMounted(async () => {
   
   loadTasks()
   
-  // 检查URL参数，如果有suite_type等参数，自动打开创建对话框
+  // 从当前项目的套件入口带入套件 ID 时，自动打开创建对话框。
   checkUrlParams()
 })
 
 // 方法
 const loadTasks = async () => {
+  const projectId = projectStore.currentProjectId
+  const requestId = ++taskRequestId
   if (!selectedProject.value) {
     tasks.value = []
     pagination.total = 0
@@ -414,12 +410,15 @@ const loadTasks = async () => {
     const params = {
       page: pagination.page,
       page_size: pagination.size,
-      ...filters
+      status: filters.status || undefined,
+      search: filters.search || undefined
     }
     
-    const response = await getScheduledTasks(projectStore.currentProjectId, params)
-    tasks.value = response.results || response
-    pagination.total = response.count || response.length
+    const response = await getScheduledTasks(projectId, params)
+    if (requestId !== taskRequestId || projectId !== projectStore.currentProjectId) return
+    const data = response?.data ?? response
+    tasks.value = data?.results ?? data ?? []
+    pagination.total = data?.count ?? data?.length ?? 0
   } catch (error) {
     ElMessage.error('加载任务列表失败')
     console.error('Load tasks error:', error)
@@ -429,19 +428,17 @@ const loadTasks = async () => {
 }
 
 const checkUrlParams = () => {
-  // 检查URL参数，如果有suite_type等参数，自动打开创建对话框
+  // 测试类型由当前项目确定，只接受套件 ID 预填充。
   const urlParams = new URLSearchParams(window.location.search)
-  const suiteType = urlParams.get('suite_type')
   const suiteId = urlParams.get('suite_id')
   const projectId = urlParams.get('project_id')
   
-  if (suiteType && suiteId && projectId && selectedProject.value && projectId == projectStore.currentProjectId) {
+  if (suiteId && projectId && selectedProject.value && projectId == projectStore.currentProjectId) {
     // 自动打开创建对话框
     showCreateDialog.value = true
     
     // 清除URL参数，避免刷新页面时重复打开
     const newUrl = new URL(window.location)
-    newUrl.searchParams.delete('suite_type')
     newUrl.searchParams.delete('suite_id')
     newUrl.searchParams.delete('suite_name')
     newUrl.searchParams.delete('project_id')
@@ -484,7 +481,11 @@ const runTask = async (task) => {
     loadTasks()
   } catch (error) {
     if (error !== 'cancel') {
-      ElMessage.error('执行任务失败')
+      if (error?.response?.status === 409) {
+        ElMessage.warning('任务正在执行，请等待当前执行完成后再试')
+      } else {
+        ElMessage.error('执行任务失败')
+      }
       console.error('Run task error:', error)
     }
   }
@@ -492,6 +493,22 @@ const runTask = async (task) => {
 
 const handleTaskSuccess = () => {
   loadTasks()
+}
+
+const changeTaskStatus = async (task) => {
+  const nextStatus = task.status === 'active' ? 'paused' : 'active'
+  try {
+    statusChangingTaskId.value = task.id
+    await updateScheduledTaskStatus(projectStore.currentProjectId, task.id, nextStatus)
+    ElMessage.success(nextStatus === 'active' ? '任务已启用' : '任务已暂停')
+    await loadTasks()
+  } catch (error) {
+    const message = error?.response?.data?.message || error?.response?.data?.detail
+    ElMessage.error(message || (nextStatus === 'active' ? '启用任务失败' : '暂停任务失败'))
+    console.error('Update task status error:', error)
+  } finally {
+    statusChangingTaskId.value = null
+  }
 }
 
 // 处理选择变化
@@ -539,29 +556,10 @@ const goToProjects = () => {
 }
 
 // 工具方法
-const getSuiteTypeLabel = (type) => {
-  const labels = {
-    web: 'Web测试',
-    api: 'API测试',
-    app: 'App测试'
-  }
-  return labels[type] || type
-}
-
-const getSuiteTypeTagType = (type) => {
-  const types = {
-    web: 'primary',
-    api: 'success',
-    app: 'warning'
-  }
-  return types[type] || 'info'
-}
-
 const getStatusLabel = (status) => {
   const labels = {
     active: '启用',
-    paused: '暂停',
-    disabled: '禁用'
+    paused: '暂停'
   }
   return labels[status] || status
 }
@@ -569,8 +567,7 @@ const getStatusLabel = (status) => {
 const getStatusTagType = (status) => {
   const types = {
     active: 'success',
-    paused: 'warning',
-    disabled: 'danger'
+    paused: 'warning'
   }
   return types[status] || 'info'
 }
@@ -580,10 +577,29 @@ const getExecutionStatusLabel = (status) => {
     success: '成功',
     failed: '失败',
     running: '执行中',
-    pending: '等待中',
-    cancelled: '已取消'
+    pending: '未完成',
+    cancelled: '已跳过'
   }
   return labels[status] || status
+}
+
+const getLastReportResult = (row) => {
+  const reportStatus = row.last_report_status
+  const executionStatus = row.last_execution_status
+  if (executionStatus === 'running' || executionStatus === 'pending' || reportStatus === 'running') {
+    return { label: '未完成', type: 'warning' }
+  }
+  if (executionStatus === 'cancelled' || reportStatus === 'skipped') {
+    return { label: '已跳过', type: 'info' }
+  }
+  if (reportStatus === 'passed') return { label: '通过', type: 'success' }
+  if (['failed', 'error'].includes(reportStatus) || (!reportStatus && executionStatus === 'failed')) {
+    return { label: '未通过', type: 'danger' }
+  }
+  if (['incomplete', 'completed'].includes(reportStatus)) {
+    return { label: reportStatus === 'incomplete' ? '未完成' : '已完成', type: 'warning' }
+  }
+  return { label: '结果未知', type: 'info' }
 }
 
 const getExecutionStatusTagType = (status) => {
@@ -634,6 +650,11 @@ watch(showDetailDialog, (newVal) => {
 watch(selectedProject, async (newProject, oldProject) => {
   if (newProject && newProject !== oldProject) {
     // 项目变化时重新加载数据
+    taskRequestId += 1
+    selectedTasks.value = []
+    showCreateDialog.value = false
+    showDetailDialog.value = false
+    pagination.page = 1
     await loadTasks()
   }
 }, { immediate: true })

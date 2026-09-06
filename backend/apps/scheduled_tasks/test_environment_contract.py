@@ -1,9 +1,9 @@
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from api_testing.models import APITestSuite
+from api_testing.models import APITestSuite, APITestCase
 from projects.models import Environment, Project
-from web_testing.models import WebUITestSuite
+from web_testing.models import WebUITestSuite, WebUITestCase
 
 from .serializers import ScheduledTaskCreateSerializer
 
@@ -17,8 +17,9 @@ class ScheduledTaskEnvironmentContractTests(TestCase):
             name='Scheduled task contract', project_type='web',
             owner=self.user, created_by=self.user,
         )
+        self.api_project = Project.objects.create(name='API project', project_type='api', created_by=self.user)
         self.environment = Environment.objects.create(
-            project=self.project, name='API environment',
+            project=self.api_project, name='API environment',
             category=Environment.EnvironmentCategory.API,
             config={'base_url': 'https://api.example.test'}, is_active=True,
         )
@@ -26,8 +27,14 @@ class ScheduledTaskEnvironmentContractTests(TestCase):
             name='Web suite', user=self.user, project=self.project,
         )
         self.api_suite = APITestSuite.objects.create(
-            name='API suite', user=self.user, project=self.project,
+            name='API suite', user=self.user, project=self.api_project,
         )
+        self.web_suite.test_cases.add(WebUITestCase.objects.create(title='UI', user=self.user, project=self.project))
+        self.api_suite.test_cases.add(APITestCase.objects.create(title='API', created_by=self.user, project=self.api_project, test_case_type='scenario'))
+
+    def serializer(self, suite_type, *args, **kwargs):
+        kwargs['context'] = {'project': self.project if suite_type == 'web' else self.api_project}
+        return ScheduledTaskCreateSerializer(*args, **kwargs)
 
     def payload(self, suite_type, suite_id, **overrides):
         payload = {
@@ -40,14 +47,14 @@ class ScheduledTaskEnvironmentContractTests(TestCase):
         return payload
 
     def test_webui_schedule_allows_no_environment_and_persists_null(self):
-        serializer = ScheduledTaskCreateSerializer(data=self.payload('web', self.web_suite.id))
+        serializer = self.serializer('web', data=self.payload('web', self.web_suite.id))
 
         self.assertTrue(serializer.is_valid(), serializer.errors)
         task = serializer.save(user=self.user, project=self.project)
         self.assertIsNone(task.environment)
 
     def test_webui_schedule_rejects_environment(self):
-        serializer = ScheduledTaskCreateSerializer(data=self.payload(
+        serializer = self.serializer('web', data=self.payload(
             'web', self.web_suite.id, environment=self.environment.id,
         ))
 
@@ -55,34 +62,33 @@ class ScheduledTaskEnvironmentContractTests(TestCase):
         self.assertIn('environment', serializer.errors)
 
     def test_api_schedule_requires_environment_on_create_and_update(self):
-        missing_environment = ScheduledTaskCreateSerializer(data=self.payload('api', self.api_suite.id))
+        missing_environment = self.serializer('api', data=self.payload('api', self.api_suite.id))
         self.assertFalse(missing_environment.is_valid())
         self.assertIn('environment', missing_environment.errors)
 
-        create_serializer = ScheduledTaskCreateSerializer(data=self.payload(
+        create_serializer = self.serializer('api', data=self.payload(
             'api', self.api_suite.id, environment=self.environment.id,
         ))
         self.assertTrue(create_serializer.is_valid(), create_serializer.errors)
-        task = create_serializer.save(user=self.user, project=self.project)
+        task = create_serializer.save(user=self.user, project=self.api_project)
 
-        update_serializer = ScheduledTaskCreateSerializer(
+        update_serializer = self.serializer('api',
             task, data={'environment': None}, partial=True,
         )
         self.assertFalse(update_serializer.is_valid())
         self.assertIn('environment', update_serializer.errors)
 
-    def test_switching_api_schedule_to_webui_clears_former_environment(self):
-        create_serializer = ScheduledTaskCreateSerializer(data=self.payload(
+    def test_cannot_switch_project_schedule_to_another_type(self):
+        create_serializer = self.serializer('api', data=self.payload(
             'api', self.api_suite.id, environment=self.environment.id,
         ))
         self.assertTrue(create_serializer.is_valid(), create_serializer.errors)
-        task = create_serializer.save(user=self.user, project=self.project)
+        task = create_serializer.save(user=self.user, project=self.api_project)
 
-        update_serializer = ScheduledTaskCreateSerializer(
+        update_serializer = self.serializer('api',
             task,
             data={'suite_type': 'web', 'suite_ids': [self.web_suite.id]},
             partial=True,
         )
-        self.assertTrue(update_serializer.is_valid(), update_serializer.errors)
-        updated = update_serializer.save()
-        self.assertIsNone(updated.environment)
+        self.assertFalse(update_serializer.is_valid())
+        self.assertIn('suite_type', update_serializer.errors)

@@ -31,12 +31,6 @@
         <div class="card-header-right">
           <!-- 筛选器 -->
           <div class="card-header-filters">
-            <el-select v-model="filters.suite_type" placeholder="测试类型" clearable style="width: 120px;" @change="loadLogs">
-              <el-option label="全部" value="" />
-              <el-option label="Web测试" value="web" />
-              <el-option label="API测试" value="api" />
-              <el-option label="App测试" value="app" />
-            </el-select>
             <el-select v-model="filters.status" placeholder="执行状态" clearable style="width: 140px;" @change="loadLogs">
               <el-option label="全部" value="" />
               <el-option label="成功" value="success" />
@@ -92,14 +86,6 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="suite_type" label="测试类型" width="100" align="center">
-          <template #default="{ row }">
-            <el-tag :type="getSuiteTypeTagType(row.suite_type)" size="small">
-              {{ getSuiteTypeLabel(row.suite_type) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-
         <el-table-column prop="status" label="状态" width="120" align="center">
           <template #default="{ row }">
             <el-tag
@@ -135,11 +121,11 @@
               <span class="separator"> / </span>
               <span class="total">{{ row.total_cases ?? 0 }}</span>
               <el-tag
-                :type="Number(row.failed_cases) > 0 ? 'danger' : 'success'"
+                :type="getLogResult(row).type"
                 size="small"
                 class="result-label-tag"
               >
-                {{ Number(row.failed_cases) > 0 ? '测试未通过' : '测试通过' }}
+                {{ getLogResult(row).label }}
               </el-tag>
             </div>
           </template>
@@ -186,7 +172,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { 
@@ -208,7 +194,6 @@ const projectStore = useProjectStore()
 
 // 筛选条件
 const filters = reactive({
-  suite_type: '',
   status: '',
   date_range: null,
   search: ''
@@ -224,10 +209,15 @@ const pagination = reactive({
 
 // 搜索防抖
 let searchTimeout = null
+let logRequestId = 0
 
 // 生命周期
 onMounted(() => {
   loadLogs()
+})
+
+onUnmounted(() => {
+  if (searchTimeout) clearTimeout(searchTimeout)
 })
 
 // 跳转到项目管理页面
@@ -237,6 +227,8 @@ const goToProjects = () => {
 
 // 方法
 const loadLogs = async () => {
+  const projectId = projectStore.currentProjectId
+  const requestId = ++logRequestId
   try {
     loading.value = true
     
@@ -249,7 +241,8 @@ const loadLogs = async () => {
     const params = {
       page: pagination.page,
       page_size: pagination.size,
-      ...filters
+      status: filters.status || undefined,
+      search: filters.search || undefined
     }
     
     // 处理日期范围
@@ -258,15 +251,17 @@ const loadLogs = async () => {
       params.end_time = filters.date_range[1]
     }
     
-    const response = await getExecutionLogs(projectStore.currentProjectId, params)
+    const response = await getExecutionLogs(projectId, params)
+    if (requestId !== logRequestId || projectId !== projectStore.currentProjectId) return
     // 适配新的分页数据结构
     if (response.data && response.data.items) {
       logs.value = response.data.items
       pagination.total = response.data.pagination.total
     } else {
       // 兼容旧的数据结构
-      logs.value = response.results || response
-      pagination.total = response.count || response.length
+      const data = response?.data ?? response
+      logs.value = data?.results ?? data ?? []
+      pagination.total = data?.count ?? data?.length ?? 0
     }
   } catch (error) {
     ElMessage.error('加载执行日志失败')
@@ -295,9 +290,6 @@ const viewExecutionRecord = (log) => {
   } else if (log.suite_type === 'web') {
     // Web测试执行记录
     router.push('/web-testing/test-executions')
-  } else if (log.suite_type === 'app') {
-    // App测试执行记录
-    router.push('/app-testing/test-runs')
   } else {
     ElMessage.warning('未知的测试类型')
   }
@@ -367,31 +359,13 @@ const getRowClassName = ({ row }) => {
 }
 
 // 工具方法
-const getSuiteTypeLabel = (type) => {
-  const labels = {
-    web: 'Web测试',
-    api: 'API测试',
-    app: 'App测试'
-  }
-  return labels[type] || type
-}
-
-const getSuiteTypeTagType = (type) => {
-  const types = {
-    web: 'primary',
-    api: 'success',
-    app: 'warning'
-  }
-  return types[type] || 'info'
-}
-
 const getExecutionStatusLabel = (status) => {
   const labels = {
     success: '成功',
     failed: '失败',
     running: '执行中',
-    pending: '等待中',
-    cancelled: '已取消'
+    pending: '未完成',
+    cancelled: '已跳过'
   }
   return labels[status] || status
 }
@@ -400,10 +374,32 @@ const getExecutionStatusLabel = (status) => {
 const getExecutionDisplayLabel = (row) => {
   const status = row?.status
   if (status === 'running') return '执行中'
-  if (status === 'pending') return '等待中'
-  if (status === 'cancelled') return '已取消'
+  if (status === 'pending') return '未完成'
+  if (status === 'cancelled') return '已跳过'
   if (status === 'success' || status === 'failed') return '已完成'
   return '异常'
+}
+
+const getLogResult = (row) => {
+  const reportStatus = row.report_status
+  const totalCases = Number(row.total_cases) || 0
+  const skippedCases = Number(row.skipped_cases) || 0
+  if (row.status === 'running' || row.status === 'pending' || reportStatus === 'running') {
+    return { label: '未完成', type: 'warning' }
+  }
+  if (row.status === 'cancelled' || reportStatus === 'skipped' || (row.status === 'success' && (!totalCases || skippedCases === totalCases))) {
+    return { label: '已跳过', type: 'info' }
+  }
+  if (['failed', 'error'].includes(reportStatus) || (!reportStatus && row.status === 'failed') || Number(row.failed_cases) > 0) {
+    return { label: '测试未通过', type: 'danger' }
+  }
+  if (reportStatus === 'incomplete' || Number(row.incomplete_cases) > 0) {
+    return { label: '未完成', type: 'warning' }
+  }
+  if (reportStatus === 'passed' || (row.status === 'success' && totalCases > 0 && Number(row.passed_cases) === totalCases)) {
+    return { label: '测试通过', type: 'success' }
+  }
+  return { label: '结果未知', type: 'info' }
 }
 
 const getExecutionStatusTagType = (status) => {
@@ -460,6 +456,15 @@ const formatDuration = (duration) => {
   
   return duration
 }
+
+watch(() => projectStore.currentProjectId, async (projectId, previousProjectId) => {
+  if (!projectId || projectId === previousProjectId) return
+  logRequestId += 1
+  logs.value = []
+  selectedLogs.value = []
+  pagination.page = 1
+  await loadLogs()
+})
 </script>
 
 <style scoped>

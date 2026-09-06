@@ -982,6 +982,7 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
 def _finalize_scheduled_execution(
     scheduled_log_id: int | None,
     *,
+    execution_id: int,
     total_cases: int,
     passed_cases: int,
     failed_cases: int,
@@ -989,32 +990,14 @@ def _finalize_scheduled_execution(
     skipped_cases: int,
     log: str,
 ) -> None:
-    """Refresh the shared scheduled report after one linked WebUI suite ends."""
+    """Refresh a scheduled report and let its serial controller advance once."""
     if not scheduled_log_id:
         return
     try:
-        from notifications.services import trigger_notification
-        from scheduled_tasks.models import TaskExecutionLog
-        from scheduled_tasks.reporting import mark_notification_sent, refresh_execution_log_from_links
-
-        execution_log = TaskExecutionLog.objects.get(id=scheduled_log_id)
-        summary = refresh_execution_log_from_links(execution_log, append_log=log)
-        if not summary['is_running'] and execution_log.notification_sent_at is None:
-            trigger_notification(
-                scheduled_task_id=execution_log.task_id,
-                execution_log=execution_log,
-                result={
-                    'total_cases': summary['total_cases'],
-                    'passed_cases': summary['passed_cases'],
-                    'failed_cases': summary['failed_cases'] + summary['error_cases'],
-                    'incomplete_cases': summary['incomplete_cases'],
-                    'skipped_cases': summary['skipped_cases'],
-                    'report_status': summary['report_status'],
-                },
-            )
-            mark_notification_sent(execution_log)
+        from scheduled_tasks.scheduling import finish_scheduled_suite
+        finish_scheduled_suite(scheduled_log_id, execution_id, append_log=log)
     except Exception:
-        logger.error('回填定时任务日志或触发通知失败', exc_info=True)
+        logger.error('回填定时任务日志或推进串行套件失败', exc_info=True)
 
 
 @shared_task(bind=True, name='web_testing.execute_webui_test_suite')
@@ -1234,6 +1217,7 @@ def _execute_webui_test_suite_logic(
 
         _finalize_scheduled_execution(
             scheduled_log_id,
+            execution_id=execution.id,
             total_cases=counts['total_cases'], passed_cases=counts['passed_cases'],
             failed_cases=counts['failed_cases'], incomplete_cases=counts['incomplete_cases'],
             skipped_cases=counts['skipped_cases'], log=suite_detail.log or '',
@@ -1246,7 +1230,15 @@ def _execute_webui_test_suite_logic(
             'pass_rate': execution.pass_rate, 'execution_results': execution_results, 'error': error_message,
         }
     except WebUITestExecution.DoesNotExist:
-        return build_error_result(None, f'测试套件执行记录不存在: {execution_id}')
+        error_message = f'测试套件执行记录不存在: {execution_id}'
+        try:
+            from scheduled_tasks.scheduling import finish_scheduled_suite
+            # A deleted prepared execution is an aggregate execution error,
+            # not a reason to leave the parent serial plan running forever.
+            finish_scheduled_suite(scheduled_log_id, execution_id, append_log=error_message)
+        except Exception:
+            logger.warning('缺失 WebUI 执行记录后推进串行定时任务失败', exc_info=True)
+        return build_error_result(None, error_message)
     except Exception as exc:
         error_message = f'测试套件执行任务异常: {exc}'
         logger.error(error_message, exc_info=True)
@@ -1272,6 +1264,7 @@ def _execute_webui_test_suite_logic(
             execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'updated_at'])
         _finalize_scheduled_execution(
             scheduled_log_id,
+            execution_id=execution_id,
             total_cases=(counts or {}).get('total_cases', 0),
             passed_cases=(counts or {}).get('passed_cases', 0),
             failed_cases=(counts or {}).get('failed_cases', 0),

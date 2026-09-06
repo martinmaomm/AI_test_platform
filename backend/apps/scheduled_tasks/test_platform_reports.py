@@ -25,7 +25,7 @@ from .reporting import (
     refresh_execution_log_from_links,
     summarize_linked_executions,
 )
-from .tasks import _execute_api_test_suite, run_scheduled_task
+from .scheduling import reserve_scheduled_run
 
 
 class PlatformNativeReportTests(TestCase):
@@ -55,11 +55,16 @@ class PlatformNativeReportTests(TestCase):
             project=self.project, endpoint=self.endpoint, title='Native case',
             created_by=self.owner, script_content='config: {name: native}\nteststeps: []',
         )
-        self.task = ScheduledTask.objects.create(
-            name='Native report schedule', suite_type='api', suite_ids=[self.case.id],
-            cron_expression='0 9 * * *', environment=self.environment,
-            user=self.owner, project=self.project,
+        self.scheduled_suite = APITestSuite.objects.create(
+            name='Scheduled suite', user=self.owner, project=self.project,
         )
+        self.scheduled_suite.test_cases.add(self.case)
+        with patch('scheduled_tasks.signals.register_periodic_task'):
+            self.task = ScheduledTask.objects.create(
+                name='Native report schedule', suite_type='api', suite_ids=[self.scheduled_suite.id],
+                cron_expression='0 9 * * *', environment=self.environment,
+                user=self.owner, project=self.project,
+            )
 
     def make_log(self):
         return TaskExecutionLog.objects.create(task=self.task, start_time=self.task.created_at)
@@ -155,41 +160,29 @@ class PlatformNativeReportTests(TestCase):
         self.assertEqual(serialized['test_suite_name'], 'Native suite')
         self.assertEqual(serialized['case_executions'][0]['test_case_title'], 'Native case')
 
-    def test_dispatch_links_all_suites_before_first_delay(self):
+    def test_serial_reservation_links_all_suites_before_first_dispatch(self):
         first = APITestSuite.objects.create(name='First', user=self.owner, project=self.project)
         second = APITestSuite.objects.create(name='Second', user=self.owner, project=self.project)
         first.test_cases.add(self.case)
         second.test_cases.add(self.case)
         self.task.suite_ids = [second.id, first.id]
         self.task.save(update_fields=['suite_ids'])
-        log = self.make_log()
+        with patch('scheduled_tasks.scheduling._enqueue_suite_dispatch') as enqueue, self.captureOnCommitCallbacks(execute=True):
+            reservation = reserve_scheduled_run(self.task.id, manual=True)
 
-        def delay(*args):
-            log.refresh_from_db()
-            self.assertEqual([item['name'] for item in log.linked_executions], ['Second', 'First'])
-            return SimpleNamespace(id=f'celery-{args[0]}')
-
-        with patch('api_testing.tasks.execute_api_test_suite_async.delay', side_effect=delay):
-            result = _execute_api_test_suite(self.task, log)
-
-        self.assertEqual(result['execution_ids'], [
-            item['execution_id'] for item in log.linked_executions
-        ])
+        self.assertTrue(reservation.started)
+        log = TaskExecutionLog.objects.get(pk=reservation.execution_log_id)
+        self.assertEqual([item['name'] for item in log.linked_executions], ['Second', 'First'])
+        self.assertEqual([item['serial_dispatch_state'] for item in log.linked_executions], ['queued', 'ready'])
+        enqueue.assert_called_once_with(log.id, log.linked_executions[0]['execution_id'])
 
     def test_async_dispatch_persists_platform_report_url(self):
-        log = self.make_log()
-        self.assertIsNone(log.report_url)
-        dispatch_result = {
-            'success': True,
-            'task_ids': ['celery-native-report'],
-            'total_cases': 3,
-        }
+        with patch('scheduled_tasks.scheduling._enqueue_suite_dispatch'), self.captureOnCommitCallbacks(execute=True):
+            reservation = reserve_scheduled_run(self.task.id, manual=True)
 
-        with patch('scheduled_tasks.tasks._execute_test_suite', return_value=dispatch_result):
-            run_scheduled_task.run(self.task.id, log.id)
-
-        log.refresh_from_db()
-        self.assertEqual(log.report_url, f'/reports/detail/{log.id}')
+        self.assertTrue(reservation.started)
+        execution_log = TaskExecutionLog.objects.get(pk=reservation.execution_log_id)
+        self.assertEqual(execution_log.report_url, f'/reports/detail/{execution_log.id}')
 
     def test_api_suite_runner_executes_each_snapshot_case_once(self):
         second_case = APITestCase.objects.create(

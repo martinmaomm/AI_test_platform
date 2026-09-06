@@ -524,7 +524,10 @@ def _execute_api_test_case(task_instance, execution_id: int, test_case_id: int, 
             execution = APITestExecution.objects.get(id=execution_id)
             execution.status = 'failed'
             execution.end_time = timezone.now()
-            execution.duration = (execution.end_time - execution.start_time).total_seconds()
+            execution.duration = max(
+                0.0,
+                (execution.end_time - (execution.start_time or execution.end_time)).total_seconds(),
+            )
             execution.error_message = error_msg
             execution.save()
             
@@ -825,40 +828,17 @@ def _execute_api_test_suite(
         suite_detail.log = ''.join(all_logs) if all_logs else ''
         suite_detail.save()
         
-        # 定时报告从派发时关联的真实执行记录聚合；不要按套件增量累加，
-        # 否则多套件会在第一个结束时提前完成和通知。
+        # 定时报告从派发时关联的真实执行记录聚合；串行控制器仅在本
+        # 套件终态后安排下一套件，并在全部结束时统一通知。
         if task_execution_log_id:
             try:
-                from scheduled_tasks.models import TaskExecutionLog
-                execution_log = TaskExecutionLog.objects.get(id=task_execution_log_id)
-                from scheduled_tasks.reporting import refresh_execution_log_from_links
-                report_summary = refresh_execution_log_from_links(
-                    execution_log,
+                from scheduled_tasks.scheduling import finish_scheduled_suite
+                finish_scheduled_suite(
+                    task_execution_log_id, execution_id,
                     append_log=(suite_detail.log or '').strip(),
                 )
             except Exception as e:
-                logger.warning(f'回填定时任务执行日志统计失败: task_execution_log_id={task_execution_log_id}, error={e}')
-                report_summary = None
-            # 通知发送与报告生成/状态更新完全隔离：任何异常都不影响任务完成与报告 404
-            try:
-                if report_summary is None or report_summary['is_running']:
-                    raise RuntimeError('关联执行尚未全部结束，暂不发送通知')
-                from scheduled_tasks.models import TaskExecutionLog
-                from scheduled_tasks.reporting import mark_notification_sent
-                from notifications.services import trigger_notification
-                execution_log = TaskExecutionLog.objects.get(id=task_execution_log_id)
-                if execution_log.notification_sent_at:
-                    raise RuntimeError('关联执行的完成通知已发送')
-                trigger_notification(
-                    scheduled_task_id=execution_log.task_id,
-                    execution_log=execution_log,
-                    result=None,
-                )
-                mark_notification_sent(execution_log)
-            except RuntimeError as e:
-                logger.info('%s', e)
-            except Exception as e:
-                logger.error('发送通知失败: %s', e, exc_info=True)
+                logger.warning('回填定时任务日志或推进串行套件失败: task_execution_log_id=%s, error=%s', task_execution_log_id, e)
 
         # 步骤6: 构建结果
         update_task_progress(task_instance, 100, '套件执行完成')
@@ -899,7 +879,10 @@ def _execute_api_test_suite(
             execution = APITestExecution.objects.get(id=execution_id)
             execution.status = 'failed'
             execution.end_time = timezone.now()
-            execution.duration = (execution.end_time - execution.start_time).total_seconds()
+            execution.duration = max(
+                0.0,
+                (execution.end_time - (execution.start_time or execution.end_time)).total_seconds(),
+            )
             execution.error_message = error_msg
             execution.save()
             
@@ -908,6 +891,12 @@ def _execute_api_test_suite(
             suite_detail.end_time = timezone.now()
             suite_detail.duration = execution.duration
             suite_detail.save()
+            if task_execution_log_id:
+                try:
+                    from scheduled_tasks.scheduling import finish_scheduled_suite
+                    finish_scheduled_suite(task_execution_log_id, execution_id, append_log=error_msg)
+                except Exception:
+                    logger.warning('异常后推进串行定时任务失败: task_execution_log_id=%s', task_execution_log_id, exc_info=True)
             
             # 返回任务完成状态，success 为 True
             return {
@@ -930,6 +919,15 @@ def _execute_api_test_suite(
             }
         except Exception as inner_e:
             logger.error(f"更新执行状态失败: {str(inner_e)}", exc_info=True)
+            if task_execution_log_id:
+                try:
+                    from scheduled_tasks.scheduling import finish_scheduled_suite
+                    # The execution may have been deleted after it was
+                    # planned.  The scheduler treats that as a terminal
+                    # execution-level error and can still advance safely.
+                    finish_scheduled_suite(task_execution_log_id, execution_id, append_log=error_msg)
+                except Exception:
+                    logger.warning('缺失执行记录后推进串行定时任务失败: task_execution_log_id=%s', task_execution_log_id, exc_info=True)
             # 即使更新状态失败，也返回任务完成
             return {
                 'success': True,

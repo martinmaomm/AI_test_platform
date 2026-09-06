@@ -8,8 +8,10 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
-from django.db.models import Q
-from django.utils import timezone
+from django.http import Http404
+from django.db.models import Q, Count
+from django.db import transaction
+from rest_framework.exceptions import APIException, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 
@@ -20,30 +22,35 @@ from .serializers import (
     TaskExecutionLogListSerializer, TaskRunSerializer, TaskStatusUpdateSerializer,
     SuiteChoiceSerializer
 )
-from .tasks import run_task_manually, calculate_next_run_time
-from .reporting import platform_report_url
+from .contracts import get_schedule_project, suite_model
 
 logger = logging.getLogger(__name__)
 
 
-class ScheduledTaskListCreateView(generics.ListCreateAPIView):
+class ScheduleProjectMixin:
+    def get_schedule_project(self):
+        capability = {'POST': 'edit', 'PUT': 'edit', 'PATCH': 'edit', 'DELETE': 'delete'}.get(self.request.method, 'read')
+        return get_schedule_project(self.kwargs['project_id'], self.request.user, capability)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['project'] = self.get_schedule_project()
+        return context
+
+
+class ScheduledTaskListCreateView(ScheduleProjectMixin, generics.ListCreateAPIView):
     """定时任务列表和创建视图"""
     
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['suite_type', 'status', 'environment']
+    filterset_fields = ['status']
     search_fields = ['name', 'description']
     ordering_fields = ['created_at', 'updated_at', 'last_run_time', 'next_run_time']
     ordering = ['-created_at']
     
     def get_queryset(self):
         """获取用户有权限的任务"""
-        project_id = self.kwargs['project_id']
-        user = self.request.user
-        qs = ScheduledTask.objects.filter(project_id=project_id)
-        if not user.is_superuser:
-            qs = qs.filter(Q(user=user) | Q(project__members__user=user)).distinct()
-        return qs.prefetch_related('notice_targets')
+        return ScheduledTask.objects.filter(project=self.get_schedule_project()).prefetch_related('notice_targets')
     
     def get_serializer_class(self):
         """根据请求方法选择序列化器"""
@@ -53,32 +60,35 @@ class ScheduledTaskListCreateView(generics.ListCreateAPIView):
     
     def perform_create(self, serializer):
         """创建任务时设置用户和项目"""
-        project_id = self.kwargs['project_id']
-        serializer.save(
-            user=self.request.user,
-            project_id=project_id
-        )
+        with transaction.atomic():
+            serializer.save(user=self.request.user, project=self.get_schedule_project())
 
 
-class ScheduledTaskDetailView(generics.RetrieveUpdateDestroyAPIView):
+class ScheduledTaskDetailView(ScheduleProjectMixin, generics.RetrieveUpdateDestroyAPIView):
     """定时任务详情视图"""
     
     permission_classes = [permissions.IsAuthenticated]
     
     def get_queryset(self):
         """获取用户有权限的任务"""
-        project_id = self.kwargs['project_id']
-        user = self.request.user
-        qs = ScheduledTask.objects.filter(project_id=project_id)
-        if not user.is_superuser:
-            qs = qs.filter(Q(user=user) | Q(project__members__user=user)).distinct()
-        return qs.prefetch_related('notice_targets')
+        return ScheduledTask.objects.filter(project=self.get_schedule_project()).prefetch_related('notice_targets')
     
     def get_serializer_class(self):
         """根据请求方法选择序列化器"""
         if self.request.method in ['PUT', 'PATCH']:
             return ScheduledTaskCreateSerializer
         return ScheduledTaskSerializer
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            task = ScheduledTask.objects.select_for_update().get(pk=instance.pk)
+            if task.execution_logs.filter(status__in=['pending', 'running']).exists():
+                raise ValidationError('任务正在执行，结束后才能删除')
+            task.delete()
 
 
 class TaskRunView(APIView):
@@ -88,13 +98,10 @@ class TaskRunView(APIView):
     
     def post(self, request, project_id, pk):
         """手动执行定时任务"""
+        get_schedule_project(project_id, request.user, 'execute')
         try:
             task = get_object_or_404(
-                ScheduledTask.objects.filter(
-                    project_id=project_id
-                ).filter(
-                    Q(user=request.user) | Q(project__members__user=request.user)
-                ).distinct(),
+                ScheduledTask.objects.filter(project_id=project_id),
                 pk=pk
             )
             
@@ -108,26 +115,23 @@ class TaskRunView(APIView):
                     status_code=status.HTTP_400_BAD_REQUEST
                 )
             
-            # 先创建执行日志，便于前端轮询与跳转报告
-            execution_log = TaskExecutionLog.objects.create(
-                task=task,
-                start_time=timezone.now(),
-                status='running'
-            )
-            execution_log.report_url = platform_report_url(execution_log.id)
-            execution_log.save(update_fields=['report_url'])
-            result = run_task_manually.delay(task.id, execution_log.id)
+            from .scheduling import reserve_scheduled_run
+            reservation = reserve_scheduled_run(task.id, manual=True)
+            if not reservation.started:
+                return response(kind='error', message=reservation.error or '无法启动任务',
+                                status_code=409 if reservation.already_running else 400)
             return response(
                 kind="success",
                 data={
                     'task_id': task.id,
-                    'execution_id': execution_log.id,
-                    'celery_task_id': result.id,
+                    'execution_id': reservation.execution_log_id,
                     'task_name': task.name
                 },
-                message="任务执行已启动"
+                message="任务已进入顺序执行队列"
             )
             
+        except (APIException, Http404):
+            raise
         except Exception as e:
             logger.error(f"手动执行任务时发生错误: {str(e)}", exc_info=True)
             return response(
@@ -144,13 +148,10 @@ class TaskStatusUpdateView(APIView):
     
     def patch(self, request, project_id, pk):
         """更新任务状态"""
+        get_schedule_project(project_id, request.user, 'edit')
         try:
             task = get_object_or_404(
-                ScheduledTask.objects.filter(
-                    project_id=project_id
-                ).filter(
-                    Q(user=request.user) | Q(project__members__user=request.user)
-                ).distinct(),
+                ScheduledTask.objects.filter(project_id=project_id),
                 pk=pk
             )
             
@@ -163,16 +164,13 @@ class TaskStatusUpdateView(APIView):
                     status_code=status.HTTP_400_BAD_REQUEST
                 )
             
-            # 更新任务状态
-            task.status = serializer.validated_data['status']
-            task.save()
-            
-            # 计算下次执行时间
-            if task.status == 'active':
-                next_run_time = calculate_next_run_time(task.cron_expression)
-                if next_run_time:
-                    task.next_run_time = next_run_time
-                    task.save(update_fields=['next_run_time'])
+            desired = serializer.validated_data['status']
+            if desired == 'active':
+                get_schedule_project(project_id, request.user, 'execute')
+                check = ScheduledTaskCreateSerializer(task, data={'status': desired}, partial=True, context={'project': task.project})
+                check.is_valid(raise_exception=True)
+            task.status = desired
+            task.save(update_fields=['status', 'updated_at'])
             
             return response(
                 kind="success",
@@ -180,6 +178,8 @@ class TaskStatusUpdateView(APIView):
                 message=f"任务状态已更新为: {task.get_status_display()}"
             )
             
+        except (APIException, Http404):
+            raise
         except Exception as e:
             logger.error(f"更新任务状态时发生错误: {str(e)}", exc_info=True)
             return response(
@@ -201,24 +201,8 @@ class TaskExecutionLogListView(generics.ListAPIView):
     def get_queryset(self):
         """获取用户有权限的任务的执行日志"""
         project_id = self.kwargs['project_id']
-        user = self.request.user
-        queryset = TaskExecutionLog.objects.select_related('task')
-        
-        if user.is_superuser:
-            queryset = queryset.filter(task__project_id=project_id)
-        else:
-            queryset = queryset.filter(
-                task__project_id=project_id
-            ).filter(
-                task__in=ScheduledTask.objects.filter(
-                    Q(user=user) | Q(project__members__user=user)
-                ).distinct()
-            )
-        
-        # 处理 suite_type 筛选
-        suite_type = self.request.GET.get('suite_type')
-        if suite_type in ['web', 'api', 'app']:
-            queryset = queryset.filter(task__suite_type=suite_type)
+        get_schedule_project(project_id, self.request.user, 'report')
+        queryset = TaskExecutionLog.objects.select_related('task').filter(task__project_id=project_id)
         
         # 处理搜索
         search = self.request.GET.get('search')
@@ -232,7 +216,7 @@ class TaskExecutionLogListView(generics.ListAPIView):
     
     def list(self, request, *args, **kwargs):
         """重写list方法以支持分页和自定义响应格式"""
-        queryset = self.get_queryset()
+        queryset = self.filter_queryset(self.get_queryset())
         page = int(request.query_params.get("page", 1))
         page_size = int(request.query_params.get("page_size", 20))
         # 直接使用封装的分页函数
@@ -254,16 +238,14 @@ class TaskExecutionLogDetailView(generics.RetrieveDestroyAPIView):
     def get_queryset(self):
         """获取用户有权限的任务的执行日志"""
         project_id = self.kwargs['project_id']
-        user = self.request.user
-        if user.is_superuser:
-            return TaskExecutionLog.objects.filter(task__project_id=project_id)
-        return TaskExecutionLog.objects.filter(
-            task__project_id=project_id
-        ).filter(
-            task__in=ScheduledTask.objects.filter(
-                Q(user=user) | Q(project__members__user=user)
-            ).distinct()
-        )
+        capability = 'delete' if self.request.method == 'DELETE' else 'report'
+        get_schedule_project(project_id, self.request.user, capability)
+        return TaskExecutionLog.objects.filter(task__project_id=project_id)
+
+    def perform_destroy(self, instance):
+        if instance.status in {'pending', 'running'}:
+            raise ValidationError('执行尚未结束，不能删除执行记录')
+        instance.delete()
     
     def get_serializer_class(self):
         return TaskExecutionLogSerializer
@@ -299,23 +281,8 @@ class TaskExecutionLogsByTaskView(generics.ListAPIView):
         """获取指定任务的执行日志"""
         project_id = self.kwargs['project_id']
         task_id = self.kwargs['task_id']
-        user = self.request.user
-        
-        # 验证用户是否有权限访问该任务
-        if user.is_superuser:
-            task = get_object_or_404(
-                ScheduledTask.objects.filter(project_id=project_id),
-                pk=task_id
-            )
-        else:
-            task = get_object_or_404(
-                ScheduledTask.objects.filter(
-                    project_id=project_id
-                ).filter(
-                    Q(user=user) | Q(project__members__user=user)
-                ).distinct(),
-                pk=task_id
-            )
+        get_schedule_project(project_id, self.request.user, 'report')
+        task = get_object_or_404(ScheduledTask.objects.filter(project_id=project_id), pk=task_id)
         
         return TaskExecutionLog.objects.filter(task=task)
     
@@ -330,81 +297,27 @@ class SuiteChoicesView(APIView):
     
     def get(self, request, project_id):
         """获取指定类型的测试套件列表"""
-        suite_type = request.query_params.get('suite_type')
-        
-        if not suite_type:
-            return response(
-                kind="error",
-                message="缺少必要参数: suite_type",
-                status_code=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            suites = []
-            
-            if suite_type == 'web':
-                from web_testing.models import WebUITestSuite
-                queryset = WebUITestSuite.objects.filter(project_id=project_id)
-                suites = [
-                    {
-                        'id': suite.id,
-                        'name': suite.name,
-                        'description': suite.description,
-                        'total_cases': suite.test_cases.count()
-                    }
-                    for suite in queryset
-                ]
-                
-            elif suite_type == 'api':
-                from api_testing.models import APITestSuite
-                queryset = APITestSuite.objects.filter(project_id=project_id)
-                suites = [
-                    {
-                        'id': suite.id,
-                        'name': suite.name,
-                        'description': suite.description,
-                        'total_cases': suite.test_cases.count()
-                    }
-                    for suite in queryset
-                ]
-                
-            elif suite_type == 'app':
-                # App测试套件模型待实现
-                suites = []
-            
-            serializer = SuiteChoiceSerializer(suites, many=True)
-            
-            return response(
-                kind="success",
-                data=serializer.data,
-                message="获取测试套件列表成功"
-            )
-            
-        except Exception as e:
-            logger.error(f"获取测试套件列表时发生错误: {str(e)}", exc_info=True)
-            return response(
-                kind="error",
-                message=f"获取测试套件列表时发生错误: {str(e)}",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        project = get_schedule_project(project_id, request.user)
+        queryset = suite_model(project).objects.filter(project=project).annotate(case_count=Count('test_cases'))
+        suites = []
+        for suite in queryset:
+            reason = '套件未启用' if suite.status != 'active' else '套件没有测试用例' if not suite.case_count else ''
+            suites.append({
+                'id': suite.id, 'name': suite.name, 'description': suite.description,
+                'total_cases': suite.case_count, 'status': suite.status,
+                'selectable': not reason, 'unavailable_reason': reason,
+            })
+        return response(kind='success', data=SuiteChoiceSerializer(suites, many=True).data,
+                        message='获取当前项目测试套件成功')
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def task_statistics(request, project_id):
     """获取定时任务统计信息"""
+    get_schedule_project(project_id, request.user, 'report')
     try:
-        user = request.user
-        
-        # 获取用户有权限的任务
-        if user.is_superuser:
-            tasks = ScheduledTask.objects.filter(project_id=project_id)
-        else:
-            tasks = ScheduledTask.objects.filter(
-                project_id=project_id
-            ).filter(
-                Q(user=user) | Q(project__members__user=user)
-            ).distinct()
+        tasks = ScheduledTask.objects.filter(project_id=project_id)
         
         # 统计信息
         total_tasks = tasks.count()
@@ -414,7 +327,6 @@ def task_statistics(request, project_id):
         # 按类型统计
         web_tasks = tasks.filter(suite_type='web').count()
         api_tasks = tasks.filter(suite_type='api').count()
-        app_tasks = tasks.filter(suite_type='app').count()
         
         # 执行统计
         total_executions = TaskExecutionLog.objects.filter(
@@ -439,7 +351,6 @@ def task_statistics(request, project_id):
             'paused_tasks': paused_tasks,
             'web_tasks': web_tasks,
             'api_tasks': api_tasks,
-            'app_tasks': app_tasks,
             'total_executions': total_executions,
             'success_executions': success_executions,
             'failed_executions': failed_executions,

@@ -391,11 +391,13 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
         execution_log.linked_executions = [{
             'kind': 'web', 'project_id': self.project.id,
             'execution_id': execution.id, 'name': execution.name,
+            'sequence': 0, 'serial_dispatch_state': 'dispatched',
         }]
         execution_log.save(update_fields=['linked_executions'])
-        with patch('notifications.services.trigger_notification') as notify:
+        with patch('notifications.services.trigger_notification') as notify, self.captureOnCommitCallbacks(execute=True):
             _finalize_scheduled_execution(
                 execution_log.id,
+                execution_id=execution.id,
                 total_cases=3,
                 passed_cases=1,
                 failed_cases=0,
@@ -408,5 +410,6 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
         self.assertEqual(execution_log.passed_cases, 1)
         self.assertEqual(execution_log.failed_cases, 0)
         self.assertIn('验证未完成', execution_log.error_message)
+        self.assertEqual(execution_log.linked_executions[0]['serial_dispatch_state'], 'finished')
         notify.assert_called_once()
-        self.assertEqual(notify.call_args.kwargs['result']['report_status'], 'incomplete')
+        self.assertIsNone(notify.call_args.kwargs['result'])

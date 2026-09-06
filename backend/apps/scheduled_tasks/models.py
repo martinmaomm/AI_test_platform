@@ -2,7 +2,7 @@
 Scheduled Tasks Models
 全局定时任务中心数据模型
 """
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from django.core.exceptions import ValidationError
@@ -19,13 +19,11 @@ class ScheduledTask(models.Model):
     STATUS_CHOICES = [
         ('active', '启用'),
         ('paused', '暂停'),
-        ('disabled', '禁用'),
     ]
     
     # 套件类型选择
     SUITE_TYPE_CHOICES = [
         ('web', 'Web测试'),
-        ('app', 'App测试'),
         ('api', 'API测试'),
     ]
     
@@ -52,7 +50,7 @@ class ScheduledTask(models.Model):
         help_text="格式: 分 时 日 月 周 (如: 0 9 * * 1-5 表示工作日9点执行)"
     )
     
-    # API/App schedules use a shared environment; WebUI scripts own full URLs.
+    # API schedules use a shared environment; WebUI scripts own full URLs.
     environment = models.ForeignKey(
         Environment,
         on_delete=models.CASCADE,
@@ -132,38 +130,31 @@ class ScheduledTask(models.Model):
     def clean(self):
         """验证cron表达式格式"""
         if self.cron_expression:
-            if not self._validate_cron_expression(self.cron_expression):
-                raise ValidationError({
-                    'cron_expression': 'Cron表达式格式不正确，应为: 分 时 日 月 周'
-                })
+            from .cron import next_run_time
+            try:
+                next_run_time(self.cron_expression)
+            except ValueError as exc:
+                raise ValidationError({'cron_expression': str(exc)}) from exc
     
     def save(self, *args, **kwargs):
+        from .cron import next_run_time
         self.full_clean()
-        super().save(*args, **kwargs)
-        
-        # 计算下次执行时间
-        if self.cron_expression:
-            from .tasks import calculate_next_run_time
-            try:
-                next_run = calculate_next_run_time(self.cron_expression)
-                if next_run:
-                    self.next_run_time = next_run
-                    # 更新时不保存，避免递归
-                    if self.pk:
-                        ScheduledTask.objects.filter(pk=self.pk).update(next_run_time=next_run)
-            except Exception as e:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"无法计算下次执行时间: {str(e)}")
+        self.next_run_time = next_run_time(self.cron_expression) if self.status == 'active' else None
+        if kwargs.get('update_fields') is not None:
+            kwargs['update_fields'] = set(kwargs['update_fields']) | {'next_run_time'}
+        # Beat registration is part of the same transaction as the task edit.
+        with transaction.atomic():
+            super().save(*args, **kwargs)
     
     @staticmethod
     def _validate_cron_expression(cron_expr):
-        """验证cron表达式格式：仅校验是否为空格分隔的 5 段非空字符串，具体语法由 Celery Crontab 解析兜底。"""
-        if not cron_expr or not isinstance(cron_expr, str):
+        """Use the same date/range validation as Beat registration."""
+        from .cron import next_run_time
+        try:
+            next_run_time(cron_expr)
+            return True
+        except ValueError:
             return False
-        stripped = cron_expr.strip()
-        parts = stripped.split()
-        return len(parts) == 5 and all(p for p in parts)
     
     def get_suite_name(self):
         """获取关联的测试套件名称"""
@@ -173,13 +164,14 @@ class ScheduledTask(models.Model):
                 suite_names = []
                 if self.suite_type == 'web':
                     from web_testing.models import WebUITestSuite
-                    suites = WebUITestSuite.objects.filter(id__in=self.suite_ids)
-                    suite_names = [suite.name for suite in suites]
+                    suites = WebUITestSuite.objects.filter(project_id=self.project_id, id__in=self.suite_ids)
+                    names = {suite.id: suite.name for suite in suites}
+                    suite_names = [names.get(pk, f'已删除套件 #{pk}') for pk in self.suite_ids]
                 elif self.suite_type == 'api':
                     from api_testing.models import APITestSuite
-                    suites = APITestSuite.objects.filter(id__in=self.suite_ids)
-                    suite_names = [suite.name for suite in suites]
-                # App测试套件模型待实现
+                    suites = APITestSuite.objects.filter(project_id=self.project_id, id__in=self.suite_ids)
+                    names = {suite.id: suite.name for suite in suites}
+                    suite_names = [names.get(pk, f'已删除套件 #{pk}') for pk in self.suite_ids]
                 
                 if suite_names:
                     return ', '.join(suite_names)

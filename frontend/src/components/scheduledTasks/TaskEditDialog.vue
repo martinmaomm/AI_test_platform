@@ -14,18 +14,9 @@
     >
       <!-- 基本信息 -->
       <el-row :gutter="20">
-        <el-col :span="12">
+        <el-col :span="24">
           <el-form-item label="任务名称" prop="name">
             <el-input v-model="form.name" placeholder="请输入任务名称" />
-          </el-form-item>
-        </el-col>
-        <el-col :span="12">
-          <el-form-item label="测试类型" prop="suite_type">
-            <el-select v-model="form.suite_type" placeholder="请选择测试类型" @change="handleSuiteTypeChange">
-              <el-option label="Web测试" value="web" />
-              <el-option label="API测试" value="api" />
-              <el-option label="App测试" value="app" />
-            </el-select>
           </el-form-item>
         </el-col>
       </el-row>
@@ -52,21 +43,45 @@
               collapse-tags-tooltip
               :max-collapse-tags="3"
             >
+              <template #empty>
+                <div v-if="suiteLoadError" class="suite-empty-state">
+                  <span>加载测试套件失败</span>
+                  <el-button link type="primary" @click="loadSuites">重试</el-button>
+                </div>
+                <div v-else-if="!loadingSuites" class="suite-empty-state">
+                  <span>{{ suites.length ? '当前项目的测试套件均不可执行' : '当前项目暂无测试套件' }}</span>
+                </div>
+              </template>
               <el-option
                 v-for="suite in suites"
                 :key="suite.id"
                 :label="suite.name"
                 :value="suite.id"
+                :disabled="isSuiteDisabled(suite)"
               >
                 <div class="suite-option">
                   <div class="suite-name">{{ suite.name }}</div>
                   <div class="suite-description" v-if="suite.description">{{ suite.description }}</div>
                   <div class="suite-info">
                     <span class="suite-cases">{{ suite.total_cases || 0 }} 个用例</span>
+                    <span v-if="!suite.selectable" class="suite-unavailable">{{ suite.unavailable_reason || '当前不可执行' }}</span>
                   </div>
                 </div>
               </el-option>
             </el-select>
+            <div v-if="suites.length && !selectableSuites.length" class="suite-empty-state">
+              当前项目的测试套件均不可执行，请启用套件并至少配置一个用例后重试。
+            </div>
+            <div v-if="form.suite_ids.length" class="suite-order" aria-label="测试套件执行顺序">
+              <div class="suite-order-title">执行顺序（从上到下）</div>
+              <div v-for="(suiteId, index) in form.suite_ids" :key="suiteId" class="suite-order-item">
+                <span>{{ index + 1 }}. {{ getSuiteName(suiteId) }}</span>
+                <span class="suite-order-actions">
+                  <el-button link :disabled="index === 0" @click="moveSuite(index, -1)">上移</el-button>
+                  <el-button link :disabled="index === form.suite_ids.length - 1" @click="moveSuite(index, 1)">下移</el-button>
+                </span>
+              </div>
+            </div>
           </el-form-item>
         </el-col>
       </el-row>
@@ -127,7 +142,6 @@
         <el-radio-group v-model="form.status">
           <el-radio value="active">启用</el-radio>
           <el-radio value="paused">暂停</el-radio>
-          <el-radio value="disabled">禁用</el-radio>
         </el-radio-group>
       </el-form-item>
 
@@ -230,7 +244,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted } from 'vue'
+import { ref, reactive, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Warning, Bell } from '@element-plus/icons-vue'
 import { 
@@ -259,11 +273,6 @@ const props = defineProps({
   initialSuiteId: {
     type: [Number, String],
     default: null
-  },
-  /** 外部传入的测试类型，配合 initialSuiteId 使用 */
-  initialSuiteType: {
-    type: String,
-    default: 'api'
   },
   /** 外部传入的任务名称前缀，弹窗打开时自动填入任务名称 */
   initialSuiteName: {
@@ -294,7 +303,6 @@ const selectedProject = computed(() => projectStore.currentProject)
 const form = reactive({
   name: '',
   description: '',
-  suite_type: '',
   suite_ids: [],
   cron_expression: '',
   environment: null,
@@ -302,13 +310,20 @@ const form = reactive({
   notice_targets: [],
   trigger_condition: 'always'
 })
-const requiresEnvironment = computed(() => form.suite_type !== 'web')
+const projectType = computed(() => selectedProject.value?.project_type)
+const requiresEnvironment = computed(() => projectType.value === 'api')
 
 // 选项数据
 const environments = ref([])
 const suites = ref([])
+const suiteLoadError = ref(false)
 const channels = ref([])
 const loadingChannels = ref(false)
+let suiteRequestId = 0
+let environmentRequestId = 0
+let channelRequestId = 0
+
+const selectableSuites = computed(() => suites.value.filter((suite) => suite.selectable))
 
 const CHANNEL_TYPE_LABELS = { wechat_work: '企业微信', dingtalk: '钉钉', email: '邮件' }
 
@@ -336,9 +351,6 @@ const rules = {
     { required: true, message: '请输入任务名称', trigger: 'blur' },
     { min: 2, max: 200, message: '任务名称长度在2到200个字符', trigger: 'blur' }
   ],
-  suite_type: [
-    { required: true, message: '请选择测试类型', trigger: 'change' }
-  ],
   suite_ids: [
     { required: true, message: '请选择测试套件', trigger: 'change' },
     { type: 'array', min: 1, message: '至少选择一个测试套件', trigger: 'change' }
@@ -358,60 +370,45 @@ const rules = {
   ]
 }
 
-// 生命周期
-onMounted(() => {
-  if (props.task) {
-    loadTaskData()
-  } else {
-    // 检查URL参数，自动填充表单
-    loadUrlParams()
-  }
-})
-
 // 监听对话框显示
-watch(visible, (newVal) => {
+watch(visible, async (newVal) => {
   if (newVal) {
-    loadChannels()
     if (props.task) {
       loadTaskData()
     } else {
       resetForm()
       if (props.initialSuiteId) {
-        form.suite_type = props.initialSuiteType || 'api'
         form.suite_ids = [Number(props.initialSuiteId)]
         if (props.initialSuiteName) {
           form.name = `${props.initialSuiteName} - 定时任务`
         }
-        loadEnvironments()
-        loadSuites()
       }
     }
+    await Promise.all([loadChannels(), loadEnvironments(), loadSuites()])
   }
+}, { immediate: true })
+
+watch(() => projectStore.currentProjectId, async (projectId, previousProjectId) => {
+  if (projectId === previousProjectId) return
+  suiteRequestId += 1
+  environmentRequestId += 1
+  channelRequestId += 1
+  suites.value = []
+  suiteLoadError.value = false
+  environments.value = []
+  channels.value = []
+  form.notice_targets = []
+  if (isEdit.value) {
+    visible.value = false
+    return
+  }
+  if (!visible.value) return
+  form.suite_ids = []
+  form.environment = null
+  await Promise.all([loadChannels(), loadEnvironments(), loadSuites()])
 })
 
 // 方法
-const loadUrlParams = () => {
-  // 从URL参数中获取预填充数据
-  const urlParams = new URLSearchParams(window.location.search)
-  const suiteType = urlParams.get('suite_type')
-  const suiteId = urlParams.get('suite_id')
-  const suiteName = urlParams.get('suite_name')
-  const projectId = urlParams.get('project_id')
-  
-  if (suiteType && suiteId && projectId && selectedProject.value && projectId == projectStore.currentProjectId) {
-    form.suite_type = suiteType
-    form.suite_ids = [parseInt(suiteId)] // 改为数组
-    
-    // 设置任务名称
-    if (suiteName) {
-      form.name = `${suiteName} - 定时任务`
-    }
-    
-    // 加载环境和套件
-    loadEnvironments()
-    loadSuites()
-  }
-}
 
 const loadTaskData = () => {
   if (!props.task) return
@@ -419,8 +416,7 @@ const loadTaskData = () => {
   Object.assign(form, {
     name: props.task.name,
     description: props.task.description,
-    suite_type: props.task.suite_type,
-    suite_ids: props.task.suite_ids || [props.task.suite_id].filter(Boolean), // 兼容旧数据
+    suite_ids: Array.isArray(props.task.suite_ids) ? props.task.suite_ids : [],
     cron_expression: props.task.cron_expression,
     environment: props.task.environment,
     status: props.task.status,
@@ -428,80 +424,88 @@ const loadTaskData = () => {
     trigger_condition: props.task.trigger_condition || 'always'
   })
   
-  loadEnvironments()
-  loadSuites()
 }
 
 const loadEnvironments = async () => {
+  const projectId = projectStore.currentProjectId
+  const requestId = ++environmentRequestId
   if (!requiresEnvironment.value) {
     environments.value = []
     form.environment = null
+    loadingEnvironments.value = false
     return
   }
-  if (!selectedProject.value) return
+  if (!projectId) {
+    environments.value = []
+    loadingEnvironments.value = false
+    return
+  }
   
   try {
     loadingEnvironments.value = true
-    // API/App 保持按测试类型获取执行环境；WebUI 不使用项目环境。
-    const category = form.suite_type
-    const response = await getProjectEnvironments(projectStore.currentProjectId, {
-      category: category
+    const response = await getProjectEnvironments(projectId, {
+      category: 'api'
     })
-    // 处理API响应格式，数据在response.data.items中
-    environments.value = response.data?.items || response.results || response
+    if (requestId !== environmentRequestId || projectId !== projectStore.currentProjectId) return
+    const data = response?.data ?? response
+    const items = data?.items ?? data?.results ?? data
+    environments.value = Array.isArray(items) ? items : []
   } catch (error) {
+    if (requestId !== environmentRequestId || projectId !== projectStore.currentProjectId) return
+    environments.value = []
     console.error('Load environments error:', error)
   } finally {
-    loadingEnvironments.value = false
+    if (requestId === environmentRequestId) loadingEnvironments.value = false
   }
 }
 
 const loadSuites = async () => {
-  if (!form.suite_type || !selectedProject.value) return
-  
+  const projectId = projectStore.currentProjectId
+  const requestId = ++suiteRequestId
+  if (!projectId) {
+    suites.value = []
+    loadingSuites.value = false
+    return
+  }
   try {
     loadingSuites.value = true
-    const response = await getSuiteChoices(projectStore.currentProjectId, form.suite_type)
-    suites.value = response.data || response
+    suiteLoadError.value = false
+    const response = await getSuiteChoices(projectId)
+    if (requestId !== suiteRequestId || projectId !== projectStore.currentProjectId) return
+    const data = response?.data ?? response
+    if (!Array.isArray(data)) throw new TypeError('测试套件响应格式无效')
+    suites.value = data
   } catch (error) {
-    ElMessage.error('加载测试套件失败')
+    if (requestId !== suiteRequestId || projectId !== projectStore.currentProjectId) return
+    suites.value = []
+    suiteLoadError.value = true
     console.error('Load suites error:', error)
   } finally {
-    loadingSuites.value = false
+    if (requestId === suiteRequestId) loadingSuites.value = false
   }
 }
 
 const loadChannels = async () => {
   const projectId = projectStore.currentProjectId
+  const requestId = ++channelRequestId
   if (!projectId) {
     channels.value = []
+    loadingChannels.value = false
     return
   }
   try {
     loadingChannels.value = true
     const res = await getNotificationReceivers({ project_id: projectId })
+    if (requestId !== channelRequestId || projectId !== projectStore.currentProjectId) return
     const data = res?.data ?? res
-    channels.value = data?.results ?? data ?? []
+    const items = data?.results ?? data
+    channels.value = Array.isArray(items) ? items : []
   } catch (e) {
+    if (requestId !== channelRequestId || projectId !== projectStore.currentProjectId) return
     console.error('Load notification receivers error:', e)
     channels.value = []
   } finally {
-    loadingChannels.value = false
-  }
-}
-
-const handleSuiteTypeChange = () => {
-  form.suite_ids = [] // 改为数组
-  suites.value = []
-  if (!requiresEnvironment.value) {
-    form.environment = null
-    environments.value = []
-    formRef.value?.clearValidate('environment')
-  }
-  // 当测试类型改变时，重新加载需要的选项。
-  if (selectedProject.value) {
-    loadEnvironments()
-    loadSuites()
+    if (requestId === channelRequestId) loadingChannels.value = false
   }
 }
 
@@ -509,7 +513,6 @@ const resetForm = () => {
   Object.assign(form, {
     name: '',
     description: '',
-    suite_type: '',
     suite_ids: [],
     cron_expression: '',
     environment: null,
@@ -518,7 +521,42 @@ const resetForm = () => {
     trigger_condition: 'always'
   })
   suites.value = []
+  suiteLoadError.value = false
   environments.value = []
+}
+
+const getSuiteName = (suiteId) => {
+  const suite = suites.value.find((item) => Number(item.id) === Number(suiteId))
+  return suite?.name || `套件 #${suiteId}`
+}
+
+const isSuiteDisabled = (suite) => !suite.selectable && !form.suite_ids.some((id) => Number(id) === Number(suite.id))
+
+const moveSuite = (index, offset) => {
+  const target = index + offset
+  if (target < 0 || target >= form.suite_ids.length) return
+  const [suiteId] = form.suite_ids.splice(index, 1)
+  form.suite_ids.splice(target, 0, suiteId)
+}
+
+const getSubmitErrorMessage = (error) => {
+  const payload = error?.response?.data
+  const details = payload?.error?.details ?? payload?.details
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    const labels = {
+      suite_ids: '测试套件',
+      cron_expression: 'Cron表达式',
+      environment: '执行环境',
+      name: '任务名称',
+      non_field_errors: '任务配置'
+    }
+    const messages = Object.entries(details).flatMap(([field, value]) => {
+      const values = Array.isArray(value) ? value : [value]
+      return values.filter((item) => typeof item === 'string' && item.trim()).map((item) => `${labels[field] || field}：${item}`)
+    })
+    if (messages.length) return messages.join('；')
+  }
+  return payload?.error?.message || payload?.message || error?.message
 }
 
 const handleSubmit = async () => {
@@ -547,7 +585,7 @@ const handleSubmit = async () => {
     handleClose()
   } catch (error) {
     if (error !== false) { // 表单验证失败时不显示错误消息
-      ElMessage.error(isEdit.value ? '更新任务失败' : '创建任务失败')
+      ElMessage.error(getSubmitErrorMessage(error) || (isEdit.value ? '更新任务失败' : '创建任务失败'))
       console.error('Submit error:', error)
     }
   } finally {
@@ -584,6 +622,7 @@ const handleClose = () => {
 .suite-info {
   display: flex;
   gap: 12px;
+  align-items: center;
   font-size: 12px;
   color: #909399;
 }
@@ -591,6 +630,49 @@ const handleClose = () => {
 .suite-cases {
   color: #409eff;
   font-weight: 500;
+}
+
+.suite-unavailable {
+  color: #e6a23c;
+}
+
+.suite-empty-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  color: #909399;
+}
+
+.suite-order {
+  width: 100%;
+  margin-top: 8px;
+  border: 1px solid #ebeef5;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.suite-order-title {
+  padding: 6px 10px;
+  color: #606266;
+  font-size: 12px;
+  background: #f5f7fa;
+}
+
+.suite-order-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
+  border-top: 1px solid #ebeef5;
+}
+
+.suite-order-actions {
+  display: inline-flex;
+  gap: 8px;
 }
 
 .environment-option {

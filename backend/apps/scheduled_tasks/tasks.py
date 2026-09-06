@@ -13,6 +13,7 @@ from django_celery_beat.models import PeriodicTask, CrontabSchedule
 from django.db import transaction
 
 from .models import ScheduledTask, TaskExecutionLog
+from .reporting import append_linked_execution, platform_report_url
 from common.task import (
     execute_async_task_with_websocket,
     update_task_progress,
@@ -42,8 +43,10 @@ def run_scheduled_task(self, task_id: int, execution_log_id: Optional[int] = Non
             execution_log = TaskExecutionLog.objects.create(
                 task=task,
                 start_time=timezone.now(),
-                status='running'
+                status='running',
             )
+            execution_log.report_url = platform_report_url(execution_log.id)
+            execution_log.save(update_fields=['report_url'])
         
         logger.info(f"开始执行定时任务: {task.name} (ID: {task_id})")
         
@@ -58,7 +61,9 @@ def run_scheduled_task(self, task_id: int, execution_log_id: Optional[int] = Non
         if result.get('task_ids'):
             execution_log.result_log = json.dumps(result, ensure_ascii=False, indent=2)
             execution_log.total_cases = result.get('total_cases', 0)
-            execution_log.save(update_fields=['result_log', 'total_cases'])
+            if not execution_log.report_url:
+                execution_log.report_url = platform_report_url(execution_log.id)
+            execution_log.save(update_fields=['result_log', 'total_cases', 'report_url'])
         else:
             # 同步执行：立即更新执行日志与统计
             execution_log.status = 'success' if result.get('success', False) else 'failed'
@@ -72,6 +77,8 @@ def run_scheduled_task(self, task_id: int, execution_log_id: Optional[int] = Non
             execution_log.skipped_cases = result.get('skipped_cases', 0)
             if result.get('report_url'):
                 execution_log.report_url = result['report_url']
+            elif not execution_log.report_url:
+                execution_log.report_url = platform_report_url(execution_log.id)
             execution_log.save()
 
         # 确保存在 PeriodicTask 以便通知规则能匹配（手动执行时若任务已暂停，PeriodicTask 可能被删）
@@ -160,13 +167,15 @@ def _execute_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog) ->
 def _execute_web_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog) -> Dict[str, Any]:
     """执行Web测试套件"""
     try:
-        from web_testing.models import WebUITestSuite, WebUITestExecution, WebUITestSuiteExecutionDetail
+        from web_testing.models import WebUITestSuite, WebUITestExecution
+        from web_testing.execution_snapshots import capture_suite_snapshot
         from web_testing.tasks import execute_webui_test_suite_task
         
         # 获取测试套件列表
-        suites = WebUITestSuite.objects.filter(id__in=task.suite_ids)
+        suite_order = {suite_id: index for index, suite_id in enumerate(task.suite_ids or [])}
+        suites = sorted(WebUITestSuite.objects.filter(id__in=task.suite_ids), key=lambda suite: (suite_order.get(suite.id, 10**9), suite.id))
         
-        if not suites.exists():
+        if not suites:
             return build_error_result("未找到指定的Web测试套件")
         
         total_cases = 0
@@ -175,6 +184,7 @@ def _execute_web_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
         total_skipped = 0
         task_ids = []
         execution_ids = []
+        dispatches = []
         
         # 执行所有测试套件
         for suite in suites:
@@ -195,35 +205,28 @@ def _execute_web_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
                 browser='chromium'  # 默认浏览器
             )
             
-            # 创建套件执行详情
-            suite_detail = WebUITestSuiteExecutionDetail.objects.create(
-                execution=execution,
-                test_suite=suite,
-                total_cases=suite.test_cases.count(),
-                passed_cases=0,
-                failed_cases=0,
-                skipped_cases=0
+            # 统一复用 WebUI 的快照写入契约。它在任何 Celery 派发前持久化
+            # 套件和子用例，执行器不得再从可变源套件补建快照。
+            suite_detail = capture_suite_snapshot(execution, suite)
+            append_linked_execution(
+                execution_log,
+                kind='web', project_id=task.project_id,
+                execution_id=execution.id, name=suite.name,
             )
             
-            # 启动异步任务执行测试套件（传入 execution_log.id 以便完成后回填状态与企微通知）
-            celery_task = execute_webui_test_suite_task.delay(
-                execution.id,
-                task.user.id,
-                {},
-                execution_log.id
-            )
-            
-            # 更新执行记录的任务ID
-            execution.task_id = celery_task.id
-            execution.save()
-            
-            task_ids.append(celery_task.id)
+            # 先完整持久化本轮所有关联执行；任何 .delay() 都在第二阶段。
+            dispatches.append((suite, execution))
             execution_ids.append(execution.id)
-            
-            # 统计用例数量
-            suite_cases = suite.test_cases.count()
+            suite_cases = suite_detail.total_cases
             total_cases += suite_cases
-            
+
+        for suite, execution in dispatches:
+            celery_task = execute_webui_test_suite_task.delay(
+                execution.id, task.user.id, {}, execution_log.id,
+            )
+            execution.task_id = celery_task.id
+            execution.save(update_fields=['task_id'])
+            task_ids.append(celery_task.id)
             logger.info(f"定时任务开始执行Web测试套件 {suite.name}, 执行记录ID: {execution.id}, 任务ID: {celery_task.id}")
         
         suite_names = [suite.name for suite in suites]
@@ -251,9 +254,10 @@ def _execute_api_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
         from projects.models import Environment
         
         # 获取测试套件列表
-        suites = APITestSuite.objects.filter(id__in=task.suite_ids)
+        suite_order = {suite_id: index for index, suite_id in enumerate(task.suite_ids or [])}
+        suites = sorted(APITestSuite.objects.filter(id__in=task.suite_ids), key=lambda suite: (suite_order.get(suite.id, 10**9), suite.id))
         
-        if not suites.exists():
+        if not suites:
             return build_error_result("未找到指定的API测试套件")
         
         total_cases = 0
@@ -262,6 +266,7 @@ def _execute_api_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
         total_skipped = 0
         task_ids = []
         execution_ids = []
+        dispatches = []
         
         # 执行所有测试套件
         for suite in suites:
@@ -286,6 +291,7 @@ def _execute_api_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
             suite_detail = APITestSuiteExecutionDetail.objects.create(
                 execution=execution,
                 test_suite=suite,
+                test_suite_name=suite.name,
                 total_cases=suite.test_cases.count()
             )
             
@@ -297,23 +303,25 @@ def _execute_api_test_suite(task: ScheduledTask, execution_log: TaskExecutionLog
                     name=test_case.title,
                     status='pending'
                 )
-            
-            # 启动异步任务执行测试套件（传入 execution_log.id 以便完成后回填通过/失败统计）
-            celery_task = execute_api_test_suite_async.delay(
-                execution.id, suite.id, task.environment.id, execution_log.id
+            append_linked_execution(
+                execution_log,
+                kind='api', project_id=task.project_id,
+                execution_id=execution.id, name=suite.name,
             )
             
-            # 更新执行记录的任务ID
-            execution.task_id = celery_task.id
-            execution.save()
-            
-            task_ids.append(celery_task.id)
+            # 先完整持久化本轮所有关联执行；任何 .delay() 都在第二阶段。
+            dispatches.append((suite, execution))
             execution_ids.append(execution.id)
-            
-            # 统计用例数量
             suite_cases = suite.test_cases.count()
             total_cases += suite_cases
-            
+
+        for suite, execution in dispatches:
+            celery_task = execute_api_test_suite_async.delay(
+                execution.id, suite.id, task.environment.id, execution_log.id,
+            )
+            execution.task_id = celery_task.id
+            execution.save(update_fields=['task_id'])
+            task_ids.append(celery_task.id)
             logger.info(f"定时任务开始执行API测试套件 {suite.name}, 执行记录ID: {execution.id}, 任务ID: {celery_task.id}")
         
         suite_names = [suite.name for suite in suites]

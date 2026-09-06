@@ -214,7 +214,7 @@ class AssistedDebuggingTests(TestCase):
             'runtime_assertion_count': runtime_assertion_count,
             'error': '' if passed else 'runner failed',
             'result': {
-                'stdout': stdout, 'stderr': '', 'test_file': '', 'allure_report': '',
+                'stdout': stdout, 'stderr': '', 'test_file': '',
                 'screenshot_path': None,
             },
         }

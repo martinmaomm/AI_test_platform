@@ -92,8 +92,6 @@ api.interceptors.request.use(
       '/users/register/',
       '/users/csrf-token/',
       '/users/refresh-token/',
-      '/reports/execution/',
-      '/reports/detail/'
     ]
     
     // 检查当前请求是否需要跳过token

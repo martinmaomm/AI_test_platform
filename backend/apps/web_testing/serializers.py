@@ -498,7 +498,7 @@ class WebUITestExecutionListSerializer(serializers.ModelSerializer):
             'executor_name',
             'project_id',
             'browser', 'task_id', 'start_time', 'end_time', 'duration',
-            'log_path', 'report_path', 'pass_rate', 'execution_duration',
+            'log_path', 'pass_rate', 'execution_duration',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
@@ -510,8 +510,14 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
     """WebUI测试套件执行详情序列化器 - 用于套件执行详情页面"""
     test_suite_name = serializers.CharField(source='execution.name', read_only=True)
     browser = serializers.CharField(source='execution.browser', read_only=True)
+    status = serializers.CharField(source='execution.status', read_only=True)
+    exec_type = serializers.CharField(source='execution.exec_type', read_only=True)
+    executor_name = serializers.CharField(source='execution.executor.username', read_only=True)
+    name = serializers.CharField(source='execution.name', read_only=True)
+    description = serializers.CharField(source='execution.description', read_only=True)
+    report_url = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
-    allure_report_url = serializers.SerializerMethodField()
+    not_executed_cases = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
     error_message = serializers.CharField(source='execution.error_message', read_only=True)
     
@@ -519,34 +525,21 @@ class WebUITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
         model = WebUITestSuiteExecutionDetail
         fields = [
             'id', 'execution', 'project_id', 'test_suite', 'test_suite_name',
+            'status', 'exec_type', 'executor_name', 'name', 'description', 'report_url',
             'total_cases', 'passed_cases', 'incomplete_cases', 'failed_cases', 'skipped_cases',
-            'pass_rate', 'browser',
-            'start_time', 'end_time', 'duration', 'allure_report', 'allure_report_url',
+            'not_executed_cases', 'pass_rate', 'browser',
+            'start_time', 'end_time', 'duration',
             'error_message', 'log'
         ]
         read_only_fields = ['id', 'execution']
     
-    def get_allure_report_url(self, obj):
-        """生成Allure报告访问URL - 优先返回持久化 media 路径"""
-        if obj.allure_report:
-            import os
-            from django.conf import settings
-            report_path = obj.allure_report
-            # 持久化报告：media/allure_reports/<execution_id>/index.html
-            norm_media = os.path.normpath(settings.MEDIA_ROOT)
-            norm_path = os.path.normpath(os.path.abspath(report_path))
-            if norm_media in norm_path and 'allure_reports' in norm_path and os.path.exists(report_path):
-                return f"/media/allure_reports/{obj.execution_id}/index.html"
-            if not os.path.exists(report_path):
-                return None
-            report_dir = os.path.dirname(report_path)
-            report_filename = os.path.basename(report_path)
-            try:
-                relative_path = os.path.relpath(report_dir, settings.PLAYWRIGHT_REPORTS_ROOT)
-                return f"/playwright-reports/{relative_path}/{report_filename}"
-            except ValueError:
-                return None
-        return None
+    def get_report_url(self, obj):
+        return f'/reports/web/{obj.execution.project_id}/{obj.execution_id}'
+
+    def get_not_executed_cases(self, obj):
+        if obj.execution.status in {'pending', 'running'}:
+            return 0
+        return obj.case_executions.filter(status__in=['pending', 'running']).count()
 
 
 # ============ WebUI测试套件序列化器 ============
@@ -676,6 +669,12 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     test_case_title = serializers.CharField(source='execution.name', read_only=True)
     test_case_description = serializers.CharField(source='execution.description', read_only=True)
     browser = serializers.CharField(source='execution.browser', read_only=True)
+    status = serializers.CharField(source='execution.status', read_only=True)
+    exec_type = serializers.CharField(source='execution.exec_type', read_only=True)
+    executor_name = serializers.CharField(source='execution.executor.username', read_only=True)
+    name = serializers.CharField(source='execution.name', read_only=True)
+    description = serializers.CharField(source='execution.description', read_only=True)
+    report_url = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
     screenshot_path = serializers.SerializerMethodField()
     
@@ -683,7 +682,7 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
         model = WebUITestCaseExecutionDetail
         fields = [
             'id', 'execution', 'project_id', 'test_case', 'test_case_title', 'test_case_description',
-            'status', 'browser',
+            'status', 'exec_type', 'executor_name', 'name', 'description', 'report_url', 'browser',
             'start_time', 'end_time', 'duration',
             'error_message', 'log', 'screenshot_path', 'video_path'
         ]
@@ -691,6 +690,9 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     
     def get_screenshot_path(self, obj):
         return safe_screenshot_relative_path(obj.screenshot_path)
+
+    def get_report_url(self, obj):
+        return f'/reports/web/{obj.execution.project_id}/{obj.execution_id}'
 
 
 class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
@@ -702,7 +704,7 @@ class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
         model = WebUITestSuiteCaseExecution
         fields = [
             'id', 'suite_execution', 'test_case', 'test_case_title',
-            'name', 'status', 'status_display', 'duration',
+            'name', 'description', 'module_name', 'execution_order', 'status', 'status_display', 'duration',
             'error_message', 'log', 'screenshot_path', 'video_path', 'stdout'
         ]
         read_only_fields = ['id', 'suite_execution']

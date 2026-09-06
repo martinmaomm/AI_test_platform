@@ -1,7 +1,5 @@
 aiohttp==3.9.1
 aiosignal==1.4.0
-allure-pytest==2.14.2
-allure-python-commons==2.14.2
 amqp==5.3.1
 annotated-types==0.7.0
 anyio==4.11.0

@@ -9,6 +9,7 @@ from django.test import TestCase
 from projects.models import Project
 
 from .execution_variables import merge_execution_variables, store_runtime_variables
+from .execution_snapshots import capture_suite_snapshot
 from .models import (
     WebUITestCase,
     WebUITestCaseExecutionDetail,
@@ -122,10 +123,8 @@ class ScriptAssetFlowTests(TestCase):
             executor=self.user,
             project=self.project,
         )
-        suite_detail = WebUITestSuiteExecutionDetail.objects.create(
-            execution=suite_execution,
-            test_suite=suite,
-        )
+        WebUITestSuiteCase.objects.create(suite=suite, test_case=test_case, order=1)
+        suite_detail = capture_suite_snapshot(suite_execution, suite)
 
         test_case.delete()
         suite.delete()
@@ -171,11 +170,7 @@ class ScriptAssetFlowTests(TestCase):
             executor=self.user,
             project=self.project,
         )
-        detail = WebUITestSuiteExecutionDetail.objects.create(
-            execution=execution,
-            test_suite=suite,
-            total_cases=2,
-        )
+        detail = capture_suite_snapshot(execution, suite)
         store_runtime_variables(execution.id, [
             {'name': 'SHARED_VALUE', 'value': 'runtime'},
             {'name': 'REQUIRED_VALUE', 'value': 'provided-at-runtime'},
@@ -198,7 +193,7 @@ class ScriptAssetFlowTests(TestCase):
 
         def run_in_order(script_content, *_args, **_kwargs):
             if script_content == first_script.strip():
-                self.assertFalse(detail.case_executions.filter(test_case=second_case).exists())
+                self.assertTrue(detail.case_executions.filter(test_case=second_case, status='pending').exists())
                 return failed_result
             self.assertEqual(script_content, second_script.strip())
             first_result = detail.case_executions.get(test_case=first_case)

@@ -109,15 +109,15 @@ class AssertionPreservationTests(SimpleTestCase):
 '''
         self.assertEqual(validate_assertion_preservation(baseline, candidate), [])
 
-    def test_allows_locator_and_wait_repair_inside_allure_step(self):
+    def test_allows_locator_and_wait_repair_inside_regular_block(self):
         baseline = '''async def run(page):
-    with allure.step("新增"):
+    if True:
         target = page.locator("#old")
         await page.wait_for_load_state("networkidle", timeout=1000)
         await expect(target).to_have_text("paid", timeout=1000)
 '''
         candidate = '''async def run(page):
-    with allure.step("新增"):
+    if True:
         target = page.locator("#new")
         await page.wait_for_load_state("networkidle", timeout=3000)
         await expect(target).to_have_text("paid", timeout=5000)

@@ -145,7 +145,7 @@ def main():
             outcome = {'scenario': name, 'error_code': result.error_code, 'completion': result.completion, 'checkpoints': checkpoint_count, 'script_chars': len(result.script_draft), 'stats': result.snapshot.get('tool_stats'), 'blockers': quality['blockers'], 'runs': []}
             if result.script_draft and not quality['blockers']:
                 for run in range(2):
-                    config = ExecutionConfig(timeout=60, generate_allure=False, failure_screenshot_path=str(directory / f'failure-{run + 1}.png'), environment_variables={'UI_TEST_USERNAME': 'fixture-user', 'UI_TEST_PASSWORD': 'fixture-pass'})
+                    config = ExecutionConfig(timeout=60, failure_screenshot_path=str(directory / f'failure-{run + 1}.png'), environment_variables={'UI_TEST_USERNAME': 'fixture-user', 'UI_TEST_PASSWORD': 'fixture-pass'})
                     execution = PlaywrightRunner().run_single_test(f'smoke-{name}-{run}', result.script_draft, config)
                     status, _, count = evaluation_status(result.script_draft, operation_success=execution.success, runtime_assertion_count=execution.runtime_assertion_count)
                     outcome['runs'].append({'status': status, 'runtime_assertion_count': count})

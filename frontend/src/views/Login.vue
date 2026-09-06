@@ -74,12 +74,14 @@
 
 <script setup>
 import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import AITSBrand from '@/components/AITSBrand.vue'
+import { safeInternalRedirect } from '@/utils/reportLinks'
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 const loginFormRef = ref()
 const canvasRef = ref()
@@ -349,7 +351,7 @@ const handleLogin = async () => {
     const result = await authStore.login(loginForm)
     if (result.success) {
       ElMessage.success(result.message || '登录成功')
-      router.push('/dashboard')
+      router.push(safeInternalRedirect(route.query.redirect))
     } else {
       ElMessage.error(result.error || '登录失败')
     }

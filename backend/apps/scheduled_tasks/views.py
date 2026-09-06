@@ -7,7 +7,6 @@ from rest_framework import generics, status, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import AllowAny
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
 from django.utils import timezone
@@ -22,6 +21,7 @@ from .serializers import (
     SuiteChoiceSerializer
 )
 from .tasks import run_task_manually, calculate_next_run_time
+from .reporting import platform_report_url
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,8 @@ class TaskRunView(APIView):
                 start_time=timezone.now(),
                 status='running'
             )
+            execution_log.report_url = platform_report_url(execution_log.id)
+            execution_log.save(update_fields=['report_url'])
             result = run_task_manually.delay(task.id, execution_log.id)
             return response(
                 kind="success",
@@ -268,10 +270,20 @@ class TaskExecutionLogDetailView(generics.RetrieveDestroyAPIView):
 
 
 class ReportExecutionLogPublicView(generics.RetrieveAPIView):
-    """报告页免密查看执行日志详情（AllowAny，用于企微/钉钉链接打开）"""
-    permission_classes = [AllowAny]
-    queryset = TaskExecutionLog.objects.all()
+    """登录后的平台报告详情；保留类名以兼容既有全局 URL。"""
+    permission_classes = [permissions.IsAuthenticated]
     serializer_class = TaskExecutionLogSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = TaskExecutionLog.objects.select_related('task', 'task__project')
+        if user.is_superuser:
+            return queryset
+        return queryset.filter(
+            Q(task__project__owner=user)
+            | Q(task__project__created_by=user)
+            | Q(task__project__members__user=user, task__project__members__can_view_reports=True)
+        ).distinct()
 
 
 class TaskExecutionLogsByTaskView(generics.ListAPIView):

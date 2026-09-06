@@ -203,8 +203,16 @@ class TaskExecutionLogSerializer(serializers.ModelSerializer):
     task_name = serializers.CharField(source='task.name', read_only=True)
     suite_type = serializers.CharField(source='task.suite_type', read_only=True)
     duration = serializers.SerializerMethodField(read_only=True)
+    total_cases = serializers.SerializerMethodField(read_only=True)
+    passed_cases = serializers.SerializerMethodField(read_only=True)
+    failed_cases = serializers.SerializerMethodField(read_only=True)
+    skipped_cases = serializers.SerializerMethodField(read_only=True)
     success_rate = serializers.SerializerMethodField(read_only=True)
-    allure_report_url = serializers.SerializerMethodField(read_only=True)
+    incomplete_cases = serializers.SerializerMethodField(read_only=True)
+    error_cases = serializers.SerializerMethodField(read_only=True)
+    execution_errors = serializers.SerializerMethodField(read_only=True)
+    report_status = serializers.SerializerMethodField(read_only=True)
+    task_status = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = TaskExecutionLog
@@ -212,7 +220,8 @@ class TaskExecutionLogSerializer(serializers.ModelSerializer):
             'id', 'task', 'task_name', 'suite_type', 'start_time', 'end_time',
             'duration', 'status', 'result_log', 'step_log', 'error_message',
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',
-            'success_rate', 'report_url', 'report_path', 'allure_report_url', 'created_at'
+            'incomplete_cases', 'error_cases', 'execution_errors', 'report_status', 'task_status',
+            'success_rate', 'report_url', 'linked_executions', 'notification_sent_at', 'created_at'
         ]
         read_only_fields = ['id', 'created_at']
     
@@ -224,30 +233,57 @@ class TaskExecutionLogSerializer(serializers.ModelSerializer):
     
     def get_success_rate(self, obj):
         """获取成功率"""
-        return obj.success_rate
+        return self._summary(obj)['success_rate']
 
-    def get_allure_report_url(self, obj):
-        """Allure 报告相对路径（供 iframe）：返回 allure_reports/{id}/index.html 供前端拼接 /media/ 前缀"""
-        rel = getattr(obj, 'allure_report_url', None) or ''
-        if rel:
-            return rel
-        import os
-        path = getattr(obj, 'report_path', None) or ''
-        if not path or not os.path.isabs(path):
-            return None
-        from django.conf import settings
-        media_root = getattr(settings, 'MEDIA_ROOT', '') or ''
-        if media_root and os.path.exists(path):
-            try:
-                report_dir = os.path.dirname(path) if os.path.isfile(path) else path
-                report_dir_real = os.path.realpath(report_dir)
-                media_root_real = os.path.realpath(media_root)
-                if report_dir_real == media_root_real or report_dir_real.startswith(media_root_real + os.sep):
-                    rel = os.path.relpath(report_dir_real, media_root_real)
-                    return f"{rel.replace(os.sep, '/')}/index.html"
-            except ValueError:
-                pass
-        return None
+    def _summary(self, obj):
+        cache = getattr(self, '_report_summary_cache', None)
+        if cache is None:
+            cache = self._report_summary_cache = {}
+        cache_key = obj.pk if obj.pk is not None else id(obj)
+        if cache_key in cache:
+            return cache[cache_key]
+        from .reporting import summarize_linked_executions
+        summary = summarize_linked_executions(obj) if obj.linked_executions else {
+            'total_cases': obj.total_cases,
+            'passed_cases': obj.passed_cases,
+            'failed_cases': obj.failed_cases,
+            'skipped_cases': obj.skipped_cases,
+            'success_rate': obj.success_rate,
+            'incomplete_cases': 0,
+            'error_cases': 0,
+            'execution_errors': 0,
+            'is_running': obj.status in {'pending', 'running'},
+            'report_status': 'running' if obj.status in {'pending', 'running'} else ('passed' if obj.status == 'success' and obj.total_cases else 'skipped' if obj.status == 'success' else 'failed'),
+        }
+        cache[cache_key] = summary
+        return summary
+
+    def get_total_cases(self, obj):
+        return self._summary(obj)['total_cases']
+
+    def get_passed_cases(self, obj):
+        return self._summary(obj)['passed_cases']
+
+    def get_failed_cases(self, obj):
+        return self._summary(obj)['failed_cases']
+
+    def get_skipped_cases(self, obj):
+        return self._summary(obj)['skipped_cases']
+
+    def get_incomplete_cases(self, obj):
+        return self._summary(obj)['incomplete_cases']
+
+    def get_error_cases(self, obj):
+        return self._summary(obj)['error_cases']
+
+    def get_execution_errors(self, obj):
+        return self._summary(obj)['execution_errors']
+
+    def get_report_status(self, obj):
+        return self._summary(obj)['report_status']
+
+    def get_task_status(self, obj):
+        return 'running' if self._summary(obj).get('is_running') else 'completed'
 
 
 class TaskExecutionLogListSerializer(serializers.ModelSerializer):
@@ -256,13 +292,20 @@ class TaskExecutionLogListSerializer(serializers.ModelSerializer):
     task_name = serializers.CharField(source='task.name', read_only=True)
     suite_type = serializers.CharField(source='task.suite_type', read_only=True)
     duration = serializers.SerializerMethodField(read_only=True)
+    total_cases = serializers.SerializerMethodField(read_only=True)
+    passed_cases = serializers.SerializerMethodField(read_only=True)
+    failed_cases = serializers.SerializerMethodField(read_only=True)
+    skipped_cases = serializers.SerializerMethodField(read_only=True)
+    incomplete_cases = serializers.SerializerMethodField(read_only=True)
+    success_rate = serializers.SerializerMethodField(read_only=True)
+    task_status = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = TaskExecutionLog
         fields = [
             'id', 'task_name', 'suite_type', 'start_time', 'end_time', 'duration',
             'status', 'total_cases', 'passed_cases', 'failed_cases',
-            'success_rate', 'report_url'
+            'skipped_cases', 'incomplete_cases', 'task_status', 'success_rate', 'report_url', 'linked_executions'
         ]
     
     def get_duration(self, obj):
@@ -270,6 +313,45 @@ class TaskExecutionLogListSerializer(serializers.ModelSerializer):
         if obj.duration:
             return str(obj.duration)
         return None
+
+    def get_incomplete_cases(self, obj):
+        return self._summary(obj)['incomplete_cases']
+
+    def get_success_rate(self, obj):
+        return self._summary(obj)['success_rate']
+
+    def get_task_status(self, obj):
+        return 'running' if self._summary(obj)['is_running'] else 'completed'
+
+    def _summary(self, obj):
+        cache = getattr(self, '_report_summary_cache', None)
+        if cache is None:
+            cache = self._report_summary_cache = {}
+        cache_key = obj.pk if obj.pk is not None else id(obj)
+        if cache_key not in cache:
+            from .reporting import summarize_linked_executions
+            cache[cache_key] = summarize_linked_executions(obj) if obj.linked_executions else {
+                'total_cases': obj.total_cases,
+                'passed_cases': obj.passed_cases,
+                'failed_cases': obj.failed_cases,
+                'skipped_cases': obj.skipped_cases,
+                'incomplete_cases': 0,
+                'success_rate': obj.success_rate,
+                'is_running': obj.status in {'pending', 'running'},
+            }
+        return cache[cache_key]
+
+    def get_total_cases(self, obj):
+        return self._summary(obj)['total_cases']
+
+    def get_passed_cases(self, obj):
+        return self._summary(obj)['passed_cases']
+
+    def get_failed_cases(self, obj):
+        return self._summary(obj)['failed_cases']
+
+    def get_skipped_cases(self, obj):
+        return self._summary(obj)['skipped_cases']
 
 
 class TaskRunSerializer(serializers.Serializer):

@@ -56,6 +56,7 @@ urlpatterns = [
     path('executions/case/<int:pk>/', views.APITestCaseExecutionDetailView.as_view(), name='api-test-case-execution-detail'),
     path('executions/suite/<int:pk>/', views.APITestSuiteExecutionDetailView.as_view(), name='api-test-suite-execution-detail'),
     path('executions/<int:pk>/cases/', views.APITestExecutionCasesView.as_view(), name='api-test-execution-cases'),
+    path('executions/<int:pk>/report/', views.APITestExecutionReportView.as_view(), name='api-test-execution-report'),
     path('executions/<int:pk>/delete/', views.APITestExecutionDeleteView.as_view(), name='api-test-execution-delete'),
     
     # 测试统计

@@ -19,12 +19,14 @@ from .assertion_state import (
     evaluation_status,
     read_runtime_assertion_count,
 )
+from .execution_snapshots import capture_suite_snapshot
 from .models import (
     WebUITestCase,
     WebUITestCaseExecutionDetail,
     WebUITestExecution,
     WebUITestSuite,
     WebUITestSuiteCase,
+    WebUITestSuiteCaseExecution,
     WebUITestSuiteExecutionDetail,
 )
 from .script_contract import materialize_script
@@ -300,7 +302,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
             'success': operation_success,
             'operation_success': operation_success,
             'runtime_assertion_count': runtime_assertion_count,
-            'result': {'stdout': '', 'stderr': '', 'test_file': '', 'allure_report': ''},
+            'result': {'stdout': '', 'stderr': '', 'test_file': ''},
             'error': '' if operation_success else 'fixture browser timeout',
         }
 
@@ -346,9 +348,7 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
             exec_type='suite', name=suite.name, executor=self.user,
             project=self.project, status='pending',
         )
-        detail = WebUITestSuiteExecutionDetail.objects.create(
-            execution=execution, test_suite=suite, total_cases=2,
-        )
+        detail = capture_suite_snapshot(execution, suite)
         results = [
             self.runner_result(operation_success=True, runtime_assertion_count=1),
             self.runner_result(operation_success=True, runtime_assertion_count=1),
@@ -375,6 +375,24 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
         execution_log = TaskExecutionLog.objects.create(
             task=scheduled, start_time=scheduled.created_at, status='running', total_cases=3,
         )
+        execution = WebUITestExecution.objects.create(
+            exec_type='suite', name='Deferred scheduled suite', executor=self.user,
+            project=self.project, status='incomplete',
+        )
+        detail = WebUITestSuiteExecutionDetail.objects.create(
+            execution=execution, total_cases=2,
+        )
+        WebUITestSuiteCaseExecution.objects.create(
+            suite_execution=detail, name='Verified case', execution_order=1, status='passed',
+        )
+        WebUITestSuiteCaseExecution.objects.create(
+            suite_execution=detail, name='Pending case', execution_order=2, status='incomplete',
+        )
+        execution_log.linked_executions = [{
+            'kind': 'web', 'project_id': self.project.id,
+            'execution_id': execution.id, 'name': execution.name,
+        }]
+        execution_log.save(update_fields=['linked_executions'])
         with patch('notifications.services.trigger_notification') as notify:
             _finalize_scheduled_execution(
                 execution_log.id,
@@ -390,17 +408,5 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
         self.assertEqual(execution_log.passed_cases, 1)
         self.assertEqual(execution_log.failed_cases, 0)
         self.assertIn('验证未完成', execution_log.error_message)
-        notify.assert_not_called()
-
-        # A later genuine failure must still notify, even if an earlier suite
-        # left verification incomplete. Pending assertions do not mute errors.
-        with patch('notifications.services.trigger_notification') as notify_failure:
-            _finalize_scheduled_execution(
-                execution_log.id, total_cases=3, passed_cases=0,
-                failed_cases=1, incomplete_cases=0, skipped_cases=0,
-                log='fixture actual execution failure',
-            )
-        execution_log.refresh_from_db()
-        self.assertEqual(execution_log.status, 'failed')
-        self.assertEqual(execution_log.failed_cases, 1)
-        notify_failure.assert_called_once()
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs['result']['report_status'], 'incomplete')

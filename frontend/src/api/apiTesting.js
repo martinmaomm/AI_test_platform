@@ -171,6 +171,11 @@ export const getAPITestExecutions = async (projectId, params = {}) => {
   return response.data
 }
 
+export const getAPITestExecutionReport = async (projectId, executionId) => {
+  const response = await api.get(`/projects/${projectId}/api-testing/executions/${executionId}/report/`)
+  return response.data
+}
+
 // 获取单用例执行详情
 export const getAPITestCaseExecutionDetail = async (projectId, executionId) => {
   const response = await api.get(`/projects/${projectId}/api-testing/executions/case/${executionId}/`)
@@ -310,4 +315,3 @@ export const addCasesToTestSuite = async (projectId, suiteId, testCaseIds) => {
   )
   return response.data
 }
-

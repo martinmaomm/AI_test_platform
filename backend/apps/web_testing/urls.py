@@ -49,6 +49,7 @@ urlpatterns = [
     path('executions/', views.TestExecutionListView.as_view(), name='executions-list'),
     path('executions/case/<int:pk>/', views.TestCaseExecutionDetailView.as_view(), name='case-execution-detail'),
     path('executions/suite/<int:pk>/', views.TestSuiteExecutionDetailView.as_view(), name='suite-execution-detail'),
+    path('executions/<int:pk>/report/', views.TestExecutionReportView.as_view(), name='execution-report'),
     path('executions/<int:pk>/cases/', views.TestExecutionCasesView.as_view(), name='execution-cases'),
     path('executions/<int:pk>/cases/<int:case_pk>/screenshot/', views.TestExecutionScreenshotView.as_view(), name='suite-case-screenshot'),
     path('executions/<int:pk>/screenshot/', views.TestExecutionScreenshotView.as_view(), name='execution-screenshot'),

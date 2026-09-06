@@ -88,6 +88,10 @@ class AgentDraftQualityTests(SimpleTestCase):
             self.assertTrue(evaluate_draft(SCRIPT + '\n' + addition)['blockers'])
         self.assertTrue(evaluate_draft('import subprocess\n' + SCRIPT)['blockers'])
 
+    def test_allure_import_is_not_part_of_the_script_contract(self):
+        report = evaluate_draft('import allure\n' + SCRIPT)
+        self.assertIn('IMPORT_NOT_ALLOWED', [item['code'] for item in report['blockers']])
+
     def test_known_os_alias_cannot_execute_command(self):
         script = 'from os import system as execute\n' + SCRIPT + '\n    execute("echo hello")\n'
         self.assertIn('UNSAFE_OS_OPERATION', [item['code'] for item in evaluate_draft(script)['blockers']])

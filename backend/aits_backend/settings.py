@@ -73,7 +73,7 @@ MIDDLEWARE = [
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
-    # 移除 XFrameOptionsMiddleware：前端 5173 嵌入后端 8000 的 Allure 需跨端口，避免白屏
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
 ROOT_URLCONF = 'aits_backend.urls'
@@ -178,15 +178,9 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
-# Media files（用户上传及 Allure 报告等）
+# Media files（用户上传与执行截图；报告数据使用认证接口）
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
-
-# Playwright reports static files
-PLAYWRIGHT_REPORTS_ROOT = os.path.join(BASE_DIR, 'playwright_workspace')
-
-# HttpRunner reports static files
-HTTPRUNNER_REPORTS_ROOT = os.path.join(BASE_DIR, 'httprunner_workspace')
 
 # 前端/报告站点地址，用于通知中的「查看报告」链接及 CORS/CSRF 放行
 # TODO: 用户请在此处填入本机的真实局域网 IP，如 http://192.168.1.100:5173（或通过环境变量 FRONTEND_BASE_URL 配置）

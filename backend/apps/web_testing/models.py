@@ -373,7 +373,6 @@ class WebUITestExecution(models.Model):
     
     # 路径信息
     log_path = models.CharField(max_length=500, blank=True, null=True, verbose_name="日志路径")
-    report_path = models.CharField(max_length=500, blank=True, null=True, verbose_name="报告路径")
     
     # 时间戳
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
@@ -467,7 +466,7 @@ class WebUITestCaseExecutionDetail(models.Model):
         verbose_name_plural = "单用例执行详情"
     
     def __str__(self):
-        return f"{self.test_case.title} - {self.get_status_display()}"
+        return f"{self.execution.name} - {self.get_status_display()}"
 
 
 class WebUITestSuiteExecutionDetail(models.Model):
@@ -497,8 +496,8 @@ class WebUITestSuiteExecutionDetail(models.Model):
     end_time = models.DateTimeField(null=True, blank=True, verbose_name="结束时间")
     duration = models.FloatField(null=True, blank=True, verbose_name="执行时长(秒)")
     
-    # 报告信息
-    allure_report = models.TextField(null=True, blank=True, verbose_name="Allure报告路径")
+    # 执行时的套件变量快照。报告及重试均不得读取当前套件配置。
+    suite_variables = models.JSONField(default=list, blank=True, verbose_name='套件变量快照')
     
     # 执行日志
     log = models.TextField(blank=True, null=True, verbose_name="执行日志")
@@ -509,7 +508,7 @@ class WebUITestSuiteExecutionDetail(models.Model):
         verbose_name_plural = "套件执行详情"
     
     def __str__(self):
-        return f"{self.test_suite.name} - {self.total_cases}个用例"
+        return f"{self.execution.name} - {self.total_cases}个用例"
     
     @property
     def pass_rate(self):
@@ -546,6 +545,11 @@ class WebUITestSuiteCaseExecution(models.Model):
     
     # 执行信息
     name = models.CharField(max_length=200, verbose_name="用例名称")
+    description = models.TextField(blank=True, default='', verbose_name='用例描述快照')
+    module_name = models.CharField(max_length=100, blank=True, default='', verbose_name='模块名称快照')
+    execution_order = models.PositiveIntegerField(default=0, verbose_name='执行顺序')
+    script_content = models.TextField(blank=True, default='', verbose_name='脚本快照')
+    variables = models.JSONField(default=list, blank=True, verbose_name='用例变量快照')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name="执行状态")
     duration = models.FloatField(null=True, blank=True, verbose_name="执行时长(秒)")
     

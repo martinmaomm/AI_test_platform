@@ -18,7 +18,7 @@ from .target_urls import target_origin, validate_target_url
 
 
 _ALLOWED_IMPORTS = frozenset({
-    'playwright.async_api', 'allure', 'time', 'datetime', 'uuid', 'secrets',
+    'playwright.async_api', 'time', 'datetime', 'uuid', 'secrets',
     'random', 're', 'json', 'math', 'decimal', 'string', 'typing', 'asyncio',
     'collections', 'itertools', 'os',
 })

@@ -41,10 +41,8 @@ urlpatterns = [
     path('api/v1/util/', include('common.urls'))
 ]
 
-# 托管媒体文件（Allure 报告等，需可读权限供 iframe 加载）
+# 开发环境媒体文件；原生报告通过认证接口读取，不公开执行工作目录。
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-# 开发环境下额外静态与报告目录
+# 开发环境下额外静态资源
 if settings.DEBUG:
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
-    urlpatterns += static('playwright-reports/', document_root=settings.PLAYWRIGHT_REPORTS_ROOT)
-    urlpatterns += static('httprunner-reports/', document_root=settings.HTTPRUNNER_REPORTS_ROOT)

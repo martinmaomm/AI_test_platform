@@ -489,7 +489,10 @@ class APITestCaseExecutionDetail(models.Model):
     execution = models.OneToOneField(APITestExecution, on_delete=models.CASCADE, related_name='case_execution_detail', verbose_name="执行记录")
     
     # 关联测试用例
-    test_case = models.ForeignKey(APITestCase, on_delete=models.CASCADE, verbose_name="测试用例")
+    test_case = models.ForeignKey(
+        APITestCase, on_delete=models.SET_NULL, null=True, blank=True,
+        verbose_name="测试用例",
+    )
     
     # 执行信息
     name = models.CharField(max_length=200, verbose_name="用例名称")
@@ -526,7 +529,12 @@ class APITestSuiteExecutionDetail(models.Model):
     execution = models.OneToOneField(APITestExecution, on_delete=models.CASCADE, related_name='suite_execution_detail', verbose_name="执行记录")
     
     # 关联测试套件
-    test_suite = models.ForeignKey(APITestSuite, on_delete=models.CASCADE, verbose_name="测试套件")
+    test_suite = models.ForeignKey(
+        APITestSuite, on_delete=models.SET_NULL, null=True, blank=True,
+        verbose_name="测试套件",
+    )
+    # 执行时固化套件名称，源套件被删除后历史报告仍可展示。
+    test_suite_name = models.CharField(max_length=200, blank=True, default='', verbose_name="测试套件名称快照")
     
     # 统计信息
     total_cases = models.PositiveIntegerField(default=0, verbose_name="总用例数")
@@ -542,9 +550,6 @@ class APITestSuiteExecutionDetail(models.Model):
     # 执行日志
     log = models.TextField(blank=True, null=True, verbose_name="执行日志")
     
-    # 报告信息
-    allure_report = models.CharField(max_length=500, blank=True, null=True, verbose_name="Allure报告路径")
-    
     class Meta:
         db_table = 'api_test_suite_execution_details'
         verbose_name = "API套件执行详情"
@@ -552,7 +557,7 @@ class APITestSuiteExecutionDetail(models.Model):
         ordering = ['-execution__created_at']
     
     def __str__(self):
-        return f"{self.test_suite.name} - {self.execution.name}"
+        return f"{self.test_suite_name or self.execution.name} - {self.execution.name}"
     
     @property
     def pass_rate(self):
@@ -578,7 +583,10 @@ class APITestSuiteCaseExecution(models.Model):
     suite_execution = models.ForeignKey(APITestSuiteExecutionDetail, on_delete=models.CASCADE, related_name='case_executions', verbose_name="套件执行详情")
     
     # 关联测试用例
-    test_case = models.ForeignKey(APITestCase, on_delete=models.CASCADE, verbose_name="测试用例")
+    test_case = models.ForeignKey(
+        APITestCase, on_delete=models.SET_NULL, null=True, blank=True,
+        verbose_name="测试用例",
+    )
     
     # 执行信息
     name = models.CharField(max_length=200, verbose_name="用例名称")

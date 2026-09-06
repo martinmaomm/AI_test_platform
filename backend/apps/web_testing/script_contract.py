@@ -280,7 +280,6 @@ def materialize_script(
     test_name: str,
     *,
     headed: bool = True,
-    suite_name: Optional[str] = None,
     failure_screenshot_path: Optional[str] = None,
     runtime_assertion_count_path: Optional[str] = None,
 ) -> str:
@@ -312,9 +311,6 @@ def materialize_script(
     browser_literal = repr(WEBUI_BROWSER_ENGINE)
     screenshot_path_literal = repr(failure_screenshot_path) if failure_screenshot_path else "None"
     runtime_count_path_literal = repr(runtime_assertion_count_path) if runtime_assertion_count_path else "None"
-    suite_decorator = f"@allure.suite({suite_name!r})\n" if suite_name else ""
-    allure_import = "import allure\n" if suite_name else ""
-
     # A script that already has run always uses the managed browser,
     # even when an old main() remains in the same file.
     module = _parse(normalized.content)
@@ -322,8 +318,7 @@ def materialize_script(
         wrapper = f'''
 
 import asyncio
-{allure_import}
-{suite_decorator}def {safe_name}():
+def {safe_name}():
     asyncio.run(main())
 '''
         return textwrap.dedent(normalized.content + wrapper).strip() + "\n"
@@ -416,7 +411,6 @@ import logging
 import os
 import sys
 from playwright.async_api import async_playwright
-{allure_import}
 async def _run_with_managed_browser():
     async with async_playwright() as playwright:
         browser_type = getattr(playwright, {browser_literal})
@@ -470,7 +464,7 @@ async def _run_with_managed_browser():
                 raise _aits_close_error
     _aits_emit_completion()
 
-{suite_decorator}def {safe_name}():
+def {safe_name}():
     asyncio.run(_run_with_managed_browser())
 '''
     return textwrap.dedent(instrumented_content + runtime_support + wrapper).strip() + "\n"

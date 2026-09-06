@@ -23,6 +23,7 @@ from common.api import response
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .assertion_state import analyze_assertion_state
 from .execution_diagnostics import safe_screenshot_relative_path
+from .execution_snapshots import capture_suite_snapshot
 from .execution_variables import (
     ExecutionVariableError,
     normalize_variable_definitions,
@@ -1278,8 +1279,8 @@ class ExecuteWebUITestSuiteView(APIView):
     @project_access_required(EXECUTE)
     def post(self, request, project_id, pk):
         suite = get_object_or_404(WebUITestSuite, pk=pk, project_id=project_id)
-        total_cases = suite.case_memberships.count()
-        if not total_cases:
+        memberships = list(suite.case_memberships.select_related('test_case__module').order_by('order', 'id'))
+        if not memberships:
             return response(kind='error', message='测试套件中没有测试用例', status_code=400)
         try:
             options = normalize_webui_execution_options(request.data.get('options'))
@@ -1288,21 +1289,18 @@ class ExecuteWebUITestSuiteView(APIView):
             )
         except (ValueError, ExecutionVariableError) as exc:
             return response(kind='error', message=str(exc), status_code=400)
-        execution = WebUITestExecution.objects.create(
-            exec_type='suite',
-            name=suite.name,
-            description=suite.description,
-            executor=request.user,
-            project=suite.project,
-            browser=WEBUI_BROWSER_ENGINE,
-            status='pending',
-            trigger_type='manual',
-        )
-        WebUITestSuiteExecutionDetail.objects.create(
-            execution=execution,
-            test_suite=suite,
-            total_cases=total_cases,
-        )
+        with transaction.atomic():
+            execution = WebUITestExecution.objects.create(
+                exec_type='suite',
+                name=suite.name,
+                description=suite.description,
+                executor=request.user,
+                project=suite.project,
+                browser=WEBUI_BROWSER_ENGINE,
+                status='pending',
+                trigger_type='manual',
+            )
+            capture_suite_snapshot(execution, suite)
         store_runtime_variables(execution.id, runtime_variables)
         task = execute_webui_test_suite_task.delay(execution.id, request.user.id, options)
         execution.task_id = task.id
@@ -1313,7 +1311,7 @@ class ExecuteWebUITestSuiteView(APIView):
                 'execution_id': execution.id,
                 'task_id': task.id,
                 'test_suite_name': suite.name,
-                'total_cases': total_cases,
+                'total_cases': len(memberships),
                 'status': execution.status,
             },
             message='测试套件执行任务已启动',
@@ -1391,6 +1389,39 @@ class TestCaseExecutionDetailView(APIView):
         )
 
 
+class TestExecutionReportView(APIView):
+    """Return a report-ready execution snapshot without inferring its type client-side."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(REPORT)
+    def get(self, request, project_id, pk):
+        execution = get_object_or_404(
+            WebUITestExecution.objects.select_related('executor', 'project'),
+            pk=pk,
+            project_id=project_id,
+        )
+        if execution.exec_type == 'suite':
+            detail = get_object_or_404(
+                WebUITestSuiteExecutionDetail.objects.select_related('execution__executor'),
+                execution=execution,
+            )
+            detail_data = WebUITestSuiteExecutionDetailSerializer(detail).data
+        else:
+            detail = get_object_or_404(
+                WebUITestCaseExecutionDetail.objects.select_related('execution__executor'),
+                execution=execution,
+            )
+            detail_data = WebUITestCaseExecutionDetailSerializer(detail).data
+        detail_id = detail_data.pop('id')
+        data = dict(detail_data)
+        data.update(WebUITestExecutionListSerializer(execution).data)
+        data['id'] = execution.id
+        data['execution'] = execution.id
+        data['detail_id'] = detail_id
+        return response(kind='success', data=data, message='获取执行报告成功')
+
+
 class TestSuiteExecutionDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1398,8 +1429,8 @@ class TestSuiteExecutionDetailView(APIView):
     def get(self, request, project_id, pk):
         detail = get_object_or_404(
             WebUITestSuiteExecutionDetail.objects.select_related(
-                'execution', 'test_suite'
-            ).prefetch_related('case_executions__test_case'),
+                'execution__executor'
+            ).prefetch_related('case_executions'),
             execution_id=pk,
             execution__project_id=project_id,
             execution__exec_type='suite',
@@ -1423,17 +1454,25 @@ class TestExecutionCasesView(APIView):
             exec_type='suite',
         )
         detail = get_object_or_404(WebUITestSuiteExecutionDetail, execution=execution)
-        cases = detail.case_executions.select_related('test_case__module').order_by('id')
+        cases = detail.case_executions.order_by('execution_order', 'id')
+        suite_ended = execution.status not in {'pending', 'running'}
         data = [
             {
                 'id': item.id,
                 'test_case_id': item.test_case_id,
-                'test_case_title': item.test_case.title,
-                'test_case_description': item.test_case.description,
-                'test_case_module': item.test_case.module.name if item.test_case.module else None,
+                'test_case_title': item.name,
+                'test_case_description': item.description,
+                'test_case_module': item.module_name or None,
                 'name': item.name,
+                'description': item.description,
+                'module_name': item.module_name,
+                'execution_order': item.execution_order,
                 'status': item.status,
-                'status_display': item.get_status_display(),
+                'status_display': (
+                    '未执行（套件已结束）'
+                    if suite_ended and item.status in {'pending', 'running'}
+                    else item.get_status_display()
+                ),
                 'duration': item.duration,
                 'error_message': item.error_message,
                 'log': item.log,
@@ -1443,24 +1482,38 @@ class TestExecutionCasesView(APIView):
             }
             for item in cases
         ]
+        statuses = [item.status for item in cases]
+        passed_cases = statuses.count('passed')
+        failed_cases = sum(status in {'failed', 'error'} for status in statuses)
+        incomplete_cases = statuses.count('incomplete')
+        skipped_cases = statuses.count('skipped')
+        not_executed_cases = sum(status in {'pending', 'running'} for status in statuses)
+        total_cases = len(cases)
         return response(
             kind='success',
             data={
                 'suite_summary': {
+                    'execution_id': execution.id,
                     'test_suite_id': detail.test_suite_id,
-                    'test_suite_name': detail.test_suite.name,
-                    'total_cases': detail.total_cases,
-                    'passed_cases': detail.passed_cases,
-                    'failed_cases': detail.failed_cases,
-                    'incomplete_cases': detail.incomplete_cases,
-                    'skipped_cases': detail.skipped_cases,
-                    'pass_rate': detail.pass_rate,
-                    'start_time': detail.start_time,
-                    'end_time': detail.end_time,
-                    'duration': detail.duration,
+                    'test_suite_name': execution.name,
+                    'status': execution.status,
+                    'exec_type': execution.exec_type,
+                    'executor_name': execution.executor.username,
+                    'name': execution.name,
+                    'report_url': f'/reports/web/{project_id}/{execution.id}',
+                    'total_cases': total_cases,
+                    'passed_cases': passed_cases,
+                    'failed_cases': failed_cases,
+                    'incomplete_cases': incomplete_cases,
+                    'skipped_cases': skipped_cases,
+                    'not_executed_cases': not_executed_cases,
+                    'pass_rate': round(passed_cases / total_cases * 100, 2) if total_cases else 0.0,
+                    'start_time': execution.start_time,
+                    'end_time': execution.end_time,
+                    'duration': execution.execution_duration,
                 },
                 'cases': data,
-                'total_cases': len(data),
+                'total_cases': total_cases,
             },
             message='获取套件子用例执行详情成功',
         )

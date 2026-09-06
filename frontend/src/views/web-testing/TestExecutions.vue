@@ -190,12 +190,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="120" fixed="right" align="center">
+        <el-table-column label="操作" width="250" fixed="right" align="center">
           <template #default="{ row }">
             <div class="action-buttons">
               <el-button size="small" @click.stop="viewDetails(row)" class="view-btn">
                 查看详情
               </el-button>
+              <el-button size="small" type="primary" link @click.stop="viewReport(row)">查看完整报告</el-button>
+              <el-button size="small" link @click.stop="copyReportLink(row)">复制链接</el-button>
             </div>
           </template>
         </el-table-column>
@@ -261,6 +263,7 @@ import WebUITestSuiteExecutionDetail from '@/components/WebUITestSuiteExecutionD
 import WebUITestCaseExecutionDetail from '@/components/WebUITestCaseExecutionDetail.vue'
 import dayjs from 'dayjs'
 import { useProjectStore } from '@/stores/project'
+import { copyText, reportPath, reportUrl } from '@/utils/reportLinks'
 const loading = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(20)
@@ -495,7 +498,6 @@ const loadTestRuns = async () => {
           execution_duration: item.execution_duration,
           pass_rate: item.pass_rate,
           log_path: item.log_path,
-          report_path: item.report_path,
           created_at: item.created_at,
           updated_at: item.updated_at
         }
@@ -560,6 +562,16 @@ const viewDetails = async (row) => {
   } catch (error) {
     console.error('获取执行详情失败:', error)
     ElMessage.error('获取执行详情失败')
+  }
+}
+
+const viewReport = (row) => router.push(reportPath('web', projectStore.currentProjectId, row.id))
+const copyReportLink = async (row) => {
+  try {
+    await copyText(reportUrl('web', projectStore.currentProjectId, row.id))
+    ElMessage.success('报告链接已复制')
+  } catch {
+    ElMessage.error('复制失败，请从地址栏手动复制链接')
   }
 }
 

@@ -647,12 +647,13 @@ class APITestExecutionListSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     trigger_type_display = serializers.CharField(source='get_trigger_type_display', read_only=True)
     pass_rate = serializers.FloatField(read_only=True)
+    project_id = serializers.IntegerField(read_only=True)
     
     class Meta:
         model = APITestExecution
         fields = [
             'id', 'exec_type', 'exec_type_display', 'name', 'description', 'status', 'status_display',
-            'trigger_type', 'trigger_type_display', 'executor', 'executor_name',
+            'trigger_type', 'trigger_type_display', 'executor', 'executor_name', 'project_id',
             'environment', 'environment_name', 'task_id',
             'start_time', 'end_time', 'duration', 'pass_rate',
             'log_path', 'report_path', 'created_at', 'updated_at'
@@ -662,8 +663,8 @@ class APITestExecutionListSerializer(serializers.ModelSerializer):
 class APITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     """单用例执行详情序列化器 - 用于单用例执行详情页面"""
     exec_type = serializers.CharField(source='execution.exec_type', read_only=True)
-    test_case_title = serializers.CharField(source='test_case.title', read_only=True)
-    test_case_description = serializers.CharField(source='test_case.description', read_only=True)
+    test_case_title = serializers.CharField(source='name', read_only=True)
+    test_case_description = serializers.SerializerMethodField()
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
     environment_base_url = serializers.SerializerMethodField()
     httprunner_result = serializers.SerializerMethodField()
@@ -684,6 +685,9 @@ class APITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
             web_config = obj.execution.environment.get_api_config()
             return web_config.get('base_url', '') if web_config else ''
         return ''
+
+    def get_test_case_description(self, obj):
+        return obj.test_case.description if obj.test_case else ''
     
     def get_httprunner_result(self, obj):
         """解析HttpRunner结果为JSON对象"""
@@ -698,11 +702,11 @@ class APITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
 
 class APITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
     """API测试套件执行详情序列化器 - 用于套件执行详情页面"""
-    test_suite_name = serializers.CharField(source='test_suite.name', read_only=True)
+    test_suite_name = serializers.CharField(read_only=True)
     environment_name = serializers.CharField(source='execution.environment.name', read_only=True)
     environment_base_url = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
-    allure_report_url = serializers.SerializerMethodField()
+    case_executions = serializers.SerializerMethodField(read_only=True)
     
     class Meta:
         model = APITestSuiteExecutionDetail
@@ -710,7 +714,7 @@ class APITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
             'id', 'execution', 'test_suite', 'test_suite_name',
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',
             'pass_rate', 'environment_name', 'environment_base_url',
-            'start_time', 'end_time', 'duration', 'log', 'allure_report', 'allure_report_url'
+            'start_time', 'end_time', 'duration', 'log', 'case_executions'
         ]
         read_only_fields = ['id', 'execution']
     
@@ -720,29 +724,15 @@ class APITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
             api_config = obj.execution.environment.get_api_config()
             return api_config.get('base_url', '') if api_config else ''
         return ''
-    
-    def get_allure_report_url(self, obj):
-        """生成Allure报告访问URL - 返回静态文件URL"""
-        if obj.allure_report:
-            import os
-            if not os.path.exists(obj.allure_report):
-                return None
 
-            from django.conf import settings
-            report_dir = os.path.dirname(obj.allure_report)
-            report_filename = os.path.basename(obj.allure_report)
-
-            # 使用HTTPRUNNER_REPORTS_ROOT计算相对路径
-            relative_path = os.path.relpath(report_dir, settings.HTTPRUNNER_REPORTS_ROOT)
-            static_url = f"/httprunner-reports/{relative_path}/{report_filename}"
-
-            return static_url
-        return None
-
+    def get_case_executions(self, obj):
+        return APITestSuiteCaseExecutionSerializer(
+            obj.case_executions.all().order_by('id'), many=True,
+        ).data
 
 class APITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
     """套件用例执行明细序列化器"""
-    test_case_title = serializers.CharField(source='test_case.title', read_only=True)
+    test_case_title = serializers.CharField(source='name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     httprunner_result = serializers.SerializerMethodField()
     

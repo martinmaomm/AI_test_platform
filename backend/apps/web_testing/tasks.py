@@ -168,7 +168,6 @@ def _run_test_script(
         'stderr': result.get('stderr', ''),
         'test_file': result.get('test_file', ''),
         'return_code': result.get('return_code', 0 if result.get('success') else 1),
-        'allure_report': result.get('allure_report', ''),
         'screenshot_path': result.get('screenshot_path'),
     }
     return {
@@ -290,7 +289,6 @@ def _execute_webui_test_case_logic(
         execution.end_time = end_time
         execution.duration = duration
         execution.log_path = result_data.get('test_file') or ''
-        execution.report_path = result_data.get('allure_report') or ''
         execution.save()
 
         case_detail.status = execution.status
@@ -437,8 +435,7 @@ def debug_webui_script_generation_task(
         execution.end_time = end_time
         execution.duration = (end_time - execution.start_time).total_seconds()
         execution.log_path = result_data.get('test_file') or ''
-        execution.report_path = result_data.get('allure_report') or ''
-        execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'log_path', 'report_path', 'updated_at'])
+        execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'log_path', 'updated_at'])
         detail.status = execution.status
         detail.end_time = end_time
         detail.duration = execution.duration
@@ -765,7 +762,6 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
             execution.end_time = ended
             execution.duration = (ended - execution.start_time).total_seconds()
             execution.log_path = safe_result_data.get('test_file') or ''
-            execution.report_path = safe_result_data.get('allure_report') or ''
             execution.save()
             detail.status = execution_status
             detail.end_time = ended
@@ -993,53 +989,30 @@ def _finalize_scheduled_execution(
     skipped_cases: int,
     log: str,
 ) -> None:
-    """Update scheduled-task aggregates without changing suite execution semantics."""
+    """Refresh the shared scheduled report after one linked WebUI suite ends."""
     if not scheduled_log_id:
         return
     try:
-        from django.db.models import F, Value
-        from django.db.models.functions import Coalesce, Concat
         from notifications.services import trigger_notification
         from scheduled_tasks.models import TaskExecutionLog
+        from scheduled_tasks.reporting import mark_notification_sent, refresh_execution_log_from_links
 
-        TaskExecutionLog.objects.filter(id=scheduled_log_id).update(
-            passed_cases=F('passed_cases') + passed_cases,
-            failed_cases=F('failed_cases') + failed_cases,
-            skipped_cases=F('skipped_cases') + skipped_cases,
-        )
-        if log:
-            TaskExecutionLog.objects.filter(id=scheduled_log_id).update(
-                step_log=Concat(
-                    Coalesce(F('step_log'), Value('')),
-                    Value('\n\n'),
-                    Value(log),
-                )
-            )
         execution_log = TaskExecutionLog.objects.get(id=scheduled_log_id)
-        prior_incomplete = str(execution_log.error_message or '').startswith('验证未完成：')
-        has_incomplete = incomplete_cases > 0 or prior_incomplete
-        # The scheduled-task log has only success/failed states.  Preserve the
-        # true per-suite failed count, but never mark an incomplete validation
-        # as success or emit a passing notification.
-        execution_log.status = 'success' if execution_log.failed_cases == 0 and not has_incomplete else 'failed'
-        if has_incomplete:
-            execution_log.error_message = (
-                f'验证未完成：本次有 {incomplete_cases} 个 WebUI 用例尚未完成完整断言验证。'
-                if incomplete_cases else '验证未完成：此前已有 WebUI 用例尚未完成完整断言验证。'
-            )
-        execution_log.end_time = timezone.now()
-        execution_log.total_cases = execution_log.total_cases or total_cases
-        execution_log.save(update_fields=['status', 'error_message', 'end_time', 'total_cases'])
-        if not has_incomplete or execution_log.failed_cases > 0:
+        summary = refresh_execution_log_from_links(execution_log, append_log=log)
+        if not summary['is_running'] and execution_log.notification_sent_at is None:
             trigger_notification(
                 scheduled_task_id=execution_log.task_id,
                 execution_log=execution_log,
                 result={
-                    'total_cases': execution_log.total_cases,
-                    'passed_cases': execution_log.passed_cases,
-                    'failed_cases': execution_log.failed_cases,
+                    'total_cases': summary['total_cases'],
+                    'passed_cases': summary['passed_cases'],
+                    'failed_cases': summary['failed_cases'] + summary['error_cases'],
+                    'incomplete_cases': summary['incomplete_cases'],
+                    'skipped_cases': summary['skipped_cases'],
+                    'report_status': summary['report_status'],
                 },
             )
+            mark_notification_sent(execution_log)
     except Exception:
         logger.error('回填定时任务日志或触发通知失败', exc_info=True)
 
@@ -1070,27 +1043,49 @@ def _execute_webui_test_suite_logic(
     user_id: int | None,
     options: dict | None = None,
 ) -> Dict[str, Any]:
-    """Run suite members sequentially in isolated workspaces and continue on failure."""
+    """Run persisted suite snapshots sequentially and retain partial progress."""
     execution = None
     suite_detail = None
+    active_case = None
+    log_sections: list[str] = []
     options = dict(options or {})
     scheduled_log_id = options.pop('scheduled_log_id', None)
+
+    def persist_progress(*, log: str):
+        rows = suite_detail.case_executions.values_list('status', flat=True)
+        statuses = list(rows)
+        counts = {
+            'total_cases': len(statuses),
+            'passed_cases': statuses.count('passed'),
+            'failed_cases': sum(status in {'failed', 'error'} for status in statuses),
+            'incomplete_cases': statuses.count('incomplete'),
+            'skipped_cases': statuses.count('skipped'),
+            'unexecuted_cases': sum(status in {'pending', 'running'} for status in statuses),
+        }
+        suite_detail.total_cases = counts['total_cases']
+        suite_detail.passed_cases = counts['passed_cases']
+        suite_detail.failed_cases = counts['failed_cases']
+        suite_detail.incomplete_cases = counts['incomplete_cases']
+        suite_detail.skipped_cases = counts['skipped_cases']
+        suite_detail.log = log
+        suite_detail.save(update_fields=[
+            'total_cases', 'passed_cases', 'failed_cases', 'incomplete_cases',
+            'skipped_cases', 'log',
+        ])
+        return counts
+
     try:
-        query = WebUITestExecution.objects.select_related(
-            'suite_execution_detail__test_suite',
-        ).filter(id=execution_id, exec_type='suite')
+        query = WebUITestExecution.objects.select_related('suite_execution_detail').filter(
+            id=execution_id, exec_type='suite',
+        )
         if user_id is not None:
             query = query.filter(executor_id=user_id)
         execution = query.get()
         suite_detail = execution.suite_execution_detail
-        suite = suite_detail.test_suite
-        if suite is None:
-            raise ValueError('测试套件已删除，无法继续执行')
-        memberships = list(
-            suite.case_memberships.select_related('test_case').order_by('order', 'id')
-        )
-        if not memberships:
-            raise ValueError('测试套件中没有测试用例')
+        case_executions = list(suite_detail.case_executions.select_related('test_case').order_by('execution_order', 'id'))
+        if not case_executions:
+            raise ValueError('执行快照中没有测试用例，任务未执行')
+
         options = normalize_webui_execution_options(options)
         started_at = timezone.now()
         execution.task_id = task_instance.request.id
@@ -1098,69 +1093,55 @@ def _execute_webui_test_suite_logic(
         execution.error_message = ''
         execution.browser = WEBUI_BROWSER_ENGINE
         execution.start_time = started_at
-        execution.save()
+        execution.save(update_fields=['task_id', 'status', 'error_message', 'browser', 'start_time', 'updated_at'])
         suite_detail.start_time = started_at
-        suite_detail.total_cases = len(memberships)
-        suite_detail.passed_cases = 0
-        suite_detail.failed_cases = 0
-        suite_detail.incomplete_cases = 0
-        suite_detail.skipped_cases = 0
-        suite_detail.case_executions.all().delete()
-        suite_detail.save()
+        suite_detail.save(update_fields=['start_time'])
 
         runtime_variables = pop_runtime_variables(execution.id)
-        passed_cases = failed_cases = incomplete_cases = skipped_cases = 0
+        log_sections = [f'=== 测试套件：{execution.name} ===']
         execution_results = []
-        log_sections = [f'=== 测试套件：{suite.name} ===']
+        total_cases = len(case_executions)
 
-        for index, membership in enumerate(memberships, start=1):
-            test_case = membership.test_case
-            progress = 15 + int((index - 1) / len(memberships) * 75)
+        for index, case_execution in enumerate(case_executions, start=1):
+            if case_execution.status not in {'pending'}:
+                continue
+            active_case = case_execution
             update_task_progress(
                 task_instance,
-                progress,
-                f'正在执行第 {index}/{len(memberships)} 个用例：{test_case.title}',
+                15 + int((index - 1) / total_cases * 75),
+                f'正在执行第 {index}/{total_cases} 个用例：{case_execution.name}',
             )
             case_started_at = timezone.now()
-            case_execution = WebUITestSuiteCaseExecution.objects.create(
-                suite_execution=suite_detail,
-                test_case=test_case,
-                name=test_case.title,
-                status='running',
-            )
-            script_content = (test_case.test_script_content or '').strip()
+            case_execution.status = 'running'
+            case_execution.save(update_fields=['status'])
+            script_content = (case_execution.script_content or '').strip()
             if not script_content:
-                skipped_cases += 1
                 case_execution.status = 'skipped'
                 case_execution.error_message = '测试用例没有可执行脚本'
                 case_execution.duration = 0
-                case_execution.save()
+                case_execution.save(update_fields=['status', 'error_message', 'duration'])
+                log_sections.append(f'\n--- {index}. {case_execution.name} [SKIPPED] ---\n{case_execution.error_message}')
+                persist_progress(log='\n'.join(log_sections))
                 execution_results.append({
-                    'test_case_id': test_case.id,
-                    'test_case_title': test_case.title,
-                    'status': 'skipped',
+                    'test_case_id': case_execution.test_case_id,
+                    'test_case_title': case_execution.name,
+                    'status': case_execution.status,
                     'error_message': case_execution.error_message,
                 })
-                log_sections.append(
-                    f'\n--- {index}. {test_case.title} [SKIPPED] ---\n{case_execution.error_message}'
-                )
+                active_case = None
                 continue
 
-            screenshot_absolute, screenshot_relative = _failure_screenshot_paths(
-                execution.id,
-                f'suite_case_{index}_{test_case.id}.png',
-            )
             try:
-                variables = merge_execution_variables(
-                    test_case.variables,
-                    suite.variables,
-                    runtime_variables,
+                screenshot_absolute, screenshot_relative = _failure_screenshot_paths(
+                    execution.id, f'suite_case_{index}_{case_execution.id}.png',
                 )
                 result = _run_test_script(
                     script_content,
                     options,
                     failure_screenshot_path=screenshot_absolute,
-                    environment_variables=variables,
+                    environment_variables=merge_execution_variables(
+                        case_execution.variables, suite_detail.suite_variables, runtime_variables,
+                    ),
                 )
                 result_data = result.get('result') or {}
                 operation_success = bool(result.get('operation_success', result.get('success')))
@@ -1170,18 +1151,15 @@ def _execute_webui_test_suite_logic(
                     runtime_assertion_count=result.get('runtime_assertion_count'),
                 )
                 error_message = '' if operation_success else friendly_failure_summary(
-                    result_data.get('stdout', ''),
-                    result_data.get('stderr', ''),
-                    result.get('error', ''),
+                    result_data.get('stdout', ''), result_data.get('stderr', ''), result.get('error', ''),
                 )
                 if case_status == 'incomplete':
                     error_message = _incomplete_message(assertion_state, runtime_assertion_count)
             except Exception as exc:
-                logger.error('套件用例执行异常: case_id=%s', test_case.id, exc_info=True)
-                result = {'success': False, 'error': str(exc)}
+                logger.error('套件用例执行异常: case_execution_id=%s', case_execution.id, exc_info=True)
                 result_data = {}
                 operation_success = False
-                case_status = 'failed'
+                case_status = 'error'
                 assertion_state = {}
                 runtime_assertion_count = 0
                 error_message = f'执行准备失败: {exc}'
@@ -1193,28 +1171,26 @@ def _execute_webui_test_suite_logic(
             case_execution.log = _raw_execution_log(result_data)
             case_execution.stdout = result_data.get('stdout', '')
             persisted = _normalize_persisted_screenshot_path(
-                execution.id,
-                result_data.get('screenshot_path') or screenshot_relative,
+                execution.id, result_data.get('screenshot_path') or screenshot_relative,
             )
             if persisted and os.path.exists(os.path.join(str(settings.MEDIA_ROOT), persisted)):
                 case_execution.screenshot_path = persisted
             case_execution.save()
-
-            if case_status == 'passed':
-                passed_cases += 1
-            elif case_status == 'incomplete':
-                incomplete_cases += 1
-            else:
-                failed_cases += 1
-            test_case.last_execute_status = case_execution.status
-            test_case.last_execute_time = case_ended_at
-            test_case.last_error_message = error_message[:500]
-            test_case.save(
-                update_fields=['last_execute_status', 'last_execute_time', 'last_error_message']
+            if case_execution.test_case_id:
+                case_execution.test_case.last_execute_status = case_execution.status
+                case_execution.test_case.last_execute_time = case_ended_at
+                case_execution.test_case.last_error_message = error_message[:500]
+                case_execution.test_case.save(update_fields=[
+                    'last_execute_status', 'last_execute_time', 'last_error_message',
+                ])
+            log_sections.append(
+                f'\n--- {index}. {case_execution.name} [{case_execution.status.upper()}] ---\n'
+                f'{case_execution.log or error_message or "执行完成"}'
             )
+            persist_progress(log='\n'.join(log_sections))
             execution_results.append({
-                'test_case_id': test_case.id,
-                'test_case_title': test_case.title,
+                'test_case_id': case_execution.test_case_id,
+                'test_case_title': case_execution.name,
                 'status': case_execution.status,
                 'operation_success': operation_success,
                 'assertion_state': assertion_state,
@@ -1222,93 +1198,85 @@ def _execute_webui_test_suite_logic(
                 'error_message': error_message,
                 'result': result_data,
             })
-            log_sections.append(
-                f'\n--- {index}. {test_case.title} [{case_execution.status.upper()}] ---\n'
-                f'{case_execution.log or error_message or "执行完成"}'
-            )
+            active_case = None
 
+        counts = persist_progress(log='\n'.join(log_sections))
         ended_at = timezone.now()
-        duration = (ended_at - started_at).total_seconds()
-        all_skipped = passed_cases == 0 and failed_cases == 0 and incomplete_cases == 0
-        operation_success = failed_cases == 0 and not all_skipped
-        execution_status = (
-            'failed' if failed_cases else
-            'incomplete' if incomplete_cases else
-            'passed' if operation_success else
-            'failed'
-        )
+        all_skipped = counts['passed_cases'] == counts['failed_cases'] == counts['incomplete_cases'] == 0
+        if counts['failed_cases']:
+            execution_status = 'failed'
+            error_message = f"测试套件中有 {counts['failed_cases']} 个用例失败"
+        elif counts['incomplete_cases']:
+            execution_status = 'incomplete'
+            error_message = f"测试套件中有 {counts['incomplete_cases']} 个用例尚未完成验证"
+        elif counts['unexecuted_cases']:
+            execution_status = 'failed'
+            error_message = f"测试套件有 {counts['unexecuted_cases']} 个用例未执行"
+        elif all_skipped:
+            execution_status = 'failed'
+            error_message = '测试套件没有可执行脚本'
+        else:
+            execution_status = 'passed'
+            error_message = ''
+        operation_success = execution_status in {'passed', 'incomplete'}
         summary = (
-            f'测试套件执行完成：通过 {passed_cases}，验证未完成 {incomplete_cases}，失败 {failed_cases}，跳过 {skipped_cases}'
+            f"测试套件执行完成：通过 {counts['passed_cases']}，验证未完成 {counts['incomplete_cases']}，"
+            f"失败 {counts['failed_cases']}，跳过 {counts['skipped_cases']}"
         )
-        error_message = (
-            '' if execution_status == 'passed' else
-            '测试套件没有可执行脚本' if all_skipped else
-            f'测试套件中有 {failed_cases} 个用例失败' if failed_cases else
-            f'测试套件中有 {incomplete_cases} 个用例尚未完成验证'
-        )
-        full_log = '\n'.join(log_sections)
-
-        suite_detail.passed_cases = passed_cases
-        suite_detail.failed_cases = failed_cases
-        suite_detail.incomplete_cases = incomplete_cases
-        suite_detail.skipped_cases = skipped_cases
         suite_detail.end_time = ended_at
-        suite_detail.duration = duration
-        suite_detail.log = full_log
-        suite_detail.save()
+        suite_detail.duration = (ended_at - started_at).total_seconds()
+        suite_detail.save(update_fields=['end_time', 'duration'])
         execution.status = execution_status
         execution.error_message = error_message
         execution.end_time = ended_at
-        execution.duration = duration
-        execution.save()
+        execution.duration = suite_detail.duration
+        execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'updated_at'])
 
         _finalize_scheduled_execution(
             scheduled_log_id,
-            total_cases=len(memberships),
-            passed_cases=passed_cases,
-            failed_cases=failed_cases,
-            incomplete_cases=incomplete_cases,
-            skipped_cases=skipped_cases,
-            log=full_log,
+            total_cases=counts['total_cases'], passed_cases=counts['passed_cases'],
+            failed_cases=counts['failed_cases'], incomplete_cases=counts['incomplete_cases'],
+            skipped_cases=counts['skipped_cases'], log=suite_detail.log or '',
         )
         update_task_progress(task_instance, 100, summary)
         return {
-            'success': operation_success,
-            'operation_success': operation_success,
-            'evaluation_status': execution_status,
-            'status': 'completed',
-            'message': summary,
-            'execution_id': execution.id,
-            'total_cases': len(memberships),
-            'passed_cases': passed_cases,
-            'failed_cases': failed_cases,
-            'incomplete_cases': incomplete_cases,
-            'skipped_cases': skipped_cases,
-            'pass_rate': execution.pass_rate,
-            'execution_results': execution_results,
-            'error': error_message,
+            'success': operation_success, 'operation_success': operation_success,
+            'evaluation_status': execution_status, 'status': 'completed', 'message': summary,
+            'execution_id': execution.id, **{key: value for key, value in counts.items() if key != 'unexecuted_cases'},
+            'pass_rate': execution.pass_rate, 'execution_results': execution_results, 'error': error_message,
         }
     except WebUITestExecution.DoesNotExist:
         return build_error_result(None, f'测试套件执行记录不存在: {execution_id}')
     except Exception as exc:
         error_message = f'测试套件执行任务异常: {exc}'
         logger.error(error_message, exc_info=True)
+        ended_at = timezone.now()
+        if active_case is not None and active_case.status == 'running':
+            active_case.status = 'error'
+            active_case.error_message = error_message
+            active_case.duration = max(0.0, (ended_at - (execution.start_time or ended_at)).total_seconds())
+            active_case.log = error_message
+            active_case.save(update_fields=['status', 'error_message', 'duration', 'log'])
+        counts = None
+        if suite_detail is not None:
+            log_sections.append(error_message)
+            counts = persist_progress(log='\n'.join(log_sections))
+            suite_detail.end_time = ended_at
+            suite_detail.duration = max(0.0, (ended_at - (execution.start_time or ended_at)).total_seconds()) if execution else 0.0
+            suite_detail.save(update_fields=['end_time', 'duration'])
         if execution is not None:
             execution.status = 'failed'
             execution.error_message = error_message
-            execution.end_time = timezone.now()
-            execution.save(update_fields=['status', 'error_message', 'end_time', 'updated_at'])
-        if suite_detail is not None:
-            suite_detail.end_time = timezone.now()
-            suite_detail.log = error_message
-            suite_detail.save(update_fields=['end_time', 'log'])
+            execution.end_time = ended_at
+            execution.duration = suite_detail.duration if suite_detail is not None else 0.0
+            execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'updated_at'])
         _finalize_scheduled_execution(
             scheduled_log_id,
-            total_cases=suite_detail.total_cases if suite_detail else 0,
-            passed_cases=0,
-            failed_cases=1,
-            incomplete_cases=0,
-            skipped_cases=0,
-            log=error_message,
+            total_cases=(counts or {}).get('total_cases', 0),
+            passed_cases=(counts or {}).get('passed_cases', 0),
+            failed_cases=(counts or {}).get('failed_cases', 0),
+            incomplete_cases=(counts or {}).get('incomplete_cases', 0),
+            skipped_cases=(counts or {}).get('skipped_cases', 0),
+            log='\n'.join(log_sections) or error_message,
         )
         return build_error_result(task_instance.request.id, error_message)

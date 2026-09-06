@@ -6,13 +6,6 @@ import uuid
 from datetime import datetime
 from typing import List, Dict, Text
 
-try:
-    import allure
-
-    USE_ALLURE = True
-except ModuleNotFoundError:
-    USE_ALLURE = False
-
 from loguru import logger
 
 from httprunner import utils, exceptions
@@ -389,7 +382,7 @@ class HttpRunner(object):
         self.__start_at = time.time()
         self.__step_datas: List[StepData] = []
         self.__session = self.__session or HttpSession()
-        self.__last_failure = None  # 用于 run 结束后重抛，确保 Pytest/Allure 能收到失败状态
+        self.__last_failure = None  # 用于 run 结束后重抛，确保测试框架收到失败状态
         # save extracted variables of teststeps
         extracted_variables: VariablesMapping = {}
 
@@ -409,11 +402,7 @@ class HttpRunner(object):
 
                 # run step - 捕获异常以允许后续step继续执行
                 try:
-                    if USE_ALLURE:
-                        with allure.step(f"step: {step.name}"):
-                            extract_mapping = self.__run_step(step)
-                    else:
-                        extract_mapping = self.__run_step(step)
+                    extract_mapping = self.__run_step(step)
 
                     # save extracted variables to session variables（只有成功时才更新）
                     extracted_variables.update(extract_mapping)
@@ -439,7 +428,7 @@ class HttpRunner(object):
                     continue
 
             self.__session_variables.update(extracted_variables)
-            # 强制断言同步：若有步骤失败，必须重抛以便 Pytest/Allure 记录为 failed，避免假 Pass
+            # 强制断言同步：若有步骤失败，必须重抛以避免场景误报通过。
             if not self.success and self.__last_failure is not None:
                 raise self.__last_failure
         finally:
@@ -527,11 +516,6 @@ class HttpRunner(object):
         self.__config.name = parse_data(
             self.__config.name, config_variables, self.__project_meta.functions
         )
-
-        if USE_ALLURE:
-            # update allure report meta
-            allure.dynamic.title(self.__config.name)
-            allure.dynamic.description(f"TestCase ID: {self.__case_id}")
 
         logger.info(
             f"Start to run testcase: {self.__config.name}, TestCase ID: {self.__case_id}"

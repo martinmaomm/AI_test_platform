@@ -19,6 +19,8 @@ from .playwright_python_runner import (
 class PlaywrightRunnerContractTests(unittest.TestCase):
     def test_public_runner_contracts_and_execution_config_have_no_base_url(self):
         self.assertNotIn('base_url', ExecutionConfig.__dataclass_fields__)
+        self.assertNotIn('generate_allure', ExecutionConfig.__dataclass_fields__)
+        self.assertNotIn('suite_name', ExecutionConfig.__dataclass_fields__)
         self.assertNotIn('base_url', inspect.signature(playwright_runner).parameters)
         self.assertNotIn('base_url', inspect.signature(playwright_suite_runner).parameters)
 
@@ -39,6 +41,7 @@ class PlaywrightRunnerContractTests(unittest.TestCase):
             self.assertNotIn('PLAYWRIGHT_BASE_URL', child_env)
             self.assertEqual(json.loads(child_env['WEBUI_RUNTIME_VARIABLES']), {'UI_TEST_USERNAME': 'tester'})
             self.assertEqual(run.call_args.args[0][0], sys.executable)
+            self.assertNotIn('--alluredir', run.call_args.args[0])
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -62,6 +65,7 @@ class PlaywrightRunnerContractTests(unittest.TestCase):
                 self.assertIn('context = await browser.new_context()', content)
                 self.assertNotIn('base_url', content)
                 self.assertNotIn('PLAYWRIGHT_BASE_URL', content)
+                self.assertNotIn('allure', content.lower())
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 

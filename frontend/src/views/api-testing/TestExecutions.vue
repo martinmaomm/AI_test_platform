@@ -177,12 +177,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="120" fixed="right" align="center">
+        <el-table-column label="操作" width="250" fixed="right" align="center">
           <template #default="{ row }">
             <div class="action-buttons">
               <el-button size="small" @click.stop="viewDetails(row)" class="view-btn">
                 查看详情
               </el-button>
+              <el-button size="small" type="primary" link @click.stop="viewReport(row)">查看完整报告</el-button>
+              <el-button size="small" link @click.stop="copyReportLink(row)">复制链接</el-button>
             </div>
           </template>
         </el-table-column>
@@ -234,6 +236,7 @@ import APITestSuiteExecutionDetai from '@/components/APITestSuiteExecutionDetai.
 import APITestCaseExecutionDetail from '@/components/APITestCaseExecutionDetail.vue'
 import dayjs from 'dayjs'
 import { useProjectStore } from '@/stores/project'
+import { copyText, reportPath, reportUrl } from '@/utils/reportLinks'
 
 const loading = ref(false)
 const currentPage = ref(1)
@@ -464,7 +467,6 @@ const loadTestRuns = async () => {
           execution_duration: item.execution_duration,
           pass_rate: item.pass_rate,
           log_path: item.log_path,
-          report_path: item.report_path,
           created_at: item.created_at,
           updated_at: item.updated_at
         }
@@ -515,26 +517,30 @@ const viewDetails = async (row) => {
       return
     }
     
-    // API调用成功，处理统一响应格式
-    console.log('API响应数据:', response)
-    
-    // 检查是否是统一响应格式 { success: true, data: {...} }
-    const responseData = (response && response.success && response.data) ? response.data : response
-    
-    // 确保正确合并数据
+    if (!response?.success || !response.data || typeof response.data !== 'object' || Array.isArray(response.data)) {
+      ElMessage.error(response?.message || '获取执行详情失败')
+      return
+    }
+
     selectedRun.value = {
       ...row,  // 先使用原始行数据
-      ...responseData  // 然后用API响应数据覆盖
+      ...response.data  // 然后用API响应数据覆盖
     }
-    
-    console.log('合并后的selectedRun:', selectedRun.value)
 
     detailDialogVisible.value = true
   } catch (error) {
     console.error('获取执行详情失败:', error)
     ElMessage.error('获取执行详情失败')
-    selectedRun.value = row
-    detailDialogVisible.value = true
+  }
+}
+
+const viewReport = (row) => router.push(reportPath('api', projectStore.currentProjectId, row.id))
+const copyReportLink = async (row) => {
+  try {
+    await copyText(reportUrl('api', projectStore.currentProjectId, row.id))
+    ElMessage.success('报告链接已复制')
+  } catch {
+    ElMessage.error('复制失败，请从地址栏手动复制链接')
   }
 }
 

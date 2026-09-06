@@ -121,6 +121,9 @@ export const getWebUITestSuiteStatistics = async (projectId) =>
 export const getTestExecutions = async (projectId, params = {}) =>
   (await api.get(`${base(projectId)}/executions/`, { params })).data
 
+export const getWebUITestExecutionReport = async (projectId, executionId) =>
+  (await api.get(`${base(projectId)}/executions/${executionId}/report/`)).data
+
 export const getTestExecutionCases = async (projectId, executionId) =>
   (await api.get(`${base(projectId)}/executions/${executionId}/cases/`)).data
 

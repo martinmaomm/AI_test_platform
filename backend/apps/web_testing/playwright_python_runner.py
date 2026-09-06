@@ -26,10 +26,6 @@ from .execution_diagnostics import diagnose_failure
 
 logger = logging.getLogger(__name__)
 
-# 常量定义
-ALLURE_VERSION = "2.23.0"
-ALLURE_TIMEOUT = 60
-ALLURE_CHECK_TIMEOUT = 10
 PYTEST_TIMEOUT_BUFFER = 30
 
 
@@ -39,8 +35,6 @@ class ExecutionConfig:
     browser: str = field(default=WEBUI_BROWSER_ENGINE, init=False)
     headed: bool = WEBUI_DEFAULT_HEADED
     timeout: int = WEBUI_DEFAULT_TIMEOUT
-    generate_allure: bool = False
-    suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
     failure_screenshot_path: Optional[str] = None
     failure_screenshot_dir: Optional[str] = None
     runtime_assertion_count_path: Optional[str] = None
@@ -55,7 +49,6 @@ class ExecutionResult:
     stdout: str
     stderr: str
     work_dir: str
-    allure_report: Optional[str]
     config: ExecutionConfig
     test_summary: Optional[Dict[str, Any]] = None
     case_results: Optional[List[Dict[str, Any]]] = None
@@ -79,10 +72,8 @@ class PlaywrightRunner:
             self._create_test_file(work_dir, script_content, config)
             self._create_pytest_config(work_dir)
             result = self._run_pytest_command(work_dir, config)
-            allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
-            execution_result = self._build_execution_result(result, work_dir, allure_report_path, config)
-            # 清理工作目录（保留报告）
-            self._cleanup_work_dir(work_dir, execution_result.allure_report)
+            execution_result = self._build_execution_result(result, work_dir, config)
+            self._cleanup_work_dir(work_dir)
             return execution_result
         except subprocess.TimeoutExpired:
             logger.error(f"测试执行超时: {script_id}")
@@ -96,7 +87,7 @@ class PlaywrightRunner:
         work_dir = self._create_work_dir(f"playwright_suite_{suite_id}_")
         try:
             test_files, skipped_results = self._create_suite_test_files(
-                work_dir, test_cases_data, config.suite_name, config
+                work_dir, test_cases_data, config
             )
 
             # 统计临时目录下生成的 .py 文件数量，若为 0 则直接返回错误，避免盲目启动 Pytest
@@ -117,15 +108,13 @@ class PlaywrightRunner:
 
             self._create_pytest_config(work_dir)
             result = self._run_pytest_command(work_dir, config)
-            allure_report_path = self._generate_report(work_dir, config) if config.generate_allure else None
             parsed_case_results = self._parse_suite_test_results(result.stdout, test_cases_data, config)
             
             # 合并跳过的用例结果
             all_case_results = skipped_results + parsed_case_results
             
-            execution_result = self._build_execution_result(result, work_dir, allure_report_path, config, all_case_results)
-            # 清理工作目录（保留报告）
-            self._cleanup_work_dir(work_dir, execution_result.allure_report)
+            execution_result = self._build_execution_result(result, work_dir, config, all_case_results)
+            self._cleanup_work_dir(work_dir)
             return execution_result
         except subprocess.TimeoutExpired:
             logger.error(f"测试套件执行超时: {suite_id}")
@@ -158,7 +147,6 @@ class PlaywrightRunner:
         self,
         work_dir: str,
         test_cases_data: List[Dict[str, Any]],
-        suite_name: Optional[str] = None,
         config: Optional[ExecutionConfig] = None,
     ) -> tuple:
         """创建套件测试文件，并输出详细日志便于排查"""
@@ -192,7 +180,6 @@ class PlaywrightRunner:
                         script_content,
                         f"test_case_{test_case_id}",
                         headed=config.headed,
-                        suite_name=suite_name,
                         failure_screenshot_path=(
                             os.path.join(config.failure_screenshot_dir, f'case_{test_case_id}.png')
                             if config.failure_screenshot_dir else None
@@ -218,65 +205,6 @@ class PlaywrightRunner:
 
         logger.info(f"[脚本生成] 完成: 成功 {len(test_files)} 个, 跳过 {len(skipped_results)} 个")
         return test_files, skipped_results
-    
-    def _add_allure_suite_decorator(self, script_content: str, suite_name: str) -> str:
-        """为测试脚本添加allure.suite装饰器"""
-        import re
-        
-        # 检查是否已经导入了allure
-        has_allure_import = 'import allure' in script_content or 'from allure' in script_content
-        
-        # 检查是否已经有suite装饰器
-        has_suite_decorator = '@allure.suite' in script_content
-        
-        if has_suite_decorator:
-            # 如果已有suite装饰器，替换它
-            script_content = re.sub(
-                r'@allure\.suite\(["\'][^"\']*["\']\)',
-                f'@allure.suite("{suite_name}")',
-                script_content
-            )
-        else:
-            # 查找所有测试函数定义（def test_xxx）
-            lines = script_content.split('\n')
-            new_lines = []
-            i = 0
-            
-            while i < len(lines):
-                line = lines[i]
-                # 检查是否是测试函数定义
-                if re.match(r'^\s*def\s+test_\w+', line):
-                    # 获取函数定义的缩进
-                    indent_match = re.match(r'^(\s*)', line)
-                    indent = indent_match.group(1) if indent_match else ''
-                    
-                    # 检查上一行是否已经有装饰器
-                    if i > 0 and lines[i-1].strip().startswith('@'):
-                        # 在最后一个装饰器后添加suite装饰器
-                        new_lines.append(f'{indent}@allure.suite("{suite_name}")')
-                    else:
-                        # 在函数定义前添加suite装饰器
-                        new_lines.append(f'{indent}@allure.suite("{suite_name}")')
-                
-                new_lines.append(line)
-                i += 1
-            
-            script_content = '\n'.join(new_lines)
-        
-        # 如果没有导入allure，添加导入语句
-        if not has_allure_import:
-            # 查找第一个import或from语句的位置
-            import_pattern = r'^(import\s+|from\s+)'
-            match = re.search(import_pattern, script_content, re.MULTILINE)
-            if match:
-                # 在第一个import之前添加allure导入
-                insert_pos = match.start()
-                script_content = script_content[:insert_pos] + 'import allure\n' + script_content[insert_pos:]
-            else:
-                # 如果没有import语句，在文件开头添加
-                script_content = 'import allure\n' + script_content
-        
-        return script_content
     
     def _create_pytest_config(self, work_dir: str) -> None:
         """创建pytest配置文件"""
@@ -328,11 +256,6 @@ python_functions = test_*
         # interleave progress messages with the per-case status lines.
         cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short", "-rA"]
         
-        if config.generate_allure:
-            allure_results_dir = os.path.join(work_dir, "allure-results")
-            os.makedirs(allure_results_dir, exist_ok=True)
-            cmd.extend(["--alluredir", allure_results_dir])
-        
         env = os.environ.copy()
         env.pop('PLAYWRIGHT_BASE_URL', None)
         env.update({
@@ -378,80 +301,8 @@ python_functions = test_*
         
         return result
 
-    def _get_allure_path(self) -> Optional[str]:
-        """获取Allure可执行文件路径"""
-        if os.name == 'nt':  # Windows
-            allure_path = os.path.join(self.project_root, "allure-2.23.0", "bin", "allure.bat")
-        else:  # Linux/Unix
-            allure_path = os.path.join(self.project_root, "allure-2.23.0", "bin", "allure")
-            if os.path.exists(allure_path):
-                os.chmod(allure_path, 0o755)
-        
-        return allure_path if os.path.exists(allure_path) else None
-
-    def _generate_report(self, work_dir: str, config: ExecutionConfig) -> Optional[str]:
-        """生成Allure报告"""
-        allure_results_dir = os.path.join(work_dir, "allure-results")
-        allure_report_dir = os.path.join(work_dir, "allure-report")
-        
-        if not os.path.exists(allure_results_dir) or not os.listdir(allure_results_dir):
-            return None
-        
-        allure_path = self._get_allure_path()
-        if not allure_path:
-            logger.warning("Allure命令行工具未找到")
-            return None
-        
-        try:
-            # 检查Allure命令是否可用
-            check_result = subprocess.run(
-                [allure_path, "--version"],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                timeout=ALLURE_CHECK_TIMEOUT
-            )
-            
-            if check_result.returncode != 0:
-                logger.warning("Allure命令不可用")
-                return None
-            
-            # 生成Allure报告
-            allure_cmd = [allure_path, "generate", allure_results_dir, "-o", allure_report_dir, "--clean"]
-            result = subprocess.run(
-                allure_cmd,
-                cwd=work_dir,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                timeout=ALLURE_TIMEOUT
-            )
-            
-            if result.returncode == 0:
-                return os.path.join(allure_report_dir, "index.html")
-            else:
-                logger.warning(f"Allure报告生成失败: {result.stderr}")
-                return None
-        except subprocess.TimeoutExpired:
-            logger.warning("Allure命令执行超时")
-            return None
-        except Exception as e:
-            logger.warning(f"生成Allure报告时发生错误: {e}")
-            return None
-
-    def _normalize_allure_report_path(self, allure_report_path: Optional[str]) -> Optional[str]:
-        """规范化Allure报告路径"""
-        if not allure_report_path:
-            return None
-        
-        if os.path.exists(allure_report_path):
-            return allure_report_path
-        
-        # 即使文件不存在，也返回路径（可能文件稍后才生成）
-        return allure_report_path
-
     def _build_execution_result(self, result: subprocess.CompletedProcess, work_dir: str,
-                               allure_report_path: Optional[str], config: ExecutionConfig,
+                               config: ExecutionConfig,
                                case_results: Optional[List[Dict[str, Any]]] = None) -> ExecutionResult:
         """构建执行结果"""
         test_summary = self._extract_test_summary(result.stdout) if result.stdout else None
@@ -463,7 +314,6 @@ python_functions = test_*
             stdout=result.stdout,
             stderr=result.stderr,
             work_dir=work_dir,
-            allure_report=self._normalize_allure_report_path(allure_report_path),
             config=config,
             test_summary=test_summary,
             case_results=case_results,
@@ -478,15 +328,13 @@ python_functions = test_*
             stdout='',
             stderr=error_msg,
             work_dir=work_dir,
-            allure_report=None,
             config=config
         )
     
-    def _cleanup_work_dir(self, work_dir: str, allure_report_path: Optional[str]) -> None:
+    def _cleanup_work_dir(self, work_dir: str) -> None:
         """清理工作目录"""
         try:
-            if not (allure_report_path and os.path.exists(allure_report_path)):
-                shutil.rmtree(work_dir)
+            shutil.rmtree(work_dir)
         except Exception as e:
             logger.warning(f"清理临时目录失败: {e}")
 
@@ -703,7 +551,6 @@ def playwright_runner(
     config = ExecutionConfig(
         headed=normalized_options['headed'],
         timeout=normalized_options['timeout'],
-        generate_allure=True,
         failure_screenshot_path=failure_screenshot_path,
         environment_variables=environment_variables or {},
     )
@@ -730,7 +577,6 @@ def playwright_runner(
         'stderr': result.stderr,
         'test_file': result.work_dir,
         'work_dir': result.work_dir,
-        'allure_report': result.allure_report,
         'browser': result.config.browser,
         'headed': result.config.headed,
         'timeout': result.config.timeout,
@@ -745,13 +591,11 @@ def playwright_runner(
 
 
 def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]], options: Dict[str, Any] = None, environment_variables: Dict[str, str] | None = None) -> Dict[str, Any]:
-    """使用pytest批量执行多个Playwright Python测试脚本并生成Allure报告"""
+    """使用 pytest 批量执行多个 Playwright Python 测试脚本。"""
     normalized_options = normalize_webui_execution_options(options)
     config = ExecutionConfig(
         headed=normalized_options['headed'],
         timeout=normalized_options['timeout'],
-        generate_allure=True,
-        suite_name=options.get('suite_name') if options else None,
         failure_screenshot_dir=(options or {}).get('failure_screenshot_dir'),
         environment_variables=environment_variables or {},
     )
@@ -772,7 +616,6 @@ def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]]
         'error': error_msg,
         'return_code': result.return_code,
         'test_files': [result.work_dir],
-        'allure_report': result.allure_report,
         'case_results': result.case_results,
         'execution_info': {
             'browser': result.config.browser,

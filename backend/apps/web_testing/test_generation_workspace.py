@@ -167,7 +167,7 @@ async def run(page):
         WebUITestCaseExecutionDetail.objects.create(execution=execution, test_case=None, status='pending')
         _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=execution.id)
         attach_debug_task(generation.id, execution_id=execution.id, locked_revision=0, locked_hash=digest, task_id='worker-once')
-        result = {'success': True, 'runtime_assertion_count': 1, 'result': {'runtime_assertion_count': 1, 'stdout': '', 'stderr': '', 'test_file': '', 'allure_report': '', 'screenshot_path': None}}
+        result = {'success': True, 'runtime_assertion_count': 1, 'result': {'runtime_assertion_count': 1, 'stdout': '', 'stderr': '', 'test_file': '', 'screenshot_path': None}}
         with patch('web_testing.tasks._run_test_script', return_value=result) as runner:
             debug_webui_script_generation_task.apply(args=(str(generation.id), execution.id, 0, digest), task_id='worker-once')
             debug_webui_script_generation_task.apply(args=(str(generation.id), execution.id, 0, digest), task_id='worker-once')

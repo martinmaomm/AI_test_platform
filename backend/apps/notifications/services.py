@@ -36,12 +36,13 @@ def trigger_notification(
             logger.warning("任务不存在，跳过通知: task_id=%s", scheduled_task_id)
             return
 
+        report_summary = None
+        if getattr(execution_log, 'linked_executions', None):
+            from scheduled_tasks.reporting import summarize_linked_executions
+            report_summary = summarize_linked_executions(execution_log)
         trigger = getattr(task, 'trigger_condition', None) or 'always'
         if trigger == 'fail':
-            passed = int(getattr(execution_log, 'passed_cases', 0) or (result or {}).get('passed_cases', 0))
-            total = int(getattr(execution_log, 'total_cases', 0) or (result or {}).get('total_cases', 0))
-            failed = int(getattr(execution_log, 'failed_cases', 0) or (result or {}).get('failed_cases', 0))
-            if total and failed == 0 and passed == total:
+            if report_summary and report_summary['report_status'] == 'passed':
                 logger.info('任务配置为仅失败时通知，本次执行通过，跳过推送: task_id=%s', scheduled_task_id)
                 return
 
@@ -50,15 +51,22 @@ def trigger_notification(
             logger.info('任务未配置通知对象或均为禁用: task_id=%s', scheduled_task_id)
             return
 
-        total = int(getattr(execution_log, 'total_cases', 0) or (result or {}).get('total_cases', 0))
-        passed = int(getattr(execution_log, 'passed_cases', 0) or (result or {}).get('passed_cases', 0))
-        failed = int(getattr(execution_log, 'failed_cases', 0) or (result or {}).get('failed_cases', 0))
-        skipped = int(getattr(execution_log, 'skipped_cases', 0) or (result or {}).get('skipped_cases', 0))
+        total = int((report_summary or {}).get('total_cases', getattr(execution_log, 'total_cases', 0) or (result or {}).get('total_cases', 0)))
+        passed = int((report_summary or {}).get('passed_cases', getattr(execution_log, 'passed_cases', 0) or (result or {}).get('passed_cases', 0)))
+        failed = int((report_summary or {}).get('failed_cases', getattr(execution_log, 'failed_cases', 0) or (result or {}).get('failed_cases', 0)))
+        skipped = int((report_summary or {}).get('skipped_cases', getattr(execution_log, 'skipped_cases', 0) or (result or {}).get('skipped_cases', 0)))
         start_time = getattr(execution_log, 'start_time', None)
         task_name = getattr(task, 'name', None) or f'任务#{scheduled_task_id}'
         start_str = start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time and hasattr(start_time, 'strftime') else (str(start_time) if start_time else '-')
-        success_rate = round((float(passed) / total * 100), 2) if total else 100.0
-        conclusion_text = '测试通过' if failed == 0 else '测试未通过'
+        success_rate = float((report_summary or {}).get('success_rate', round((float(passed) / total * 100), 2) if total else 0.0))
+        conclusion_text = {
+            'passed': '测试通过',
+            'failed': '测试未通过',
+            'error': '执行错误',
+            'incomplete': '验证未完成',
+            'skipped': '未执行或已跳过',
+            'running': '执行中',
+        }.get((report_summary or {}).get('report_status'), '测试通过' if failed == 0 and total else '未完成')
 
         markdown_lines = [
             '## 定时任务执行结果',
@@ -92,6 +100,7 @@ def trigger_notification(
                         start_str=start_str,
                         report_url=report_url,
                         execution_id=execution_id,
+                        conclusion=conclusion_text,
                     )
                 except Exception as e:
                     logger.warning('单渠道发送异常（继续其他渠道）: channel=%s, error=%s', receiver.name, e, exc_info=True)
@@ -163,6 +172,7 @@ def _send_email_to_channel(
     start_str: str,
     report_url: str,
     execution_id,
+    conclusion: str,
 ) -> None:
     """向邮件渠道发送 HTML 报告摘要；从 EmailConfig 动态读取 SMTP 配置。"""
     from django.core.mail import get_connection, EmailMultiAlternatives
@@ -193,7 +203,6 @@ def _send_email_to_channel(
     )
 
     subject = f'【AITS 自动化测试报告】任务: {task_name} 执行完毕 (成功率 {success_rate}%)'
-    conclusion = '测试通过' if failed == 0 else '测试未通过'
     html_body = f'''
 <!DOCTYPE html>
 <html>
@@ -212,7 +221,7 @@ def _send_email_to_channel(
     <div class="row"><span class="label">成功率：</span>{success_rate}%</div>
     <div class="row"><span class="label">测试结论：</span>{conclusion}</div>
     <div class="row"><span class="label">开始时间：</span>{start_str}</div>
-    <p style="margin-top: 16px;">请点击以下链接登录系统查看包含 Allure 饼图的详细报告：</p>
+    <p style="margin-top: 16px;">请点击以下链接登录系统查看详细报告：</p>
     <p><a class="link" href="{report_url}">{report_url}</a></p>
   </div>
 </body>

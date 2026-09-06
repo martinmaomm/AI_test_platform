@@ -7,7 +7,6 @@ import os
 import tempfile
 import subprocess
 import logging
-import shutil
 import uuid
 import io
 import sys
@@ -25,25 +24,13 @@ from loguru import logger as loguru_logger
 
 logger = logging.getLogger(__name__)
 
-# 常量定义
-ALLURE_TIMEOUT = 90
-ALLURE_CHECK_TIMEOUT = 15
-
-# 用户本地 Allure CLI 绝对路径（优先使用，确保报告生成正常）
-ALLURE_COMMAND: str = r"D:\dev\allure-2.37.0\bin\allure.bat"
-
-
 @dataclass
 class ExecutionConfig:
     """执行配置类"""
     timeout: int = 30
-    generate_allure: bool = False
     base_url: Optional[str] = None
     headers: Optional[Dict[str, Any]] = None
     variables: Optional[Dict[str, Any]] = None
-    suite_name: Optional[str] = None  # 测试套件名称，用于Allure报告
-    external_allure_results_dir: Optional[str] = None  # 外部 allure-results 目录（多用例汇总用）
-    workspace_dir: Optional[str] = None  # 外部工作目录（隔离多任务，防止竞态）
 
 
 @dataclass
@@ -54,7 +41,6 @@ class ExecutionResult:
     stdout: str
     stderr: str
     work_dir: str
-    allure_report: Optional[str]
     config: ExecutionConfig
     test_summary: Optional[Dict[str, Any]] = None
     case_results: Optional[List[Dict[str, Any]]] = None
@@ -623,11 +609,7 @@ class HttpRunnerSuiteRunner:
     def run_suite_test(self, suite_id: str, test_cases_data: List[Dict[str, Any]], 
                       config: ExecutionConfig) -> ExecutionResult:
         """执行测试套件"""
-        if getattr(config, 'workspace_dir', None):
-            work_dir = config.workspace_dir
-            os.makedirs(work_dir, exist_ok=True)
-        else:
-            work_dir = _create_work_dir(f"httprunner_suite_{suite_id}_")
+        work_dir = _create_work_dir(f"httprunner_suite_{suite_id}_")
         
         try:
             test_files, skipped_results = self._create_suite_test_files(work_dir, test_cases_data, config)
@@ -647,11 +629,6 @@ class HttpRunnerSuiteRunner:
                       skipped_results: Optional[List[Dict[str, Any]]] = None) -> ExecutionResult:
         """执行测试的通用方法"""
         result = self._run_httprunner_command(test_files, work_dir, config)
-        # 使用外部 alluredir 时不在本 work_dir 生成报告，由调用方统一生成
-        use_external = getattr(config, 'external_allure_results_dir', None)
-        allure_report_path = (
-            self._generate_report(work_dir, config) if config.generate_allure and not use_external else None
-        )
         
         # 如果是套件测试，解析用例结果
         case_results = None
@@ -659,10 +636,8 @@ class HttpRunnerSuiteRunner:
             parsed_case_results = self._parse_suite_test_results(result.stdout, test_cases_data)
             case_results = (skipped_results or []) + parsed_case_results
         
-        execution_result = self._build_execution_result(result, work_dir, allure_report_path, config, case_results)
-        # 清理工作目录（保留报告）；外部 workspace_dir 由调用方管理，此处不清理
-        if not getattr(config, 'workspace_dir', None):
-            self._cleanup_work_dir(work_dir, execution_result.allure_report)
+        execution_result = self._build_execution_result(result, work_dir, config, case_results)
+        self._cleanup_work_dir(work_dir)
         return execution_result
     
     def _create_suite_test_files(self, work_dir: str, test_cases_data: List[Dict[str, Any]], 
@@ -700,24 +675,13 @@ class HttpRunnerSuiteRunner:
     
     def _run_httprunner_command(self, test_files: List[str], work_dir: str, 
                                config: ExecutionConfig) -> subprocess.CompletedProcess:
-        """执行HttpRunner命令；当有外部 workspace_dir 时使用 subprocess.run(hrun) 以捕获完整报错"""
-        allure_results_dir = getattr(config, 'external_allure_results_dir', None) or "allure-results"
-        if not os.path.isabs(allure_results_dir):
-            abs_results = os.path.join(work_dir, allure_results_dir)
-            if os.path.isdir(abs_results):
-                try:
-                    shutil.rmtree(abs_results)
-                except Exception as e:
-                    logger.warning(f"清理旧 allure-results 失败: {e}")
-            os.makedirs(abs_results, exist_ok=True)
-        else:
-            os.makedirs(allure_results_dir, exist_ok=True)
+        """执行 HttpRunner 并保留原生 stdout/stderr。"""
 
         # 回归原生 API：不再使用 subprocess，始终走 main_run 以配合 tasks.py 的 monkey patch
         use_subprocess = False
         if use_subprocess:
             # 终极方案：直接使用 pytest 模块运行工作区内的所有 _test.py 脚本
-            test_cmd = f'"{sys.executable}" -m pytest "{work_dir}" --alluredir="{allure_results_dir}"'
+            test_cmd = f'"{sys.executable}" -m pytest "{work_dir}"'
             logger.info("========== 开始执行 Pytest 底层测试 ==========")
             logger.info("动态构建的执行命令: %s", test_cmd)
             try:
@@ -753,10 +717,8 @@ class HttpRunnerSuiteRunner:
         try:
             os.chdir(work_dir)
             _clear_project_meta_cache()
-            extra_args = ["-p", "allure_pytest"] + _convert_to_relative_paths(test_files, work_dir)
+            extra_args = _convert_to_relative_paths(test_files, work_dir)
             extra_args.append("-s")
-            if config.generate_allure:
-                extra_args.append(f"--alluredir={allure_results_dir}")
             stdout_capture, stderr_capture = io.StringIO(), io.StringIO()
             sys.stdout, sys.stderr = stdout_capture, stderr_capture
             pytest_exit_code = main_run(extra_args)
@@ -770,7 +732,7 @@ class HttpRunnerSuiteRunner:
             sys.stdout, sys.stderr = original_stdout, original_stderr
     
     def _build_execution_result(self, result: subprocess.CompletedProcess, work_dir: str,
-                               allure_report_path: Optional[str], config: ExecutionConfig,
+                               config: ExecutionConfig,
                                case_results: Optional[List[Dict[str, Any]]] = None) -> ExecutionResult:
         """构建执行结果"""
         test_summary = self._extract_test_summary(result.stdout) if result.stdout else None
@@ -784,7 +746,6 @@ class HttpRunnerSuiteRunner:
             stdout=result.stdout,
             stderr=result.stderr,
             work_dir=work_dir,
-            allure_report=allure_report_path,
             config=config,
             test_summary=test_summary,
             case_results=case_results,
@@ -800,7 +761,6 @@ class HttpRunnerSuiteRunner:
             stdout='',
             stderr=error_msg,
             work_dir=work_dir,
-            allure_report=None,
             config=config
         )
     
@@ -907,90 +867,11 @@ class HttpRunnerSuiteRunner:
         
         return case_results
     
-    def _get_allure_path(self) -> Optional[str]:
-        """获取Allure可执行文件路径（优先使用 ALLURE_COMMAND 常量中指定的路径）"""
-        # 1. 优先使用顶部常量配置的本地路径
-        if ALLURE_COMMAND and os.path.exists(ALLURE_COMMAND):
-            logger.info(f"使用配置的 Allure CLI: {ALLURE_COMMAND}")
-            return ALLURE_COMMAND
-
-        # 2. 退而求其次，检查项目目录中捆绑的版本
-        if os.name == 'nt':
-            candidates = [
-                os.path.join(self.project_root, "allure-2.37.0", "bin", "allure.bat"),
-                os.path.join(self.project_root, "allure-2.23.0", "bin", "allure.bat"),
-            ]
-        else:
-            candidates = [
-                os.path.join(self.project_root, "allure-2.37.0", "bin", "allure"),
-                os.path.join(self.project_root, "allure-2.23.0", "bin", "allure"),
-            ]
-        for path in candidates:
-            if os.path.exists(path):
-                if os.name != 'nt':
-                    os.chmod(path, 0o755)
-                logger.info(f"使用捆绑的 Allure CLI: {path}")
-                return path
-
-        logger.warning("未找到可用的 Allure CLI，请检查 ALLURE_COMMAND 常量或安装 Allure")
-        return None
-    
-    def _generate_report(self, work_dir: str, config: ExecutionConfig) -> Optional[str]:
-        """生成Allure报告"""
-        allure_results_dir = os.path.join(work_dir, "allure-results")
-        allure_report_dir = os.path.join(work_dir, "allure-report")
-        
-        if not os.path.exists(allure_results_dir) or not os.listdir(allure_results_dir):
-            logger.warning("Allure结果目录为空，无法生成报告")
-            return None
-        
-        allure_path = self._get_allure_path()
-        if not allure_path:
-            logger.warning("Allure命令行工具未找到")
-            return None
-        
-        try:
-            # 检查Allure命令是否可用
-            check_result = subprocess.run(
-                [allure_path, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=ALLURE_CHECK_TIMEOUT
-            )
-            
-            if check_result.returncode != 0:
-                logger.warning("Allure命令不可用")
-                return None
-            
-            # 生成Allure报告
-            allure_cmd = [allure_path, "generate", allure_results_dir, "-o", allure_report_dir, "--clean"]
-            result = subprocess.run(
-                allure_cmd,
-                cwd=work_dir,
-                capture_output=True,
-                text=True,
-                timeout=ALLURE_TIMEOUT
-            )
-            
-            if result.returncode == 0:
-                report_path = os.path.join(allure_report_dir, "index.html")
-                logger.info(f"Allure报告生成成功: {report_path}")
-                return report_path
-            else:
-                logger.warning(f"Allure报告生成失败: {result.stderr}")
-                return None
-        except subprocess.TimeoutExpired:
-            logger.warning("Allure命令执行超时")
-            return None
-        except Exception as e:
-            logger.warning(f"生成Allure报告时发生错误: {e}")
-            return None
-    
-    def _cleanup_work_dir(self, work_dir: str, allure_report_path: Optional[str]) -> None:
+    def _cleanup_work_dir(self, work_dir: str) -> None:
         """清理工作目录"""
         try:
-            if not (allure_report_path and os.path.exists(allure_report_path)):
-                shutil.rmtree(work_dir)
+            import shutil
+            shutil.rmtree(work_dir)
         except Exception as e:
             logger.warning(f"清理临时目录失败: {e}")
 
@@ -999,58 +880,15 @@ class HttpRunnerSuiteRunner:
 _suite_runner = HttpRunnerSuiteRunner()
 
 
-def generate_allure_report_from_results_dir(
-    allure_results_dir: str, output_dir: str
-) -> Optional[str]:
-    """
-    从指定的 allure-results 目录生成 Allure 报告到 output_dir。
-    供定时任务等场景在多用例写入同一 results 目录后统一生成报告。
-    Returns:
-        index.html 的完整路径，失败返回 None
-    """
-    if not os.path.isdir(allure_results_dir) or not os.listdir(allure_results_dir):
-        logger.warning("Allure结果目录为空，无法生成报告")
-        return None
-    allure_path = _suite_runner._get_allure_path()
-    if not allure_path:
-        logger.warning("Allure命令行工具未找到")
-        return None
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        result = subprocess.run(
-            [allure_path, "generate", allure_results_dir, "-o", output_dir, "--clean"],
-            capture_output=True,
-            text=True,
-            timeout=ALLURE_TIMEOUT,
-        )
-        if result.returncode != 0:
-            logger.warning(f"Allure报告生成失败: {result.stderr}")
-            return None
-        index_path = os.path.join(output_dir, "index.html")
-        if os.path.exists(index_path):
-            logger.info(f"Allure报告生成成功: {index_path}")
-            return index_path
-    except subprocess.TimeoutExpired:
-        logger.warning("Allure命令执行超时")
-    except Exception as e:
-        logger.warning(f"生成Allure报告时发生错误: {e}")
-    return None
-
-
-def _build_execution_config(base_url: Optional[str], options: Optional[Dict[str, Any]], 
-                            default_allure: bool = False) -> ExecutionConfig:
+def _build_execution_config(base_url: Optional[str], options: Optional[Dict[str, Any]]) -> ExecutionConfig:
     """构建执行配置"""
     if options is None:
         options = {}
     return ExecutionConfig(
         timeout=options.get('timeout', 30),
-        generate_allure=options.get('generate_allure', default_allure),
         base_url=base_url,
         headers=options.get('headers'),
         variables=options.get('variables'),
-        suite_name=options.get('suite_name'),
-        external_allure_results_dir=options.get('external_allure_results_dir'),
-        workspace_dir=options.get('workspace_dir'),
     )
 
 
@@ -1062,7 +900,6 @@ def _build_result_dict(result: ExecutionResult, include_case_results: bool = Fal
         'stdout': result.stdout,
         'stderr': result.stderr,
         'work_dir': result.work_dir,
-        'allure_report': result.allure_report,
         'log': result.log,
         'status': 'passed' if result.success else 'failed',
         'test_summary': result.test_summary
@@ -1087,7 +924,7 @@ def httprunner_suite_runner(
     options: Dict[str, Any] = None
 ) -> Dict[str, Any]:
     """
-    使用HttpRunner批量执行多个API测试脚本并生成Allure报告
+    使用 HttpRunner 批量执行多个 API 测试脚本。
     
     Args:
         suite_id: 套件ID
@@ -1100,13 +937,10 @@ def httprunner_suite_runner(
             - timeout: 超时时间（秒）
             - headers: 请求头
             - variables: 变量
-            - generate_allure: 是否生成Allure报告（默认True）
-            - suite_name: 套件名称（可选）
     
     Returns:
         执行结果字典
     """
-    config = _build_execution_config(base_url, options or {}, default_allure=True)
+    config = _build_execution_config(base_url, options or {})
     result = _suite_runner.run_suite_test(suite_id, test_cases_data, config)
     return _build_result_dict(result, include_case_results=True)
-

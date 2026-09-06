@@ -617,8 +617,8 @@ def _execute_api_test_suite(
         passed_cases = 0
         failed_cases = 0
         
-        # 导入HttpRunner执行器（单用例用 httprunner_runner 确保统计可靠；Allure 在循环完成后批量生成）
-        from api_testing.httprunner_runner import httprunner_runner, httprunner_suite_runner
+        # 每个用例只执行一次；持久化的结果直接作为平台报告数据源。
+        from api_testing.httprunner_runner import httprunner_runner
         from api_testing.runner import ScriptExecutor
         
         # 构建环境配置
@@ -683,9 +683,6 @@ def _execute_api_test_suite(
         # 步骤4: 按顺序逐个执行测试用例（始终用 httprunner_runner 保证统计可靠）
         update_task_progress(task_instance, 50, '正在执行测试套件...')
 
-        # 收集各用例的脚本内容，用于完成后批量生成 Allure 报告
-        allure_cases_data: list = []
-
         try:
             all_logs = []
             all_logs.append(f"\n{'='*80}\n套件执行日志\n{'='*80}\n")
@@ -736,13 +733,6 @@ def _execute_api_test_suite(
                     case_execution.httprunner_result = json.dumps(result or {}, ensure_ascii=False)
                     case_execution.log = result.get('log', '')
 
-                    # 收集用于批量 Allure 的脚本（只有内容不为空才收集）
-                    if script_content and script_content.strip():
-                        allure_cases_data.append({
-                            'test_case_id': test_case.id,
-                            'script_content': script_content,
-                            'test_case_title': test_case.title or f'Case {test_case.id}',
-                        })
                 except Exception as case_error:
                     case_execution.status = 'failed'
                     case_execution.error_message = str(case_error)
@@ -782,110 +772,6 @@ def _execute_api_test_suite(
                 environment.save(update_fields=['config'])
             except Exception as save_error:
                 logger.warning(f"自动保存环境变量失败: {save_error}")
-
-            # ── 定时任务：批量生成 Allure 报告（多任务物理隔离）────────────────────────────
-            # 步骤 A：创建隔离的 WORKSPACE_DIR / RESULTS_DIR；步骤 B：执行 HttpRunner；步骤 C：allure generate；步骤 D：调试期间暂不清理
-            if task_execution_log_id and allure_cases_data:
-                from django.conf import settings
-                exec_log_id = task_execution_log_id
-                base_dir = getattr(settings, 'BASE_DIR', None) or os.path.abspath(os.path.dirname(__file__))
-                media_root = getattr(settings, 'MEDIA_ROOT', None) or os.path.join(base_dir, 'media')
-                hr_reports_root = getattr(settings, 'HTTPRUNNER_REPORTS_ROOT', None) or os.path.join(base_dir, 'httprunner_workspace')
-                # 严格唯一标识：UUID + Execution ID，防止多次执行或旧任务残留互相覆盖、误删
-                run_suffix = f"{exec_log_id}_{uuid.uuid4().hex[:8]}"
-                WORKSPACE_DIR = os.path.join(hr_reports_root, f"workspace_{run_suffix}")
-                RESULTS_DIR = os.path.join(media_root, 'allure_results', f"results_{run_suffix}")
-                REPORT_DIR = os.path.join(media_root, 'allure_reports', str(exec_log_id))
-                report_saved = False
-                try:
-                    # 步骤 A：在生成用例前创建目录，确保隔离
-                    os.makedirs(WORKSPACE_DIR, exist_ok=True)
-                    os.makedirs(RESULTS_DIR, exist_ok=True)
-                    os.makedirs(os.path.dirname(REPORT_DIR), exist_ok=True)
-                    logger.info("Allure 隔离目录已创建: WORKSPACE_DIR=%s, RESULTS_DIR=%s", WORKSPACE_DIR, RESULTS_DIR)
-                    # === 核心修复：拦截 HttpRunner 3.x 的全局缓存和 Black 崩溃 Bug ===
-                    import httprunner.make
-                    # 1. 清空全局文件缓存，防止旧任务(如159)的路径污染当前任务(如160)
-                    if hasattr(httprunner.make, 'pytest_files_run_set'):
-                        httprunner.make.pytest_files_run_set = set()
-                    # 2. 暴力禁用 black 格式化，不仅彻底解决 404 报错，还能提升 30% 执行速度
-                    httprunner.make.format_pytest_with_black = lambda *args, **kwargs: None
-                    # =========================================================
-                    # 步骤 B：执行 HttpRunner（--alluredir=RESULTS_DIR），执行期间不清理
-                    batch_result = httprunner_suite_runner(
-                        suite_id=str(suite_detail.id),
-                        test_cases_data=allure_cases_data,
-                        base_url=environment_config['base_url'],
-                        options={
-                            **environment_config,
-                            'generate_allure': True,
-                            'external_allure_results_dir': RESULTS_DIR,
-                            'workspace_dir': WORKSPACE_DIR,
-                        },
-                    )
-                    def _result_json_count(results_dir):
-                        if not os.path.isdir(results_dir):
-                            return 0
-                        return sum(1 for n in os.listdir(results_dir) if n.endswith("-result.json"))
-                    if os.path.isdir(RESULTS_DIR):
-                        try:
-                            for _ in range(5):
-                                for fname in os.listdir(RESULTS_DIR):
-                                    if fname.endswith(".json"):
-                                        with open(os.path.join(RESULTS_DIR, fname), "rb") as f:
-                                            os.fsync(f.fileno())
-                                        break
-                                time.sleep(0.5)
-                        except Exception:
-                            pass
-                    result_count = _result_json_count(RESULTS_DIR)
-                    expected_count = len(allure_cases_data)
-                    if result_count != expected_count:
-                        logger.warning(
-                            "Allure 结果条数 %s 与用例数 %s 不一致",
-                            result_count, expected_count,
-                        )
-                    from api_testing.allure_inject import update_allure_results_with_summary
-                    update_allure_results_with_summary(RESULTS_DIR, suite_detail, allure_cases_data)
-                    # 步骤 C：allure generate（使用 RESULTS_DIR，不得在此前删除）
-                    from api_testing.httprunner_runner import generate_allure_report_from_results_dir
-                    index_path = generate_allure_report_from_results_dir(RESULTS_DIR, REPORT_DIR)
-                    if index_path and os.path.exists(index_path) and result_count == expected_count:
-                        from scheduled_tasks.models import TaskExecutionLog
-                        relative_url = f"allure_reports/{exec_log_id}/index.html"
-                        TaskExecutionLog.objects.filter(id=task_execution_log_id).update(
-                            report_path=index_path,
-                            allure_report_url=relative_url,
-                        )
-                        logger.info(f"Allure 报告已保存: {index_path}, allure_report_url={relative_url}")
-                        report_saved = True
-                        # 同步更新 execution_log 对象，确保前端详情页能正确读取
-                        try:
-                            execution_log = TaskExecutionLog.objects.get(id=task_execution_log_id)
-                            execution_log.allure_report_url = relative_url
-                            execution_log.report_path = index_path
-                            execution_log.save(update_fields=['allure_report_url', 'report_path'])
-                        except Exception as e:
-                            logger.warning("更新 execution_log.allure_report_url 失败，可能缺少模型字段: %s", e)
-                    elif not (index_path and os.path.exists(index_path)):
-                        logger.warning("Allure 报告生成未输出 index.html，跳过保存")
-                    else:
-                        logger.warning("Allure 结果条数与用例数不一致，不写入 report_path/allure_report_url")
-                except Exception as allure_err:
-                    logger.warning(f"批量生成 Allure 报告失败: {allure_err}", exc_info=True)
-                finally:
-                    # 步骤 D：调试期间暂时保留 workspace 和 results 目录用于排查 Allure 结果为 0 的 Bug
-                    # if report_saved and RESULTS_DIR and os.path.isdir(RESULTS_DIR):
-                    #     try:
-                    #         shutil.rmtree(RESULTS_DIR, ignore_errors=True)
-                    #     except Exception as e:
-                    #         logger.debug("清理 RESULTS_DIR 失败: %s", e)
-                    # if WORKSPACE_DIR and os.path.isdir(WORKSPACE_DIR):
-                    #     try:
-                    #         shutil.rmtree(WORKSPACE_DIR, ignore_errors=True)
-                    #     except Exception as e:
-                    #         logger.debug("清理 WORKSPACE_DIR 失败: %s", e)
-                    logger.info("调试期间，暂时保留 workspace 和 results 目录用于排查")
 
         except Exception as e:
             # 套件执行异常
@@ -939,44 +825,38 @@ def _execute_api_test_suite(
         suite_detail.log = ''.join(all_logs) if all_logs else ''
         suite_detail.save()
         
-        # 步骤5: 若由定时任务触发，回填 TaskExecutionLog 的通过/失败统计与步骤日志（原子累加，多套件并发安全）
+        # 定时报告从派发时关联的真实执行记录聚合；不要按套件增量累加，
+        # 否则多套件会在第一个结束时提前完成和通知。
         if task_execution_log_id:
             try:
-                from django.db.models import F, Value
-                from django.db.models.functions import Concat, Coalesce
                 from scheduled_tasks.models import TaskExecutionLog
-                TaskExecutionLog.objects.filter(id=task_execution_log_id).update(
-                    passed_cases=F('passed_cases') + passed_cases,
-                    failed_cases=F('failed_cases') + failed_cases,
-                    skipped_cases=F('skipped_cases') + 0,
-                )
-                step_content = (suite_detail.log or '').strip()
-                if step_content:
-                    TaskExecutionLog.objects.filter(id=task_execution_log_id).update(
-                        step_log=Concat(
-                            Coalesce(F('step_log'), Value('')),
-                            Value('\n\n'),
-                            Value(step_content),
-                        ),
-                    )
-                # 回填后设置 status/end_time，确保“已完成”时统计数据已落库，弹窗与列表一致
                 execution_log = TaskExecutionLog.objects.get(id=task_execution_log_id)
-                execution_log.refresh_from_db()
-                execution_log.status = 'failed' if execution_log.failed_cases > 0 else 'success'
-                execution_log.end_time = timezone.now()
-                execution_log.save(update_fields=['status', 'end_time'])
+                from scheduled_tasks.reporting import refresh_execution_log_from_links
+                report_summary = refresh_execution_log_from_links(
+                    execution_log,
+                    append_log=(suite_detail.log or '').strip(),
+                )
             except Exception as e:
                 logger.warning(f'回填定时任务执行日志统计失败: task_execution_log_id={task_execution_log_id}, error={e}')
+                report_summary = None
             # 通知发送与报告生成/状态更新完全隔离：任何异常都不影响任务完成与报告 404
             try:
+                if report_summary is None or report_summary['is_running']:
+                    raise RuntimeError('关联执行尚未全部结束，暂不发送通知')
                 from scheduled_tasks.models import TaskExecutionLog
+                from scheduled_tasks.reporting import mark_notification_sent
                 from notifications.services import trigger_notification
                 execution_log = TaskExecutionLog.objects.get(id=task_execution_log_id)
+                if execution_log.notification_sent_at:
+                    raise RuntimeError('关联执行的完成通知已发送')
                 trigger_notification(
                     scheduled_task_id=execution_log.task_id,
                     execution_log=execution_log,
                     result=None,
                 )
+                mark_notification_sent(execution_log)
+            except RuntimeError as e:
+                logger.info('%s', e)
             except Exception as e:
                 logger.error('发送通知失败: %s', e, exc_info=True)
 

@@ -16,6 +16,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from projects.models import Project, ProjectMember
 
 from .generation_workspace import attach_debug_task, prepare_debug
+from .execution_snapshots import capture_suite_snapshot
 from .models import (
     WebUIScriptGeneration,
     WebUITestCase,
@@ -97,7 +98,7 @@ class ExecutionScreenshotPersistenceTests(ScreenshotMediaTestCase):
             'runtime_assertion_count': 1 if success else 0,
             'error': '' if success else 'fixture browser failure',
             'result': {
-                'stdout': 'fixture stdout', 'stderr': '', 'test_file': '', 'allure_report': '',
+                'stdout': 'fixture stdout', 'stderr': '', 'test_file': '',
                 'screenshot_path': screenshot_path,
             },
         }
@@ -175,9 +176,7 @@ class ExecutionScreenshotPersistenceTests(ScreenshotMediaTestCase):
         execution = WebUITestExecution.objects.create(
             exec_type='suite', name=suite.name, executor=self.user, project=self.project, status='pending',
         )
-        WebUITestSuiteExecutionDetail.objects.create(
-            execution=execution, test_suite=suite, total_cases=2,
-        )
+        capture_suite_snapshot(execution, suite)
 
         with patch(
             'web_testing.tasks._run_test_script',

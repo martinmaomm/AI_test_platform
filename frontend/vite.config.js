@@ -26,11 +26,6 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
-      // Playwright报告静态文件代理
-      '/playwright-reports': {
-        target: 'http://127.0.0.1:8000',
-        changeOrigin: true,
-      },
       // WebSocket代理配置
       '/ws': {
         target: 'ws://127.0.0.1:8000',

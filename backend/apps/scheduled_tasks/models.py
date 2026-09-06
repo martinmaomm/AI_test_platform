@@ -234,10 +234,10 @@ class TaskExecutionLog(models.Model):
     failed_cases = models.IntegerField(default=0, verbose_name="失败用例数")
     skipped_cases = models.IntegerField(default=0, verbose_name="跳过用例数")
     
-    # 报告信息
+    # 平台原生报告入口和执行快照。linked_executions 保持派发顺序。
     report_url = models.URLField(blank=True, null=True, verbose_name="测试报告URL")
-    report_path = models.CharField(max_length=500, blank=True, null=True, verbose_name="Allure报告静态路径")
-    allure_report_url = models.CharField(max_length=500, blank=True, null=True, verbose_name="Allure报告相对路径(供iframe)")
+    linked_executions = models.JSONField(default=list, blank=True, verbose_name="关联执行记录")
+    notification_sent_at = models.DateTimeField(blank=True, null=True, verbose_name="报告通知发送时间")
     
     # 时间戳
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
@@ -267,5 +267,3 @@ class TaskExecutionLog(models.Model):
         if self.total_cases > 0:
             return round((self.passed_cases / self.total_cases) * 100, 2)
         return 0
-
-

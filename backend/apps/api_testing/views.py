@@ -2,6 +2,7 @@ from rest_framework import generics, permissions, status, serializers, viewsets
 from rest_framework.decorators import api_view, permission_classes
 
 from django.shortcuts import get_object_or_404
+from django.http import Http404
 from django.utils import timezone
 from datetime import timedelta
 
@@ -1659,6 +1660,7 @@ class ExecuteAPITestSuiteView(APIView):
             suite_detail = APITestSuiteExecutionDetail.objects.create(
                 execution=execution,
                 test_suite=test_suite,
+                test_suite_name=test_suite.name,
                 total_cases=test_suite.test_cases.count()
             )
             
@@ -1708,6 +1710,17 @@ class ExecuteAPITestSuiteView(APIView):
 
 
 # ============ API测试执行记录管理视图 ============
+
+def _report_execution_queryset(user, project_id):
+    """Executions visible in a project report (not only to the executor)."""
+    queryset = APITestExecution.objects.filter(project_id=project_id)
+    if user.is_superuser:
+        return queryset
+    return queryset.filter(
+        Q(project__owner=user)
+        | Q(project__created_by=user)
+        | Q(project__members__user=user, project__members__can_view_reports=True)
+    ).distinct()
 
 class APITestExecutionListView(generics.ListAPIView):
     """统一执行记录列表视图 - 获取所有执行记录（包含类型）"""
@@ -1776,7 +1789,7 @@ class APITestCaseExecutionDetailView(APIView):
                 'execution', 'test_case'
             ).filter(
                 execution_id=pk,
-                execution__executor=user,
+                execution__in=_report_execution_queryset(user, project_id),
                 execution__exec_type__in=['case', 'scenario']
             ).first()
             
@@ -1814,7 +1827,7 @@ class APITestSuiteExecutionDetailView(APIView):
                 'case_executions__test_case'
             ).get(
                 execution_id=pk,
-                execution__executor=user,
+                execution__in=_report_execution_queryset(user, project_id),
                 execution__exec_type='suite'
             )
             serializer = APITestSuiteExecutionDetailSerializer(suite_detail)
@@ -1845,10 +1858,8 @@ class APITestExecutionCasesView(APIView):
         try:
             # 获取执行记录
             execution = get_object_or_404(
-                APITestExecution,
-                pk=pk,
-                executor=request.user,
-                exec_type='suite'
+                _report_execution_queryset(request.user, project_id),
+                pk=pk, exec_type='suite'
             )
             
             # 获取套件执行详情
@@ -1858,7 +1869,7 @@ class APITestExecutionCasesView(APIView):
             )
             
             # 获取子用例执行记录
-            case_executions = suite_detail.case_executions.all().order_by('test_case')
+            case_executions = suite_detail.case_executions.all().order_by('id')
             serializer = APITestSuiteCaseExecutionSerializer(case_executions, many=True)
             
             return response(
@@ -1867,12 +1878,45 @@ class APITestExecutionCasesView(APIView):
                 message="获取子用例执行详情成功"
             )
             
+        except Http404:
+            # Preserve DRF's 404 for an inaccessible report execution instead
+            # of converting it into a successful-shaped error payload.
+            raise
         except Exception as e:
             logger.error(f"获取子用例执行详情失败: {e}", exc_info=True)
             return response(
                 kind="error",
                 message=f"获取子用例执行详情失败: {str(e)}"
             )
+
+
+class APITestExecutionReportView(APIView):
+    """Platform-native API report endpoint for one durable execution."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id, pk):
+        execution = get_object_or_404(
+            _report_execution_queryset(request.user, project_id), pk=pk,
+        )
+        if execution.exec_type == 'suite':
+            detail = get_object_or_404(
+                APITestSuiteExecutionDetail.objects.select_related('test_suite'),
+                execution=execution,
+            )
+            detail_data = APITestSuiteExecutionDetailSerializer(detail).data
+        else:
+            detail = get_object_or_404(
+                APITestCaseExecutionDetail.objects.select_related('test_case'),
+                execution=execution,
+            )
+            detail_data = APITestCaseExecutionDetailSerializer(detail).data
+        detail_id = detail_data.pop('id')
+        data = dict(detail_data)
+        data.update(APITestExecutionListSerializer(execution).data)
+        data['id'] = execution.id
+        data['execution'] = execution.id
+        data['detail_id'] = detail_id
+        return response(kind='success', data=data, message='获取API平台报告成功')
 
 
 class APITestExecutionDeleteView(APIView):

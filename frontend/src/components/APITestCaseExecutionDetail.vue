@@ -889,6 +889,11 @@ const getHttpRunnerExportVars = () => {
 const getHttpRunnerLog = () => {
   const rawResult = getHttpRunnerRawResult()
   const actualResult = result.value
+
+  // 执行记录保存的日志是原生报告的首选数据源。
+  if (typeof actualResult?.log === 'string' && actualResult.log.trim()) {
+    return actualResult.log
+  }
   
   // 优先返回log，如果log存在且不为空
   if (rawResult.log && rawResult.log.trim()) {
@@ -3494,11 +3499,11 @@ onMounted(() => {
     justify-content: center;
   }
 
-  .allure-content {
+  .execution-content {
     flex-direction: column;
   }
 
-  .allure-sidebar {
+  .execution-sidebar {
     width: 100%;
     border-right: none;
     border-bottom: 1px solid #e1e5e9;
@@ -3544,7 +3549,7 @@ onMounted(() => {
     flex-wrap: wrap;
   }
 
-  .allure-main {
+  .execution-main {
     padding: 20px;
   }
 

@@ -41,6 +41,15 @@ python manage.py migrate web_testing
 
 离线回归可在 `backend` 虚拟环境中运行 `python scripts/test_webui_generation_offline.py`：使用独立内存数据库、禁止网络访问，不触碰配置中的 MySQL、Redis 或被测网站。它不代替真实模型生成和浏览器业务流程验收。
 
+## 平台原生执行报告
+
+WebUI / API 执行结果和定时任务报告使用平台自己的页面，不再安装或生成 Allure 报告。
+执行详情展示实际保存的统计、用例结果、日志与截图；可通过需要登录和项目报告权限的独立链接查看。
+报告汇总不重新执行测试，API 定时任务也不会为了生成报告重复请求被测接口。
+
+本次升级需停止旧后端和 Celery，安装依赖并执行 `python manage.py migrate` 后重启；原始执行记录、日志和截图保留。
+旧脚本若手工使用了 Allure，请改用 Python 日志。详细范围、依赖卸载、验收与回退见 [平台原生执行报告](docs/platform-native-reports.md)。
+
 ## 项目知识库：手工用例与项目问答
 
 UI 项目的“项目知识库”现提供“项目资料、手工测试用例、知识问答”三个页签。

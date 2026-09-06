@@ -149,7 +149,7 @@ const routes = [
       { path: 'test-executions', name: 'WebTestExecutions', component: () => import('@/views/web-testing/TestExecutions.vue'), meta: { title: '测试执行记录' } },
       { path: 'scheduled-tasks', name: 'WebScheduledTasks', component: () => import('@/views/scheduledTasks/ScheduledTasksPage.vue'), meta: { title: '定时任务' } },
       { path: 'notification-receivers', name: 'WebNotificationReceivers', component: () => import('@/views/project/NotificationReceivers.vue'), meta: { title: '通知接收管理' } },
-      { path: 'knowledge-base', name: 'WebKnowledgeBase', component: () => import('@/views/project/KnowledgeBase.vue'), meta: { title: '知识库管理' } }
+      { path: 'knowledge-base', name: 'WebKnowledgeBase', component: () => import('@/views/project-knowledge/ProjectKnowledgeWorkspace.vue'), meta: { title: '项目知识库' } }
     ]
   },
 

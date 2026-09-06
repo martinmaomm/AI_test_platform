@@ -256,7 +256,7 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(result.result['status'], 'stale')
 
     def test_disabled_model_cannot_be_bound_or_used_for_generation(self):
-        workspace = self.workspace()
+        workspace = self.workspace(model_id=self.model.id)
         self.model.is_active = False
         self.model.save(update_fields=['is_active'])
         update = APIWorkspaceDetailView.as_view()(
@@ -264,6 +264,28 @@ class APIWorkspaceTests(TestCase):
             project_id=self.project.id, workspace_id=workspace.id,
         )
         self.assertEqual(update.status_code, 400)
+
+        with patch('api_testing.workspace_views._queue_generation') as queue:
+            generate = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查'}),
+                project_id=self.project.id, workspace_id=workspace.id,
+            )
+        self.assertEqual(generate.status_code, 400)
+        queue.assert_not_called()
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.messages, [])
+
+    def test_model_disabled_after_enqueue_never_contacts_provider(self):
+        workspace = self.workspace(model_id=self.model.id, status='generating', task_id='disabled-task')
+        self.model.is_active = False
+        self.model.save(update_fields=['is_active'])
+        with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+            generate_api_workspace_candidate.apply(args=(workspace.id, 0, 'disabled-task', 'generate', []))
+        manager.assert_not_called()
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.status, 'failed')
+        self.assertIn('禁用', workspace.error)
+        self.assertIsNone(workspace.candidate)
 
     def test_normalization_rejects_runtime_unsupported_fields_before_persisting(self):
         workspace = self.workspace()

@@ -12,6 +12,39 @@ export const listItems = (response) => {
   return Array.isArray(body?.data?.results) ? body.data.results : [];
 };
 
+export const isAvailableChatModel = (model) =>
+  model?.is_active === true && model?.model_type === "llm";
+
+export const availableChatModels = (response) =>
+  listItems(response).filter(isAvailableChatModel);
+
+export const hasAvailableChatModel = (models, modelId) =>
+  Array.isArray(models) &&
+  models.some((model) => String(model.id) === String(modelId));
+
+export const reconcileWorkspaceModel = (
+  models,
+  modelId,
+  modelsLoaded,
+  wasUnavailable = false,
+) => {
+  if (!modelsLoaded || modelId == null)
+    return { modelId, unavailable: wasUnavailable };
+  return hasAvailableChatModel(models, modelId)
+    ? { modelId, unavailable: false }
+    : { modelId: null, unavailable: true };
+};
+
+export const canGenerateWithModel = (
+  models,
+  modelId,
+  modelsLoaded,
+  modelsLoadFailed,
+) =>
+  modelsLoaded &&
+  !modelsLoadFailed &&
+  hasAvailableChatModel(models, modelId);
+
 export const errorMessage = (error, fallback) =>
   error?.response?.data?.error?.message ||
   error?.response?.data?.message ||

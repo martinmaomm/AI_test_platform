@@ -65,9 +65,9 @@
                   filterable
                   :loading="modelsLoading"
                   :disabled="interactionLocked"
-                  placeholder="选择已配置模型"
+                  placeholder="请选择可用聊天模型"
                   style="width: 100%"
-                  @change="contextDirty = true"
+                  @change="selectModel"
                   ><el-option
                     v-for="model in models"
                     :key="model.id"
@@ -80,8 +80,29 @@
                     @click="router.push('/ai-config/llm')"
                     >模型配置</el-link
                   >中创建可用模型。
-                </p></el-form-item
-              >
+                </p>
+                <el-alert
+                  v-if="unavailableModel"
+                  title="此工作区原先选择的模型已禁用、类型不匹配或不再可用；请重新选择可用聊天模型后再发起 AI 对话。"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                />
+                <el-alert
+                  v-else-if="modelsLoaded && !models.length"
+                  title="没有可用聊天模型。请在模型配置中启用一个 LLM 模型后重新加载。"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                />
+                <el-alert
+                  v-else-if="modelsLoadFailed"
+                  title="可用聊天模型列表加载失败；为避免使用失效模型，暂时不能发起 AI 对话。"
+                  type="error"
+                  :closable="false"
+                  show-icon
+                />
+              </el-form-item>
               <el-form-item label="API 规范"
                 ><el-select
                   v-model="selectedSpecId"
@@ -143,6 +164,7 @@
             :status="status"
             :busy="interactionLocked"
             :disabled="conflict"
+            :generation-disabled="generationDisabled"
             :can-repair="canRepair"
             :workspace-error="workspace.error"
             @send="sendMessage"
@@ -315,14 +337,18 @@ import DebugResultPanel from "@/components/api-workspace/DebugResultPanel.vue";
 import PythonExportPanel from "@/components/api-workspace/PythonExportPanel.vue";
 import KeyValueRows from "@/components/api-workspace/KeyValueRows.vue";
 import {
+  availableChatModels,
+  canGenerateWithModel,
   candidateDiff,
   clone,
   debugHasFailure,
   defaultStep,
   errorMessage,
+  hasAvailableChatModel,
   isBusyWorkspace,
   listItems,
   normalizeDraft,
+  reconcileWorkspaceModel,
   statusMeta,
   unwrap,
 } from "./apiWorkspace";
@@ -340,6 +366,9 @@ const endpointIds = ref([]);
 const selectedSpecId = ref(null);
 const endpointOptions = ref([]);
 const models = ref([]);
+const modelsLoaded = ref(false);
+const modelsLoadFailed = ref(false);
+const unavailableModel = ref(false);
 const specs = ref([]);
 const environments = ref([]);
 const python = ref({
@@ -402,10 +431,60 @@ const debugStale = computed(
 const canRepair = computed(
   () => !dirty.value && debugHasFailure(workspace.value?.debug_result),
 );
+const hasSelectedAvailableModel = computed(() =>
+  hasAvailableChatModel(models.value, modelId.value),
+);
+const generationDisabled = computed(
+  () =>
+    !canGenerateWithModel(
+      models.value,
+      modelId.value,
+      modelsLoaded.value,
+      modelsLoadFailed.value,
+    ),
+);
 const modelLabel = (model) =>
   model.name ||
-  [model.provider, model.model_name].filter(Boolean).join(" · ") ||
+  [model.provider_name || model.provider, model.model_name]
+    .filter(Boolean)
+    .join(" · ") ||
   `模型 ${model.id}`;
+const reconcileModelSelection = () => {
+  const selection = reconcileWorkspaceModel(
+    models.value,
+    modelId.value,
+    modelsLoaded.value,
+    unavailableModel.value,
+  );
+  if (!selection.unavailable) {
+    unavailableModel.value = false;
+    return;
+  }
+  modelId.value = selection.modelId;
+  unavailableModel.value = true;
+  contextDirty.value = true;
+};
+const selectModel = (selectedId) => {
+  unavailableModel.value = hasAvailableChatModel(models.value, selectedId)
+    ? false
+    : unavailableModel.value;
+  contextDirty.value = true;
+};
+const ensureAvailableChatModel = () => {
+  if (modelsLoadFailed.value) {
+    ElMessage.error("可用聊天模型列表加载失败，请重新加载后再试。");
+    return false;
+  }
+  if (!models.value.length) {
+    ElMessage.warning("请先在模型配置中启用一个 LLM 模型。");
+    return false;
+  }
+  if (!hasSelectedAvailableModel.value) {
+    ElMessage.warning("请选择可用聊天模型后再发起 AI 对话。");
+    return false;
+  }
+  return true;
+};
 const endpointLabel = (endpoint) =>
   `${String(endpoint.method || "GET").toUpperCase()} ${endpoint.path || endpoint.url || endpoint.name || endpoint.id}`;
 const routeInteger = (key) => {
@@ -509,6 +588,8 @@ const startPolling = () => {
 const applyWorkspace = (value) => {
   const next = asWorkspace(value);
   if (!next?.id) return;
+  if (!sameWorkspaceId(workspace.value?.id, next.id))
+    unavailableModel.value = false;
   if (
     !sameWorkspaceId(python.value.workspaceId, next.id) ||
     python.value.revision !== next.revision
@@ -530,6 +611,7 @@ const applyWorkspace = (value) => {
   draftDirty.value = false;
   contextDirty.value = false;
   conflict.value = false;
+  reconcileModelSelection();
   if (
     next.status === "idle" ||
     next.status === "ready" ||
@@ -551,9 +633,17 @@ const loadAuxiliary = async () => {
       getAPISpecifications(projectId.value),
       getProjectEnvironments(projectId.value, { category: "api" }),
     ]);
-  if (modelsResult.status === "fulfilled")
-    models.value = listItems(modelsResult.value);
-  else ElMessage.warning(errorMessage(modelsResult.reason, "模型列表加载失败"));
+  if (modelsResult.status === "fulfilled") {
+    models.value = availableChatModels(modelsResult.value);
+    modelsLoaded.value = true;
+    modelsLoadFailed.value = false;
+    reconcileModelSelection();
+  } else {
+    models.value = [];
+    modelsLoaded.value = false;
+    modelsLoadFailed.value = true;
+    ElMessage.warning(errorMessage(modelsResult.reason, "模型列表加载失败"));
+  }
   if (specsResult.status === "fulfilled")
     specs.value = listItems(specsResult.value);
   else ElMessage.warning(errorMessage(specsResult.reason, "API 规范加载失败"));
@@ -721,6 +811,7 @@ const saveDraft = async ({ notify = true } = {}) => {
 };
 const sendMessage = async ({ mode, message }) => {
   if (!workspace.value || busy.value || conflict.value) return;
+  if (!ensureAvailableChatModel()) return;
   if (dirty.value && !(await saveDraft({ notify: false }))) return;
   if (mode === "repair" && !canRepair.value)
     return ElMessage.warning("请先保存草稿并获得失败调试结果");

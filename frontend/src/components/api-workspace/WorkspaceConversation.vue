@@ -59,13 +59,13 @@
       <el-button
         type="primary"
         :loading="busy && mode === 'generate'"
-        :disabled="disabled || busy || !message.trim()"
+        :disabled="disabled || busy || generationDisabled || !message.trim()"
         @click="send('generate')"
         >生成候选</el-button
       >
       <el-button
         :loading="busy && mode === 'repair'"
-        :disabled="disabled || busy || !canRepair"
+        :disabled="disabled || busy || generationDisabled || !canRepair"
         @click="send('repair')"
         >基于失败结果修复</el-button
       >
@@ -79,13 +79,14 @@
 <script setup>
 import { ref } from "vue";
 
-defineProps({
+const props = defineProps({
   messages: { type: Array, default: () => [] },
   candidate: { type: Object, default: null },
   diff: { type: Array, default: () => [] },
   status: { type: Object, required: true },
   busy: Boolean,
   disabled: Boolean,
+  generationDisabled: Boolean,
   canRepair: Boolean,
   workspaceError: String,
 });
@@ -93,6 +94,7 @@ const emit = defineEmits(["send", "adopt"]);
 const message = ref("");
 const mode = ref("generate");
 const send = (nextMode) => {
+  if (props.generationDisabled) return;
   if (!message.value.trim() && nextMode === "generate") return;
   mode.value = nextMode;
   emit("send", {

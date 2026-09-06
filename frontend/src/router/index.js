@@ -121,8 +121,8 @@ const routes = [
     component: () => import('@/layouts/MainLayout.vue'),
     meta: { requiresAuth: true, layout: 'workspace', module: 'api', title: 'API 测试' },
     children: [
-      { path: '', redirect: '/api-testing/function-navigation' },
-      { path: 'function-navigation', name: 'FunctionNavigation', component: () => import('@/views/api-testing/FunctionNavigation.vue') },
+      { path: '', redirect: '/api-testing/workspace' },
+      { path: 'function-navigation', redirect: '/api-testing/workspace' },
       { path: 'api-specs', name: 'APITesting', component: () => import('@/views/api-testing/ApiSpecManage.vue') },
       { path: 'specs/:id', name: 'APISpecDetail', component: () => import('@/views/api-testing/ApiSpecDetail.vue') },
       { path: 'workspace', name: 'ApiWorkspace', component: () => import('@/views/api-testing/ApiWorkspace.vue'), meta: { title: 'API 对话工作区' } },

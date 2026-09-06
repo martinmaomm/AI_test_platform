@@ -152,7 +152,7 @@ const loadProjects = async () => {
 const enterProject = async (project) => {
   try {
     await projectStore.setCurrentProject(project)
-    router.push('/api-testing/function-navigation')
+    router.push('/api-testing/workspace')
   } catch {
     ElMessage.error('设置项目失败，请重试')
   }

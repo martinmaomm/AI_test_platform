@@ -63,6 +63,8 @@ def bootstrap(root):
     endpoint = APIEndpoint.objects.create(spec=spec, path='/health', method='GET', summary='健康检查', responses={'200': {'description': 'OK'}})
     model = LLMConfiguration.objects.create(created_by=user, provider='openai', provider_name='离线模拟',
                                              model_name='fixture-model', api_key='fixture-only', base_url='https://never-called.invalid')
+    LLMConfiguration.objects.create(created_by=user, provider='openai', model_name='disabled-fixture', is_active=False)
+    LLMConfiguration.objects.create(created_by=user, provider='openai', model_name='vision-fixture', model_type='vision')
     return {'token': str(AccessToken.for_user(user)), 'user_id': user.pk, 'project_id': project.pk,
             'endpoint_id': endpoint.pk, 'model_id': model.pk}
 
@@ -70,6 +72,7 @@ def bootstrap(root):
 def verify(origin, fixture, output):
     from playwright.sync_api import sync_playwright, expect
     from api_testing.models import APIWorkspace, APITestCase
+    from ai_core.models import LLMConfiguration
     errors = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=str(CHROME), headless=True)
@@ -86,6 +89,15 @@ def verify(origin, fixture, output):
             page.goto(origin + f'/api-testing/workspace?endpoint_id={fixture["endpoint_id"]}')
             expect(page.get_by_role('heading', name='API 对话工作区')).to_be_visible(timeout=20000)
             expect(page).to_have_url(__import__('re').compile(r'workspace_id=\d+'), timeout=15000)
+            workspace_url = page.url
+            expect(page.get_by_text('API功能导航', exact=True)).to_have_count(0)
+            model_picker = page.get_by_role('combobox', name='模型', exact=True)
+            expect(model_picker).to_be_enabled(timeout=15000)
+            model_picker.click()
+            expect(page.get_by_role('option').filter(has_text='fixture-model')).to_be_visible(timeout=15000)
+            expect(page.get_by_role('option').filter(has_text='disabled-fixture')).to_have_count(0)
+            expect(page.get_by_role('option').filter(has_text='vision-fixture')).to_have_count(0)
+            page.get_by_role('option').filter(has_text='fixture-model').click()
             message = page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。')
             expect(message).to_be_visible()
             message.fill('生成健康检查，验证 HTTP 状态码为 200')
@@ -149,6 +161,15 @@ def verify(origin, fixture, output):
             expect(page.get_by_text('https://example.test/health', exact=True).first).to_be_visible()
             expect(page.locator('iframe')).to_have_count(0)
             page.screenshot(path=str(output / 'native-api-report.png'), full_page=True)
+            database(lambda: LLMConfiguration.objects.filter(pk=fixture['model_id']).update(is_active=False))
+            page.goto(workspace_url)
+            expect(page.get_by_text('此工作区原先选择的模型已禁用、类型不匹配或不再可用；请重新选择可用聊天模型后再发起 AI 对话。', exact=True)).to_be_visible(timeout=15000)
+            page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。').fill('模型禁用后不能偷偷改用其他模型')
+            expect(page.get_by_role('button', name='生成候选', exact=True)).to_be_disabled()
+            page.screenshot(path=str(output / 'disabled-model.png'), full_page=True)
+            page.goto(origin + '/api-testing/function-navigation')
+            expect(page.get_by_role('heading', name='API 对话工作区')).to_be_visible(timeout=15000)
+            expect(page.get_by_text('API功能导航', exact=True)).to_have_count(0)
             assert not errors, errors
         except Exception:
             page.screenshot(path=str(output / 'failure.png'), full_page=True)

@@ -19,7 +19,7 @@ const ROUTE_TITLE_MAP = {
   '/api-testing/knowledge-base': '知识库管理',
   '/web-testing/knowledge-base': '知识库管理',
   '/app-testing/knowledge-base': '知识库管理',
-  '/api-testing/function-navigation': 'API功能导航',
+  '/api-testing/function-navigation': 'API对话工作区',
   '/api-testing/api-specs': 'API规范管理',
   '/api-testing/workspace': 'API对话工作区',
   '/api-testing/scenario-generator': 'API对话工作区',

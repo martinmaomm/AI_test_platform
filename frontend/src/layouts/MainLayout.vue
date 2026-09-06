@@ -198,7 +198,6 @@ const MENU_CONFIG = {
   api: {
     title: 'API 测试',
     items: [
-      { path: '/api-testing/function-navigation', label: 'API功能导航' },
       { path: '/api-testing/api-specs', label: 'API规范管理' },
       { path: '/api-testing/workspace', label: 'API对话工作区' },
       {
@@ -428,7 +427,7 @@ const activeMenuIndex = computed(() => {
   if (/^\/api-testing\/specs\/[^/]+/.test(p)) return '/api-testing/api-specs'
   if (/^\/project\/project-detail\/[^/]+/.test(p)) return '/project/project-list'
   // 模块基础路径 -> 默认子页
-  if (p === '/api-testing') return '/api-testing/function-navigation'
+  if (p === '/api-testing') return '/api-testing/workspace'
   if (p === '/web-testing' || p === '/web-testing/create' || p.startsWith('/web-testing/create/')) return '/web-testing/create'
   if (p === '/app-testing') return '/app-testing/pom-parser'
   if (p === '/perf-testing') return '/perf-testing/workspace'

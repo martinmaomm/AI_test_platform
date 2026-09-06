@@ -2,12 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
+  availableChatModels,
   bodyKind,
+  canGenerateWithModel,
   candidateDiff,
   debugHasFailure,
   defaultDraft,
+  hasAvailableChatModel,
   listItems,
   normalizeDraft,
+  reconcileWorkspaceModel,
 } from "../src/views/api-testing/apiWorkspace.js";
 
 test("API workspace draft remains structured and preserves body kinds", () => {
@@ -76,29 +80,69 @@ test("repair is enabled only for actual failed debug evidence", () => {
   assert.equal(debugHasFailure({ steps: [{ status: "failed" }] }), true);
 });
 
+test("workspace only permits active LLM models and clears an unavailable saved model", () => {
+  const models = availableChatModels({
+    data: [
+      { id: 1, is_active: true, model_type: "llm" },
+      { id: 2, is_active: false, model_type: "llm" },
+      { id: 3, is_active: true, model_type: "embedding" },
+      { id: 4, is_active: false, model_type: "embedding" },
+    ],
+  });
+  assert.deepEqual(
+    models.map((model) => model.id),
+    [1],
+  );
+  assert.equal(hasAvailableChatModel(models, 1), true);
+  assert.equal(hasAvailableChatModel(models, 2), false);
+  assert.equal(canGenerateWithModel(models, 1, true, false), true);
+  assert.equal(canGenerateWithModel(models, 2, true, false), false);
+  assert.equal(canGenerateWithModel(models, 1, false, false), false);
+  assert.equal(canGenerateWithModel([], null, true, false), false);
+  assert.deepEqual(reconcileWorkspaceModel(models, 1, true), {
+    modelId: 1,
+    unavailable: false,
+  });
+  assert.deepEqual(reconcileWorkspaceModel(models, 2, true), {
+    modelId: null,
+    unavailable: true,
+  });
+  assert.deepEqual(reconcileWorkspaceModel(models, 3, true), {
+    modelId: null,
+    unavailable: true,
+  });
+  assert.deepEqual(reconcileWorkspaceModel(models, 2, false), {
+    modelId: 2,
+    unavailable: false,
+  });
+  assert.deepEqual(reconcileWorkspaceModel(models, null, true, true), {
+    modelId: null,
+    unavailable: true,
+  });
+  assert.deepEqual(reconcileWorkspaceModel(models, 1, true, true), {
+    modelId: 1,
+    unavailable: false,
+  });
+});
+
 test("workspace API, routing, navigation, and suite variables use the approved contract", async () => {
   const [
     api,
     legacyApi,
     router,
-    navigation,
+    mainLayout,
     suites,
     endpointCases,
     specDetail,
     workspace,
     debugPanel,
     configEditor,
+    conversation,
   ] = await Promise.all([
     readFile(new URL("../src/api/apiWorkspace.js", import.meta.url), "utf8"),
     readFile(new URL("../src/api/apiTesting.js", import.meta.url), "utf8"),
     readFile(new URL("../src/router/index.js", import.meta.url), "utf8"),
-    readFile(
-      new URL(
-        "../src/views/api-testing/FunctionNavigation.vue",
-        import.meta.url,
-      ),
-      "utf8",
-    ),
+    readFile(new URL("../src/layouts/MainLayout.vue", import.meta.url), "utf8"),
     readFile(
       new URL("../src/views/api-testing/TestSuites.vue", import.meta.url),
       "utf8",
@@ -125,13 +169,20 @@ test("workspace API, routing, navigation, and suite variables use the approved c
       ),
       "utf8",
     ),
-    readFile(
-      new URL(
-        "../src/components/api-workspace/WorkspaceConfigEditor.vue",
-        import.meta.url,
+      readFile(
+        new URL(
+          "../src/components/api-workspace/WorkspaceConfigEditor.vue",
+          import.meta.url,
+        ),
+        "utf8",
       ),
-      "utf8",
-    ),
+      readFile(
+        new URL(
+          "../src/components/api-workspace/WorkspaceConversation.vue",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
   ]);
   assert.match(api, /`\/projects\/\$\{projectId\}\/api-testing\/workspaces\/`/);
   assert.match(api, /\$\{workspaceId\}\/messages\//);
@@ -139,11 +190,17 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(api, /\$\{workspaceId\}\/save\//);
   assert.match(api, /\$\{workspaceId\}\/python\//);
   assert.match(router, /path: 'workspace', name: 'ApiWorkspace'/);
+  assert.match(router, /path: '', redirect: '\/api-testing\/workspace'/);
   assert.match(
     router,
-    /path: 'scenario-generator', redirect: '\/api-testing\/workspace'/,
+    /path: 'function-navigation', redirect: '\/api-testing\/workspace'/,
   );
-  assert.match(navigation, /router\.push\('\/api-testing\/workspace'\)/);
+  assert.doesNotMatch(router, /FunctionNavigation/);
+  assert.doesNotMatch(mainLayout, /API功能导航/);
+  assert.match(
+    mainLayout,
+    /if \(p === '\/api-testing'\) return '\/api-testing\/workspace'/,
+  );
   assert.match(suites, /v-model="suiteForm\.variables"/);
   assert.match(suites, /套件变量会覆盖用例变量/);
   assert.match(endpointCases, /query: \{ case_id: selectedList\[0\]\.id \}/);
@@ -153,6 +210,13 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, /const pollWorkspace = async/);
   assert.match(workspace, /python\.value\.workspaceId/);
   assert.match(workspace, /payload\.revision != null/);
+  assert.match(workspace, /availableChatModels\(modelsResult\.value\)/);
+  assert.match(workspace, /reconcileWorkspaceModel/);
+  assert.match(workspace, /ensureAvailableChatModel/);
+  assert.match(workspace, /:generation-disabled="generationDisabled"/);
+  assert.match(workspace, /重新选择可用聊天模型/);
+  assert.match(conversation, /generationDisabled/);
+  assert.match(conversation, /if \(props\.generationDisabled\) return/);
   assert.match(debugPanel, /result\.log/);
   assert.match(debugPanel, /step\?\.status\) === "skipped"/);
   assert.match(configEditor, /timestamp_ns/);

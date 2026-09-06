@@ -80,6 +80,28 @@ export const applyWebUIScriptGenerationRepair = async (projectId, generationId, 
 export const discardWebUIScriptGenerationRepair = async (projectId, generationId, data) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/repair/discard/`, data)).data
 
+// Saved-script assistant. This is intentionally separate from the generation workspace API.
+export const getWebUIScriptAssistants = async (projectId, params = {}) =>
+  (await api.get(`${base(projectId)}/script-assistants/`, { params })).data
+
+export const createWebUIScriptAssistant = async (projectId, data) =>
+  (await api.post(`${base(projectId)}/script-assistants/`, data)).data
+
+export const getWebUIScriptAssistant = async (projectId, assistantId) =>
+  (await api.get(`${base(projectId)}/script-assistants/${assistantId}/`)).data
+
+export const sendWebUIScriptAssistantMessage = async (projectId, assistantId, data) =>
+  (await api.post(`${base(projectId)}/script-assistants/${assistantId}/messages/`, data)).data
+
+export const verifyWebUIScriptAssistant = async (projectId, assistantId, data) =>
+  (await api.post(`${base(projectId)}/script-assistants/${assistantId}/verify/`, data)).data
+
+export const cancelWebUIScriptAssistant = async (projectId, assistantId, data) =>
+  (await api.post(`${base(projectId)}/script-assistants/${assistantId}/cancel/`, data)).data
+
+export const applyWebUIScriptAssistant = async (projectId, assistantId, data) =>
+  (await api.post(`${base(projectId)}/script-assistants/${assistantId}/apply/`, data)).data
+
 export const saveWebUIScriptGeneration = async (projectId, generationId, data = {}) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/save/`, data)).data
 

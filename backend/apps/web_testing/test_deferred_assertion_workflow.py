@@ -19,6 +19,7 @@ from .assertion_state import (
     evaluation_status,
     read_runtime_assertion_count,
 )
+from .constants import normalize_webui_execution_options
 from .execution_snapshots import capture_suite_snapshot
 from .models import (
     WebUITestCase,
@@ -293,6 +294,12 @@ class DeferredAssertionExecutionWorkflowTests(TestCase):
         )
         WebUITestCaseExecutionDetail.objects.create(
             execution=execution, test_case=test_case, status='pending',
+            source_script=test_case.test_script_content,
+            source_script_version=test_case.script_version,
+            source_edit_version=test_case.edit_version,
+            source_variables=test_case.variables,
+            runtime_variable_names=[],
+            execution_options=normalize_webui_execution_options(None),
         )
         return execution
 

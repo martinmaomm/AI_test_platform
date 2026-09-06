@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import copy
 
+from .constants import normalize_webui_execution_options
+from .execution_variables import runtime_variable_names
 from .models import WebUITestSuiteCaseExecution, WebUITestSuiteExecutionDetail
 
 
-def capture_suite_snapshot(execution, suite):
+def capture_suite_snapshot(execution, suite, *, execution_options=None, runtime_variables=None):
     """Create one complete, ordered suite snapshot for a new execution.
 
     The caller owns the surrounding transaction and must call this before any
@@ -35,6 +37,10 @@ def capture_suite_snapshot(execution, suite):
         test_suite=suite,
         total_cases=len(memberships),
         suite_variables=copy.deepcopy(suite.variables or []),
+        runtime_variable_names=runtime_variable_names(runtime_variables),
+        # All callers (including scheduled execution) freeze the normalized
+        # defaults here, never defer option resolution to a future worker.
+        execution_options=copy.deepcopy(normalize_webui_execution_options(execution_options)),
     )
     WebUITestSuiteCaseExecution.objects.bulk_create([
         WebUITestSuiteCaseExecution(
@@ -46,6 +52,8 @@ def capture_suite_snapshot(execution, suite):
             execution_order=index,
             script_content=membership.test_case.test_script_content or '',
             variables=copy.deepcopy(membership.test_case.variables or []),
+            source_script_version=membership.test_case.script_version,
+            source_edit_version=membership.test_case.edit_version,
             status='pending',
         )
         for index, membership in enumerate(memberships, start=1)

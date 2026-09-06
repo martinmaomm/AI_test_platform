@@ -2,10 +2,17 @@
 from django.urls import path
 
 from . import views
+from . import script_assistant_views
 
 app_name = 'web_testing'
 
 urlpatterns = [
+    path('script-assistants/', script_assistant_views.ScriptAssistantListCreateView.as_view(), name='script-assistants'),
+    path('script-assistants/<uuid:session_id>/', script_assistant_views.ScriptAssistantDetailView.as_view(), name='script-assistant-detail'),
+    path('script-assistants/<uuid:session_id>/messages/', script_assistant_views.ScriptAssistantMessageView.as_view(), name='script-assistant-messages'),
+    path('script-assistants/<uuid:session_id>/verify/', script_assistant_views.ScriptAssistantVerifyView.as_view(), name='script-assistant-verify'),
+    path('script-assistants/<uuid:session_id>/cancel/', script_assistant_views.ScriptAssistantCancelView.as_view(), name='script-assistant-cancel'),
+    path('script-assistants/<uuid:session_id>/apply/', script_assistant_views.ScriptAssistantApplyView.as_view(), name='script-assistant-apply'),
     # AI + Playwright MCP script generation.
     path('script-generation-settings/', views.WebUIScriptGenerationSettingsView.as_view(), name='script-generation-settings'),
     path('script-generations/', views.WebUIScriptGenerationCreateView.as_view(), name='script-generation-create'),

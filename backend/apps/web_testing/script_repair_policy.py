@@ -42,7 +42,9 @@ def _evidenced_locators(trace: Any) -> set[str]:
     for event in data.get('events', []):
         if event.get('status') != 'succeeded':
             continue
-        locator = event.get('locator') or {}
+        # Historical unit fixtures used ``locator``; live recorder events use
+        # ``locator_input``.  Both are callback-owned MCP evidence only.
+        locator = event.get('locator') or event.get('locator_input') or {}
         for value in locator.values():
             try:
                 expression = ast.parse(value, mode='eval').body
@@ -54,6 +56,20 @@ def _evidenced_locators(trace: Any) -> set[str]:
                 # Some MCP snapshots contain a CSS selector instead of a Python locator.
                 result.add(_signature(ast.parse(f'page.locator({value!r})', mode='eval').body))
     return result
+
+
+def _locator_signatures(tree: ast.AST) -> set[str]:
+    """Return every concrete locator expression, including ones under expect().
+
+    Assertion comparison intentionally normalizes locator identity to protect
+    matcher semantics.  Targeted repair must make the opposite check first:
+    every newly introduced locator has to originate from a successful callback.
+    """
+    return {
+        _signature(node)
+        for node in ast.walk(tree)
+        if _is_locator(node)
+    }
 
 
 def _is_expect_matcher(node: ast.AST) -> bool:
@@ -403,8 +419,15 @@ def validate_targeted_repair(original_script: str, candidate_script: str, snapsh
             alias.asname or alias.name not in _SAFE_NEW_IMPORTS for alias in node.names
         ):
             return [blocker]
+    # Do this before normalizing assertion structure.  In particular,
+    # ``expect(page.locator(...))`` must not inherit a pass merely because the
+    # assertion normalizer deliberately ignores locator identity.
+    evidenced = _evidenced_locators(snapshot)
+    new_locators = _locator_signatures(after) - _locator_signatures(before)
+    if any(locator not in evidenced for locator in new_locators):
+        return [blocker]
     before = _RemoveDocstrings().visit(copy.deepcopy(before))
     after = _RemoveDocstrings().visit(copy.deepcopy(after))
     before.body = [node for node in before.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
     after.body = [node for node in after.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
-    return [] if _same_business_structure(before, after, _evidenced_locators(snapshot)) else [blocker]
+    return [] if _same_business_structure(before, after, evidenced) else [blocker]

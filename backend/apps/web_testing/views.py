@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import copy
 
 from django.conf import settings
 from django.db import models, transaction
@@ -1034,13 +1035,20 @@ class WebUITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIVi
             validate_related_project(WebUITestModule, module_id, project_id, 'module_id')
             data['module_id'] = module_id
             data.pop('module', None)
-        serializer = self.get_serializer(
-            self.get_object(),
-            data=data,
-            partial=kwargs.get('partial', False),
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        expected_edit_version = data.pop('expected_edit_version', None)
+        with transaction.atomic():
+            test_case = WebUITestCase.objects.select_for_update().get(
+                pk=self.get_object().pk, project_id=project_id,
+            )
+            if expected_edit_version is not None:
+                from .script_assistant import case_edit_version
+                if expected_edit_version != case_edit_version(test_case):
+                    return response(kind='error', message='用例已被其他编辑修改，请保留当前编辑后刷新。', status_code=409)
+            serializer = self.get_serializer(
+                test_case, data=data, partial=kwargs.get('partial', False),
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         return response(kind='success', data=serializer.data, message='测试用例更新成功')
 
     @project_access_required(DELETE)
@@ -1082,12 +1090,18 @@ class ExecuteWebUITestCaseView(APIView):
             execution=execution,
             test_case=test_case,
             status='pending',
+            source_script=test_case.test_script_content,
+            source_script_version=test_case.script_version,
+            source_edit_version=test_case.edit_version,
+            source_variables=copy.deepcopy(test_case.variables or []),
+            runtime_variable_names=[item['name'] for item in runtime_variables],
+            execution_options=copy.deepcopy(options),
         )
         store_runtime_variables(execution.id, runtime_variables)
         task = execute_webui_test_case_task.delay(
             execution.id,
             options,
-            test_case.test_script_content,
+            None,
         )
         execution.task_id = task.id
         execution.save(update_fields=['task_id', 'updated_at'])
@@ -1300,7 +1314,10 @@ class ExecuteWebUITestSuiteView(APIView):
                 status='pending',
                 trigger_type='manual',
             )
-            capture_suite_snapshot(execution, suite)
+            capture_suite_snapshot(
+                execution, suite, execution_options=options,
+                runtime_variables=runtime_variables,
+            )
         store_runtime_variables(execution.id, runtime_variables)
         task = execute_webui_test_suite_task.delay(execution.id, request.user.id, options)
         execution.task_id = task.id

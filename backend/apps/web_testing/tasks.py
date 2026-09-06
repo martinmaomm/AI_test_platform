@@ -126,6 +126,13 @@ def retry_webui_script_generation_from_trace_task(self, generation_id: str):
     )
 
 
+@shared_task(bind=True, name='web_testing.run_script_assistant_operation')
+def run_script_assistant_operation_task(self, session_id: str, revision: int, task_id: str):
+    """The single durable worker entry for saved-script assistant operations."""
+    from .script_assistant import run_script_assistant_operation
+    return run_script_assistant_operation(str(session_id), int(revision), str(task_id))
+
+
 def _run_test_script(
     script_content: str,
     options: dict | None = None,
@@ -250,8 +257,10 @@ def _execute_webui_test_case_logic(
         test_case.last_error_message = ''
         test_case.save(update_fields=['last_execute_status', 'last_error_message'])
 
-        script_content = (script_content or test_case.test_script_content or '').strip()
-        if not script_content:
+        # The API always creates this frozen source before dispatch.  Historical
+        # rows remain non-runnable rather than silently reading mutable code.
+        script_content = case_detail.source_script or ''
+        if not script_content.strip():
             raise ValueError('测试脚本内容为空，无法执行')
         update_task_progress(task_instance, 45, '正在执行测试脚本...')
         screenshot_absolute, screenshot_relative = _failure_screenshot_paths(
@@ -260,10 +269,10 @@ def _execute_webui_test_case_logic(
         runtime_variables = pop_runtime_variables(execution.id)
         result = _run_test_script(
             script_content,
-            options,
+            case_detail.execution_options or options,
             failure_screenshot_path=screenshot_absolute,
             environment_variables=merge_execution_variables(
-                test_case.variables,
+                case_detail.source_variables,
                 runtime_variables,
             ),
         )
@@ -1097,8 +1106,8 @@ def _execute_webui_test_suite_logic(
             case_started_at = timezone.now()
             case_execution.status = 'running'
             case_execution.save(update_fields=['status'])
-            script_content = (case_execution.script_content or '').strip()
-            if not script_content:
+            script_content = case_execution.script_content or ''
+            if not script_content.strip():
                 case_execution.status = 'skipped'
                 case_execution.error_message = '测试用例没有可执行脚本'
                 case_execution.duration = 0
@@ -1120,7 +1129,7 @@ def _execute_webui_test_suite_logic(
                 )
                 result = _run_test_script(
                     script_content,
-                    options,
+                    suite_detail.execution_options or options,
                     failure_screenshot_path=screenshot_absolute,
                     environment_variables=merge_execution_variables(
                         case_execution.variables, suite_detail.suite_variables, runtime_variables,

@@ -4,6 +4,15 @@
     <div class="report-content">
       <!-- 主内容区域 -->
       <div class="main-content">
+        <section v-if="canRepair" class="assistant-entry">
+          <div><strong>AI 修复失败脚本</strong><p>会从本次执行冻结快照读取脚本；确认后才可能运行测试网站。</p></div>
+          <el-button type="danger" plain @click="assistantVisible = !assistantVisible">{{ assistantVisible ? '收起 AI 修复' : 'AI 修复' }}</el-button>
+        </section>
+        <WebUIScriptAssistantPanel
+          v-if="assistantVisible && canRepair"
+          :project-id="execution.project_id"
+          :repair-context="{ executionId: execution.execution || execution.id }"
+        />
         <div v-if="execution.error_message" class="execution-error">
           <strong>{{ execution.status === 'incomplete' ? '验证提示' : '失败摘要' }}</strong>
           <pre>{{ execution.error_message }}</pre>
@@ -82,9 +91,10 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import WebUIExecutionScreenshot from '@/components/WebUIExecutionScreenshot.vue'
+import WebUIScriptAssistantPanel from '@/components/WebUIScriptAssistantPanel.vue'
 
 const props = defineProps({
   execution: {
@@ -95,11 +105,15 @@ const props = defineProps({
   visible: {
     type: Boolean,
     default: false
-  }
+  },
+  hideAiRepair: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['close'])
 const openLogSections = ref([])
+const assistantVisible = ref(false)
+const canRepair = computed(() => !props.hideAiRepair && ['failed', 'error'].includes(props.execution?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id)))
+watch(() => props.execution?.execution || props.execution?.id, () => { assistantVisible.value = false })
 
 const technicalLog = computed(() => {
   const parts = []
@@ -202,6 +216,8 @@ const copyLogs = () => {
   border: 1px solid #fecdca;
   border-radius: 6px;
 }
+
+.assistant-entry { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:16px; padding:14px 16px; border:1px solid #fecdca; border-radius:8px; background:#fff7ed; }.assistant-entry p { margin:4px 0 0; color:#7c2d12; font-size:13px; }
 
 .execution-error pre {
   margin: 8px 0 0;

@@ -7,6 +7,8 @@
           <p>用例本身就是一份可独立执行的 Python Playwright 脚本。</p>
         </div>
         <div class="header-actions">
+          <el-tooltip v-if="isCreate" content="新建用例需先保存，才能使用 AI 对话编辑。" placement="bottom"><span><el-button disabled>AI 对话编辑</el-button></span></el-tooltip>
+          <el-button v-else @click="toggleAssistant">{{ assistantVisible ? '收起 AI 助手' : 'AI 对话编辑' }}</el-button>
           <el-button @click="visible = false">关闭</el-button>
           <el-button type="primary" :loading="saving" @click="save">保存</el-button>
         </div>
@@ -56,15 +58,24 @@
           <MonacoEditor v-model:value="form.test_script_content" language="python" theme="vs-dark" height="100%" />
         </div>
         <el-alert v-if="testCase?.script_validation_error" :title="testCase.script_validation_error" type="error" :closable="false" show-icon />
+        <el-alert v-if="saveConflict" title="保存时发现用例已被更新。编辑器与 AI 候选均已保留，请刷新后处理冲突。" type="warning" :closable="false" show-icon />
+        <WebUIScriptAssistantPanel
+          v-if="assistantVisible && !isCreate"
+          ref="assistantPanelRef"
+          :project-id="projectStore.currentProject?.id"
+          :edit-context="assistantEditContext"
+          @apply-to-editor="applyAssistantCandidate"
+        />
       </section>
     </el-form>
   </el-drawer>
 </template>
 
 <script setup>
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import MonacoEditor from './MonacoEditor.vue'
+import WebUIScriptAssistantPanel from './WebUIScriptAssistantPanel.vue'
 import { createWebUITestCase, patchWebUITestCase } from '@/api/webTesting'
 import { useProjectStore } from '@/stores/project'
 
@@ -88,6 +99,9 @@ const props = defineProps({
 const emit = defineEmits(['update:modelValue', 'saved'])
 const projectStore = useProjectStore()
 const saving = ref(false)
+const saveConflict = ref(false)
+const assistantVisible = ref(false)
+const assistantPanelRef = ref(null)
 const form = reactive({ title: '', description: '', module_id: null, variables: [], test_script_content: SCRIPT_TEMPLATE })
 const visible = computed({ get: () => props.modelValue, set: value => emit('update:modelValue', value) })
 const isCreate = computed(() => !props.testCase?.id)
@@ -107,8 +121,22 @@ const reset = () => {
   form.module_id = source.module_id || null
   form.variables = (source.variables || []).map(item => ({ ...item }))
   form.test_script_content = source.test_script_content || SCRIPT_TEMPLATE
+  saveConflict.value = false
 }
 watch(() => [props.modelValue, props.testCase], reset, { immediate: true, deep: true })
+
+const assistantEditContext = computed(() => ({
+  testCaseId: props.testCase?.id,
+  editVersion: props.testCase?.edit_version,
+  scriptContent: form.test_script_content,
+  description: form.description,
+  variables: form.variables
+}))
+const applyAssistantCandidate = ({ scriptContent }) => { form.test_script_content = scriptContent }
+const toggleAssistant = async () => {
+  assistantVisible.value = !assistantVisible.value
+  if (assistantVisible.value) await nextTick(() => assistantPanelRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+}
 
 const addVariable = () => form.variables.push({ name: '', value: '', description: '', required: false, is_secret: false })
 const save = async () => {
@@ -127,6 +155,7 @@ const save = async () => {
       variables: form.variables,
       test_script_content: form.test_script_content
     }
+    if (!isCreate.value) payload.expected_edit_version = props.testCase?.edit_version
     const result = isCreate.value
       ? await createWebUITestCase(projectId, payload)
       : await patchWebUITestCase(projectId, props.testCase.id, payload)
@@ -134,6 +163,7 @@ const save = async () => {
     emit('saved', result?.data || result)
     visible.value = false
   } catch (error) {
+    if (error?.response?.status === 409) saveConflict.value = true
     ElMessage.error(error?.response?.data?.message || '保存测试用例失败')
   } finally {
     saving.value = false

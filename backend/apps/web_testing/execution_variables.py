@@ -94,6 +94,48 @@ def merge_execution_variables(*layers: Any) -> dict[str, str]:
     return merged
 
 
+def merge_variable_definitions(*layers: Any) -> list[dict[str, Any]]:
+    """Return one normalized definition list with later layers taking priority.
+
+    This is deliberately separate from ``merge_execution_variables``.  A
+    frozen suite repair source needs to retain definition metadata while still
+    applying the normal low-to-high precedence rule.  Concatenating the two
+    snapshots would turn an intentional cross-layer override into a duplicate
+    definition error on the next normalization.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for layer in layers:
+        for item in normalize_variable_definitions(layer):
+            merged[item['name']] = item
+    return list(merged.values())
+
+
+def runtime_variable_names(value: Any) -> list[str]:
+    """Persist only safe runtime variable names, never their values."""
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            name = validate_variable_name(item)
+            if name in seen:
+                raise ExecutionVariableError(f'变量名重复: {name}')
+            names.append(name)
+            seen.add(name)
+        return names
+    return [item['name'] for item in normalize_variable_definitions(value)]
+
+
+def require_runtime_variables(value: Any, required_names: Any) -> list[dict[str, Any]]:
+    """Require re-entry of every runtime variable named by an old snapshot."""
+    variables = normalize_variable_definitions(value)
+    required = {validate_variable_name(name) for name in (required_names or [])}
+    supplied = {item['name'] for item in variables if item['value']}
+    missing = sorted(required - supplied)
+    if missing:
+        raise ExecutionVariableError(f"一次性运行变量 {', '.join(missing)} 必须重新输入")
+    return variables
+
+
 def store_runtime_variables(execution_id: int, value: Any) -> None:
     """Keep one-time overrides out of Celery payloads and persistent records."""
     normalized = normalize_variable_definitions(value)
@@ -128,3 +170,10 @@ def pop_repair_runtime_variables(generation_id: object, revision: int, digest: s
     value = cache.get(key) or []
     cache.delete(key)
     return normalize_variable_definitions(value)
+
+
+def get_repair_runtime_variables(generation_id: object, revision: int, digest: str) -> list[dict[str, Any]]:
+    """Read one repair request's short-lived values for its bounded two rounds."""
+    return normalize_variable_definitions(
+        cache.get(_repair_runtime_key(generation_id, revision, digest)) or []
+    )

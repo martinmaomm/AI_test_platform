@@ -192,10 +192,10 @@ class ScriptAssetFlowTests(TestCase):
         }
 
         def run_in_order(script_content, *_args, **_kwargs):
-            if script_content == first_script.strip():
+            if script_content == first_script:
                 self.assertTrue(detail.case_executions.filter(test_case=second_case, status='pending').exists())
                 return failed_result
-            self.assertEqual(script_content, second_script.strip())
+            self.assertEqual(script_content, second_script)
             first_result = detail.case_executions.get(test_case=first_case)
             self.assertEqual(first_result.status, 'failed')
             return passed_result
@@ -212,8 +212,8 @@ class ScriptAssetFlowTests(TestCase):
             )
 
         self.assertEqual(run_script.call_count, 2)
-        self.assertEqual(run_script.call_args_list[0].args[0], first_script.strip())
-        self.assertEqual(run_script.call_args_list[1].args[0], second_script.strip())
+        self.assertEqual(run_script.call_args_list[0].args[0], first_script)
+        self.assertEqual(run_script.call_args_list[1].args[0], second_script)
         self.assertEqual(
             run_script.call_args_list[0].kwargs['environment_variables']['SHARED_VALUE'],
             'runtime',

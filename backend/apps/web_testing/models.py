@@ -184,6 +184,12 @@ class WebUITestCase(models.Model):
             'generation_metadata': self.generation_metadata,
         }
 
+    @property
+    def edit_version(self):
+        """Stable optimistic-lock fingerprint for case-editor fields."""
+        from .script_assistant import case_edit_version
+        return case_edit_version(self)
+
 
 # ============ WebUI 脚本生成记录 ============
 
@@ -459,6 +465,13 @@ class WebUITestCaseExecutionDetail(models.Model):
     # 媒体文件
     screenshot_path = models.CharField(max_length=500, blank=True, null=True, verbose_name="截图路径")
     video_path = models.CharField(max_length=500, blank=True, null=True, verbose_name="视频路径")
+    # Empty values identify historical records whose source must not be guessed.
+    source_script = models.TextField(blank=True, default='', verbose_name='执行脚本快照')
+    source_script_version = models.PositiveIntegerField(null=True, blank=True, verbose_name='执行脚本版本快照')
+    source_edit_version = models.CharField(max_length=64, blank=True, default='', verbose_name='用例编辑版本快照')
+    source_variables = models.JSONField(default=list, blank=True, verbose_name='默认变量快照')
+    runtime_variable_names = models.JSONField(default=list, blank=True, verbose_name='一次性运行变量名快照')
+    execution_options = models.JSONField(default=dict, blank=True, verbose_name='运行选项快照')
     
     class Meta:
         db_table = 'webui_test_case_execution_details'
@@ -498,6 +511,8 @@ class WebUITestSuiteExecutionDetail(models.Model):
     
     # 执行时的套件变量快照。报告及重试均不得读取当前套件配置。
     suite_variables = models.JSONField(default=list, blank=True, verbose_name='套件变量快照')
+    runtime_variable_names = models.JSONField(default=list, blank=True, verbose_name='一次性运行变量名快照')
+    execution_options = models.JSONField(default=dict, blank=True, verbose_name='运行选项快照')
     
     # 执行日志
     log = models.TextField(blank=True, null=True, verbose_name="执行日志")
@@ -550,6 +565,8 @@ class WebUITestSuiteCaseExecution(models.Model):
     execution_order = models.PositiveIntegerField(default=0, verbose_name='执行顺序')
     script_content = models.TextField(blank=True, default='', verbose_name='脚本快照')
     variables = models.JSONField(default=list, blank=True, verbose_name='用例变量快照')
+    source_script_version = models.PositiveIntegerField(null=True, blank=True, verbose_name='用例脚本版本快照')
+    source_edit_version = models.CharField(max_length=64, blank=True, default='', verbose_name='用例编辑版本快照')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name="执行状态")
     duration = models.FloatField(null=True, blank=True, verbose_name="执行时长(秒)")
     
@@ -574,6 +591,71 @@ class WebUITestSuiteCaseExecution(models.Model):
     
     def __str__(self):
         return f"{self.name} - {self.get_status_display()}"
+
+
+class WebUIScriptAssistant(models.Model):
+    """Project-scoped durable state for saved-script editing and repair."""
+    class Mode(models.TextChoices):
+        EDIT = 'edit', '编辑'
+        REPAIR = 'repair', '修复'
+
+    class Status(models.TextChoices):
+        IDLE = 'idle', '空闲'
+        QUEUED = 'queued', '已排队'
+        RUNNING = 'running', '运行中'
+        CANDIDATE_READY = 'candidate_ready', '候选已就绪'
+        CANDIDATE_PASSED = 'candidate_passed', '候选已通过'
+        FAILED = 'failed', '失败'
+        CANCELLED = 'cancelled', '已取消'
+        APPLIED = 'applied', '已采用'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='webui_script_assistants')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='webui_script_assistants')
+    test_case = models.ForeignKey(WebUITestCase, on_delete=models.SET_NULL, null=True, blank=True, related_name='script_assistants')
+    execution = models.ForeignKey('WebUITestExecution', on_delete=models.SET_NULL, null=True, blank=True, related_name='script_assistants')
+    suite_case = models.ForeignKey('WebUITestSuiteCaseExecution', on_delete=models.SET_NULL, null=True, blank=True, related_name='script_assistants')
+    mode = models.CharField(max_length=12, choices=Mode.choices)
+    model_config_id = models.PositiveIntegerField()
+    model_info = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.IDLE)
+    operation = models.CharField(max_length=12, default='edit')
+    revision = models.PositiveIntegerField(default=0)
+    phase = models.CharField(max_length=40, blank=True, default='')
+    message = models.TextField(blank=True, default='')
+    task_id = models.CharField(max_length=100, blank=True, default='')
+    deadline_at = models.DateTimeField(null=True, blank=True)
+    source_script = models.TextField(blank=True, default='')
+    source_script_version = models.PositiveIntegerField(null=True, blank=True)
+    source_edit_version = models.CharField(max_length=64, blank=True, default='')
+    source_variables = models.JSONField(default=list, blank=True)
+    source_options = models.JSONField(default=dict, blank=True)
+    candidate_script = models.TextField(blank=True, default='')
+    candidate_hash = models.CharField(max_length=64, blank=True, default='')
+    candidate_diff = models.TextField(blank=True, default='')
+    summary = models.TextField(blank=True, default='')
+    blockers = models.JSONField(default=list, blank=True)
+    quality_report = models.JSONField(default=dict, blank=True)
+    messages = models.JSONField(default=list, blank=True)
+    attempts = models.JSONField(default=list, blank=True)
+    verification = models.JSONField(default=dict, blank=True)
+    # Normal editor state may be durable. One-time repair variables are cache-only.
+    pending_script = models.TextField(blank=True, default='')
+    pending_description = models.TextField(blank=True, default='')
+    pending_variables = models.JSONField(default=list, blank=True)
+    pending_message = models.TextField(blank=True, default='')
+    pending_use_candidate = models.BooleanField(default=False)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'webui_script_assistants'
+        ordering = ['-updated_at']
+        indexes = [
+            models.Index(fields=['project', 'user', '-updated_at'], name='webui_asst_proj_user_upd'),
+            models.Index(fields=['status', 'updated_at'], name='webui_asst_status_updated'),
+        ]
 
 
 # ============ MidScene脚本 ============

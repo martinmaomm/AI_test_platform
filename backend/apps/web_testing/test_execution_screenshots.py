@@ -15,6 +15,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from projects.models import Project, ProjectMember
 
+from .constants import normalize_webui_execution_options
 from .generation_workspace import attach_debug_task, prepare_debug
 from .execution_snapshots import capture_suite_snapshot
 from .models import (
@@ -85,6 +86,12 @@ class ExecutionScreenshotPersistenceTests(ScreenshotMediaTestCase):
         )
         detail = WebUITestCaseExecutionDetail.objects.create(
             execution=execution, test_case=test_case, status='pending',
+            source_script=test_case.test_script_content if test_case else '',
+            source_script_version=test_case.script_version if test_case else None,
+            source_edit_version=test_case.edit_version if test_case else '',
+            source_variables=test_case.variables if test_case else [],
+            runtime_variable_names=[],
+            execution_options=normalize_webui_execution_options(None),
         )
         return execution, detail
 

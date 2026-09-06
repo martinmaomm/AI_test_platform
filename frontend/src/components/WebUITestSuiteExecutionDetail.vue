@@ -41,9 +41,15 @@
       <el-collapse v-else v-model="expandedCases" class="case-list">
         <el-collapse-item v-for="caseItem in filteredCases" :key="caseItem.id" :name="String(caseItem.id)">
           <template #title>
-            <div class="case-title"><span>{{ caseItem.test_case_title || caseItem.name || '未命名用例' }}</span><el-tag :type="statusType(caseItem.status)" size="small">{{ caseItem.status_display || statusText(caseItem.status) }}</el-tag><small>{{ formatDuration(caseItem.duration) }}</small></div>
+            <div class="case-title"><span>{{ caseItem.test_case_title || caseItem.name || '未命名用例' }}</span><el-tag :type="statusType(caseItem.status)" size="small">{{ caseItem.status_display || statusText(caseItem.status) }}</el-tag><small>{{ formatDuration(caseItem.duration) }}</small><el-button v-if="canRepairCase(caseItem)" size="small" type="danger" plain @click.stop="toggleRepairCase(caseItem)">AI 修复</el-button></div>
           </template>
           <pre v-if="caseItem.error_message" class="case-error">{{ caseItem.error_message }}</pre>
+          <WebUIScriptAssistantPanel
+            v-if="selectedRepairCaseId === String(caseItem.id) && canRepairCase(caseItem)"
+            :ref="element => setRepairPanelRef(caseItem.id, element)"
+            :project-id="execution.project_id"
+            :repair-context="{ executionId: execution.execution || execution.id, suiteCaseId: caseItem.id }"
+          />
           <WebUIExecutionScreenshot v-if="expandedCases.includes(String(caseItem.id))" :project-id="execution.project_id" :execution-id="execution.execution || execution.id" :case-execution-id="caseItem.id" :screenshot-path="caseItem.screenshot_path || ''" :status="caseItem.status" />
           <el-collapse v-if="caseLog(caseItem)" class="raw-log"><el-collapse-item title="查看原始 stdout / stderr / log" name="log"><pre>{{ caseLog(caseItem) }}</pre></el-collapse-item></el-collapse>
         </el-collapse-item>
@@ -58,12 +64,14 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 import { getTestExecutionCases } from '@/api/webTesting'
 import WebUIExecutionScreenshot from '@/components/WebUIExecutionScreenshot.vue'
+import WebUIScriptAssistantPanel from '@/components/WebUIScriptAssistantPanel.vue'
 import { copyText } from '@/utils/reportLinks'
+import { expandedAssistantRowIds } from '@/composables/webUIScriptAssistantPresentation'
 
 const props = defineProps({ execution: { type: Object, required: true, default: () => ({}) } })
 const caseExecutions = ref([])
@@ -71,10 +79,26 @@ const casesLoading = ref(false)
 const casesError = ref('')
 const onlyFailures = ref(false)
 const expandedCases = ref([])
+const selectedRepairCaseId = ref(null)
+const repairPanelRefs = new Map()
 let requestVersion = 0
 
 const filteredCases = computed(() => onlyFailures.value ? caseExecutions.value.filter(item => ['failed', 'error'].includes(item.status)) : caseExecutions.value)
 const actualUrl = computed(() => props.execution?.diagnostics?.actual_url || props.execution?.actual_url || '')
+const canRepairCase = item => ['failed', 'error'].includes(item?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id) && item?.id)
+const setRepairPanelRef = (id, element) => {
+  const key = String(id)
+  if (element) repairPanelRefs.set(key, element)
+  else repairPanelRefs.delete(key)
+}
+const toggleRepairCase = async item => {
+  const id = String(item.id)
+  const opening = selectedRepairCaseId.value !== id
+  selectedRepairCaseId.value = opening ? id : null
+  if (!opening) return
+  expandedCases.value = expandedAssistantRowIds(expandedCases.value, id, true)
+  await nextTick(() => repairPanelRefs.get(id)?.$el?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+}
 
 const loadCases = async () => {
   const version = ++requestVersion
@@ -82,6 +106,7 @@ const loadCases = async () => {
   const executionId = props.execution?.execution || props.execution?.id
   caseExecutions.value = []
   expandedCases.value = []
+  selectedRepairCaseId.value = null
   casesError.value = ''
   if (!projectId || !executionId) {
     casesError.value = '缺少执行记录信息，无法加载子用例结果。'

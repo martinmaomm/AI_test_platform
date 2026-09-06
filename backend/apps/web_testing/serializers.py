@@ -360,6 +360,7 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
     )
     has_script = serializers.BooleanField(read_only=True)
     assertion_state = serializers.SerializerMethodField()
+    edit_version = serializers.CharField(read_only=True)
 
     def get_assertion_state(self, obj):
         return analyze_assertion_state(obj.test_script_content)
@@ -385,6 +386,7 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
             'module_id', 'module_name', 'has_script', 'variables',
             'test_script_content', 'script_source', 'script_status', 'script_framework',
             'script_version', 'script_validation_error', 'generation_metadata', 'assertion_state',
+            'edit_version',
             'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
         ]

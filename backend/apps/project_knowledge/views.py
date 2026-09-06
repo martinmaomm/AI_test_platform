@@ -7,7 +7,8 @@ import uuid
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import F, Max
+from django.db.models import F, Max, OuterRef, Subquery, TextField, Value
+from django.db.models.functions import Coalesce
 from django.http import Http404, HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -606,7 +607,12 @@ class ConversationListView(KnowledgeAPIView):
         project, error = self.project(request, project_id)
         if error:
             return error
-        rows = KnowledgeConversation.objects.filter(project=project, created_by=request.user)
+        first_question = KnowledgeMessage.objects.filter(
+            conversation_id=OuterRef('pk'), role='user',
+        ).order_by('created_at', 'id').values('content')[:1]
+        rows = KnowledgeConversation.objects.filter(project=project, created_by=request.user).annotate(
+            first_question=Coalesce(Subquery(first_question), Value(''), output_field=TextField()),
+        )
         return _ok({'items': KnowledgeConversationSerializer(rows, many=True).data}, '知识问答会话获取成功。')
 
     def post(self, request, project_id):

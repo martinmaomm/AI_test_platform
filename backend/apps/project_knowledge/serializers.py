@@ -161,9 +161,11 @@ class ManualTestCaseSerializer(serializers.ModelSerializer):
 
 
 class KnowledgeConversationSerializer(serializers.ModelSerializer):
+    first_question = serializers.CharField(read_only=True, default='')
+
     class Meta:
         model = KnowledgeConversation
-        fields = ('id', 'title', 'created_at')
+        fields = ('id', 'title', 'first_question', 'created_at')
         read_only_fields = ('id', 'created_at')
 
 

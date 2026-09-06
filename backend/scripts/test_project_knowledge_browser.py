@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import mimetypes
 import os
 from pathlib import Path
@@ -347,7 +348,8 @@ def _ui_flow(origin: str, root: Path, artifacts_dir: Path, token: str, user, pro
             page.locator(".question-box .el-select").get_by_text("fake - offline-json", exact=True).wait_for()
             page.get_by_role("button", name="提问", exact=True).click()
             page.get_by_text("依据当前资料，角色停用后不可登录。", exact=True).wait_for()
-            page.get_by_role("button", name=re.compile(r"requirements\.md.*登录规则")).click()
+            _verify_conversation_history(page, artifacts_dir)
+            page.get_by_role("button", name=re.compile(r"requirements\.md.*登录规则")).first.click()
             page.get_by_label("来源原文").get_by_text("角色停用后不可登录，系统必须拒绝登录。", exact=False).wait_for()
             wait_for_toasts()
             page.screenshot(path=str(qa_screenshot), animations="disabled")
@@ -363,6 +365,74 @@ def _ui_flow(origin: str, root: Path, artifacts_dir: Path, token: str, user, pro
         raise AssertionError(f"浏览器 API 失败: {api_failures}")
 
 
+def _verify_conversation_history(page, artifacts_dir):
+    """New/switch/reload must preserve saved history and each page-local draft."""
+    from playwright.sync_api import expect
+
+    first_question = '角色停用后能否登录？'
+    answer = '依据当前资料，角色停用后不可登录。'
+    question_box = page.get_by_placeholder('针对当前项目资料提问…')
+    original = page.locator('.conversation-panel .el-menu-item').filter(has_text=first_question)
+    expect(original).to_be_visible()
+    question_box.fill('原会话未发送的草稿')
+    page.get_by_role('button', name='新建', exact=True).click()
+    expect(page.locator('.conversation-panel .el-menu-item')).to_have_count(2)
+    expect(question_box).to_have_value('')
+    expect(page.locator('.chat-message')).to_have_count(0)
+    question_box.fill('第二个会话的草稿')
+    original.click()
+    expect(question_box).to_have_value('原会话未发送的草稿')
+    expect(page.get_by_text(answer, exact=True)).to_be_visible()
+
+    # Delay the HTTP acknowledgement after the real temporary API has accepted
+    # the question. No real worker, external model, or socket is involved.
+    held = {}
+
+    def hold_post(route):
+        if route.request.method != 'POST':
+            route.continue_()
+            return
+        held['response'] = route.fetch()
+        held['route'] = route
+
+    pattern = '**/knowledge/conversations/*/messages/'
+    page.route(pattern, hold_post)
+    with patch('project_knowledge.tasks.execute_knowledge_task.delay', return_value=SimpleNamespace(id='offline-delayed-answer')):
+        question_box.fill('如何验证角色停用后的登录限制？')
+        page.get_by_role('button', name='提问', exact=True).click()
+        page.get_by_role('button', name='新建', exact=True).click()
+        expect(page.locator('.conversation-panel .el-menu-item')).to_have_count(3)
+        expect(question_box).to_have_value('')
+        question_box.fill('第三个会话仍需保留的草稿')
+        assert 'response' in held, 'Question was not accepted by the isolated API'
+        task_id = held['response'].json()['data']['task']['id']
+        held['route'].fulfill(response=held['response'])
+        page.unroute(pattern, hold_post)
+        expect(question_box).to_have_value('第三个会话仍需保留的草稿')
+        expect(page.locator('.chat-message')).to_have_count(0)
+        original.click()
+        expect(page.locator('.chat-panel .task-card')).to_contain_text('排队中')
+        expect(question_box).to_have_value('')
+        # Sync Playwright keeps an event loop on this thread. Run the fake
+        # worker's synchronous ORM calls outside that loop, as a real worker does.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(_inline_delay, task_id).result(timeout=15)
+        expect(page.locator('.chat-panel .task-card')).to_contain_text('已完成', timeout=15000)
+        expect(page.locator('.chat-message.assistant pre').filter(has_text=answer)).to_have_count(2)
+
+    page.locator('.conversation-panel .el-menu-item').nth(1).click()
+    expect(question_box).to_have_value('第二个会话的草稿')
+    page.locator('.conversation-panel .el-menu-item').nth(0).click()
+    expect(question_box).to_have_value('第三个会话仍需保留的草稿')
+    page.reload()
+    page.get_by_role('tab', name='知识问答').click()
+    original.click()
+    expect(page.locator('.chat-message')).to_have_count(4)
+    expect(page.locator('.chat-message.assistant pre').filter(has_text=answer)).to_have_count(2)
+    expect(page.locator('.chat-messages .el-loading-mask:visible')).to_have_count(0)
+    page.screenshot(path=str(artifacts_dir / 'qa-restored-history.png'), animations='disabled')
+
+
 def _assert_database(project):
     from project_knowledge.models import KnowledgeChunk, KnowledgeConversation, KnowledgeDocument, KnowledgeMessage, ManualTestCase
 
@@ -373,8 +443,10 @@ def _assert_database(project):
     case = ManualTestCase.objects.get(project=project)
     assert case.title == "停用角色不可登录（已编辑）"
     assert case.sources and case.sources[0]["id"] == str(chunk.id)
-    conversation = KnowledgeConversation.objects.get(project=project)
-    answer = KnowledgeMessage.objects.get(conversation=conversation, role="assistant")
+    assert KnowledgeConversation.objects.filter(project=project).count() == 3
+    conversation = KnowledgeConversation.objects.get(project=project, messages__role='user', messages__content='角色停用后能否登录？')
+    answer = KnowledgeMessage.objects.filter(conversation=conversation, role="assistant").first()
+    assert conversation.messages.count() == 4
     assert answer.content == "依据当前资料，角色停用后不可登录。"
     assert answer.sources and answer.sources[0]["id"] == str(chunk.id)
 
@@ -385,7 +457,7 @@ def main() -> int:
         "--artifacts-dir",
         type=Path,
         default=BACKEND_DIR / "logs" / "knowledge-browser-check",
-        help="保留三张成功截图和失败截图的 gitignored 目录",
+        help="保留成功截图和失败截图的 gitignored 目录",
     )
     args = parser.parse_args()
     artifacts_dir = args.artifacts_dir.resolve()

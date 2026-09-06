@@ -169,6 +169,11 @@ test("workspace uses the approved API scope and safe plain-text rendering", asyn
   assert.match(apiSource, /conversations\/\$\{conversationId\}\/messages\//);
   assert.match(apiSource, /tasks\/\$\{taskId\}\/retry-cleanup\//);
   assert.match(viewSource, /<pre v-text="message\.content">/);
+  assert.match(
+    viewSource,
+    /@select="\(id\) => selectConversation\(id\)"/,
+  );
+  assert.doesNotMatch(viewSource, /@select="selectConversation"/);
   assert.match(viewSource, /client_request_id: requestId\(\)/);
   assert.match(
     viewSource,

@@ -375,18 +375,31 @@
           <aside class="conversation-panel">
             <div class="section-heading">
               <h3>我的会话</h3>
-              <el-button text type="primary" @click="createConversation"
+              <el-button
+                text
+                type="primary"
+                :disabled="creatingConversation"
+                :loading="creatingConversation"
+                @click="createConversation"
                 >新建</el-button
               >
             </div>
             <el-menu
               :default-active="String(activeConversationId || '')"
-              @select="selectConversation"
+              @select="(id) => selectConversation(id)"
               ><el-menu-item
                 v-for="item in conversations"
                 :key="item.id"
                 :index="String(item.id)"
-                >{{ item.title || "未命名会话" }}</el-menu-item
+                ><span
+                  class="conversation-title"
+                  :title="conversationDisplayTitle(item)"
+                  >{{
+                    truncateConversationTitle(conversationDisplayTitle(item))
+                  }}</span
+                ><span class="conversation-time">{{
+                  formatTime(item.created_at)
+                }}</span></el-menu-item
               ></el-menu
             ><el-empty
               v-if="!conversations.length"
@@ -396,7 +409,8 @@
           </aside>
           <section class="chat-panel">
             <template v-if="activeConversationId"
-              ><div class="chat-messages">
+              ><div v-loading="messagesLoading" class="chat-messages">
+                <p v-if="messagesLoading" class="subtle">正在加载会话消息…</p>
                 <article
                   v-for="message in messages"
                   :key="message.id"
@@ -1008,6 +1022,16 @@ import {
   taskLabel,
   unwrap,
 } from "./workspace";
+import {
+  clearConversationDraftIfUnchanged,
+  conversationDisplayTitle,
+  createConversationRequestState,
+  getConversationDraft,
+  mergeConversationMessages,
+  setConversationDraft,
+  truncateConversationTitle,
+  upsertConversation,
+} from "./conversationState";
 
 const projectStore = useProjectStore();
 const selectedProject = computed(() => projectStore.currentProject);
@@ -1028,6 +1052,7 @@ const selectedManualCaseIds = ref([]);
 const conversations = ref([]);
 const activeConversationId = ref(null);
 const messages = ref([]);
+const messagesLoading = ref(false);
 const generationTask = ref(null);
 const generationTasks = ref([]);
 const selectedGenerationTaskId = ref(null);
@@ -1085,12 +1110,23 @@ const manualCaseEdit = reactive({
   steps: [],
   pendingQuestionsText: "",
 });
-const question = ref("");
+const questionDrafts = reactive(new Map());
+const question = computed({
+  get: () => getConversationDraft(questionDrafts, activeConversationId.value),
+  set: (value) =>
+    setConversationDraft(questionDrafts, activeConversationId.value, value),
+});
 const questionDocumentIds = ref([]);
 const questionModelId = ref(null);
-const asking = ref(false);
+const askingConversationIds = ref(new Set());
+const asking = computed(() =>
+  askingConversationIds.value.has(String(activeConversationId.value || "")),
+);
+const creatingConversation = ref(false);
 const pollers = new Map();
+const conversationRequestState = createConversationRequestState();
 let epoch = 0;
+let conversationListRequestVersion = 0;
 
 const canEdit = computed(() => options.enabled && options.can_edit);
 const filteredDocuments = computed(() => {
@@ -1274,9 +1310,14 @@ async function loadConversations(
   expectedProjectId = projectId.value,
 ) {
   if (!expectedProjectId) return;
+  const requestVersion = ++conversationListRequestVersion;
   try {
     const result = await getProjectKnowledgeConversations(expectedProjectId);
-    if (!current(token, expectedProjectId)) return;
+    if (
+      !current(token, expectedProjectId) ||
+      requestVersion !== conversationListRequestVersion
+    )
+      return false;
     conversations.value = listItems(result);
     if (!activeConversationId.value && conversations.value[0])
       await selectConversation(
@@ -1284,9 +1325,11 @@ async function loadConversations(
         token,
         expectedProjectId,
       );
+    return true;
   } catch (error) {
     if (current(token, expectedProjectId))
       ElMessage.error(errorMessage(error, "加载我的会话失败"));
+    return false;
   }
 }
 async function loadMessages(
@@ -1295,19 +1338,25 @@ async function loadMessages(
   expectedProjectId = projectId.value,
 ) {
   if (!conversationId || !expectedProjectId) return;
+  const request = conversationRequestState.startMessageLoad(conversationId);
+  const canApply = () =>
+    current(token, expectedProjectId) &&
+    conversationRequestState.canApplyMessageLoad(
+      request,
+      activeConversationId.value,
+    );
+  if (canApply()) messagesLoading.value = true;
   try {
     const result = await getProjectKnowledgeMessages(
       expectedProjectId,
       conversationId,
     );
-    if (
-      current(token, expectedProjectId) &&
-      String(activeConversationId.value) === String(conversationId)
-    )
-      messages.value = listItems(result);
+    if (canApply()) messages.value = listItems(result);
   } catch (error) {
-    if (current(token, expectedProjectId))
+    if (canApply())
       ElMessage.error(errorMessage(error, "加载会话消息失败"));
+  } finally {
+    if (canApply()) messagesLoading.value = false;
   }
 }
 async function loadTasks(token = epoch, expectedProjectId = projectId.value) {
@@ -1380,6 +1429,7 @@ function resetProjectState() {
   manualCases.value = [];
   conversations.value = [];
   messages.value = [];
+  messagesLoading.value = false;
   activeConversationId.value = null;
   generationTask.value = null;
   generationTasks.value = [];
@@ -1391,7 +1441,7 @@ function resetProjectState() {
   retryingCleanupTaskId.value = null;
   selectedDraftIds.value = [];
   selectedManualCaseIds.value = [];
-  question.value = "";
+  questionDrafts.clear();
   questionDocumentIds.value = [];
   questionModelId.value = null;
   uploadVisible.value = false;
@@ -1412,7 +1462,10 @@ function resetProjectState() {
   savingDocument.value = false;
   generating.value = false;
   savingManualCase.value = false;
-  asking.value = false;
+  askingConversationIds.value = new Set();
+  creatingConversation.value = false;
+  conversationRequestState.reset();
+  conversationListRequestVersion += 1;
   Object.keys(sectionCache).forEach((key) => delete sectionCache[key]);
 }
 function pollTask(task, token = epoch, expectedProjectId = projectId.value) {
@@ -1536,11 +1589,8 @@ async function completeTask(task, token, expectedProjectId) {
     await loadCases(token, expectedProjectId);
     applyTask(task);
   }
-  if (
-    task.kind === "answer" &&
-    taskConversationId(task) === String(activeConversationId.value)
-  )
-    await loadMessages(activeConversationId.value, token, expectedProjectId);
+  if (task.kind === "answer" && taskConversationId(task))
+    await loadMessages(taskConversationId(task), token, expectedProjectId);
 }
 
 function openUpload() {
@@ -1980,8 +2030,11 @@ async function exportCases() {
 }
 
 async function createConversation() {
+  if (creatingConversation.value) return;
   const scope = requestScope();
   if (!scope.projectId) return;
+  const selectionAtCreate = conversationRequestState.selectionVersion();
+  creatingConversation.value = true;
   try {
     const result = unwrap(
       await createProjectKnowledgeConversation(scope.projectId, {
@@ -1989,12 +2042,19 @@ async function createConversation() {
       }),
     );
     if (!scopeIsCurrent(scope)) return;
+    conversations.value = upsertConversation(conversations.value, result);
     await loadConversations(scope.token, scope.projectId);
-    if (!scopeIsCurrent(scope)) return;
+    if (
+      !scopeIsCurrent(scope) ||
+      !conversationRequestState.shouldAutoSelectCreated(selectionAtCreate)
+    )
+      return;
     await selectConversation(String(result.id), scope.token, scope.projectId);
   } catch (error) {
     if (scopeIsCurrent(scope))
       ElMessage.error(errorMessage(error, "新建会话失败"));
+  } finally {
+    if (scopeIsCurrent(scope)) creatingConversation.value = false;
   }
 }
 async function selectConversation(
@@ -2003,7 +2063,14 @@ async function selectConversation(
   expectedProjectId = projectId.value,
 ) {
   if (!current(token, expectedProjectId)) return;
+  const isConversationChange =
+    String(activeConversationId.value) !== String(id);
+  conversationRequestState.select();
   activeConversationId.value = id;
+  if (isConversationChange) {
+    messages.value = [];
+    messagesLoading.value = true;
+  }
   syncAnswerTaskForConversation();
   await loadMessages(id, token, expectedProjectId);
 }
@@ -2029,7 +2096,10 @@ async function askQuestion() {
   const selectedDocumentIds = [...questionDocumentIds.value];
   const modelConfigId = questionModelId.value;
   if (!scope.projectId || !conversationId) return;
-  asking.value = true;
+  askingConversationIds.value = new Set([
+    ...askingConversationIds.value,
+    String(conversationId),
+  ]);
   try {
     const payload = {
       question: questionText,
@@ -2044,35 +2114,42 @@ async function askQuestion() {
         payload,
       ),
     );
-    if (
-      !scopeIsCurrent(scope) ||
-      String(activeConversationId.value) !== String(conversationId)
-    )
-      return;
+    if (!scopeIsCurrent(scope)) return;
     const task = response.task || response;
     applyTask(task);
     const createdMessages = [
       response.user_message,
       response.assistant_message,
     ].filter(Boolean);
-    if (createdMessages.length) {
-      messages.value = [
-        ...new Map(
-          [...messages.value, ...createdMessages].map((item) => [
-            item.id,
-            item,
-          ]),
-        ).values(),
-      ];
+    conversationRequestState.invalidateMessages(conversationId);
+    const conversation = conversations.value.find(
+      (item) => String(item.id) === String(conversationId),
+    );
+    if (conversation && !conversation.first_question)
+      conversation.first_question = questionText;
+    conversationListRequestVersion += 1;
+    if (String(activeConversationId.value) === String(conversationId)) {
+      if (createdMessages.length)
+        messages.value = mergeConversationMessages(messages.value, createdMessages);
+      void loadMessages(conversationId, scope.token, scope.projectId);
     }
-    question.value = "";
+    clearConversationDraftIfUnchanged(
+      questionDrafts,
+      conversationId,
+      questionText,
+    );
     ElMessage.info("问答已排队，引用将在任务完成后核对。");
     pollTask(task, scope.token, scope.projectId);
   } catch (error) {
     if (scopeIsCurrent(scope))
       ElMessage.error(errorMessage(error, "提交问题失败"));
   } finally {
-    if (scopeIsCurrent(scope)) asking.value = false;
+    if (scopeIsCurrent(scope))
+      askingConversationIds.value = new Set(
+        [...askingConversationIds.value].filter(
+          (id) => id !== String(conversationId),
+        ),
+      );
   }
 }
 async function cancelTask(task) {
@@ -2293,6 +2370,26 @@ onUnmounted(clearPollers);
 }
 .conversation-panel .el-menu {
   border-right: 0;
+}
+.conversation-panel .el-menu-item {
+  display: flex;
+  height: auto;
+  min-height: 44px;
+  line-height: 1.4;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  flex-direction: column;
+  align-items: stretch;
+}
+.conversation-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-time {
+  margin-top: 2px;
+  color: var(--app-text-secondary);
+  font-size: 12px;
 }
 .chat-panel {
   display: flex;

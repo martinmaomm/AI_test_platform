@@ -14,7 +14,7 @@ from ai_core.models import LLMConfiguration, ModelType
 from projects.knowledge.models import KnowledgeBaseFile
 from projects.models import Project, ProjectMember, UploadedFile
 from project_knowledge.models import (DocumentRevision, KnowledgeChunk,
-                                      KnowledgeConversation, KnowledgeDocument,
+                                      KnowledgeConversation, KnowledgeDocument, KnowledgeMessage,
                                       KnowledgeTask, ManualTestCase)
 from project_knowledge.serializers import (DocumentCreateSerializer,
                                            DocumentUpdateSerializer,
@@ -22,7 +22,7 @@ from project_knowledge.serializers import (DocumentCreateSerializer,
                                            KnowledgeChunkSerializer,
                                            ManualTestCaseSerializer,
                                            MAX_KNOWLEDGE_FILE_SIZE)
-from project_knowledge.views import (CaseGenerationView, MessageListView,
+from project_knowledge.views import (CaseGenerationView, MessageListView, ConversationListView,
                                      DocumentSectionsView, KnowledgeOptionsView,
                                      SourceDetailView, TaskCancelView,
                                      CaseGenerationSaveView, DocumentListView,
@@ -156,6 +156,38 @@ class ProjectKnowledgeApiTests(TestCase):
         self.assertEqual([response.status_code for response in responses], [202, 202, 409])
         self.assertEqual(conversation.messages.filter(role='user').count(), 1)
         self.assertEqual(conversation.messages.filter(role='assistant').count(), 1)
+
+    def test_creating_another_conversation_preserves_messages_and_identifiable_history(self):
+        original = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        question = '角色停用后可以登录吗？'
+        payload = {'question': question, 'model_config_id': self.model.id, 'client_request_id': 'preserve-history'}
+        with patch('project_knowledge.tasks.execute_knowledge_task.delay'):
+            accepted = MessageListView.as_view()(self._request('post', '/', payload), project_id=self.project.id, conversation_id=original.id)
+        self.assertEqual(accepted.status_code, 202, accepted.data)
+        before = list(original.messages.values_list('id', 'content'))
+        created = ConversationListView.as_view()(self._request('post', '/', {'title': '新建知识问答'}), project_id=self.project.id)
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data['data']['first_question'], '')
+        self.assertEqual(list(original.messages.values_list('id', 'content')), before)
+        history = ConversationListView.as_view()(self._request('get', '/'), project_id=self.project.id)
+        rows = {row['id']: row for row in history.data['data']['items']}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[str(original.id)]['first_question'], question)
+        self.assertEqual(rows[created.data['data']['id']]['first_question'], '')
+        restored = MessageListView.as_view()(self._request('get', '/'), project_id=self.project.id, conversation_id=original.id)
+        self.assertEqual(restored.data['data']['items'][0]['content'], question)
+        self.assertEqual(len(restored.data['data']['items']), 2)
+
+    def test_conversation_previews_do_not_expose_another_users_questions(self):
+        private = KnowledgeConversation.objects.create(project=self.project, created_by=self.viewer)
+        KnowledgeMessage.objects.create(conversation=private, role='user', content='private question')
+        own = KnowledgeConversation.objects.create(project=self.project, created_by=self.user)
+        KnowledgeMessage.objects.create(conversation=own, role='assistant', content='not the question')
+        KnowledgeMessage.objects.create(conversation=own, role='user', content='first question')
+        KnowledgeMessage.objects.create(conversation=own, role='user', content='second question')
+        result = ConversationListView.as_view()(self._request('get', '/'), project_id=self.project.id)
+        self.assertEqual([row['id'] for row in result.data['data']['items']], [str(own.id)])
+        self.assertEqual(result.data['data']['items'][0]['first_question'], 'first question')
 
     def test_hashing_upload_rewinds_before_shared_service_reads_it(self):
         file = SimpleUploadedFile('rules.md', b'# rules\nread after hash')

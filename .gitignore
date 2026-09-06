@@ -6,6 +6,7 @@
 backend/.env
 backend/db.sqlite3
 backend/chroma_db/
+backend/project_knowledge_chroma_db/
 
 # 2. 运行时生成的缓存与工作区 (可以删，系统会自动重建，严禁上传)
 backend/.idea/

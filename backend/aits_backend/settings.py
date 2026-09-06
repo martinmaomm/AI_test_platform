@@ -129,7 +129,7 @@ CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 CELERY_WORKER_LOG_FILE = os.path.join(LOGS_DIR, 'celery.log')
 
 # Celery Beat Configuration
-CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+CELERY_BEAT_SCHEDULER = 'scheduled_tasks.beat_health:BeatHealthDatabaseScheduler'
 CELERY_BEAT_SCHEDULE = {
     # 可以在这里定义一些默认的定时任务
 }

@@ -76,6 +76,15 @@ export const getTaskExecutionLogs = async (projectId, taskId, params = {}) => {
 
 // ============ 辅助接口相关 ============
 
+// Beat 自身心跳检测，不依赖 worker 是否在线。
+export const getScheduledServiceStatus = async (projectId, signal) => {
+  const response = await api.get(`/projects/${projectId}/scheduled-tasks/service-status/`, {
+    signal,
+    timeout: 10000
+  })
+  return response.data
+}
+
 // 获取测试套件选择列表
 export const getSuiteChoices = async (projectId) => {
   const response = await api.get(`/projects/${projectId}/scheduled-tasks/suite-choices/`)

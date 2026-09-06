@@ -15,6 +15,7 @@ router.register(r'task-detail', views.ScheduledTaskDetailView, basename='schedul
 
 # URL模式
 urlpatterns = [
+    path('service-status/', views.ServiceStatusView.as_view(), name='service-status'),
     # 定时任务管理
     path('tasks/', views.ScheduledTaskListCreateView.as_view(), name='task-list-create'),
     path('tasks/<int:pk>/', views.ScheduledTaskDetailView.as_view(), name='task-detail'),
@@ -30,4 +31,3 @@ urlpatterns = [
     path('suite-choices/', views.SuiteChoicesView.as_view(), name='suite-choices'),
     path('statistics/', views.task_statistics, name='task-statistics'),
 ]
-

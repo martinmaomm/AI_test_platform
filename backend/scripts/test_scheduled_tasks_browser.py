@@ -55,6 +55,21 @@ def verify(origin, fixture, output):
         page.on('pageerror', lambda error: errors.append(str(error)))
         try:
             page.goto(origin + '/web-testing/scheduled-tasks')
+            # Empty isolated cache means no Beat heartbeat, not worker state.
+            expect(page.get_by_text('定时任务服务未启动或已离线', exact=True)).to_be_visible()
+            expect(page.get_by_role('button', name='创建任务', exact=True)).to_be_enabled()
+            expect(page.locator('.scheduled-tasks-card .el-loading-mask')).not_to_be_visible()
+            page.screenshot(path=str(output / 'beat-offline.png'), full_page=True, animations='disabled')
+            health = {'http_status': 503, 'status': 'unknown'}
+            page.route('**/scheduled-tasks/service-status/', lambda route: route.fulfill(
+                status=health['http_status'], json={'success': True, 'data': {'status': health['status']}},
+            ))
+            page.get_by_role('button', name='重新检测', exact=True).click()
+            expect(page.get_by_text('定时任务服务状态检测失败', exact=True)).to_be_visible()
+            expect(page.get_by_text('定时任务服务未启动或已离线', exact=True)).to_have_count(0)
+            health.update(http_status=200, status='online')
+            page.get_by_role('button', name='重新检测', exact=True).click()
+            expect(page.get_by_text('定时任务服务状态检测失败', exact=True)).to_have_count(0)
             page.get_by_role('button', name='创建任务', exact=True).click()
             dialog = page.get_by_role('dialog', name='创建定时任务')
             expect(dialog).to_be_visible()
@@ -135,7 +150,7 @@ def main():
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
-    print('PASS: isolated Web/API schedule forms, automatic choices, suite order and load failure')
+    print('PASS: isolated Web/API schedule forms, suite order, load failure and Beat offline/unknown/recovery banner')
 
 
 if __name__ == '__main__':

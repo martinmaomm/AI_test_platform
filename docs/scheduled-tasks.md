@@ -35,10 +35,21 @@ celery -A aits_backend worker --loglevel=info --pool=solo
 另开一个终端，激活同一虚拟环境：
 
 ```bash
-celery -A aits_backend beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler --logfile=logs/celery-beat.log
+celery -A aits_backend beat --loglevel=info --logfile=logs/celery-beat.log
 ```
 
 同一数据库只运行一个 Beat。启动 Beat 会实际执行已启用的任务，请先确认任务的套件和执行时间。暂停任务不会自动执行。未运行 Beat 时仍可手动触发，但不会到点自动运行。
+
+### 页面服务状态检测
+
+Beat 的项目默认调度器继承数据库调度器，在调度循环正常完成后每 10 秒向共享 Redis 缓存记录心跳；页面可见时每 15 秒检测，离开页面或隐藏标签页后停止轮询。
+
+- 没有心跳或心跳超过 60 秒：显示“定时任务服务未启动或已离线”。正常停止后通常在约 60–75 秒内显示提示。
+- 收到新心跳：自动收起提示，也可点击“重新检测”。
+- 检测接口或 Redis 出错：显示“定时任务服务状态检测失败”，不误报为确定离线。
+- 心跳只说明 Beat 调度循环近期在运行，不代表 worker、被测网站正常，也不保证任务已执行成功。提示不禁用编辑、保存和手动执行。
+
+**升级后重启后端和 Beat，无需新增迁移或依赖。旧启动命令中的 `--scheduler django_celery_beat.schedulers:DatabaseScheduler` 必须移除**，否则会绕过项目默认调度器，无法上报心跳。使用上方不带 `--scheduler` 的命令。不要同时保留旧 Beat 再启动新实例。
 
 本次防重入针对同一个计划任务，不是全平台分布式串行队列。当前部署继续使用一个 `--pool=solo` worker，可使不同任务在同一 worker 顺序处理；不要把多 worker 当成已实现全平台严格串行。进程被强杀、消息丢失等情况不自动重复执行有副作用的脚本，需要检查执行记录与服务状态后人工处理。
 
@@ -47,6 +58,8 @@ celery -A aits_backend beat --loglevel=info --scheduler django_celery_beat.sched
 自动回归使用隔离 SQLite、模拟队列和本机临时页面；不连接 NAS、Redis、AI、通知渠道或被测网站。真实数据库迁移与 Beat 启动交由用户完成。
 
 2026-09-06 验收：后端 378 项回归、前端 127 项单测、前端生产构建通过；计划任务表单及原生报告两套隔离浏览器验收通过。Schema 漂移检查通过。SQLite 测试验证了串行状态与防重入分支，未替代 MariaDB 多进程锁竞争实测，也未实际启动 Beat。
+
+同日服务检测增量验收：后端 390 项回归、前端 133 项单测及生产构建通过；隔离浏览器验证无心跳警告、接口异常提示和恢复后收起提示。未启动实际 Beat，也未读写真实 Redis。
 
 - UI 项目打开创建弹窗即显示已有套件，且无测试类型/环境下拉框。
 - API 项目仅显示 API 套件并要求合法环境。

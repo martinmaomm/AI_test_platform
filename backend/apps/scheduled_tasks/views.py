@@ -23,6 +23,7 @@ from .serializers import (
     SuiteChoiceSerializer
 )
 from .contracts import get_schedule_project, suite_model
+from .beat_health import get_beat_service_status
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,20 @@ class ScheduleProjectMixin:
         context = super().get_serializer_context()
         context['project'] = self.get_schedule_project()
         return context
+
+
+class ServiceStatusView(APIView):
+    """Return the project-authorized Celery Beat status without changing state."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, project_id):
+        get_schedule_project(project_id, request.user, 'read')
+        return response(
+            kind='success',
+            data=get_beat_service_status(),
+            message='获取计划任务服务状态成功',
+        )
 
 
 class ScheduledTaskListCreateView(ScheduleProjectMixin, generics.ListCreateAPIView):

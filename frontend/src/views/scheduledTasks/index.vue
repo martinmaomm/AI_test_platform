@@ -1,5 +1,6 @@
 <template>
   <div class="scheduled-tasks-container" v-if="selectedProject">
+    <ScheduledServiceStatus :project-id="selectedProject.id" />
     <!-- 项目选择提示 -->
     <el-alert v-if="!selectedProject" title="请先选择一个项目" type="info" :closable="false" show-icon
       style="margin-bottom: 20px;">
@@ -288,6 +289,7 @@ import {
 } from '../../api/scheduledTasks'
 import TaskEditDialog from '../../components/scheduledTasks/TaskEditDialog.vue'
 import TaskDetailDialog from '../../components/scheduledTasks/TaskDetailDialog.vue'
+import ScheduledServiceStatus from '../../components/scheduledTasks/ScheduledServiceStatus.vue'
 import { useProjectStore } from '@/stores/project'
 import { maskEmailList } from '@/utils/mask'
 import cronstrue from 'cronstrue/i18n'

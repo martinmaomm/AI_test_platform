@@ -28,6 +28,7 @@ urlpatterns = [
     # API路由
     # 项目模块（内部继续分发子路由）
     path('api/v1/projects/', include('projects.urls')),
+    path('api/v1/projects/<int:project_id>/knowledge/', include('project_knowledge.urls')),
     
     path('api/v1/projects/<int:project_id>/api-testing/', include('api_testing.urls')),
     path('api/v1/ai-core/', include('ai_core.urls')),

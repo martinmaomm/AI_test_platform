@@ -52,7 +52,15 @@ INSTALLED_APPS = [
     'web_testing',
     'scheduled_tasks',
     'notifications',
+    'project_knowledge',
 ]
+
+# 独立知识应用；关闭后禁止提交新任务，不影响原 API RAG 或 WebUI 脚本。
+PROJECT_KNOWLEDGE_ENABLED = os.getenv('AITS_PROJECT_KNOWLEDGE_ENABLED', 'true').lower() == 'true'
+try:
+    PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = min(1500, max(30, int(os.getenv('AITS_KNOWLEDGE_TOTAL_TIMEOUT_SECONDS', '1200'))))
+except (TypeError, ValueError):
+    PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = 1200
 
 # Custom User Model
 AUTH_USER_MODEL = 'users.User'

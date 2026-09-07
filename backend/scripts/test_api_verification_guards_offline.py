@@ -52,9 +52,11 @@ def main():
             return value
 
         def exercise(outputs, *, http_status=200, after_model=None):
+            parent = APIWorkspace.objects.create(owner=owner, project_id=fixture['project_id'])
             workspace = APIWorkspace.objects.create(
                 owner=owner, project_id=fixture['project_id'], model_id=fixture['model_id'],
                 spec_id=fixture['spec_id'], endpoint_ids=[fixture['endpoint_id']],
+                parent=parent, scenario_order=1, scenario_description='单场景边界独立验收',
             )
             with patch.object(generate_and_verify_api_workspace, 'apply_async') as queue:
                 reply = APIWorkspaceMessagesView.as_view()(
@@ -190,6 +192,22 @@ def main():
             guarded, prompts, sent = exercise([invalid])
             assert not sent and guarded.generation['status'] != 'passed', (mutation, guarded.generation)
 
+        # Parseable static-invalid output must remain visible and be the actual
+        # next repair input, without issuing HTTP for the invalid first round.
+        no_assertions = draft()
+        no_assertions['teststeps'][0]['validate'] = []
+        static_fixed, prompts, sent = exercise([no_assertions, draft()])
+        assert static_fixed.generation['status'] == 'passed', static_fixed.generation
+        assert len(prompts) == 2 and len(sent) == 1
+        assert prompts[1]['current_draft']['teststeps'][0]['validate'] == []
+        assert static_fixed.generation['rounds'][0]['draft']['teststeps'], 'Static-invalid candidate was discarded'
+        assert not static_fixed.generation['rounds'][0]['result'].get('step_datas'), 'Static-invalid candidate ran HTTP'
+        assert prompts[1]['failure_evidence'], 'Repair did not receive the validation error'
+        malformed = {'version': 1, 'config': 42, 'teststeps': [None, 42]}
+        recovered, prompts, sent = exercise([malformed, draft()])
+        assert recovered.generation['status'] == 'passed', recovered.generation
+        assert len(sent) == 1 and prompts[1]['current_draft'] == malformed
+
         for code in (401, 403, 503):
             blocked, prompts, sent = exercise([draft()], http_status=code)
             assert blocked.generation['status'] == 'needs_review', blocked.generation
@@ -238,6 +256,25 @@ def main():
         assert sequential_result['success'], sequential_result
         assert [entry['method'] for entry in sequential_requests] == ['POST', 'GET']
         assert sequential_requests[1]['headers']['authorization'] == 'Bearer fixture-token'
+
+        # Common headers with a supplied variable must be substituted too, not
+        # sent literally as Bearer ${token}. The exporter embeds this runtime.
+        global_header_case = draft()
+        global_header_case['config']['variables'] = {'token': 'provided-fixture-token'}
+        global_header_case['config']['headers'] = {'Authorization': 'Bearer ${token}'}
+        global_sent = []
+
+        def global_response(**kwargs):
+            global_sent.append(kwargs)
+            reply = Response()
+            reply.status_code, reply._content = 200, b'{"state":"ok"}'
+            reply.headers, reply.url, reply.elapsed = {}, kwargs['url'], timedelta(milliseconds=1)
+            return reply
+
+        with patch('api_testing.requests_runtime.requests.Session', return_value=SimpleNamespace(request=global_response, close=lambda: None)):
+            global_result = run_case('global-header-acceptance', json.dumps(global_header_case))
+        assert global_result['success'], global_result
+        assert global_sent[0]['headers']['Authorization'] == 'Bearer provided-fixture-token'
 
         def disable_model(workspace):
             LLMConfiguration.objects.filter(pk=fixture['model_id']).update(is_active=False)

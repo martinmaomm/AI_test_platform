@@ -69,10 +69,12 @@ def bootstrap(root):
     endpoint = APIEndpoint.objects.create(spec=spec, path='/health', method='GET', summary='健康检查', responses=metadata['paths']['/health']['get']['responses'])
     model = LLMConfiguration.objects.create(created_by=user, provider='openai', provider_name='离线模拟',
                                              model_name='fixture-model', api_key='fixture-only', base_url='https://never-called.invalid')
+    alternate = LLMConfiguration.objects.create(created_by=user, provider='openai', provider_name='离线备用',
+                                                 model_name='fixture-alternate', api_key='fixture-only', base_url='https://never-called.invalid')
     LLMConfiguration.objects.create(created_by=user, provider='openai', model_name='disabled-fixture', is_active=False)
     LLMConfiguration.objects.create(created_by=user, provider='openai', model_name='vision-fixture', model_type='vision')
     return {'token': str(AccessToken.for_user(user)), 'user_id': user.pk, 'project_id': project.pk,
-            'endpoint_id': endpoint.pk, 'model_id': model.pk, 'spec_id': spec.pk}
+            'endpoint_id': endpoint.pk, 'model_id': model.pk, 'alternate_model_id': alternate.pk, 'spec_id': spec.pk}
 
 
 def confirm_generation(page, base_url='https://example.test'):
@@ -125,15 +127,15 @@ def verify(origin, fixture, output):
             expect(page.get_by_role('option').filter(has_text='disabled-fixture')).to_have_count(0)
             expect(page.get_by_role('option').filter(has_text='vision-fixture')).to_have_count(0)
             page.get_by_role('option').filter(has_text='fixture-model').click()
-            message = page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。')
+            message = page.get_by_role('textbox', name='描述测试目标', exact=True)
             expect(message).to_be_visible()
             message.fill('生成健康检查，验证 HTTP 状态码为 200')
-            page.get_by_role('button', name='生成并验证', exact=True).click()
+            page.get_by_role('button', name='生成并验证全流程', exact=True).click()
             confirm_generation(page)
             if fixture.get('generation_gate') is not None:
-                verification = page.get_by_test_id('api-generation-verification')
-                expect(verification).to_contain_text('正在生成候选', timeout=15000)
-                expect(page.get_by_role('button', name='生成并验证', exact=True)).to_be_disabled()
+                verification = page.get_by_test_id('api-workspace-overview')
+                expect(verification).to_contain_text('规划', timeout=15000)
+                expect(page.get_by_role('button', name='生成并验证全流程', exact=True)).to_be_disabled()
                 assert database(APITestCase.objects.count) == 0
                 page.screenshot(path=str(output / 'generation-running.png'), full_page=True)
                 fixture['generation_gate'].set()
@@ -141,7 +143,7 @@ def verify(origin, fixture, output):
             expect(adopt).to_be_visible(timeout=15000)
             verification = page.get_by_test_id('api-generation-verification')
             expect(verification).to_contain_text('已验证通过')
-            generated = database(APIWorkspace.objects.get)
+            generated = database(lambda: APIWorkspace.objects.get(parent__isnull=False))
             assert generated.generation['status'] == 'passed', generated.generation
             assert len(generated.generation['rounds']) == 2, generated.generation
             first_result = generated.generation['rounds'][0]['result']
@@ -168,7 +170,7 @@ def verify(origin, fixture, output):
             exported = Path(download.value.path()).read_text(encoding='utf-8')
             compile(exported, '<browser-export>', 'exec')
             expect(page.locator('pre.code')).to_contain_text('body.state')
-            assert database(APIWorkspace.objects.get).debug_result['success'] is True
+            assert database(lambda: APIWorkspace.objects.get(pk=generated.pk)).debug_result['success'] is True
             execute_debug(page)
             expect(page.locator('.debug-panel').last).to_contain_text('200', timeout=15000)
 
@@ -196,7 +198,10 @@ def verify(origin, fixture, output):
             saved = database(APITestCase.objects.get)
             assert json.loads(saved.script_content)['teststeps'][0]['extract']['health'] == 'body.state'
             page.reload()
-            expect(page.get_by_text('生成健康检查，验证 HTTP 状态码为 200', exact=True)).to_be_visible(timeout=15000)
+            history = page.locator('.requirement-history')
+            expect(history).to_be_visible(timeout=15000)
+            history.locator('summary').click()
+            expect(history).to_contain_text('生成健康检查，验证 HTTP 状态码为 200')
             expect(page.locator('.debug-panel').last).to_contain_text('200')
             page.screenshot(path=str(output / 'workspace-ready.png'), full_page=True)
             execution_response = page.request.post(
@@ -215,8 +220,8 @@ def verify(origin, fixture, output):
             database(lambda: LLMConfiguration.objects.filter(pk=fixture['model_id']).update(is_active=False))
             page.goto(workspace_url)
             expect(page.get_by_text('此工作区原先选择的模型已禁用、类型不匹配或不再可用；请重新选择可用聊天模型后再发起 AI 对话。', exact=True)).to_be_visible(timeout=15000)
-            page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。').fill('模型禁用后不能偷偷改用其他模型')
-            expect(page.get_by_role('button', name='生成并验证', exact=True)).to_be_disabled()
+            page.get_by_role('textbox', name='描述测试目标', exact=True).fill('模型禁用后不能偷偷改用其他模型')
+            expect(page.get_by_role('button', name='生成并验证全流程', exact=True)).to_be_disabled()
             page.screenshot(path=str(output / 'disabled-model.png'), full_page=True)
             page.goto(origin + '/api-testing/function-navigation')
             expect(page.get_by_role('heading', name='API 对话工作区')).to_be_visible(timeout=15000)
@@ -252,6 +257,14 @@ def main():
                 raise RuntimeError('Browser test did not release the isolated model gate')
             payload = next(json.loads(item.content) for item in messages if item.content.lstrip().startswith('{'))
             fixture.setdefault('model_prompts', []).append(payload)
+            if payload.get('stage') == 'plan':
+                answer = json.dumps({'summary': '独立健康检查场景', 'scenarios': fixture.get('planned_scenarios') or [
+                    {'title': '健康检查', 'description': '验证 HTTP 状态码 200 和响应状态',
+                     'endpoint_ids': [fixture['endpoint_id']]},
+                ]})
+                if callback:
+                    callback(answer)
+                return answer
             if payload['failure_evidence']:
                 draft = deepcopy(payload['current_draft'])
                 draft['teststeps'][0]['extract'] = {'health': 'body.state'}

@@ -14,11 +14,13 @@
           <p>可视化编排请求步骤；AI 只提供候选，执行和保存均需明确发起。</p>
         </div>
         <div class="header-actions">
+          <label class="workspace-select-label" for="current-workspace-select">当前工作区</label>
           <el-select
+            id="current-workspace-select"
             v-model="workspaceId"
-            filterable
+            class="workspace-select"
             :disabled="interactionLocked"
-            placeholder="选择工作区"
+            placeholder="当前工作区"
             @change="selectWorkspace"
             ><el-option
               v-for="item in workspaces"
@@ -28,6 +30,9 @@
           /></el-select>
           <el-button :disabled="interactionLocked" @click="createWorkspace"
             >新建工作区</el-button
+          >
+          <el-button :disabled="interactionLocked" @click="managerDialog = true"
+            >管理工作区</el-button
           >
           <el-button
             :loading="loading"
@@ -50,10 +55,32 @@
           ></template
         >
       </el-alert>
-      <main v-if="workspaceReady" class="workspace-grid">
-        <aside class="context-panel">
+      <main v-if="workspaceReady" class="workspace-main">
+        <ScenarioOverview
+          v-if="!hasSavedRootCase || rootWorkspace?.scenarios?.length"
+          :root="rootWorkspace || workspace"
+          :endpoint-options="endpointOptions"
+          :selected-scenario-id="activeScenarioId"
+          :root-prompt="rootPrompt"
+          :active-dirty="draftDirty && editingScenario"
+          :prompt-disabled="interactionLocked"
+          :generation-disabled="generationDisabled"
+          @update:root-prompt="rootPrompt = $event"
+          @generate="prepareRootGeneration"
+          @edit-root-context="focusRootContext"
+          @select="selectScenario"
+        />
+        <div class="workspace-grid">
+          <aside ref="contextPanel" class="context-panel">
           <el-card shadow="never">
-            <template #header><strong>上下文与模型</strong></template>
+            <template #header><strong>根工作区范围与模型</strong></template>
+            <el-alert
+              v-if="editingScenario"
+              title="这里编辑的是根工作区的规划范围，不会改动当前子场景的接口范围或模型。"
+              type="info"
+              :closable="false"
+              show-icon
+            />
             <el-form label-position="top" size="small">
               <el-form-item label="模型"
                 ><el-select
@@ -165,14 +192,63 @@
                 type="primary"
                 plain
                 :disabled="interactionLocked || !contextDirty"
-                @click="saveDraft"
-                >保存草稿与上下文</el-button
+                @click="saveRootContext"
+                >保存工作区设置</el-button
               >
             </el-form>
           </el-card>
         </aside>
-        <section class="editor-panel">
+          <section class="editor-panel">
+          <el-alert
+            v-if="!editorAvailable"
+            title="根工作区用于规划多个独立场景。场景计划生成后，请从上方列表选择一个子场景查看草稿、候选、日志、调试和 Python 导出。"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+          <template v-else>
+          <el-alert
+            v-if="editingScenario"
+            :title="`正在编辑子场景：${workspace.title || `场景 #${workspace.id}`}。其草稿、候选、调试和保存均独立于根工作区。`"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+          <el-card v-if="editingScenario" shadow="never" class="scenario-model-settings">
+            <template #header><strong>子场景模型</strong></template>
+            <p class="hint">模型仅用于当前子场景后续修复；不会影响根工作区或其他场景。</p>
+            <el-select
+              v-model="scenarioModelId"
+              clearable
+              filterable
+              :disabled="interactionLocked || draftDirty"
+              placeholder="明确选择当前子场景的可用聊天模型"
+              style="width: 100%"
+              @change="scenarioModelDirty = true"
+            >
+              <el-option
+                v-for="model in models"
+                :key="model.id"
+                :value="model.id"
+                :label="modelLabel(model)"
+              />
+            </el-select>
+            <el-button
+              size="small"
+              plain
+              :disabled="interactionLocked || draftDirty || !scenarioModelDirty"
+              @click="saveScenarioModel"
+            >保存子场景模型</el-button>
+          </el-card>
+          <el-alert
+            v-if="editingScenario && scenarioModelDirty"
+            title="子场景模型尚未保存；请先保存后再重新生成或修复，避免使用旧模型执行。"
+            type="warning"
+            :closable="false"
+            show-icon
+          />
           <WorkspaceConversation
+            v-if="editingScenario || hasSavedRootCase"
             ref="conversationRef"
             :messages="workspace.messages || []"
             :candidate="workspace.candidate"
@@ -180,8 +256,12 @@
             :status="status"
             :busy="interactionLocked"
             :disabled="conflict"
-            :generation-disabled="generationDisabled"
+            :generation-disabled="conversationGenerationDisabled"
             :can-repair="canRepair"
+            :allow-generate="hasSavedRootCase"
+            :allow-scenario-regenerate="editingScenario"
+            :input-aria-label="editingScenario ? '修复补充说明' : '描述测试目标'"
+            :input-placeholder="editingScenario ? '原目标会保留；请补充当前场景的要求后重新生成或修复，不会影响其他场景。' : undefined"
             :generation-pending="generationDialog"
             :workspace-error="workspace.error"
             :send-message="prepareGeneration"
@@ -215,7 +295,7 @@
             :key="`step-${index}`"
             :model-value="step"
             :index="index"
-            :endpoints="endpointOptions"
+            :endpoints="editorEndpointOptions"
             :disabled="interactionLocked || conflict"
             @update:model-value="updateStep(index, $event)"
             @remove="removeStep(index)"
@@ -261,7 +341,9 @@
             @copy="copyPython"
             @download="downloadPython"
           />
-        </section>
+          </template>
+          </section>
+        </div>
       </main>
       <el-skeleton v-else-if="loading" :rows="8" animated />
     </template>
@@ -303,6 +385,28 @@
           >确认执行</el-button
         ></template
       >
+    </el-dialog>
+    <WorkspaceManagerDialog
+      v-model="managerDialog"
+      :workspaces="workspaces"
+      :current-workspace-id="workspaceId"
+      :dirty="dirty"
+      :mutating="workspaceMutation"
+      @select="selectWorkspaceFromManager"
+      @rename="openRenameWorkspace"
+      @delete="confirmDeleteWorkspace"
+    />
+    <el-dialog v-model="renameDialog" title="重命名工作区" width="460px">
+      <el-form label-position="top">
+        <el-form-item label="工作区名称">
+          <el-input v-model="renameForm.title" maxlength="200" show-word-limit />
+        </el-form-item>
+      </el-form>
+      <p class="hint">此名称独立于已保存测试用例标题，不会改动用例、脚本或执行记录。</p>
+      <template #footer>
+        <el-button :disabled="workspaceMutation" @click="renameDialog = false">取消</el-button>
+        <el-button type="primary" :loading="workspaceMutation" @click="renameWorkspace">确认重命名</el-button>
+      </template>
     </el-dialog>
     <el-dialog
       v-model="saveDialog"
@@ -350,15 +454,15 @@
         show-icon
       />
       <el-descriptions :column="1" size="small" border class="generation-context">
-        <el-descriptions-item label="Swagger">{{ selectedSpecName }}</el-descriptions-item>
+        <el-descriptions-item label="Swagger">{{ confirmationSpecName }}</el-descriptions-item>
         <el-descriptions-item label="选中接口范围"
-          >{{ endpointScope }}</el-descriptions-item
+          >{{ confirmationEndpointScope }}</el-descriptions-item
         >
       </el-descriptions>
       <el-collapse class="endpoint-scope-details">
         <el-collapse-item title="查看具体 method / path" name="endpoints">
           <ul>
-            <li v-for="endpoint in selectedEndpoints" :key="endpoint.id">
+            <li v-for="endpoint in confirmationEndpoints" :key="endpoint.id">
               {{ endpointLabel(endpoint) }}
             </li>
           </ul>
@@ -411,6 +515,7 @@ import { getProjectEnvironments } from "@/api/projects";
 import { getLLMConfigurations } from "@/api/aiConfig";
 import {
   createApiWorkspace,
+  deleteApiWorkspace,
   debugApiWorkspace,
   getApiWorkspace,
   getApiWorkspacePython,
@@ -424,10 +529,13 @@ import WorkspaceConfigEditor from "@/components/api-workspace/WorkspaceConfigEdi
 import VisualStepEditor from "@/components/api-workspace/VisualStepEditor.vue";
 import DebugResultPanel from "@/components/api-workspace/DebugResultPanel.vue";
 import GenerationVerificationPanel from "@/components/api-workspace/GenerationVerificationPanel.vue";
+import ScenarioOverview from "@/components/api-workspace/ScenarioOverview.vue";
+import WorkspaceManagerDialog from "@/components/api-workspace/WorkspaceManagerDialog.vue";
 import PythonExportPanel from "@/components/api-workspace/PythonExportPanel.vue";
 import KeyValueRows from "@/components/api-workspace/KeyValueRows.vue";
 import {
   availableChatModels,
+  activeScenario,
   canGenerateWithModel,
   canRepairWorkspace,
   candidateDiff,
@@ -443,11 +551,16 @@ import {
   isHttpUrl,
   isBusyWorkspace,
   listItems,
+  mergeRootWorkspaceMetadata,
   normalizeDraft,
+  mergeScenario,
+  nextRootAfterDelete,
   reconcileWorkspaceModel,
   savedCaseDescription,
   statusMeta,
+  rootWorkspaceBusy,
   shouldApplyWorkspaceReload,
+  shouldClearRootGenerationPrompt,
   updateWorkspaceListItem,
   unwrap,
   workspaceInitializationPlan,
@@ -458,7 +571,9 @@ const router = useRouter();
 const projectStore = useProjectStore();
 const projectId = computed(() => projectStore.currentProjectId);
 const workspace = ref(null);
+const rootWorkspace = ref(null);
 const workspaceId = ref(null);
+const activeScenarioId = ref(null);
 const workspaces = ref([]);
 const draft = ref(normalizeDraft());
 const modelId = ref(null);
@@ -493,6 +608,15 @@ const conflict = ref(false);
 const debugDialog = ref(false);
 const saveDialog = ref(false);
 const generationDialog = ref(false);
+const managerDialog = ref(false);
+const renameDialog = ref(false);
+const workspaceMutation = ref(false);
+const renameForm = ref({ id: null, revision: null, title: "" });
+const rootPrompt = ref("");
+const scenarioEndpointOptions = ref([]);
+const scenarioModelId = ref(null);
+const scenarioModelDirty = ref(false);
+const contextPanel = ref(null);
 const conversationRef = ref(null);
 const debugForm = ref({ environment_id: null, variables: {} });
 const saveForm = ref({ title: "", description: "" });
@@ -501,6 +625,8 @@ const generationForm = ref({
   message: "",
   base_url: "",
   variables: {},
+  workspaceId: null,
+  rootPlan: false,
 });
 const initializing = ref(false);
 const routeTransitioning = ref(false);
@@ -510,7 +636,18 @@ let reloadSequence = 0;
 let initializationSequence = 0;
 let messageSendSequence = 0;
 const dirty = computed(() => draftDirty.value || contextDirty.value);
-const busy = computed(() => isBusyWorkspace(workspace.value));
+const rootBusy = computed(() => rootWorkspaceBusy(rootWorkspace.value));
+const editingScenario = computed(() => Boolean(workspace.value?.parent_id));
+const hasSavedRootCase = computed(
+  () => !editingScenario.value && Boolean(rootWorkspace.value?.saved_case_id),
+);
+const editorAvailable = computed(
+  () => editingScenario.value || hasSavedRootCase.value,
+);
+const busy = computed(() => isBusyWorkspace(workspace.value) || rootBusy.value);
+const editorEndpointOptions = computed(() =>
+  editingScenario.value ? scenarioEndpointOptions.value : endpointOptions.value,
+);
 const interactionLocked = computed(
   () =>
     busy.value ||
@@ -588,6 +725,29 @@ const endpointScope = computed(() =>
     ? `${selectedSpecName.value}：${selectedEndpoints.value.length} 个接口`
     : "未选择接口",
 );
+const activeScenarioEndpoints = computed(() =>
+  (workspace.value?.endpoint_ids || [])
+    .map((id) =>
+      editorEndpointOptions.value.find(
+        (endpoint) => String(endpoint.id) === String(id),
+      ),
+    )
+    .filter(Boolean),
+);
+const activeScenarioScope = computed(() =>
+  activeScenarioEndpoints.value.length
+    ? `${workspace.value?.title || "当前场景"}：${activeScenarioEndpoints.value.length} 个接口`
+    : "当前场景未记录接口范围",
+);
+const confirmationEndpoints = computed(() =>
+  generationForm.value.rootPlan ? selectedEndpoints.value : activeScenarioEndpoints.value,
+);
+const confirmationEndpointScope = computed(() =>
+  generationForm.value.rootPlan ? endpointScope.value : activeScenarioScope.value,
+);
+const confirmationSpecName = computed(() =>
+  generationForm.value.rootPlan ? selectedSpecName.value : `子场景规范 #${workspace.value?.spec_id || "未选择"}`,
+);
 const generationContextError = computed(() =>
   generationContextMessage({
     specId: selectedSpecId.value,
@@ -608,6 +768,15 @@ const generationDisabled = computed(
       modelsLoaded.value,
       modelsLoadFailed.value,
     ) || Boolean(generationContextError.value),
+);
+const scenarioGenerationDisabled = computed(
+  () =>
+    editingScenario.value &&
+    (scenarioModelDirty.value ||
+      !hasAvailableChatModel(models.value, workspace.value?.model_id)),
+);
+const conversationGenerationDisabled = computed(() =>
+  editingScenario.value ? scenarioGenerationDisabled.value : generationDisabled.value,
 );
 const modelLabel = (model) =>
   model.name ||
@@ -700,6 +869,8 @@ const markContextDirty = () => {
   contextDirty.value = true;
   clearPython();
 };
+const focusRootContext = () =>
+  contextPanel.value?.scrollIntoView({ behavior: "smooth", block: "start" });
 const updateConfig = (config) => {
   draft.value = { ...draft.value, config };
   markDirty();
@@ -741,13 +912,13 @@ const pollWorkspace = async () => {
     !busy.value ||
     dirty.value ||
     routeTransitioning.value ||
-    !workspace.value?.id
+    !rootWorkspace.value?.id
   )
     return;
   const expected = {
     projectId: projectId.value,
-    id: workspace.value.id,
-    revision: workspace.value.revision,
+    id: rootWorkspace.value.id,
+    revision: rootWorkspace.value.revision,
   };
   pollInFlight = true;
   try {
@@ -758,20 +929,52 @@ const pollWorkspace = async () => {
 };
 const startPolling = () => {
   stopPolling();
-  if (!busy.value || !workspaceId.value) return;
+  if (!rootBusy.value || !workspaceId.value) return;
   pollTimer = setInterval(pollWorkspace, 1500);
 };
-const applyWorkspace = (value) => {
-  const next = asWorkspace(value);
+const loadScenarioEndpointOptions = async (scenario) => {
+  if (!scenario?.spec_id) {
+    scenarioEndpointOptions.value = [];
+    return;
+  }
+  const requestProjectId = projectId.value;
+  const scenarioId = scenario.id;
+  try {
+    const response = await getAPIEndpoints(requestProjectId, scenario.spec_id);
+    if (
+      requestProjectId !== projectId.value ||
+      !sameWorkspaceId(scenarioId, workspace.value?.id)
+    )
+      return;
+    const selected = new Set((scenario.endpoint_ids || []).map(String));
+    scenarioEndpointOptions.value = listItems(response).filter((endpoint) =>
+      selected.has(String(endpoint.id)),
+    );
+  } catch {
+    if (sameWorkspaceId(scenarioId, workspace.value?.id))
+      scenarioEndpointOptions.value = [];
+  }
+};
+const applyEditorWorkspace = (next) => {
   if (!next?.id) return;
-  if (!sameWorkspaceId(workspace.value?.id, next.id))
-    unavailableModel.value = false;
   if (
     !sameWorkspaceId(python.value.workspaceId, next.id) ||
     python.value.revision !== next.revision
   )
     clearPython();
   workspace.value = next;
+  draft.value = normalizeDraft(next.draft);
+  draftDirty.value = false;
+  scenarioModelId.value = next.parent_id ? next.model_id ?? null : null;
+  scenarioModelDirty.value = false;
+  conflict.value = false;
+  if (next.parent_id) void loadScenarioEndpointOptions(next);
+  else scenarioEndpointOptions.value = [];
+};
+const applyRootWorkspace = (value) => {
+  const next = asWorkspace(value);
+  if (!next?.id) return;
+  rootWorkspace.value = next;
   workspaces.value = updateWorkspaceListItem(workspaces.value, next);
   workspaceId.value = next.id;
   modelId.value = next.model_id ?? null;
@@ -780,10 +983,7 @@ const applyWorkspace = (value) => {
   endpointOptions.value = [];
   endpointsLoadFailed.value = false;
   endpointLoadError.value = "";
-  draft.value = normalizeDraft(next.draft);
-  draftDirty.value = false;
   contextDirty.value = false;
-  conflict.value = false;
   reconcileModelSelection();
   if (selectedSpecId.value) {
     void loadEndpointsForSpec({
@@ -799,13 +999,25 @@ const applyWorkspace = (value) => {
       markAutoSelection: true,
     });
   }
-  if (
-    next.status === "idle" ||
-    next.status === "ready" ||
-    next.status === "failed"
-  )
-    stopPolling();
-  else startPolling();
+  const scenario = activeScenario(next, activeScenarioId.value);
+  activeScenarioId.value = scenario?.id ?? null;
+  applyEditorWorkspace(scenario || next);
+  if (rootBusy.value) startPolling();
+  else stopPolling();
+};
+const applyWorkspace = (value) => {
+  const next = asWorkspace(value);
+  if (!next?.id) return;
+  if (!next.parent_id) {
+    applyRootWorkspace(next);
+    return;
+  }
+  if (sameWorkspaceId(next.parent_id, rootWorkspace.value?.id)) {
+    rootWorkspace.value = mergeScenario(rootWorkspace.value, next);
+    workspaces.value = updateWorkspaceListItem(workspaces.value, rootWorkspace.value);
+  }
+  activeScenarioId.value = next.id;
+  applyEditorWorkspace(next);
 };
 const loadWorkspaces = async (requestProjectId = projectId.value) => {
   const response = await listApiWorkspaces(requestProjectId);
@@ -906,7 +1118,7 @@ const selectWorkspace = async (id) => {
   if (sendingMessage.value) return;
   if (dirty.value) {
     ElMessage.warning("请先保存或处理本地草稿，再切换工作区");
-    workspaceId.value = workspace.value?.id;
+    workspaceId.value = rootWorkspace.value?.id;
     return;
   }
   if (!id) return;
@@ -919,6 +1131,93 @@ const selectWorkspace = async (id) => {
     await reloadWorkspace({ id, skipDirtyCheck: true });
   } finally {
     routeTransitioning.value = false;
+  }
+};
+const selectWorkspaceFromManager = async (id) => {
+  managerDialog.value = false;
+  await selectWorkspace(id);
+};
+const selectScenario = async (scenarioId) => {
+  const next = activeScenario(rootWorkspace.value, scenarioId);
+  if (!next || sameWorkspaceId(next.id, workspace.value?.id)) return;
+  if (!(await confirmDiscardDraft("切换场景"))) return;
+  activeScenarioId.value = next.id;
+  applyEditorWorkspace(next);
+};
+const openRenameWorkspace = (item) => {
+  if (!item || rootWorkspaceBusy(item)) return;
+  renameForm.value = { id: item.id, revision: item.revision, title: item.title || "" };
+  renameDialog.value = true;
+};
+const renameWorkspace = async () => {
+  const form = renameForm.value;
+  const title = form.title.trim();
+  if (!title) return ElMessage.warning("工作区名称不能为空。");
+  if (!form.id || workspaceMutation.value) return;
+  workspaceMutation.value = true;
+  try {
+    const response = await updateApiWorkspace(projectId.value, form.id, {
+      title,
+      revision: form.revision,
+    });
+    const next = asWorkspace(response);
+    if (!next?.id) throw new Error("后端未返回重命名后的工作区。");
+    workspaces.value = updateWorkspaceListItem(workspaces.value, next);
+    if (sameWorkspaceId(next.id, rootWorkspace.value?.id)) {
+      rootWorkspace.value = mergeRootWorkspaceMetadata(rootWorkspace.value, next);
+      if (!editingScenario.value && sameWorkspaceId(next.id, workspace.value?.id)) {
+        workspace.value = mergeRootWorkspaceMetadata(workspace.value, next);
+      }
+    }
+    renameDialog.value = false;
+    ElMessage.success("工作区已重命名");
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "重命名工作区失败"));
+  } finally {
+    workspaceMutation.value = false;
+  }
+};
+const confirmDeleteWorkspace = async (item) => {
+  if (!item || rootWorkspaceBusy(item) || workspaceMutation.value) return;
+  if (sameWorkspaceId(item.id, rootWorkspace.value?.id) && dirty.value) {
+    ElMessage.warning("当前工作区有未保存编辑，请先保存或处理草稿。");
+    return;
+  }
+  try {
+    await ElMessageBox.confirm(
+      "仅删除此工作区及其子场景、草稿和对话历史；不会删除已保存测试用例、执行记录、规范或端点。",
+      "确认删除工作区",
+      { confirmButtonText: "确认删除", cancelButtonText: "取消", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  workspaceMutation.value = true;
+  try {
+    await deleteApiWorkspace(projectId.value, item.id, item.revision);
+    const remaining = workspaces.value.filter(
+      (workspaceItem) => !sameWorkspaceId(workspaceItem.id, item.id),
+    );
+    workspaces.value = remaining;
+    if (sameWorkspaceId(item.id, rootWorkspace.value?.id)) {
+      const next = nextRootAfterDelete(remaining, item.id);
+      rootWorkspace.value = null;
+      workspace.value = null;
+      workspaceId.value = null;
+      activeScenarioId.value = null;
+      clearPython();
+      if (next) {
+        await router.replace({ path: route.path, query: { workspace_id: String(next.id) } });
+        await reloadWorkspace({ id: next.id, skipDirtyCheck: true });
+      } else {
+        await router.replace({ path: route.path, query: {} });
+      }
+    }
+    ElMessage.success("工作区已删除");
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "删除工作区失败"));
+  } finally {
+    workspaceMutation.value = false;
   }
 };
 const reloadWorkspace = async ({
@@ -942,8 +1241,8 @@ const reloadWorkspace = async ({
     const expectedIsCurrent =
       expected &&
       expected.projectId === projectId.value &&
-      sameWorkspaceId(expected.id, workspace.value?.id) &&
-      expected.revision === workspace.value?.revision;
+      sameWorkspaceId(expected.id, rootWorkspace.value?.id) &&
+      expected.revision === rootWorkspace.value?.revision;
     const responseMatchesExpected =
       !expected ||
       (sameWorkspaceId(next?.id, expected.id) &&
@@ -973,10 +1272,12 @@ const reloadWorkspace = async ({
 };
 const saveDraft = async ({ notify = true } = {}) => {
   if (!workspace.value || busy.value) return false;
+  const target = workspace.value;
+  const saveScenario = Boolean(target.parent_id);
   const request = {
     projectId: projectId.value,
-    workspaceId: workspace.value.id,
-    revision: workspace.value.revision,
+    workspaceId: target.id,
+    revision: target.revision,
   };
   savingDraft.value = true;
   try {
@@ -985,9 +1286,9 @@ const saveDraft = async ({ notify = true } = {}) => {
       request.workspaceId,
       {
         draft: clone(draft.value),
-        model_id: modelId.value,
-        spec_id: selectedSpecId.value,
-        endpoint_ids: endpointIds.value,
+        model_id: saveScenario ? target.model_id : modelId.value,
+        spec_id: saveScenario ? target.spec_id : selectedSpecId.value,
+        endpoint_ids: saveScenario ? target.endpoint_ids : endpointIds.value,
         revision: request.revision,
       },
     );
@@ -1020,6 +1321,110 @@ const saveDraft = async ({ notify = true } = {}) => {
       savingDraft.value = false;
   }
 };
+const saveRootContext = async ({ notify = true } = {}) => {
+  const target = rootWorkspace.value;
+  if (!target?.id || rootBusy.value || savingDraft.value) return false;
+  const request = {
+    projectId: projectId.value,
+    workspaceId: target.id,
+    revision: target.revision,
+  };
+  savingDraft.value = true;
+  try {
+    const response = await updateApiWorkspace(
+      request.projectId,
+      request.workspaceId,
+      {
+        model_id: modelId.value,
+        spec_id: selectedSpecId.value,
+        endpoint_ids: endpointIds.value,
+        revision: request.revision,
+      },
+    );
+    const next = asWorkspace(response);
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id) ||
+      request.revision !== rootWorkspace.value?.revision ||
+      !next?.id
+    )
+      return false;
+    rootWorkspace.value = {
+      ...rootWorkspace.value,
+      model_id: next.model_id,
+      spec_id: next.spec_id,
+      endpoint_ids: next.endpoint_ids || [],
+      revision: next.revision,
+      updated_at: next.updated_at,
+    };
+    workspaces.value = updateWorkspaceListItem(workspaces.value, next);
+    contextDirty.value = false;
+    if (!editingScenario.value && sameWorkspaceId(workspace.value?.id, next.id)) {
+      workspace.value = {
+        ...workspace.value,
+        model_id: next.model_id,
+        spec_id: next.spec_id,
+        endpoint_ids: next.endpoint_ids || [],
+        revision: next.revision,
+        updated_at: next.updated_at,
+      };
+    }
+    if (notify) ElMessage.success("工作区设置已保存");
+    return true;
+  } catch (error) {
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id)
+    )
+      return false;
+    if (error?.response?.status === 409) conflict.value = true;
+    ElMessage.error(errorMessage(error, "保存工作区设置失败"));
+    return false;
+  } finally {
+    if (
+      request.projectId === projectId.value &&
+      sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id)
+    )
+      savingDraft.value = false;
+  }
+};
+const saveScenarioModel = async () => {
+  const target = workspace.value;
+  if (!target?.parent_id || !scenarioModelDirty.value || busy.value) return false;
+  if (scenarioModelId.value && !hasAvailableChatModel(models.value, scenarioModelId.value)) {
+    ElMessage.warning("请选择已启用的 LLM 模型，或清空模型后保存。");
+    return false;
+  }
+  const request = {
+    projectId: projectId.value,
+    workspaceId: target.id,
+    revision: target.revision,
+  };
+  savingDraft.value = true;
+  try {
+    const response = await updateApiWorkspace(
+      request.projectId,
+      request.workspaceId,
+      { model_id: scenarioModelId.value, revision: request.revision },
+    );
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+      request.revision !== workspace.value?.revision
+    )
+      return false;
+    applyWorkspace(response);
+    ElMessage.success("子场景模型已保存");
+    return true;
+  } catch (error) {
+    if (error?.response?.status === 409) conflict.value = true;
+    ElMessage.error(errorMessage(error, "保存子场景模型失败"));
+    return false;
+  } finally {
+    if (sameWorkspaceId(request.workspaceId, workspace.value?.id))
+      savingDraft.value = false;
+  }
+};
 const ensureGenerationContext = () => {
   if (!ensureAvailableChatModel()) return false;
   if (generationContextError.value) {
@@ -1027,6 +1432,28 @@ const ensureGenerationContext = () => {
     return false;
   }
   return true;
+};
+const prepareRootGeneration = () => {
+  if (
+    !rootWorkspace.value ||
+    rootBusy.value ||
+    conflict.value ||
+    generationDialog.value ||
+    sendingMessage.value
+  )
+    return false;
+  if (!rootPrompt.value.trim()) return false;
+  if (!ensureGenerationContext()) return false;
+  generationForm.value = {
+    mode: "generate",
+    message: rootPrompt.value.trim(),
+    base_url: normalizeDraft(rootWorkspace.value.draft).config.base_url || "",
+    variables: {},
+    workspaceId: rootWorkspace.value.id,
+    rootPlan: true,
+  };
+  generationDialog.value = true;
+  return false;
 };
 const prepareGeneration = ({ mode, message }) => {
   if (
@@ -1037,13 +1464,22 @@ const prepareGeneration = ({ mode, message }) => {
     sendingMessage.value
   )
     return false;
-  if (!ensureGenerationContext()) return false;
+  if (!editingScenario.value && mode === "generate" && !hasSavedRootCase.value)
+    return prepareRootGeneration();
+  if (editingScenario.value) {
+    if (!["generate", "repair"].includes(mode)) return false;
+    if (scenarioGenerationDisabled.value) {
+      ElMessage.warning("请先保存当前子场景的可用聊天模型，再重新生成或修复并验证。");
+      return false;
+    }
+  } else if (!ensureGenerationContext()) return false;
   const useGenerationEvidence =
-    mode === "repair" &&
-    hasCurrentGenerationFailure(
-      workspace.value?.generation,
-      workspace.value?.revision,
-    );
+    (mode === "repair" &&
+      hasCurrentGenerationFailure(
+        workspace.value?.generation,
+        workspace.value?.revision,
+      )) ||
+    (editingScenario.value && mode === "generate");
   const repairDefaults = generationRepairDefaults({
     generation: workspace.value?.generation,
     candidate: workspace.value?.candidate,
@@ -1054,10 +1490,15 @@ const prepareGeneration = ({ mode, message }) => {
     mode,
     message,
     base_url:
-      mode === "repair"
+      mode === "repair" || (editingScenario.value && mode === "generate")
         ? repairDefaults.base_url
         : draft.value.config.base_url || "",
-    variables: mode === "repair" ? repairDefaults.variables : {},
+    variables:
+      mode === "repair" || (editingScenario.value && mode === "generate")
+        ? repairDefaults.variables
+        : {},
+    workspaceId: workspace.value.id,
+    rootPlan: false,
   };
   generationDialog.value = true;
   return false;
@@ -1073,43 +1514,65 @@ const confirmGeneration = async () => {
     message: generationForm.value.message,
     base_url: baseUrl,
     variables: clone(generationForm.value.variables),
+    workspaceId: generationForm.value.workspaceId,
+    rootPlan: generationForm.value.rootPlan,
   });
   if (!accepted) return;
   generationDialog.value = false;
-  conversationRef.value?.clearSubmittedMessage(generationForm.value.message);
+  if (generationForm.value.rootPlan) {
+    if (
+      shouldClearRootGenerationPrompt(
+        true,
+        generationForm.value.message,
+        rootPrompt.value,
+      )
+    )
+      rootPrompt.value = "";
+  } else conversationRef.value?.clearSubmittedMessage(generationForm.value.message);
 };
-const sendMessage = async ({ mode, message, base_url, variables }) => {
+const sendMessage = async ({ mode, message, base_url, variables, workspaceId: targetId, rootPlan = false }) => {
+  const target = rootPlan ? rootWorkspace.value : workspace.value;
   if (
-    !workspace.value ||
+    !target ||
     busy.value ||
     conflict.value ||
     sendingMessage.value
   )
     return false;
-  if (!ensureGenerationContext()) return false;
+  if (rootPlan) {
+    if (!ensureGenerationContext()) return false;
+  } else if (editingScenario.value) {
+    if (scenarioGenerationDisabled.value) return false;
+  } else if (!ensureGenerationContext()) return false;
   const context = {
     projectId: projectId.value,
-    workspaceId: workspace.value.id,
-    specId: selectedSpecId.value,
-    endpointIds: [...endpointIds.value],
+    workspaceId: targetId || target.id,
+    rootId: rootWorkspace.value?.id,
+    rootPlan,
+    specId: rootPlan ? selectedSpecId.value : target.spec_id,
+    endpointIds: rootPlan ? [...endpointIds.value] : [...(target.endpoint_ids || [])],
   };
   const requestSequence = ++messageSendSequence;
   sendingMessage.value = true;
   try {
-    if (dirty.value && !(await saveDraft({ notify: false }))) return false;
+    if (draftDirty.value && !(await saveDraft({ notify: false }))) return false;
+    if (contextDirty.value && !(await saveRootContext({ notify: false }))) return false;
     if (
       requestSequence !== messageSendSequence ||
       context.projectId !== projectId.value ||
-      !sameWorkspaceId(context.workspaceId, workspace.value?.id) ||
-      String(context.specId) !== String(selectedSpecId.value) ||
-      JSON.stringify(context.endpointIds) !== JSON.stringify(endpointIds.value)
+      !sameWorkspaceId(context.rootId, rootWorkspace.value?.id) ||
+      (!rootPlan && !sameWorkspaceId(context.workspaceId, workspace.value?.id)) ||
+      (rootPlan &&
+        (String(context.specId) !== String(selectedSpecId.value) ||
+          JSON.stringify(context.endpointIds) !== JSON.stringify(endpointIds.value)))
     )
       return false;
     if (mode === "repair" && !canRepair.value) {
       ElMessage.warning("请先获得当前版本的失败或待人工处理验证结果。");
       return false;
     }
-    const request = { ...context, revision: workspace.value.revision };
+    const currentTarget = rootPlan ? rootWorkspace.value : workspace.value;
+    const request = { ...context, revision: currentTarget?.revision };
     const response = await sendApiWorkspaceMessage(
       request.projectId,
       request.workspaceId,
@@ -1125,10 +1588,14 @@ const sendMessage = async ({ mode, message, base_url, variables }) => {
     if (
       requestSequence !== messageSendSequence ||
       request.projectId !== projectId.value ||
-      !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
-      request.revision !== workspace.value?.revision ||
-      String(context.specId) !== String(selectedSpecId.value) ||
-      JSON.stringify(context.endpointIds) !== JSON.stringify(endpointIds.value)
+      !sameWorkspaceId(request.rootId, rootWorkspace.value?.id) ||
+      (rootPlan && request.revision !== rootWorkspace.value?.revision) ||
+      (!rootPlan &&
+        (!sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+          request.revision !== workspace.value?.revision)) ||
+      (rootPlan &&
+        (String(context.specId) !== String(selectedSpecId.value) ||
+          JSON.stringify(context.endpointIds) !== JSON.stringify(endpointIds.value)))
     )
       return false;
     applyWorkspace(response);
@@ -1138,7 +1605,8 @@ const sendMessage = async ({ mode, message, base_url, variables }) => {
     if (
       requestSequence !== messageSendSequence ||
       context.projectId !== projectId.value ||
-      !sameWorkspaceId(context.workspaceId, workspace.value?.id)
+      !sameWorkspaceId(context.rootId, rootWorkspace.value?.id) ||
+      (!rootPlan && !sameWorkspaceId(context.workspaceId, workspace.value?.id))
     )
       return false;
     if (error?.response?.status === 409) conflict.value = true;
@@ -1204,7 +1672,7 @@ const loadEndpointsForSpec = async ({
 } = {}) => {
   if (!specId) return false;
   const requestProjectId = projectId.value;
-  const requestWorkspaceId = workspace.value?.id;
+  const requestRootWorkspaceId = rootWorkspace.value?.id;
   endpointsLoading.value = true;
   endpointsLoadFailed.value = false;
   endpointLoadError.value = "";
@@ -1212,7 +1680,7 @@ const loadEndpointsForSpec = async ({
     const response = await getAPIEndpoints(requestProjectId, specId);
     if (
       requestProjectId !== projectId.value ||
-      !sameWorkspaceId(requestWorkspaceId, workspace.value?.id) ||
+      !sameWorkspaceId(requestRootWorkspaceId, rootWorkspace.value?.id) ||
       String(specId) !== String(selectedSpecId.value)
     )
       return false;
@@ -1232,8 +1700,8 @@ const loadEndpointsForSpec = async ({
       endpointIds.value = loaded.map((endpoint) => endpoint.id);
       if (markAutoSelection) markContextDirty();
     } else {
-      const knownIds = new Set(loaded.map((endpoint) => endpoint.id));
-      endpointIds.value = endpointIds.value.filter((id) => knownIds.has(id));
+      const knownIds = new Set(loaded.map((endpoint) => String(endpoint.id)));
+      endpointIds.value = endpointIds.value.filter((id) => knownIds.has(String(id)));
     }
     return true;
   } catch (error) {
@@ -1251,6 +1719,7 @@ const loadEndpointsForSpec = async ({
   } finally {
     if (
       requestProjectId === projectId.value &&
+      sameWorkspaceId(requestRootWorkspaceId, rootWorkspace.value?.id) &&
       String(specId) === String(selectedSpecId.value)
     )
       endpointsLoading.value = false;
@@ -1292,7 +1761,7 @@ const openSave = async () => {
   }
   if (dirty.value && !(await saveDraft())) return;
   saveForm.value = {
-    title: workspace.value?.title || draft.value.config.name,
+    title: workspace.value?.saved_case_title || draft.value.config.name,
     description: savedCaseDescription(workspace.value),
   };
   saveDialog.value = true;
@@ -1415,8 +1884,12 @@ const initialize = async () => {
   messageSendSequence += 1;
   stopPolling();
   workspace.value = null;
+  rootWorkspace.value = null;
   workspaceId.value = null;
+  activeScenarioId.value = null;
   workspaces.value = [];
+  scenarioEndpointOptions.value = [];
+  rootPrompt.value = "";
   draft.value = normalizeDraft();
   modelId.value = null;
   endpointIds.value = [];
@@ -1495,7 +1968,22 @@ onBeforeUnmount(stopPolling);
 }
 .header-actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+}
+.workspace-select-label {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.workspace-select {
+  width: min(280px, 44vw);
+  min-width: 220px;
+}
+.workspace-main {
+  display: grid;
+  gap: 16px;
 }
 .workspace-grid {
   display: grid;
@@ -1511,6 +1999,10 @@ onBeforeUnmount(stopPolling);
   display: grid;
   gap: 16px;
   min-width: 0;
+}
+.scenario-model-settings {
+  display: grid;
+  gap: 10px;
 }
 .endpoint-field :deep(.el-checkbox-group) {
   display: grid;
@@ -1544,6 +2036,10 @@ onBeforeUnmount(stopPolling);
   .header-actions {
     width: 100%;
     flex-wrap: wrap;
+  }
+  .workspace-select {
+    flex: 1 1 220px;
+    width: auto;
   }
 }
 </style>

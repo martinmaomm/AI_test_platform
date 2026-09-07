@@ -158,11 +158,36 @@ def main():
         assert Workspace.objects.get(pk=workspace.pk).spec_id == spec.pk
         assert Workspace.objects.get(pk=workspace.pk).generation['rounds'][0]['attempt'] == 1
         assert apps.get_model('api_testing', 'APITestCase').objects.get(pk=case.pk).title == '既有场景用例'
+
+        scenario_migrations = [
+            key for key in executor.loader.disk_migrations
+            if key[0] == 'api_testing' and key[1].startswith('0018_')
+        ]
+        assert len(scenario_migrations) == 1, scenario_migrations
+        with connection.schema_editor() as editor:
+            state = executor.loader.get_migration(*scenario_migrations[0]).apply(state, editor)
+        apps = state.apps
+        Workspace = apps.get_model('api_testing', 'APIWorkspace')
+        migrated = Workspace.objects.get(pk=workspace.pk)
+        assert migrated.parent_id is None and migrated.scenario_order == 0
+        assert migrated.title == '新工作区' and migrated.saved_case_id == case.pk
+        child = Workspace.objects.create(
+            parent=migrated, owner_id=user.pk, project_id=project.pk,
+            title='独立场景', scenario_order=1, scenario_description='独立登录与验证',
+            saved_case_id=case.pk,
+        )
+        assert Workspace.objects.get(pk=child.pk).parent_id == migrated.pk
+        assert Workspace.objects.get(pk=child.pk).scenario_description == '独立登录与验证'
+        assert migrated.scenarios.count() == 1
+        migrated.delete()
+        assert not Workspace.objects.filter(pk=child.pk).exists()
+        assert apps.get_model('api_testing', 'APITestCase').objects.filter(pk=case.pk).exists()
+        assert apps.get_model('api_testing', 'APITestExecution').objects.get(pk=execution.pk).execution_log == '保留的历史失败日志'
         connection.close()
 
     print(
-        'PASS: actual 0015/0016/0017 SQLite migrations preserve API case/execution data; '
-        'workspace spec/generation, suite.variables and input_snapshot are readable and writable; NAS not accessed'
+        'PASS: actual 0015/0016/0017/0018 SQLite migrations preserve API case/execution data; '
+        'independent scenarios and workspace-only cascade verified; NAS not accessed'
     )
 
 

@@ -26,6 +26,13 @@ export const updateApiWorkspace = async (projectId, workspaceId, payload) => {
   return response.data;
 };
 
+export const deleteApiWorkspace = async (projectId, workspaceId, revision) => {
+  const response = await api.delete(`${basePath(projectId)}${workspaceId}/`, {
+    data: { revision, confirmed: true },
+  });
+  return response.data;
+};
+
 export const sendApiWorkspaceMessage = async (
   projectId,
   workspaceId,

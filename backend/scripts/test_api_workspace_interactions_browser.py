@@ -96,7 +96,7 @@ def verify(origin, fixture, output):
             expect(page.get_by_text('工作区标题', exact=True)).to_have_count(0)
 
             # A failed submit retains input; held requests cannot be submitted twice.
-            message = page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。')
+            message = page.get_by_role('textbox', name='描述测试目标', exact=True)
             pending_requests = []
             page.route('**/messages/', lambda route: pending_requests.append(route))
             message.fill('请求失败后应保留这段描述')
@@ -143,7 +143,8 @@ def verify(origin, fixture, output):
             page.get_by_role('textbox', name='用例标题', exact=True).fill('保存后的新名称')
             page.get_by_role('button', name='确认保存', exact=True).click()
             expect(page.get_by_text('测试用例已保存', exact=True)).to_be_visible()
-            expect(page.locator('.header-actions')).to_contain_text('保存后的新名称')
+            expect(page.locator('.header-actions')).to_contain_text('原用例名称')
+            assert harness.database(lambda: APIWorkspace.objects.get(pk=workspace_id).title) == '原用例名称'
             saved = harness.database(lambda: APITestCase.objects.get(pk=case_id))
             assert (saved.title, saved.description) == ('保存后的新名称', '已有用例备注必须保留')
             page.get_by_role('button', name='保存为测试用例', exact=True).click()

@@ -244,21 +244,31 @@ def _variable_names(value: Any) -> set[str]:
     return names
 
 
-def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, Any]) -> None:
+def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, Any], *,
+                              headers: Mapping[str, Any] | None = None) -> None:
     """Reject statically unknown placeholders before any HTTP request is sent."""
     available = set(variables)
     config = case["config"]
-    for value in (config.get("base_url"), config.get("headers")):
+    for value in (config.get("base_url"),):
         missing = _variable_names(value).difference(available)
         if missing:
             raise CaseContractError(f"未知变量：{', '.join(sorted(missing))}")
     for index, step in enumerate(case["teststeps"], start=1):
         request = step["request"]
-        for key in ("url", "headers", "params", "json", "data", "raw"):
+        for key in ("url", "params", "json", "data", "raw"):
             if key in request:
                 missing = _variable_names(request[key]).difference(available)
                 if missing:
                     raise CaseContractError(f"步骤 {index} 请求前发现未知变量：{', '.join(sorted(missing))}")
+        effective_headers = _merge_headers(
+            headers if headers is not None else config.get("headers") or {}, request.get("headers") or {},
+        )
+        missing_headers = _variable_names(effective_headers).difference(available)
+        if missing_headers:
+            raise CaseContractError(
+                f"步骤 {index} 的有效 headers 使用了当前未定义的变量：{', '.join(sorted(missing_headers))}；"
+                "依赖登录提取值的 header 请放到登录后的具体步骤。"
+            )
         for position, raw_validator in enumerate(step["validate"]):
             validator = _parse_validator(raw_validator, f"teststeps[{index - 1}].validate[{position}]")
             missing = _variable_names(validator["expect"]).difference(available | set(step["extract"]))
@@ -379,7 +389,7 @@ def _runtime_options(case: Mapping[str, Any], options: Mapping[str, Any] | None)
         "read_timeout": read,
         "total_timeout": total,
         "verify": verify,
-        "headers": {**headers, **dict(option_headers)},
+        "headers": _merge_headers(headers, option_headers),
         "allowed_origin": allowed_origin,
     }
 
@@ -436,6 +446,20 @@ def _http_headers(value: Mapping[str, Any]) -> dict[str, str]:
             raise CaseContractError("HTTP Header 名称或值不能包含换行，名称不能含冒号")
         result[key] = item
     return result
+
+
+def _merge_headers(global_headers: Mapping[str, Any], step_headers: Mapping[str, Any]) -> dict[str, Any]:
+    """Overlay step headers using HTTP's case-insensitive field names."""
+    merged = {}
+    known = {}
+    for source in (global_headers, step_headers):
+        for key, value in source.items():
+            replaced = known.get(str(key).lower())
+            if replaced is not None:
+                merged.pop(replaced, None)
+            merged[key] = value
+            known[str(key).lower()] = key
+    return merged
 
 
 def _path_tokens(path: str) -> list[str]:
@@ -674,8 +698,8 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
         option_variables = dict(raw_option_variables)
         variables.update(deepcopy(option_variables))
         variables = _resolve_variable_definitions(variables)
-        _validate_known_variables(case, variables)
         runtime = _runtime_options(case, option_mapping)
+        _validate_known_variables(case, variables, headers=runtime["headers"])
         resolved_base_url = _substitute(base_url if base_url is not None else config.get("base_url"), variables)
     except (CaseContractError, UnsupportedCaseFeature) as exc:
         return _report(script_id=script_id, name="", started_wall=started_wall, started_monotonic=started_monotonic, steps=steps, error=str(exc), error_type=type(exc).__name__)
@@ -695,10 +719,15 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("用例总超时，未发送请求")
-                request = _substitute(step["request"], variables)
+                raw_request = deepcopy(step["request"])
+                raw_headers = _merge_headers(runtime["headers"], raw_request.pop("headers", {}))
+                request = _substitute(raw_request, variables)
                 url = _absolute_http_url(request.pop("url"), resolved_base_url)
                 _assert_allowed_origin(url, runtime["allowed_origin"])
-                headers = _http_headers({**runtime["headers"], **dict(request.pop("headers", {}))})
+                # Config headers are global but substitutions must still use
+                # the variables currently in scope.  This keeps runtime,
+                # static validation and Python export semantics aligned.
+                headers = _http_headers(_substitute(raw_headers, variables))
                 params = request.pop("params", None)
                 raw_request_timeout = request.pop("timeout", None)
                 if raw_request_timeout is None:

@@ -298,6 +298,40 @@ def test_empty_steps_are_editable_but_not_executable():
     assert "至少需要一个测试步骤" in result["error"]
 
 
+def test_effective_global_headers_are_overlaid_before_variable_validation():
+    case = {
+        "config": {"base_url": "https://api.example.test", "headers": {"Authorization": "Bearer ${not_supplied}"}},
+        "teststeps": [{"request": {"url": "/health", "headers": {"X-Run": "${timestamp_ns}"}},
+                       "validate": [{"eq": ["status_code", 200]}]}],
+    }
+    session = FakeSession([FakeResponse(body={})])
+    with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+        result = run_case("header-overlay", case, options={"headers": {"authorization": "Bearer provided"}})
+    assert result["success"], result
+    sent = session.requests[0]["headers"]
+    assert sent["authorization"] == "Bearer provided"
+    assert "Authorization" not in sent
+    assert sent["X-Run"].isdigit()
+
+
+def test_extracted_header_values_are_not_interpreted_as_templates_twice():
+    opaque_token = "opaque_${server_value}"
+    case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+        {"request": {"url": "/login"}, "extract": {"token": "body.token"},
+         "validate": [{"eq": ["status_code", 200]}]},
+        {"request": {"url": "/profile", "headers": {"Authorization": "Bearer ${token}"}},
+         "validate": [{"eq": ["status_code", 200]}]},
+    ]}
+    namespace = {"__name__": "exported_header_acceptance"}
+    exec(compile(export_python(case), "exported_headers.py", "exec"), namespace)
+    for runtime in (run_case, namespace["run_case"]):
+        session = FakeSession([FakeResponse(body={"token": opaque_token}), FakeResponse(body={})])
+        with patch("requests.Session", return_value=session):
+            result = runtime("opaque-header", case)
+        assert result["success"], result
+        assert session.requests[1]["headers"]["Authorization"] == f"Bearer {opaque_token}"
+
+
 def test_invalid_runtime_options_and_type_comparator_are_contract_errors():
     case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [{"request": {"url": "/health"}}]}
     invalid_options = requests_runner("options", json.dumps(case), options={"variables": []})

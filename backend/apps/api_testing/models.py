@@ -325,6 +325,11 @@ class APIWorkspace(models.Model):
 
     project = models.ForeignKey('projects.Project', on_delete=models.CASCADE, related_name='api_workspaces')
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='api_workspaces')
+    parent = models.ForeignKey(
+        'self', on_delete=models.CASCADE, null=True, blank=True, related_name='scenarios',
+    )
+    scenario_order = models.PositiveIntegerField(default=0)
+    scenario_description = models.TextField(blank=True)
     spec = models.ForeignKey(
         APISpecification, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='workspaces',

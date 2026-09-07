@@ -10,7 +10,7 @@ import os
 from copy import deepcopy
 from typing import Any
 
-from django.db import transaction
+from django.db import models, transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -208,11 +208,14 @@ def _document_context(endpoint):
     }
 
 
-def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
+def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = True) -> dict[str, Any]:
     saved_case = workspace.saved_case if workspace.saved_case_id else None
-    return {
+    data = {
         'id': workspace.id,
         'title': workspace.title,
+        'parent_id': workspace.parent_id,
+        'scenario_order': workspace.scenario_order,
+        'scenario_description': workspace.scenario_description,
         'model_id': workspace.model_id,
         'spec_id': workspace.spec_id,
         'endpoint_ids': workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else [],
@@ -226,9 +229,86 @@ def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
         'debug_result': workspace.debug_result if isinstance(workspace.debug_result, dict) else {},
         'debug_revision': workspace.debug_revision,
         'saved_case_id': workspace.saved_case_id,
+        'saved_case_title': str(saved_case.title or '') if saved_case else '',
         'saved_case_description': str(saved_case.description or '') if saved_case else '',
         'task_id': workspace.task_id or None,
         'updated_at': workspace.updated_at.isoformat() if workspace.updated_at else None,
+    }
+    if workspace.parent_id is None and include_scenarios:
+        children = list(workspace.scenarios.all().select_related('saved_case').order_by('scenario_order', 'id'))
+        data['scenarios'] = [serialize_workspace(child, include_scenarios=False) for child in children]
+        data['coverage'] = workspace_coverage(workspace, children)
+    return data
+
+
+def workspace_coverage(root: APIWorkspace, children: list[APIWorkspace] | None = None) -> dict[str, Any]:
+    children = children if children is not None else list(root.scenarios.all())
+    generation = root.generation if isinstance(root.generation, dict) else {}
+    snapshot = generation.get('_snapshot') if isinstance(generation.get('_snapshot'), dict) else {}
+    frozen_scope = snapshot.get('scope_endpoint_ids')
+    total = {
+        endpoint_id for endpoint_id in (
+            frozen_scope if isinstance(frozen_scope, list) else root.endpoint_ids or []
+        ) if isinstance(endpoint_id, int)
+    }
+    # A real root scope/model/spec edit marks prior evidence stale.  It remains
+    # visible in child history but must not be reported as coverage for the new
+    # scope.  Title-only updates deliberately do not set this state.
+    if generation.get('status') == 'stale':
+        current_ids = root.endpoint_ids if isinstance(root.endpoint_ids, list) else []
+        if current_ids:
+            total = {item for item in current_ids if isinstance(item, int)}
+        elif root.spec_id:
+            total = set(APIEndpoint.objects.filter(spec_id=root.spec_id).values_list('id', flat=True))
+        return {
+            'total': len(total), 'planned': 0, 'generated': 0, 'verified': 0,
+            'uncovered_endpoint_ids': sorted(total), 'planned_endpoint_ids': [],
+            'generated_endpoint_ids': [], 'verified_endpoint_ids': [],
+        }
+    scoped_ids = generation.get('scenario_ids') if isinstance(generation.get('scenario_ids'), list) else [item.id for item in children]
+    scoped = [item for item in children if item.id in scoped_ids]
+    planned = {endpoint_id for item in scoped for endpoint_id in (item.endpoint_ids or []) if isinstance(endpoint_id, int)}
+    generated: set[int] = set()
+    verified: set[int] = set()
+
+    def actual_endpoint_ids(draft: Any) -> set[int]:
+        if not isinstance(draft, dict):
+            return set()
+        return {
+            step.get('endpoint_id') for step in draft.get('teststeps', [])
+            if isinstance(step, dict) and isinstance(step.get('endpoint_id'), int)
+        }
+
+    def successful_round(item: APIWorkspace, candidate: dict[str, Any]) -> bool:
+        candidate_hash = candidate.get('draft_hash')
+        rounds = item.generation.get('rounds') if isinstance(item.generation, dict) else []
+        rounds = rounds if isinstance(rounds, list) else []
+        return any(
+            isinstance(round_, dict) and round_.get('draft_hash') == candidate_hash
+            and isinstance(round_.get('result'), dict) and round_['result'].get('success') is True
+            for round_ in rounds
+        )
+
+    for item in scoped:
+        candidate = item.candidate if isinstance(item.candidate, dict) else {}
+        candidate_draft = candidate.get('draft') if isinstance(candidate.get('draft'), dict) else None
+        if candidate_draft is not None:
+            actual = actual_endpoint_ids(candidate_draft)
+            generated.update(actual)
+            if (candidate.get('verification_status') == 'passed' and candidate.get('source_revision') == item.revision
+                    and successful_round(item, candidate)):
+                verified.update(actual)
+        if item.debug_revision == item.revision and isinstance(item.debug_result, dict) and item.debug_result.get('success'):
+            actual = actual_endpoint_ids(item.draft)
+            generated.update(actual)
+            verified.update(actual)
+    planned.intersection_update(total)
+    generated.intersection_update(total)
+    verified.intersection_update(total)
+    return {
+        'total': len(total), 'planned': len(planned), 'generated': len(generated), 'verified': len(verified),
+        'uncovered_endpoint_ids': sorted(total - planned), 'planned_endpoint_ids': sorted(planned),
+        'generated_endpoint_ids': sorted(generated), 'verified_endpoint_ids': sorted(verified),
     }
 
 
@@ -266,11 +346,12 @@ _UNSET = object()
 
 def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any = _UNSET,
                            model_id: Any = _UNSET, endpoint_ids: Any = _UNSET,
-                           spec_id: Any = _UNSET) -> APIWorkspace:
+                           spec_id: Any = _UNSET, title: Any = _UNSET) -> APIWorkspace:
     require_revision(workspace, revision)
-    if workspace.status in {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}:
+    if workspace_is_busy(workspace):
         raise WorkspaceConflict('当前工作区任务尚未结束，不能修改草稿。')
     changed = False
+    title_changed = False
     next_spec_id = workspace.spec_id
     if spec_id is not _UNSET:
         spec = validate_spec_id(workspace.project_id, spec_id)
@@ -290,6 +371,26 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
     proposed_draft = normalize_draft(draft) if draft is not _UNSET else workspace.draft
     candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
     generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+    previous_revision = workspace.revision
+    child_model_only = (
+        workspace.parent_id is not None and model_id is not _UNSET
+        and draft is _UNSET and endpoint_ids is _UNSET and spec_id is _UNSET
+    )
+
+    def current_source(value: dict[str, Any], key: str = 'source_revision') -> bool:
+        return not value or value.get(key) == previous_revision
+
+    # Model-only selection changes no HTTP script or verification context.  It
+    # may carry current failed evidence into the next revision, but never
+    # revive already-stale/mismatched proof or rewrite its historical snapshot.
+    preserve_child_evidence = (
+        child_model_only
+        and generation.get('status') != 'stale'
+        and current_source(generation)
+        and current_source(candidate)
+        and workspace.debug_revision in {None, previous_revision}
+        and generation.get('adopted_revision') in {None, previous_revision}
+    )
     candidate_draft = candidate.get('draft') if isinstance(candidate.get('draft'), dict) else None
     exact_adoption = False
     if draft is not _UNSET and candidate_draft is not None:
@@ -315,6 +416,11 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
             workspace.debug_snapshot = {}
             workspace.debug_revision = None
         changed = True
+    if title is not _UNSET:
+        if not isinstance(title, str) or not title.strip() or len(title) > 200:
+            raise WorkspaceValidationError('title 必须是 1 到 200 个字符。')
+        workspace.title = title.strip()
+        title_changed = True
     if model_id is not _UNSET:
         workspace.model_id = validate_model_id(model_id, owner=workspace.owner)
         changed = True
@@ -335,10 +441,31 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
             workspace.debug_revision = workspace.revision
             workspace.generation = {**generation, 'adopted_revision': workspace.revision}
             workspace.candidate = None
+        elif preserve_child_evidence:
+            rebound_generation = deepcopy(generation)
+            if rebound_generation.get('source_revision') == previous_revision:
+                rebound_generation['source_revision'] = workspace.revision
+            if rebound_generation.get('adopted_revision') == previous_revision:
+                rebound_generation['adopted_revision'] = workspace.revision
+            workspace.generation = rebound_generation
+            if candidate.get('source_revision') == previous_revision:
+                workspace.candidate = {**deepcopy(candidate), 'source_revision': workspace.revision}
+            if workspace.debug_revision == previous_revision:
+                workspace.debug_revision = workspace.revision
         elif workspace.generation:
             workspace.generation = {**workspace.generation, 'status': 'stale', 'phase': 'finished'}
         workspace.save()
+    elif title_changed:
+        workspace.save(update_fields=['title', 'updated_at'])
     return workspace
+
+
+def workspace_is_busy(workspace: APIWorkspace) -> bool:
+    active = {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}
+    root_id = workspace.parent_id or workspace.id
+    return APIWorkspace.objects.filter(
+        models.Q(pk=root_id) | models.Q(parent_id=root_id), status__in=active,
+    ).exists()
 
 
 def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspace:
@@ -381,6 +508,21 @@ def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspa
             })
             current.generation = generation
         current.save()
+        # A root owns its child execution lease.  Once it expires, queued or
+        # running children must not leave the whole family permanently busy.
+        if current.parent_id is None and not was_debugging:
+            for child in APIWorkspace.objects.select_for_update().filter(
+                parent_id=current.id, status=APIWorkspace.Status.GENERATING,
+            ):
+                child_generation = deepcopy(child.generation) if isinstance(child.generation, dict) else {}
+                child_generation.update({
+                    'status': 'failed', 'phase': 'finished', 'summary': current.error,
+                    'finished_at': now.isoformat(),
+                })
+                child.generation = child_generation
+                child.status = APIWorkspace.Status.FAILED
+                child.error = current.error
+                child.save()
         return current
 
 
@@ -435,7 +577,7 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
     with transaction.atomic():
         workspace = APIWorkspace.objects.select_for_update().get(pk=workspace.pk)
         require_revision(workspace, revision)
-        if workspace.status in {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}:
+        if workspace_is_busy(workspace):
             raise WorkspaceConflict('当前工作区任务尚未结束，不能保存。')
         draft = require_executable_draft(workspace.draft)
         test_case_type, endpoint = classify_case_draft(draft, project_id=workspace.project_id)
@@ -446,7 +588,10 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
             )
             if workspace.saved_case_updated_at and case.updated_at != workspace.saved_case_updated_at:
                 raise WorkspaceConflict('关联用例已被其他人修改，请先处理冲突。')
-        case_title = title if isinstance(title, str) and title.strip() else (workspace.title or draft['config']['name'] or '未命名 API 用例')
+        case_title = (
+            title if isinstance(title, str) and title.strip()
+            else (case.title if case else (draft['config']['name'] or workspace.title or '未命名 API 用例'))
+        )
         if description is _UNSET or description is None:
             case_description = case.description if case else ''
         elif isinstance(description, str):
@@ -469,7 +614,6 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
             case.endpoint = endpoint
             case.save(update_fields=['title', 'description', 'script_content', 'test_case_type', 'endpoint', 'updated_at'])
             workspace.saved_case = case
-        workspace.title = case.title
         workspace.saved_case_updated_at = case.updated_at
-        workspace.save(update_fields=['saved_case', 'title', 'saved_case_updated_at', 'updated_at'])
+        workspace.save(update_fields=['saved_case', 'saved_case_updated_at', 'updated_at'])
     return workspace

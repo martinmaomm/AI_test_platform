@@ -52,11 +52,29 @@
       maxlength="2000"
       show-word-limit
       :disabled="disabled || busy || submitting || generationPending"
-      placeholder="例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。"
-      @keydown.ctrl.enter.prevent="send('generate')"
+      :aria-label="inputAriaLabel"
+      :placeholder="inputPlaceholder"
+      @keydown.ctrl.enter.prevent="send(allowGenerate ? 'generate' : 'repair')"
     />
     <div class="actions">
       <el-button
+        v-if="allowGenerate"
+        type="primary"
+        :loading="busy && mode === 'generate'"
+        :disabled="
+          disabled ||
+          busy ||
+          submitting ||
+          generationPending ||
+          generationDisabled ||
+          !allowGenerate ||
+          !message.trim()
+        "
+        @click="send('generate')"
+        >生成并验证</el-button
+      >
+      <el-button
+        v-else-if="allowScenarioRegenerate"
         type="primary"
         :loading="busy && mode === 'generate'"
         :disabled="
@@ -68,7 +86,7 @@
           !message.trim()
         "
         @click="send('generate')"
-        >生成并验证</el-button
+        >重新生成本场景</el-button
       >
       <el-button
         :loading="busy && mode === 'repair'"
@@ -85,7 +103,7 @@
       >
     </div>
     <p class="hint">
-      生成、修复和验证都不会自动采用候选或保存用例；确认后才会发起真实验证请求。
+      {{ allowGenerate ? "生成、修复和验证都不会自动采用候选或保存用例；确认后才会发起真实验证请求。" : allowScenarioRegenerate ? "重新生成仅处理当前子场景：原目标会保留，请补充当前场景的要求；不会重新规划或生成其他场景。" : "仅补充当前子场景的修复说明；不会重新规划或生成其他场景。" }}
     </p>
   </section>
 </template>
@@ -103,7 +121,14 @@ const props = defineProps({
   disabled: Boolean,
   generationDisabled: Boolean,
   canRepair: Boolean,
+  allowGenerate: { type: Boolean, default: true },
+  allowScenarioRegenerate: Boolean,
+  inputPlaceholder: {
+    type: String,
+    default: "例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。",
+  },
   generationPending: Boolean,
+  inputAriaLabel: { type: String, default: "补充说明" },
   workspaceError: String,
   sendMessage: { type: Function, required: true },
 });

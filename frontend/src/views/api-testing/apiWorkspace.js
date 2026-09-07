@@ -61,6 +61,117 @@ export const updateWorkspaceListItem = (workspaces, workspace) =>
       )
     : workspaces;
 
+export const rootWorkspaceBusy = (workspace) =>
+  isBusyWorkspace(workspace) ||
+  ["queued", "running"].includes(workspace?.generation?.status) ||
+  ["planning", "scenarios"].includes(workspace?.generation?.phase) ||
+  (Array.isArray(workspace?.scenarios) &&
+    workspace.scenarios.some(
+      (scenario) =>
+        isBusyWorkspace(scenario) ||
+        ["queued", "running"].includes(scenario?.generation?.status),
+    ));
+
+export const rootWorkspaceStatusMeta = (status) =>
+  ({
+    queued: { label: "已排队", type: "info" },
+    running: { label: "场景执行中", type: "warning" },
+    passed: { label: "已验证通过", type: "success" },
+    partial: { label: "部分完成", type: "warning" },
+    needs_review: { label: "需要人工处理", type: "warning" },
+    failed: { label: "生成失败", type: "danger" },
+  })[status] || statusMeta(status);
+
+export const scenarioStatusMeta = (status) =>
+  ({
+    pending: { label: "待执行", type: "info" },
+    queued: { label: "待执行", type: "info" },
+    running: { label: "执行中", type: "warning" },
+    generating: { label: "生成中", type: "warning" },
+    passed: { label: "已验证", type: "success" },
+    ready: { label: "待调试", type: "info" },
+    stale: { label: "已修改待重验", type: "warning" },
+    failed: { label: "失败", type: "danger" },
+    needs_review: { label: "需人工处理", type: "warning" },
+  })[status] || { label: status || "待规划", type: "info" };
+
+export const rootGenerationStatusMeta = rootWorkspaceStatusMeta;
+
+export const normalizeCoverage = (value) => {
+  const coverage = value && typeof value === "object" ? value : {};
+  const ids = (key) =>
+    Array.isArray(coverage[key]) ? coverage[key] : [];
+  return {
+    total: Number(coverage.total) || 0,
+    planned: Number(coverage.planned) || 0,
+    generated: Number(coverage.generated) || 0,
+    verified: Number(coverage.verified) || 0,
+    uncovered_endpoint_ids: ids("uncovered_endpoint_ids"),
+    planned_endpoint_ids: ids("planned_endpoint_ids"),
+    generated_endpoint_ids: ids("generated_endpoint_ids"),
+    verified_endpoint_ids: ids("verified_endpoint_ids"),
+  };
+};
+
+export const currentScenarioState = (root) => {
+  const scenarios = Array.isArray(root?.scenarios) ? root.scenarios : [];
+  const scenarioIds = Array.isArray(root?.generation?.scenario_ids)
+    ? new Set(root.generation.scenario_ids.map(String))
+    : null;
+  const current = scenarioIds
+    ? scenarios.filter((scenario) => scenarioIds.has(String(scenario.id)))
+    : scenarios;
+  const statusOf = (scenario) =>
+    scenario?.status === "stale"
+      ? "stale"
+      : scenario?.generation?.status || scenario?.status;
+  if (current.some((scenario) => statusOf(scenario) === "stale"))
+    return { label: "有场景已修改待重验", type: "warning", stale: true };
+  if (current.some((scenario) => ["running", "queued", "generating"].includes(statusOf(scenario))))
+    return { label: "场景仍在执行", type: "warning", stale: false };
+  return null;
+};
+
+export const activeScenario = (root, scenarioId) => {
+  const scenarios = Array.isArray(root?.scenarios) ? root.scenarios : [];
+  const currentId = scenarioId ?? root?.generation?.active_scenario_id;
+  const generatedIds = Array.isArray(root?.generation?.scenario_ids)
+    ? new Set(root.generation.scenario_ids.map(String))
+    : null;
+  return (
+    scenarios.find((scenario) => String(scenario.id) === String(currentId)) ||
+    scenarios.find((scenario) => generatedIds?.has(String(scenario.id))) ||
+    scenarios[0] ||
+    null
+  );
+};
+
+export const mergeScenario = (root, scenario) => {
+  if (!root || !scenario?.id) return root;
+  const scenarios = Array.isArray(root.scenarios) ? root.scenarios : [];
+  return {
+    ...root,
+    scenarios: scenarios.map((item) =>
+      String(item.id) === String(scenario.id) ? { ...item, ...scenario } : item,
+    ),
+  };
+};
+
+export const nextRootAfterDelete = (workspaces, deletedId) =>
+  (Array.isArray(workspaces) ? workspaces : []).find(
+    (workspace) => String(workspace?.id) !== String(deletedId),
+  ) || null;
+
+export const mergeRootWorkspaceMetadata = (root, update) => {
+  if (!root || !update?.id || String(root.id) !== String(update.id)) return root;
+  return {
+    ...root,
+    title: update.title ?? root.title,
+    updated_at: update.updated_at ?? root.updated_at,
+    revision: update.revision ?? root.revision,
+  };
+};
+
 export const shouldApplyWorkspaceReload = ({
   requestProjectId,
   currentProjectId,
@@ -85,6 +196,14 @@ export const shouldClearSubmittedMessage = (
   submittedMessage,
   currentMessage,
 ) => accepted === true && submittedMessage === currentMessage;
+
+export const shouldClearRootGenerationPrompt = (
+  accepted,
+  submittedMessage,
+  currentPrompt,
+) =>
+  accepted === true &&
+  submittedMessage === String(currentPrompt ?? "").trim();
 
 export const isHttpUrl = (value) => {
   try {
@@ -144,6 +263,60 @@ export const isGenerationStale = (generation, workspaceRevision, dirty) =>
 const hasGeneratedSteps = (draft) =>
   Array.isArray(draft?.teststeps) && draft.teststeps.length > 0;
 
+export const generationDraftSummary = (draft) => {
+  const errors = [];
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
+    return {
+      name: "候选场景尚未生成",
+      steps: [],
+      errors: ["候选草稿不是对象，无法解析为可编辑场景。"],
+    };
+  }
+  const config = draft.config;
+  if (config != null && (typeof config !== "object" || Array.isArray(config)))
+    errors.push("候选 config 不是对象。");
+  if (!Array.isArray(draft.teststeps)) {
+    errors.push("候选 teststeps 不是数组。");
+    return {
+      name:
+        config && typeof config === "object"
+          ? config.name || "未命名候选场景"
+          : "未命名候选场景",
+      steps: [],
+      errors,
+    };
+  }
+  const steps = [];
+  draft.teststeps.forEach((step, index) => {
+    if (!step || typeof step !== "object" || Array.isArray(step)) {
+      errors.push(`步骤 ${index + 1} 不是对象。`);
+      return;
+    }
+    const request =
+      step.request && typeof step.request === "object" && !Array.isArray(step.request)
+        ? step.request
+        : {};
+    if (step.request != null && request !== step.request)
+      errors.push(`步骤 ${index + 1} 的 request 不是对象。`);
+    steps.push({
+      name:
+        typeof step.name === "string" && step.name.trim()
+          ? step.name
+          : `步骤 ${index + 1}`,
+      method: String(request.method || "GET").toUpperCase(),
+      url: typeof request.url === "string" ? request.url : "/",
+    });
+  });
+  return {
+    name:
+      config && typeof config === "object"
+        ? config.name || "未命名候选场景"
+        : "未命名候选场景",
+    steps,
+    errors,
+  };
+};
+
 export const latestGenerationDraft = (generation, candidate) => {
   const rounds = Array.isArray(generation?.rounds) ? generation.rounds : [];
   for (let index = rounds.length - 1; index >= 0; index -= 1) {
@@ -170,7 +343,11 @@ export const generationRepairDefaults = ({
       typeof candidateConfig.variables === "object" &&
       !Array.isArray(candidateConfig.variables)
         ? clone(candidateConfig.variables)
-        : {},
+        : draftConfig.variables &&
+            typeof draftConfig.variables === "object" &&
+            !Array.isArray(draftConfig.variables)
+          ? clone(draftConfig.variables)
+          : {},
   };
 };
 

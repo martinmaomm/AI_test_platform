@@ -34,6 +34,13 @@
     <section class="scenario-summary">
       <strong>场景与步骤概要</strong>
       <p>{{ scenario.name }}</p>
+      <el-alert
+        v-if="scenario.errors.length"
+        :title="`候选草稿包含静态结构错误：${scenario.errors.join('；')}`"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
       <ol v-if="scenario.steps.length">
         <li v-for="(step, index) in scenario.steps" :key="`${step.name}-${index}`">
           {{ step.name }}：{{ step.method }} {{ step.url }}
@@ -62,7 +69,7 @@
           <li v-for="change in round.changes" :key="change">{{ change }}</li>
         </ul>
         <DebugResultPanel v-if="round.result" :result="round.result" :stale="stale" />
-        <details v-if="round.draft" class="candidate-json">
+        <details v-if="round.draft != null" class="candidate-json">
           <summary>查看只读候选 JSON</summary>
           <pre v-text="pretty(round.draft)" />
         </details>
@@ -83,6 +90,7 @@ import DebugResultPanel from "./DebugResultPanel.vue";
 import {
   generationPhaseLabel,
   generationStatusMeta,
+  generationDraftSummary,
   isGenerationStale,
   latestGenerationDraft,
 } from "@/views/api-testing/apiWorkspace";
@@ -114,19 +122,7 @@ const hasCandidateDraft = computed(
     Array.isArray(props.candidate?.draft?.teststeps) &&
     props.candidate.draft.teststeps.length > 0,
 );
-const scenario = computed(() => {
-  const draft = latestDraft.value || {};
-  return {
-    name: draft.config?.name || "候选场景尚未生成",
-    steps: Array.isArray(draft.teststeps)
-      ? draft.teststeps.map((step) => ({
-          name: step.name || "未命名步骤",
-          method: String(step.request?.method || "GET").toUpperCase(),
-          url: step.request?.url || "/",
-        }))
-      : [],
-  };
-});
+const scenario = computed(() => generationDraftSummary(latestDraft.value));
 const roundStatus = (value) => generationStatusMeta(value);
 const pretty = (value) => JSON.stringify(value, null, 2);
 const timeLabel = (value, label) =>

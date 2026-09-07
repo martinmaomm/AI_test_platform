@@ -13,6 +13,7 @@ import {
   defaultDraft,
   hasAvailableChatModel,
   generationContextMessage,
+  generationDraftSummary,
   generationPhaseLabel,
   generationRepairDefaults,
   generationStatusMeta,
@@ -21,9 +22,15 @@ import {
   latestGenerationDraft,
   listItems,
   normalizeDraft,
+  normalizeCoverage,
+  currentScenarioState,
+  activeScenario,
+  mergeRootWorkspaceMetadata,
+  rootWorkspaceBusy,
   reconcileWorkspaceModel,
   savedCaseDescription,
   shouldApplyWorkspaceReload,
+  shouldClearRootGenerationPrompt,
   shouldClearSubmittedMessage,
   updateWorkspaceListItem,
   workspaceInitializationPlan,
@@ -237,6 +244,8 @@ test("workspace save metadata and reload guards preserve the intended local stat
   assert.equal(shouldClearSubmittedMessage(true, "输入", "输入"), true);
   assert.equal(shouldClearSubmittedMessage(false, "输入", "输入"), false);
   assert.equal(shouldClearSubmittedMessage(true, "输入", "后续输入"), false);
+  assert.equal(shouldClearRootGenerationPrompt(true, "目标", "目标  \n"), true);
+  assert.equal(shouldClearRootGenerationPrompt(true, "目标", "后续目标 "), false);
 });
 
 test("adopted verification stays current until the draft or context changes", () => {
@@ -312,6 +321,14 @@ test("repair accepts only current failure evidence and preserves failed candidat
     }),
     { base_url: "https://failed-target.example.test", variables: { run: "old" } },
   );
+  assert.deepEqual(
+    generationRepairDefaults({
+      generation: { target_url: "https://prior-run.example.test" },
+      draft: { config: { base_url: "https://draft.example.test", variables: { tenant: "qa" } } },
+      useGenerationEvidence: true,
+    }),
+    { base_url: "https://prior-run.example.test", variables: { tenant: "qa" } },
+  );
 });
 
 test("generation helpers ignore incomplete specs and empty final rounds", () => {
@@ -332,6 +349,63 @@ test("generation helpers ignore incomplete specs and empty final rounds", () => 
       { draft: { config: { name: "备用" }, teststeps: [{ name: "备用步骤" }] } },
     ),
     usableDraft,
+  );
+});
+
+test("multi-scenario helpers keep root metadata and distinguish current stale scenarios", () => {
+  const root = {
+    id: 10,
+    title: "健康检查",
+    revision: 2,
+    scenarios: [
+      { id: 21, status: "passed" },
+      { id: 22, status: "stale", generation: { status: "passed" }, draft: { config: { name: "本地编辑" } } },
+    ],
+    generation: { status: "passed", scenario_ids: [22] },
+  };
+  assert.deepEqual(currentScenarioState(root), {
+    label: "有场景已修改待重验",
+    type: "warning",
+    stale: true,
+  });
+  assert.equal(activeScenario(root).id, 22);
+  assert.equal(rootWorkspaceBusy({ scenarios: [{ generation: { status: "running" } }] }), true);
+  assert.deepEqual(normalizeCoverage({ total: 3, planned: 2, verified: 1 }), {
+    total: 3,
+    planned: 2,
+    generated: 0,
+    verified: 1,
+    uncovered_endpoint_ids: [],
+    planned_endpoint_ids: [],
+    generated_endpoint_ids: [],
+    verified_endpoint_ids: [],
+  });
+  const renamed = mergeRootWorkspaceMetadata(root, {
+    id: 10,
+    title: "新的根名称",
+    revision: 3,
+    updated_at: "2026-09-07T10:00:00Z",
+  });
+  assert.equal(renamed.title, "新的根名称");
+  assert.equal(renamed.scenarios[1].draft.config.name, "本地编辑");
+  assert.equal(root.scenarios[1].draft.config.name, "本地编辑");
+});
+
+test("generation draft summary safely exposes malformed raw candidate structures", () => {
+  const summary = generationDraftSummary({
+    config: 42,
+    teststeps: [null, 42, { name: "有效步骤", request: "bad request" }],
+  });
+  assert.equal(summary.name, "未命名候选场景");
+  assert.deepEqual(summary.steps, [
+    { name: "有效步骤", method: "GET", url: "/" },
+  ]);
+  assert.ok(summary.errors.includes("候选 config 不是对象。"));
+  assert.ok(summary.errors.includes("步骤 1 不是对象。"));
+  assert.ok(summary.errors.includes("步骤 2 不是对象。"));
+  assert.ok(summary.errors.includes("步骤 3 的 request 不是对象。"));
+  assert.doesNotThrow(() =>
+    candidateDiff(defaultDraft(), { draft: { config: 42, teststeps: [null, 42] } }),
   );
 });
 
@@ -443,6 +517,7 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(api, /\$\{workspaceId\}\/debug\//);
   assert.match(api, /\$\{workspaceId\}\/save\//);
   assert.match(api, /\$\{workspaceId\}\/python\//);
+  assert.match(api, /data: \{ revision, confirmed: true \}/);
   assert.match(router, /path: 'workspace', name: 'ApiWorkspace'/);
   assert.match(router, /path: '', redirect: '\/api-testing\/workspace'/);
   assert.match(
@@ -470,7 +545,14 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, /availableChatModels\(modelsResult\.value\)/);
   assert.match(workspace, /reconcileWorkspaceModel/);
   assert.match(workspace, /ensureAvailableChatModel/);
-  assert.match(workspace, /:generation-disabled="generationDisabled"/);
+  assert.match(workspace, /:generation-disabled="conversationGenerationDisabled"/);
+  assert.match(workspace, /mergeRootWorkspaceMetadata\(rootWorkspace\.value, next\)/);
+  assert.match(workspace, /保存工作区设置/);
+  assert.match(workspace, /保存子场景模型/);
+  assert.match(workspace, /:allow-scenario-regenerate="editingScenario"/);
+  assert.match(workspace, /scenarioModelDirty\.value/);
+  assert.match(workspace, /editingScenario\.value && mode === "generate"/);
+  assert.match(workspace, /workspace-select-label/);
   assert.match(workspace, /execution_confirmed: true/);
   assert.match(workspace, /title="生成并验证确认"/);
   assert.match(workspace, /label="目标地址"/);
@@ -487,6 +569,7 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(conversation, /await props\.sendMessage/);
   assert.match(conversation, /submitting/);
   assert.match(conversation, />生成并验证</);
+  assert.match(conversation, />重新生成本场景</);
   assert.match(conversation, />修复并验证</);
   assert.match(debugPanel, /result\.log/);
   assert.match(debugPanel, /step\.extractionResults/);

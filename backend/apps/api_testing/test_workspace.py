@@ -633,6 +633,342 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(result.result['status'], 'failed')
         self.assertEqual(manager.stream_invoke.call_count, 3)
 
+    def test_single_endpoint_root_generate_always_queues_scenario_planning(self):
+        endpoint = self.endpoint()
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': root.revision, 'message': '为这个接口覆盖正向和边界场景',
+                    'execution_confirmed': True, 'base_url': 'https://example.test', 'variables': {},
+                }), project_id=self.project.id, workspace_id=root.id,
+            )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        root.refresh_from_db()
+        self.assertEqual(root.generation['_snapshot']['workflow'], 'scenarios')
+        self.assertEqual(root.generation['_snapshot']['scope_endpoint_ids'], [endpoint.id])
+        self.assertEqual(queued.call_args.kwargs['args'][:2], (root.id, root.revision))
+
+    def test_planner_keeps_invalid_raw_plan_then_repairs_once_before_children(self):
+        endpoint = self.endpoint()
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        invalid_plan = {'summary': '坏计划', 'scenarios': []}
+        valid_plan = {'summary': '修正后的计划', 'scenarios': [
+            {'title': '读取项目', 'description': '正向读取', 'endpoint_ids': [endpoint.id]},
+        ]}
+        candidate = {
+            'version': 1, 'config': {'name': '读取项目', 'variables': {}},
+            'teststeps': [{'name': '读取', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/items'},
+                'validate': [{'eq': ['status_code', 200]}]}],
+        }
+        outputs, prompts = [invalid_plan, valid_plan, candidate], []
+
+        def stream(messages, callback=None, **_kwargs):
+            payload = next(__import__('json').loads(item.content) for item in messages if item.content.startswith('{'))
+            prompts.append(payload)
+            output = __import__('json').dumps(outputs.pop(0))
+            if callback:
+                callback(output)
+            return output
+
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': 0, 'message': '规划一个读取场景', 'execution_confirmed': True,
+                    'base_url': 'https://example.test', 'variables': {},
+                }), project_id=self.project.id, workspace_id=root.id,
+            )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace(stream_invoke=stream)), \
+             patch('api_testing.requests_runner.requests_runner', return_value=self.passed_result()):
+            result = generate_and_verify_api_workspace.apply(**queued.call_args.kwargs)
+        self.assertEqual(result.result['status'], 'passed')
+        root.refresh_from_db()
+        self.assertEqual(root.generation['planning_attempts'][0]['raw'], invalid_plan)
+        self.assertEqual(root.generation['plan'], valid_plan)
+        self.assertEqual(prompts[0]['stage'], 'plan')
+        self.assertEqual(prompts[1]['stage'], 'plan')
+        self.assertEqual(prompts[1]['failure_evidence']['raw_plan'], invalid_plan)
+        self.assertEqual(root.scenarios.count(), 1)
+
+    def test_root_model_revocation_terminates_unstarted_children_without_http(self):
+        endpoint = self.endpoint()
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        plan = {'summary': '两个独立场景', 'scenarios': [
+            {'title': '第一场景', 'description': '会在执行前撤权', 'endpoint_ids': [endpoint.id]},
+            {'title': '第二场景', 'description': '不得开始', 'endpoint_ids': [endpoint.id]},
+        ]}
+        candidate = {
+            'version': 1, 'config': {'name': '候选', 'variables': {}},
+            'teststeps': [{'name': '读取', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/items'},
+                'validate': [{'eq': ['status_code', 200]}]}],
+        }
+        calls = 0
+
+        def stream(_messages, callback=None, **_kwargs):
+            nonlocal calls
+            calls += 1
+            value = plan if calls == 1 else candidate
+            if callback:
+                callback(__import__('json').dumps(value))
+            if calls == 2:
+                self.model.is_active = False
+                self.model.save(update_fields=['is_active'])
+            return __import__('json').dumps(value)
+
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': 0, 'message': '建立两个场景', 'execution_confirmed': True,
+                    'base_url': 'https://example.test', 'variables': {},
+                }), project_id=self.project.id, workspace_id=root.id,
+            )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace(stream_invoke=stream)), \
+             patch('api_testing.requests_runner.requests_runner') as runner:
+            generate_and_verify_api_workspace.apply(**queued.call_args.kwargs)
+        root.refresh_from_db()
+        self.assertEqual(root.generation['status'], 'failed')
+        self.assertEqual(calls, 2)
+        self.assertFalse(runner.called)
+        self.assertEqual(
+            list(root.scenarios.order_by('scenario_order').values_list('generation__status', flat=True)),
+            ['failed', 'failed'],
+        )
+
+    def test_parent_lease_change_during_child_callback_cleans_old_children_without_http(self):
+        endpoint = self.endpoint()
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        plan = {'summary': '两个场景', 'scenarios': [
+            {'title': '第一', 'description': '', 'endpoint_ids': [endpoint.id]},
+            {'title': '第二', 'description': '', 'endpoint_ids': [endpoint.id]},
+        ]}
+        candidate = {
+            'version': 1, 'config': {'name': '候选', 'variables': {}},
+            'teststeps': [{'name': '读取', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/items'},
+                'validate': [{'eq': ['status_code', 200]}]}],
+        }
+        calls = 0
+
+        def stream(_messages, callback=None, **_kwargs):
+            nonlocal calls
+            calls += 1
+            value = plan if calls == 1 else candidate
+            if calls == 2:
+                root.task_id = 'replacement-root-task'
+                root.revision = 1
+                root.save(update_fields=['task_id', 'revision', 'updated_at'])
+            if callback:
+                callback(__import__('json').dumps(value))
+            return __import__('json').dumps(value)
+
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': 0, 'message': '建立两个场景', 'execution_confirmed': True,
+                    'base_url': 'https://example.test', 'variables': {},
+                }), project_id=self.project.id, workspace_id=root.id,
+            )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace(stream_invoke=stream)), \
+             patch('api_testing.requests_runner.requests_runner') as runner:
+            result = generate_and_verify_api_workspace.apply(**queued.call_args.kwargs)
+        self.assertEqual(result.result['status'], 'stale')
+        root.refresh_from_db()
+        self.assertEqual((root.task_id, root.revision), ('replacement-root-task', 1))
+        self.assertFalse(runner.called)
+        self.assertEqual(
+            list(root.scenarios.order_by('scenario_order').values_list('status', flat=True)),
+            ['failed', 'failed'],
+        )
+
+    def test_expired_root_terminates_generating_children(self):
+        from .workspace_service import expire_stalled_workspace
+        root, endpoint = self.pipeline_workspace(task_id='expired-root')
+        child = self.workspace(
+            parent=root, model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id],
+            status='generating', task_id='expired-child',
+            generation={'status': 'running', 'phase': 'generating', '_snapshot': {
+                'revision': 0, 'task_id': 'expired-child', 'parent_task_id': 'expired-root',
+                'parent_revision': 0, 'queued_at': (timezone.now() - timedelta(seconds=10)).isoformat(),
+            }},
+        )
+        root.generation['_snapshot']['queued_at'] = (timezone.now() - timedelta(seconds=10)).isoformat()
+        root.save(update_fields=['generation', 'updated_at'])
+        with patch('api_testing.workspace_service.generation_timeout_seconds', return_value=5):
+            expire_stalled_workspace(root)
+        child.refresh_from_db()
+        self.assertEqual(child.status, 'failed')
+        self.assertEqual(child.generation['status'], 'failed')
+
+    def test_root_or_sibling_busy_blocks_queue_and_delete(self):
+        endpoint = self.endpoint()
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        self.workspace(parent=root, status='debugging', task_id='sibling-debug')
+        queued = APIWorkspaceMessagesView.as_view()(
+            self.request(self.user, 'post', '/', {
+                'revision': 0, 'message': '不得并发', 'execution_confirmed': True,
+                'base_url': 'https://example.test', 'variables': {},
+            }), project_id=self.project.id, workspace_id=root.id,
+        )
+        deleted = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'delete', '/', {'revision': 0, 'confirmed': True}),
+            project_id=self.project.id, workspace_id=root.id,
+        )
+        self.assertEqual(queued.status_code, 409, queued.data)
+        self.assertEqual(deleted.status_code, 409, deleted.data)
+
+    def test_root_rename_and_delete_are_owned_and_preserve_saved_cases(self):
+        endpoint = self.endpoint()
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id], title='根标题')
+        case = APITestCase.objects.create(
+            project=self.project, created_by=self.user, title='已保存用例', test_case_type='endpoint', endpoint=endpoint,
+            script_content=__import__('json').dumps(default_api_workspace_draft()),
+        )
+        self.workspace(parent=root, saved_case=case, saved_case_updated_at=case.updated_at)
+        renamed = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'title': '用户根标题'}),
+            project_id=self.project.id, workspace_id=root.id,
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.data)
+        root.refresh_from_db()
+        self.assertEqual((root.title, root.revision), ('用户根标题', 0))
+        stranger = get_user_model().objects.create_user(username='workspace-delete-stranger', email='workspace-delete-stranger@example.test')
+        forbidden = APIWorkspaceDetailView.as_view()(
+            self.request(stranger, 'delete', '/', {'revision': 0, 'confirmed': True}),
+            project_id=self.project.id, workspace_id=root.id,
+        )
+        self.assertIn(forbidden.status_code, {403, 404})
+        deleted = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'delete', '/', {'revision': 0, 'confirmed': True}),
+            project_id=self.project.id, workspace_id=root.id,
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.data)
+        self.assertTrue(APITestCase.objects.filter(pk=case.id).exists())
+
+    def test_saving_existing_case_keeps_case_title_and_workspace_title_independent(self):
+        endpoint = self.endpoint()
+        draft = {
+            'version': 1, 'config': {'name': '草稿名称', 'base_url': '', 'variables': {}, 'verify': True},
+            'teststeps': [{'name': '读取', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/items'}}],
+        }
+        case = APITestCase.objects.create(
+            project=self.project, created_by=self.user, title='正式用例名称', test_case_type='endpoint', endpoint=endpoint,
+            script_content=__import__('json').dumps(draft),
+        )
+        workspace = self.workspace(
+            title='独立工作区标题', saved_case=case, saved_case_updated_at=case.updated_at,
+            spec=endpoint.spec, endpoint_ids=[endpoint.id], draft=draft,
+        )
+        saved = APIWorkspaceSaveView.as_view()(
+            self.request(self.user, 'post', '/', {'revision': 0}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(saved.status_code, 200, saved.data)
+        workspace.refresh_from_db()
+        case.refresh_from_db()
+        self.assertEqual(workspace.title, '独立工作区标题')
+        self.assertEqual(case.title, '正式用例名称')
+        self.assertEqual(saved.data['data']['saved_case_title'], '正式用例名称')
+
+    def test_child_model_only_change_rebinds_current_failed_evidence_for_repair(self):
+        endpoint = self.endpoint()
+        replacement = LLMConfiguration.objects.create(
+            model_type='llm', provider='openai', model_name='replacement-offline-model',
+            created_by=self.user, is_active=True,
+        )
+        draft = {
+            'version': 1, 'config': {'name': '失败场景', 'base_url': '', 'variables': {}, 'verify': True},
+            'teststeps': [{'name': '读取', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/items'},
+                'validate': [{'eq': ['status_code', 200]}]}],
+        }
+        candidate_hash = draft_hash(draft)
+        failed_result = {'success': False, 'error_type': 'ValidationFailure', 'step_datas': []}
+        root = self.workspace(spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        child = self.workspace(
+            parent=root, title='冻结子场景', scenario_description='保留登录要求',
+            model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id], draft=draft,
+            messages=[{'role': 'user', 'content': '使用固定账号并验证失败原因'}],
+            candidate={'draft': draft, 'summary': '失败', 'risks': [], 'source_revision': 0,
+                'mode': 'generate', 'verification_status': 'needs_review', 'draft_hash': candidate_hash},
+            generation={'status': 'needs_review', 'phase': 'finished', 'source_revision': 0,
+                'rounds': [{'draft_hash': candidate_hash, 'draft': draft, 'result': failed_result}],
+                '_snapshot': {'model_id': self.model.id, 'historical': True}},
+            debug_result=failed_result, debug_revision=0,
+        )
+        updated = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'model_id': replacement.id, 'title': '改模型后的标题'}),
+            project_id=self.project.id, workspace_id=child.id,
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        child.refresh_from_db()
+        self.assertEqual(child.revision, 1)
+        self.assertEqual(child.generation['status'], 'needs_review')
+        self.assertEqual(child.generation['source_revision'], 1)
+        self.assertEqual(child.generation['_snapshot']['model_id'], self.model.id)
+        self.assertEqual(child.candidate['source_revision'], 1)
+        self.assertEqual(child.debug_revision, 1)
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            repair = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': 1, 'mode': 'repair', 'message': '仅修复失败原因',
+                    'execution_confirmed': True, 'base_url': 'https://example.test', 'variables': {},
+                }), project_id=self.project.id, workspace_id=child.id,
+            )
+        self.assertEqual(repair.status_code, 202, repair.data)
+        child.refresh_from_db()
+        snapshot = child.generation['_snapshot']
+        self.assertEqual(snapshot['model_id'], replacement.id)
+        self.assertEqual(snapshot['scenario'], {
+            'title': '改模型后的标题', 'description': '保留登录要求', 'endpoint_ids': [endpoint.id],
+        })
+        self.assertEqual(snapshot['messages'], [{'role': 'user', 'content': '使用固定账号并验证失败原因'},
+            {'role': 'user', 'content': '仅修复失败原因', 'mode': 'repair'}])
+        self.assertTrue(queued.called)
+
+    def test_model_change_with_draft_or_root_scope_change_stales_evidence(self):
+        endpoint = self.endpoint()
+        replacement = LLMConfiguration.objects.create(
+            model_type='llm', provider='openai', model_name='replacement-stale-model',
+            created_by=self.user, is_active=True,
+        )
+        draft = {
+            'version': 1, 'config': {'name': '旧草稿', 'base_url': '', 'variables': {}, 'verify': True},
+            'teststeps': [{'name': '读取', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/items'},
+                'validate': [{'eq': ['status_code', 200]}]}],
+        }
+        evidence = {'status': 'needs_review', 'source_revision': 0, 'rounds': []}
+        root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id], generation=evidence)
+        child = self.workspace(
+            parent=root, model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id], draft=draft,
+            candidate={'draft': draft, 'source_revision': 0}, generation=deepcopy(evidence),
+            debug_result={'success': False}, debug_revision=0,
+        )
+        changed = deepcopy(draft)
+        changed['config']['name'] = '脚本已编辑'
+        child_reply = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'model_id': replacement.id, 'draft': changed}),
+            project_id=self.project.id, workspace_id=child.id,
+        )
+        root_reply = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'model_id': replacement.id}),
+            project_id=self.project.id, workspace_id=root.id,
+        )
+        self.assertEqual(child_reply.status_code, 200, child_reply.data)
+        self.assertEqual(root_reply.status_code, 200, root_reply.data)
+        child.refresh_from_db()
+        root.refresh_from_db()
+        self.assertEqual(child.generation['status'], 'stale')
+        self.assertIsNone(child.candidate)
+        self.assertIsNone(child.debug_revision)
+        self.assertEqual(root.generation['status'], 'stale')
+
     def test_case_with_unparseable_legacy_script_is_not_silently_replaced(self):
         case = APITestCase.objects.create(
             project=self.project, created_by=self.user, title='legacy', test_case_type='scenario', script_content='not-json',

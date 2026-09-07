@@ -103,13 +103,20 @@ def assertions_preserved(baseline: dict[str, set[str]], protected: dict[str, dic
 
 def draft_changes(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
     """Human-readable structural diff that deliberately excludes request values and secrets."""
-    before = previous.get('teststeps', []) if isinstance(previous, dict) else []
-    after = current.get('teststeps', []) if isinstance(current, dict) else []
+    if not isinstance(previous, dict) or not isinstance(previous.get('config'), dict) or not isinstance(previous.get('teststeps'), list):
+        return ['已修正上一轮候选的非法 JSON 结构']
+    before = previous['teststeps']
+    after = current.get('teststeps', []) if isinstance(current, dict) and isinstance(current.get('teststeps'), list) else []
     changes: list[str] = []
     if len(before) != len(after):
         changes.append(f'测试步骤数量由 {len(before)} 调整为 {len(after)}')
     for index, (old, new) in enumerate(zip(before, after), start=1):
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            changes.append(f'第 {index} 步已修正非法结构')
+            continue
         old_request, new_request = old.get('request', {}), new.get('request', {})
+        old_request = old_request if isinstance(old_request, dict) else {}
+        new_request = new_request if isinstance(new_request, dict) else {}
         if (old.get('endpoint_id'), old_request.get('method'), old_request.get('url')) != (
             new.get('endpoint_id'), new_request.get('method'), new_request.get('url'),
         ):
@@ -127,11 +134,16 @@ def draft_changes(previous: dict[str, Any], current: dict[str, Any]) -> list[str
             changes.append(f'第 {index} 步提取路径已调整')
         if _canonical(old.get('validate', [])) != _canonical(new.get('validate', [])):
             changes.append(f'第 {index} 步断言结构已调整')
-    old_variables = set((previous.get('config', {}) or {}).get('variables', {}))
-    new_variables = set((current.get('config', {}) or {}).get('variables', {}))
+    old_variables_value = previous['config'].get('variables', {})
+    new_config = current.get('config', {}) if isinstance(current, dict) else {}
+    new_variables_value = new_config.get('variables', {}) if isinstance(new_config, dict) else {}
+    if not isinstance(old_variables_value, dict) or not isinstance(new_variables_value, dict):
+        return changes + ['已修正配置变量的非法结构']
+    old_variables = set(old_variables_value)
+    new_variables = set(new_variables_value)
     if old_variables != new_variables:
         changes.append('配置变量名称集合已调整')
-    elif _canonical((previous.get('config', {}) or {}).get('variables', {})) != _canonical((current.get('config', {}) or {}).get('variables', {})):
+    elif _canonical(old_variables_value) != _canonical(new_variables_value):
         changes.append('配置变量定义已调整')
     return changes or ['未变更请求结构；保留上一轮候选进行复测']
 
@@ -208,7 +220,6 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
     merged_variables = {**deepcopy(draft['config'].get('variables') or {}), **deepcopy(variables)}
     scoped_values = _static_variable_values(merged_variables)
     config_headers = draft['config'].get('headers') if isinstance(draft['config'].get('headers'), dict) else {}
-    _require_variables(config_headers, scoped_values, allowed=set(scoped_values), label='候选配置 headers')
     available = set(merged_variables) | {'timestamp_ns', 'uuid4'}
     for index, step in enumerate(draft['teststeps']):
         request = step['request']
@@ -221,8 +232,17 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
             raise WorkspaceValidationError(f'候选步骤 {index + 1} 不允许修改已确认目标地址。')
         if not step['validate']:
             raise WorkspaceValidationError(f'候选步骤 {index + 1} 至少需要一条可执行断言。')
+        # Runtime overlays headers case-insensitively before substitution.  Do
+        # the same here so a step-level ``authorization`` correctly replaces a
+        # global ``Authorization`` instead of triggering a false static error.
+        from .requests_runtime import _merge_headers
         effective_step = deepcopy(step)
-        effective_step['request']['headers'] = {**config_headers, **request.get('headers', {})}
+        effective_headers = _merge_headers(config_headers, request.get('headers', {}))
+        effective_step['request']['headers'] = effective_headers
+        _require_variables(
+            effective_headers, scoped_values, allowed=available,
+            label=f'候选步骤 {index + 1} 的有效 headers（依赖登录变量请移到登录后的步骤）',
+        )
         _require_endpoint_input(effective_step, endpoint, scoped_values, allowed=available, index=index)
         for extracted_name in step['extract']:
             scoped_values.pop(extracted_name, None)

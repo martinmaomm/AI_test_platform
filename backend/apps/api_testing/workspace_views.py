@@ -21,7 +21,7 @@ from .models import APITestCase, APIWorkspace, default_api_workspace_draft
 from .workspace_service import (
     WorkspaceConflict, WorkspaceValidationError, _UNSET, append_message,
     can_edit_project, can_execute_project, create_or_update_case, endpoint_specs, expire_stalled_workspace,
-    normalize_draft, require_executable_draft, validate_model_id,
+    normalize_draft, require_executable_draft, require_generation_model_id, validate_model_id,
     owned_workspace, require_revision, serialize_workspace, update_workspace_draft,
 )
 from .workspace_tasks import debug_api_workspace, generate_api_workspace_candidate
@@ -96,7 +96,10 @@ class APIWorkspaceCollectionView(APIView):
             _project_or_denied(project_id, request.user)
         except PermissionError as exc:
             return _problem(exc, 403)
-        workspaces = [expire_stalled_workspace(item) for item in APIWorkspace.objects.filter(project_id=project_id, owner=request.user)]
+        workspaces = [
+            expire_stalled_workspace(item)
+            for item in APIWorkspace.objects.filter(project_id=project_id, owner=request.user).select_related('saved_case')
+        ]
         return response(kind='success', data=[serialize_workspace(item) for item in workspaces], message='获取工作区成功')
 
     def post(self, request, project_id):
@@ -112,7 +115,7 @@ class APIWorkspaceCollectionView(APIView):
             if not isinstance(endpoint_ids, list):
                 raise WorkspaceValidationError('endpoint_ids 必须是数组。')
             endpoint_specs(project.id, endpoint_ids)
-            model_id = validate_model_id(request.data.get('model_id'))
+            model_id = validate_model_id(request.data.get('model_id'), owner=request.user)
             if case and case.script_content:
                 try:
                     draft = normalize_draft(json.loads(case.script_content))
@@ -191,7 +194,7 @@ class APIWorkspaceMessagesView(APIView):
                 revision = require_revision(workspace, request.data['revision'])
                 if workspace.status in {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}:
                     raise WorkspaceConflict('当前工作区任务尚未结束。')
-                validate_model_id(workspace.model_id)
+                require_generation_model_id(workspace.model_id, owner=workspace.owner)
                 failure_evidence = None
                 if mode == 'repair':
                     if workspace.debug_revision != revision or not isinstance(workspace.debug_result, dict) or not workspace.debug_result:
@@ -271,7 +274,7 @@ class APIWorkspaceSaveView(APIView):
             workspace = owned_workspace(project_id=project_id, workspace_id=workspace_id, user=request.user)
             workspace = create_or_update_case(
                 workspace, revision=request.data['revision'], title=request.data.get('title'),
-                description=request.data.get('description'),
+                description=request.data['description'] if 'description' in request.data else _UNSET,
             )
             return response(kind='success', data=serialize_workspace(workspace), message='工作区已保存为 API 用例')
         except PermissionError as exc:

@@ -40,7 +40,7 @@
       />
       <el-button
         type="primary"
-        :disabled="disabled || busy"
+        :disabled="disabled || busy || submitting"
         @click="$emit('adopt')"
         >采用候选并替换草稿</el-button
       >
@@ -51,7 +51,7 @@
       :rows="3"
       maxlength="2000"
       show-word-limit
-      :disabled="disabled || busy"
+      :disabled="disabled || busy || submitting"
       placeholder="例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。"
       @keydown.ctrl.enter.prevent="send('generate')"
     />
@@ -59,13 +59,19 @@
       <el-button
         type="primary"
         :loading="busy && mode === 'generate'"
-        :disabled="disabled || busy || generationDisabled || !message.trim()"
+        :disabled="
+          disabled ||
+          busy ||
+          submitting ||
+          generationDisabled ||
+          !message.trim()
+        "
         @click="send('generate')"
         >生成候选</el-button
       >
       <el-button
         :loading="busy && mode === 'repair'"
-        :disabled="disabled || busy || generationDisabled || !canRepair"
+        :disabled="disabled || busy || submitting || generationDisabled || !canRepair"
         @click="send('repair')"
         >基于失败结果修复</el-button
       >
@@ -78,6 +84,7 @@
 
 <script setup>
 import { ref } from "vue";
+import { shouldClearSubmittedMessage } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -89,21 +96,31 @@ const props = defineProps({
   generationDisabled: Boolean,
   canRepair: Boolean,
   workspaceError: String,
+  sendMessage: { type: Function, required: true },
 });
-const emit = defineEmits(["send", "adopt"]);
+const emit = defineEmits(["adopt"]);
 const message = ref("");
 const mode = ref("generate");
-const send = (nextMode) => {
-  if (props.generationDisabled) return;
-  if (!message.value.trim() && nextMode === "generate") return;
+const submitting = ref(false);
+const send = async (nextMode) => {
+  if (props.generationDisabled || props.disabled || props.busy || submitting.value)
+    return;
+  const submittedMessage = message.value;
+  if (!submittedMessage.trim() && nextMode === "generate") return;
   mode.value = nextMode;
-  emit("send", {
-    mode: nextMode,
-    message:
-      message.value.trim() ||
-      "请基于本次失败调试结果修复草稿，不要删除或放宽断言。",
-  });
-  if (nextMode === "generate") message.value = "";
+  submitting.value = true;
+  try {
+    const accepted = await props.sendMessage({
+      mode: nextMode,
+      message:
+        submittedMessage.trim() ||
+        "请基于本次失败调试结果修复草稿，不要删除或放宽断言。",
+    });
+    if (shouldClearSubmittedMessage(accepted, submittedMessage, message.value))
+      message.value = "";
+  } finally {
+    submitting.value = false;
+  }
 };
 </script>
 

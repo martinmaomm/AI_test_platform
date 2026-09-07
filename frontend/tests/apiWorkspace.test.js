@@ -12,6 +12,11 @@ import {
   listItems,
   normalizeDraft,
   reconcileWorkspaceModel,
+  savedCaseDescription,
+  shouldApplyWorkspaceReload,
+  shouldClearSubmittedMessage,
+  updateWorkspaceListItem,
+  workspaceInitializationPlan,
 } from "../src/views/api-testing/apiWorkspace.js";
 
 test("API workspace draft remains structured and preserves body kinds", () => {
@@ -125,6 +130,83 @@ test("workspace only permits active LLM models and clears an unavailable saved m
   });
 });
 
+test("workspace initialization honors explicit targets before history", () => {
+  const history = [{ id: 9 }, { id: 8 }];
+  assert.deepEqual(
+    workspaceInitializationPlan({ workspace_id: "7", case_id: "4" }, history),
+    { action: "load", workspaceId: 7, explicit: true },
+  );
+  assert.deepEqual(
+    workspaceInitializationPlan({ case_id: "4", endpoint_id: "5" }, history),
+    { action: "create", caseId: 4, endpointId: 5, explicit: true },
+  );
+  assert.deepEqual(workspaceInitializationPlan({}, history), {
+    action: "load",
+    workspaceId: 9,
+    explicit: false,
+  });
+  assert.equal(
+    workspaceInitializationPlan({ workspace_id: "bad" }, history).action,
+    "invalid",
+  );
+  assert.equal(
+    workspaceInitializationPlan({ endpoint_id: ["5"] }, history).action,
+    "invalid",
+  );
+});
+
+test("workspace save metadata and reload guards preserve the intended local state", () => {
+  assert.equal(savedCaseDescription({ saved_case_description: "已有描述" }), "已有描述");
+  assert.equal(savedCaseDescription({}), "");
+  assert.deepEqual(
+    updateWorkspaceListItem(
+      [{ id: 1, title: "旧标题" }, { id: 2, title: "其他" }],
+      { id: 1, title: "新标题", saved_case_description: "描述" },
+    ),
+    [
+      { id: 1, title: "新标题", saved_case_description: "描述" },
+      { id: 2, title: "其他" },
+    ],
+  );
+  assert.equal(
+    shouldApplyWorkspaceReload({
+      requestProjectId: 1,
+      currentProjectId: 1,
+      requestSequence: 3,
+      latestSequence: 3,
+      dirty: true,
+      confirmedSnapshot: "accepted-draft",
+      currentSnapshot: "accepted-draft",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldApplyWorkspaceReload({
+      requestProjectId: 1,
+      currentProjectId: 1,
+      requestSequence: 3,
+      latestSequence: 3,
+      dirty: true,
+      confirmedSnapshot: "accepted-draft",
+      currentSnapshot: "new-edit",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldApplyWorkspaceReload({
+      requestProjectId: 1,
+      currentProjectId: 2,
+      requestSequence: 3,
+      latestSequence: 3,
+      dirty: false,
+    }),
+    false,
+  );
+  assert.equal(shouldClearSubmittedMessage(true, "输入", "输入"), true);
+  assert.equal(shouldClearSubmittedMessage(false, "输入", "输入"), false);
+  assert.equal(shouldClearSubmittedMessage(true, "输入", "后续输入"), false);
+});
+
 test("workspace API, routing, navigation, and suite variables use the approved contract", async () => {
   const [
     api,
@@ -217,9 +299,14 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, /reconcileWorkspaceModel/);
   assert.match(workspace, /ensureAvailableChatModel/);
   assert.match(workspace, /:generation-disabled="generationDisabled"/);
+  assert.match(workspace, /:send-message="sendMessage"/);
+  assert.match(workspace, /workspaceInitializationPlan/);
+  assert.match(workspace, /savedCaseDescription\(workspace\.value\)/);
   assert.match(workspace, /重新选择可用聊天模型/);
   assert.match(conversation, /generationDisabled/);
-  assert.match(conversation, /if \(props\.generationDisabled\) return/);
+  assert.match(conversation, /props\.generationDisabled/);
+  assert.match(conversation, /await props\.sendMessage/);
+  assert.match(conversation, /submitting/);
   assert.match(debugPanel, /result\.log/);
   assert.match(debugPanel, /step\?\.status\) === "skipped"/);
   assert.match(configEditor, /timestamp_ns/);

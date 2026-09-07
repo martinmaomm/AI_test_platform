@@ -131,7 +131,7 @@
                 ><el-checkbox-group
                   v-model="endpointIds"
                   :disabled="interactionLocked"
-                  @change="contextDirty = true"
+                  @change="markContextDirty"
                   ><el-checkbox
                     v-for="endpoint in endpointOptions"
                     :key="endpoint.id"
@@ -164,7 +164,7 @@
             :generation-disabled="generationDisabled"
             :can-repair="canRepair"
             :workspace-error="workspace.error"
-            @send="sendMessage"
+            :send-message="sendMessage"
             @adopt="adoptCandidate"
           />
           <WorkspaceConfigEditor
@@ -300,7 +300,11 @@
       ></el-form>
       <template #footer
         ><el-button @click="saveDialog = false">取消</el-button
-        ><el-button type="success" :loading="busy" @click="saveCase"
+        ><el-button
+          type="success"
+          :loading="busy || savingCase"
+          :disabled="savingCase"
+          @click="saveCase"
           >确认保存</el-button
         ></template
       >
@@ -346,8 +350,12 @@ import {
   listItems,
   normalizeDraft,
   reconcileWorkspaceModel,
+  savedCaseDescription,
   statusMeta,
+  shouldApplyWorkspaceReload,
+  updateWorkspaceListItem,
   unwrap,
+  workspaceInitializationPlan,
 } from "./apiWorkspace";
 
 const route = useRoute();
@@ -376,6 +384,8 @@ const python = ref({
 });
 const loading = ref(false);
 const savingDraft = ref(false);
+const savingCase = ref(false);
+const sendingMessage = ref(false);
 const modelsLoading = ref(false);
 const specsLoading = ref(false);
 const endpointsLoading = ref(false);
@@ -390,12 +400,17 @@ const initializing = ref(false);
 const routeTransitioning = ref(false);
 let pollTimer = null;
 let pollInFlight = false;
+let reloadSequence = 0;
+let initializationSequence = 0;
+let messageSendSequence = 0;
 const dirty = computed(() => draftDirty.value || contextDirty.value);
 const busy = computed(() => isBusyWorkspace(workspace.value));
 const interactionLocked = computed(
   () =>
     busy.value ||
     savingDraft.value ||
+    savingCase.value ||
+    sendingMessage.value ||
     loading.value ||
     initializing.value ||
     routeTransitioning.value,
@@ -465,7 +480,7 @@ const selectModel = (selectedId) => {
   unavailableModel.value = hasAvailableChatModel(models.value, selectedId)
     ? false
     : unavailableModel.value;
-  contextDirty.value = true;
+  markContextDirty();
 };
 const ensureAvailableChatModel = () => {
   if (modelsLoadFailed.value) {
@@ -492,6 +507,12 @@ const routeInteger = (key) => {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
 };
 const sameWorkspaceId = (left, right) => String(left) === String(right);
+const workspaceEditSnapshot = () =>
+  JSON.stringify({
+    draft: draft.value,
+    modelId: modelId.value,
+    endpointIds: endpointIds.value,
+  });
 const clearPython = () => {
   python.value = {
     code: "",
@@ -519,6 +540,10 @@ const asWorkspace = (response) => {
 };
 const markDirty = () => {
   draftDirty.value = true;
+  clearPython();
+};
+const markContextDirty = () => {
+  contextDirty.value = true;
   clearPython();
 };
 const updateConfig = (config) => {
@@ -593,6 +618,7 @@ const applyWorkspace = (value) => {
   )
     clearPython();
   workspace.value = next;
+  workspaces.value = updateWorkspaceListItem(workspaces.value, next);
   workspaceId.value = next.id;
   modelId.value = next.model_id ?? null;
   endpointIds.value = [...(next.endpoint_ids || [])];
@@ -617,11 +643,14 @@ const applyWorkspace = (value) => {
     stopPolling();
   else startPolling();
 };
-const loadWorkspaces = async () => {
-  const response = await listApiWorkspaces(projectId.value);
+const loadWorkspaces = async (requestProjectId = projectId.value) => {
+  const response = await listApiWorkspaces(requestProjectId);
+  if (requestProjectId !== projectId.value) return false;
   workspaces.value = listItems(response);
+  return true;
 };
 const loadAuxiliary = async () => {
+  const requestProjectId = projectId.value;
   modelsLoading.value = true;
   specsLoading.value = true;
   const [modelsResult, specsResult, environmentsResult] =
@@ -630,6 +659,7 @@ const loadAuxiliary = async () => {
       getAPISpecifications(projectId.value),
       getProjectEnvironments(projectId.value, { category: "api" }),
     ]);
+  if (requestProjectId !== projectId.value) return;
   if (modelsResult.status === "fulfilled") {
     models.value = availableChatModels(modelsResult.value);
     modelsLoaded.value = true;
@@ -656,6 +686,8 @@ const loadAuxiliary = async () => {
   specsLoading.value = false;
 };
 const loadWorkspaceEndpointLabels = async () => {
+  const requestProjectId = projectId.value;
+  const requestWorkspaceId = workspace.value?.id;
   const unresolved = new Set(
     endpointIds.value.filter(
       (id) =>
@@ -668,6 +700,11 @@ const loadWorkspaceEndpointLabels = async () => {
   for (const spec of specs.value) {
     try {
       const response = await getAPIEndpoints(projectId.value, spec.id);
+      if (
+        requestProjectId !== projectId.value ||
+        !sameWorkspaceId(requestWorkspaceId, workspace.value?.id)
+      )
+        return;
       const matches = listItems(response).filter((item) =>
         unresolved.has(item.id),
       );
@@ -687,8 +724,14 @@ const loadWorkspaceEndpointLabels = async () => {
     }
   }
 };
-const createWorkspace = async () => {
-  if (busy.value || routeTransitioning.value) return;
+const createWorkspace = async ({ fromInitialize = false } = {}) => {
+  if (
+    busy.value ||
+    routeTransitioning.value ||
+    (loading.value && !fromInitialize) ||
+    sendingMessage.value
+  )
+    return;
   if (!(await confirmDiscardDraft("新建工作区"))) return;
   const caseRaw = route.query.case_id;
   const endpointRaw = route.query.endpoint_id;
@@ -700,11 +743,13 @@ const createWorkspace = async () => {
   }
   routeTransitioning.value = true;
   loading.value = true;
+  const requestProjectId = projectId.value;
   try {
     const payload = {};
     if (caseId) payload.case_id = caseId;
     if (endpointId) payload.endpoint_ids = [endpointId];
-    const response = await createApiWorkspace(projectId.value, payload);
+    const response = await createApiWorkspace(requestProjectId, payload);
+    if (requestProjectId !== projectId.value) return;
     const created = asWorkspace(response);
     if (!created?.id) throw new Error("后端未返回工作区 ID");
     await loadWorkspaces();
@@ -716,11 +761,14 @@ const createWorkspace = async () => {
   } catch (error) {
     ElMessage.error(errorMessage(error, "新建工作区失败"));
   } finally {
-    loading.value = false;
-    routeTransitioning.value = false;
+    if (requestProjectId === projectId.value) {
+      loading.value = false;
+      routeTransitioning.value = false;
+    }
   }
 };
 const selectWorkspace = async (id) => {
+  if (sendingMessage.value) return;
   if (dirty.value) {
     ElMessage.warning("请先保存或处理本地草稿，再切换工作区");
     workspaceId.value = workspace.value?.id;
@@ -744,10 +792,13 @@ const reloadWorkspace = async ({
   expected = null,
   skipDirtyCheck = false,
 } = {}) => {
-  if (!projectId.value || !id) return;
+  if (!projectId.value || !id || sendingMessage.value) return false;
+  let confirmedSnapshot = skipDirtyCheck ? workspaceEditSnapshot() : null;
   if (dirty.value && !skipDirtyCheck) {
     if (quiet || !(await confirmDiscardDraft("重新加载工作区"))) return false;
+    confirmedSnapshot = workspaceEditSnapshot();
   }
+  const requestSequence = ++reloadSequence;
   if (!quiet) loading.value = true;
   try {
     const requestProjectId = projectId.value;
@@ -763,8 +814,15 @@ const reloadWorkspace = async ({
       (sameWorkspaceId(next?.id, expected.id) &&
         next?.revision === expected.revision);
     if (
-      requestProjectId !== projectId.value ||
-      dirty.value ||
+      !shouldApplyWorkspaceReload({
+        requestProjectId,
+        currentProjectId: projectId.value,
+        requestSequence,
+        latestSequence: reloadSequence,
+        dirty: dirty.value,
+        confirmedSnapshot,
+        currentSnapshot: workspaceEditSnapshot(),
+      }) ||
       (expected && (!expectedIsCurrent || !responseMatchesExpected))
     )
       return false;
@@ -775,54 +833,112 @@ const reloadWorkspace = async ({
     if (!quiet) ElMessage.error(errorMessage(error, "加载工作区失败"));
     return false;
   } finally {
-    if (!quiet) loading.value = false;
+    if (!quiet && requestSequence === reloadSequence) loading.value = false;
   }
 };
 const saveDraft = async ({ notify = true } = {}) => {
   if (!workspace.value || busy.value) return false;
+  const request = {
+    projectId: projectId.value,
+    workspaceId: workspace.value.id,
+    revision: workspace.value.revision,
+  };
   savingDraft.value = true;
   try {
     const response = await updateApiWorkspace(
-      projectId.value,
-      workspace.value.id,
+      request.projectId,
+      request.workspaceId,
       {
         draft: clone(draft.value),
         model_id: modelId.value,
         endpoint_ids: endpointIds.value,
-        revision: workspace.value.revision,
+        revision: request.revision,
       },
     );
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+      request.revision !== workspace.value?.revision
+    )
+      return false;
     applyWorkspace(response);
     await loadWorkspaces();
     if (notify) ElMessage.success("草稿已保存");
     return true;
   } catch (error) {
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id)
+    )
+      return false;
     if (error?.response?.status === 409) {
       conflict.value = true;
       ElMessage.error("保存冲突：服务器版本已更新");
     } else ElMessage.error(errorMessage(error, "保存草稿失败"));
     return false;
   } finally {
-    savingDraft.value = false;
+    if (
+      request.projectId === projectId.value &&
+      sameWorkspaceId(request.workspaceId, workspace.value?.id)
+    )
+      savingDraft.value = false;
   }
 };
 const sendMessage = async ({ mode, message }) => {
-  if (!workspace.value || busy.value || conflict.value) return;
-  if (!ensureAvailableChatModel()) return;
-  if (dirty.value && !(await saveDraft({ notify: false }))) return;
-  if (mode === "repair" && !canRepair.value)
-    return ElMessage.warning("请先保存草稿并获得失败调试结果");
+  if (
+    !workspace.value ||
+    busy.value ||
+    conflict.value ||
+    sendingMessage.value
+  )
+    return false;
+  if (!ensureAvailableChatModel()) return false;
+  const context = {
+    projectId: projectId.value,
+    workspaceId: workspace.value.id,
+  };
+  const requestSequence = ++messageSendSequence;
+  sendingMessage.value = true;
   try {
+    if (dirty.value && !(await saveDraft({ notify: false }))) return false;
+    if (
+      requestSequence !== messageSendSequence ||
+      context.projectId !== projectId.value ||
+      !sameWorkspaceId(context.workspaceId, workspace.value?.id)
+    )
+      return false;
+    if (mode === "repair" && !canRepair.value) {
+      ElMessage.warning("请先保存草稿并获得失败调试结果");
+      return false;
+    }
+    const request = { ...context, revision: workspace.value.revision };
     const response = await sendApiWorkspaceMessage(
-      projectId.value,
-      workspace.value.id,
-      { message, revision: workspace.value.revision, mode },
+      request.projectId,
+      request.workspaceId,
+      { message, revision: request.revision, mode },
     );
+    if (
+      requestSequence !== messageSendSequence ||
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+      request.revision !== workspace.value?.revision
+    )
+      return false;
     applyWorkspace(response);
     startPolling();
+    return true;
   } catch (error) {
+    if (
+      requestSequence !== messageSendSequence ||
+      context.projectId !== projectId.value ||
+      !sameWorkspaceId(context.workspaceId, workspace.value?.id)
+    )
+      return false;
     if (error?.response?.status === 409) conflict.value = true;
     ElMessage.error(errorMessage(error, "启动 AI 任务失败"));
+    return false;
+  } finally {
+    if (requestSequence === messageSendSequence) sendingMessage.value = false;
   }
 };
 const adoptCandidate = async () => {
@@ -909,30 +1025,53 @@ const openSave = async () => {
   if (dirty.value && !(await saveDraft())) return;
   saveForm.value = {
     title: workspace.value?.title || draft.value.config.name,
-    description: "",
+    description: savedCaseDescription(workspace.value),
   };
   saveDialog.value = true;
 };
 const saveCase = async () => {
-  if (!workspace.value || busy.value) return;
+  if (!workspace.value || busy.value || savingCase.value) return;
+  const request = {
+    projectId: projectId.value,
+    workspaceId: workspace.value.id,
+    revision: workspace.value.revision,
+  };
+  savingCase.value = true;
   try {
     const response = await saveApiWorkspace(
-      projectId.value,
-      workspace.value.id,
+      request.projectId,
+      request.workspaceId,
       {
-        revision: workspace.value.revision,
+        revision: request.revision,
         title: saveForm.value.title,
         description: saveForm.value.description,
       },
     );
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+      request.revision !== workspace.value?.revision
+    )
+      return;
     applyWorkspace(response);
     saveDialog.value = false;
     ElMessage.success(
       workspace.value?.saved_case_id ? "测试用例已保存" : "保存完成",
     );
   } catch (error) {
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id)
+    )
+      return;
     if (error?.response?.status === 409) conflict.value = true;
     ElMessage.error(errorMessage(error, "保存测试用例失败"));
+  } finally {
+    if (
+      request.projectId === projectId.value &&
+      sameWorkspaceId(request.workspaceId, workspace.value?.id)
+    )
+      savingCase.value = false;
   }
 };
 const loadPython = async () => {
@@ -993,25 +1132,68 @@ const downloadPython = () => {
   URL.revokeObjectURL(url);
 };
 const initialize = async () => {
-  if (initializing.value) return;
+  const requestSequence = ++initializationSequence;
   initializing.value = true;
   if (!projectId.value) {
     await projectStore.initializeUserPreferences();
+    if (requestSequence !== initializationSequence) return;
     if (!projectId.value) {
       initializing.value = false;
       return;
     }
   }
+  const requestProjectId = projectId.value;
+  reloadSequence += 1;
+  messageSendSequence += 1;
+  stopPolling();
+  workspace.value = null;
+  workspaceId.value = null;
+  workspaces.value = [];
+  draft.value = normalizeDraft();
+  modelId.value = null;
+  endpointIds.value = [];
+  endpointOptions.value = [];
+  draftDirty.value = false;
+  contextDirty.value = false;
+  conflict.value = false;
+  savingDraft.value = false;
+  savingCase.value = false;
+  sendingMessage.value = false;
+  unavailableModel.value = false;
+  clearPython();
   loading.value = true;
   try {
     await Promise.all([loadWorkspaces(), loadAuxiliary()]);
-    const requestedId = route.query.workspace_id;
-    const target = requestedId || workspaces.value[0]?.id;
-    if (target) await reloadWorkspace({ id: target });
-    else await createWorkspace();
+    if (
+      requestSequence !== initializationSequence ||
+      requestProjectId !== projectId.value
+    )
+      return;
+    const plan = workspaceInitializationPlan(route.query, workspaces.value);
+    if (plan.action === "invalid") {
+      ElMessage.error(plan.message);
+      return;
+    }
+    if (plan.action === "create") {
+      await createWorkspace({ fromInitialize: true });
+      return;
+    }
+    if (!plan.explicit) {
+      await router.replace({
+        path: route.path,
+        query: { workspace_id: String(plan.workspaceId) },
+      });
+    }
+    if (
+      requestSequence === initializationSequence &&
+      requestProjectId === projectId.value
+    )
+      await reloadWorkspace({ id: plan.workspaceId, skipDirtyCheck: true });
   } finally {
-    loading.value = false;
-    initializing.value = false;
+    if (requestSequence === initializationSequence) {
+      loading.value = false;
+      initializing.value = false;
+    }
   }
 };
 watch(projectId, (next, previous) => {

@@ -92,6 +92,90 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(workspace.draft['config']['name'], 'v1')
         self.assertEqual(workspace.revision, 1)
 
+    def test_create_and_patch_allow_null_model_for_an_empty_workspace(self):
+        created = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'post', '/', {'model_id': None}), project_id=self.project.id,
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        workspace_id = created.data['data']['id']
+        self.assertIsNone(created.data['data']['model_id'])
+
+        updated = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'model_id': None}),
+            project_id=self.project.id, workspace_id=workspace_id,
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertIsNone(updated.data['data']['model_id'])
+
+        owned_created = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'post', '/', {'model_id': self.model.id}), project_id=self.project.id,
+        )
+        self.assertEqual(owned_created.status_code, 201, owned_created.data)
+        self.assertEqual(owned_created.data['data']['model_id'], self.model.id)
+        owned_updated = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'model_id': self.model.id}),
+            project_id=self.project.id, workspace_id=owned_created.data['data']['id'],
+        )
+        self.assertEqual(owned_updated.status_code, 200, owned_updated.data)
+        self.assertEqual(owned_updated.data['data']['model_id'], self.model.id)
+
+    def test_model_binding_and_generation_are_owner_scoped(self):
+        other_model = LLMConfiguration.objects.create(
+            model_type='llm', provider='openai', model_name='other-owner-model',
+            created_by=self.viewer, is_active=True,
+        )
+        denied_create = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'post', '/', {'model_id': other_model.id}), project_id=self.project.id,
+        )
+        self.assertEqual(denied_create.status_code, 400)
+
+        workspace = self.workspace()
+        denied_patch = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'model_id': other_model.id}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(denied_patch.status_code, 400)
+
+        workspace.model_id = other_model.id
+        workspace.save(update_fields=['model_id', 'updated_at'])
+        with patch('api_testing.workspace_views._queue_generation') as queue:
+            denied_message = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查'}),
+                project_id=self.project.id, workspace_id=workspace.id,
+            )
+        self.assertEqual(denied_message.status_code, 400)
+        queue.assert_not_called()
+
+        workspace.status = 'generating'
+        workspace.task_id = 'other-owner-task'
+        workspace.save(update_fields=['status', 'task_id', 'updated_at'])
+        with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+            result = generate_api_workspace_candidate.apply(
+                args=(workspace.id, 0, 'other-owner-task', 'generate', []),
+            )
+        self.assertEqual(result.result['status'], 'failed')
+        manager.assert_not_called()
+
+    def test_generation_requires_an_explicit_owned_active_model(self):
+        workspace = self.workspace()
+        with patch('api_testing.workspace_views._queue_generation') as queue:
+            denied_message = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查'}),
+                project_id=self.project.id, workspace_id=workspace.id,
+            )
+        self.assertEqual(denied_message.status_code, 400)
+        queue.assert_not_called()
+
+        workspace.status = 'generating'
+        workspace.task_id = 'no-model-task'
+        workspace.save(update_fields=['status', 'task_id', 'updated_at'])
+        with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+            result = generate_api_workspace_candidate.apply(
+                args=(workspace.id, 0, 'no-model-task', 'generate', []),
+            )
+        self.assertEqual(result.result['status'], 'failed')
+        manager.assert_not_called()
+
     def test_fake_llm_stores_candidate_without_replacing_draft(self):
         draft = default_api_workspace_draft()
         workspace = self.workspace(
@@ -173,6 +257,49 @@ class APIWorkspaceTests(TestCase):
             self.request(self.user, 'post', '/', {'revision': 0}), project_id=self.project.id, workspace_id=workspace.id,
         )
         self.assertEqual(conflict.status_code, 409)
+
+    def test_save_description_preserves_omitted_or_null_and_allows_explicit_clear(self):
+        draft = default_api_workspace_draft()
+        draft['teststeps'] = [{'name': 'one', 'request': {'method': 'GET', 'url': '/health'}}]
+        workspace = self.workspace(draft=draft)
+
+        created = APIWorkspaceSaveView.as_view()(
+            self.request(self.user, 'post', '/', {'revision': 0}), project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(created.status_code, 200, created.data)
+        self.assertEqual(created.data['data']['saved_case_description'], '')
+        workspace.refresh_from_db()
+        case = workspace.saved_case
+        case.description = '保留的描述'
+        case.save(update_fields=['description', 'updated_at'])
+        workspace.saved_case_updated_at = case.updated_at
+        workspace.save(update_fields=['saved_case_updated_at', 'updated_at'])
+
+        omitted = APIWorkspaceSaveView.as_view()(
+            self.request(self.user, 'post', '/', {'revision': 0}), project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(omitted.status_code, 200, omitted.data)
+        self.assertEqual(omitted.data['data']['saved_case_description'], '保留的描述')
+
+        preserved_null = APIWorkspaceSaveView.as_view()(
+            self.request(self.user, 'post', '/', {'revision': 0, 'description': None}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(preserved_null.status_code, 200, preserved_null.data)
+        self.assertEqual(preserved_null.data['data']['saved_case_description'], '保留的描述')
+
+        cleared = APIWorkspaceSaveView.as_view()(
+            self.request(self.user, 'post', '/', {'revision': 0, 'description': ''}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.data)
+        self.assertEqual(cleared.data['data']['saved_case_description'], '')
+
+        invalid = APIWorkspaceSaveView.as_view()(
+            self.request(self.user, 'post', '/', {'revision': 0, 'description': {'not': 'text'}}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(invalid.status_code, 400)
 
     def test_empty_draft_can_be_edited_but_not_saved_or_debugged(self):
         workspace = self.workspace()
@@ -286,6 +413,20 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(workspace.status, 'failed')
         self.assertIn('禁用', workspace.error)
         self.assertIsNone(workspace.candidate)
+
+    def test_model_owner_change_after_enqueue_never_contacts_provider(self):
+        workspace = self.workspace(model_id=self.model.id, status='generating', task_id='owner-changed-task')
+        self.model.created_by = self.viewer
+        self.model.save(update_fields=['created_by'])
+        with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+            result = generate_api_workspace_candidate.apply(
+                args=(workspace.id, 0, 'owner-changed-task', 'generate', []),
+            )
+        self.assertEqual(result.result['status'], 'failed')
+        manager.assert_not_called()
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.status, 'failed')
+        self.assertIn('不属于', workspace.error)
 
     def test_normalization_rejects_runtime_unsupported_fields_before_persisting(self):
         workspace = self.workspace()

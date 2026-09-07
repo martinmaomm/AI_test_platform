@@ -12,6 +12,77 @@ export const listItems = (response) => {
   return Array.isArray(body?.data?.results) ? body.data.results : [];
 };
 
+const positiveQueryInteger = (value) => {
+  if (value == null || value === "" || Array.isArray(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+export const workspaceInitializationPlan = (query = {}, workspaces = []) => {
+  const hasWorkspaceId = query.workspace_id != null;
+  if (hasWorkspaceId) {
+    const workspaceId = positiveQueryInteger(query.workspace_id);
+    return workspaceId
+      ? { action: "load", workspaceId, explicit: true }
+      : { action: "invalid", message: "workspace_id 必须是正整数。" };
+  }
+
+  const hasCaseId = query.case_id != null;
+  const hasEndpointId = query.endpoint_id != null;
+  if (hasCaseId || hasEndpointId) {
+    const caseId = positiveQueryInteger(query.case_id);
+    const endpointId = positiveQueryInteger(query.endpoint_id);
+    if ((hasCaseId && !caseId) || (hasEndpointId && !endpointId)) {
+      return { action: "invalid", message: "工作区入口参数必须是正整数。" };
+    }
+    return { action: "create", caseId, endpointId, explicit: true };
+  }
+
+  const workspaceId = workspaces[0]?.id;
+  return workspaceId
+    ? { action: "load", workspaceId, explicit: false }
+    : { action: "create", caseId: null, endpointId: null, explicit: false };
+};
+
+export const savedCaseDescription = (workspace) =>
+  typeof workspace?.saved_case_description === "string"
+    ? workspace.saved_case_description
+    : "";
+
+export const updateWorkspaceListItem = (workspaces, workspace) =>
+  Array.isArray(workspaces) && workspace?.id != null
+    ? workspaces.map((item) =>
+        String(item?.id) === String(workspace.id)
+          ? { ...item, ...workspace }
+          : item,
+      )
+    : workspaces;
+
+export const shouldApplyWorkspaceReload = ({
+  requestProjectId,
+  currentProjectId,
+  requestSequence,
+  latestSequence,
+  dirty,
+  confirmedSnapshot = null,
+  currentSnapshot = null,
+}) => {
+  if (
+    requestProjectId !== currentProjectId ||
+    requestSequence !== latestSequence
+  )
+    return false;
+  return confirmedSnapshot != null
+    ? confirmedSnapshot === currentSnapshot
+    : !dirty;
+};
+
+export const shouldClearSubmittedMessage = (
+  accepted,
+  submittedMessage,
+  currentMessage,
+) => accepted === true && submittedMessage === currentMessage;
+
 export const isAvailableChatModel = (model) =>
   model?.is_active === true && model?.model_type === "llm";
 

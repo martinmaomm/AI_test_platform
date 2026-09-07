@@ -18,7 +18,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai_core.model_manager import get_llm_manager
 from .models import APIWorkspace
-from .workspace_service import normalize_draft, require_executable_draft, validate_model_id
+from .workspace_service import normalize_draft, require_executable_draft, require_generation_model_id
 
 logger = logging.getLogger(__name__)
 
@@ -165,8 +165,8 @@ def generate_api_workspace_candidate(self, workspace_id: int, revision: int, tas
                 raise ValueError('缺少当前草稿的失败调试证据，不能生成修复候选。')
         else:
             baseline = set()
-        validate_model_id(workspace.model_id)
-        manager = get_llm_manager(config_id=workspace.model_id)
+        model_id = require_generation_model_id(workspace.model_id, owner=workspace.owner)
+        manager = get_llm_manager(config_id=model_id)
         output = manager.stream_invoke(_generation_messages(
             conversation=workspace.messages if isinstance(workspace.messages, list) else [],
             draft=current_draft, endpoints=endpoint_snapshot, mode=mode,

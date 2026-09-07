@@ -40,15 +40,26 @@ def can_execute_project(project: Project, user) -> bool:
     )
 
 
-def validate_model_id(model_id: Any) -> int | None:
+def validate_model_id(model_id: Any, *, owner) -> int | None:
+    """Validate a persisted model binding without allowing cross-user reuse."""
     if model_id is None:
         return None
     if not isinstance(model_id, int) or isinstance(model_id, bool) or model_id <= 0:
         raise WorkspaceValidationError('model_id 必须是正整数或 null。')
     from ai_core.models import LLMConfiguration, ModelType
-    if not LLMConfiguration.objects.filter(pk=model_id, model_type=ModelType.LLM, is_active=True).exists():
-        raise WorkspaceValidationError('model_id 不存在、不是 LLM 或已被禁用。')
+    if not LLMConfiguration.objects.filter(
+        pk=model_id, created_by=owner, model_type=ModelType.LLM, is_active=True,
+    ).exists():
+        raise WorkspaceValidationError('model_id 不存在、不属于当前工作区所有者、不是 LLM 或已被禁用。')
     return model_id
+
+
+def require_generation_model_id(model_id: Any, *, owner) -> int:
+    """Generation must use an explicit, currently available owner-scoped model."""
+    validated_model_id = validate_model_id(model_id, owner=owner)
+    if validated_model_id is None:
+        raise WorkspaceValidationError('发起 AI 对话前必须选择当前工作区所有者的启用 LLM 模型。')
+    return validated_model_id
 
 
 def normalize_draft(value: Any) -> dict[str, Any]:
@@ -109,6 +120,7 @@ def _document_context(endpoint):
 
 
 def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
+    saved_case = workspace.saved_case if workspace.saved_case_id else None
     return {
         'id': workspace.id,
         'title': workspace.title,
@@ -123,15 +135,20 @@ def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
         'debug_result': workspace.debug_result if isinstance(workspace.debug_result, dict) else {},
         'debug_revision': workspace.debug_revision,
         'saved_case_id': workspace.saved_case_id,
+        'saved_case_description': str(saved_case.description or '') if saved_case else '',
         'task_id': workspace.task_id or None,
         'updated_at': workspace.updated_at.isoformat() if workspace.updated_at else None,
     }
 
 
 def owned_workspace(*, project_id: int, workspace_id: int, user, lock: bool = False) -> APIWorkspace:
-    queryset = APIWorkspace.objects.filter(project_id=project_id, id=workspace_id, owner=user)
+    queryset = APIWorkspace.objects.filter(
+        project_id=project_id, id=workspace_id, owner=user,
+    )
     if lock:
         queryset = queryset.select_for_update()
+    else:
+        queryset = queryset.select_related('saved_case')
     try:
         return queryset.get()
     except APIWorkspace.DoesNotExist as exc:
@@ -163,7 +180,7 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
         workspace.debug_revision = None
         changed = True
     if model_id is not _UNSET:
-        workspace.model_id = validate_model_id(model_id)
+        workspace.model_id = validate_model_id(model_id, owner=workspace.owner)
         changed = True
     if endpoint_ids is not _UNSET:
         if not isinstance(endpoint_ids, list):
@@ -250,18 +267,29 @@ def classify_case_draft(draft: dict[str, Any], *, project_id: int) -> tuple[str,
     return 'scenario', None
 
 
-def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str | None, description: str | None) -> APIWorkspace:
-    require_revision(workspace, revision)
-    draft = require_executable_draft(workspace.draft)
+def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str | None,
+                          description: Any = _UNSET) -> APIWorkspace:
     with transaction.atomic():
         workspace = APIWorkspace.objects.select_for_update().get(pk=workspace.pk)
         require_revision(workspace, revision)
         if workspace.status in {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}:
             raise WorkspaceConflict('当前工作区任务尚未结束，不能保存。')
+        draft = require_executable_draft(workspace.draft)
         test_case_type, endpoint = classify_case_draft(draft, project_id=workspace.project_id)
-        case = workspace.saved_case
+        case = None
+        if workspace.saved_case_id:
+            case = APITestCase.objects.select_for_update().get(
+                pk=workspace.saved_case_id, project_id=workspace.project_id,
+            )
+            if workspace.saved_case_updated_at and case.updated_at != workspace.saved_case_updated_at:
+                raise WorkspaceConflict('关联用例已被其他人修改，请先处理冲突。')
         case_title = title if isinstance(title, str) and title.strip() else (workspace.title or draft['config']['name'] or '未命名 API 用例')
-        case_description = description if isinstance(description, str) else ''
+        if description is _UNSET or description is None:
+            case_description = case.description if case else ''
+        elif isinstance(description, str):
+            case_description = description
+        else:
+            raise WorkspaceValidationError('description 必须是字符串、null，或省略。')
         if case is None:
             case = APITestCase.objects.create(
                 project_id=workspace.project_id, created_by=workspace.owner,
@@ -271,15 +299,13 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
             )
             workspace.saved_case = case
         else:
-            case = APITestCase.objects.select_for_update().get(pk=case.pk, project_id=workspace.project_id)
-            if workspace.saved_case_updated_at and case.updated_at != workspace.saved_case_updated_at:
-                raise WorkspaceConflict('关联用例已被其他人修改，请先处理冲突。')
             case.title = case_title[:200]
             case.description = case_description
             case.script_content = __import__('json').dumps(draft, ensure_ascii=False)
             case.test_case_type = test_case_type
             case.endpoint = endpoint
             case.save(update_fields=['title', 'description', 'script_content', 'test_case_type', 'endpoint', 'updated_at'])
+            workspace.saved_case = case
         workspace.title = case.title
         workspace.saved_case_updated_at = case.updated_at
         workspace.save(update_fields=['saved_case', 'title', 'saved_case_updated_at', 'updated_at'])

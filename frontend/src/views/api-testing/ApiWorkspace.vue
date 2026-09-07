@@ -24,7 +24,7 @@
               v-for="item in workspaces"
               :key="item.id"
               :value="item.id"
-              :label="item.title || `工作区 ${item.id}`"
+              :label="item.title?.trim() || `未命名工作区 #${item.id}`"
           /></el-select>
           <el-button :disabled="interactionLocked" @click="createWorkspace"
             >新建工作区</el-button
@@ -55,9 +55,6 @@
           <el-card shadow="never">
             <template #header><strong>上下文与模型</strong></template>
             <el-form label-position="top" size="small">
-              <el-form-item label="工作区标题"
-                ><el-input :model-value="workspace.title" disabled
-              /></el-form-item>
               <el-form-item label="模型"
                 ><el-select
                   v-model="modelId"

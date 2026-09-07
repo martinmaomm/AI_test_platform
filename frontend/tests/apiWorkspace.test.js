@@ -206,6 +206,9 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(endpointCases, /query: \{ case_id: selectedList\[0\]\.id \}/);
   assert.match(specDetail, /query: \{ endpoint_id: endpoint\.id \}/);
   assert.match(workspace, /<main v-if="workspaceReady"/);
+  assert.doesNotMatch(workspace, /label="工作区标题"/);
+  assert.doesNotMatch(workspace, /:model-value="workspace\.title" disabled/);
+  assert.match(workspace, /未命名工作区 #\$\{item\.id\}/);
   assert.match(workspace, /await router\.replace\(/);
   assert.match(workspace, /const pollWorkspace = async/);
   assert.match(workspace, /python\.value\.workspaceId/);

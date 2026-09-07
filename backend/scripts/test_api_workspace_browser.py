@@ -91,6 +91,8 @@ def verify(origin, fixture, output):
             expect(page).to_have_url(__import__('re').compile(r'workspace_id=\d+'), timeout=15000)
             workspace_url = page.url
             expect(page.get_by_text('API功能导航', exact=True)).to_have_count(0)
+            expect(page.get_by_text('工作区标题', exact=True)).to_have_count(0)
+            expect(page.locator('.header-actions')).to_contain_text('未命名工作区 #')
             model_picker = page.get_by_role('combobox', name='模型', exact=True)
             expect(model_picker).to_be_enabled(timeout=15000)
             model_picker.click()

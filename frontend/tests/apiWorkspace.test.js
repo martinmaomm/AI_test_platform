@@ -1,14 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { normalizeDebugSteps } from "../src/components/api-workspace/debugResult.js";
 import {
   availableChatModels,
   bodyKind,
   canGenerateWithModel,
+  canRepairWorkspace,
   candidateDiff,
+  completedApiSpecs,
   debugHasFailure,
   defaultDraft,
   hasAvailableChatModel,
+  generationContextMessage,
+  generationPhaseLabel,
+  generationRepairDefaults,
+  generationStatusMeta,
+  isHttpUrl,
+  isGenerationStale,
+  latestGenerationDraft,
   listItems,
   normalizeDraft,
   reconcileWorkspaceModel,
@@ -69,9 +79,11 @@ test("candidate display names structural changes without applying a draft", () =
   assert.ok(changes.some((item) => item.includes("步骤数量")));
   assert.ok(
     changes.some(
-      (item) => item.includes("新增步骤 1") && item.includes("Authorization"),
+      (item) =>
+        item === "新增步骤 1：查询（GET /me；断言 0 条，提取 1 项）",
     ),
   );
+  assert.doesNotMatch(changes.join("\n"), /Authorization/);
   assert.equal(current.config.base_url, "");
 });
 
@@ -83,6 +95,26 @@ test("repair is enabled only for actual failed debug evidence", () => {
     false,
   );
   assert.equal(debugHasFailure({ steps: [{ status: "failed" }] }), true);
+});
+
+test("DebugResultPanel keeps successful exports and displays per-step extraction results", () => {
+  const [step] = normalizeDebugSteps({
+    steps: [
+      {
+        status: "failed",
+        export_vars: { access_token: "ok" },
+        extraction_results: {
+          access_token: { path: "$.token", status: "passed", value: "ok" },
+          user_id: { path: "$.user.id", status: "failed", error: "not found" },
+        },
+      },
+    ],
+  });
+  assert.deepEqual(step.exportVariables, { access_token: "ok" });
+  assert.deepEqual(step.extractionResults, {
+    access_token: { path: "$.token", status: "passed", value: "ok" },
+    user_id: { path: "$.user.id", status: "failed", error: "not found" },
+  });
 });
 
 test("workspace only permits active LLM models and clears an unavailable saved model", () => {
@@ -207,6 +239,138 @@ test("workspace save metadata and reload guards preserve the intended local stat
   assert.equal(shouldClearSubmittedMessage(true, "输入", "后续输入"), false);
 });
 
+test("adopted verification stays current until the draft or context changes", () => {
+  const passedGeneration = {
+    status: "passed",
+    source_revision: 4,
+    adopted_revision: 5,
+  };
+  assert.equal(isGenerationStale(passedGeneration, 5, false), false);
+  assert.equal(isGenerationStale(passedGeneration, 5, true), true);
+  assert.equal(isGenerationStale(passedGeneration, 6, false), true);
+});
+
+test("repair accepts only current failure evidence and preserves failed candidate defaults", () => {
+  const failedGeneration = {
+    status: "failed",
+    source_revision: 4,
+    target_url: "https://failed-target.example.test",
+    rounds: [{ draft: { teststeps: [{ name: "失败步骤" }] }, result: { status: "failed", success: false } }],
+  };
+  assert.equal(
+    canRepairWorkspace({
+      generation: { ...failedGeneration, rounds: [] },
+      workspaceRevision: 4,
+    }),
+    false,
+    "No candidate or execution evidence means regenerate, not a broken repair action",
+  );
+  assert.equal(
+    canRepairWorkspace({
+      dirty: false,
+      generation: failedGeneration,
+      workspaceRevision: 4,
+    }),
+    true,
+  );
+  assert.equal(
+    canRepairWorkspace({
+      dirty: false,
+      generation: failedGeneration,
+      workspaceRevision: 5,
+    }),
+    false,
+  );
+  assert.equal(
+    canRepairWorkspace({
+      dirty: false,
+      generation: failedGeneration,
+      workspaceRevision: 5,
+      debugRevision: 5,
+      debugResult: { status: "failed" },
+    }),
+    true,
+  );
+  assert.equal(
+    canRepairWorkspace({
+      dirty: true,
+      generation: failedGeneration,
+      workspaceRevision: 4,
+      debugRevision: 4,
+      debugResult: { status: "failed" },
+    }),
+    false,
+  );
+  assert.deepEqual(
+    generationRepairDefaults({
+      generation: failedGeneration,
+      candidate: {
+        draft: { config: { base_url: "https://candidate.example.test", variables: { run: "old" } } },
+      },
+      draft: { config: { base_url: "https://draft.example.test" } },
+      useGenerationEvidence: true,
+    }),
+    { base_url: "https://failed-target.example.test", variables: { run: "old" } },
+  );
+});
+
+test("generation helpers ignore incomplete specs and empty final rounds", () => {
+  assert.deepEqual(
+    completedApiSpecs({
+      data: [
+        { id: 1, status: "completed" },
+        { id: 2, status: "running" },
+        { id: 3, status: "failed" },
+      ],
+    }),
+    [{ id: 1, status: "completed" }],
+  );
+  const usableDraft = { config: { name: "有效候选" }, teststeps: [{ name: "步骤" }] };
+  assert.equal(
+    latestGenerationDraft(
+      { rounds: [{ draft: usableDraft }, { draft: {} }] },
+      { draft: { config: { name: "备用" }, teststeps: [{ name: "备用步骤" }] } },
+    ),
+    usableDraft,
+  );
+});
+
+test("generation confirmation only accepts complete HTTP targets and documented endpoint context", () => {
+  assert.equal(isHttpUrl("https://api.example.test/v1"), true);
+  assert.equal(isHttpUrl("http://localhost:8080"), true);
+  assert.equal(isHttpUrl("api.example.test"), false);
+  assert.equal(isHttpUrl("ftp://api.example.test"), false);
+  assert.equal(
+    generationContextMessage({ specId: 1, specAvailable: true, endpointIds: [2] }),
+    "",
+  );
+  assert.match(
+    generationContextMessage({ specId: null, endpointIds: [2] }),
+    /请选择 API 规范/,
+  );
+  assert.match(
+    generationContextMessage({
+      specId: 1,
+      specAvailable: true,
+      endpointIds: [],
+    }),
+    /至少选择一个/,
+  );
+  assert.match(
+    generationContextMessage({
+      specId: 1,
+      specAvailable: true,
+      endpointIds: Array.from({ length: 51 }, (_, index) => index),
+    }),
+    /最多选择 50 个/,
+  );
+  assert.deepEqual(generationStatusMeta("passed"), {
+    label: "已验证通过",
+    type: "success",
+  });
+  assert.equal(generationPhaseLabel("running"), "正在验证请求与断言");
+});
+
 test("workspace API, routing, navigation, and suite variables use the approved contract", async () => {
   const [
     api,
@@ -218,6 +382,7 @@ test("workspace API, routing, navigation, and suite variables use the approved c
     specDetail,
     workspace,
     debugPanel,
+    verificationPanel,
     configEditor,
     conversation,
   ] = await Promise.all([
@@ -247,6 +412,13 @@ test("workspace API, routing, navigation, and suite variables use the approved c
     readFile(
       new URL(
         "../src/components/api-workspace/DebugResultPanel.vue",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+    readFile(
+      new URL(
+        "../src/components/api-workspace/GenerationVerificationPanel.vue",
         import.meta.url,
       ),
       "utf8",
@@ -299,7 +471,14 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, /reconcileWorkspaceModel/);
   assert.match(workspace, /ensureAvailableChatModel/);
   assert.match(workspace, /:generation-disabled="generationDisabled"/);
-  assert.match(workspace, /:send-message="sendMessage"/);
+  assert.match(workspace, /execution_confirmed: true/);
+  assert.match(workspace, /title="生成并验证确认"/);
+  assert.match(workspace, /label="目标地址"/);
+  assert.match(workspace, /aria-label="目标地址"/);
+  assert.match(workspace, />确认并开始验证</);
+  assert.match(workspace, /spec_id: selectedSpecId\.value/);
+  assert.match(workspace, /GenerationVerificationPanel/);
+  assert.match(workspace, /:send-message="prepareGeneration"/);
   assert.match(workspace, /workspaceInitializationPlan/);
   assert.match(workspace, /savedCaseDescription\(workspace\.value\)/);
   assert.match(workspace, /重新选择可用聊天模型/);
@@ -307,8 +486,15 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(conversation, /props\.generationDisabled/);
   assert.match(conversation, /await props\.sendMessage/);
   assert.match(conversation, /submitting/);
+  assert.match(conversation, />生成并验证</);
+  assert.match(conversation, />修复并验证</);
   assert.match(debugPanel, /result\.log/);
+  assert.match(debugPanel, /step\.extractionResults/);
+  assert.match(debugPanel, /导出变量/);
   assert.match(debugPanel, /step\?\.status\) === "skipped"/);
+  assert.match(verificationPanel, /data-testid="api-generation-verification"/);
+  assert.match(verificationPanel, /v-if="generation\?\.status"/);
+  assert.match(verificationPanel, /第 \{\{ round\.attempt/);
   assert.match(configEditor, /timestamp_ns/);
   assert.match(configEditor, /uuid4/);
   assert.doesNotMatch(legacyApi, /generateSpecTestCases/);

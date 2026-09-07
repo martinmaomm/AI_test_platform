@@ -107,8 +107,9 @@
                   filterable
                   :loading="specsLoading"
                   :disabled="interactionLocked"
-                  placeholder="选择规范后加载端点"
+                  placeholder="选择 API 规范"
                   style="width: 100%"
+                  @change="selectSpec"
                   ><el-option
                     v-for="spec in specs"
                     :key="spec.id"
@@ -120,18 +121,21 @@
                       `规范 ${spec.id}`
                     " /></el-select
               ></el-form-item>
-              <el-button
-                size="small"
-                :disabled="interactionLocked || !selectedSpecId"
-                :loading="endpointsLoading"
-                @click="loadEndpointsForSpec"
-                >加载该规范端点</el-button
-              >
+              <p v-if="specs.length === 1 && selectedSpecId" class="hint">
+                当前项目仅有一个 API 规范，已自动选为工作区上下文；保存或生成时会持久化该选择。
+              </p>
+              <el-alert
+                v-if="specsLoadFailed"
+                title="API 规范列表加载失败，不能沿用旧范围生成并验证。"
+                type="error"
+                :closable="false"
+                show-icon
+              />
               <el-form-item label="供 AI 参考的端点" class="endpoint-field"
                 ><el-checkbox-group
                   v-model="endpointIds"
                   :disabled="interactionLocked"
-                  @change="markContextDirty"
+                  @change="selectEndpoints"
                   ><el-checkbox
                     v-for="endpoint in endpointOptions"
                     :key="endpoint.id"
@@ -140,9 +144,23 @@
                   ></el-checkbox-group
                 >
                 <p class="hint">
-                  端点只提供上下文和步骤关联，不会自动生成或保存测试用例。
+                  选定规范后会加载并勾选其接口；一次最多 50 个，您可缩小范围。端点仅提供上下文和步骤关联。
                 </p></el-form-item
               >
+              <el-alert
+                v-if="endpointLoadError"
+                :title="endpointLoadError"
+                type="warning"
+                :closable="false"
+                show-icon
+              />
+              <el-alert
+                v-else-if="generationContextError"
+                :title="generationContextError"
+                type="info"
+                :closable="false"
+                show-icon
+              />
               <el-button
                 type="primary"
                 plain
@@ -155,6 +173,7 @@
         </aside>
         <section class="editor-panel">
           <WorkspaceConversation
+            ref="conversationRef"
             :messages="workspace.messages || []"
             :candidate="workspace.candidate"
             :diff="candidateChanges"
@@ -163,9 +182,17 @@
             :disabled="conflict"
             :generation-disabled="generationDisabled"
             :can-repair="canRepair"
+            :generation-pending="generationDialog"
             :workspace-error="workspace.error"
-            :send-message="sendMessage"
+            :send-message="prepareGeneration"
             @adopt="adoptCandidate"
+          />
+          <GenerationVerificationPanel
+            :generation="workspace.generation"
+            :candidate="workspace.candidate"
+            :workspace-revision="workspace.revision"
+            :dirty="dirty"
+            :endpoint-scope="endpointScope"
           />
           <WorkspaceConfigEditor
             :model-value="draft.config"
@@ -201,6 +228,7 @@
             >保存草稿</el-button
           >
           <DebugResultPanel
+            data-testid="api-current-debug-result"
             :result="workspace.debug_result"
             :stale="debugStale"
           />
@@ -309,6 +337,66 @@
         ></template
       >
     </el-dialog>
+    <el-dialog
+      v-model="generationDialog"
+      title="生成并验证确认"
+      width="620px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        :title="generationForm.mode === 'repair' ? '本次将基于上一轮结果修复并验证。' : '本次将生成候选并验证。'"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
+      <el-descriptions :column="1" size="small" border class="generation-context">
+        <el-descriptions-item label="Swagger">{{ selectedSpecName }}</el-descriptions-item>
+        <el-descriptions-item label="选中接口范围"
+          >{{ endpointScope }}</el-descriptions-item
+        >
+      </el-descriptions>
+      <el-collapse class="endpoint-scope-details">
+        <el-collapse-item title="查看具体 method / path" name="endpoints">
+          <ul>
+            <li v-for="endpoint in selectedEndpoints" :key="endpoint.id">
+              {{ endpointLabel(endpoint) }}
+            </li>
+          </ul>
+        </el-collapse-item>
+      </el-collapse>
+      <el-form label-position="top" class="dialog-form">
+        <el-form-item label="目标地址" required>
+          <el-input
+            v-model="generationForm.base_url"
+            aria-label="目标地址"
+            placeholder="https://api.example.test"
+            autocomplete="off"
+          />
+        </el-form-item>
+        <el-form-item label="本次变量覆盖（可选）">
+          <KeyValueRows
+            v-model="generationForm.variables"
+            typed
+            key-placeholder="变量名"
+            value-placeholder="本次值"
+          />
+        </el-form-item>
+      </el-form>
+      <p class="generation-warning">
+        将向该目标发送真实请求，可能增删改测试数据；建议使用动态唯一测试数据，最多执行 3 轮。请仅使用测试环境。
+      </p>
+      <template #footer>
+        <el-button :disabled="sendingMessage" @click="generationDialog = false"
+          >取消</el-button
+        >
+        <el-button
+          type="primary"
+          :loading="sendingMessage"
+          @click="confirmGeneration"
+          >确认并开始验证</el-button
+        >
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -335,17 +423,24 @@ import WorkspaceConversation from "@/components/api-workspace/WorkspaceConversat
 import WorkspaceConfigEditor from "@/components/api-workspace/WorkspaceConfigEditor.vue";
 import VisualStepEditor from "@/components/api-workspace/VisualStepEditor.vue";
 import DebugResultPanel from "@/components/api-workspace/DebugResultPanel.vue";
+import GenerationVerificationPanel from "@/components/api-workspace/GenerationVerificationPanel.vue";
 import PythonExportPanel from "@/components/api-workspace/PythonExportPanel.vue";
 import KeyValueRows from "@/components/api-workspace/KeyValueRows.vue";
 import {
   availableChatModels,
   canGenerateWithModel,
+  canRepairWorkspace,
   candidateDiff,
   clone,
-  debugHasFailure,
+  completedApiSpecs,
   defaultStep,
   errorMessage,
+  generationRepairDefaults,
+  hasCurrentGenerationFailure,
   hasAvailableChatModel,
+  generationContextMessage,
+  isGenerationStale,
+  isHttpUrl,
   isBusyWorkspace,
   listItems,
   normalizeDraft,
@@ -375,6 +470,7 @@ const modelsLoaded = ref(false);
 const modelsLoadFailed = ref(false);
 const unavailableModel = ref(false);
 const specs = ref([]);
+const specsLoadFailed = ref(false);
 const environments = ref([]);
 const python = ref({
   code: "",
@@ -389,13 +485,23 @@ const sendingMessage = ref(false);
 const modelsLoading = ref(false);
 const specsLoading = ref(false);
 const endpointsLoading = ref(false);
+const endpointsLoadFailed = ref(false);
+const endpointLoadError = ref("");
 const contextDirty = ref(false);
 const draftDirty = ref(false);
 const conflict = ref(false);
 const debugDialog = ref(false);
 const saveDialog = ref(false);
+const generationDialog = ref(false);
+const conversationRef = ref(null);
 const debugForm = ref({ environment_id: null, variables: {} });
 const saveForm = ref({ title: "", description: "" });
+const generationForm = ref({
+  mode: "generate",
+  message: "",
+  base_url: "",
+  variables: {},
+});
 const initializing = ref(false);
 const routeTransitioning = ref(false);
 let pollTimer = null;
@@ -411,6 +517,7 @@ const interactionLocked = computed(
     savingDraft.value ||
     savingCase.value ||
     sendingMessage.value ||
+    generationDialog.value ||
     loading.value ||
     initializing.value ||
     routeTransitioning.value,
@@ -440,8 +547,55 @@ const debugStale = computed(
     (workspace.value?.debug_revision != null &&
       workspace.value.debug_revision !== workspace.value.revision),
 );
+const generationStale = computed(() =>
+  isGenerationStale(
+    workspace.value?.generation,
+    workspace.value?.revision,
+    dirty.value,
+  ),
+);
 const canRepair = computed(
-  () => !dirty.value && debugHasFailure(workspace.value?.debug_result),
+  () =>
+    canRepairWorkspace({
+      dirty: dirty.value,
+      generation: workspace.value?.generation,
+      workspaceRevision: workspace.value?.revision,
+      debugResult: workspace.value?.debug_result,
+      debugRevision: workspace.value?.debug_revision,
+    }),
+);
+const selectedSpec = computed(() =>
+  specs.value.find((spec) => String(spec.id) === String(selectedSpecId.value)),
+);
+const selectedSpecName = computed(
+  () =>
+    selectedSpec.value?.spec_name ||
+    selectedSpec.value?.name ||
+    selectedSpec.value?.title ||
+    (selectedSpecId.value ? `规范 ${selectedSpecId.value}` : "未选择规范"),
+);
+const selectedEndpoints = computed(() =>
+  endpointIds.value
+    .map((id) =>
+      endpointOptions.value.find(
+        (endpoint) => String(endpoint.id) === String(id),
+      ),
+    )
+    .filter(Boolean),
+);
+const endpointScope = computed(() =>
+  selectedEndpoints.value.length
+    ? `${selectedSpecName.value}：${selectedEndpoints.value.length} 个接口`
+    : "未选择接口",
+);
+const generationContextError = computed(() =>
+  generationContextMessage({
+    specId: selectedSpecId.value,
+    specAvailable: Boolean(selectedSpec.value),
+    endpointIds: endpointIds.value,
+    specsLoadFailed: specsLoadFailed.value,
+    endpointsLoadFailed: endpointsLoadFailed.value,
+  }),
 );
 const hasSelectedAvailableModel = computed(() =>
   hasAvailableChatModel(models.value, modelId.value),
@@ -453,7 +607,7 @@ const generationDisabled = computed(
       modelId.value,
       modelsLoaded.value,
       modelsLoadFailed.value,
-    ),
+    ) || Boolean(generationContextError.value),
 );
 const modelLabel = (model) =>
   model.name ||
@@ -621,20 +775,30 @@ const applyWorkspace = (value) => {
   workspaces.value = updateWorkspaceListItem(workspaces.value, next);
   workspaceId.value = next.id;
   modelId.value = next.model_id ?? null;
+  selectedSpecId.value = next.spec_id ?? null;
   endpointIds.value = [...(next.endpoint_ids || [])];
-  const known = new Set(endpointOptions.value.map((item) => item.id));
-  endpointOptions.value = [
-    ...endpointOptions.value,
-    ...endpointIds.value
-      .filter((id) => !known.has(id))
-      .map((id) => ({ id, path: `端点 ${id}`, _placeholder: true })),
-  ];
-  void loadWorkspaceEndpointLabels();
+  endpointOptions.value = [];
+  endpointsLoadFailed.value = false;
+  endpointLoadError.value = "";
   draft.value = normalizeDraft(next.draft);
   draftDirty.value = false;
   contextDirty.value = false;
   conflict.value = false;
   reconcileModelSelection();
+  if (selectedSpecId.value) {
+    void loadEndpointsForSpec({
+      specId: selectedSpecId.value,
+      selectAll: !endpointIds.value.length,
+      markAutoSelection: !endpointIds.value.length,
+    });
+  } else if (specs.value.length === 1) {
+    selectedSpecId.value = specs.value[0].id;
+    void loadEndpointsForSpec({
+      specId: selectedSpecId.value,
+      selectAll: true,
+      markAutoSelection: true,
+    });
+  }
   if (
     next.status === "idle" ||
     next.status === "ready" ||
@@ -671,9 +835,19 @@ const loadAuxiliary = async () => {
     modelsLoadFailed.value = true;
     ElMessage.warning(errorMessage(modelsResult.reason, "模型列表加载失败"));
   }
-  if (specsResult.status === "fulfilled")
-    specs.value = listItems(specsResult.value);
-  else ElMessage.warning(errorMessage(specsResult.reason, "API 规范加载失败"));
+  if (specsResult.status === "fulfilled") {
+    specs.value = completedApiSpecs(specsResult.value);
+    specsLoadFailed.value = false;
+  } else {
+    specs.value = [];
+    specsLoadFailed.value = true;
+    selectedSpecId.value = null;
+    endpointIds.value = [];
+    endpointOptions.value = [];
+    endpointsLoadFailed.value = true;
+    endpointLoadError.value = "API 规范列表加载失败，已清空旧接口范围。";
+    ElMessage.warning(errorMessage(specsResult.reason, "API 规范加载失败"));
+  }
   if (environmentsResult.status === "fulfilled")
     environments.value = listItems(environmentsResult.value).filter(
       (item) => item.is_active !== false,
@@ -684,45 +858,6 @@ const loadAuxiliary = async () => {
     );
   modelsLoading.value = false;
   specsLoading.value = false;
-};
-const loadWorkspaceEndpointLabels = async () => {
-  const requestProjectId = projectId.value;
-  const requestWorkspaceId = workspace.value?.id;
-  const unresolved = new Set(
-    endpointIds.value.filter(
-      (id) =>
-        !endpointOptions.value.some(
-          (item) => item.id === id && !item._placeholder,
-        ),
-    ),
-  );
-  if (!unresolved.size) return;
-  for (const spec of specs.value) {
-    try {
-      const response = await getAPIEndpoints(projectId.value, spec.id);
-      if (
-        requestProjectId !== projectId.value ||
-        !sameWorkspaceId(requestWorkspaceId, workspace.value?.id)
-      )
-        return;
-      const matches = listItems(response).filter((item) =>
-        unresolved.has(item.id),
-      );
-      if (matches.length) {
-        const known = new Map(
-          endpointOptions.value.map((item) => [item.id, item]),
-        );
-        matches.forEach((item) => {
-          known.set(item.id, item);
-          unresolved.delete(item.id);
-        });
-        endpointOptions.value = [...known.values()];
-      }
-      if (!unresolved.size) return;
-    } catch {
-      // A failed spec must not hide other workspace endpoint labels.
-    }
-  }
 };
 const createWorkspace = async ({ fromInitialize = false } = {}) => {
   if (
@@ -851,6 +986,7 @@ const saveDraft = async ({ notify = true } = {}) => {
       {
         draft: clone(draft.value),
         model_id: modelId.value,
+        spec_id: selectedSpecId.value,
         endpoint_ids: endpointIds.value,
         revision: request.revision,
       },
@@ -884,7 +1020,65 @@ const saveDraft = async ({ notify = true } = {}) => {
       savingDraft.value = false;
   }
 };
-const sendMessage = async ({ mode, message }) => {
+const ensureGenerationContext = () => {
+  if (!ensureAvailableChatModel()) return false;
+  if (generationContextError.value) {
+    ElMessage.warning(generationContextError.value);
+    return false;
+  }
+  return true;
+};
+const prepareGeneration = ({ mode, message }) => {
+  if (
+    !workspace.value ||
+    busy.value ||
+    conflict.value ||
+    generationDialog.value ||
+    sendingMessage.value
+  )
+    return false;
+  if (!ensureGenerationContext()) return false;
+  const useGenerationEvidence =
+    mode === "repair" &&
+    hasCurrentGenerationFailure(
+      workspace.value?.generation,
+      workspace.value?.revision,
+    );
+  const repairDefaults = generationRepairDefaults({
+    generation: workspace.value?.generation,
+    candidate: workspace.value?.candidate,
+    draft: draft.value,
+    useGenerationEvidence,
+  });
+  generationForm.value = {
+    mode,
+    message,
+    base_url:
+      mode === "repair"
+        ? repairDefaults.base_url
+        : draft.value.config.base_url || "",
+    variables: mode === "repair" ? repairDefaults.variables : {},
+  };
+  generationDialog.value = true;
+  return false;
+};
+const confirmGeneration = async () => {
+  const baseUrl = generationForm.value.base_url.trim();
+  if (!isHttpUrl(baseUrl)) {
+    ElMessage.warning("目标地址必须是完整的 HTTP(S) 地址。");
+    return;
+  }
+  const accepted = await sendMessage({
+    mode: generationForm.value.mode,
+    message: generationForm.value.message,
+    base_url: baseUrl,
+    variables: clone(generationForm.value.variables),
+  });
+  if (!accepted) return;
+  generationDialog.value = false;
+  conversationRef.value?.clearSubmittedMessage(generationForm.value.message);
+};
+const sendMessage = async ({ mode, message, base_url, variables }) => {
   if (
     !workspace.value ||
     busy.value ||
@@ -892,10 +1086,12 @@ const sendMessage = async ({ mode, message }) => {
     sendingMessage.value
   )
     return false;
-  if (!ensureAvailableChatModel()) return false;
+  if (!ensureGenerationContext()) return false;
   const context = {
     projectId: projectId.value,
     workspaceId: workspace.value.id,
+    specId: selectedSpecId.value,
+    endpointIds: [...endpointIds.value],
   };
   const requestSequence = ++messageSendSequence;
   sendingMessage.value = true;
@@ -904,24 +1100,35 @@ const sendMessage = async ({ mode, message }) => {
     if (
       requestSequence !== messageSendSequence ||
       context.projectId !== projectId.value ||
-      !sameWorkspaceId(context.workspaceId, workspace.value?.id)
+      !sameWorkspaceId(context.workspaceId, workspace.value?.id) ||
+      String(context.specId) !== String(selectedSpecId.value) ||
+      JSON.stringify(context.endpointIds) !== JSON.stringify(endpointIds.value)
     )
       return false;
     if (mode === "repair" && !canRepair.value) {
-      ElMessage.warning("请先保存草稿并获得失败调试结果");
+      ElMessage.warning("请先获得当前版本的失败或待人工处理验证结果。");
       return false;
     }
     const request = { ...context, revision: workspace.value.revision };
     const response = await sendApiWorkspaceMessage(
       request.projectId,
       request.workspaceId,
-      { message, revision: request.revision, mode },
+      {
+        message,
+        revision: request.revision,
+        mode,
+        execution_confirmed: true,
+        base_url,
+        variables,
+      },
     );
     if (
       requestSequence !== messageSendSequence ||
       request.projectId !== projectId.value ||
       !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
-      request.revision !== workspace.value?.revision
+      request.revision !== workspace.value?.revision ||
+      String(context.specId) !== String(selectedSpecId.value) ||
+      JSON.stringify(context.endpointIds) !== JSON.stringify(endpointIds.value)
     )
       return false;
     applyWorkspace(response);
@@ -944,6 +1151,8 @@ const sendMessage = async ({ mode, message }) => {
 const adoptCandidate = async () => {
   const candidate = workspace.value?.candidate;
   if (!candidate?.draft) return;
+  if (generationStale.value)
+    return ElMessage.warning("当前验证结果已过期，请重新生成并验证后再采用候选。");
   if (dirty.value)
     return ElMessage.warning(
       "当前本地草稿已修改，请先保存或重新加载后再采用候选",
@@ -970,22 +1179,81 @@ const adoptCandidate = async () => {
     }
   }
 };
-const loadEndpointsForSpec = async () => {
-  if (!selectedSpecId.value) return;
+const selectSpec = async (specId) => {
+  endpointIds.value = [];
+  selectedSpecId.value = specId ?? null;
+  endpointOptions.value = [];
+  specsLoadFailed.value = false;
+  endpointsLoadFailed.value = false;
+  endpointLoadError.value = "";
+  markContextDirty();
+  if (!specId) return;
+  await loadEndpointsForSpec({ specId, selectAll: true });
+};
+const selectEndpoints = (ids) => {
+  if (ids.length > 50) {
+    endpointIds.value = ids.slice(0, 50);
+    ElMessage.warning("一次最多选择 50 个 API 接口，已保留前 50 个。");
+  }
+  markContextDirty();
+};
+const loadEndpointsForSpec = async ({
+  specId = selectedSpecId.value,
+  selectAll = false,
+  markAutoSelection = false,
+} = {}) => {
+  if (!specId) return false;
+  const requestProjectId = projectId.value;
+  const requestWorkspaceId = workspace.value?.id;
   endpointsLoading.value = true;
+  endpointsLoadFailed.value = false;
+  endpointLoadError.value = "";
   try {
-    const response = await getAPIEndpoints(
-      projectId.value,
-      selectedSpecId.value,
-    );
+    const response = await getAPIEndpoints(requestProjectId, specId);
+    if (
+      requestProjectId !== projectId.value ||
+      !sameWorkspaceId(requestWorkspaceId, workspace.value?.id) ||
+      String(specId) !== String(selectedSpecId.value)
+    )
+      return false;
     const loaded = listItems(response);
-    const known = new Map(endpointOptions.value.map((item) => [item.id, item]));
-    loaded.forEach((item) => known.set(item.id, item));
-    endpointOptions.value = [...known.values()];
+    endpointOptions.value = loaded;
+    if (!loaded.length) {
+      endpointIds.value = [];
+      endpointLoadError.value = "该 API 规范没有可用于生成并验证的接口。";
+      return false;
+    }
+    if (selectAll) {
+      if (loaded.length > 50) {
+        endpointIds.value = [];
+        endpointLoadError.value = `该 API 规范包含 ${loaded.length} 个接口，请手动选择至多 50 个。`;
+        return false;
+      }
+      endpointIds.value = loaded.map((endpoint) => endpoint.id);
+      if (markAutoSelection) markContextDirty();
+    } else {
+      const knownIds = new Set(loaded.map((endpoint) => endpoint.id));
+      endpointIds.value = endpointIds.value.filter((id) => knownIds.has(id));
+    }
+    return true;
   } catch (error) {
+    if (
+      requestProjectId !== projectId.value ||
+      String(specId) !== String(selectedSpecId.value)
+    )
+      return false;
+    endpointIds.value = [];
+    endpointOptions.value = [];
+    endpointsLoadFailed.value = true;
+    endpointLoadError.value = "接口加载失败，已清空旧范围，不能生成并验证。";
     ElMessage.error(errorMessage(error, "加载端点失败"));
+    return false;
   } finally {
-    endpointsLoading.value = false;
+    if (
+      requestProjectId === projectId.value &&
+      String(specId) === String(selectedSpecId.value)
+    )
+      endpointsLoading.value = false;
   }
 };
 const openDebug = async () => {

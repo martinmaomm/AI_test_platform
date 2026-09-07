@@ -136,11 +136,33 @@ def main():
         }
         assert Suite.objects.get(pk=suite.pk).variables == {'tenant': 'offline'}
         assert Workspace.objects.get(pk=workspace.pk).debug_result == {'status': 'passed'}
+
+        # Exercise the actual additive generation migration without contacting
+        # the configured database. Keep its file name discoverable during work.
+        generation_migrations = [
+            key for key in executor.loader.disk_migrations
+            if key[0] == 'api_testing' and key[1].startswith('0017_')
+        ]
+        assert len(generation_migrations) == 1, generation_migrations
+        with connection.schema_editor() as editor:
+            state = executor.loader.get_migration(*generation_migrations[0]).apply(state, editor)
+        apps = state.apps
+        Workspace = apps.get_model('api_testing', 'APIWorkspace')
+        Spec = apps.get_model('api_testing', 'APISpecification')
+        migrated = Workspace.objects.get(pk=workspace.pk)
+        assert migrated.spec_id is None and migrated.generation == {}
+        spec = Spec.objects.create(project_id=project.pk, created_by_id=user.pk, spec_name='迁移验证规范')
+        migrated.spec_id = spec.pk
+        migrated.generation = {'status': 'needs_review', 'rounds': [{'attempt': 1, 'result': {'success': False}}]}
+        migrated.save(update_fields=['spec', 'generation'])
+        assert Workspace.objects.get(pk=workspace.pk).spec_id == spec.pk
+        assert Workspace.objects.get(pk=workspace.pk).generation['rounds'][0]['attempt'] == 1
+        assert apps.get_model('api_testing', 'APITestCase').objects.get(pk=case.pk).title == '既有场景用例'
         connection.close()
 
     print(
-        'PASS: actual 0015/0016 SQLite migrations preserve API case/execution data; '
-        'workspace, suite.variables and input_snapshot are readable and writable; NAS not accessed'
+        'PASS: actual 0015/0016/0017 SQLite migrations preserve API case/execution data; '
+        'workspace spec/generation, suite.variables and input_snapshot are readable and writable; NAS not accessed'
     )
 
 

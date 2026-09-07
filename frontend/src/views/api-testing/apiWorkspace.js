@@ -12,6 +12,9 @@ export const listItems = (response) => {
   return Array.isArray(body?.data?.results) ? body.data.results : [];
 };
 
+export const completedApiSpecs = (response) =>
+  listItems(response).filter((spec) => spec?.status === "completed");
+
 const positiveQueryInteger = (value) => {
   if (value == null || value === "" || Array.isArray(value)) return null;
   const parsed = Number(value);
@@ -82,6 +85,94 @@ export const shouldClearSubmittedMessage = (
   submittedMessage,
   currentMessage,
 ) => accepted === true && submittedMessage === currentMessage;
+
+export const isHttpUrl = (value) => {
+  try {
+    const url = new URL(String(value || "").trim());
+    return ["http:", "https:"].includes(url.protocol) && Boolean(url.host);
+  } catch {
+    return false;
+  }
+};
+
+export const generationContextMessage = ({
+  specId,
+  specAvailable = true,
+  endpointIds,
+  specsLoadFailed = false,
+  endpointsLoadFailed = false,
+}) => {
+  if (specsLoadFailed) return "API 规范列表加载失败，不能生成并验证。";
+  if (!specId) return "请选择 API 规范后再生成并验证。";
+  if (!specAvailable) return "当前选择的 API 规范不可用，不能生成并验证。";
+  if (endpointsLoadFailed) return "该 API 规范的接口加载失败，不能沿用旧范围生成。";
+  if (!Array.isArray(endpointIds) || !endpointIds.length)
+    return "请至少选择一个 API 接口后再生成并验证。";
+  if (endpointIds.length > 50) return "一次最多选择 50 个 API 接口。";
+  return "";
+};
+
+export const generationStatusMeta = (status) =>
+  ({
+    queued: { label: "已排队", type: "info" },
+    running: { label: "验证中", type: "warning" },
+    passed: { label: "已验证通过", type: "success" },
+    needs_review: { label: "需要人工处理", type: "warning" },
+    failed: { label: "验证失败", type: "danger" },
+    stale: { label: "结果已过期", type: "info" },
+  })[status] || { label: "尚未验证", type: "info" };
+
+export const generationPhaseLabel = (phase) =>
+  ({
+    queued: "等待执行",
+    generating: "正在生成候选",
+    checking: "正在检查候选",
+    running: "正在验证请求与断言",
+    repairing: "正在修复并复验",
+    finished: "流程已结束",
+  })[phase] || "等待状态更新";
+
+export const isGenerationStale = (generation, workspaceRevision, dirty) =>
+  Boolean(
+    dirty ||
+      generation?.status === "stale" ||
+      ((generation?.adopted_revision ?? generation?.source_revision) != null &&
+        (generation?.adopted_revision ?? generation?.source_revision) !==
+          workspaceRevision),
+  );
+
+const hasGeneratedSteps = (draft) =>
+  Array.isArray(draft?.teststeps) && draft.teststeps.length > 0;
+
+export const latestGenerationDraft = (generation, candidate) => {
+  const rounds = Array.isArray(generation?.rounds) ? generation.rounds : [];
+  for (let index = rounds.length - 1; index >= 0; index -= 1) {
+    if (hasGeneratedSteps(rounds[index]?.draft)) return rounds[index].draft;
+  }
+  return hasGeneratedSteps(candidate?.draft) ? candidate.draft : null;
+};
+
+export const generationRepairDefaults = ({
+  generation,
+  candidate,
+  draft,
+  useGenerationEvidence = false,
+} = {}) => {
+  const candidateConfig = candidate?.draft?.config || {};
+  const draftConfig = draft?.config || {};
+  return {
+    base_url: useGenerationEvidence
+      ? generation?.target_url || candidateConfig.base_url || draftConfig.base_url || ""
+      : draftConfig.base_url || "",
+    variables:
+      useGenerationEvidence &&
+      candidateConfig.variables &&
+      typeof candidateConfig.variables === "object" &&
+      !Array.isArray(candidateConfig.variables)
+        ? clone(candidateConfig.variables)
+        : {},
+  };
+};
 
 export const isAvailableChatModel = (model) =>
   model?.is_active === true && model?.model_type === "llm";
@@ -209,6 +300,17 @@ const changed = (changes, label, before, after) => {
   }
 };
 
+const addedStepSummary = (step) => {
+  const assertions = Array.isArray(step?.validate) ? step.validate.length : 0;
+  const extractions =
+    step?.extract && typeof step.extract === "object"
+      ? Object.keys(step.extract).length
+      : 0;
+  return `${step?.name || "未命名步骤"}（${String(
+    step?.request?.method || "GET",
+  ).toUpperCase()} ${step?.request?.url || "/"}；断言 ${assertions} 条，提取 ${extractions} 项）`;
+};
+
 export const candidateDiff = (draft, candidate) => {
   const current = normalizeDraft(draft);
   const proposed = normalizeDraft(candidate?.draft);
@@ -285,7 +387,7 @@ export const candidateDiff = (draft, candidate) => {
   });
   proposed.teststeps.slice(current.teststeps.length).forEach((step, index) => {
     changes.push(
-      `新增步骤 ${current.teststeps.length + index + 1}：${preview(step)}`,
+      `新增步骤 ${current.teststeps.length + index + 1}：${addedStepSummary(step)}`,
     );
   });
   current.teststeps.slice(proposed.teststeps.length).forEach((step, index) => {
@@ -316,6 +418,30 @@ export const debugHasFailure = (result) => {
       ),
     )
   );
+};
+
+export const hasCurrentGenerationFailure = (generation, workspaceRevision) =>
+  ["failed", "needs_review"].includes(generation?.status) &&
+  !isGenerationStale(generation, workspaceRevision, false) &&
+  Array.isArray(generation?.rounds) &&
+  generation.rounds.some((round) =>
+    hasGeneratedSteps(round?.draft) && debugHasFailure(round?.result),
+  );
+
+export const canRepairWorkspace = ({
+  dirty,
+  generation,
+  workspaceRevision,
+  debugResult,
+  debugRevision,
+} = {}) => {
+  if (dirty) return false;
+  const currentDebugFailure =
+    debugRevision != null &&
+    debugRevision === workspaceRevision &&
+    debugHasFailure(debugResult);
+  const currentGenerationFailure = hasCurrentGenerationFailure(generation, workspaceRevision);
+  return currentDebugFailure || currentGenerationFailure;
 };
 
 export const statusMeta = (status) =>

@@ -46,6 +46,7 @@ def requests_runner(
     script_content: str,
     base_url: str | None = None,
     options: Mapping[str, Any] | None = None,
+    hard_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Run canonical JSON in a reaped subprocess with a hard wall deadline.
 
@@ -57,15 +58,25 @@ def requests_runner(
     if isinstance(prepared, dict):
         return prepared
     case, option_data, total_timeout = prepared
+    if hard_timeout_seconds is not None:
+        try:
+            hard_timeout = float(hard_timeout_seconds)
+        except (TypeError, ValueError):
+            return build_error_report(str(script_id), 'hard_timeout_seconds 必须是正秒数', 'CaseContractError', name=str(case['config'].get('name') or ''))
+        if hard_timeout <= 0:
+            return hard_timeout_report(str(script_id), case, 0)
+        total_timeout = min(total_timeout, hard_timeout)
+        option_data['total_timeout'] = total_timeout
     payload = json.dumps(
         {"script_id": str(script_id), "case": case, "base_url": base_url, "options": option_data},
         ensure_ascii=False, separators=(",", ":"),
     )
     worker = Path(__file__).with_name("requests_worker.py")
+    process_timeout = total_timeout if hard_timeout_seconds is not None else total_timeout + PROCESS_GRACE_SECONDS
     try:
         completed = subprocess.run(
             [sys.executable, "-u", str(worker)], input=payload, text=True,
-            capture_output=True, check=False, timeout=total_timeout + PROCESS_GRACE_SECONDS,
+            capture_output=True, check=False, timeout=process_timeout,
         )
     except subprocess.TimeoutExpired:
         return hard_timeout_report(str(script_id), case, total_timeout)

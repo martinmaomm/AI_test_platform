@@ -1,7 +1,7 @@
 """API requests execution task entry points."""
 from celery import shared_task
 from common.task import update_task_progress
-from .workspace_tasks import debug_api_workspace, generate_api_workspace_candidate  # noqa: F401
+from .workspace_tasks import debug_api_workspace, generate_and_verify_api_workspace  # noqa: F401
 
 @shared_task(bind=True, name='api_testing.tasks.execute_api_test_case_async')
 def execute_api_test_case_async(self, execution_id, test_case_id=None, environment_id=None):

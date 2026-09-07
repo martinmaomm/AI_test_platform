@@ -5,7 +5,6 @@ provider or target-site traffic: the shared harness blocks external sockets.
 """
 import json
 import re
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_api_workspace_browser as harness
@@ -28,7 +27,7 @@ def seed(fixture):
     workspace = APIWorkspace.objects.create(
         project_id=fixture['project_id'], owner_id=fixture['user_id'],
         title=case.title, saved_case=case, saved_case_updated_at=case.updated_at,
-        draft=script, model_id=fixture['model_id'], endpoint_ids=[fixture['endpoint_id']],
+        draft=script, model_id=fixture['model_id'], spec_id=fixture['spec_id'], endpoint_ids=[fixture['endpoint_id']],
     )
     script['config']['name'] = '另一个目标用例'
     other = APITestCase.objects.create(
@@ -48,7 +47,6 @@ def verify_model_isolation(fixture):
     from rest_framework.test import APIRequestFactory, force_authenticate
     from api_testing.models import APIWorkspace
     from api_testing.workspace_views import APIWorkspaceCollectionView, APIWorkspaceMessagesView
-    from api_testing.workspace_tasks import generate_api_workspace_candidate
 
     user = get_user_model().objects.create_user(username='isolated-second-owner', email='second@example.test')
     project = Project.objects.create(name='第二用户的隔离项目', project_type='api', created_by=user)
@@ -64,22 +62,13 @@ def verify_model_isolation(fixture):
     assert result.status_code == 400, 'Other owners must not bind this model'
     assert not APIWorkspace.objects.filter(owner=user).exists()
     workspace = APIWorkspace.objects.create(project=project, owner=user)
-    with patch('api_testing.workspace_views._queue_generation') as queue:
+    with patch('api_testing.workspace_views._queue_pipeline') as queue:
         result = APIWorkspaceMessagesView.as_view()(
-            request({'revision': 0, 'message': '缺少模型不能回退到他人的配置'}),
+            request({'revision': 0, 'message': '缺少模型不能回退到他人的配置', 'execution_confirmed': True, 'base_url': 'https://example.test'}),
             project_id=project.pk, workspace_id=workspace.pk,
         )
     assert result.status_code == 400
     queue.assert_not_called()
-    # A stale/forged binding must also fail after reaching the worker boundary.
-    workspace.model_id = fixture['model_id']
-    workspace.status, workspace.task_id = 'generating', 'isolated-ownership-probe'
-    workspace.save()
-    with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace()) as manager:
-        generate_api_workspace_candidate.apply(args=(workspace.pk, 0, workspace.task_id, 'generate', []))
-    manager.assert_not_called()
-    workspace.refresh_from_db()
-    assert workspace.status == 'failed'
 
 
 def verify(origin, fixture, output):
@@ -111,9 +100,10 @@ def verify(origin, fixture, output):
             pending_requests = []
             page.route('**/messages/', lambda route: pending_requests.append(route))
             message.fill('请求失败后应保留这段描述')
-            generate = page.get_by_role('button', name='生成候选', exact=True)
+            generate = page.get_by_role('button', name='生成并验证', exact=True)
+            generate.click()
             with page.expect_request('**/messages/'):
-                generate.click()
+                harness.confirm_generation(page)
             expect(generate).to_be_disabled()
             expect(page.get_by_role('button', name='重新加载', exact=True)).to_be_disabled()
             expect(name).to_be_disabled()
@@ -122,9 +112,12 @@ def verify(origin, fixture, output):
             pending_requests[0].fulfill(status=503, content_type='application/json', body=json.dumps({'success': False, 'message': '模拟提交失败'}))
             expect(page.get_by_text('模拟提交失败', exact=True)).to_be_visible()
             expect(message).to_have_value('请求失败后应保留这段描述')
-            expect(generate).to_be_enabled()
             page.unroute('**/messages/')
-            generate.click()
+            # On failure the consent dialog may remain open to allow retry.
+            confirm = page.get_by_role('button', name='确认并开始验证', exact=True)
+            if not confirm.is_visible():
+                generate.click()
+            harness.confirm_generation(page)
             expect(message).to_have_value('')
             expect(page.get_by_role('button', name='采用候选并替换草稿')).to_be_visible(timeout=15000)
 

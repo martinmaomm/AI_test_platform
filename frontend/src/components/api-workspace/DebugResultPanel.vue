@@ -43,9 +43,13 @@
           <summary>响应</summary>
           <pre v-text="pretty(step.response)" />
         </details>
-        <details v-if="step.extract || step.extractions">
-          <summary>提取</summary>
-          <pre v-text="pretty(step.extract || step.extractions)" />
+        <details v-if="step.exportVariables">
+          <summary>导出变量</summary>
+          <pre v-text="pretty(step.exportVariables)" />
+        </details>
+        <details v-if="step.extractionResults">
+          <summary>提取结果</summary>
+          <pre v-text="pretty(step.extractionResults)" />
         </details>
         <details v-if="step.assertions || step.validate">
           <summary>断言</summary>
@@ -57,6 +61,10 @@
         <summary>执行日志</summary>
         <pre v-text="pretty(result.log)" />
       </details>
+      <details v-if="extractionResults" class="execution-log">
+        <summary>提取结果</summary>
+        <pre v-text="pretty(extractionResults)" />
+      </details>
       <details v-if="!steps.length">
         <summary>原始调试数据</summary>
         <pre v-text="pretty(result)" />
@@ -67,6 +75,7 @@
 
 <script setup>
 import { computed } from "vue";
+import { normalizeDebugSteps } from "./debugResult";
 const props = defineProps({
   result: { type: Object, default: null },
   stale: Boolean,
@@ -74,33 +83,9 @@ const props = defineProps({
 const hasResult = computed(() =>
   Boolean(props.result && Object.keys(props.result).length),
 );
-const rawSteps = computed(() => {
-  const value =
-    props.result?.step_datas ||
-    props.result?.steps ||
-    props.result?.results ||
-    props.result?.debug_steps ||
-    [];
-  return Array.isArray(value) ? value : [];
-});
-const steps = computed(() =>
-  rawSteps.value.map((step) => {
-    const data = step?.data || {};
-    const reqResps = data.req_resps || step?.req_resps || [];
-    const requests = reqResps.map((item) => item?.request).filter(Boolean);
-    const responses = reqResps.map((item) => item?.response).filter(Boolean);
-    return {
-      ...step,
-      request: requests.length === 1 ? requests[0] : requests,
-      response: responses.length === 1 ? responses[0] : responses,
-      extract: step?.export_vars || step?.extract || step?.extractions,
-      assertions:
-        data.validators ||
-        step?.validators ||
-        step?.assertions ||
-        step?.validate,
-    };
-  }),
+const steps = computed(() => normalizeDebugSteps(props.result));
+const extractionResults = computed(
+  () => props.result?.extraction_results || props.result?.result?.extraction_results,
 );
 const pretty = (value) => JSON.stringify(value, null, 2);
 const normalizedStatus = (status) => String(status || "").toLowerCase();

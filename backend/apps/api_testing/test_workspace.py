@@ -1,5 +1,6 @@
 """Offline contract tests for API Workspace B; no model, broker, or HTTP service is used."""
 import sys
+from copy import deepcopy
 from datetime import timedelta
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -12,8 +13,9 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from projects.models import Environment, Project, ProjectMember
 from ai_core.models import LLMConfiguration
 from .models import APIEndpoint, APISpecification, APITestCase, APIWorkspace, default_api_workspace_draft
-from .workspace_service import debug_timeout_seconds, normalize_draft
-from .workspace_tasks import _path_matches, _step_assertions, debug_api_workspace, generate_api_workspace_candidate
+from .workspace_service import debug_timeout_seconds, endpoint_specs, normalize_draft
+from .workspace_tasks import _path_matches, _step_assertions, debug_api_workspace, generate_and_verify_api_workspace
+from .workspace_verification import draft_hash, prepare_candidate, protected_expected_values
 from .workspace_views import (
     APIWorkspaceCollectionView, APIWorkspaceDebugView, APIWorkspaceDetailView,
     APIWorkspaceMessagesView, APIWorkspaceSaveView,
@@ -37,6 +39,32 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(value['security_schemes']['key']['name'], 'X-Api-Key')
         self.assertNotIn('paths', value)
 
+    def test_endpoint_specs_expand_local_schema_refs_without_external_fetch(self):
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, status=APISpecification.TaskStatus.COMPLETED,
+            metadata={'definitions': {'Login': {'type': 'object', 'properties': {'email': {'type': 'string'}}}}},
+        )
+        endpoint = APIEndpoint.objects.create(
+            spec=spec, method='POST', path='/login', request_body={'required': True, 'schema': {'$ref': '#/definitions/Login'}},
+        )
+        value = endpoint_specs(self.project.id, [endpoint.id], spec_id=spec.id)[0]
+        self.assertEqual(value['request_body']['schema']['properties']['email']['type'], 'string')
+
+    def test_endpoint_specs_preserve_recursive_and_external_refs_as_marked_context(self):
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, status=APISpecification.TaskStatus.COMPLETED,
+            metadata={'definitions': {'Node': {'type': 'object', 'properties': {'children': {
+                'type': 'array', 'items': {'$ref': '#/definitions/Node'},
+            }}}}},
+        )
+        endpoint = APIEndpoint.objects.create(
+            spec=spec, method='GET', path='/tree', request_body={'schema': {'$ref': '#/definitions/Node'}},
+            responses={'200': {'schema': {'$ref': 'https://example.invalid/common.yaml#/Result'}}},
+        )
+        value = endpoint_specs(self.project.id, [endpoint.id], spec_id=spec.id)[0]
+        self.assertEqual(value['request_body']['schema']['properties']['children']['items']['x-aits-ref-status'], 'circular')
+        self.assertEqual(value['responses']['200']['schema']['x-aits-ref-status'], 'external')
+
     def setUp(self):
         self.user = get_user_model().objects.create_user(username='workspace-owner', email='workspace-owner@example.test', password='pw')
         self.viewer = get_user_model().objects.create_user(username='workspace-viewer', email='workspace-viewer@example.test', password='pw')
@@ -59,8 +87,40 @@ class APIWorkspaceTests(TestCase):
 
     def endpoint(self, project=None):
         project = project or self.project
-        spec = APISpecification.objects.create(project=project, created_by=self.user, spec_name='Workspace API')
+        spec = APISpecification.objects.create(
+            project=project, created_by=self.user, spec_name='Workspace API',
+            status=APISpecification.TaskStatus.COMPLETED,
+        )
         return APIEndpoint.objects.create(spec=spec, method='GET', path='/items', summary='items')
+
+    def pipeline_workspace(self, *, draft=None, model_id=..., task_id='pipeline-task'):
+        endpoint = self.endpoint()
+        workspace = self.workspace(
+            draft=draft or default_api_workspace_draft(), model_id=self.model.id if model_id is ... else model_id,
+            spec=endpoint.spec, endpoint_ids=[endpoint.id], status='generating', task_id=task_id,
+        )
+        workspace.generation = {
+            'status': 'queued', 'phase': 'queued', 'attempt': 0, 'max_attempts': 3,
+            'source_revision': 0, 'target_url': 'https://example.test', 'rounds': [], 'adopted_revision': None,
+            '_snapshot': {
+                'revision': 0, 'task_id': task_id, 'mode': 'generate', 'draft': workspace.draft,
+                'model_id': workspace.model_id, 'spec_id': endpoint.spec_id,
+                'endpoints': endpoint_specs(self.project.id, [endpoint.id], spec_id=endpoint.spec_id),
+                'target_url': 'https://example.test', 'variables': {}, 'messages': [],
+                'queued_at': timezone.now().isoformat(),
+            },
+        }
+        workspace.save(update_fields=['generation', 'updated_at'])
+        return workspace, endpoint
+
+    @staticmethod
+    def passed_result():
+        return {
+            'success': True, 'error_type': '', 'step_datas': [{
+                'status': 'passed', 'validators': {'validate_extractor': [{'passed': True}]},
+                'data': {'req_resps': [{'response': {'status_code': 200}}]},
+            }],
+        }
 
     def test_project_editor_and_workspace_owner_are_both_required(self):
         workspace = self.workspace()
@@ -138,75 +198,75 @@ class APIWorkspaceTests(TestCase):
 
         workspace.model_id = other_model.id
         workspace.save(update_fields=['model_id', 'updated_at'])
-        with patch('api_testing.workspace_views._queue_generation') as queue:
+        with patch('api_testing.workspace_views.generate_and_verify_api_workspace.apply_async') as queue:
             denied_message = APIWorkspaceMessagesView.as_view()(
-                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查'}),
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查', 'execution_confirmed': True, 'base_url': 'https://example.test'}),
                 project_id=self.project.id, workspace_id=workspace.id,
             )
         self.assertEqual(denied_message.status_code, 400)
         queue.assert_not_called()
 
-        workspace.status = 'generating'
-        workspace.task_id = 'other-owner-task'
-        workspace.save(update_fields=['status', 'task_id', 'updated_at'])
+        workspace, _ = self.pipeline_workspace(model_id=other_model.id, task_id='other-owner-task')
         with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
-            result = generate_api_workspace_candidate.apply(
-                args=(workspace.id, 0, 'other-owner-task', 'generate', []),
-            )
+            result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'other-owner-task'))
         self.assertEqual(result.result['status'], 'failed')
         manager.assert_not_called()
 
     def test_generation_requires_an_explicit_owned_active_model(self):
         workspace = self.workspace()
-        with patch('api_testing.workspace_views._queue_generation') as queue:
+        with patch('api_testing.workspace_views.generate_and_verify_api_workspace.apply_async') as queue:
             denied_message = APIWorkspaceMessagesView.as_view()(
-                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查'}),
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查', 'execution_confirmed': True, 'base_url': 'https://example.test'}),
                 project_id=self.project.id, workspace_id=workspace.id,
             )
         self.assertEqual(denied_message.status_code, 400)
         queue.assert_not_called()
 
-        workspace.status = 'generating'
-        workspace.task_id = 'no-model-task'
-        workspace.save(update_fields=['status', 'task_id', 'updated_at'])
+        workspace, _ = self.pipeline_workspace(model_id=None, task_id='no-model-task')
         with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
-            result = generate_api_workspace_candidate.apply(
-                args=(workspace.id, 0, 'no-model-task', 'generate', []),
-            )
+            result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'no-model-task'))
         self.assertEqual(result.result['status'], 'failed')
         manager.assert_not_called()
 
     def test_fake_llm_stores_candidate_without_replacing_draft(self):
         draft = default_api_workspace_draft()
-        workspace = self.workspace(
-            draft=draft, status='generating', task_id='candidate-task',
-            messages=[{'role': 'user', 'content': '生成登录场景'}], model_id=self.model.id,
-        )
+        workspace, endpoint = self.pipeline_workspace(draft=draft, task_id='candidate-task')
         candidate = {
             'version': 1,
-            'config': {'name': '登录', 'base_url': 'https://example.test', 'variables': {}, 'verify': True},
-            'teststeps': [{'name': '登录', 'endpoint_id': 1, 'request': {'method': 'POST', 'url': '/login'}}],
+            'config': {'name': 'items', 'base_url': '', 'variables': {}, 'verify': True},
+            'teststeps': [{'name': 'items', 'endpoint_id': endpoint.id, 'request': {'method': 'GET', 'url': '/items'}, 'validate': [{'eq': ['status_code', 200]}]}],
         }
-        manager = SimpleNamespace(stream_invoke=lambda messages: __import__('json').dumps(candidate))
+        manager = SimpleNamespace(stream_invoke=lambda messages, **kwargs: __import__('json').dumps(candidate))
+        module = ModuleType('api_testing.requests_runner')
+        module.requests_runner = lambda **kwargs: self.passed_result()
         with patch('api_testing.workspace_tasks.get_llm_manager', return_value=manager) as manager_factory:
-            result = generate_api_workspace_candidate.apply(args=(workspace.id, 0, 'candidate-task', 'generate', [], None))
-        self.assertEqual(result.result['status'], 'ready')
+            with patch.dict(sys.modules, {'api_testing.requests_runner': module}):
+                result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'candidate-task'))
+        self.assertEqual(result.result['status'], 'passed')
         manager_factory.assert_called_once_with(config_id=self.model.id)
         workspace.refresh_from_db()
         self.assertEqual(workspace.draft, draft)
-        self.assertEqual(workspace.candidate['draft'], normalize_draft(candidate))
+        self.assertEqual(workspace.candidate['draft']['config']['base_url'], 'https://example.test')
+        self.assertFalse(workspace.candidate['draft']['teststeps'][0]['request']['allow_redirects'])
         self.assertEqual(workspace.candidate['source_revision'], 0)
+        adopted = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {'revision': 0, 'draft': workspace.candidate['draft']}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(adopted.status_code, 200, adopted.data)
+        workspace.refresh_from_db()
+        self.assertIsNone(workspace.candidate)
+        self.assertEqual(workspace.debug_revision, 1)
 
     def test_fake_llm_repair_rejects_candidate_that_removes_assertion(self):
-        draft = default_api_workspace_draft()
-        draft['teststeps'] = [{'name': 'existing', 'request': {'method': 'GET', 'url': '/x'}, 'validate': [{'eq': ['status_code', 200]}]}]
-        workspace = self.workspace(
-            draft=draft, status='generating', task_id='repair-task', debug_revision=0,
-            debug_result={'success': False, 'error': '500'}, model_id=self.model.id,
-        )
-        manager = SimpleNamespace(stream_invoke=lambda messages: __import__('json').dumps(default_api_workspace_draft()))
+        endpoint = self.endpoint()
+        draft = {'version': 1, 'config': {'name': '', 'base_url': '', 'variables': {}, 'verify': True}, 'teststeps': [
+            {'name': 'existing', 'endpoint_id': endpoint.id, 'request': {'method': 'GET', 'url': '/items'}, 'validate': [{'eq': ['status_code', 200]}]},
+        ]}
+        workspace, _ = self.pipeline_workspace(draft=draft, task_id='repair-task')
+        manager = SimpleNamespace(stream_invoke=lambda messages, **kwargs: __import__('json').dumps(default_api_workspace_draft()))
         with patch('api_testing.workspace_tasks.get_llm_manager', return_value=manager):
-            generate_api_workspace_candidate.apply(args=(workspace.id, 0, 'repair-task', 'repair', [], {'success': False, 'error': '500'}))
+            generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'repair-task'))
         workspace.refresh_from_db()
         self.assertEqual(workspace.status, 'failed')
         self.assertIsNone(workspace.candidate)
@@ -392,9 +452,9 @@ class APIWorkspaceTests(TestCase):
         )
         self.assertEqual(update.status_code, 400)
 
-        with patch('api_testing.workspace_views._queue_generation') as queue:
+        with patch('api_testing.workspace_views.generate_and_verify_api_workspace.apply_async') as queue:
             generate = APIWorkspaceMessagesView.as_view()(
-                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查'}),
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '生成健康检查', 'execution_confirmed': True, 'base_url': 'https://example.test'}),
                 project_id=self.project.id, workspace_id=workspace.id,
             )
         self.assertEqual(generate.status_code, 400)
@@ -403,11 +463,11 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(workspace.messages, [])
 
     def test_model_disabled_after_enqueue_never_contacts_provider(self):
-        workspace = self.workspace(model_id=self.model.id, status='generating', task_id='disabled-task')
+        workspace, _ = self.pipeline_workspace(task_id='disabled-task')
         self.model.is_active = False
         self.model.save(update_fields=['is_active'])
         with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
-            generate_api_workspace_candidate.apply(args=(workspace.id, 0, 'disabled-task', 'generate', []))
+            generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'disabled-task'))
         manager.assert_not_called()
         workspace.refresh_from_db()
         self.assertEqual(workspace.status, 'failed')
@@ -415,13 +475,11 @@ class APIWorkspaceTests(TestCase):
         self.assertIsNone(workspace.candidate)
 
     def test_model_owner_change_after_enqueue_never_contacts_provider(self):
-        workspace = self.workspace(model_id=self.model.id, status='generating', task_id='owner-changed-task')
+        workspace, _ = self.pipeline_workspace(task_id='owner-changed-task')
         self.model.created_by = self.viewer
         self.model.save(update_fields=['created_by'])
         with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
-            result = generate_api_workspace_candidate.apply(
-                args=(workspace.id, 0, 'owner-changed-task', 'generate', []),
-            )
+            result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'owner-changed-task'))
         self.assertEqual(result.result['status'], 'failed')
         manager.assert_not_called()
         workspace.refresh_from_db()
@@ -472,18 +530,108 @@ class APIWorkspaceTests(TestCase):
         self.assertFalse(_path_matches('/foo.json', '/fooXjson'))
         self.assertTrue(_path_matches('/users/{id}', '/users/42'))
 
-    def test_feedback_retry_includes_previous_model_output(self):
-        workspace = self.workspace(status='generating', task_id='retry-task', model_id=self.model.id)
-        candidate = {
-            'version': 1, 'config': {'name': 'health', 'base_url': '', 'variables': {}, 'verify': True},
-            'teststeps': [{'name': 'health', 'request': {'method': 'GET', 'url': '/health'}}],
+    def test_repair_candidate_cannot_shadow_a_baseline_expected_variable(self):
+        endpoint = self.endpoint()
+        baseline = normalize_draft({
+            'version': 1, 'config': {'name': '', 'base_url': '', 'variables': {'expected': 200}, 'verify': True},
+            'teststeps': [{'name': 'items', 'endpoint_id': endpoint.id, 'request': {'method': 'GET', 'url': '/items'},
+                           'validate': [{'eq': ['status_code', '${expected}']}]}],
+        })
+        unsafe = deepcopy(baseline)
+        unsafe['teststeps'][0]['extract'] = {'expected': 'status_code'}
+        with self.assertRaisesRegex(ValueError, '断言'):
+            prepare_candidate(
+                unsafe, endpoints=endpoint_specs(self.project.id, [endpoint.id], spec_id=endpoint.spec_id),
+                target_url='https://example.test', variables={}, baseline=_step_assertions(baseline),
+                protected=protected_expected_values(baseline),
+            )
+
+    def test_candidate_data_without_content_type_is_rejected_when_spec_only_accepts_json(self):
+        endpoint = self.endpoint()
+        endpoint.request_body = {'content': {'application/json': {'schema': {'type': 'object'}}}}
+        endpoint.save(update_fields=['request_body'])
+        draft = {
+            'version': 1, 'config': {'name': '', 'base_url': '', 'variables': {}, 'verify': True},
+            'teststeps': [{'name': 'items', 'endpoint_id': endpoint.id,
+                           'request': {'method': 'GET', 'url': '/items', 'data': {'x': '1'}},
+                           'validate': [{'eq': ['status_code', 200]}]}],
         }
-        manager = SimpleNamespace(stream_invoke=Mock(side_effect=['not json', __import__('json').dumps(candidate)]))
+        with self.assertRaisesRegex(ValueError, '媒体类型'):
+            prepare_candidate(
+                draft, endpoints=endpoint_specs(self.project.id, [endpoint.id], spec_id=endpoint.spec_id),
+                target_url='https://example.test', variables={},
+            )
+
+    def test_repair_freezes_current_candidate_and_failed_server_result(self):
+        endpoint = self.endpoint()
+        candidate = normalize_draft({
+            'version': 1, 'config': {'name': 'candidate', 'base_url': '', 'variables': {}, 'verify': True},
+            'teststeps': [{'name': 'items', 'endpoint_id': endpoint.id, 'request': {'method': 'GET', 'url': '/items'},
+                           'validate': [{'eq': ['status_code', 200]}]}],
+        })
+        result = {'success': False, 'error_type': 'ExtractionFailure', 'step_datas': []}
+        candidate_hash = draft_hash(candidate)
+        workspace = self.workspace(
+            model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id], status='ready',
+            candidate={'draft': candidate, 'source_revision': 0, 'draft_hash': candidate_hash, 'verification_status': 'needs_review'},
+            generation={'status': 'needs_review', 'source_revision': 0,
+                        'rounds': [{'draft_hash': candidate_hash, 'result': result}]},
+        )
+        with patch('api_testing.workspace_views.generate_and_verify_api_workspace.apply_async'):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': 0, 'message': '修复提取路径', 'mode': 'repair', 'execution_confirmed': True,
+                    'base_url': 'https://example.test', 'variables': {},
+                }), project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        workspace.refresh_from_db()
+        snapshot = workspace.generation['_snapshot']
+        self.assertEqual(snapshot['draft'], candidate)
+        self.assertEqual(snapshot['failure_evidence'], result)
+
+    def test_expired_pipeline_does_not_contact_model_or_target(self):
+        workspace, _ = self.pipeline_workspace(task_id='expired-pipeline')
+        workspace.generation['_snapshot']['queued_at'] = (timezone.now() - timedelta(seconds=2)).isoformat()
+        workspace.save(update_fields=['generation', 'updated_at'])
+        with patch('api_testing.workspace_tasks.generation_timeout_seconds', return_value=1), \
+             patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+            result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'expired-pipeline'))
+        self.assertEqual(result.result['status'], 'failed')
+        manager.assert_not_called()
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.generation['status'], 'failed')
+
+    def test_revoked_edit_permission_stops_queued_generation(self):
+        workspace, _ = self.pipeline_workspace(task_id='edit-permission-revoked')
+        with patch('api_testing.workspace_tasks.can_edit_project', return_value=False), \
+             patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+            generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'edit-permission-revoked'))
+        manager.assert_not_called()
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.generation['status'], 'failed')
+
+    def test_polling_uses_total_deadline_despite_recent_heartbeat_and_cannot_revive(self):
+        from .workspace_service import expire_stalled_workspace
+        from .workspace_tasks import _finish_pipeline
+        workspace, _ = self.pipeline_workspace(task_id='heartbeat-expired')
+        workspace.generation['_snapshot']['queued_at'] = (timezone.now() - timedelta(seconds=10)).isoformat()
+        workspace.save(update_fields=['generation', 'updated_at'])
+        with patch('api_testing.workspace_service.generation_timeout_seconds', return_value=5):
+            expired = expire_stalled_workspace(workspace)
+        self.assertEqual(expired.status, 'failed')
+        self.assertEqual(expired.generation['status'], 'failed')
+        _finish_pipeline(workspace.id, 0, 'heartbeat-expired', 'passed', 'late worker result')
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.generation['status'], 'failed')
+
+    def test_invalid_candidates_stop_after_three_bounded_attempts(self):
+        workspace, _ = self.pipeline_workspace(task_id='retry-task')
+        manager = SimpleNamespace(stream_invoke=Mock(return_value='not json'))
         with patch('api_testing.workspace_tasks.get_llm_manager', return_value=manager):
-            result = generate_api_workspace_candidate.apply(args=(workspace.id, 0, 'retry-task', 'generate', [], None))
-        self.assertEqual(result.result['status'], 'ready')
-        self.assertEqual(manager.stream_invoke.call_count, 2)
-        self.assertIn('not json', manager.stream_invoke.call_args_list[1].args[0][-1].content)
+            result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'retry-task'))
+        self.assertEqual(result.result['status'], 'failed')
+        self.assertEqual(manager.stream_invoke.call_count, 3)
 
     def test_case_with_unparseable_legacy_script_is_not_silently_replaced(self):
         case = APITestCase.objects.create(

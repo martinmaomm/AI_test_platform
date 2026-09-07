@@ -261,7 +261,7 @@ def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, A
                     raise CaseContractError(f"步骤 {index} 请求前发现未知变量：{', '.join(sorted(missing))}")
         for position, raw_validator in enumerate(step["validate"]):
             validator = _parse_validator(raw_validator, f"teststeps[{index - 1}].validate[{position}]")
-            missing = _variable_names(validator["expect"]).difference(available)
+            missing = _variable_names(validator["expect"]).difference(available | set(step["extract"]))
             if missing:
                 raise CaseContractError(f"步骤 {index} 断言中发现未知变量：{', '.join(sorted(missing))}")
         available.update(step["extract"])
@@ -369,13 +369,35 @@ def _runtime_options(case: Mapping[str, Any], options: Mapping[str, Any] | None)
     option_headers = options.get("headers", {})
     if not isinstance(option_headers, Mapping):
         raise CaseContractError("options.headers 必须是 JSON 对象")
+    allowed_origin = options.get("allowed_origin")
+    if allowed_origin is not None:
+        if not isinstance(allowed_origin, str):
+            raise CaseContractError("options.allowed_origin 必须是完整 HTTP(S) URL")
+        _http_origin(allowed_origin, "options.allowed_origin")
     return {
         "connect_timeout": connect,
         "read_timeout": read,
         "total_timeout": total,
         "verify": verify,
         "headers": {**headers, **dict(option_headers)},
+        "allowed_origin": allowed_origin,
     }
+
+
+def _http_origin(value: str, label: str) -> tuple[str, str, int]:
+    parts = urlsplit(value)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+        raise CaseContractError(f"{label} 必须是完整 HTTP(S) URL")
+    try:
+        port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    except ValueError as exc:
+        raise CaseContractError(f"{label} 端口非法") from exc
+    return parts.scheme.lower(), parts.hostname.lower(), port
+
+
+def _assert_allowed_origin(url: str, allowed_origin: str | None) -> None:
+    if allowed_origin is not None and _http_origin(url, "请求 URL") != _http_origin(allowed_origin, "options.allowed_origin"):
+        raise CaseContractError("请求 URL 超出本轮确认目标地址的 origin")
 
 
 def _absolute_http_url(value: Any, base_url: Any) -> str:
@@ -511,13 +533,14 @@ def _compare(comparator: str, actual: Any, expected: Any) -> bool:
 def _validator_record(validator: Mapping[str, Any], context: Mapping[str, Any], variables: Mapping[str, Any]) -> dict[str, Any]:
     comparator = validator["comparator"]
     check = validator["check"]
-    expected = _substitute(validator["expect"], variables)
+    raw_expected = deepcopy(validator["expect"])
     try:
+        expected = _substitute(raw_expected, variables)
         actual = _select(check, context)
         passed = _compare(comparator, actual, expected)
         message = "断言通过" if passed else f"断言失败：{check} {comparator} {expected!r}，实际为 {actual!r}"
     except (CaseContractError, KeyError, TypeError, ValueError) as exc:
-        actual, passed, message = None, False, f"断言无法执行：{exc}"
+        actual, expected, passed, message = None, raw_expected, False, f"断言无法执行：{exc}"
     return {
         "comparator": comparator,
         "check": check,
@@ -564,7 +587,7 @@ def _report(*, script_id: str, name: str, started_wall: datetime, started_monoto
     errored = sum(1 for step in steps if step["status"] == "error")
     skipped = sum(1 for step in steps if step["status"] == "skipped")
     success = not error and failed == 0 and errored == 0 and skipped == 0
-    status = "passed" if success else ("failed" if error_type == "ValidationFailure" else "error")
+    status = "passed" if success else ("failed" if error_type in {"ValidationFailure", "ExtractionFailure"} else "error")
     log = "\n".join(step["log"] for step in steps if step.get("log"))
     return {
         "success": success,
@@ -674,6 +697,7 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
                     raise TimeoutError("用例总超时，未发送请求")
                 request = _substitute(step["request"], variables)
                 url = _absolute_http_url(request.pop("url"), resolved_base_url)
+                _assert_allowed_origin(url, runtime["allowed_origin"])
                 headers = _http_headers({**runtime["headers"], **dict(request.pop("headers", {}))})
                 params = request.pop("params", None)
                 raw_request_timeout = request.pop("timeout", None)
@@ -719,13 +743,21 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
                     "extract": variables,
                 }
                 exported: dict[str, Any] = {}
+                extraction_results: list[dict[str, Any]] = []
+                extraction_errors: list[str] = []
                 for name, selector in step["extract"].items():
                     try:
                         exported[name] = deepcopy(_select(selector, response_context))
+                        extraction_results.append({"name": name, "selector": selector, "passed": True})
                     except (CaseContractError, KeyError, TypeError, ValueError) as exc:
-                        raise ExtractionFailure(f"步骤 {index} 提取变量 {name} 失败：{exc}") from exc
-                variables.update(exported)
-                response_context["extract"] = variables
+                        message = f"步骤 {index} 提取变量 {name} 失败：{exc}"
+                        extraction_errors.append(message)
+                        extraction_results.append({"name": name, "selector": selector, "passed": False, "error": str(exc)})
+                # A partially extracted response is useful evidence, but never a
+                # source of variables for later requests after extraction failed.
+                if not extraction_errors:
+                    variables.update(exported)
+                    response_context["extract"] = variables
                 records = [
                     _validator_record(
                         _parse_validator(raw_validator, f"步骤 {index} 断言"), response_context, variables,
@@ -739,19 +771,20 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
                     "content": getattr(response, "text", None), "url": getattr(response, "url", url), "elapsed_ms": elapsed,
                 }
                 validators = {"validate_extractor": records}
-                step_error = "" if passed else next(record["message"] for record in records if not record["passed"])
+                passed = passed and not extraction_errors
+                step_error = (extraction_errors[0] if extraction_errors else "") or (
+                    "" if passed else next(record["message"] for record in records if not record["passed"])
+                )
                 steps.append({
                     "name": step["name"], "success": passed, "status": "passed" if passed else "failed",
                     "data": {"req_resps": [{"request": attempted_request, "response": response_view}], "validators": validators, "stat": {"elapsed_ms": elapsed, "response_time_ms": elapsed}},
-                    "validators": validators, "export_vars": exported, "attachment": {}, "error": step_error,
+                    "validators": validators, "export_vars": exported, "extraction_results": extraction_results,
+                    "attachment": {}, "error": step_error,
                     "log": f"步骤 {index} {'成功' if passed else '失败'}：{request_kwargs['method']} {url}",
                 })
                 if not passed:
-                    terminal_error, terminal_error_type = step_error, "ValidationFailure"
-            except ExtractionFailure as exc:
-                terminal_error, terminal_error_type = str(exc), "ValidationFailure"
-                elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0
-                steps.append(_empty_step(step["name"], status="failed", error=terminal_error, log=f"步骤 {index} 提取失败：{terminal_error}", request_view=attempted_request, elapsed_ms=elapsed))
+                    terminal_error = step_error
+                    terminal_error_type = "ExtractionFailure" if extraction_errors else "ValidationFailure"
             except TimeoutError as exc:
                 terminal_error, terminal_error_type = str(exc), "Timeout"
                 elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0

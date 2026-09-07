@@ -6,13 +6,15 @@ newer editor revision.
 """
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
-from .models import APIEndpoint, APIWorkspace, APITestCase, default_api_workspace_draft
+from .models import APIEndpoint, APIWorkspace, APITestCase, APISpecification, default_api_workspace_draft
 from projects.models import Project
 
 
@@ -79,23 +81,110 @@ def require_executable_draft(value: Any) -> dict[str, Any]:
     return draft
 
 
-def endpoint_specs(project_id: int, endpoint_ids: list[int]) -> list[dict[str, Any]]:
+def validate_spec_id(project_id: int, spec_id: Any) -> APISpecification | None:
+    if spec_id is None:
+        return None
+    if not isinstance(spec_id, int) or isinstance(spec_id, bool) or spec_id <= 0:
+        raise WorkspaceValidationError('spec_id 必须是正整数或 null。')
+    try:
+        spec = APISpecification.objects.get(pk=spec_id, project_id=project_id)
+    except APISpecification.DoesNotExist as exc:
+        raise WorkspaceValidationError('API 规范不存在或不属于当前项目。') from exc
+    if spec.status != APISpecification.TaskStatus.COMPLETED:
+        raise WorkspaceValidationError('API 规范尚未可用，不能用于生成。')
+    return spec
+
+
+def infer_spec_id(project_id: int, endpoint_ids: list[int]) -> int | None:
+    if not endpoint_ids:
+        return None
+    spec_ids = list(APIEndpoint.objects.filter(
+        id__in=endpoint_ids, spec__project_id=project_id,
+    ).values_list('spec_id', flat=True).distinct())
+    return spec_ids[0] if len(spec_ids) == 1 else None
+
+
+def endpoint_specs(project_id: int, endpoint_ids: list[int], *, spec_id: int | None = None) -> list[dict[str, Any]]:
     if len(endpoint_ids) > 50:
         raise WorkspaceValidationError('一次最多选择 50 个相关接口，请缩小本次生成范围。')
     ids = [value for value in endpoint_ids if isinstance(value, int) and not isinstance(value, bool) and value > 0]
     if len(ids) != len(set(ids)) or len(ids) != len(endpoint_ids):
         raise WorkspaceValidationError('endpoint_ids 必须是互不重复的正整数。')
-    endpoints = list(APIEndpoint.objects.filter(id__in=ids, spec__project_id=project_id).select_related('spec'))
+    query = APIEndpoint.objects.filter(id__in=ids, spec__project_id=project_id)
+    if spec_id is not None:
+        query = query.filter(spec_id=spec_id)
+    endpoints = list(query.select_related('spec'))
     if len(endpoints) != len(ids):
         raise WorkspaceValidationError('存在不属于当前项目的接口端点。')
     by_id = {endpoint.id: endpoint for endpoint in endpoints}
     return [{
         'id': endpoint.id, 'method': endpoint.method, 'path': endpoint.path,
         'summary': endpoint.summary, 'description': endpoint.description,
-        'parameters': endpoint.parameters, 'request_body': endpoint.request_body,
-        'responses': endpoint.responses, 'operation_id': endpoint.operation_id,
+        'parameters': _resolve_endpoint_refs(endpoint.parameters, endpoint.spec.metadata),
+        'request_body': _resolve_endpoint_refs(endpoint.request_body, endpoint.spec.metadata),
+        'responses': _resolve_endpoint_refs(endpoint.responses, endpoint.spec.metadata), 'operation_id': endpoint.operation_id,
         'document_context': _document_context(endpoint),
     } for endpoint in (by_id[item] for item in ids)]
+
+
+_MAX_LOCAL_REF_DEPTH = 24
+
+
+def _resolve_endpoint_refs(value: Any, document: Any, resolving: frozenset[str] = frozenset(), depth: int = 0) -> Any:
+    """Boundedly expand local refs while preserving unexpandable schema evidence."""
+    if isinstance(value, list):
+        return [_resolve_endpoint_refs(item, document, resolving, depth) for item in value]
+    if not isinstance(value, dict):
+        return deepcopy(value)
+    reference = value.get('$ref')
+    if reference is not None:
+        # APIParserService persists locally-expanded schemas together with the
+        # source pointer.  Prefer that checked expansion when the original
+        # document is not retained in ``metadata``.
+        if value.get('x-aits-ref-status') == 'resolved':
+            return {
+                key: _resolve_endpoint_refs(item, document, resolving, depth)
+                for key, item in value.items() if key not in {'$ref', 'x-aits-ref-status'}
+            }
+        copied = {key: _resolve_endpoint_refs(item, document, resolving, depth) for key, item in value.items()}
+        if not isinstance(reference, str) or not reference.startswith('#/'):
+            copied['x-aits-ref-status'] = 'external'
+            return copied
+        if reference in resolving:
+            copied['x-aits-ref-status'] = 'circular'
+            return copied
+        if depth >= _MAX_LOCAL_REF_DEPTH:
+            copied['x-aits-ref-status'] = 'truncated'
+            return copied
+        current: Any = document
+        try:
+            for part in reference[2:].split('/'):
+                current = current[part.replace('~1', '/').replace('~0', '~')]
+        except (KeyError, IndexError, TypeError, ValueError):
+            copied['x-aits-ref-status'] = 'unresolved'
+            return copied
+        resolved = _resolve_endpoint_refs(current, document, resolving | {reference}, depth + 1)
+        if not isinstance(resolved, dict):
+            copied['x-aits-ref-status'] = 'unresolved'
+            return copied
+        resolved.update(copied)
+        resolved['x-aits-ref-status'] = 'resolved'
+        return resolved
+    return {key: _resolve_endpoint_refs(item, document, resolving, depth) for key, item in value.items()}
+
+
+def generation_endpoint_specs(workspace: APIWorkspace) -> list[dict[str, Any]]:
+    if not workspace.spec_id:
+        raise WorkspaceValidationError('请先选择可用 API 规范后再生成。')
+    validate_spec_id(workspace.project_id, workspace.spec_id)
+    endpoint_ids = workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else []
+    if not endpoint_ids:
+        endpoint_ids = list(APIEndpoint.objects.filter(spec_id=workspace.spec_id).values_list('id', flat=True)[:51])
+        if len(endpoint_ids) > 50:
+            raise WorkspaceValidationError('该 API 规范超过 50 个端点，请明确缩小本次生成范围。')
+    if not endpoint_ids:
+        raise WorkspaceValidationError('所选 API 规范没有可用端点，不能生成。')
+    return endpoint_specs(workspace.project_id, endpoint_ids, spec_id=workspace.spec_id)
 
 
 def _document_context(endpoint):
@@ -125,6 +214,7 @@ def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
         'id': workspace.id,
         'title': workspace.title,
         'model_id': workspace.model_id,
+        'spec_id': workspace.spec_id,
         'endpoint_ids': workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else [],
         'draft': workspace.draft if isinstance(workspace.draft, dict) else default_api_workspace_draft(),
         'revision': workspace.revision,
@@ -132,6 +222,7 @@ def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
         'error': workspace.error,
         'messages': workspace.messages if isinstance(workspace.messages, list) else [],
         'candidate': workspace.candidate,
+        'generation': public_generation(workspace.generation),
         'debug_result': workspace.debug_result if isinstance(workspace.debug_result, dict) else {},
         'debug_revision': workspace.debug_revision,
         'saved_case_id': workspace.saved_case_id,
@@ -139,6 +230,13 @@ def serialize_workspace(workspace: APIWorkspace) -> dict[str, Any]:
         'task_id': workspace.task_id or None,
         'updated_at': workspace.updated_at.isoformat() if workspace.updated_at else None,
     }
+
+
+def public_generation(value: Any) -> dict[str, Any]:
+    generation = deepcopy(value) if isinstance(value, dict) else {}
+    for internal_key in ('_snapshot', '_claimed', 'task_id'):
+        generation.pop(internal_key, None)
+    return generation
 
 
 def owned_workspace(*, project_id: int, workspace_id: int, user, lock: bool = False) -> APIWorkspace:
@@ -167,32 +265,78 @@ _UNSET = object()
 
 
 def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any = _UNSET,
-                           model_id: Any = _UNSET, endpoint_ids: Any = _UNSET) -> APIWorkspace:
+                           model_id: Any = _UNSET, endpoint_ids: Any = _UNSET,
+                           spec_id: Any = _UNSET) -> APIWorkspace:
     require_revision(workspace, revision)
     if workspace.status in {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}:
         raise WorkspaceConflict('当前工作区任务尚未结束，不能修改草稿。')
     changed = False
+    next_spec_id = workspace.spec_id
+    if spec_id is not _UNSET:
+        spec = validate_spec_id(workspace.project_id, spec_id)
+        next_spec_id = spec.id if spec else None
+    next_endpoint_ids = workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else []
+    if endpoint_ids is not _UNSET:
+        if not isinstance(endpoint_ids, list):
+            raise WorkspaceValidationError('endpoint_ids 必须是数组。')
+        next_endpoint_ids = endpoint_ids
+    if next_endpoint_ids and next_spec_id is None:
+        inferred_spec_id = infer_spec_id(workspace.project_id, next_endpoint_ids)
+        if inferred_spec_id is None:
+            raise WorkspaceValidationError('所选端点必须来自同一可用 API 规范，请明确选择 spec_id。')
+        next_spec_id = validate_spec_id(workspace.project_id, inferred_spec_id).id
+    if next_endpoint_ids:
+        endpoint_specs(workspace.project_id, next_endpoint_ids, spec_id=next_spec_id)
+    proposed_draft = normalize_draft(draft) if draft is not _UNSET else workspace.draft
+    candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
+    generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+    candidate_draft = candidate.get('draft') if isinstance(candidate.get('draft'), dict) else None
+    exact_adoption = False
+    if draft is not _UNSET and candidate_draft is not None:
+        from .workspace_verification import draft_hash
+        rounds = generation.get('rounds') if isinstance(generation.get('rounds'), list) else []
+        final_round = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}
+        exact_adoption = (
+            model_id is _UNSET and endpoint_ids is _UNSET and spec_id is _UNSET
+            and
+            generation.get('status') == 'passed'
+            and candidate.get('source_revision') == workspace.revision
+            and generation.get('source_revision') == workspace.revision
+            and candidate.get('draft_hash') == draft_hash(candidate_draft)
+            and final_round.get('draft_hash') == candidate.get('draft_hash')
+            and proposed_draft == candidate_draft
+            and isinstance(final_round.get('result'), dict)
+        )
     if draft is not _UNSET:
-        workspace.draft = normalize_draft(draft)
-        workspace.candidate = None
-        workspace.debug_result = {}
-        workspace.debug_snapshot = {}
-        workspace.debug_revision = None
+        workspace.draft = proposed_draft
+        if not exact_adoption:
+            workspace.candidate = None
+            workspace.debug_result = {}
+            workspace.debug_snapshot = {}
+            workspace.debug_revision = None
         changed = True
     if model_id is not _UNSET:
         workspace.model_id = validate_model_id(model_id, owner=workspace.owner)
         changed = True
     if endpoint_ids is not _UNSET:
-        if not isinstance(endpoint_ids, list):
-            raise WorkspaceValidationError('endpoint_ids 必须是数组。')
-        endpoint_specs(workspace.project_id, endpoint_ids)
-        workspace.endpoint_ids = endpoint_ids
+        workspace.endpoint_ids = next_endpoint_ids
+        changed = True
+    if spec_id is not _UNSET:
+        workspace.spec_id = next_spec_id
         changed = True
     if changed:
         workspace.revision += 1
         workspace.status = APIWorkspace.Status.IDLE
         workspace.error = ''
         workspace.task_id = ''
+        if exact_adoption:
+            workspace.debug_result = deepcopy(final_round['result'])
+            workspace.debug_snapshot = {}
+            workspace.debug_revision = workspace.revision
+            workspace.generation = {**generation, 'adopted_revision': workspace.revision}
+            workspace.candidate = None
+        elif workspace.generation:
+            workspace.generation = {**workspace.generation, 'status': 'stale', 'phase': 'finished'}
         workspace.save()
     return workspace
 
@@ -203,13 +347,25 @@ def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspa
         return workspace
     now = now or timezone.now()
     limit_seconds = debug_timeout_seconds() if workspace.status == APIWorkspace.Status.DEBUGGING else generation_timeout_seconds()
-    if (now - workspace.updated_at).total_seconds() <= limit_seconds:
+
+    def elapsed(value: APIWorkspace) -> float:
+        anchor = value.updated_at
+        if value.status == APIWorkspace.Status.GENERATING:
+            generation = value.generation if isinstance(value.generation, dict) else {}
+            snapshot = generation.get('_snapshot') or {}
+            queued_at = parse_datetime(str(snapshot.get('queued_at') or ''))
+            if queued_at is not None and timezone.is_aware(queued_at):
+                anchor = queued_at
+        return (now - anchor).total_seconds()
+
+    # A streaming heartbeat must not extend the complete task's deadline.
+    if elapsed(workspace) <= limit_seconds:
         return workspace
     with transaction.atomic():
         current = APIWorkspace.objects.select_for_update().get(pk=workspace.pk)
         if current.status != workspace.status or current.task_id != workspace.task_id:
             return current
-        if (now - current.updated_at).total_seconds() <= limit_seconds:
+        if elapsed(current) <= limit_seconds:
             return current
         was_debugging = current.status == APIWorkspace.Status.DEBUGGING
         current.status = APIWorkspace.Status.FAILED
@@ -217,17 +373,24 @@ def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspa
         if was_debugging:
             current.debug_snapshot = {}
             current.debug_result = {'status': 'error', 'error': current.error}
+        else:
+            generation = deepcopy(current.generation) if isinstance(current.generation, dict) else {}
+            generation.update({
+                'status': 'failed', 'phase': 'finished', 'summary': current.error,
+                'finished_at': now.isoformat(),
+            })
+            current.generation = generation
         current.save()
         return current
 
 
 def generation_timeout_seconds() -> int:
-    """Follow the configured model-manager request timeout, including long requests."""
-    from ai_core import model_manager
-    reader = getattr(model_manager, 'get_llm_request_timeout', None)
-    if not callable(reader):
-        reader = model_manager._get_default_llm_timeout
-    return max(1, int(reader())) * 2 + 60
+    """Bound the complete queued generate-and-verify pipeline."""
+    configured = os.environ.get('AITS_API_GENERATION_TIMEOUT_SECONDS', '1800')
+    try:
+        return max(60, int(configured))
+    except ValueError:
+        return 1800
 
 
 def debug_timeout_seconds() -> int:

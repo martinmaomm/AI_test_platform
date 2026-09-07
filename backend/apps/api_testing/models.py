@@ -325,6 +325,10 @@ class APIWorkspace(models.Model):
 
     project = models.ForeignKey('projects.Project', on_delete=models.CASCADE, related_name='api_workspaces')
     owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='api_workspaces')
+    spec = models.ForeignKey(
+        APISpecification, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='workspaces',
+    )
     saved_case = models.ForeignKey(
         APITestCase, on_delete=models.SET_NULL, null=True, blank=True, related_name='workspaces',
     )
@@ -337,6 +341,7 @@ class APIWorkspace(models.Model):
     error = models.TextField(blank=True)
     messages = models.JSONField(default=list, blank=True)
     candidate = models.JSONField(null=True, blank=True)
+    generation = models.JSONField(default=dict, blank=True)
     debug_result = models.JSONField(default=dict, blank=True)
     # Internal queued input. It is never returned by the workspace representation.
     debug_snapshot = models.JSONField(default=dict, blank=True)

@@ -27,7 +27,7 @@
       :closable="false"
       show-icon
     />
-    <div v-if="candidate" class="candidate">
+    <div v-if="candidate?.draft" class="candidate">
       <strong>AI 候选草稿（尚未采用）</strong>
       <p v-if="candidate.summary">{{ candidate.summary }}</p>
       <p>变更：{{ diff.join("、") }}</p>
@@ -40,7 +40,7 @@
       />
       <el-button
         type="primary"
-        :disabled="disabled || busy || submitting"
+        :disabled="disabled || busy || submitting || generationPending"
         @click="$emit('adopt')"
         >采用候选并替换草稿</el-button
       >
@@ -51,7 +51,7 @@
       :rows="3"
       maxlength="2000"
       show-word-limit
-      :disabled="disabled || busy || submitting"
+      :disabled="disabled || busy || submitting || generationPending"
       placeholder="例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。"
       @keydown.ctrl.enter.prevent="send('generate')"
     />
@@ -63,21 +63,29 @@
           disabled ||
           busy ||
           submitting ||
+          generationPending ||
           generationDisabled ||
           !message.trim()
         "
         @click="send('generate')"
-        >生成候选</el-button
+        >生成并验证</el-button
       >
       <el-button
         :loading="busy && mode === 'repair'"
-        :disabled="disabled || busy || submitting || generationDisabled || !canRepair"
+        :disabled="
+          disabled ||
+          busy ||
+          submitting ||
+          generationPending ||
+          generationDisabled ||
+          !canRepair
+        "
         @click="send('repair')"
-        >基于失败结果修复</el-button
+        >修复并验证</el-button
       >
     </div>
     <p class="hint">
-      生成和修复不会自动保存用例，也不会自动采用候选。修复仅使用已发生的失败调试证据。
+      生成、修复和验证都不会自动采用候选或保存用例；确认后才会发起真实验证请求。
     </p>
   </section>
 </template>
@@ -95,6 +103,7 @@ const props = defineProps({
   disabled: Boolean,
   generationDisabled: Boolean,
   canRepair: Boolean,
+  generationPending: Boolean,
   workspaceError: String,
   sendMessage: { type: Function, required: true },
 });
@@ -103,7 +112,13 @@ const message = ref("");
 const mode = ref("generate");
 const submitting = ref(false);
 const send = async (nextMode) => {
-  if (props.generationDisabled || props.disabled || props.busy || submitting.value)
+  if (
+    props.generationDisabled ||
+    props.disabled ||
+    props.busy ||
+    props.generationPending ||
+    submitting.value
+  )
     return;
   const submittedMessage = message.value;
   if (!submittedMessage.trim() && nextMode === "generate") return;
@@ -122,6 +137,10 @@ const send = async (nextMode) => {
     submitting.value = false;
   }
 };
+const clearSubmittedMessage = (submittedMessage) => {
+  if (message.value === submittedMessage) message.value = "";
+};
+defineExpose({ clearSubmittedMessage });
 </script>
 
 <style scoped>

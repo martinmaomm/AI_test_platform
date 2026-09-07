@@ -234,6 +234,32 @@ def test_extraction_failure_is_failed_not_runtime_error():
         result = run_case("extract", json.dumps(case))
     assert result["status"] == result["step_datas"][0]["status"] == "failed"
     assert result["stat"]["teststeps"] == {"total": 1, "successes": 0, "failures": 1, "errors": 0, "skipped": 0}
+    step = result["step_datas"][0]
+    assert step["data"]["req_resps"][0]["response"]["status_code"] == 200
+    assert step["data"]["req_resps"][0]["response"]["body"] == {}
+    assert step["extraction_results"] == [{"name": "token", "selector": "body.data.token", "passed": False, "error": "'data'"}]
+    assert result["error_type"] == "ExtractionFailure"
+
+
+def test_partial_extract_preserves_response_and_never_leaks_variables_to_later_steps():
+    session = FakeSession([FakeResponse(body={"token": "only-this-step"})])
+    case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+        {
+            "request": {"url": "/login"},
+            "extract": {"token": "body.token", "missing": "body.nope"},
+            "validate": [{"eq": ["status_code", 200]}, {"eq": ["status_code", "${token}"]}],
+        },
+        {"request": {"url": "/next/${token}"}, "validate": [{"eq": ["status_code", 200]}]},
+    ]}
+    with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+        result = run_case("partial-extract", json.dumps(case))
+    first, second = result["step_datas"]
+    assert first["status"] == "failed" and second["status"] == "skipped"
+    assert first["data"]["req_resps"][0]["response"]["body"] == {"token": "only-this-step"}
+    assert first["export_vars"] == {"token": "only-this-step"}
+    assert [record["passed"] for record in first["validators"]["validate_extractor"]] == [True, False]
+    assert "未知变量：token" in first["validators"]["validate_extractor"][1]["message"]
+    assert len(session.requests) == 1
 
 
 def test_runner_rejects_unknown_variables_and_illegal_urls_before_session_request():
@@ -250,6 +276,18 @@ def test_runner_rejects_unknown_variables_and_illegal_urls_before_session_reques
     assert bad_url_result["success"] is False
     assert bad_url_result["status"] == "error"
     assert "HTTP(S)" in bad_url_result["error"]
+
+
+def test_allowed_origin_blocks_substituted_or_extracted_cross_origin_url_before_http():
+    case = {
+        "config": {"base_url": "https://api.example.test", "variables": {"next": "https://other.invalid/path"}},
+        "teststeps": [{"request": {"url": "${next}"}}],
+    }
+    with patch("api_testing.requests_runtime.requests.Session") as session_factory:
+        result = run_case("origin", json.dumps(case), options={"allowed_origin": "https://api.example.test"})
+    assert result["status"] == "error"
+    assert "超出本轮确认目标地址" in result["error"]
+    session_factory.return_value.request.assert_not_called()
 
 
 def test_empty_steps_are_editable_but_not_executable():

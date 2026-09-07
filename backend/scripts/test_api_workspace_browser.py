@@ -59,14 +59,39 @@ def bootstrap(root):
     from rest_framework_simplejwt.tokens import AccessToken
     user = get_user_model().objects.create_user(username='workspace-offline', password='fixture-only')
     project = Project.objects.create(name='API 工作区隔离验收', project_type='api', created_by=user)
-    spec = APISpecification.objects.create(project=project, spec_name='验收 Swagger', status='completed', created_by=user)
-    endpoint = APIEndpoint.objects.create(spec=spec, path='/health', method='GET', summary='健康检查', responses={'200': {'description': 'OK'}})
+    metadata = {
+        'swagger': '2.0', 'info': {'title': '隔离验收', 'version': '1'},
+        'host': 'example.test', 'schemes': ['https'],
+        'paths': {'/health': {'get': {'responses': {'200': {'description': 'OK', 'schema': {'$ref': '#/definitions/Health'}}}}}},
+        'definitions': {'Health': {'type': 'object', 'properties': {'state': {'type': 'string'}}, 'example': {'state': 'ok'}}},
+    }
+    spec = APISpecification.objects.create(project=project, spec_name='验收 Swagger', status='completed', created_by=user, metadata=metadata)
+    endpoint = APIEndpoint.objects.create(spec=spec, path='/health', method='GET', summary='健康检查', responses=metadata['paths']['/health']['get']['responses'])
     model = LLMConfiguration.objects.create(created_by=user, provider='openai', provider_name='离线模拟',
                                              model_name='fixture-model', api_key='fixture-only', base_url='https://never-called.invalid')
     LLMConfiguration.objects.create(created_by=user, provider='openai', model_name='disabled-fixture', is_active=False)
     LLMConfiguration.objects.create(created_by=user, provider='openai', model_name='vision-fixture', model_type='vision')
     return {'token': str(AccessToken.for_user(user)), 'user_id': user.pk, 'project_id': project.pk,
-            'endpoint_id': endpoint.pk, 'model_id': model.pk}
+            'endpoint_id': endpoint.pk, 'model_id': model.pk, 'spec_id': spec.pk}
+
+
+def confirm_generation(page, base_url='https://example.test'):
+    """Exercise the explicit live-request consent UI; endpoints here are fake."""
+    dialog = page.get_by_role('dialog', name='生成并验证确认', exact=True)
+    dialog.get_by_role('textbox', name='目标地址', exact=True).fill(base_url)
+    dialog.get_by_role('button', name='确认并开始验证', exact=True).click()
+
+
+def execute_debug(page):
+    from playwright.sync_api import expect
+    launch = page.get_by_role('button', name='显式调试执行', exact=True)
+    expect(launch).to_be_enabled(timeout=15000)
+    launch.click()
+    with page.expect_response(lambda item: item.url.endswith('/debug/') and item.request.method == 'POST'):
+        page.get_by_role('button', name='确认执行', exact=True).click()
+    expect(page.get_by_role('button', name='确认执行', exact=True)).to_be_hidden()
+    # Wait for the new task to settle, not for the previous result's HTTP code.
+    expect(launch).to_be_enabled(timeout=15000)
 
 
 def verify(origin, fixture, output):
@@ -103,9 +128,28 @@ def verify(origin, fixture, output):
             message = page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。')
             expect(message).to_be_visible()
             message.fill('生成健康检查，验证 HTTP 状态码为 200')
-            page.get_by_role('button', name='生成候选', exact=True).click()
+            page.get_by_role('button', name='生成并验证', exact=True).click()
+            confirm_generation(page)
+            if fixture.get('generation_gate') is not None:
+                verification = page.get_by_test_id('api-generation-verification')
+                expect(verification).to_contain_text('正在生成候选', timeout=15000)
+                expect(page.get_by_role('button', name='生成并验证', exact=True)).to_be_disabled()
+                assert database(APITestCase.objects.count) == 0
+                page.screenshot(path=str(output / 'generation-running.png'), full_page=True)
+                fixture['generation_gate'].set()
             adopt = page.get_by_role('button', name='采用候选并替换草稿')
             expect(adopt).to_be_visible(timeout=15000)
+            verification = page.get_by_test_id('api-generation-verification')
+            expect(verification).to_contain_text('已验证通过')
+            generated = database(APIWorkspace.objects.get)
+            assert generated.generation['status'] == 'passed', generated.generation
+            assert len(generated.generation['rounds']) == 2, generated.generation
+            first_result = generated.generation['rounds'][0]['result']
+            first_response = first_result['step_datas'][0]['data']['req_resps'][0]['response']
+            assert first_response['status_code'] == 200 and first_response['body'] == {'state': 'ok'}
+            assert first_result['success'] is False
+            assert generated.draft['teststeps'] == [], '试运行不能直接覆盖编辑草稿'
+            page.screenshot(path=str(output / 'generation-verified.png'), full_page=True)
             assert database(APITestCase.objects.count) == 0, '生成不应自动保存正式用例'
             adopt.click()
             page.get_by_role('button', name='采用', exact=True).click()
@@ -123,32 +167,37 @@ def verify(origin, fixture, output):
                 page.get_by_role('button', name='导出 .py', exact=True).click()
             exported = Path(download.value.path()).read_text(encoding='utf-8')
             compile(exported, '<browser-export>', 'exec')
-            page.get_by_role('button', name='显式调试执行', exact=True).click()
-            page.get_by_role('button', name='确认执行', exact=True).click()
-            repair = page.get_by_role('button', name='基于失败结果修复', exact=True)
-            expect(repair).to_be_enabled(timeout=15000)
-            expect(page.locator('.debug-panel')).to_contain_text('500')
-            page.screenshot(path=str(output / 'failed-debug.png'), full_page=True)
-            repair.click()
+            expect(page.locator('pre.code')).to_contain_text('body.state')
+            assert database(APIWorkspace.objects.get).debug_result['success'] is True
+            execute_debug(page)
+            expect(page.locator('.debug-panel').last).to_contain_text('200', timeout=15000)
+
+            # The explicit repair action must use current manual-debug evidence,
+            # even when the last generation itself passed and was adopted.
+            fixture['http_status'] = 503
+            execute_debug(page)
+            expect(page.locator('.debug-panel').last).to_contain_text('503', timeout=15000)
+            expect(page.get_by_role('button', name='修复并验证', exact=True)).to_be_enabled()
+            fixture['http_status'] = 200
+            page.get_by_role('button', name='修复并验证', exact=True).click()
+            confirm_generation(page)
             expect(adopt).to_be_visible(timeout=15000)
-            assert database(lambda: APIWorkspace.objects.get().debug_result.get('success')) is False
+            expect(verification).to_contain_text('已验证通过')
+            assert fixture['model_prompts'][-1]['failure_evidence']['success'] is False
+            assert fixture['model_prompts'][-1]['failure_evidence']['step_datas'][0]['data']['req_resps'][0]['response']['status_code'] == 503
+            page.screenshot(path=str(output / 'manual-repair-verified.png'), full_page=True)
             adopt.click()
             page.get_by_role('button', name='采用', exact=True).click()
-            expect(page.locator('pre.code')).to_have_count(0)
-            page.get_by_role('button', name='查看代码', exact=True).click()
-            expect(page.locator('pre.code')).to_contain_text('X-Repaired')
-            page.get_by_role('button', name='显式调试执行', exact=True).click()
-            page.get_by_role('button', name='确认执行', exact=True).click()
-            expect(page.locator('.debug-panel')).to_contain_text('200', timeout=15000)
+            expect(page.get_by_text('AI 候选草稿（尚未采用）', exact=True)).to_have_count(0)
             page.get_by_role('button', name='保存为测试用例', exact=True).click()
             page.get_by_role('button', name='确认保存', exact=True).click()
             expect(page.get_by_text('测试用例已保存', exact=True)).to_be_visible(timeout=15000)
             assert database(APITestCase.objects.count) == 1
             saved = database(APITestCase.objects.get)
-            assert json.loads(saved.script_content)['teststeps'][0]['request']['headers']['X-Repaired'] == 'true'
+            assert json.loads(saved.script_content)['teststeps'][0]['extract']['health'] == 'body.state'
             page.reload()
             expect(page.get_by_text('生成健康检查，验证 HTTP 状态码为 200', exact=True)).to_be_visible(timeout=15000)
-            expect(page.locator('.debug-panel')).to_contain_text('200')
+            expect(page.locator('.debug-panel').last).to_contain_text('200')
             page.screenshot(path=str(output / 'workspace-ready.png'), full_page=True)
             execution_response = page.request.post(
                 origin + f'/api/v1/projects/{fixture["project_id"]}/api-testing/test-cases/{saved.pk}/execute/',
@@ -167,7 +216,7 @@ def verify(origin, fixture, output):
             page.goto(workspace_url)
             expect(page.get_by_text('此工作区原先选择的模型已禁用、类型不匹配或不再可用；请重新选择可用聊天模型后再发起 AI 对话。', exact=True)).to_be_visible(timeout=15000)
             page.get_by_placeholder('例如：先登录取得 token，再查询当前用户；需要覆盖未授权场景。').fill('模型禁用后不能偷偷改用其他模型')
-            expect(page.get_by_role('button', name='生成候选', exact=True)).to_be_disabled()
+            expect(page.get_by_role('button', name='生成并验证', exact=True)).to_be_disabled()
             page.screenshot(path=str(output / 'disabled-model.png'), full_page=True)
             page.goto(origin + '/api-testing/function-navigation')
             expect(page.get_by_role('heading', name='API 对话工作区')).to_be_visible(timeout=15000)
@@ -188,32 +237,48 @@ def main():
         socket.socket, 'connect', loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, 'connect_ex', loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(temp))
-        from api_testing.workspace_tasks import generate_api_workspace_candidate, debug_api_workspace
+        # Only the full-flow verifier holds the first model call so it can
+        # inspect real persisted running progress. Other regression scripts
+        # that reuse this harness run without an artificial gate.
+        fixture['generation_gate'] = threading.Event() if verify.__module__ == __name__ else None
+        from api_testing.workspace_tasks import generate_and_verify_api_workspace, debug_api_workspace
         from api_testing.requests_runtime import run_case
         from requests import Response, Request
         from django.core.wsgi import get_wsgi_application
 
-        def model_answer(messages):
-            payload = json.loads(messages[-1].content)
+        def model_answer(messages, callback=None, **kwargs):
+            gate = fixture.get('generation_gate')
+            if gate is not None and not gate.wait(timeout=25):
+                raise RuntimeError('Browser test did not release the isolated model gate')
+            payload = next(json.loads(item.content) for item in messages if item.content.lstrip().startswith('{'))
+            fixture.setdefault('model_prompts', []).append(payload)
             if payload['failure_evidence']:
                 draft = deepcopy(payload['current_draft'])
-                draft['teststeps'][0]['request']['headers'] = {'X-Repaired': 'true'}
+                draft['teststeps'][0]['extract'] = {'health': 'body.state'}
             else:
                 draft = {'version': 1, 'config': {'name': '健康检查', 'base_url': 'https://example.test', 'variables': {}, 'verify': True},
                          'teststeps': [{'name': '健康检查', 'endpoint_id': fixture['endpoint_id'],
                                         'request': {'method': 'GET', 'url': '/health', 'headers': {}},
+                                        'extract': {'health': 'body.result.state'},
                                         'validate': [{'eq': ['status_code', 200]}]}]}
-            return json.dumps(draft)
+            answer = json.dumps(draft)
+            if callback:
+                callback(answer)
+            return answer
 
         def fake_http(**kwargs):
             result = Response()
-            result.status_code = 200 if kwargs.get('headers', {}).get('X-Repaired') == 'true' else 500
+            assert kwargs['url'] == 'https://example.test/health', 'Unexpected request in fake test service'
+            result.status_code = fixture.get('http_status', 200)
             result._content = json.dumps({'state': 'ok' if result.status_code == 200 else 'error'}).encode()
             result.url, result.headers, result.elapsed = kwargs['url'], {'Content-Type': 'application/json'}, timedelta(milliseconds=5)
             result.request = Request(kwargs['method'], kwargs['url'], headers=kwargs.get('headers')).prepare()
             return result
 
         def local_runner(**kwargs):
+            remaining = kwargs.pop('hard_timeout_seconds', None)
+            if remaining is not None:
+                kwargs['options'] = {**(kwargs.get('options') or {}), 'total_timeout': min(600, remaining)}
             fake_session = SimpleNamespace(request=fake_http, close=lambda: None)
             with patch('api_testing.requests_runtime.requests.Session', return_value=fake_session):
                 return run_case(**kwargs)
@@ -223,9 +288,23 @@ def main():
                 return task.apply(args=args, task_id=task_id)
             return dispatch
 
+        workers = []
+
+        def background_generation(args, task_id, **kwargs):
+            def run():
+                from django.db import connections
+                try:
+                    generate_and_verify_api_workspace.apply(args=args, task_id=task_id)
+                finally:
+                    connections.close_all()
+            worker = threading.Thread(target=run, daemon=True)
+            workers.append(worker)
+            worker.start()
+            return SimpleNamespace(id=task_id)
+
         with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace(stream_invoke=model_answer)), patch(
             'api_testing.requests_runner.requests_runner', side_effect=local_runner,
-        ), patch.object(generate_api_workspace_candidate, 'apply_async', side_effect=eager(generate_api_workspace_candidate)), patch.object(
+        ), patch.object(generate_and_verify_api_workspace, 'apply_async', side_effect=background_generation), patch.object(
             debug_api_workspace, 'apply_async', side_effect=eager(debug_api_workspace),
         ), patch('api_testing.execution_service.requests_runner', side_effect=local_runner):
             server = make_server('127.0.0.1', 0, _static_or_django(get_wsgi_application()), handler_class=_QuietHandler)
@@ -234,6 +313,11 @@ def main():
             try:
                 verify(f'http://127.0.0.1:{server.server_port}', fixture, output)
             finally:
+                if fixture.get('generation_gate') is not None:
+                    fixture['generation_gate'].set()
+                for worker in workers:
+                    worker.join(timeout=5)
+                    assert not worker.is_alive(), 'An isolated generation worker failed to finish'
                 server.shutdown()
                 thread.join(timeout=5)
                 server.server_close()

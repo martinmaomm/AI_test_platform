@@ -633,6 +633,113 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(prompts[1]['current_scenario']['target_endpoint_ids'], [info.id])
         runner.assert_called_once()
 
+    def mixed_authentication_child(self):
+        from .workspace_tasks import _parse_plan, _scenario_children
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, status=APISpecification.TaskStatus.COMPLETED,
+            metadata={'security': [{'bearer': []}], 'components': {'securitySchemes': {
+                'bearer': {'type': 'http', 'scheme': 'bearer'},
+            }}},
+        )
+        # Deliberately inherit global security, including the credential issuer;
+        # neither URL matching nor a document override can make this test pass.
+        endpoints = [APIEndpoint.objects.create(spec=spec, method=method, path=path) for method, path in (
+            ('POST', '/flow/start'), ('GET', '/flow/current'), ('POST', '/flow/end'),
+        )]
+        ids = [endpoint.id for endpoint in endpoints]
+        root = self.workspace(
+            model_id=self.model.id, spec=spec, endpoint_ids=ids,
+            status='generating', task_id='mixed-auth-root',
+        )
+        plan = _parse_plan({'scenarios': [{
+            'title': 'Credential lifecycle', 'endpoint_ids': ids,
+            'authenticated_endpoint_ids': ids[1:], 'requires_authenticated_context': True,
+        }]}, endpoint_ids=set(ids))
+        _scenario_children(root_id=root.id, revision=0, task_id=root.task_id, plan=plan, snapshot={
+            'target_url': 'https://example.test', 'variables': {}, 'queued_at': timezone.now().isoformat(),
+            'scope_endpoint_ids': ids, 'endpoints': endpoint_specs(self.project.id, ids, spec_id=spec.id),
+        })
+        draft = {'version': 1, 'config': {'name': 'Credential lifecycle', 'variables': {}}, 'teststeps': [
+            {'endpoint_id': endpoint.id, 'request': {'method': endpoint.method, 'url': endpoint.path},
+             'extract': {}, 'validate': [{'eq': ['status_code', 200]}]}
+            for endpoint in endpoints
+        ]}
+        draft['teststeps'][0]['extract'] = {'credential': 'body.credential'}
+        for step in draft['teststeps'][1:]:
+            step['request']['headers'] = {'Authorization': 'Bearer ${credential}'}
+        return root, root.scenarios.get(), draft
+
+    def test_mixed_authentication_targets_keep_issuer_and_enforce_only_frozen_subset(self):
+        root, child, draft = self.mixed_authentication_child()
+        manager = SimpleNamespace(stream_invoke=Mock(return_value=__import__('json').dumps(draft)))
+        passed = self.passed_result()
+        passed['step_datas'] *= 3
+        with patch('api_testing.workspace_tasks.get_llm_manager', return_value=manager), \
+             patch('api_testing.requests_runner.requests_runner', return_value=passed) as runner:
+            result = generate_and_verify_api_workspace.apply(args=(child.id, child.revision, child.task_id))
+        self.assertEqual(result.result['status'], 'passed')
+        child.refresh_from_db()
+        self.assertEqual(child.endpoint_ids, root.endpoint_ids)
+        self.assertEqual([step['endpoint_id'] for step in child.candidate['draft']['teststeps']], root.endpoint_ids)
+        for context in (child.generation['_snapshot']['scenario'], child.generation['scenario_context']):
+            self.assertEqual(context['authenticated_endpoint_ids'], root.endpoint_ids[1:])
+            self.assertEqual(context['target_endpoint_ids'], root.endpoint_ids)
+        manager.stream_invoke.assert_called_once()
+        runner.assert_called_once()
+
+    def test_automatic_repair_cannot_downgrade_frozen_authentication_subset(self):
+        root, child, draft = self.mixed_authentication_child()
+        downgrade = deepcopy(draft)
+        downgrade.update(authenticated_endpoint_ids=[], requires_authenticated_context=False)
+        for step in downgrade['teststeps'][1:]:
+            step['request']['headers'] = {}
+        manager = SimpleNamespace(stream_invoke=Mock(side_effect=[
+            __import__('json').dumps(value) for value in (draft, downgrade, downgrade)
+        ]))
+        failed = {'success': False, 'error_type': 'ExtractionFailure', 'step_datas': []}
+        with patch('api_testing.workspace_tasks.get_llm_manager', return_value=manager), \
+             patch('api_testing.requests_runner.requests_runner', return_value=failed) as runner:
+            result = generate_and_verify_api_workspace.apply(args=(child.id, child.revision, child.task_id))
+        self.assertEqual(result.result['status'], 'needs_review')
+        runner.assert_called_once()
+        self.assertEqual(manager.stream_invoke.call_count, 3)
+        for call in manager.stream_invoke.call_args_list:
+            payload = __import__('json').loads(call.args[0][1].content)
+            self.assertEqual(payload['current_scenario']['authenticated_endpoint_ids'], root.endpoint_ids[1:])
+        child.refresh_from_db()
+        self.assertEqual(child.generation['_snapshot']['scenario']['authenticated_endpoint_ids'], root.endpoint_ids[1:])
+        for attempt in child.generation['rounds'][1:]:
+            self.assertFalse(attempt['runnable'])
+            self.assertIn('security', attempt['summary'])
+
+    def test_manual_child_repair_preserves_snapshot_authentication_over_draft_or_request(self):
+        root, child, draft = self.mixed_authentication_child()
+        root.status = 'ready'
+        root.save(update_fields=['status', 'updated_at'])
+        # Editable draft metadata and request fields are not authentication authority.
+        draft.update(authenticated_endpoint_ids=[], requires_authenticated_context=False)
+        child.draft = draft
+        child.status = 'ready'
+        child.generation['status'] = 'needs_review'
+        child.debug_revision = child.revision
+        child.debug_result = {'success': False, 'error_type': 'ExtractionFailure', 'step_datas': []}
+        child.save()
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {
+                    'revision': child.revision, 'mode': 'repair', 'message': 'Fix extraction only',
+                    'execution_confirmed': True, 'base_url': 'https://example.test', 'variables': {},
+                    'authenticated_endpoint_ids': [], 'requires_authenticated_context': False,
+                }), project_id=self.project.id, workspace_id=child.id,
+            )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        queued.assert_called_once()
+        child.refresh_from_db()
+        for context in (child.generation['_snapshot']['scenario'], child.generation['scenario_context']):
+            self.assertEqual(context['authenticated_endpoint_ids'], root.endpoint_ids[1:])
+            self.assertEqual(context['target_endpoint_ids'], root.endpoint_ids)
+            self.assertTrue(context['requires_authenticated_context'])
+
     def test_candidate_data_without_content_type_is_rejected_when_spec_only_accepts_json(self):
         endpoint = self.endpoint()
         endpoint.request_body = {'content': {'application/json': {'schema': {'type': 'object'}}}}
@@ -741,7 +848,7 @@ class APIWorkspaceTests(TestCase):
         root = self.workspace(model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id])
         invalid_plan = {'summary': '坏计划', 'scenarios': []}
         valid_plan = {'summary': '修正后的计划', 'scenarios': [
-            {'title': '读取项目', 'description': '正向读取', 'endpoint_ids': [endpoint.id]},
+            {'title': '读取项目', 'description': '正向读取', 'endpoint_ids': [endpoint.id], 'requires_authenticated_context': False},
         ]}
         candidate = {
             'version': 1, 'config': {'name': '读取项目', 'variables': {}},
@@ -777,7 +884,7 @@ class APIWorkspaceTests(TestCase):
             **valid_plan,
             'scenarios': [{
                 **valid_plan['scenarios'][0], 'dependency_endpoint_ids': [],
-                'dependency_evidence': '', 'requires_authenticated_context': False,
+                'dependency_evidence': '', 'requires_authenticated_context': False, 'authenticated_endpoint_ids': [],
             }],
         })
         self.assertEqual(prompts[0]['stage'], 'plan')
@@ -995,7 +1102,8 @@ class APIWorkspaceTests(TestCase):
                 'rounds': [{'draft_hash': candidate_hash, 'draft': draft, 'result': failed_result}],
                 '_snapshot': {
                     'model_id': self.model.id, 'historical': True, 'scope_endpoint_ids': [endpoint.id],
-                    'scenario': {'target_endpoint_ids': [endpoint.id], 'available_endpoint_ids': [endpoint.id]},
+                    'scenario': {'target_endpoint_ids': [endpoint.id], 'available_endpoint_ids': [endpoint.id],
+                                 'requires_authenticated_context': False},
                 }},
             debug_result=failed_result, debug_revision=0,
         )
@@ -1026,6 +1134,7 @@ class APIWorkspaceTests(TestCase):
             'title': '改模型后的标题', 'description': '保留登录要求', 'endpoint_ids': [endpoint.id],
             'target_endpoint_ids': [endpoint.id], 'available_endpoint_ids': [endpoint.id],
             'dependency_endpoint_ids': [], 'dependency_evidence': '', 'requires_authenticated_context': False,
+            'authenticated_endpoint_ids': [],
         })
         self.assertEqual(snapshot['messages'], [{'role': 'user', 'content': '使用固定账号并验证失败原因'},
             {'role': 'user', 'content': '仅修复失败原因', 'mode': 'repair'}])

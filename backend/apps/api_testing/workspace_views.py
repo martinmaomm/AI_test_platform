@@ -25,7 +25,7 @@ from .workspace_service import (
     generation_endpoint_specs, infer_spec_id, validate_spec_id,
     normalize_draft, require_executable_draft, require_generation_model_id, validate_model_id,
     owned_workspace, require_revision, serialize_workspace, update_workspace_draft,
-    workspace_is_busy,
+    workspace_is_busy, scenario_authenticated_endpoint_ids,
 )
 from .workspace_tasks import debug_api_workspace, generate_and_verify_api_workspace
 from .workspace_verification import require_target_url
@@ -98,6 +98,7 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
             raise WorkspaceValidationError('子场景没有冻结业务目标，不能生成或修复。')
         if {item['id'] for item in endpoints} != set(frozen_scope):
             raise WorkspaceValidationError('子场景依赖范围与冻结快照不一致，不能继续执行。')
+        authenticated_ids = scenario_authenticated_endpoint_ids(previous_scenario, target_endpoint_ids=target_ids)
         snapshot.update({
             'scope_endpoint_ids': deepcopy(frozen_scope),
             'scenario': {
@@ -106,7 +107,8 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
                 'available_endpoint_ids': deepcopy(frozen_scope),
                 'dependency_endpoint_ids': deepcopy(previous_scenario.get('dependency_endpoint_ids') or []),
                 'dependency_evidence': str(previous_scenario.get('dependency_evidence') or ''),
-                'requires_authenticated_context': previous_scenario.get('requires_authenticated_context') is True,
+                'authenticated_endpoint_ids': authenticated_ids,
+                'requires_authenticated_context': bool(authenticated_ids),
             },
         })
     workspace.generation = {

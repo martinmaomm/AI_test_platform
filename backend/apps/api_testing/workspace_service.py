@@ -26,6 +26,24 @@ class WorkspaceValidationError(ValueError):
     pass
 
 
+def scenario_authenticated_endpoint_ids(scenario: dict[str, Any], *, target_endpoint_ids: list[int] | set[int]) -> list[int]:
+    """Read a frozen authentication subset, conservatively handling older plans."""
+    legacy_required = scenario.get('requires_authenticated_context', True)
+    if not isinstance(legacy_required, bool):
+        raise WorkspaceValidationError('requires_authenticated_context 必须是布尔值。')
+    if 'authenticated_endpoint_ids' not in scenario:
+        # Only an explicit legacy false declares an unauthenticated scenario.
+        return list(dict.fromkeys(target_endpoint_ids)) if legacy_required else []
+    ids = scenario['authenticated_endpoint_ids']
+    if not isinstance(ids, list) or any(not isinstance(item, int) or isinstance(item, bool) for item in ids):
+        raise WorkspaceValidationError('authenticated_endpoint_ids 必须是整数数组。')
+    if not set(ids).issubset(target_endpoint_ids):
+        raise WorkspaceValidationError('authenticated_endpoint_ids 必须是本场景业务目标端点的子集。')
+    if 'requires_authenticated_context' in scenario and legacy_required != bool(ids):
+        raise WorkspaceValidationError('requires_authenticated_context 必须与 authenticated_endpoint_ids 是否非空一致。')
+    return list(dict.fromkeys(ids))
+
+
 def can_edit_project(project: Project, user) -> bool:
     return (
         project.created_by_id == user.id

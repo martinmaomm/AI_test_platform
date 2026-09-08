@@ -30,3 +30,28 @@ export const normalizeDebugSteps = (result) =>
         step?.validate,
     };
   });
+
+const failed = (value) =>
+  ["failed", "failure", "error"].includes(
+    String(value?.status || "").toLowerCase(),
+  );
+
+const failedAssertions = (assertions) => {
+  const records = Array.isArray(assertions?.validate_extractor)
+    ? assertions.validate_extractor
+    : Array.isArray(assertions)
+      ? assertions
+      : [];
+  return records.filter(
+    (record) => record?.passed === false || record?.check_result === "fail",
+  );
+};
+
+export const failureEvidence = (result) =>
+  normalizeDebugSteps(result)
+    .filter((step) => failed(step) || step?.error || failedAssertions(step?.assertions).length)
+    .map((step, index) => ({
+      name: step.name || `步骤 ${index + 1}`,
+      error: step.error || "",
+      assertions: failedAssertions(step.assertions),
+    }));

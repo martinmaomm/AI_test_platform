@@ -49,15 +49,19 @@ def _canonical(value: Any) -> str:
 
 
 def step_assertions(draft: dict[str, Any]) -> dict[str, set[str]]:
-    """Attach assertions to their original ordered request identity."""
+    """Attach assertions to endpoint occurrence without pinning path-variable values."""
     values: dict[str, set[str]] = {}
-    for index, step in enumerate(draft.get('teststeps', [])):
+    occurrences: dict[str, int] = {}
+    for step in draft.get('teststeps', []):
         request = step.get('request') if isinstance(step, dict) else {}
         request = request if isinstance(request, dict) else {}
         endpoint_id = step.get('endpoint_id') if isinstance(step, dict) else None
         method = str(request.get('method', '')).upper()
-        identity = (f'step:{index}:endpoint:{endpoint_id}:method:{method}' if isinstance(endpoint_id, int)
-                    else f"step:{index}:request:{method}:{request.get('url', '')}")
+        identity_base = (f'endpoint:{endpoint_id}:method:{method}' if isinstance(endpoint_id, int)
+                         else f"request:{method}:url:{request.get('url', '')}")
+        occurrence = occurrences.get(identity_base, 0)
+        occurrences[identity_base] = occurrence + 1
+        identity = f'{identity_base}:occurrence:{occurrence}'
         values[identity] = {_canonical(item) for item in (step.get('validate') or []) if isinstance(item, (dict, list))}
     return values
 
@@ -88,6 +92,10 @@ def protected_expected_values(draft: dict[str, Any], variables_override: dict[st
 def assertions_preserved(baseline: dict[str, set[str]], protected: dict[str, dict[str, str]], candidate: dict[str, Any]) -> bool:
     candidate_assertions = step_assertions(candidate)
     if any(not required.issubset(candidate_assertions.get(identity, set())) for identity, required in baseline.items()):
+        return False
+    candidate_order = {identity: index for index, identity in enumerate(candidate_assertions)}
+    baseline_order = [candidate_order[identity] for identity in baseline if identity in candidate_order]
+    if baseline_order != sorted(baseline_order):
         return False
     candidate_variables = candidate.get('config', {}).get('variables', {})
     if not isinstance(candidate_variables, dict):
@@ -210,9 +218,68 @@ def _require_endpoint_input(step: dict[str, Any], endpoint: dict[str, Any], vari
     _require_variables(request, variables, allowed=allowed, label=f'候选步骤 {index + 1}')
 
 
+def _security_parameter(scheme: dict[str, Any]) -> tuple[str, str] | None:
+    """Return a request location/name only when OpenAPI defines it unambiguously."""
+    scheme_type = str(scheme.get('type') or '').lower()
+    if scheme_type == 'apikey':
+        location, name = scheme.get('in'), scheme.get('name')
+        if location in {'header', 'query', 'cookie'} and isinstance(name, str) and name:
+            return str(location), name
+    # HTTP bearer/basic, Swagger basic and OAuth flows all use Authorization.
+    if scheme_type in {'http', 'basic', 'oauth2', 'openidconnect'}:
+        return 'header', 'Authorization'
+    return None
+
+
+def _request_has_security_parameter(request: dict[str, Any], location: str, name: str, *, session_cookie_available: bool) -> bool:
+    if location == 'header':
+        return any(str(key).lower() == name.lower() and value is not None and value != '' for key, value in request.get('headers', {}).items())
+    if location == 'query':
+        return name in request.get('params', {}) and request['params'][name] is not None and request['params'][name] != ''
+    if location == 'cookie':
+        cookie = next((str(value) for key, value in request.get('headers', {}).items() if str(key).lower() == 'cookie'), '')
+        return session_cookie_available or any(part.strip().startswith(f'{name}=') for part in cookie.split(';'))
+    return False
+
+
+def _require_endpoint_security(request: dict[str, Any], endpoint: dict[str, Any], *, index: int,
+                               session_cookie_available: bool) -> None:
+    """Reject removal of a credential only when the selected OpenAPI scope proves it is required."""
+    context = endpoint.get('document_context') if isinstance(endpoint.get('document_context'), dict) else {}
+    requirements = context.get('security')
+    schemes = context.get('security_schemes') if isinstance(context.get('security_schemes'), dict) else {}
+    if not isinstance(requirements, list) or not requirements:
+        return
+    alternatives: list[list[tuple[str, str]]] = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict) or not requirement:
+            # An empty security requirement is an explicitly unauthenticated
+            # alternative, so the document cannot prove a credential is needed.
+            return
+        fields: list[tuple[str, str]] = []
+        for scheme_name in requirement:
+            scheme = schemes.get(scheme_name)
+            field = _security_parameter(scheme) if isinstance(scheme, dict) else None
+            if field is None:
+                # Missing or non-representable scheme data must remain a model
+                # review concern, not a guessed hard-coded authentication rule.
+                return
+            fields.append(field)
+        if fields:
+            alternatives.append(fields)
+    if alternatives and not any(
+        all(_request_has_security_parameter(request, location, name, session_cookie_available=session_cookie_available) for location, name in fields)
+        for fields in alternatives
+    ):
+        raise WorkspaceValidationError(f'候选步骤 {index + 1} 缺少 OpenAPI security 要求的鉴权参数。')
+
+
 def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url: str,
                       variables: dict[str, Any], baseline: dict[str, set[str]] | None = None,
-                      protected: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
+                      protected: dict[str, dict[str, str]] | None = None,
+                      required_endpoint_ids: set[int] | None = None,
+                      authenticated_target_ids: set[int] | None = None,
+                      cookie_session_dependency_ids: set[int] | None = None) -> dict[str, Any]:
     draft = normalize_draft(value)
     selected = {item['id']: item for item in endpoints}
     if not draft['teststeps']:
@@ -221,6 +288,7 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
     scoped_values = _static_variable_values(merged_variables)
     config_headers = draft['config'].get('headers') if isinstance(draft['config'].get('headers'), dict) else {}
     available = set(merged_variables) | {'timestamp_ns', 'uuid4'}
+    completed_dependency_ids: set[int] = set()
     for index, step in enumerate(draft['teststeps']):
         request = step['request']
         endpoint = selected.get(step.get('endpoint_id'))
@@ -244,13 +312,29 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
             label=f'候选步骤 {index + 1} 的有效 headers（依赖登录变量请移到登录后的步骤）',
         )
         _require_endpoint_input(effective_step, endpoint, scoped_values, allowed=available, index=index)
+        # A global OpenAPI security declaration cannot tell us whether this is
+        # an intentionally unauthenticated negative case (or an endpoint whose
+        # document forgot a security override).  Enforce it only for business
+        # targets the scenario plan explicitly marked as authenticated.
+        if step.get('endpoint_id') in (authenticated_target_ids or set()):
+            _require_endpoint_security(
+                effective_step['request'], endpoint, index=index,
+                session_cookie_available=bool(completed_dependency_ids.intersection(cookie_session_dependency_ids or set())),
+            )
         for extracted_name in step['extract']:
             scoped_values.pop(extracted_name, None)
         _require_variables(step['validate'], scoped_values, allowed=available | set(step['extract']), label=f'候选步骤 {index + 1} 断言')
         request['allow_redirects'] = False
         available.update(step['extract'])
+        if isinstance(step.get('endpoint_id'), int):
+            completed_dependency_ids.add(step['endpoint_id'])
     draft['config']['base_url'] = target_url
     draft['config']['variables'] = merged_variables
+    if required_endpoint_ids:
+        actual_ids = {step.get('endpoint_id') for step in draft['teststeps'] if isinstance(step.get('endpoint_id'), int)}
+        missing = sorted(required_endpoint_ids - actual_ids)
+        if missing:
+            raise WorkspaceValidationError(f'候选草稿没有保留本场景业务目标端点：{missing}。')
     if baseline is not None and not assertions_preserved(baseline, protected or {}, draft):
         raise WorkspaceValidationError('修复候选删除、弱化、迁移了原步骤或断言，或改写了断言引用的预期变量。')
     return draft

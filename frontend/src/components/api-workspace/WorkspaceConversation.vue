@@ -46,6 +46,7 @@
       >
     </div>
     <el-input
+      ref="messageInput"
       v-model="message"
       type="textarea"
       :rows="3"
@@ -109,7 +110,7 @@
 </template>
 
 <script setup>
-import { ref } from "vue";
+import { nextTick, ref } from "vue";
 import { shouldClearSubmittedMessage } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
@@ -134,6 +135,7 @@ const props = defineProps({
 });
 const emit = defineEmits(["adopt"]);
 const message = ref("");
+const messageInput = ref(null);
 const mode = ref("generate");
 const submitting = ref(false);
 const send = async (nextMode) => {
@@ -165,7 +167,13 @@ const send = async (nextMode) => {
 const clearSubmittedMessage = (submittedMessage) => {
   if (message.value === submittedMessage) message.value = "";
 };
-defineExpose({ clearSubmittedMessage });
+const focusInput = async () => {
+  await nextTick();
+  const input = messageInput.value?.textarea || messageInput.value?.$el?.querySelector("textarea");
+  input?.focus();
+  return Boolean(input);
+};
+defineExpose({ clearSubmittedMessage, focusInput });
 </script>
 
 <style scoped>

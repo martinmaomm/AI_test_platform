@@ -57,6 +57,28 @@
         </details>
         <p v-if="step.error" class="error">{{ step.error }}</p>
       </div>
+      <section
+        v-if="failureItems.length"
+        class="failure-evidence"
+        data-testid="api-debug-failure-evidence"
+      >
+        <strong>失败证据摘要</strong>
+        <div
+          v-for="(item, index) in failureItems"
+          :key="`${item.name}-${index}`"
+          class="failure-item"
+          data-testid="api-debug-failed-step"
+        >
+          <p>失败步骤：{{ item.name }}</p>
+          <p v-if="item.error" class="error">{{ item.error }}</p>
+          <ul v-if="item.assertions.length">
+            <li v-for="(assertion, assertionIndex) in item.assertions" :key="assertionIndex">
+              <span>断言 {{ assertion.check || "未命名" }}（{{ assertion.comparator || "比较" }}）</span>
+              <pre v-text="pretty({ 预期: assertion.expect_value ?? assertion.expect, 实际: assertion.check_value })" />
+            </li>
+          </ul>
+        </div>
+      </section>
       <details v-if="result.log" class="execution-log">
         <summary>执行日志</summary>
         <pre v-text="pretty(result.log)" />
@@ -75,7 +97,7 @@
 
 <script setup>
 import { computed } from "vue";
-import { normalizeDebugSteps } from "./debugResult";
+import { failureEvidence, normalizeDebugSteps } from "./debugResult";
 const props = defineProps({
   result: { type: Object, default: null },
   stale: Boolean,
@@ -84,6 +106,7 @@ const hasResult = computed(() =>
   Boolean(props.result && Object.keys(props.result).length),
 );
 const steps = computed(() => normalizeDebugSteps(props.result));
+const failureItems = computed(() => failureEvidence(props.result));
 const extractionResults = computed(
   () => props.result?.extraction_results || props.result?.result?.extraction_results,
 );
@@ -152,5 +175,23 @@ const resultType = computed(() =>
 }
 .error {
   color: var(--el-color-danger);
+}
+.failure-evidence {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--el-color-danger-light-9);
+}
+.failure-item p,
+.failure-item ul {
+  margin: 4px 0;
+}
+.failure-item pre {
+  max-height: 160px;
+  margin: 4px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
 }
 </style>

@@ -1,6 +1,6 @@
 <template>
   <el-card
-    v-if="generation?.status"
+    v-if="generation?.status || failureActions.visible"
     data-testid="api-generation-verification"
     shadow="never"
     class="verification-panel"
@@ -21,16 +21,16 @@
     <el-descriptions :column="2" size="small" border>
       <el-descriptions-item label="当前阶段">{{ phase }}</el-descriptions-item>
       <el-descriptions-item label="验证轮次"
-        >第 {{ generation.attempt || 0 }} / {{ generation.max_attempts || 3 }} 轮</el-descriptions-item
+        >第 {{ generationState.attempt || 0 }} / {{ generationState.max_attempts || 3 }} 轮</el-descriptions-item
       >
       <el-descriptions-item label="验证目标" :span="2"
-        >{{ generation.target_url || "尚未开始请求验证" }}</el-descriptions-item
+        >{{ generationState.target_url || "尚未开始请求验证" }}</el-descriptions-item
       >
       <el-descriptions-item label="接口范围" :span="2"
         >{{ endpointScope || "未记录接口范围" }}</el-descriptions-item
       >
     </el-descriptions>
-    <p v-if="generation.summary" class="summary">{{ generation.summary }}</p>
+    <p v-if="generationState.summary" class="summary">{{ generationState.summary }}</p>
     <section class="scenario-summary">
       <strong>场景与步骤概要</strong>
       <p>{{ scenario.name }}</p>
@@ -48,11 +48,74 @@
       </ol>
       <p v-else>候选尚未产出可展示的步骤。</p>
     </section>
-    <el-collapse v-if="rounds.length" class="rounds">
+    <section
+      v-if="failureActions.visible"
+      class="failure-actions"
+      data-testid="api-scenario-failure-actions"
+    >
+      <strong>当前场景需要人工处理</strong>
+      <div class="failure-action-buttons">
+        <el-button
+          :disabled="failureActions.view.disabled"
+          :title="failureActions.view.reason || '展开失败验证轮次'"
+          @click="$emit('view-failure')"
+        >查看失败原因</el-button>
+        <el-button
+          type="primary"
+          plain
+          :disabled="failureActions.repair.disabled"
+          :title="failureActions.repair.reason || '聚焦修复补充说明，不会发起请求'"
+          @click="$emit('repair')"
+        >AI 修复</el-button>
+        <el-button
+          type="warning"
+          plain
+          :disabled="failureActions.manual.disabled"
+          :title="failureActions.manual.reason || failureActions.manual.note"
+          @click="$emit('manual-edit')"
+        >手动编辑</el-button>
+      </div>
+      <el-alert
+        v-if="failureActionReasons.length"
+        :title="failureActionReasons.join('；')"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+      <section
+        v-if="failureSummary.hasContent"
+        class="failure-summary"
+        data-testid="api-scenario-failure-summary"
+      >
+        <p v-if="failureSummary.message">最近失败原因：{{ failureSummary.message }}</p>
+        <div
+          v-for="(item, index) in failureSummary.steps"
+          :key="`${item.name}-${index}`"
+          class="failure-summary-step"
+          data-testid="api-scenario-failure-step"
+        >
+          <p>失败步骤：{{ item.name }}</p>
+          <p v-if="item.error">{{ item.error }}</p>
+          <ul v-if="item.assertions.length">
+            <li
+              v-for="(assertion, assertionIndex) in item.assertions"
+              :key="assertionIndex"
+              data-testid="api-scenario-failure-assertion"
+            >
+              断言 {{ assertion.check || "未命名" }}（{{ assertion.comparator || "比较" }}）：
+              实际 <span v-text="displayValue(assertion.check_value)" />；
+              预期 <span v-text="displayValue(assertion.expect_value ?? assertion.expect)" />
+            </li>
+          </ul>
+        </div>
+      </section>
+      <p class="manual-note">{{ failureActions.manual.note }}</p>
+    </section>
+    <el-collapse v-if="rounds.length" v-model="expandedRounds" class="rounds">
       <el-collapse-item
         v-for="round in rounds"
         :key="round.attempt || round.started_at || round.summary"
-        :name="String(round.attempt || round.started_at)"
+        :name="roundName(round)"
       >
         <template #title>
           <div class="round-title">
@@ -85,7 +148,7 @@
 </template>
 
 <script setup>
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import DebugResultPanel from "./DebugResultPanel.vue";
 import {
   generationPhaseLabel,
@@ -93,7 +156,10 @@ import {
   generationDraftSummary,
   isGenerationStale,
   latestGenerationDraft,
+  debugHasFailure,
+  hasReviewableGenerationRound,
 } from "@/views/api-testing/apiWorkspace";
+import { failureEvidence } from "./debugResult";
 
 const props = defineProps({
   generation: { type: Object, default: null },
@@ -101,7 +167,20 @@ const props = defineProps({
   workspaceRevision: { type: Number, default: null },
   dirty: Boolean,
   endpointScope: String,
+  currentDebugResult: { type: Object, default: null },
+  failureActions: {
+    type: Object,
+    default: () => ({
+      visible: false,
+      view: { disabled: true, reason: "" },
+      repair: { disabled: true, reason: "" },
+      manual: { disabled: true, reason: "", note: "" },
+    }),
+  },
 });
+defineEmits(["view-failure", "repair", "manual-edit"]);
+const expandedRounds = ref([]);
+const generationState = computed(() => props.generation || {});
 const rounds = computed(() =>
   Array.isArray(props.generation?.rounds) ? props.generation.rounds : [],
 );
@@ -124,7 +203,50 @@ const hasCandidateDraft = computed(
 );
 const scenario = computed(() => generationDraftSummary(latestDraft.value));
 const roundStatus = (value) => generationStatusMeta(value);
+const roundName = (round) => String(round.attempt || round.started_at || round.summary);
+const failedRoundNames = computed(() =>
+  rounds.value.filter(hasReviewableGenerationRound).map(roundName),
+);
+const latestReviewableRound = computed(() =>
+  [...rounds.value].reverse().find(hasReviewableGenerationRound) || null,
+);
+const failureSummary = computed(() => {
+  const round = latestReviewableRound.value;
+  const result = round?.result || props.currentDebugResult;
+  const steps = failureEvidence(result);
+  const staticErrors = Array.isArray(round?.static_errors)
+    ? round.static_errors.filter(Boolean)
+    : [];
+  const message =
+    round?.error ||
+    result?.error ||
+    round?.summary ||
+    props.generation?.summary ||
+    staticErrors.join("；") ||
+    (result?.error_type ? `执行失败：${result.error_type}` : "");
+  return { steps, message, hasContent: Boolean(message || steps.length) };
+});
+const failureActionReasons = computed(() =>
+  [
+    props.failureActions.view?.reason,
+    props.failureActions.repair?.reason,
+    props.failureActions.manual?.reason,
+  ].filter((reason, index, values) => reason && values.indexOf(reason) === index),
+);
+const showFailureEvidence = () => {
+  expandedRounds.value = [...failedRoundNames.value];
+  return expandedRounds.value.length > 0;
+};
+defineExpose({ showFailureEvidence });
 const pretty = (value) => JSON.stringify(value, null, 2);
+const displayValue = (value) => {
+  if (value === undefined) return "未记录";
+  try {
+    return typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
 const timeLabel = (value, label) =>
   value ? `${label}：${new Date(value).toLocaleString()} ` : "";
 const finalMessage = computed(() => {
@@ -148,7 +270,8 @@ const finalMessage = computed(() => {
 <style scoped>
 .verification-panel,
 .scenario-summary,
-.rounds {
+.rounds,
+.failure-actions {
   display: grid;
   gap: 10px;
 }
@@ -168,6 +291,30 @@ const finalMessage = computed(() => {
 .changes {
   margin: 0;
   padding-left: 20px;
+}
+.failure-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.failure-summary {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--el-color-warning-light-9);
+}
+.failure-summary p,
+.failure-summary ul {
+  margin: 0;
+}
+.failure-summary ul {
+  padding-left: 20px;
+}
+.manual-note {
+  margin: 0;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 .candidate-json pre {
   max-height: 300px;

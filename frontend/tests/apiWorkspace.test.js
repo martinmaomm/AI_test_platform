@@ -1,16 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { normalizeDebugSteps } from "../src/components/api-workspace/debugResult.js";
+import {
+  failureEvidence,
+  normalizeDebugSteps,
+} from "../src/components/api-workspace/debugResult.js";
 import {
   availableChatModels,
   bodyKind,
   canGenerateWithModel,
   canRepairWorkspace,
   candidateDiff,
+  childEditorEndpointIds,
   completedApiSpecs,
   debugHasFailure,
   defaultDraft,
+  failureActionState,
   hasAvailableChatModel,
   generationContextMessage,
   generationDraftSummary,
@@ -122,6 +127,155 @@ test("DebugResultPanel keeps successful exports and displays per-step extraction
     access_token: { path: "$.token", status: "passed", value: "ok" },
     user_id: { path: "$.user.id", status: "failed", error: "not found" },
   });
+});
+
+test("failure evidence safely retains failed steps and assertion actual/expected values", () => {
+  const result = {
+    success: false,
+    step_datas: [
+      {
+        name: "读取订单",
+        status: "failed",
+        error: "状态码不匹配",
+        validators: {
+          validate_extractor: [
+            {
+              passed: false,
+              check: "status_code",
+              comparator: "eq",
+              expect_value: 200,
+              check_value: 503,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  assert.equal(debugHasFailure(result), true);
+  assert.deepEqual(failureEvidence(result), [
+    {
+      name: "读取订单",
+      error: "状态码不匹配",
+      assertions: [
+        {
+          passed: false,
+          check: "status_code",
+          comparator: "eq",
+          expect_value: 200,
+          check_value: 503,
+        },
+      ],
+    },
+  ]);
+});
+
+test("selected failed scenarios expose only safe, explicitly gated recovery actions", () => {
+  const generation = {
+    status: "needs_review",
+    source_revision: 4,
+    rounds: [{ result: { success: false, steps: [{ status: "failed" }] } }],
+  };
+  const candidate = { source_revision: 4, draft: { teststeps: [{ name: "候选步骤" }] } };
+  const ready = failureActionState({
+    editingScenario: true,
+    generation,
+    workspaceRevision: 4,
+    draft: { teststeps: [] },
+    candidate,
+    debugResult: { success: false },
+    debugRevision: 4,
+    modelAvailable: true,
+    canRepair: true,
+  });
+  assert.equal(ready.visible, true);
+  assert.equal(ready.view.disabled, false);
+  assert.equal(ready.repair.disabled, false);
+  assert.equal(ready.manual.disabled, false);
+  assert.equal(ready.manual.usesCandidate, true);
+
+  const staticOnly = failureActionState({
+    editingScenario: true,
+    generation: {
+      status: "failed",
+      source_revision: 4,
+      rounds: [{ status: "failed", summary: "候选 JSON 缺少请求地址" }],
+    },
+    workspaceRevision: 4,
+    draft: { teststeps: [] },
+    modelAvailable: true,
+  });
+  assert.equal(staticOnly.view.disabled, false);
+  assert.equal(staticOnly.view.hasRoundEvidence, true);
+  assert.equal(staticOnly.repair.disabled, true);
+  assert.match(staticOnly.repair.reason, /静态失败/);
+  assert.equal(staticOnly.manual.disabled, true);
+  assert.equal(staticOnly.manual.usesCandidate, false);
+  assert.match(staticOnly.manual.reason, /草稿没有步骤/);
+
+  const dirty = failureActionState({
+    editingScenario: true,
+    generation,
+    workspaceRevision: 4,
+    draft: { teststeps: [{ name: "本地步骤" }] },
+    candidate,
+    dirty: true,
+    modelAvailable: true,
+    canRepair: false,
+  });
+  assert.equal(dirty.repair.disabled, true);
+  assert.match(dirty.repair.reason, /当前草稿已修改/);
+  assert.equal(dirty.manual.disabled, false);
+  assert.equal(dirty.manual.usesCandidate, false);
+  assert.match(dirty.manual.note, /不会覆盖本地编辑/);
+
+  const dirtyEmptyDraft = failureActionState({
+    editingScenario: true,
+    generation,
+    workspaceRevision: 4,
+    draft: { teststeps: [] },
+    candidate,
+    dirty: true,
+    modelAvailable: true,
+  });
+  assert.equal(dirtyEmptyDraft.manual.disabled, true);
+  assert.match(dirtyEmptyDraft.manual.reason, /草稿没有步骤/);
+
+  const unavailable = failureActionState({
+    editingScenario: true,
+    generation,
+    workspaceRevision: 4,
+    draft: { teststeps: [] },
+    modelAvailable: false,
+  });
+  assert.equal(unavailable.repair.disabled, true);
+  assert.match(unavailable.repair.reason, /没有可用聊天模型/);
+
+  const busy = failureActionState({
+    editingScenario: true,
+    generation,
+    workspaceRevision: 4,
+    draft: { teststeps: [] },
+    busy: true,
+    modelAvailable: true,
+    canRepair: true,
+  });
+  assert.equal(busy.view.disabled, true);
+  assert.equal(busy.repair.disabled, true);
+  assert.equal(busy.manual.disabled, true);
+  assert.match(busy.repair.reason, /仍在处理/);
+  assert.equal(
+    failureActionState({ editingScenario: false, generation }).visible,
+    false,
+  );
+  assert.equal(
+    failureActionState({
+      editingScenario: true,
+      workspaceRevision: null,
+      debugRevision: null,
+      debugResult: { success: false },
+    }).visible,
+    false,
+  );
 });
 
 test("workspace only permits active LLM models and clears an unavailable saved model", () => {
@@ -391,6 +545,31 @@ test("multi-scenario helpers keep root metadata and distinguish current stale sc
   assert.equal(root.scenarios[1].draft.config.name, "本地编辑");
 });
 
+test("child editor keeps frozen dependency endpoints separate from target coverage", () => {
+  const child = {
+    endpoint_ids: [20],
+    generation: {
+      scenario_context: {
+        target_endpoint_ids: [20],
+        available_endpoint_ids: [10, 20, 30],
+        dependency_endpoint_ids: [10],
+      },
+    },
+    draft: { teststeps: [{ endpoint_id: 10 }, { endpoint_id: 40 }] },
+    candidate: { draft: { teststeps: [{ endpoint_id: 30 }, { endpoint_id: 50 }] } },
+  };
+  assert.deepEqual(childEditorEndpointIds(child), [20, 10, 30, 40, 50]);
+  assert.deepEqual(
+    childEditorEndpointIds({
+      endpoint_ids: [20],
+      draft: { teststeps: [{ endpoint_id: 10 }] },
+      candidate: { draft: { teststeps: [{ endpoint_id: 30 }] } },
+    }),
+    [20],
+    "legacy children keep the original target-only endpoint scope",
+  );
+});
+
 test("generation draft summary safely exposes malformed raw candidate structures", () => {
   const summary = generationDraftSummary({
     config: 42,
@@ -560,6 +739,17 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, />确认并开始验证</);
   assert.match(workspace, /spec_id: selectedSpecId\.value/);
   assert.match(workspace, /GenerationVerificationPanel/);
+  assert.match(workspace, /:failure-actions="failureActions"/);
+  assert.match(workspace, /@view-failure="viewFailureEvidence"/);
+  assert.match(workspace, /@repair="focusRepairConversation"/);
+  assert.match(workspace, /@manual-edit="openManualEditor"/);
+  assert.match(workspace, /const openManualEditor = async/);
+  assert.match(workspace, /const focusRepairConversation = async/);
+  assert.match(workspace, /const adoptingCandidate = ref\(false\)/);
+  assert.match(workspace, /adoptingCandidate\.value \|\|/);
+  assert.match(workspace, /adoptingCandidate\.value = true/);
+  assert.match(workspace, /contextDirty\.value/);
+  assert.match(workspace, /execution_confirmed: true/);
   assert.match(workspace, /:send-message="prepareGeneration"/);
   assert.match(workspace, /workspaceInitializationPlan/);
   assert.match(workspace, /savedCaseDescription\(workspace\.value\)/);
@@ -567,6 +757,8 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(conversation, /generationDisabled/);
   assert.match(conversation, /props\.generationDisabled/);
   assert.match(conversation, /await props\.sendMessage/);
+  assert.match(conversation, /const focusInput = async/);
+  assert.match(conversation, /defineExpose\(\{ clearSubmittedMessage, focusInput \}\)/);
   assert.match(conversation, /submitting/);
   assert.match(conversation, />生成并验证</);
   assert.match(conversation, />重新生成本场景</);
@@ -576,7 +768,16 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(debugPanel, /导出变量/);
   assert.match(debugPanel, /step\?\.status\) === "skipped"/);
   assert.match(verificationPanel, /data-testid="api-generation-verification"/);
-  assert.match(verificationPanel, /v-if="generation\?\.status"/);
+  assert.match(verificationPanel, /data-testid="api-scenario-failure-actions"/);
+  assert.match(verificationPanel, />查看失败原因</);
+  assert.match(verificationPanel, />AI 修复</);
+  assert.match(verificationPanel, />手动编辑</);
+  assert.match(verificationPanel, /defineEmits\(\["view-failure", "repair", "manual-edit"\]\)/);
+  assert.match(verificationPanel, /const showFailureEvidence =/);
+  assert.match(verificationPanel, /v-if="generation\?\.status \|\| failureActions\.visible"/);
+  assert.match(verificationPanel, /data-testid="api-scenario-failure-summary"/);
+  assert.match(verificationPanel, /实际 <span v-text="displayValue\(assertion\.check_value\)"/);
+  assert.match(verificationPanel, /预期 <span v-text="displayValue\(assertion\.expect_value \?\? assertion\.expect\)"/);
   assert.match(verificationPanel, /第 \{\{ round\.attempt/);
   assert.match(configEditor, /timestamp_ns/);
   assert.match(configEditor, /uuid4/);

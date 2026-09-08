@@ -146,6 +146,42 @@ export const activeScenario = (root, scenarioId) => {
   );
 };
 
+const endpointIdsFromDraft = (draft) =>
+  Array.isArray(draft?.teststeps)
+    ? draft.teststeps
+        .map((step) => step?.endpoint_id)
+        .filter((id) => Number.isSafeInteger(id) && id > 0)
+    : [];
+
+export const childEditorEndpointIds = (workspace) => {
+  const targetIds = Array.isArray(workspace?.endpoint_ids)
+    ? workspace.endpoint_ids
+    : [];
+  const context = workspace?.generation?.scenario_context;
+  // Older child payloads did not freeze a root dependency scope. Keep their
+  // original, target-only editor behavior rather than inventing new scope.
+  if (!context || typeof context !== "object" || Array.isArray(context))
+    return targetIds;
+  return [
+    ...new Set(
+      [
+        ...targetIds,
+        ...(Array.isArray(context.target_endpoint_ids)
+          ? context.target_endpoint_ids
+          : []),
+        ...(Array.isArray(context.available_endpoint_ids)
+          ? context.available_endpoint_ids
+          : []),
+        ...(Array.isArray(context.dependency_endpoint_ids)
+          ? context.dependency_endpoint_ids
+          : []),
+        ...endpointIdsFromDraft(workspace?.draft),
+        ...endpointIdsFromDraft(workspace?.candidate?.draft),
+      ].filter((id) => Number.isSafeInteger(id) && id > 0),
+    ),
+  ];
+};
+
 export const mergeScenario = (root, scenario) => {
   if (!root || !scenario?.id) return root;
   const scenarios = Array.isArray(root.scenarios) ? root.scenarios : [];
@@ -577,6 +613,7 @@ export const candidateDiff = (draft, candidate) => {
 
 export const debugHasFailure = (result) => {
   if (!result || typeof result !== "object") return false;
+  if (result.success === false || result.result?.success === false) return true;
   const status = String(
     result.status || result.result?.status || "",
   ).toLowerCase();
@@ -605,6 +642,15 @@ export const hasCurrentGenerationFailure = (generation, workspaceRevision) =>
     hasGeneratedSteps(round?.draft) && debugHasFailure(round?.result),
   );
 
+export const hasReviewableGenerationRound = (round) => {
+  if (!round || typeof round !== "object") return false;
+  if (debugHasFailure(round.result)) return true;
+  if (["failed", "failure", "error", "needs_review"].includes(round.status))
+    return true;
+  if (round.error || round.static_errors?.length) return true;
+  return !round.result && Boolean(round.summary);
+};
+
 export const canRepairWorkspace = ({
   dirty,
   generation,
@@ -619,6 +665,96 @@ export const canRepairWorkspace = ({
     debugHasFailure(debugResult);
   const currentGenerationFailure = hasCurrentGenerationFailure(generation, workspaceRevision);
   return currentDebugFailure || currentGenerationFailure;
+};
+
+export const failureActionState = ({
+  editingScenario,
+  generation,
+  workspaceRevision,
+  debugResult,
+  debugRevision,
+  dirty = false,
+  busy = false,
+  conflict = false,
+  candidate,
+  draft,
+  modelAvailable = false,
+  modelDirty = false,
+  canRepair = false,
+} = {}) => {
+  const status = generation?.status;
+  const hasCurrentDebugEvidence =
+    debugRevision != null &&
+    workspaceRevision != null &&
+    debugRevision === workspaceRevision &&
+    debugHasFailure(debugResult);
+  const visible = Boolean(
+    editingScenario &&
+      (["failed", "needs_review"].includes(status) || hasCurrentDebugEvidence),
+  );
+  const rounds = Array.isArray(generation?.rounds) ? generation.rounds : [];
+  const hasRoundEvidence = rounds.some(hasReviewableGenerationRound);
+  const hasEvidence = hasRoundEvidence || hasCurrentDebugEvidence;
+  const candidateCurrent =
+    candidate?.draft &&
+    candidate?.source_revision === workspaceRevision &&
+    !isGenerationStale(generation, workspaceRevision, false);
+  const hasEditableDraft =
+    Array.isArray(draft?.teststeps) && draft.teststeps.length > 0;
+  const busyReason = "当前场景仍在处理，完成后再操作。";
+
+  const viewReason = busy
+    ? busyReason
+    : hasEvidence
+      ? ""
+      : "没有可展开的实际执行失败证据；当前仅有静态失败信息。";
+  const repairReason = busy
+    ? busyReason
+    : conflict
+      ? "草稿版本已冲突，请重新加载后再修复。"
+      : dirty
+        ? "当前草稿已修改，请先保存或处理本地编辑后再修复。"
+        : modelDirty
+          ? "子场景模型尚未保存，请保存后再修复。"
+          : !modelAvailable
+            ? "当前子场景没有可用聊天模型，无法发起 AI 修复。"
+            : !canRepair
+              ? "没有当前版本的实际执行失败证据；静态失败请手动编辑或重新生成。"
+              : "";
+  const usesCandidate = Boolean(candidateCurrent && !dirty);
+  const manualReason = busy
+    ? busyReason
+    : conflict
+      ? "草稿版本已冲突，请重新加载后再手动编辑。"
+    : !usesCandidate && !hasEditableDraft
+        ? candidate?.draft
+          ? "候选已过期且当前草稿没有步骤，请重新生成后再编辑。"
+          : "当前没有候选且草稿没有步骤，请重新生成后再编辑。"
+        : "";
+  const candidateNote = candidate?.draft
+    ? candidateCurrent && !dirty
+      ? "将先确认采用候选；不会保存正式测试用例。"
+      : "候选已过期或本地草稿已修改；将直接打开当前草稿，不会覆盖本地编辑。"
+    : hasEditableDraft
+      ? "没有可采用候选；将直接打开当前草稿。"
+      : "当前没有候选且草稿没有步骤，请重新生成。";
+
+  return {
+    visible,
+    view: {
+      disabled: Boolean(viewReason),
+      reason: viewReason,
+      hasRoundEvidence,
+      hasCurrentDebugEvidence,
+    },
+    repair: { disabled: Boolean(repairReason), reason: repairReason },
+    manual: {
+      disabled: Boolean(manualReason),
+      reason: manualReason,
+      usesCandidate,
+      note: candidateNote,
+    },
+  };
 };
 
 export const statusMeta = (status) =>

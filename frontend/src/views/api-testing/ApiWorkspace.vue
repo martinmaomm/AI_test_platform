@@ -268,18 +268,24 @@
             @adopt="adoptCandidate"
           />
           <GenerationVerificationPanel
+            ref="verificationRef"
             :generation="workspace.generation"
             :candidate="workspace.candidate"
             :workspace-revision="workspace.revision"
             :dirty="dirty"
             :endpoint-scope="endpointScope"
+            :current-debug-result="workspace.debug_result"
+            :failure-actions="failureActions"
+            @view-failure="viewFailureEvidence"
+            @repair="focusRepairConversation"
+            @manual-edit="openManualEditor"
           />
           <WorkspaceConfigEditor
             :model-value="draft.config"
             :disabled="interactionLocked || conflict"
             @update:model-value="updateConfig"
           />
-          <div class="steps-heading">
+          <div ref="visualStepsRef" class="steps-heading">
             <h3>可视化步骤</h3>
             <el-button
               type="primary"
@@ -290,6 +296,9 @@
               >添加步骤</el-button
             >
           </div>
+          <p v-if="scenarioEndpointScopeHint" class="hint">
+            {{ scenarioEndpointScopeHint }}
+          </p>
           <VisualStepEditor
             v-for="(step, index) in draft.teststeps"
             :key="`step-${index}`"
@@ -308,6 +317,7 @@
             >保存草稿</el-button
           >
           <DebugResultPanel
+            ref="currentDebugRef"
             data-testid="api-current-debug-result"
             :result="workspace.debug_result"
             :stale="debugStale"
@@ -505,7 +515,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { copyText } from "@/utils/reportLinks";
@@ -539,10 +549,12 @@ import {
   canGenerateWithModel,
   canRepairWorkspace,
   candidateDiff,
+  childEditorEndpointIds,
   clone,
   completedApiSpecs,
   defaultStep,
   errorMessage,
+  failureActionState,
   generationRepairDefaults,
   hasCurrentGenerationFailure,
   hasAvailableChatModel,
@@ -596,6 +608,7 @@ const python = ref({
 const loading = ref(false);
 const savingDraft = ref(false);
 const savingCase = ref(false);
+const adoptingCandidate = ref(false);
 const sendingMessage = ref(false);
 const modelsLoading = ref(false);
 const specsLoading = ref(false);
@@ -618,6 +631,9 @@ const scenarioModelId = ref(null);
 const scenarioModelDirty = ref(false);
 const contextPanel = ref(null);
 const conversationRef = ref(null);
+const verificationRef = ref(null);
+const visualStepsRef = ref(null);
+const currentDebugRef = ref(null);
 const debugForm = ref({ environment_id: null, variables: {} });
 const saveForm = ref({ title: "", description: "" });
 const generationForm = ref({
@@ -653,6 +669,7 @@ const interactionLocked = computed(
     busy.value ||
     savingDraft.value ||
     savingCase.value ||
+    adoptingCandidate.value ||
     sendingMessage.value ||
     generationDialog.value ||
     loading.value ||
@@ -701,6 +718,26 @@ const canRepair = computed(
       debugRevision: workspace.value?.debug_revision,
     }),
 );
+const scenarioModelAvailable = computed(() =>
+  hasAvailableChatModel(models.value, workspace.value?.model_id),
+);
+const failureActions = computed(() =>
+  failureActionState({
+    editingScenario: editingScenario.value,
+    generation: workspace.value?.generation,
+    workspaceRevision: workspace.value?.revision,
+    debugResult: workspace.value?.debug_result,
+    debugRevision: workspace.value?.debug_revision,
+    dirty: dirty.value,
+    busy: interactionLocked.value,
+    conflict: conflict.value,
+    candidate: workspace.value?.candidate,
+    draft: draft.value,
+    modelAvailable: scenarioModelAvailable.value,
+    modelDirty: scenarioModelDirty.value,
+    canRepair: canRepair.value,
+  }),
+);
 const selectedSpec = computed(() =>
   specs.value.find((spec) => String(spec.id) === String(selectedSpecId.value)),
 );
@@ -739,6 +776,12 @@ const activeScenarioScope = computed(() =>
     ? `${workspace.value?.title || "当前场景"}：${activeScenarioEndpoints.value.length} 个接口`
     : "当前场景未记录接口范围",
 );
+const scenarioEndpointScopeHint = computed(() => {
+  const context = workspace.value?.generation?.scenario_context;
+  if (!editingScenario.value || !Array.isArray(context?.available_endpoint_ids))
+    return "";
+  return "可视化编辑器同时提供冻结根范围内的可选依赖端点；场景计划和覆盖统计仍只按业务目标端点计算。";
+});
 const confirmationEndpoints = computed(() =>
   generationForm.value.rootPlan ? selectedEndpoints.value : activeScenarioEndpoints.value,
 );
@@ -871,6 +914,36 @@ const markContextDirty = () => {
 };
 const focusRootContext = () =>
   contextPanel.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+const scrollToVisualSteps = () =>
+  visualStepsRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+const viewFailureEvidence = async () => {
+  const action = failureActions.value.view;
+  if (action.disabled) return ElMessage.warning(action.reason);
+  await nextTick();
+  if (action.hasRoundEvidence && verificationRef.value?.showFailureEvidence()) {
+    verificationRef.value.$el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  if (action.hasCurrentDebugEvidence) {
+    currentDebugRef.value?.$el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  ElMessage.warning("没有可展开的失败证据，请重新加载后再试。");
+};
+const focusRepairConversation = async () => {
+  const action = failureActions.value.repair;
+  if (action.disabled) return ElMessage.warning(action.reason);
+  await nextTick();
+  if (!(await conversationRef.value?.focusInput?.()))
+    ElMessage.warning("修复补充说明输入框暂不可用，请重新加载后再试。");
+};
+const openManualEditor = async () => {
+  const action = failureActions.value.manual;
+  if (action.disabled) return ElMessage.warning(action.reason);
+  if (action.usesCandidate && !(await adoptCandidate())) return;
+  await nextTick();
+  scrollToVisualSteps();
+};
 const updateConfig = (config) => {
   draft.value = { ...draft.value, config };
   markDirty();
@@ -946,7 +1019,7 @@ const loadScenarioEndpointOptions = async (scenario) => {
       !sameWorkspaceId(scenarioId, workspace.value?.id)
     )
       return;
-    const selected = new Set((scenario.endpoint_ids || []).map(String));
+    const selected = new Set(childEditorEndpointIds(scenario).map(String));
     scenarioEndpointOptions.value = listItems(response).filter((endpoint) =>
       selected.has(String(endpoint.id)),
     );
@@ -1617,34 +1690,69 @@ const sendMessage = async ({ mode, message, base_url, variables, workspaceId: ta
   }
 };
 const adoptCandidate = async () => {
+  if (busy.value || adoptingCandidate.value) return false;
   const candidate = workspace.value?.candidate;
-  if (!candidate?.draft) return;
+  if (!candidate?.draft) return false;
   if (generationStale.value)
-    return ElMessage.warning("当前验证结果已过期，请重新生成并验证后再采用候选。");
+    return (ElMessage.warning("当前验证结果已过期，请重新生成并验证后再采用候选。"), false);
   if (dirty.value)
-    return ElMessage.warning(
-      "当前本地草稿已修改，请先保存或重新加载后再采用候选",
+    return (
+      ElMessage.warning("当前本地草稿已修改，请先保存或重新加载后再采用候选"),
+      false
     );
   if (candidate.source_revision !== workspace.value.revision)
-    return ElMessage.warning("候选对应旧版本草稿，请重新生成。");
+    return (ElMessage.warning("候选对应旧版本草稿，请重新生成。"), false);
+  const request = {
+    projectId: projectId.value,
+    workspaceId: workspace.value.id,
+    revision: workspace.value.revision,
+    rootId: rootWorkspace.value?.id,
+    candidate,
+  };
   try {
     await ElMessageBox.confirm(
       "采用后将替换当前可视化草稿；此操作不会保存为测试用例。",
       "确认采用候选",
       { confirmButtonText: "采用", cancelButtonText: "取消", type: "warning" },
     );
-    const response = await updateApiWorkspace(
-      projectId.value,
-      workspace.value.id,
-      { draft: clone(candidate.draft), revision: workspace.value.revision },
-    );
-    applyWorkspace(response);
-    ElMessage.success("候选已采用，请检查后再显式保存用例");
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+      request.revision !== workspace.value?.revision ||
+      !sameWorkspaceId(request.rootId, rootWorkspace.value?.id) ||
+      workspace.value?.candidate !== request.candidate ||
+      dirty.value ||
+      contextDirty.value
+    )
+      return false;
+    adoptingCandidate.value = true;
+    try {
+      const response = await updateApiWorkspace(
+        request.projectId,
+        request.workspaceId,
+        { draft: clone(request.candidate.draft), revision: request.revision },
+      );
+      if (
+        request.projectId !== projectId.value ||
+        !sameWorkspaceId(request.workspaceId, workspace.value?.id) ||
+        request.revision !== workspace.value?.revision ||
+        !sameWorkspaceId(request.rootId, rootWorkspace.value?.id) ||
+        dirty.value ||
+        contextDirty.value
+      )
+        return false;
+      applyWorkspace(response);
+      ElMessage.success("候选已采用，请检查后再显式保存用例");
+      return true;
+    } finally {
+      adoptingCandidate.value = false;
+    }
   } catch (error) {
     if (error !== "cancel" && error !== "close") {
       if (error?.response?.status === 409) conflict.value = true;
       ElMessage.error(errorMessage(error, "采用候选失败"));
     }
+    return false;
   }
 };
 const selectSpec = async (specId) => {

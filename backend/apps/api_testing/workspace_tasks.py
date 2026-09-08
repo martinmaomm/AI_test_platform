@@ -164,10 +164,11 @@ def _planner_messages(*, conversation: list[dict[str, Any]], endpoints: list[dic
                      failure_evidence: dict[str, Any] | None = None) -> list[Any]:
     rules = [
         '你是 API 测试场景规划助手。只输出一个 JSON 对象，不要 Markdown 或解释。',
-        '输出严格为 {"scenarios":[{"title":"","description":"","endpoint_ids":[1]}],"summary":""}。',
+        '输出严格为 {"scenarios":[{"title":"","description":"","endpoint_ids":[1],"dependency_endpoint_ids":[],"dependency_evidence":"","requires_authenticated_context":false}],"summary":""}。',
         'scenarios 必须为 1 到 20 项；每项 title 非空，description 为字符串，endpoint_ids 为非空整数数组。',
-        'endpoint_ids 只能来自 selected_endpoints；不要编造端点或把未选择端点纳入计划。',
-        '每个场景必须自包含登录和取 token 的依赖；绝不能依赖另一个场景提取的 token、cookie 或变量。',
+        'endpoint_ids 是该场景必须保留并断言的业务目标，只能来自 selected_endpoints；不要编造端点或把未选择端点纳入计划。',
+        'dependency_endpoint_ids 只能列 selected_endpoints 中、为本场景准备登录/token/必要数据的候选依赖，不能代替 endpoint_ids；dependency_evidence 必须说明 OpenAPI security、参数、请求体或响应提取字段如何支持该依赖。requires_authenticated_context 仅在业务目标确实需携带认证信息时为 true。文档没有足够证据时留空并在 dependency_evidence 明确说明，不能按 URL 或 login 词猜测。',
+        '每个场景必须自包含其实际使用的登录和取 token 步骤；绝不能依赖另一个场景提取的 token、cookie 或变量。根范围只提供可选依赖上下文，不表示每个端点都要执行。',
         '规划不是验证结果：不要声称请求已执行、通过或已保存。',
     ]
     payload = {
@@ -198,7 +199,26 @@ def _parse_plan(value: Any, *, endpoint_ids: set[int]) -> dict[str, Any]:
             raise WorkspaceValidationError(f'场景规划第 {index} 项 endpoint_ids 必须是非空整数数组。')
         if not set(ids).issubset(endpoint_ids):
             raise WorkspaceValidationError(f'场景规划第 {index} 项引用了选定范围之外的端点。')
-        normalized.append({'title': title.strip(), 'description': description, 'endpoint_ids': list(dict.fromkeys(ids))})
+        dependency_ids = scenario.get('dependency_endpoint_ids', [])
+        evidence = scenario.get('dependency_evidence', '')
+        requires_authenticated_context = scenario.get('requires_authenticated_context', False)
+        if not isinstance(dependency_ids, list) or any(not isinstance(item, int) or isinstance(item, bool) for item in dependency_ids):
+            raise WorkspaceValidationError(f'场景规划第 {index} 项 dependency_endpoint_ids 必须是整数数组。')
+        if not set(dependency_ids).issubset(endpoint_ids):
+            raise WorkspaceValidationError(f'场景规划第 {index} 项依赖引用了选定范围之外的端点。')
+        if set(dependency_ids).intersection(ids):
+            raise WorkspaceValidationError(f'场景规划第 {index} 项依赖端点不能代替业务目标端点。')
+        if not isinstance(evidence, str):
+            raise WorkspaceValidationError(f'场景规划第 {index} 项 dependency_evidence 必须是字符串。')
+        if dependency_ids and not evidence.strip():
+            raise WorkspaceValidationError(f'场景规划第 {index} 项列出依赖端点时必须提供 dependency_evidence。')
+        if not isinstance(requires_authenticated_context, bool):
+            raise WorkspaceValidationError(f'场景规划第 {index} 项 requires_authenticated_context 必须是布尔值。')
+        normalized.append({
+            'title': title.strip(), 'description': description, 'endpoint_ids': list(dict.fromkeys(ids)),
+            'dependency_endpoint_ids': list(dict.fromkeys(dependency_ids)), 'dependency_evidence': evidence,
+            'requires_authenticated_context': requires_authenticated_context,
+        })
     summary = value.get('summary', '')
     if not isinstance(summary, str):
         raise WorkspaceValidationError('场景规划 summary 必须是字符串。')
@@ -213,10 +233,8 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
                 or root.status != APIWorkspace.Status.GENERATING):
             return None
         children: list[tuple[int, int, str]] = []
-        endpoint_context = {item['id']: item for item in snapshot['endpoints']}
         for order, scenario in enumerate(plan['scenarios']):
             child_task_id = str(uuid.uuid4())
-            scenario_endpoints = [deepcopy(endpoint_context[item]) for item in scenario['endpoint_ids']]
             child = APIWorkspace.objects.create(
                 project=root.project, owner=root.owner, parent=root, spec=root.spec,
                 title=scenario['title'], scenario_order=order, scenario_description=scenario['description'],
@@ -230,12 +248,20 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
                     '_snapshot': {
                         'revision': 0, 'task_id': child_task_id, 'mode': 'generate',
                         'draft': default_api_workspace_draft(), 'model_id': root.model_id,
-                        'spec_id': root.spec_id, 'endpoints': scenario_endpoints,
+                        'spec_id': root.spec_id, 'endpoints': deepcopy(snapshot['endpoints']),
+                        'scope_endpoint_ids': deepcopy(snapshot.get('scope_endpoint_ids') or []),
                         'target_url': snapshot['target_url'], 'variables': deepcopy(snapshot['variables']),
                         'messages': deepcopy(snapshot.get('messages') or []), 'failure_evidence': None,
-                        'scenario': deepcopy(scenario),
+                        'scenario': {
+                            **deepcopy(scenario), 'target_endpoint_ids': deepcopy(scenario['endpoint_ids']),
+                            'available_endpoint_ids': deepcopy(snapshot.get('scope_endpoint_ids') or []),
+                        },
                         'queued_at': snapshot['queued_at'], 'parent_task_id': task_id,
                         'parent_revision': revision,
+                    },
+                    'scenario_context': {
+                        **deepcopy(scenario), 'target_endpoint_ids': deepcopy(scenario['endpoint_ids']),
+                        'available_endpoint_ids': deepcopy(snapshot.get('scope_endpoint_ids') or []),
                     },
                 },
             )
@@ -405,6 +431,12 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
         rounds: list[dict[str, Any]] = []
         failure_evidence = snapshot.get('failure_evidence') if isinstance(snapshot.get('failure_evidence'), dict) else None
         last_valid_round: dict[str, Any] | None = None
+        scenario = snapshot.get('scenario') if isinstance(snapshot.get('scenario'), dict) else {}
+        required_endpoint_ids = scenario.get('target_endpoint_ids', scenario.get('endpoint_ids', []))
+        required_endpoint_ids = set(required_endpoint_ids) if isinstance(required_endpoint_ids, list) else set()
+        authenticated_target_ids = required_endpoint_ids if scenario.get('requires_authenticated_context') is True else set()
+        cookie_session_dependency_ids = scenario.get('dependency_endpoint_ids', [])
+        cookie_session_dependency_ids = set(cookie_session_dependency_ids) if isinstance(cookie_session_dependency_ids, list) else set()
         from api_testing.requests_runner import requests_runner
         for attempt in range(1, 4):
             workspace = _pipeline_guard(workspace_id, revision, task_id, frozen_model_id=snapshot.get('model_id'))
@@ -456,7 +488,9 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
                 raw_candidate = _parse_candidate(output)
                 candidate = prepare_candidate(raw_candidate, endpoints=snapshot['endpoints'],
                     target_url=snapshot['target_url'], variables=snapshot['variables'], baseline=baseline,
-                    protected=protected)
+                    protected=protected, required_endpoint_ids=required_endpoint_ids,
+                    authenticated_target_ids=authenticated_target_ids,
+                    cookie_session_dependency_ids=cookie_session_dependency_ids)
             except Exception as exc:
                 # A parseable but statically invalid draft is valuable repair
                 # context.  It is deliberately not stored as ``candidate`` and
@@ -475,6 +509,26 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
                 }
                 if failed_draft:
                     prompt_draft = failed_draft
+                    # A missing runtime token can make the first candidate
+                    # non-runnable, but its target assertions are still the
+                    # user-visible business contract.  Preserve them before a
+                    # repair inserts a prerequisite; semantic identities keep
+                    # that insertion from shifting comparisons onto login.
+                    if not baseline:
+                        try:
+                            failed_normalized = normalize_draft(failed_draft)
+                            failed_assertions = _step_assertions(failed_normalized)
+                            if required_endpoint_ids:
+                                prefixes = tuple(f'endpoint:{item}:' for item in required_endpoint_ids)
+                                baseline = {
+                                    identity: checks for identity, checks in failed_assertions.items()
+                                    if identity.startswith(prefixes)
+                                }
+                            else:
+                                baseline = failed_assertions
+                            protected = protected_expected_values(failed_normalized, snapshot.get('variables'))
+                        except WorkspaceValidationError:
+                            pass
                 _pipeline_update(workspace_id, revision, task_id, rounds=rounds)
                 continue
             # Once a first executable candidate exists, repairs are constrained
@@ -592,7 +646,7 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
         'current_scenario': scenario,
     }
     if scenario:
-        rules.append('本轮只能实现 current_scenario 指定的场景及其 endpoint_ids；conversation 仅作通用凭证、目标和命名依据，不能借用其他场景的 token 或步骤。')
+        rules.append('current_scenario.target_endpoint_ids 是必须保留的业务目标和断言；selected_endpoints/available_endpoint_ids 是同一根工作区冻结的可选依赖范围。只可增加有 OpenAPI security、参数、请求体或响应字段证据支持的前置登录/数据准备步骤，且不得执行所有可选端点。requires_authenticated_context=true 时目标必须使用该场景自己提取或用户提供的凭证；false 时可生成文档支持的未登录/无权限负向场景。每个场景不能借用其他场景的 token 或步骤。修复可插入前置步骤，但必须保留目标请求及其原业务断言。')
     return [SystemMessage(content='\n'.join(rules)), HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
 
 

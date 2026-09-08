@@ -546,6 +546,93 @@ class APIWorkspaceTests(TestCase):
                 protected=protected_expected_values(baseline),
             )
 
+    def test_security_required_target_rejects_repair_that_deletes_authorization(self):
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, status=APISpecification.TaskStatus.COMPLETED,
+            metadata={
+                'security': [{'bearerAuth': []}],
+                'components': {'securitySchemes': {'bearerAuth': {'type': 'http', 'scheme': 'bearer'}}},
+            },
+        )
+        endpoint = APIEndpoint.objects.create(spec=spec, method='GET', path='/admin/info')
+        baseline = normalize_draft({
+            'version': 1, 'config': {'name': '', 'base_url': '', 'variables': {'token': 'issued'}, 'verify': True},
+            'teststeps': [{'name': 'info', 'endpoint_id': endpoint.id,
+                'request': {'method': 'GET', 'url': '/admin/info', 'headers': {'Authorization': 'Bearer ${token}'}},
+                'validate': [{'eq': ['body.code', 0]}]}],
+        })
+        unsafe = deepcopy(baseline)
+        unsafe['teststeps'][0]['request']['headers'] = {}
+        with self.assertRaisesRegex(ValueError, 'security'):
+            prepare_candidate(
+                unsafe, endpoints=endpoint_specs(self.project.id, [endpoint.id], spec_id=spec.id),
+                target_url='https://example.test', variables={'token': 'issued'},
+                baseline=_step_assertions(baseline), protected=protected_expected_values(baseline),
+                authenticated_target_ids={endpoint.id},
+            )
+
+    def test_child_uses_frozen_root_scope_for_self_contained_login_without_widening_targets(self):
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, status=APISpecification.TaskStatus.COMPLETED,
+            metadata={
+                'security': [{'bearerAuth': []}],
+                'components': {'securitySchemes': {'bearerAuth': {'type': 'http', 'scheme': 'bearer'}}},
+            },
+        )
+        login = APIEndpoint.objects.create(spec=spec, method='POST', path='/session', request_body={'required': True})
+        info = APIEndpoint.objects.create(spec=spec, method='GET', path='/admin/info')
+        root = self.workspace(model_id=self.model.id, spec=spec, endpoint_ids=[login.id, info.id])
+        plan = {'summary': '当前用户', 'scenarios': [{
+            'title': '读取当前用户', 'description': '独立登录后读取', 'endpoint_ids': [info.id],
+            'dependency_endpoint_ids': [login.id], 'dependency_evidence': '目标 security 要求 bearerAuth；登录响应提供 token。',
+            'requires_authenticated_context': True,
+        }]}
+        candidate = {
+            'version': 1, 'config': {'name': '当前用户', 'variables': {'username': 'u', 'password': 'p'}},
+            'teststeps': [
+                {'name': '建立会话', 'endpoint_id': login.id, 'request': {'method': 'POST', 'url': '/session', 'json': {'username': '${username}', 'password': '${password}'}},
+                 'extract': {'token': 'body.data.token'}, 'validate': [{'eq': ['status_code', 200]}]},
+                {'name': '读取当前用户', 'endpoint_id': info.id,
+                 'request': {'method': 'GET', 'url': '/admin/info', 'headers': {'Authorization': 'Bearer ${token}'}},
+                 'validate': [{'eq': ['body.code', 0]}]},
+            ],
+        }
+        prompts = []
+
+        def stream(messages, callback=None, **_kwargs):
+            payload = next(__import__('json').loads(item.content) for item in messages if item.content.startswith('{'))
+            prompts.append(payload)
+            value = plan if payload.get('stage') == 'plan' else candidate
+            output = __import__('json').dumps(value)
+            if callback:
+                callback(output)
+            return output
+
+        passed = {
+            'success': True, 'error_type': '', 'step_datas': [
+                {'status': 'passed', 'validators': {'validate_extractor': [{'passed': True}]}, 'data': {'req_resps': [{'response': {'status_code': 200}}]}},
+                {'status': 'passed', 'validators': {'validate_extractor': [{'passed': True}]}, 'data': {'req_resps': [{'response': {'status_code': 200}}]}},
+            ],
+        }
+        with patch.object(generate_and_verify_api_workspace, 'apply_async') as queued, self.captureOnCommitCallbacks(execute=True):
+            reply = APIWorkspaceMessagesView.as_view()(
+                self.request(self.user, 'post', '/', {'revision': 0, 'message': '读取当前登录用户',
+                    'execution_confirmed': True, 'base_url': 'https://example.test', 'variables': {}}),
+                project_id=self.project.id, workspace_id=root.id,
+            )
+        self.assertEqual(reply.status_code, 202, reply.data)
+        with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace(stream_invoke=stream)), \
+             patch('api_testing.requests_runner.requests_runner', return_value=passed) as runner:
+            result = generate_and_verify_api_workspace.apply(**queued.call_args.kwargs)
+        self.assertEqual(result.result['status'], 'passed')
+        child = root.scenarios.get()
+        self.assertEqual(child.endpoint_ids, [info.id])
+        self.assertEqual([item['id'] for item in child.generation['_snapshot']['endpoints']], [login.id, info.id])
+        self.assertEqual(child.generation['scenario_context']['available_endpoint_ids'], [login.id, info.id])
+        self.assertEqual([item['endpoint_id'] for item in child.candidate['draft']['teststeps']], [login.id, info.id])
+        self.assertEqual(prompts[1]['current_scenario']['target_endpoint_ids'], [info.id])
+        runner.assert_called_once()
+
     def test_candidate_data_without_content_type_is_rejected_when_spec_only_accepts_json(self):
         endpoint = self.endpoint()
         endpoint.request_body = {'content': {'application/json': {'schema': {'type': 'object'}}}}
@@ -686,7 +773,13 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(result.result['status'], 'passed')
         root.refresh_from_db()
         self.assertEqual(root.generation['planning_attempts'][0]['raw'], invalid_plan)
-        self.assertEqual(root.generation['plan'], valid_plan)
+        self.assertEqual(root.generation['plan'], {
+            **valid_plan,
+            'scenarios': [{
+                **valid_plan['scenarios'][0], 'dependency_endpoint_ids': [],
+                'dependency_evidence': '', 'requires_authenticated_context': False,
+            }],
+        })
         self.assertEqual(prompts[0]['stage'], 'plan')
         self.assertEqual(prompts[1]['stage'], 'plan')
         self.assertEqual(prompts[1]['failure_evidence']['raw_plan'], invalid_plan)
@@ -890,6 +983,8 @@ class APIWorkspaceTests(TestCase):
         candidate_hash = draft_hash(draft)
         failed_result = {'success': False, 'error_type': 'ValidationFailure', 'step_datas': []}
         root = self.workspace(spec=endpoint.spec, endpoint_ids=[endpoint.id])
+        root.generation = {'_snapshot': {'scope_endpoint_ids': [endpoint.id]}}
+        root.save(update_fields=['generation', 'updated_at'])
         child = self.workspace(
             parent=root, title='冻结子场景', scenario_description='保留登录要求',
             model_id=self.model.id, spec=endpoint.spec, endpoint_ids=[endpoint.id], draft=draft,
@@ -898,7 +993,10 @@ class APIWorkspaceTests(TestCase):
                 'mode': 'generate', 'verification_status': 'needs_review', 'draft_hash': candidate_hash},
             generation={'status': 'needs_review', 'phase': 'finished', 'source_revision': 0,
                 'rounds': [{'draft_hash': candidate_hash, 'draft': draft, 'result': failed_result}],
-                '_snapshot': {'model_id': self.model.id, 'historical': True}},
+                '_snapshot': {
+                    'model_id': self.model.id, 'historical': True, 'scope_endpoint_ids': [endpoint.id],
+                    'scenario': {'target_endpoint_ids': [endpoint.id], 'available_endpoint_ids': [endpoint.id]},
+                }},
             debug_result=failed_result, debug_revision=0,
         )
         updated = APIWorkspaceDetailView.as_view()(
@@ -926,6 +1024,8 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(snapshot['model_id'], replacement.id)
         self.assertEqual(snapshot['scenario'], {
             'title': '改模型后的标题', 'description': '保留登录要求', 'endpoint_ids': [endpoint.id],
+            'target_endpoint_ids': [endpoint.id], 'available_endpoint_ids': [endpoint.id],
+            'dependency_endpoint_ids': [], 'dependency_evidence': '', 'requires_authenticated_context': False,
         })
         self.assertEqual(snapshot['messages'], [{'role': 'user', 'content': '使用固定账号并验证失败原因'},
             {'role': 'user', 'content': '仅修复失败原因', 'mode': 'repair'}])

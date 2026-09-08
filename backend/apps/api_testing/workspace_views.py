@@ -87,17 +87,36 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
     if scenario_workflow:
         snapshot.update({'workflow': 'scenarios', 'scope_endpoint_ids': [item['id'] for item in endpoints]})
     elif workspace.parent_id:
-        snapshot['scenario'] = {
-            'title': workspace.title,
-            'description': workspace.scenario_description,
-            'endpoint_ids': list(workspace.endpoint_ids or []),
-        }
+        previous_generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+        previous_snapshot = previous_generation.get('_snapshot') if isinstance(previous_generation.get('_snapshot'), dict) else {}
+        previous_scenario = previous_snapshot.get('scenario') if isinstance(previous_snapshot.get('scenario'), dict) else {}
+        frozen_scope = previous_snapshot.get('scope_endpoint_ids')
+        if not isinstance(frozen_scope, list) or not frozen_scope:
+            raise WorkspaceValidationError('子场景没有冻结根依赖范围，不能生成或修复。')
+        target_ids = previous_scenario.get('target_endpoint_ids', workspace.endpoint_ids)
+        if not isinstance(target_ids, list) or not target_ids:
+            raise WorkspaceValidationError('子场景没有冻结业务目标，不能生成或修复。')
+        if {item['id'] for item in endpoints} != set(frozen_scope):
+            raise WorkspaceValidationError('子场景依赖范围与冻结快照不一致，不能继续执行。')
+        snapshot.update({
+            'scope_endpoint_ids': deepcopy(frozen_scope),
+            'scenario': {
+                'title': workspace.title, 'description': workspace.scenario_description,
+                'endpoint_ids': deepcopy(target_ids), 'target_endpoint_ids': deepcopy(target_ids),
+                'available_endpoint_ids': deepcopy(frozen_scope),
+                'dependency_endpoint_ids': deepcopy(previous_scenario.get('dependency_endpoint_ids') or []),
+                'dependency_evidence': str(previous_scenario.get('dependency_evidence') or ''),
+                'requires_authenticated_context': previous_scenario.get('requires_authenticated_context') is True,
+            },
+        })
     workspace.generation = {
         'status': 'queued', 'phase': 'queued', 'attempt': 0, 'max_attempts': 3,
         'source_revision': revision, 'target_url': target_url, 'summary': '', 'rounds': [],
         'adopted_revision': None,
         '_snapshot': snapshot,
     }
+    if workspace.parent_id:
+        workspace.generation['scenario_context'] = deepcopy(snapshot['scenario'])
     if scenario_workflow:
         workspace.generation.update({
             'phase': 'planning', 'plan': {}, 'scenario_ids': [], 'active_scenario_id': None,
@@ -280,6 +299,9 @@ class APIWorkspaceMessagesView(APIView):
                 if workspace_is_busy(workspace):
                     raise WorkspaceConflict('当前工作区任务尚未结束。')
                 require_generation_model_id(workspace.model_id, owner=workspace.owner)
+                # A child retains its business target ids for coverage, while
+                # this frozen root-scoped projection exposes only selected
+                # Swagger dependencies for its self-contained login/setup.
                 endpoints = generation_endpoint_specs(workspace)
                 prompt_draft, failure_evidence = (workspace.draft, None)
                 if mode == 'repair':

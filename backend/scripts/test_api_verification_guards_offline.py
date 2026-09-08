@@ -52,11 +52,18 @@ def main():
             return value
 
         def exercise(outputs, *, http_status=200, after_model=None):
-            parent = APIWorkspace.objects.create(owner=owner, project_id=fixture['project_id'])
+            scope = [fixture['endpoint_id']]
+            parent = APIWorkspace.objects.create(
+                owner=owner, project_id=fixture['project_id'], spec_id=fixture['spec_id'], endpoint_ids=scope,
+                generation={'status': 'passed', '_snapshot': {'scope_endpoint_ids': scope}},
+            )
             workspace = APIWorkspace.objects.create(
                 owner=owner, project_id=fixture['project_id'], model_id=fixture['model_id'],
                 spec_id=fixture['spec_id'], endpoint_ids=[fixture['endpoint_id']],
                 parent=parent, scenario_order=1, scenario_description='单场景边界独立验收',
+                generation={'_snapshot': {'scope_endpoint_ids': scope, 'scenario': {
+                    'target_endpoint_ids': scope, 'available_endpoint_ids': scope,
+                }}},
             )
             with patch.object(generate_and_verify_api_workspace, 'apply_async') as queue:
                 reply = APIWorkspaceMessagesView.as_view()(

@@ -174,6 +174,34 @@ def _resolve_endpoint_refs(value: Any, document: Any, resolving: frozenset[str] 
 
 
 def generation_endpoint_specs(workspace: APIWorkspace) -> list[dict[str, Any]]:
+    """Return the frozen root scope when a child needs local prerequisites.
+
+    A child keeps ``endpoint_ids`` as its business targets for coverage.  Its
+    generated draft may additionally need an authentication or data-setup
+    endpoint selected by the root, so using the child target list here would
+    make a self-contained scenario impossible.  The root scope remains the
+    only source of such dependencies; this never widens to an entire spec.
+    """
+    if workspace.parent_id:
+        root = APIWorkspace.objects.filter(pk=workspace.parent_id).first()
+        if not root or root.project_id != workspace.project_id or root.owner_id != workspace.owner_id:
+            raise WorkspaceValidationError('子场景的根工作区归属不一致，不能读取依赖端点。')
+        if root.spec_id != workspace.spec_id:
+            raise WorkspaceValidationError('根工作区 API 规范已变化，子场景的依赖范围已失效。')
+        child_generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+        child_snapshot = child_generation.get('_snapshot') if isinstance(child_generation.get('_snapshot'), dict) else {}
+        frozen_ids = child_snapshot.get('scope_endpoint_ids')
+        if not isinstance(frozen_ids, list) or not frozen_ids:
+            raise WorkspaceValidationError('子场景没有冻结根依赖范围，不能生成或修复。')
+        root_generation = root.generation if isinstance(root.generation, dict) else {}
+        if root_generation.get('status') == 'stale':
+            raise WorkspaceValidationError('根工作区选择范围已变化，子场景必须从新的根范围重新生成。')
+        root_current_ids = root.endpoint_ids if isinstance(root.endpoint_ids, list) else []
+        if not root_current_ids:
+            root_current_ids = list(APIEndpoint.objects.filter(spec_id=root.spec_id).values_list('id', flat=True))
+        if not set(frozen_ids).issubset(set(root_current_ids)):
+            raise WorkspaceValidationError('根工作区已缩小或变更选择范围，子场景的依赖范围已失效。')
+        return endpoint_specs(workspace.project_id, frozen_ids, spec_id=workspace.spec_id)
     if not workspace.spec_id:
         raise WorkspaceValidationError('请先选择可用 API 规范后再生成。')
     validate_spec_id(workspace.project_id, workspace.spec_id)

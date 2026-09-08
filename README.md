@@ -150,7 +150,7 @@ API 变量覆盖顺序为：**本次执行 > 套件 > 用例 > API 环境默认�
 ## 项目结构
 
 ```text
-aits_v2/
+aits/
 ├── README.md                    # 项目总览与业务流程
 ├── docs/                        # 安装、使用、设计及验收文档
 ├── frontend/                    # Vue 前端

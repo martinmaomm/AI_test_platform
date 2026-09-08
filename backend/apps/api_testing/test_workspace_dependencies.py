@@ -36,6 +36,35 @@ class WorkspaceDependencyContractsTests(TestCase):
             'teststeps': list(steps),
         })
 
+    def test_extract_filter_variables_must_be_defined_before_the_step(self):
+        spec = self.spec()
+        endpoint = APIEndpoint.objects.create(spec=spec, method='GET', path='/items')
+        endpoints = endpoint_specs(self.project.id, [endpoint.id], spec_id=spec.id)
+        step = {
+            'name': 'exact match', 'endpoint_id': endpoint.id,
+            'request': {'method': 'GET', 'url': '/items'},
+            'extract': {'item_id': 'body.data[?(@.name == ${unique_name})][0].id'},
+            'validate': [{'eq': ['status_code', 200]}],
+        }
+        for variables in ({}, {'unique_name': ''}):
+            with self.subTest(variables=variables), self.assertRaisesRegex(WorkspaceValidationError, 'unique_name'):
+                prepare_candidate(self.draft(step, variables=variables), endpoints=endpoints,
+                                  target_url='https://example.test', variables={})
+        prepare_candidate(self.draft(step, variables={'unique_name': 'run_${timestamp_ns}'}),
+                          endpoints=endpoints, target_url='https://example.test', variables={})
+        same_step = deepcopy(step)
+        same_step['extract']['unique_name'] = 'body.name'
+        with self.assertRaisesRegex(WorkspaceValidationError, 'unique_name'):
+            prepare_candidate(self.draft(same_step), endpoints=endpoints,
+                              target_url='https://example.test', variables={})
+        preceding = {
+            'name': 'read name', 'endpoint_id': endpoint.id,
+            'request': {'method': 'GET', 'url': '/items'},
+            'extract': {'unique_name': 'body.name'}, 'validate': [{'eq': ['status_code', 200]}],
+        }
+        prepare_candidate(self.draft(preceding, step), endpoints=endpoints,
+                          target_url='https://example.test', variables={})
+
     def test_explicit_auth_context_respects_negative_unknown_or_and_cookie_session_dependency(self):
         access = {'type': 'apiKey', 'in': 'header', 'name': 'X-Access'}
         spec = self.spec(security=[{'access': []}], schemes={'access': access})

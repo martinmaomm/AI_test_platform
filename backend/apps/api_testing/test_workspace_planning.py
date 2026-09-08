@@ -50,6 +50,43 @@ class WorkspacePlanningContractsTests(SimpleTestCase):
         self.assertIn('不要通过截断列表或删除原有业务目标来凑数', rules)
 
 
+class WorkspaceDependencyPlanNormalizationTests(SimpleTestCase):
+    @classmethod
+    def parse_plan(cls, scenario):
+        return _parse_plan({'scenarios': [scenario]}, endpoint_ids={2, 4, 5, 6, 7})['scenarios'][0]
+
+    def test_target_dependency_overlap_is_normalized_without_changing_targets_or_authentication(self):
+        scenario = self.parse_plan({
+            'title': 'role lifecycle', 'description': 'target and prerequisite share an endpoint',
+            'endpoint_ids': [4, 2, 6, 5], 'authenticated_endpoint_ids': [2, 6],
+            'requires_authenticated_context': True, 'dependency_endpoint_ids': [4],
+        })
+        self.assertEqual(scenario['endpoint_ids'], [4, 2, 6, 5])
+        self.assertEqual(scenario['authenticated_endpoint_ids'], [2, 6])
+        self.assertEqual(scenario['dependency_endpoint_ids'], [])
+        self.assertEqual(scenario['dependency_evidence'], '')
+
+    def test_only_remaining_dependencies_require_evidence_and_invalid_values_still_fail(self):
+        scenario = {
+            'title': 'role lifecycle', 'endpoint_ids': [4, 2],
+            'authenticated_endpoint_ids': [], 'requires_authenticated_context': False,
+            'dependency_endpoint_ids': [4, 7, 7],
+        }
+        with self.assertRaisesRegex(WorkspaceValidationError, 'dependency_evidence'):
+            self.parse_plan(scenario)
+        scenario['dependency_evidence'] = 'OpenAPI response token feeds the protected request.'
+        self.assertEqual(self.parse_plan(scenario)['dependency_endpoint_ids'], [7])
+        for dependencies in ([8], [True], [7.0], ['7']):
+            with self.subTest(dependencies=dependencies), self.assertRaises(WorkspaceValidationError):
+                self.parse_plan({**scenario, 'dependency_endpoint_ids': dependencies})
+
+    def test_planner_prompt_explains_overlap_normalization_and_self_check(self):
+        rules = _planner_messages(conversation=[], endpoints=[])[0].content
+        self.assertIn('同一端点同时是业务目标和前置用法', rules)
+        self.assertIn('从 dependency_endpoint_ids 移除该重复项', rules)
+        self.assertIn('输出前自行检查', rules)
+
+
 class WorkspaceGenerationPromptTests(SimpleTestCase):
     @staticmethod
     def messages(*, mode='generate', failure_evidence=None, draft=None):
@@ -88,7 +125,12 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
             with self.subTest(path=path):
                 self.assertIn(path, rules)
                 self.assertEqual(_select(path, context), 17)
-        self.assertIn('不支持 JSONPath filter', rules)
+        self.assertIn('支持有界等值筛选', rules)
+        self.assertIn('body.data.items[?(@.name == ${unique_name})][0].id', rules)
+        self.assertEqual(_select(
+            'body.data.items[?(@.name == ${unique_name})][0].id', context,
+            variables={'unique_name': 'current-run'}, require_unique=True,
+        ), 17)
         self.assertIn('通配符、递归搜索、切片、动态索引、函数或 eval', rules)
         with self.assertRaises((CaseContractError, KeyError)):
             _select("body.data.items[?(@.name=='current-run')].id", context)
@@ -96,6 +138,16 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
         self.assertEqual(normalize_case({'teststeps': [step]})['teststeps'][0]['extract'], {})
         with self.assertRaises(CaseContractError):
             normalize_case({'teststeps': [{**step, 'extract': None}]})
+
+    def test_prompt_explains_unique_filters_absence_and_builtin_variables(self):
+        rules = self.messages()[0].content
+        for requirement in (
+            '零条或多条均失败', '不会退回取第一条',
+            '删除后的同一筛选用 length=0', '不要在不存在验证步骤继续提取已删除的 ID',
+            '不能因当前页没有匹配就宣称不存在', '无需在 config.variables 中声明',
+            '禁止把这两个系统变量声明为空值、占位符或自引用',
+        ):
+            self.assertIn(requirement, rules)
 
     def test_prompt_contains_semantics_match_runtime_including_object_arrays(self):
         rules = self.messages()[0].content

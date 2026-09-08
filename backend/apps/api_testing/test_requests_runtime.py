@@ -16,7 +16,9 @@ import requests
 
 from api_testing.case_contract import CaseContractError, export_python, normalize_case
 from api_testing.requests_runner import requests_runner
-from api_testing.requests_runtime import run_case
+from api_testing.requests_runtime import (
+    ExtractionFailure, _select, run_case, selector_has_filter, validate_selector,
+)
 
 
 class FakeResponse:
@@ -50,6 +52,200 @@ class FakeSession:
 
     def close(self):
         self.closed = True
+
+
+def test_selector_filter_binds_variables_as_data_and_preserves_scalar_types():
+    injected_name = "中文 ' ) ][0].id ${not_a_path}"
+    context = {"body": {"data": [
+        {"id": 1, "name": "1", "meta": {"name": "old"}},
+        {"id": 2, "name": 1, "meta": {"name": injected_name}},
+        {"id": 3, "name": True, "meta": {"name": "other"}},
+    ]}}
+    variables = {"role_name": injected_name}
+    assert _select(
+        'body.data[?(@.meta.name == "${role_name}")][0].id', context, variables=variables,
+    ) == 2
+    assert _select("body.data[?(@.name == '1')][0].id", context) == 1
+    assert _select("body.data[?(@.name == 1)][0].id", context) == 2
+    assert _select("body.data[?(@.name == true)][0].id", context) == 3
+    assert _select("body.data.0.id", context) == 1
+    assert selector_has_filter("body.data[?(@.name == ${role_name})][0].id")
+    assert _select('body.data[?(@.name == "absent")]', context) == []
+    try:
+        _select('body.data[?(@.name == "absent")]', context, require_unique=True)
+    except ExtractionFailure as exc:
+        assert "唯一匹配" in str(exc)
+    else:
+        raise AssertionError("unique filters must reject an empty result")
+
+
+def test_validator_selector_uses_the_full_current_variable_scope():
+    session = FakeSession([FakeResponse(body={"data": [{"name": "current"}]})])
+    case = {"config": {"base_url": "https://api.example.test", "variables": {"role_name": "current"}}, "teststeps": [{
+        "request": {"url": "/roles"},
+        "validate": [{"length": ["body.data[?(@.name == ${role_name})]", 1]}],
+    }]}
+    with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+        assert run_case("validator-filter", case)["status"] == "passed"
+
+
+def test_selector_parser_rejects_complete_invalid_syntax_and_implicit_projection():
+    for selector in (
+        "body.data[?(@.name != 'x')]", "body.data[?(@.name == ${role})] trailing",
+        "body.data[*]", "body..data", "body.data[0]junk", "body.data[?(@.name == foo)]",
+        "body.data[?(@[0] == 'x')]",
+    ):
+        try:
+            validate_selector(selector)
+        except CaseContractError:
+            pass
+        else:
+            raise AssertionError(f"selector must be rejected: {selector}")
+    try:
+        _select("body.data.id", {"body": {"data": [{"id": 1}]}})
+    except CaseContractError as exc:
+        assert "隐式字段投影" in str(exc)
+    else:
+        raise AssertionError("lists cannot implicitly project fields")
+    try:
+        _select("body.data[?(@.name == 'x')].id", {"body": {"data": [{"name": "x", "id": 1}]}})
+    except CaseContractError as exc:
+        assert "隐式字段投影" in str(exc)
+    else:
+        raise AssertionError("filtered lists cannot implicitly project fields")
+
+
+def test_filter_variables_are_checked_before_http_and_same_extract_cannot_bind_another_extract():
+    unknown = {"config": {"base_url": "https://api.example.test"}, "teststeps": [{
+        "request": {"url": "/items"}, "extract": {"id": "body.data[?(@.name == ${role_name})][0].id"},
+    }]}
+    same_step = {"config": {"base_url": "https://api.example.test"}, "teststeps": [{
+        "request": {"url": "/items"}, "extract": {
+            "role_name": "body.role_name", "id": "body.data[?(@.name == ${role_name})][0].id",
+        },
+    }]}
+    with patch("api_testing.requests_runtime.requests.Session") as session_factory:
+        for case in (unknown, same_step):
+            result = run_case("unknown-filter", case)
+            assert result["status"] == "error"
+            assert "未知变量" in result["error"]
+        session_factory.return_value.request.assert_not_called()
+
+
+def test_filter_extraction_requires_one_match_then_allows_update_and_delete_with_old_first_row_unchanged():
+    role_name = "本轮 '角色'"
+    session = FakeSession([
+        FakeResponse(body={"data": None}),
+        FakeResponse(body={"data": {"list": [{"id": 1, "name": "旧记录"}, {"id": 9, "name": role_name}]}}),
+        FakeResponse(body={"data": None}),
+        FakeResponse(body={"data": None}),
+    ])
+    case = {"config": {"base_url": "https://api.example.test", "variables": {"role_name": role_name}}, "teststeps": [
+        {"name": "create", "request": {"method": "POST", "url": "/roles", "json": {"name": "${role_name}"}}},
+        {"name": "lookup", "request": {"url": "/roles", "params": {"name": "${role_name}"}},
+         "extract": {"role_id": 'body.data.list[?(@.name == "${role_name}")][0].id'}},
+        {"name": "update", "request": {"method": "POST", "url": "/roles/${role_id}", "json": {"name": "updated"}}},
+        {"name": "delete", "request": {"method": "DELETE", "url": "/roles/${role_id}"}},
+    ]}
+    with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+        result = run_case("filtered-write", case)
+    assert result["status"] == "passed", result
+    assert [request["url"] for request in session.requests[2:]] == [
+        "https://api.example.test/roles/9", "https://api.example.test/roles/9",
+    ]
+    assert session.requests[1]["params"] == {"name": role_name}
+
+
+def test_unfiltered_or_duplicate_list_extractions_stop_before_a_later_write_and_preserve_response_evidence():
+    base_case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+        {"name": "lookup", "request": {"url": "/roles"}, "extract": {"role_id": "body.data.list[0].id"}},
+        {"name": "must-not-write", "request": {"method": "POST", "url": "/roles/${role_id}"}},
+    ]}
+    duplicate_case = {"config": {"base_url": "https://api.example.test", "variables": {"role_name": "same"}}, "teststeps": [
+        {"name": "lookup", "request": {"url": "/roles"},
+         "extract": {"role_id": "body.data.list[?(@.name == ${role_name})][0].id"}},
+        {"name": "must-not-write", "request": {"method": "POST", "url": "/roles/${role_id}"}},
+    ]}
+    for case in (base_case, duplicate_case):
+        session = FakeSession([FakeResponse(body={"data": {"list": [
+            {"id": 1, "name": "same"}, {"id": 2, "name": "same"},
+        ]}})])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("unsafe-list", case)
+        first, second = result["step_datas"]
+        assert result["status"] == first["status"] == "failed"
+        assert result["error_type"] == "ExtractionFailure"
+        assert second["status"] == "skipped"
+        assert len(session.requests) == 1
+        assert first["data"]["req_resps"][0]["response"]["body"]["data"]["list"][0]["id"] == 1
+        assert "唯一匹配" in first["error"]
+
+
+def test_source_use_tracks_current_extract_version_including_headers_and_cookies():
+    replacement = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+        {"request": {"url": "/old"}, "extract": {"id": "body.list[0].id"}},
+        {"request": {"url": "/new"}, "extract": {"id": "body.id"}},
+        {"request": {"method": "POST", "url": "/items/${id}"}},
+    ]}
+    safe_session = FakeSession([FakeResponse(body={"list": [{"id": 1}, {"id": 2}]}), FakeResponse(body={"id": 9}), FakeResponse()])
+    with patch("api_testing.requests_runtime.requests.Session", return_value=safe_session):
+        assert run_case("overridden", replacement)["status"] == "passed"
+    for extract, transfer_selector, write_variable in (
+        ({"id": "body.list[0].id"}, None, "write_id"),
+        ({"old_id": "body.list[0].id"}, "extract.old_id", "new_id"),
+        ({"old_object": "body.list"}, "extract.old_object[0].id", "new_id"),
+    ):
+        config_variables = {"id": "", "write_id": "${id}"} if write_variable == "write_id" else {}
+        steps = [{"request": {"url": "/roles"}, "extract": extract}]
+        if transfer_selector is not None:
+            steps.append({"request": {"url": "/copy"}, "extract": {"new_id": transfer_selector}})
+        steps.append({"request": {"method": "POST", "url": f"/roles/${{{write_variable}}}"}})
+        session = FakeSession([FakeResponse(body={"list": [{"id": 1}, {"id": 2}]})])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("alias-source", {"config": {"base_url": "https://api.example.test", "variables": config_variables}, "teststeps": steps})
+        assert result["error_type"] == "ExtractionFailure"
+        assert len(session.requests) == 1
+    for request_part in ({"headers": {"X-ID": "${id}"}}, {"cookies": {"id": "${id}"}}):
+        case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+            {"request": {"url": "/roles"}, "extract": {"id": "body.list[0].id"}},
+            {"request": {"method": "POST", "url": "/roles", **request_part}},
+        ]}
+        session = FakeSession([FakeResponse(body={"list": [{"id": 1}, {"id": 2}]})])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("header-cookie-source", case)
+        assert result["error_type"] == "ExtractionFailure"
+        assert len(session.requests) == 1
+
+
+def test_exported_runtime_embeds_filter_selector_without_new_dependencies():
+    case = {"config": {"base_url": "https://api.example.test", "variables": {"role_name": "current"}}, "teststeps": [
+        {"request": {"url": "/roles"},
+         "extract": {"role_id": 'body.data[?(@.name == "${role_name}")][0].id'}},
+        {"request": {"method": "POST", "url": "/roles/${role_id}"}},
+    ]}
+    source = export_python(case)
+    assert "class _SelectorParser:" in source
+    namespace = {"__name__": "exported_filter_runtime"}
+    exec(compile(source, "exported_filter_runtime.py", "exec"), namespace)
+    session = FakeSession([FakeResponse(body={"data": [{"id": 7, "name": "current"}]}), FakeResponse()])
+    with patch.object(namespace["requests"], "Session", return_value=session):
+        result = namespace["run_case"]("exported-filter", namespace["CASE"])
+    assert result["status"] == "passed"
+    assert session.requests[1]["url"] == "https://api.example.test/roles/7"
+
+
+def test_object_transfer_cannot_hide_a_new_unfiltered_array_index_before_write():
+    case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+        {"request": {"url": "/list"}, "extract": {"payload": "body"}},
+        {"request": {"url": "/copy"}, "extract": {"id": "extract.payload.data[0].id"}},
+        {"request": {"method": "POST", "url": "/items/${id}"}},
+    ]}
+    session = FakeSession([FakeResponse(body={"data": [{"id": 1}, {"id": 2}]}), FakeResponse()])
+    with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+        result = run_case("transfer-index", case)
+    assert result["error_type"] == "ExtractionFailure"
+    assert len(session.requests) == 2
+    assert result["step_datas"][2]["status"] == "skipped"
 
 
 def test_normalize_case_is_json_only_copied_and_rejects_hooks():

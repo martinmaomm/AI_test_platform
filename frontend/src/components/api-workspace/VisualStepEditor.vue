@@ -122,6 +122,11 @@
               value-placeholder="如 body.data.token"
               @update:model-value="patch({ extract: $event })"
           /></el-form-item>
+          <p class="selector-hint">
+            按唯一名称提取示例：<code>{{ selectorExample }}</code>。
+            unique_name 需先在变量中定义。提取必须恰好匹配一条；零条或多条会停止，不会默认选第一条。
+            删除后可对筛选结果使用“长度等于 0”断言，无需再提取 ID。
+          </p>
           <div class="assertion-title">断言</div>
           <div
             v-for="(assertion, assertionIndex) in assertions"
@@ -139,9 +144,15 @@
                 value="ne" /><el-option
                 label="包含"
                 value="contains" /><el-option
+                label="不包含"
+                value="not_contains" /><el-option
                 label="大于"
                 value="gt" /><el-option label="小于" value="lt"
-            /></el-select>
+              /><el-option label="大于等于" value="ge" />
+              <el-option label="小于等于" value="le" />
+              <el-option label="类型为" value="type" />
+              <el-option label="长度等于" value="length" />
+            </el-select>
             <el-input
               :model-value="assertion.target"
               :disabled="disabled"
@@ -192,6 +203,7 @@ const props = defineProps({
 });
 const emit = defineEmits(["update:modelValue", "remove"]);
 const methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+const selectorExample = 'body.data[?(@.name == ${unique_name})][0].id';
 const step = computed(() => normalizeStep(props.modelValue, props.index + 1));
 const currentBodyKind = computed(() => bodyKind(step.value.request));
 const jsonText = computed(() =>
@@ -261,6 +273,16 @@ const removeAssertion = (index) =>
   font-size: 13px;
   font-weight: 600;
   margin-bottom: 8px;
+}
+.selector-hint {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.selector-hint code {
+  color: var(--el-text-color-regular);
+  white-space: normal;
 }
 .assertion-row {
   display: grid;

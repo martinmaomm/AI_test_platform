@@ -206,6 +206,7 @@ def normalize_case(value: Any) -> dict[str, Any]:
                 raise CaseContractError(f"{field}.extract 变量名无效：{name!r}")
             if not isinstance(selector, str) or not selector.strip():
                 raise CaseContractError(f"{field}.extract.{name} 必须是非空选择器")
+            validate_selector(selector)
         validates = step.get("validate", step.get("validators", []))
         if validates is None:
             validates = []
@@ -216,6 +217,8 @@ def normalize_case(value: Any) -> dict[str, Any]:
         step["request"] = request
         step["extract"] = deepcopy(dict(extract))
         step["validate"] = [_canonical_validator(item, f"{field}.validate[{position}]") for position, item in enumerate(validates)]
+        for position, validator in enumerate(step["validate"]):
+            validate_selector(_parse_validator(validator, f"{field}.validate[{position}]")["check"])
         step.pop("validators", None)
         normalised_steps.append(step)
 
@@ -245,10 +248,46 @@ def _variable_names(value: Any) -> set[str]:
 
 
 def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, Any], *,
-                              headers: Mapping[str, Any] | None = None) -> None:
+                              headers: Mapping[str, Any] | None = None) -> set[tuple[int, str]]:
     """Reject statically unknown placeholders before any HTTP request is sent."""
     available = set(variables)
+    definitions: dict[str, tuple[int, str] | None] = {name: None for name in available}
+    extraction_sources: dict[tuple[int, str], set[tuple[int, str]]] = {}
+    require_unique: set[tuple[int, str]] = set()
     config = case["config"]
+
+    def definition_sources(definition: tuple[int, str], seen: set[tuple[int, str]] | None = None) -> set[tuple[int, str]]:
+        seen = set() if seen is None else seen
+        if definition in seen:
+            return set()
+        seen.add(definition)
+        sources = extraction_sources.get(definition)
+        if sources is None:
+            return {definition}
+        # The transfer itself may introduce an array index even if its source
+        # was a plain object. Both ends of the chain must remain guarded.
+        return {definition}.union(*(definition_sources(source, seen) for source in sources))
+
+    def source_definitions(name: str, seen: set[str] | None = None) -> set[tuple[int, str]]:
+        """Follow config aliases until a current extraction definition takes over.
+
+        Runtime resolves config templates before requests begin, so this is a
+        deliberately conservative write guard: an unshadowed config alias
+        still protects any extracted variable it names. An extraction of the
+        alias name itself is a new definition version and stops that lookup.
+        """
+        seen = set() if seen is None else seen
+        if name in seen:
+            return set()
+        seen.add(name)
+        definition = definitions.get(name)
+        if definition is not None:
+            return definition_sources(definition)
+        raw_definition = config.get("variables", {}).get(name)
+        if raw_definition is None:
+            return set()
+        return set().union(*(source_definitions(item, seen) for item in _variable_names(raw_definition)))
+
     for value in (config.get("base_url"),):
         missing = _variable_names(value).difference(available)
         if missing:
@@ -269,12 +308,38 @@ def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, A
                 f"步骤 {index} 的有效 headers 使用了当前未定义的变量：{', '.join(sorted(missing_headers))}；"
                 "依赖登录提取值的 header 请放到登录后的具体步骤。"
             )
+        for name, selector in step["extract"].items():
+            missing = _variable_names(selector).difference(available)
+            if missing:
+                raise CaseContractError(f"步骤 {index} 提取 {name} 时发现未知变量：{', '.join(sorted(missing))}")
         for position, raw_validator in enumerate(step["validate"]):
             validator = _parse_validator(raw_validator, f"teststeps[{index - 1}].validate[{position}]")
+            missing = _variable_names(validator["check"]).difference(available | set(step["extract"]))
+            if missing:
+                raise CaseContractError(f"步骤 {index} 断言选择器中发现未知变量：{', '.join(sorted(missing))}")
             missing = _variable_names(validator["expect"]).difference(available | set(step["extract"]))
             if missing:
                 raise CaseContractError(f"步骤 {index} 断言中发现未知变量：{', '.join(sorted(missing))}")
+        if request["method"] not in {"GET", "HEAD", "OPTIONS"}:
+            request_values = [request.get(key) for key in ("url", "params", "json", "data", "raw", "cookies") if key in request]
+            request_values.append(effective_headers)
+            for variable_name in set().union(*(_variable_names(value) for value in request_values)):
+                require_unique.update(source_definitions(variable_name))
+        pending_definitions = {}
+        for name, selector in step["extract"].items():
+            definition = (index, name)
+            root, operations = _parse_selector(selector)
+            # ``extract.old_id`` (including a following key/index path) copies
+            # the current variable value. Track only that explicit first name;
+            # do not infer arbitrary dependencies from a whole extract object.
+            if root == "extract" and operations and operations[0][0] == "key":
+                extraction_sources[definition] = source_definitions(operations[0][1])
+            elif root == "extract" and not operations:
+                extraction_sources[definition] = set().union(*(source_definitions(item) for item in definitions))
+            pending_definitions[name] = definition
+        definitions.update(pending_definitions)
         available.update(step["extract"])
+    return require_unique
 
 
 def _builtin_variables() -> dict[str, Any]:
@@ -462,42 +527,267 @@ def _merge_headers(global_headers: Mapping[str, Any], step_headers: Mapping[str,
     return merged
 
 
-def _path_tokens(path: str) -> list[str]:
-    # Supports dot paths and basic JSONPath-like ["key"] / [0] segments.
-    return [token for token in re.findall(r"(?:^|\.)([^.\[\]]+)|\[\s*['\"]?([^\]'\"]+)['\"]?\s*\]", path) for token in token if token != ""]
+_SELECTOR_ROOTS = {"body", "status_code", "headers", "extract"}
+_SELECTOR_ALIASES = {"status": "status_code", "pathstatus": "status_code", "header": "headers"}
 
 
-def _select(selector: str, context: Mapping[str, Any]) -> Any:
-    value = selector.strip()
-    if value.startswith("$."):
-        value = value[2:]
-    elif value.startswith("$"):
-        value = value[1:]
-    value = value.lstrip(".")
-    aliases = {"status": "status_code", "pathstatus": "status_code", "header": "headers"}
-    first, dot, rest = value.partition(".")
-    first = aliases.get(first, first)
-    if first not in context:
-        raise CaseContractError(f"不支持的响应选择器：{selector}")
-    current: Any = context[first]
-    if not dot:
-        return current
-    for token in _path_tokens(rest):
-        if isinstance(current, Mapping):
-            if first == "headers" and current is context["headers"]:
-                current = _header_value(current, token)
-            elif token in current:
-                current = current[token]
+class _SelectorParser:
+    """Parse the deliberately small response selector grammar without eval."""
+
+    def __init__(self, selector: str):
+        self.selector = selector
+        self.text = selector.strip()
+        self.position = 0
+
+    def error(self, detail: str) -> CaseContractError:
+        return CaseContractError(f"不支持的响应选择器 {self.selector!r}：{detail}")
+
+    def skip_spaces(self) -> None:
+        while self.position < len(self.text) and self.text[self.position].isspace():
+            self.position += 1
+
+    def expect(self, token: str) -> None:
+        if not self.text.startswith(token, self.position):
+            raise self.error(f"缺少 {token!r}")
+        self.position += len(token)
+
+    def bare_key(self, *, filter_field: bool = False) -> str:
+        start = self.position
+        stop = ".[]" + ("=)" if filter_field else "")
+        while self.position < len(self.text) and self.text[self.position] not in stop:
+            character = self.text[self.position]
+            if character.isspace() or character in "?@()*'\"{}":
+                break
+            self.position += 1
+        key = self.text[start:self.position]
+        if not key:
+            raise self.error("路径键不能为空；特殊键请使用带引号的 []")
+        if any(character in key for character in "*?@$()"):
+            raise self.error("不支持通配符、函数或动态路径")
+        return key
+
+    def quoted_string(self) -> str:
+        quote = self.text[self.position]
+        self.position += 1
+        result: list[str] = []
+        escapes = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "\\": "\\", "\"": '"', "'": "'", "/": "/"}
+        while self.position < len(self.text):
+            character = self.text[self.position]
+            self.position += 1
+            if character == quote:
+                return "".join(result)
+            if character in "\r\n":
+                raise self.error("字符串不能包含未转义换行")
+            if character != "\\":
+                result.append(character)
+                continue
+            if self.position >= len(self.text):
+                raise self.error("字符串转义不完整")
+            escaped = self.text[self.position]
+            self.position += 1
+            if escaped == "u":
+                code = self.text[self.position:self.position + 4]
+                if len(code) != 4 or any(item not in "0123456789abcdefABCDEF" for item in code):
+                    raise self.error("Unicode 转义非法")
+                self.position += 4
+                result.append(chr(int(code, 16)))
+            elif escaped in escapes:
+                result.append(escapes[escaped])
             else:
-                raise KeyError(token)
-        elif isinstance(current, list):
-            try:
-                current = current[int(token)]
-            except (ValueError, IndexError) as exc:
-                raise KeyError(token) from exc
-        else:
-            raise KeyError(token)
+                raise self.error("字符串转义非法")
+        raise self.error("字符串缺少结束引号")
+
+    def filter_field(self) -> tuple[str, ...]:
+        self.expect("@")
+        self.expect(".")
+        keys = [self.bare_key(filter_field=True)]
+        while self.position < len(self.text) and self.text[self.position] == ".":
+            self.position += 1
+            keys.append(self.bare_key(filter_field=True))
+        return tuple(keys)
+
+    def filter_literal(self) -> tuple[str, Any]:
+        self.skip_spaces()
+        if self.position >= len(self.text):
+            raise self.error("筛选条件缺少等值右侧数据")
+        if self.text[self.position] in "'\"":
+            value: Any = self.quoted_string()
+            variable = _FULL_VARIABLE.fullmatch(value)
+            if variable:
+                return "variable", next(name for name in variable.groups() if name is not None)
+            return "literal", value
+        start = self.position
+        while self.position < len(self.text) and self.text[self.position] not in ") \t\r\n":
+            self.position += 1
+        token = self.text[start:self.position]
+        variable = _FULL_VARIABLE.fullmatch(token)
+        if variable:
+            return "variable", next(name for name in variable.groups() if name is not None)
+        try:
+            value = json.loads(token)
+        except json.JSONDecodeError as exc:
+            raise self.error("筛选条件右侧只能是 JSON 标量或完整变量") from exc
+        if isinstance(value, (list, dict)):
+            raise self.error("筛选条件右侧只能是 JSON 标量")
+        return "literal", value
+
+    def bracket(self) -> tuple[str, Any]:
+        self.expect("[")
+        self.skip_spaces()
+        if self.position >= len(self.text):
+            raise self.error("缺少 ]")
+        if self.text[self.position] in "'\"":
+            key = self.quoted_string()
+            self.skip_spaces()
+            self.expect("]")
+            return "key", key
+        if self.text.startswith("?(", self.position):
+            self.position += 2
+            self.skip_spaces()
+            field = self.filter_field()
+            self.skip_spaces()
+            self.expect("==")
+            kind, value = self.filter_literal()
+            self.skip_spaces()
+            self.expect(")")
+            self.skip_spaces()
+            self.expect("]")
+            return "filter", (field, kind, value)
+        start = self.position
+        while self.position < len(self.text) and self.text[self.position].isdigit():
+            self.position += 1
+        token = self.text[start:self.position]
+        self.skip_spaces()
+        if not token or not self.text.startswith("]", self.position):
+            raise self.error("[] 只支持带引号的键、非负数字索引或单个等值筛选")
+        self.position += 1
+        return "index", int(token)
+
+    def parse(self) -> tuple[str, tuple[tuple[str, Any], ...]]:
+        if not self.text:
+            raise self.error("不能为空")
+        if self.text.startswith("$"):
+            self.position = 1
+            if self.position < len(self.text) and self.text[self.position] == ".":
+                self.position += 1
+        elif self.text.startswith("."):
+            self.position = 1
+        root_start = self.position
+        self.bare_key()
+        root_name = self.text[root_start:self.position]
+        root = _SELECTOR_ALIASES.get(root_name, root_name)
+        if root not in _SELECTOR_ROOTS:
+            raise self.error("根节点仅支持 body、status_code、headers 或 extract")
+        operations: list[tuple[str, Any]] = []
+        while self.position < len(self.text):
+            character = self.text[self.position]
+            if character == ".":
+                self.position += 1
+                operations.append(("key", self.bare_key()))
+            elif character == "[":
+                operations.append(self.bracket())
+            else:
+                raise self.error("存在未解析残余")
+        return root, tuple(operations)
+
+
+def _parse_selector(selector: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
+    if not isinstance(selector, str):
+        raise CaseContractError("响应选择器必须是字符串")
+    return _SelectorParser(selector).parse()
+
+
+def validate_selector(selector: str) -> None:
+    """Reject unsupported selector syntax before a case is executed."""
+    _parse_selector(selector)
+
+
+def selector_has_filter(selector: str) -> bool:
+    """Return whether a valid selector contains an exact-match list filter."""
+    return any(kind == "filter" for kind, _ in _parse_selector(selector)[1])
+
+
+def _filter_value(item: Any, field: tuple[str, ...]) -> Any:
+    current = item
+    for key in field:
+        if not isinstance(current, Mapping) or key not in current:
+            raise KeyError(key)
+        current = current[key]
     return current
+
+
+def _selector_equals(actual: Any, expected: Any) -> bool:
+    # JSON booleans are not numbers for selector equality, unlike Python's True == 1.
+    return type(actual) is type(expected) and actual == expected
+
+
+def _select(selector: str, context: Mapping[str, Any], *, variables: Mapping[str, Any] | None = None,
+            require_unique: bool = False) -> Any:
+    """Select a response value using only parsed keys, indexes and one equality filter.
+
+    A filter returns its list unchanged for validators (so ``length=0`` can
+    assert absence). Extraction callers opt into ``require_unique`` whenever a
+    filter exists or a value later drives a write request.
+    """
+    root, operations = _parse_selector(selector)
+    if root not in context:
+        raise CaseContractError(f"不支持的响应选择器：{selector}")
+    bindings = variables if variables is not None else context.get("extract", {})
+    if not isinstance(bindings, Mapping):
+        raise CaseContractError("响应选择器变量上下文必须是 JSON 对象")
+    current: Any = context[root]
+    for position, (kind, payload) in enumerate(operations):
+        if kind == "key":
+            if not isinstance(current, Mapping):
+                if isinstance(current, list):
+                    if not payload.isdecimal():
+                        raise CaseContractError("数组不支持隐式字段投影；请明确使用 [0].字段")
+                    if require_unique and len(current) != 1:
+                        raise ExtractionFailure(f"选择器数组必须唯一匹配，实际为 {len(current)} 条")
+                    try:
+                        current = current[int(payload)]
+                    except IndexError as exc:
+                        raise KeyError(payload) from exc
+                    continue
+                raise KeyError(payload)
+            if root == "headers" and position == 0:
+                current = _header_value(current, payload)
+            elif payload in current:
+                current = current[payload]
+            else:
+                raise KeyError(payload)
+        elif kind == "index":
+            if not isinstance(current, list):
+                raise KeyError(payload)
+            if require_unique and len(current) != 1:
+                raise ExtractionFailure(f"选择器数组必须唯一匹配，实际为 {len(current)} 条")
+            try:
+                current = current[payload]
+            except IndexError as exc:
+                raise KeyError(payload) from exc
+        else:
+            if not isinstance(current, list):
+                raise KeyError("filter")
+            field, value_kind, value = payload
+            if value_kind == "variable":
+                if value not in bindings:
+                    raise CaseContractError(f"未知变量：{value}")
+                expected = bindings[value]
+            else:
+                expected = value
+            current = [item for item in current if _filter_matches(item, field, expected)]
+            if require_unique and len(current) != 1:
+                raise ExtractionFailure(f"选择器筛选结果必须唯一匹配，实际为 {len(current)} 条")
+    if require_unique and isinstance(current, list) and len(current) != 1:
+        raise ExtractionFailure(f"选择器结果必须唯一匹配，实际为 {len(current)} 条")
+    return current
+
+
+def _filter_matches(item: Any, field: tuple[str, ...], expected: Any) -> bool:
+    try:
+        return _selector_equals(_filter_value(item, field), expected)
+    except KeyError:
+        return False
 
 
 def _response_body(response: Any) -> Any:
@@ -560,7 +850,7 @@ def _validator_record(validator: Mapping[str, Any], context: Mapping[str, Any], 
     raw_expected = deepcopy(validator["expect"])
     try:
         expected = _substitute(raw_expected, variables)
-        actual = _select(check, context)
+        actual = _select(check, context, variables=variables)
         passed = _compare(comparator, actual, expected)
         message = "断言通过" if passed else f"断言失败：{check} {comparator} {expected!r}，实际为 {actual!r}"
     except (CaseContractError, KeyError, TypeError, ValueError) as exc:
@@ -699,7 +989,7 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
         variables.update(deepcopy(option_variables))
         variables = _resolve_variable_definitions(variables)
         runtime = _runtime_options(case, option_mapping)
-        _validate_known_variables(case, variables, headers=runtime["headers"])
+        unique_extracts = _validate_known_variables(case, variables, headers=runtime["headers"])
         resolved_base_url = _substitute(base_url if base_url is not None else config.get("base_url"), variables)
     except (CaseContractError, UnsupportedCaseFeature) as exc:
         return _report(script_id=script_id, name="", started_wall=started_wall, started_monotonic=started_monotonic, steps=steps, error=str(exc), error_type=type(exc).__name__)
@@ -776,7 +1066,10 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
                 extraction_errors: list[str] = []
                 for name, selector in step["extract"].items():
                     try:
-                        exported[name] = deepcopy(_select(selector, response_context))
+                        exported[name] = deepcopy(_select(
+                            selector, response_context, variables=variables,
+                            require_unique=((index, name) in unique_extracts or selector_has_filter(selector)),
+                        ))
                         extraction_results.append({"name": name, "selector": selector, "passed": True})
                     except (CaseContractError, KeyError, TypeError, ValueError) as exc:
                         message = f"步骤 {index} 提取变量 {name} 失败：{exc}"
@@ -884,5 +1177,5 @@ if __name__ == "__main__":
 
 __all__ = [
     "CaseContractError", "UnsupportedCaseFeature", "normalize_case", "run_case", "export_python",
-    "build_error_report", "hard_timeout_report", "resolve_total_timeout",
+    "build_error_report", "hard_timeout_report", "resolve_total_timeout", "validate_selector", "selector_has_filter",
 ]

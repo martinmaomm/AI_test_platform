@@ -41,6 +41,23 @@ import {
   workspaceInitializationPlan,
 } from "../src/views/api-testing/apiWorkspace.js";
 
+test("visual editor keeps exact filters and exposes absence assertions", async () => {
+  const selector = 'body.data[?(@.name == ${unique_name})]';
+  const draft = normalizeDraft({teststeps: [{
+    request: {method: "GET", url: "/items"},
+    extract: {id: `${selector}[0].id`},
+    validate: [{length: [selector, 0]}],
+  }]});
+  assert.equal(draft.teststeps[0].extract.id, `${selector}[0].id`);
+  assert.deepEqual(draft.teststeps[0].validate, [{length: [selector, 0]}]);
+  const editor = await readFile(new URL("../src/components/api-workspace/VisualStepEditor.vue", import.meta.url), "utf8");
+  for (const value of ["eq", "ne", "contains", "not_contains", "gt", "ge", "lt", "le", "type", "length"]) {
+    assert.ok(editor.includes(`value="${value}"`), `missing comparator: ${value}`);
+  }
+  assert.ok(editor.includes("零条或多条会停止"));
+  assert.ok(editor.includes("长度等于 0"));
+});
+
 test("API workspace draft remains structured and preserves body kinds", () => {
   const draft = normalizeDraft({
     config: { name: "登录", variables: { retry: 2 } },

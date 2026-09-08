@@ -321,6 +321,9 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
                 effective_step['request'], endpoint, index=index,
                 session_cookie_available=bool(completed_dependency_ids.intersection(cookie_session_dependency_ids or set())),
             )
+        # Conditions in extract selectors are evaluated against values from
+        # earlier steps, never another partially extracted value in this step.
+        _require_variables(step['extract'], scoped_values, allowed=available, label=f'候选步骤 {index + 1} 提取条件')
         for extracted_name in step['extract']:
             scoped_values.pop(extracted_name, None)
         _require_variables(step['validate'], scoped_values, allowed=available | set(step['extract']), label=f'候选步骤 {index + 1} 断言')

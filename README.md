@@ -1,215 +1,197 @@
-# AI_test_platform
+# AITS · AI 自动化测试平台
 
-## API 对话工作区（requests）
+AITS 是一个以项目为单位管理测试的平台：使用自然语言和 AI 生成 UI / API 自动化用例，在平台内调试、修复和保存，再通过测试套件、计划任务重复执行，并查看统一的执行报告。
 
-入口：API 自动化 → API 对话工作区。上传 Swagger/OpenAPI 后选取相关接口和模型，用对话生成或修改当前草稿。接口文档只作为上下文，不需要开启 RAG 或下载向量模型。
+当前主要能力是 **UI 自动化、API 自动化和项目知识库**。首页的 App 自动化、性能测试是开发中入口，暂不可使用。
 
-1. 选择一份可用 Swagger 和接口范围（最多 50 个），点击“生成并验证”，确认目标地址和可选变量。确认后会发起真实接口请求，可能新增、修改或删除测试数据。
-2. 平台先检查候选，再用 requests 顺序试运行；请求/提取结构错误可自动修复并复测，最多三轮。认证、权限、服务故障、超时或普通业务断言失败会停止自动重放，保留证据供人工处理。
-3. 查看每轮请求、响应、提取、断言及修改摘要。只有全部步骤实际运行且断言通过才标记“已验证通过”；失败候选也可采用后手动编辑。点击“采用候选”才更新可视化草稿，再显式保存为测试用例，不会自动覆盖原用例。修改草稿后，旧验证记录不再代表当前版本通过。
-4. Python 支持只读查看、复制、导出，不支持 Python 反向同步为可视化步骤。导出文件携带相同运行核心，安装 `requests` 后可 `python test_api.py` 运行，或安装 `pytest` 后执行 `python -m pytest test_api.py`。
+[安装与配置](docs/installation.md) · [UI 自动化流程](#ui-自动化流程) · [API 自动化流程](#api-自动化流程) · [文档索引](#文档索引)
 
-仍可手动点击“显式调试执行”，失败后选择“修复并验证”。用例和套件复用同一 requests 核心；套件内顺序执行，各用例独立 Session，不互相泄漏提取值或 Cookie。`backend/env.example` 中的 `AITS_API_GENERATION_TIMEOUT_SECONDS` 控制整个生成及验证任务期限（默认 1800 秒），与单次模型请求的 `AITS_LLM_TIMEOUT_SECONDS` 分开；修改后重启后端及 Celery。
+## 平台能做什么
 
-变量覆盖顺序：本次覆盖 > 套件变量 > 用例变量 > API 环境默认值。`${name}`、`$name` 和 `{{name}}` 支持完整值占位保留类型；嵌入字符串时转为文字。内置 `timestamp_ns`、`uuid4` 每次运行生成新值，例如 `username: "test_${timestamp_ns}"`，可以显式覆盖以复现一次运行。
+| 模块 | 用途 |
+| --- | --- |
+| UI 自动化 | 描述测试目标，由 Playwright MCP 探索网站并生成 Python 脚本；支持编辑、调试、AI 辅助修改与失败修复 |
+| API 自动化 | 导入 Swagger / OpenAPI，在对话工作区生成多个测试场景，自动运行与有限修复，支持步骤配置和 Python 导出 |
+| 测试用例与套件 | 保存可重复执行的正式用例，将多个独立用例按顺序组成套件，配置执行变量 |
+| 执行记录与报告 | 查看本次运行结果、失败原因、日志；UI 展示截图，API 展示请求、响应、提取和断言明细 |
+| 计划任务与通知 | 按时间执行项目套件，完成后通过已配置的通知渠道发送结果和平台报告链接 |
+| 项目知识库 | 上传项目资料、按章节处理和建立语义索引，生成手工测试用例或进行带来源的知识问答 |
+| 系统配置 | 管理模型与提供商、MCP、RAG 和通知配置，以及项目成员与权限 |
 
-脚本、环境和套件顺序在提交执行时冻结；运行中修改原用例不会改变当前任务。平台在子进程中执行结构化请求并限制总时长；导出脚本使用连接/读取超时及步骤间总时限检查。超时停止本地进程不代表远端写操作已撤销，请检查测试数据。请勿使用生产账号。
+## 技术栈
 
-升级前备份数据库并停止旧后端/Celery，在 `backend` 虚拟环境中执行：
+| 层次 | 框架 / 工具 | 负责什么 |
+| --- | --- | --- |
+| 前端 | Vue 3、Vite 5、Element Plus、Pinia、Vue Router、Axios | 页面、状态管理和后端交互 |
+| 脚本编辑与展示 | Monaco Editor、ECharts | 代码编辑及统计图表 |
+| 后端 | Django 4.2、Django REST Framework、Simple JWT | 业务接口、数据管理与登录鉴权 |
+| 后台任务与实时状态 | Celery、Redis、django-celery-beat、Django Channels、Uvicorn | 排队执行、定时派发、WebSocket 进度和 ASGI 服务 |
+| UI 页面探索 | Node.js、`@executeautomation/playwright-mcp-server@1.0.12`、Node Playwright 1.57.0、mcp-use | AI 调用浏览器工具，观察页面并逐步整理脚本 |
+| UI 脚本执行 | Python Playwright 1.62.0、pytest、pytest-playwright | 在 Chromium 中调试和重复运行 Python 用例 |
+| API 脚本执行 | Python requests | 执行结构化用例；导出的 Python 使用同一套运行逻辑 |
+| AI 调用 | LangChain、LangGraph、模型适配器 | 模型调用和智能体流程；模型请求统一使用流式传输 |
+| 业务数据库 | MySQL / MariaDB、PyMySQL | 保存项目、配置、用例、任务与执行记录 |
+| 知识检索（按需） | Chroma / Milvus、Sentence Transformers、LangChain 文档处理组件 | 文档切分、向量化与语义检索 |
 
-```bash
-python manage.py migrate api_testing
-```
+依赖以 [Python 清单](backend/requirements.txt)、[前端清单](frontend/package.json) 和 [前端锁文件](frontend/package-lock.json) 为准。
 
-然后重启后端和 Celery；前端 `npm run dev` 刷新即可，静态部署需重新构建。迁移新增工作区与执行快照，不删除既有数据库记录。旧 HttpRunner 任意代码钩子不再支持，不自动转换旧脚本；建议使用工作区重新生成。
+两个 Playwright 用途不同：**Node MCP 用于探索，Python Playwright 用于执行**，浏览器版本和缓存目录分开配置。平台原生报告不依赖 Allure；当前 API 工作区和执行链路使用 requests，不再使用 HttpRunner 执行用例。
 
-实施与验收边界见 [API 生成、验证与有限修复 B 方案](docs/plans/2026-09-07-api-generate-verify-repair.md)。
+## UI 自动化流程
 
-## WebUI 脚本生成（当前流程）
+`描述目标 → MCP 探索并逐步生成 Python → 检查草稿 → 调试 / AI 修复 → 保存用例 → 重复执行 / 套件运行`
 
-在测试描述中直接写完整 HTTP(S) 网址、测试目标，以及按需填写的测试账号和密码。
-UI 自动化不再选择测试环境、起始相对路径或独立登录信息；生成、调试、单用例和套件都执行脚本中的完整网址，不依赖 Base URL。API 测试的环境管理不受影响。
+### 1. 描述测试目标
+
+在 AI 脚本生成页面填写完整的被测网址、需要完成的业务操作、验证要求，以及按需使用的测试登录信息。可指定业务模块；模块仅用于分类，不需要先维护页面库或元素库。
+
+例如：打开测试网站，登录后进入菜单列表，新增唯一名称的菜单，编辑并验证，最后删除并确认不存在。新增数据可要求使用 `time.time_ns()` 生成唯一名称。
+
+UI 流程不再要求选择测试环境或单独填写 Base URL，脚本使用描述中的完整网址。
+
+### 2. AI 探索网页并生成脚本
+
+单个 MCP 智能体在同一浏览器会话中完成探索，平台记录工具操作、页面信息和探索轨迹，并保存逐步生成的 Python 草稿。
+
+- 不再要求先生成一份完整的页面 JSON，再由另一条流程拼装脚本。
+- 根据测试目标可以执行新增、修改、删除等操作，并非只读浏览；应使用允许修改数据的测试环境。
+- 生成脚本包含场景说明、操作注释和验证日志，方便用户直接修改代码。
+- 工具调用、重复失败和探索总时限均有限制；异常时保留已产出的草稿与证据，不把未完成探索标记为成功。
+
+### 3. 检查和调试草稿
+
+平台检查脚本结构及待补全标记，但**生成完成不等于实际运行通过**。
+
+用户可以在生成页面直接编辑和调试脚本，查看日志、失败摘要和截图。存在 `AITS_PENDING_STEP` 或 `AITS_PENDING_ASSERTION` 时，表示操作或断言仍待补全，不能当作完整验证通过。
+
+脚本入口为 `async def run(page)` 或 `async def run(page, variables)`，浏览器由平台管理，脚本负责打开目标网址和执行业务操作。
+
+脚本需要参数时，通过 `os.getenv("VARIABLE_NAME")` 读取，在页面配置变量。UI 变量覆盖顺序为：**本次执行 > 套件 > 用例**。
+
+### 4. AI 辅助修改与修复
+
+可以通过对话修改脚本，也可以从失败执行记录进入 AI 修复。修复以本次运行的脚本和错误证据为依据，展示候选代码及差异。
+
+候选可以先“运行验证”，检查日志和截图，再决定是否采用并保存；有修改范围警告时需额外确认。AI 不应通过删掉断言来伪装成功，也不会因为生成了候选就自动覆盖原用例。
+
+### 5. 保存并重复执行
+
+确认脚本后保存为正式测试用例。每个用例独立，测试套件只是有序的用例集合，不依赖上一个用例留下的变量或浏览器状态。
+
+执行层在成功结束和失败时尝试截图，并保存日志供调试及报告查看；浏览器未能启动、页面已关闭等情况可能无法截图。无需为平台报告安装 Allure。
+
+## API 自动化流程
+
+`导入 Swagger → 选择接口与模型 → 对话规划场景 → 生成候选配置 → 实际执行 / 有限修复 → 审阅保存 → 重复执行 / Python 导出`
+
+### 1. 导入接口规范
+
+在 API 项目导入 Swagger / OpenAPI，整理接口方法、路径、请求参数、请求体、响应结构和示例等信息。生成以选定规范为依据，不要求先配置向量知识库。
+
+文档描述不等于服务实际行为：如果接口规范、示例或业务规则不完整，仍需根据运行证据和实际需求核对断言。
+
+### 2. 在对话工作区明确范围
+
+选择规范、相关接口和已启用的模型，描述测试目标，确认被测 Base URL 和运行变量。可以要求生成多个场景，并使用唯一数据支持重复执行。
+
+当前一次最多选择 **50 个接口**，一次规划最多 **20 个场景**。登录、创建前置数据等依赖接口也应包含在选定范围内；覆盖所选接口不代表覆盖了所有参数组合或业务边界。
+
+工作区支持重命名、删除和继续对话。多场景任务会拆成独立子场景，每个子场景有自己的候选、验证记录和保存状态。
+
+### 3. 生成结构化用例
+
+AI 生成的是平台可执行的结构化配置，包含顺序步骤、请求头、查询参数、JSON / 表单请求体、变量提取和断言，而不是任意 Python 代码。
+
+平台先检查接口范围、请求结构、变量定义和断言等，再交给 requests 运行。页面可以查看场景概要和编辑步骤；Python 视图用于查看、复制和导出，不是另一套可自由编辑的执行源。
+
+### 4. 自动运行与有限修复
+
+用户确认真实请求后，由 Celery 按场景顺序生成和验证：
+
+- 每个场景最多 **3 轮候选尝试**，即首次生成加最多两次修复，不是无限重试。
+- 每轮先检查配置，再实际请求被测接口，保存响应、提取结果、断言及错误证据。
+- 可修复的请求或提取结构问题交回 AI；修复不得随意删除业务目标、削弱原断言或改写预期来换取通过。
+- 请求超时、HTTP 权限错误、服务端错误等需要谨慎处理，不盲目重放可能已生效的写操作；无法自动解决时标记需要人工处理。
+- 单场景步骤失败后，后续依赖步骤不继续执行；其他独立场景按顺序处理，任务取消或总时限等情况除外。
+
+“通过”表示本轮实际执行和已有断言通过，不代表 AI 设计的测试一定完整。人工处理时可以修改步骤或继续对话，再重新运行验证。
+
+### 5. 参数和上下游数据
+
+步骤可以把登录令牌、创建对象的 ID 等提取为变量，供后续步骤使用。运行器内置 `timestamp_ns`、`uuid4`，可通过 `${变量名}` 等模板构造唯一数据。
+
+需要从列表提取本轮对象时，可以使用唯一条件，例如：
 
 ```text
-目标网址：http://localhost:9990/#/users
-使用测试账号 test_user、密码 test_password 登录，进入用户列表。
-新增本轮唯一用户，验证列表显示，修改后验证，删除后确认不存在。
+body.data[?(@.name == ${unique_name})][0].id
 ```
 
-描述缺少网址会提示补充；有多个网址时，使用单独的“目标网址：”行明确入口。
-路径、查询参数和 `#` 路由会保留。每个脚本仍可配置可选变量，覆盖顺序为：本次运行 > 套件变量 > 用例变量。
-测试凭据可能保留在记录、日志、截图和脚本中，**请勿使用生产账号**。
+上述条件提取要求恰好匹配一个对象；零匹配或多匹配会失败，不能随意拿列表第一条作为修改或删除目标。
 
-本次升级先停止旧 Celery worker，在 `backend` 虚拟环境中执行下面两条迁移，再重启后端和 Celery：
+API 变量覆盖顺序为：**本次执行 > 套件 > 用例 > API 环境默认值**。各用例使用独立的 requests 会话，提取变量不跨用例隐式共享。
 
-```bash
-python manage.py migrate scheduled_tasks
-python manage.py migrate web_testing
-```
+### 6. 保存、执行和导出
 
-旧的相对路径脚本不做自动转换，请重新生成，或手工改成完整网址。
-迁移不删除 API 的共享环境数据；详细范围见 [描述直接驱动网址](docs/superpowers/specs/2026-09-04-webui-description-url-design.md)。
+采用候选只是更新工作区草稿，保存后才成为正式测试用例。草稿修改后需要重新验证，不能沿用旧版本的通过结论；保存本身也不等于验证通过。
 
-填写测试目标后，一个智能体在同一 Playwright MCP 会话中探索页面，并逐步保存完整 Python 草稿。平台记录操作证据、未完成步骤和终止原因，不再要求模型先提交 ScenarioPlan 或最终路径 JSON。
+正式用例可单独运行、组成测试套件或交给计划任务。平台保存本次执行输入和结果快照，展示请求 / 响应、提取、断言和未执行步骤。
 
-- 草稿通过静态检查后可以编辑、调试、保存到独立测试用例；草稿生成成功不等于测试通过。
-- `AITS_PENDING_STEP` / `AITS_PENDING_ASSERTION` 表示待补充操作或断言，有这些标记不能显示为调试通过。
-- 工作区按代码行号区分待补步骤和待补断言；模型未说明具体缺项时会明确提示人工核对，不推断某个业务操作失败。确认完成后移除对应标记并重新调试，单纯删除注释不代表已验证。
-- 普通提示显示简短中文摘要，模型最终回复、原始输出和完整诊断在“技术信息”中按需展开；本地编辑后的旧检查行号不再作为当前结论展示。
-- 超时、失败或取消后保留最近已保存的草稿；“基于轨迹整理脚本”只处理已有证据，不重新打开浏览器、不重复业务写入。
-- 使用测试账号，请勿使用生产账号。部署步骤见上方迁移与重启说明。
+需要离开平台运行时，可以导出 Python。导出文件包含同一套 requests 运行逻辑，不要求安装本项目后端；所需依赖及启动方式以导出文件说明为准。
 
-设计和验收说明见 [脚本优先生成](docs/superpowers/specs/2026-09-04-webui-script-first-generation.md)。
+## 相关模块与使用边界
 
-当前维护入口是 `generation_orchestrator.py`（流程调度）、`script_exploration_agent.py`（连续探索并保存 Python）、`draft_quality.py`（草稿检查）和 `assertion_state.py`（待补充项与运行判定），均位于 `backend/apps/web_testing/`。
-旧版 ScenarioPlan 整理器、JSON 回放编译器和对应的 AST 一致性检查已移除；探索轨迹与浏览器工具守卫中的共用逻辑仍保留，不要仅凭文件里的旧版本命名删除它们。
+- **项目知识库是独立流程**：上传资料 → 处理正文与索引 → 生成手工用例 / 知识问答。手工用例供人工参考，不会直接运行 Python，也不能加入自动化套件；知识库不是 UI 脚本生成的前置条件。
+- **计划任务**：按项目组织套件。UI 使用脚本内网址和执行变量；API 仍使用 API 环境。worker 负责执行，Beat 负责定时派发，页面会检测 Beat 心跳。
+- **顺序执行**：套件及其用例按顺序执行，普通用例失败后继续后续独立用例。当前部署使用单个 `--pool=solo` worker；启动多个 worker 不代表仍有全平台串行保证。
+- **报告与通知**：报告来自已保存的执行结果，不会为了生成报告再次执行测试。通知发送平台链接；查看报告仍需登录和对应项目权限。
+- **运行授权**：生成探索、调试、自动验证和 AI 修复都可能实际操作被测系统，应使用专用测试账号和可修改的测试数据。失败、取消不保证自动撤销已发生的操作。
+- **数据与模型**：描述、脚本、接口信息或知识库片段可能发送给所选模型提供商，日志与截图也可能包含登录信息。不要使用真实生产凭据或未经允许外发的数据。
 
-离线回归可在 `backend` 虚拟环境中运行 `python scripts/test_webui_generation_offline.py`：使用独立内存数据库、禁止网络访问，不触碰配置中的 MySQL、Redis 或被测网站。它不代替真实模型生成和浏览器业务流程验收。
-
-## 平台原生执行报告
-
-WebUI / API 执行结果和定时任务报告使用平台自己的页面，不再安装或生成 Allure 报告。
-执行详情展示实际保存的统计、用例结果、日志与截图；可通过需要登录和项目报告权限的独立链接查看。
-报告汇总不重新执行测试，API 定时任务也不会为了生成报告重复请求被测接口。
-
-本次升级需停止旧后端和 Celery，安装依赖并执行 `python manage.py migrate` 后重启；原始执行记录、日志和截图保留。
-旧脚本若手工使用了 Allure，请改用 Python 日志。详细范围、依赖卸载、验收与回退见 [平台原生执行报告](docs/platform-native-reports.md)。
-
-## 项目计划任务
-
-计划任务跟随当前项目选择套件，不再重复选择测试类型；UI 无环境配置，API 保留环境。多个套件按指定顺序执行，同一任务上一轮未结束时拒绝重复启动。
-执行结束沿用平台报告及通知。自动定时运行需要额外启动一个 Celery Beat，只有 worker 不会到点派发。升级迁移、启停和验收说明见 [项目计划任务](docs/scheduled-tasks.md)。
-
-## 项目知识库：手工用例与项目问答
-
-UI 项目的“项目知识库”现提供“项目资料、手工测试用例、知识问答”三个页签。
-它们使用独立任务、数据表和向量集合，不接入 Playwright MCP，不修改已有自动化脚本生成、调试或执行流程。
-
-升级时先停止旧 Celery worker，在 `backend` 的虚拟环境中执行：
-
-```bash
-python -m pip install -r requirements.txt
-python manage.py migrate project_knowledge
-```
-
-然后重启后端与 Celery。前端 `npm run dev` 模式刷新即可，生产环境重新构建并发布静态文件。
-迁移只新增结构，不清空旧知识库、API 资料、脚本或向量模型。现有资料不会自动导入新工作区，请在新入口上传要使用的文件并点击“处理文档”。
-
-- 资料处理：支持 TXT、Markdown、DOCX、文本 PDF、XLSX，单文件最多 50 MiB；保留章节及原文位置。先解析正文，再建立索引。
-- 手工用例：选择主需求与章节，顺序生成草稿，可检查来源、编辑、保存和导出 XLSX。正文已解析但索引失败时，可明确选择“仅基于所选正文生成”。
-- 项目问答：使用当前项目已启用且索引就绪的资料，回答带来源；没有依据或资料冲突时提示核对。聊天模型的回答不会自动变成新资料。
-- 向量检索：沿用已启用的 RAG 配置与 embedding 模型，但使用独立 collection。若模型已在本机缓存，可复用缓存；首次加载仍会占用内存，未缓存时可能需要下载。
-
-可选配置见 `backend/env.example`：
-
-```dotenv
-AITS_PROJECT_KNOWLEDGE_ENABLED=true
-AITS_KNOWLEDGE_TOTAL_TIMEOUT_SECONDS=1200
-```
-
-知识任务总时限默认 1200 秒（允许 30–1500 秒），排队时间不计入；每次模型请求仍遵守模型配置的 `timeout` 或 `AITS_LLM_TIMEOUT_SECONDS`。
-关闭功能开关会禁止新写入与提交，但仍可查看历史、取消本人任务；不会删除资料或影响原 API RAG / WebUI 自动化。
-
-操作、测试和回退说明见 [项目知识库使用与验收](docs/project-knowledge-guide.md)。
-
-## 部署依赖
-
-项目的 WebUI AI 脚本生成和 Python 测试执行分别使用两套 Playwright 运行时。两套浏览器版本可以共存，但不要只安装其中一套。
-
-### 1. Python 环境
-
-在 `backend` 目录创建并激活虚拟环境后安装依赖：
-
-```bash
-cd /path/to/aits_v2/backend
-python3.13 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-生成的 Python Playwright 脚本由 Python 虚拟环境执行，因此还需要安装 Python 侧浏览器：
-
-```bash
-python -m playwright install chromium
-```
-
-Python 测试执行使用独立环境变量。留空时使用 Playwright 的系统默认缓存目录：
-
-```dotenv
-PYTHON_PLAYWRIGHT_BROWSERS_PATH=
-```
-
-如需把 Python 浏览器也放进项目目录，应使用与 MCP 不同的目录：
-
-```bash
-export PLAYWRIGHT_BROWSERS_PATH="$PWD/.python-playwright-browsers"
-python -m playwright install chromium
-```
-
-并配置：
-
-```dotenv
-PYTHON_PLAYWRIGHT_BROWSERS_PATH=.python-playwright-browsers
-```
-
-### 2. Node.js Playwright MCP
-
-当前项目使用的 MCP 配置固定为：
-
-```json
-{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@executeautomation/playwright-mcp-server@1.0.12"
-      ]
-    }
-  }
-}
-```
-
-该 MCP 包内部使用 Playwright `1.57.0`，因此必须安装对应的 Chromium。建议将浏览器缓存放在项目目录中，便于部署和迁移：
-
-```bash
-cd /path/to/aits_v2/backend
-export PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers"
-npx -y playwright@1.57.0 install chromium
-```
-
-安装后可以检查目录是否存在：
-
-```bash
-test -d "$PLAYWRIGHT_BROWSERS_PATH/chromium-1200" && echo "Chromium 安装成功"
-```
-
-为了让 Celery 每次启动都使用项目内的浏览器目录，可以将下面一行加入 `backend/.env`：
-
-```dotenv
-MCP_PLAYWRIGHT_BROWSERS_PATH=.playwright-browsers
-```
-
-程序会将相对路径按 `backend` 根目录解析，并只传给 Node MCP 进程。修改 `.env` 后需要重启 Celery Worker。
-
-### 3. 平台和版本注意事项
-
-- `@executeautomation/playwright-mcp-server@1.0.12`、Node Playwright `1.57.0` 和 `chromium-1200` 要保持匹配。
-- Python Playwright 可以单独升级，例如 `1.62.0`；它只影响 Python 测试执行，不会改变 Node MCP 的浏览器版本。
-- 不要再使用通用的 `PLAYWRIGHT_BROWSERS_PATH` 同时配置两套运行时；分别使用 `MCP_PLAYWRIGHT_BROWSERS_PATH` 和 `PYTHON_PLAYWRIGHT_BROWSERS_PATH`。
-- 浏览器二进制与操作系统、CPU 架构相关。macOS 下载的浏览器不能直接复制到 Linux NAS 使用，应在实际运行 Celery 的服务器上安装。
-- 浏览器目录体积较大且平台相关，项目只保留安装说明，不提交到 Git；`backend/.playwright-browsers/` 已加入忽略列表。
-
-### 4. 启动 Celery
-
-```bash
-cd /path/to/aits_v2/backend
-source .venv/bin/activate
-celery -A aits_backend worker --loglevel=info --pool=solo
-```
-
-Celery 日志会写入：
+## 项目结构
 
 ```text
-backend/logs/celery.log
+aits_v2/
+├── README.md                    # 项目总览与业务流程
+├── docs/                        # 安装、使用、设计及验收文档
+├── frontend/                    # Vue 前端
+│   └── src/                     # 页面、组件、接口与状态管理
+└── backend/
+    ├── env.example              # 后端配置模板
+    ├── requirements.txt         # Python 依赖
+    ├── run_asgi.py              # 后端 HTTP / WebSocket 启动入口
+    ├── aits_backend/            # Django、Celery 等全局配置
+    ├── apps/
+    │   ├── web_testing/         # UI 探索、Python 执行和脚本助手
+    │   ├── api_testing/         # API 工作区、requests 执行和导出
+    │   ├── ai_core/             # 模型、MCP 和 RAG 配置
+    │   ├── project_knowledge/   # 项目资料、手工用例和知识问答
+    │   ├── scheduled_tasks/     # 计划任务、调度和报告关联
+    │   └── notifications/       # 通知渠道与发送
+    ├── scripts/                # 辅助与隔离测试脚本
+    └── resource/               # Playwright 浏览器离线安装说明
 ```
+
+## 安装与运行
+
+请从 [安装与配置指南](docs/installation.md) 开始，文档包含：
+
+1. Python venv、Node.js、MySQL / MariaDB 和 Redis 准备。
+2. 环境变量、依赖安装、数据库迁移和管理员创建。
+3. Node MCP 与 Python 两套浏览器的在线 / 离线安装。
+4. 前端、后端、Celery worker 和可选 Beat 的启动方式。
+5. 页面中的模型 / MCP / RAG 配置、日志位置、常见故障及升级注意事项。
+
+当前仓库以本地和测试环境启动流程为主，没有现成的一键 Docker / Compose 部署方案。`npm run dev` 是开发服务，生产部署还需要构建前端、配置反向代理、进程管理、访问控制与备份。
+
+## 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| [安装与配置](docs/installation.md) | 从准备环境到启动服务、配置模型和排查故障 |
+| [离线浏览器资源](backend/resource/README.md) | 指定版本的下载地址、目录布局和校验方式 |
+| [项目知识库指南](docs/project-knowledge-guide.md) | 资料处理、手工用例、问答和验收边界 |
+| [原生执行报告](docs/platform-native-reports.md) | UI / API / 计划任务报告规则 |
+| [计划任务](docs/scheduled-tasks.md) | 顺序调度、Beat 心跳、暂停与防重复执行 |
+| [API 工作区全量复测记录](docs/api-workspace-live-retest-2026-09-08.md) | 2026-09-08 的实际测试证据与人工修正记录；不是所有环境和场景的质量保证 |
+
+设计讨论和历史实施方案保存在 `docs/plans/`、`docs/superpowers/`。安装与使用以当前指南和代码为准，不要直接照搬历史方案里的迁移或清理命令。

@@ -3,7 +3,7 @@
     <div class="config-header">
       <BackButton to="/dashboard" text="返回首页" />
       <h1 class="config-title">全局系统配置</h1>
-      <p class="config-desc">邮件服务、消息渠道与通用系统参数</p>
+      <p class="config-desc">邮件通知服务与通用系统参数</p>
     </div>
 
     <div class="card-grid">
@@ -30,7 +30,7 @@
 </template>
 
 <script setup>
-import { Message, Bell, Operation } from '@element-plus/icons-vue'
+import { Message, Operation } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
 
 const cards = [
@@ -40,13 +40,6 @@ const cards = [
     title: '邮件服务配置',
     desc: '配置 SMTP 服务器、端口、发件人，供执行报告邮件推送',
     icon: Message
-  },
-  {
-    id: 'channels',
-    path: '/settings/channel-config',
-    title: '消息通道配置',
-    desc: '钉钉/企微/邮件通道接入说明与全局默认参数',
-    icon: Bell
   },
   {
     id: 'general',
@@ -92,7 +85,7 @@ const cards = [
 
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 24px;
 }
 
@@ -130,10 +123,6 @@ const cards = [
   background: linear-gradient(180deg, #409eff, #66b1ff);
 }
 
-.config-card.card-channels .card-glow-bar {
-  background: linear-gradient(180deg, #67c23a, #85ce61);
-}
-
 .config-card.card-general .card-glow-bar {
   background: linear-gradient(180deg, #64748b, #94a3b8);
 }
@@ -160,11 +149,6 @@ const cards = [
 .card-icon.email {
   background: rgba(64, 158, 255, 0.15);
   color: #409eff;
-}
-
-.card-icon.channels {
-  background: rgba(103, 194, 58, 0.15);
-  color: #67c23a;
 }
 
 .card-icon.general {

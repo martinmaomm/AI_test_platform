@@ -1,45 +1,42 @@
-"""
-通知对象序列化器
-"""
+"""Email-only notification API serializers."""
+
+from __future__ import annotations
+
+import ipaddress
+import re
 
 from rest_framework import serializers
-from .models import NotificationChannel, NotificationReceiver, EmailConfig
-from .delivery import (
-    NotificationDeliveryError,
-    SUPPORTED_CHANNEL_CODES,
-    parse_recipients,
-    validate_webhook_url,
-)
+
+from .delivery import NotificationDeliveryError, SUPPORTED_CHANNEL_CODES, parse_recipients
+from .models import EmailConfig, NotificationChannel, NotificationReceiver, get_builtin_email_channel
 
 
-def _should_ignore_address(value):
-    """空字符串或脱敏串（含 ***）时不覆写数据库中的真实地址"""
-    if value is None:
+def _is_valid_smtp_host(value: str) -> bool:
+    """Accept a hostname or IP literal, but never a URL or host:port string."""
+    if not isinstance(value, str):
+        return False
+    host = value.strip()
+    if not host or host != value or len(host) > 253 or "://" in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
         return True
-    s = (value if isinstance(value, str) else str(value)).strip()
-    return s == "" or "***" in s
+    except ValueError:
+        pass
+    if host.endswith("."):
+        host = host[:-1]
+    if not host or len(host) > 253:
+        return False
+    label = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+    return all(label.fullmatch(part) for part in host.split("."))
 
 
-def _changes_existing_transport(instance, attrs):
-    """Whether an existing receiver update actually changes a delivery target."""
-    for field in ("webhook_url", "target_address"):
-        if field not in attrs or _should_ignore_address(attrs[field]):
-            continue
-        current = getattr(instance, field, "") or ""
-        if field == "target_address":
-            try:
-                if parse_recipients(attrs[field]) == parse_recipients(current):
-                    continue
-            except NotificationDeliveryError:
-                pass
-        elif attrs[field] == current:
-            continue
-        return True
-    return False
+def _should_keep_password(value) -> bool:
+    return value is None or (isinstance(value, str) and (not value.strip() or value == "***"))
 
 
 class NotificationChannelSerializer(serializers.ModelSerializer):
-    """全局渠道 ModelSerializer（面向管理员）"""
+    """Read-only metadata for the built-in email channel."""
 
     class Meta:
         model = NotificationChannel
@@ -52,39 +49,20 @@ class NotificationChannelSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         )
-        read_only_fields = ("id", "created_at", "updated_at")
-        extra_kwargs = {
-            "description": {"required": False, "allow_blank": True},
-            "is_active": {"default": True},
-        }
-
-    def update(self, instance, validated_data):
-        if (
-            "channel_code" in validated_data
-            and validated_data["channel_code"] != instance.channel_code
-        ):
-            raise serializers.ValidationError({"channel_code": "不允许修改渠道标识"})
-        return super().update(instance, validated_data)
-
-    def validate_channel_code(self, value):
-        if value not in SUPPORTED_CHANNEL_CODES:
-            raise serializers.ValidationError(
-                "仅支持 dingtalk、wechat_work 和 email 渠道"
-            )
-        return value
+        read_only_fields = fields
 
 
 class NotificationReceiverSerializer(serializers.ModelSerializer):
-    """项目级通知接收对象 ModelSerializer；更新时空/脱敏不覆写原值。支持 channel_type 兼容旧前端。"""
+    """Project receiver serializer that always binds to the built-in email channel."""
 
+    channel = serializers.PrimaryKeyRelatedField(
+        queryset=NotificationChannel.objects.all(), required=False, write_only=True
+    )
+    channel_type = serializers.CharField(required=False, write_only=True)
+    webhook_url = serializers.CharField(required=False, write_only=True, allow_blank=True)
     channel_code = serializers.CharField(source="channel.channel_code", read_only=True)
     channel_name = serializers.CharField(source="channel.channel_name", read_only=True)
-    channel_type = serializers.ChoiceField(
-        choices=sorted(SUPPORTED_CHANNEL_CODES),
-        write_only=True,
-        required=False,
-        help_text="兼容：dingtalk/wechat_work/email，与 channel 二选一",
-    )
+    channel_is_active = serializers.BooleanField(source="channel.is_active", read_only=True)
 
     class Meta:
         model = NotificationReceiver
@@ -95,6 +73,7 @@ class NotificationReceiverSerializer(serializers.ModelSerializer):
             "channel_type",
             "channel_code",
             "channel_name",
+            "channel_is_active",
             "name",
             "webhook_url",
             "target_address",
@@ -105,13 +84,7 @@ class NotificationReceiverSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at")
         extra_kwargs = {
             "project": {"required": False},
-            "name": {"max_length": 100},
-            "webhook_url": {"required": False, "allow_blank": True},
-            "target_address": {
-                "required": False,
-                "allow_blank": True,
-                "max_length": 1000,
-            },
+            "target_address": {"required": False, "allow_blank": False, "max_length": 1000},
             "is_active": {"default": True},
         }
 
@@ -119,135 +92,53 @@ class NotificationReceiverSerializer(serializers.ModelSerializer):
         request_project = self.context.get("project")
         requested_project = attrs.get("project")
         if request_project is not None:
-            if (
-                requested_project is not None
-                and requested_project.pk != request_project.pk
-            ):
-                raise serializers.ValidationError(
-                    {"project": "请求体 project 必须与 URL 中的项目一致"}
-                )
-            if (
-                self.instance is not None
-                and self.instance.project_id != request_project.pk
-            ):
-                raise serializers.ValidationError(
-                    {"project": "通知对象必须属于当前项目"}
-                )
+            if requested_project is not None and requested_project.pk != request_project.pk:
+                raise serializers.ValidationError({"project": "请求体 project 必须与 URL 中的项目一致"})
+            if self.instance is not None and self.instance.project_id != request_project.pk:
+                raise serializers.ValidationError({"project": "通知对象必须属于当前项目"})
             attrs["project"] = request_project
-        elif (
-            self.instance is not None
-            and requested_project is not None
-            and requested_project.pk != self.instance.project_id
-        ):
+        elif self.instance is not None and requested_project is not None and requested_project.pk != self.instance.project_id:
             raise serializers.ValidationError({"project": "不允许变更通知对象所属项目"})
 
-        channel = attrs.get("channel")
-        channel_type = attrs.pop("channel_type", None)
-        if channel_type:
-            type_channel = NotificationChannel.objects.filter(
-                channel_code=channel_type
-            ).first()
-            if type_channel is None:
-                raise serializers.ValidationError({"channel_type": "指定渠道不存在"})
-            if channel is not None and channel.pk != type_channel.pk:
-                raise serializers.ValidationError(
-                    {"channel": "channel 与 channel_type 必须一致"}
-                )
-            attrs["channel"] = type_channel
-        channel = attrs.get("channel") or (
-            self.instance.channel if self.instance else None
-        )
-        if not channel:
-            raise serializers.ValidationError(
-                {"channel": "请选择渠道类型（channel 或 channel_type）"}
-            )
-        channel_code = getattr(channel, "channel_code", "")
-        changing_channel = (
-            self.instance is None or channel.pk != self.instance.channel_id
-        )
-        if channel_code not in SUPPORTED_CHANNEL_CODES:
-            raise serializers.ValidationError(
-                {"channel": "仅支持 dingtalk、wechat_work 和 email 渠道"}
-            )
-        is_disabled = not channel.is_active
-        if is_disabled and changing_channel:
-            raise serializers.ValidationError(
-                {"channel": "该通知渠道不可用于新建或切换接收对象"}
-            )
-        if channel_code == "email":
-            supplied_address = attrs.get("target_address")
-            if supplied_address is not None and not _should_ignore_address(
-                supplied_address
-            ):
-                try:
-                    attrs["target_address"] = ",".join(
-                        parse_recipients(supplied_address)
-                    )
-                except NotificationDeliveryError as exc:
-                    raise serializers.ValidationError(
-                        {"target_address": str(exc)}
-                    ) from exc
-            elif (
-                changing_channel
-                or not self.instance
-                or not (getattr(self.instance, "target_address", None) or "").strip()
-            ):
-                raise serializers.ValidationError(
-                    {
-                        "target_address": "邮件渠道请填写收件人邮箱，多个邮箱可用逗号、分号或换行分隔"
-                    }
-                )
-        else:
-            supplied_url = attrs.get("webhook_url")
-            if supplied_url is not None and not _should_ignore_address(supplied_url):
-                try:
-                    attrs["webhook_url"] = validate_webhook_url(
-                        channel_code, supplied_url
-                    )
-                except NotificationDeliveryError as exc:
-                    raise serializers.ValidationError(
-                        {"webhook_url": str(exc)}
-                    ) from exc
-            elif (
-                changing_channel
-                or not self.instance
-                or not (getattr(self.instance, "webhook_url", None) or "").strip()
-            ):
-                raise serializers.ValidationError(
-                    {"webhook_url": "请填写 Webhook 地址"}
-                )
-        if is_disabled and _changes_existing_transport(self.instance, attrs):
-            raise serializers.ValidationError({"channel": "该通知渠道不可修改传输配置"})
+        if "webhook_url" in attrs:
+            raise serializers.ValidationError({"webhook_url": "通知仅支持邮件，不接受 Webhook 配置"})
+
+        supplied_channel = attrs.pop("channel", None)
+        supplied_type = attrs.pop("channel_type", None)
+        if supplied_type is not None and supplied_type != "email":
+            raise serializers.ValidationError({"channel_type": "通知仅支持 email 渠道"})
+        if supplied_channel is not None and supplied_channel.channel_code not in SUPPORTED_CHANNEL_CODES:
+            raise serializers.ValidationError({"channel": "通知仅支持内置 email 渠道"})
+
+        email_channel = get_builtin_email_channel()
+        if supplied_channel is not None and supplied_channel.pk != email_channel.pk:
+            raise serializers.ValidationError({"channel": "通知仅支持内置 email 渠道"})
+        is_new_or_switch = self.instance is None or self.instance.channel_id != email_channel.pk
+        if is_new_or_switch and not email_channel.is_active:
+            raise serializers.ValidationError({"channel": "邮件通知渠道已停用，不能新建或切换接收组"})
+        attrs["channel"] = email_channel
+
+        if "target_address" in attrs:
+            try:
+                attrs["target_address"] = ",".join(parse_recipients(attrs["target_address"]))
+            except NotificationDeliveryError as exc:
+                raise serializers.ValidationError({"target_address": exc.safe_message}) from exc
+        elif self.instance is None:
+            raise serializers.ValidationError({"target_address": "请至少填写一个收件人邮箱"})
         return attrs
-
-    def update(self, instance, validated_data):
-        if "webhook_url" in validated_data and _should_ignore_address(
-            validated_data["webhook_url"]
-        ):
-            validated_data.pop("webhook_url", None)
-        if "target_address" in validated_data and _should_ignore_address(
-            validated_data["target_address"]
-        ):
-            validated_data.pop("target_address", None)
-        return super().update(instance, validated_data)
-
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        if getattr(instance, "webhook_url", None):
-            data["webhook_url"] = "***"
-        return data
-
-
-def _should_ignore_password(value):
-    """空字符串或脱敏串时不覆写数据库中的密码"""
-    if value is None:
-        return True
-    s = (value if isinstance(value, str) else str(value)).strip()
-    return s == "" or "***" in s
 
 
 class EmailConfigSerializer(serializers.ModelSerializer):
-    """邮件服务配置序列化器；smtp_password 返回脱敏，更新时空/*** 不覆写。"""
+    """SMTP configuration without exposing its authorization code."""
+
+    smtp_password = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        write_only=True,
+        max_length=255,
+    )
+    has_password = serializers.SerializerMethodField(read_only=True)
+    is_effective = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = EmailConfig
@@ -258,37 +149,48 @@ class EmailConfigSerializer(serializers.ModelSerializer):
             "port",
             "sender_email",
             "smtp_password",
+            "has_password",
             "use_ssl",
             "is_active",
+            "is_effective",
             "created_at",
             "updated_at",
         )
-        read_only_fields = ("id", "created_at", "updated_at")
-        extra_kwargs = {
-            "smtp_password": {"required": False, "allow_blank": True},
-        }
+        read_only_fields = ("id", "is_effective", "created_at", "updated_at")
 
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        if instance and getattr(instance, "smtp_password", None):
-            data["smtp_password"] = "***"
-        return data
-
-    def validate(self, attrs):
-        if not self.instance and _should_ignore_password(attrs.get("smtp_password")):
-            raise serializers.ValidationError(
-                {"smtp_password": "创建时请填写 SMTP 授权码"}
+    def get_is_effective(self, instance) -> bool:
+        if not instance.is_active:
+            return False
+        cache_key = "_effective_email_config_id"
+        if cache_key not in self.context:
+            self.context[cache_key] = (
+                EmailConfig.objects.filter(is_active=True)
+                .order_by("-updated_at", "-pk")
+                .values_list("pk", flat=True)
+                .first()
             )
-        return attrs
+        effective_id = self.context[cache_key]
+        return instance.pk == effective_id
 
-    def validate_port(self, value):
+    def get_has_password(self, instance) -> bool:
+        return bool(instance.smtp_password)
+
+    def validate_smtp_server(self, value: str) -> str:
+        if not _is_valid_smtp_host(value):
+            raise serializers.ValidationError("SMTP 服务器地址格式不正确")
+        return value.strip()
+
+    def validate_port(self, value: int) -> int:
         if not 1 <= value <= 65535:
             raise serializers.ValidationError("SMTP 端口必须在 1 到 65535 之间")
         return value
 
+    def validate(self, attrs):
+        if self.instance is None and _should_keep_password(attrs.get("smtp_password")):
+            raise serializers.ValidationError({"smtp_password": "创建时请填写 SMTP 授权码"})
+        return attrs
+
     def update(self, instance, validated_data):
-        if "smtp_password" in validated_data and _should_ignore_password(
-            validated_data["smtp_password"]
-        ):
+        if "smtp_password" in validated_data and _should_keep_password(validated_data["smtp_password"]):
             validated_data.pop("smtp_password", None)
         return super().update(instance, validated_data)

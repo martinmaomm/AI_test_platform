@@ -102,11 +102,13 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
             return []
         result = []
         for t in targets:
-            # type: 渠道类型；target_address 仅邮件类展示用，webhook 渠道不传
+            channel = getattr(t, 'channel', None)
+            if channel is None or channel.channel_code != 'email':
+                continue
             target_address = getattr(t, 'email', None) or getattr(t, 'target_address', None) or ''
             result.append({
                 'id': t.id,
-                'type': getattr(t, 'channel_type', None) or (t.channel.channel_code if getattr(t, 'channel', None) else ''),
+                'type': 'email',
                 'name': getattr(t, 'name', None) or '',
                 'target_address': target_address,
             })
@@ -169,9 +171,27 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
         if request and attrs.get('status', getattr(self.instance, 'status', 'active')) == 'active':
             get_schedule_project(project.pk, request.user, 'execute')
         validate_suites(project, attrs.get('suite_ids', getattr(self.instance, 'suite_ids', [])))
-        for target in attrs.get('notice_targets', []):
-            if target.project_id != project.pk:
-                raise serializers.ValidationError({'notice_targets': '通知对象必须属于当前项目'})
+        if 'notice_targets' in attrs:
+            for target in attrs['notice_targets']:
+                channel = getattr(target, 'channel', None)
+                if target.project_id != project.pk:
+                    raise serializers.ValidationError({'notice_targets': '通知对象必须属于当前项目'})
+                if (
+                    not target.is_active
+                    or channel is None
+                    or channel.channel_code != 'email'
+                    or not channel.is_active
+                ):
+                    raise serializers.ValidationError(
+                        {'notice_targets': '只能选择当前项目已启用的邮件接收组'}
+                    )
+                try:
+                    from notifications.delivery import NotificationDeliveryError, parse_recipients
+                    parse_recipients(target.target_address)
+                except NotificationDeliveryError:
+                    raise serializers.ValidationError(
+                        {'notice_targets': '邮件接收组的收件人邮箱无效'}
+                    )
         environment_provided = 'environment' in attrs
         environment = attrs.get('environment') if environment_provided else getattr(self.instance, 'environment', None)
         if suite_type == 'web':

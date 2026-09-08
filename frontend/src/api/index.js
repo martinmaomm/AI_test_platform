@@ -2,6 +2,7 @@ import axios from 'axios'
 import { ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import router from '@/router'
+import { isSessionExpiredError } from '@/utils/sessionErrors'
 
 /** 防弹窗风暴锁：防止并发 401/400 触发多个重新登录确认框 */
 let isReloginShow = false
@@ -12,21 +13,6 @@ const SESSION_EXPIRE_SKIP_URLS = ['/logout', 'users/logout']
 function isSkipSessionExpirePopup(config) {
   const url = config?.url ?? ''
   return SESSION_EXPIRE_SKIP_URLS.some((s) => url.includes(s))
-}
-
-/** 判断错误是否为会话失效（401 或 400 且含认证相关关键词） */
-function isSessionExpiredError(error) {
-  const status = error.response?.status
-  if (status === 401) return true
-  if (status !== 400) return false
-  const data = error.response?.data
-  if (!data) return false
-  const keywords = ['token', '认证', '过期', '登录', '未授权', 'invalid', 'expired', 'unauthorized']
-  const toStr = (v) => (v == null ? '' : String(v).toLowerCase())
-  const msg = toStr(
-    typeof data === 'string' ? data : (data.msg ?? data.message ?? data.detail ?? data.error?.message ?? '')
-  )
-  return keywords.some((k) => msg.includes(k.toLowerCase()))
 }
 
 /** 执行登出提示与清理，带防抖锁 */
@@ -123,7 +109,7 @@ api.interceptors.response.use(
       return Promise.reject(error)
     }
 
-    // 会话失效：401 或 400 且含认证相关关键词
+    // 会话失效：401 或明确的 JWT token_not_valid 错误码
     if (isSessionExpiredError(error)) {
       const status = error.response?.status
       const originalRequest = error.config

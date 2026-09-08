@@ -213,7 +213,7 @@ const MENU_CONFIG = {
       { path: '/api-testing/scheduled-tasks', label: '定时任务' },
       { path: '/api-testing/environments', label: '环境管理' },
       { path: '/api-testing/knowledge-base', label: '知识库管理' },
-      { path: '/api-testing/notification-receivers', label: '通知接收管理' }
+      { path: '/api-testing/notification-receivers', label: '邮件通知' }
     ]
   },
   web: {
@@ -247,7 +247,7 @@ const MENU_CONFIG = {
         label: '项目配置',
         children: [
           { path: '/web-testing/knowledge-base', label: '知识库' },
-          { path: '/web-testing/notification-receivers', label: '通知设置' }
+          { path: '/web-testing/notification-receivers', label: '邮件通知' }
         ]
       }
     ]

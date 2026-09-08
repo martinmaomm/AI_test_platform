@@ -1,137 +1,50 @@
 <template>
   <div class="receivers-page">
-    <div class="page-header">
-      <div v-if="!projectStore.currentProject" class="header-content no-project">
-        <el-empty description="请先选择项目" />
+    <el-empty v-if="!currentProjectId" description="请先选择项目" />
+    <template v-else>
+      <div class="page-header">
+        <div><h2>邮件通知</h2><p>管理本项目的邮件接收组，用于计划任务执行结果通知。</p></div>
+        <el-button type="primary" :icon="Plus" @click="openCreateDialog">新建邮件接收组</el-button>
       </div>
-      <div v-else class="header-content">
-        <div class="header-left">
-          <div class="header-icon">
-            <el-icon><Bell /></el-icon>
-          </div>
-          <div class="header-text">
-            <h2>通知接收管理</h2>
-            <p>管理本项目的通知接收对象（Webhook、邮件组），用于执行结果推送</p>
-          </div>
-        </div>
-        <div class="header-actions">
-          <el-button type="primary" icon="Plus" @click="openCreateDialog" class="create-btn">
-            新建消息接收对象
-          </el-button>
-        </div>
-      </div>
-    </div>
-
-    <el-card v-if="projectStore.currentProject" class="list-card">
-      <div class="card-header">
-        <h3>接收对象列表</h3>
-      </div>
-      <div class="table-container">
-        <el-table
-          :data="receivers"
-          v-loading="loading"
-          style="width: 100%; height: 100%"
-          row-key="id"
-        >
-          <el-table-column prop="id" label="ID" width="70" align="center">
-            <template #default="scope">
-              <span class="receiver-id">{{ scope.row.id }}</span>
+      <el-alert type="info" :closable="false" show-icon class="setup-guide">
+        <template #title>配置顺序：管理员配置邮件服务 → 添加邮件接收组 → 在计划任务中选择接收组及通知条件。</template>
+        <p>邮件服务位于「首页 → 系统配置 → 邮件服务配置」。普通用例或套件手动运行不会自动发邮件。</p>
+      </el-alert>
+      <el-card class="list-card">
+        <el-alert v-if="loadError" :title="loadError" type="error" :closable="false">
+          <el-button link type="primary" @click="loadReceivers">重新加载</el-button>
+        </el-alert>
+        <el-table :data="receivers" v-loading="loading" row-key="id" empty-text="暂无邮件接收组，请点击右上方添加">
+          <el-table-column prop="name" label="接收组名称" min-width="180" show-overflow-tooltip />
+          <el-table-column prop="target_address" label="收件人邮箱" min-width="280" show-overflow-tooltip />
+          <el-table-column label="状态" width="140">
+            <template #default="{ row }">
+              <el-tag :type="canSend(row) ? 'success' : 'info'">{{ row.channel_is_active === false ? '邮件通道已停用' : row.is_active ? '已启用' : '已停用' }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="channel_code" label="通道类型" width="120" align="center">
-            <template #default="scope">
-              <el-tag :type="getChannelTypeTag(resolveChannelCode(scope.row))" size="small">
-                {{ resolveChannelLabel(scope.row) }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column prop="name" label="通知组名称" min-width="180" show-overflow-tooltip />
-          <el-table-column label="目标地址" min-width="280">
-            <template #default="scope">
-              <span class="webhook-cell">
-                {{ resolveChannelCode(scope.row) === 'email' ? maskEmailList(scope.row.target_address) : maskWebhook(scope.row.webhook_url) }}
-              </span>
-            </template>
-          </el-table-column>
-          <el-table-column prop="created_at" label="创建时间" width="180" align="center">
-            <template #default="scope">
-              <span class="created-time">{{ formatDateTime(scope.row.created_at) }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="220" fixed="right">
-            <template #default="scope">
-              <el-button type="success" size="small" link :loading="testingId === scope.row.id" :disabled="testingId !== null || scope.row.is_active === false" @click="testChannelById(scope.row)">
-                测试
-              </el-button>
-              <el-button type="primary" size="small" link @click="openEditDialog(scope.row)">
-                编辑
-              </el-button>
-              <el-button type="danger" size="small" link @click="confirmDelete(scope.row)">
-                删除
-              </el-button>
+          <el-table-column label="操作" width="250" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="success" :loading="testingId === row.id" :disabled="testingId !== null || !canSend(row)" @click="sendTestEmail(row)">发送测试邮件</el-button>
+              <el-button link type="primary" @click="openEditDialog(row)">编辑</el-button>
+              <el-button link type="danger" @click="confirmDelete(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
-        <el-empty v-if="!loading && receivers.length === 0" description="暂无接收对象，点击「新建消息接收对象」添加" />
-      </div>
-    </el-card>
-
-    <el-dialog
-      v-model="showDialog"
-      :title="editingReceiver ? '编辑接收对象' : '新建消息接收对象'"
-      width="520px"
-      :close-on-click-modal="false"
-      class="receiver-form-dialog"
-      @closed="resetForm"
-    >
-      <el-form ref="formRef" :model="form" :rules="formRules" label-width="120px">
-        <el-form-item label="通知组名称" prop="name">
-          <el-input
-            v-model="form.name"
-            placeholder="如：研发组钉钉群"
-            maxlength="100"
-            show-word-limit
-          />
+      </el-card>
+    </template>
+    <el-dialog v-model="showDialog" :title="editingReceiver ? '编辑邮件接收组' : '新建邮件接收组'" width="560px" :close-on-click-modal="false" @closed="resetForm">
+      <el-form ref="formRef" :model="form" :rules="formRules" label-width="110px">
+        <el-form-item label="接收组名称" prop="name">
+          <el-input v-model="form.name" placeholder="如：测试结果接收组" maxlength="100" show-word-limit />
         </el-form-item>
-        <el-form-item label="通道类型" prop="channel">
-          <el-select v-model="form.channel" placeholder="请选择类型" style="width: 100%">
-            <el-option
-              v-for="item in channelList"
-              :key="item.id"
-              :label="item.channel_name"
-              :value="item.id"
-              :disabled="item.is_active === false || !isSupportedNotificationChannel(item.channel_code)"
-            />
-          </el-select>
+        <el-form-item label="收件人邮箱" prop="target_address">
+          <el-input v-model="form.target_address" type="textarea" :rows="4" placeholder="如 qa@example.com；多个邮箱可用逗号、分号或换行分隔" maxlength="1000" show-word-limit />
         </el-form-item>
-        <el-form-item v-show="selectedChannel?.channel_code !== 'email'" label="Webhook URL" prop="webhook_url">
-          <el-input
-            v-model="form.webhook_url"
-            type="password"
-            show-password
-            :placeholder="editingReceiver ? '已配置目标地址，如需修改请填入新地址；不修改请留空' : '请输入 Webhook 地址'"
-            autocomplete="off"
-          />
-        </el-form-item>
-        <el-form-item v-show="selectedChannel?.channel_code === 'email'" label="收件人邮箱" prop="target_address">
-          <el-input
-            v-model="form.target_address"
-            type="password"
-            show-password
-            :placeholder="editingReceiver ? '已配置邮箱，如需修改请填入；不修改请留空' : '多个邮箱请用英文逗号(,)分隔...'"
-            autocomplete="off"
-            maxlength="1000"
-            show-word-limit
-          />
-        </el-form-item>
+        <el-form-item label="启用"><el-switch v-model="form.is_active" /></el-form-item>
       </el-form>
       <template #footer>
-        <div class="dialog-footer">
-          <el-button @click="showDialog = false">取消</el-button>
-          <el-button type="primary" @click="submitForm" :loading="saving">
-            {{ editingReceiver ? '更新' : '创建' }}
-          </el-button>
-        </div>
+        <el-button @click="showDialog = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="submitForm">{{ editingReceiver ? '更新' : '创建' }}</el-button>
       </template>
     </el-dialog>
   </div>
@@ -141,160 +54,48 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Bell, Plus } from '@element-plus/icons-vue'
+import { Plus } from '@element-plus/icons-vue'
 import * as notificationsApi from '@/api/notifications'
-import { maskEmailList } from '@/utils/mask'
-import { isSupportedNotificationChannel, notificationErrorMessage } from '@/utils/notificationFeedback'
+import { emailNotificationReceivers, notificationErrorMessage } from '@/utils/notificationFeedback'
 import { useProjectStore } from '@/stores/project'
 
 const route = useRoute()
 const projectStore = useProjectStore()
-
+const currentProjectId = computed(() => projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id)
 const loading = ref(false)
+const loadError = ref('')
 const receivers = ref([])
-const channelList = ref([])
 const showDialog = ref(false)
 const editingReceiver = ref(null)
 const saving = ref(false)
 const testingId = ref(null)
 const formRef = ref(null)
-const currentProjectId = computed(() => projectStore.currentProjectId ?? route.params.project_id ?? route.query.project_id)
 const formProjectId = ref(null)
 let receiverRequestVersion = 0
-
-const form = ref({
-  name: '',
-  channel: null,
-  webhook_url: '',
-  target_address: ''
-})
-
-/** 当前选中的渠道（用于判断是否邮件类型） */
-const selectedChannel = computed(() => {
-  const id = form.value.channel
-  if (id == null) return null
-  return channelList.value.find((c) => c.id === id) || null
-})
-
-const formRules = computed(() => {
-  const isEmail = selectedChannel.value?.channel_code === 'email'
-  const editing = !!editingReceiver.value
-  return {
-    name: [
-      { required: true, message: '请输入通知组名称', trigger: 'blur' },
-      { max: 100, message: '长度不超过 100 个字符', trigger: 'blur' }
-    ],
-    channel: [{ required: true, message: '请选择通道类型', trigger: 'change' }],
-    webhook_url: isEmail
-      ? []
-      : editing
-        ? [{ max: 2000, message: '长度不超过 2000 个字符', trigger: 'blur' }]
-        : [
-            { required: true, message: '请输入 Webhook 地址', trigger: 'blur' },
-            { max: 2000, message: '长度不超过 2000 个字符', trigger: 'blur' }
-          ],
-    target_address: !isEmail
-      ? []
-      : editing
-        ? [{ max: 1000, message: '长度不超过 1000 个字符', trigger: 'blur' }]
-        : [
-            { required: true, message: '请填写收件人邮箱，多个邮箱用英文逗号分隔', trigger: 'blur' },
-            { max: 1000, message: '长度不超过 1000 个字符', trigger: 'blur' }
-          ]
-  }
-})
-
-/** 解析渠道编码：支持 channel_code、channel_type、channel.channel_code 等嵌套结构 */
-function resolveChannelCode(row) {
-  return row?.channel_code ?? row?.channel_type ?? row?.channel?.channel_code ?? ''
+const emptyForm = () => ({ name: '', target_address: '', is_active: true })
+const form = ref(emptyForm())
+const formRules = {
+  name: [{ required: true, whitespace: true, message: '请输入接收组名称', trigger: 'blur' }],
+  target_address: [{ required: true, whitespace: true, message: '请填写收件人邮箱', trigger: 'blur' }]
 }
-
-/** 解析渠道显示名称：优先使用 channel_name（后端序列化后返回） */
-function resolveChannelLabel(row) {
-  const name = row?.channel_name ?? row?.channel?.channel_name
-  if (name) return name
-  const code = resolveChannelCode(row)
-  const map = { dingtalk: '钉钉', wechat_work: '企微', email: '邮件' }
-  return map[code] || code || '—'
-}
-
-function getChannelTypeTag(type) {
-  const map = { dingtalk: 'warning', wechat_work: 'success', email: 'primary' }
-  return map[type || ''] || 'info'
-}
-
-function maskWebhook(url) {
-  if (url == null || typeof url !== 'string') return '—'
-  const u = url.trim()
-  if (!u) return '—'
-  try {
-    const sensitiveParams = ['access_token', 'key']
-    for (const param of sensitiveParams) {
-      const re = new RegExp(`([?&])${param}=([^&]*)`, 'i')
-      const m = u.match(re)
-      if (m) {
-        const value = m[2] || ''
-        const len = value.length
-        if (len <= 8) return u.replace(re, `${m[1]}${param}=******`)
-        return u.replace(re, `${m[1]}${param}=${value.slice(0, 4)}******${value.slice(-4)}`)
-      }
-    }
-    if (u.length <= 24) return u.slice(0, 8) + '***'
-    return u.slice(0, 12) + '******' + u.slice(-8)
-  } catch (_) {
-    return '—'
-  }
-}
-
-function formatDateTime(val) {
-  if (!val) return '—'
-  return new Date(val).toLocaleString('zh-CN')
-}
-
-async function testChannelById(row) {
-  if (!row?.id || testingId.value !== null) return
-  const projectId = currentProjectId.value
-  if (!projectId) return
-  testingId.value = row.id
-  try {
-    await notificationsApi.testReceiverById(projectId, row.id)
-    if (String(currentProjectId.value) === String(projectId)) ElMessage.success('测试消息已发送')
-  } catch (e) {
-    if (String(currentProjectId.value) === String(projectId)) ElMessage.error(notificationErrorMessage(e, '连接失败'))
-  } finally {
-    testingId.value = null
-  }
-}
-
-async function loadChannels() {
-  try {
-    const res = await notificationsApi.getNotificationChannels()
-    const data = res?.data ?? res
-    channelList.value = Array.isArray(data) ? data : (data?.results ?? data?.items ?? [])
-  } catch (e) {
-    console.error('加载渠道列表失败:', e)
-    channelList.value = []
-  }
-}
+const canSend = row => row.is_active !== false && row.channel_is_active !== false
+const sameProject = id => String(id) === String(currentProjectId.value)
 
 async function loadReceivers() {
   const projectId = currentProjectId.value
   const version = ++receiverRequestVersion
-  if (!projectId) {
-    receivers.value = []
-    loading.value = false
-    return
-  }
+  loadError.value = ''
+  if (!projectId) { receivers.value = []; loading.value = false; return }
   loading.value = true
   try {
     const res = await notificationsApi.getNotificationReceivers(projectId)
     if (version !== receiverRequestVersion) return
     const data = res?.data ?? res
-    receivers.value = Array.isArray(data) ? data : (data?.results ?? data?.items ?? [])
+    receivers.value = emailNotificationReceivers(Array.isArray(data) ? data : data?.results)
   } catch (e) {
     if (version !== receiverRequestVersion) return
-    ElMessage.error(notificationErrorMessage(e, '加载接收对象列表失败'))
     receivers.value = []
+    loadError.value = notificationErrorMessage(e, '加载邮件接收组失败')
   } finally {
     if (version === receiverRequestVersion) loading.value = false
   }
@@ -303,242 +104,77 @@ async function loadReceivers() {
 function openCreateDialog() {
   formProjectId.value = currentProjectId.value
   editingReceiver.value = null
-  form.value = {
-    name: '',
-    channel: channelList.value.find(item => item.is_active !== false && isSupportedNotificationChannel(item.channel_code))?.id ?? null,
-    webhook_url: '',
-    target_address: ''
-  }
+  form.value = emptyForm()
   showDialog.value = true
 }
-
 function openEditDialog(row) {
   formProjectId.value = currentProjectId.value
-  const channelId = row.channel_id ?? (typeof row.channel === 'object' && row.channel ? row.channel.id : row.channel) ?? null
   editingReceiver.value = row
-  form.value = {
-    name: row.name || '',
-    channel: channelId,
-    webhook_url: '',
-    target_address: row.target_address || ''
-  }
+  form.value = { name: row.name, target_address: row.target_address, is_active: row.is_active }
   showDialog.value = true
 }
-
 function resetForm() {
   editingReceiver.value = null
-  form.value = { name: '', channel: null, webhook_url: '', target_address: '' }
-  formRef.value?.clearValidate?.()
+  form.value = emptyForm()
+  formRef.value?.clearValidate()
 }
-
-function isAddressEmptyOrMasked(val) {
-  if (val == null) return true
-  const s = String(val).trim()
-  return s === '' || s.includes('***')
-}
-
-/** 清洗 payload：移除空值字段，确保 PATCH 时后端保留原数据库值 */
-function sanitizeUpdatePayload(payload, isEdit) {
-  const cleaned = { ...payload }
-  if (cleaned.webhook_url === '' || cleaned.webhook_url == null || cleaned.webhook_url === undefined || (typeof cleaned.webhook_url === 'string' && cleaned.webhook_url.trim() === '') || (isEdit && isAddressEmptyOrMasked(cleaned.webhook_url))) {
-    delete cleaned.webhook_url
-  } else if (typeof cleaned.webhook_url === 'string') {
-    cleaned.webhook_url = cleaned.webhook_url.trim()
-  }
-  if (cleaned.target_address === '' || cleaned.target_address == null || cleaned.target_address === undefined || (typeof cleaned.target_address === 'string' && cleaned.target_address.trim() === '') || (isEdit && isAddressEmptyOrMasked(cleaned.target_address))) {
-    delete cleaned.target_address
-  } else if (typeof cleaned.target_address === 'string') {
-    cleaned.target_address = cleaned.target_address.trim()
-  }
-  return cleaned
-}
-
 async function submitForm() {
   if (saving.value) return
   try { await formRef.value?.validate() } catch { return }
   const projectId = formProjectId.value
-  if (!projectId || String(projectId) !== String(currentProjectId.value)) {
-    ElMessage.warning('项目已变化，请重新打开配置')
-    return
-  }
+  if (!projectId || !sameProject(projectId)) { ElMessage.warning('项目已变化，请重新打开配置'); return }
   saving.value = true
   try {
-    const isEmail = selectedChannel.value?.channel_code === 'email'
-    let payload = { name: form.value.name, channel: form.value.channel, project: projectId }
-    if (editingReceiver.value) {
-      if (!isEmail) {
-        payload.webhook_url = form.value.webhook_url ?? ''
-      } else {
-        payload.target_address = form.value.target_address ?? ''
-      }
-      payload = sanitizeUpdatePayload(payload, true)
-      await notificationsApi.updateNotificationReceiver(projectId, editingReceiver.value.id, payload)
-      ElMessage.success('更新成功')
-    } else {
-      if (isEmail) {
-        payload.target_address = (form.value.target_address || '').trim()
-      } else {
-        payload.webhook_url = (form.value.webhook_url || '').trim()
-      }
-      await notificationsApi.createNotificationReceiver(projectId, payload)
-      ElMessage.success('创建成功')
-    }
+    const payload = { ...form.value, name: form.value.name.trim(), target_address: form.value.target_address.trim(), project: projectId }
+    if (editingReceiver.value) await notificationsApi.updateNotificationReceiver(projectId, editingReceiver.value.id, payload)
+    else await notificationsApi.createNotificationReceiver(projectId, payload)
+    if (!sameProject(projectId)) return
+    ElMessage.success('邮件接收组已保存')
     showDialog.value = false
-    loadReceivers()
+    await loadReceivers()
   } catch (e) {
-    ElMessage.error(notificationErrorMessage(e, editingReceiver.value ? '更新失败' : '创建失败'))
-  } finally {
-    saving.value = false
-  }
+    if (sameProject(projectId)) ElMessage.error(notificationErrorMessage(e, '保存失败'))
+  } finally { saving.value = false }
 }
-
-function confirmDelete(row) {
+async function sendTestEmail(row) {
+  if (testingId.value !== null || !canSend(row)) return
   const projectId = currentProjectId.value
-  ElMessageBox.confirm(
-    `确定要删除接收对象「${row.name}」吗？删除后不可恢复。`,
-    '删除确认',
-    { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' }
-  )
-    .then(async () => {
-      try {
-        if (String(projectId) !== String(currentProjectId.value)) return
-        await notificationsApi.deleteNotificationReceiver(projectId, row.id)
-        ElMessage.success('已删除')
-        loadReceivers()
-      } catch (e) {
-        ElMessage.error(notificationErrorMessage(e, '删除失败'))
-      }
-    })
-    .catch(() => {})
+  testingId.value = row.id
+  try {
+    try {
+      await ElMessageBox.confirm('将向 ' + row.target_address + ' 发送一封测试邮件。', '发送测试邮件', { confirmButtonText: '确认发送', cancelButtonText: '取消', type: 'info' })
+    } catch { return }
+    if (!sameProject(projectId)) return
+    await notificationsApi.testReceiverById(projectId, row.id)
+    if (sameProject(projectId)) ElMessage.success('SMTP 已接受测试邮件，请检查收件箱或垃圾邮件；最终送达以实际收信为准')
+  } catch (e) {
+    if (sameProject(projectId)) ElMessage.error(notificationErrorMessage(e, '测试邮件发送失败'))
+  } finally { testingId.value = null }
 }
-
-watch(
-  currentProjectId,
-  () => {
-    showDialog.value = false
-    receivers.value = []
-    loadReceivers()
-  },
-  { immediate: true }
-)
-onMounted(async () => {
-  await projectStore.initializeUserPreferences()
-  loadChannels()
-  loadReceivers()
-})
+async function confirmDelete(row) {
+  const projectId = currentProjectId.value
+  try {
+    await ElMessageBox.confirm('确定删除邮件接收组「' + row.name + '」吗？关联计划任务将不再向该组发信。', '删除确认', { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' })
+  } catch { return }
+  if (!sameProject(projectId)) return
+  try {
+    await notificationsApi.deleteNotificationReceiver(projectId, row.id)
+    if (!sameProject(projectId)) return
+    ElMessage.success('已删除')
+    await loadReceivers()
+  } catch (e) { if (sameProject(projectId)) ElMessage.error(notificationErrorMessage(e, '删除失败')) }
+}
+watch(currentProjectId, () => { showDialog.value = false; receivers.value = []; loadReceivers() }, { immediate: true })
+onMounted(async () => { await projectStore.initializeUserPreferences() })
 </script>
 
 <style scoped>
-.receivers-page {
-  padding: 20px;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.page-header {
-  margin-bottom: 20px;
-  flex-shrink: 0;
-}
-
-.header-content {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  border-radius: 12px;
-  padding: 24px;
-  color: #fff;
-}
-
-.header-content.no-project {
-  justify-content: center;
-  min-height: 120px;
-}
-
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.header-icon {
-  width: 48px;
-  height: 48px;
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 24px;
-}
-
-.header-text h2 {
-  margin: 0 0 4px 0;
-  font-size: 20px;
-  font-weight: 600;
-}
-
-.header-text p {
-  margin: 0;
-  font-size: 13px;
-  opacity: 0.9;
-}
-
-.header-actions :deep(.el-button) {
-  background: rgba(255, 255, 255, 0.95);
-  color: #667eea;
-  border: none;
-}
-
-.list-card {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  border-radius: 8px;
-}
-
-.card-header {
-  margin-bottom: 16px;
-}
-
-.card-header h3 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--el-text-color-primary);
-}
-
-.table-container {
-  flex: 1;
-  min-height: 200px;
-}
-
-.receiver-id {
-  font-family: 'Monaco', 'Menlo', monospace;
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-  background: var(--el-fill-color-light);
-  padding: 2px 8px;
-  border-radius: 4px;
-}
-
-.webhook-cell {
-  font-family: 'JetBrains Mono', Consolas, monospace;
-  font-size: 12px;
-  color: var(--el-text-color-regular);
-}
-
-.created-time {
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-}
-
-.dialog-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-}
+.receivers-page { padding: 20px; min-height: 100%; }
+.page-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
+.page-header h2 { margin: 0 0 8px; }
+.page-header p { margin: 0; color: var(--el-text-color-secondary); }
+.setup-guide { margin-bottom: 20px; }
+.setup-guide p { margin: 8px 0 0; }
+.list-card { min-width: 0; }
+@media (max-width: 700px) { .page-header { align-items: flex-start; flex-direction: column; } }
 </style>

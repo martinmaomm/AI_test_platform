@@ -184,7 +184,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="通知对象" min-width="180">
+        <el-table-column label="邮件接收组" min-width="180">
           <template #default="{ row }">
             <template v-if="!row.notice_targets || !row.notice_targets.length">
               <span class="no-data">无</span>
@@ -199,9 +199,6 @@
               >
                 <template v-if="target && typeof target === 'object' && target.type === 'email'">
                   [邮件] {{ maskEmailList(target.target_address || '') }}
-                </template>
-                <template v-else-if="target && typeof target === 'object'">
-                  [{{ getNoticeChannelTypeLabel(target.type) }}] {{ target.name || '-' }}
                 </template>
                 <template v-else>-</template>
               </el-tag>
@@ -613,15 +610,6 @@ const getExecutionStatusTagType = (status) => {
     cancelled: 'info'
   }
   return types[status] || 'info'
-}
-
-const getNoticeChannelTypeLabel = (type) => {
-  const labels = {
-    wechat_work: '企微',
-    dingtalk: '钉钉',
-    email: '邮件'
-  }
-  return labels[type] || type || '-'
 }
 
 const getSuccessRateColor = (rate) => {

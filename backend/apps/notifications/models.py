@@ -1,15 +1,15 @@
-"""
-消息通知体系：全局渠道 + 项目接收对象
-"""
-from django.db import models
+"""邮件通知模型。历史 Webhook 字段仅保留数据库兼容性。"""
+
+from django.db import models, transaction
+
+
+EMAIL_CHANNEL_CODE = "email"
+EMAIL_CHANNEL_NAME = "邮件"
+EMAIL_CHANNEL_DESCRIPTION = "填写收件人邮箱；需先配置启用的 SMTP 邮件服务。"
 
 
 class NotificationChannel(models.Model):
-    """
-    全局渠道配置（钉钉/企微/邮件等）
-    表名：notification_channel
-    存放渠道元数据与接入说明，供前端展示与接收对象关联
-    """
+    """历史全局渠道表；当前运行时只使用内置邮件渠道。"""
     channel_code = models.CharField(
         max_length=32,
         unique=True,
@@ -40,11 +40,7 @@ class NotificationChannel(models.Model):
 
 
 class NotificationReceiver(models.Model):
-    """
-    项目级通知接收对象（Webhook 群组、邮件组等）
-    表名：notification_receiver
-    必须归属项目，关联全局渠道
-    """
+    """项目级邮件接收对象；历史 Webhook 字段不再由运行时使用。"""
     project = models.ForeignKey(
         'projects.Project',
         on_delete=models.CASCADE,
@@ -87,7 +83,7 @@ class NotificationReceiver(models.Model):
 
     @property
     def channel_type(self):
-        """兼容旧接口：返回 channel_code"""
+        """内部兼容属性；新的 API 使用 channel_code。"""
         return self.channel.channel_code if self.channel else ''
 
 
@@ -107,9 +103,23 @@ class EmailConfig(models.Model):
     class Meta:
         app_label = 'notifications'
         db_table = 'notifications_email_config'
-        ordering = ['-created_at']
+        ordering = ['-updated_at', '-pk']
         verbose_name = '邮件服务配置'
         verbose_name_plural = '邮件服务配置'
 
     def __str__(self):
         return f"{self.name} ({self.sender_email})"
+
+
+def get_builtin_email_channel() -> NotificationChannel:
+    """Return the only channel runtime code may create or select."""
+    with transaction.atomic():
+        channel, _ = NotificationChannel.objects.get_or_create(
+            channel_code=EMAIL_CHANNEL_CODE,
+            defaults={
+                "channel_name": EMAIL_CHANNEL_NAME,
+                "description": EMAIL_CHANNEL_DESCRIPTION,
+                "is_active": True,
+            },
+        )
+    return channel

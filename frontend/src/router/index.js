@@ -27,10 +27,10 @@ const routes = [
     meta: { requiresAuth: true, layout: 'portal' },
     children: [
       { path: '', name: 'SystemSettings', component: () => import('@/views/settings/SystemSettings.vue'), meta: { title: '全局系统配置' } },
-      { path: 'channel-config', name: 'ChannelConfig', component: () => import('@/views/settings/ChannelConfig.vue'), meta: { title: '消息通道配置' } },
+      { path: 'channel-config', redirect: '/settings/email-config' },
       { path: 'email-config', name: 'EmailConfig', component: () => import('@/views/notifications/EmailConfigList.vue'), meta: { title: '邮件服务配置' } },
       { path: 'general-params', name: 'GeneralSystemParams', component: () => import('@/views/settings/GeneralSystemParams.vue'), meta: { title: '通用系统参数' } },
-      { path: 'notification-channels', redirect: '/settings/channel-config' }
+      { path: 'notification-channels', redirect: '/settings/email-config' }
     ]
   },
 

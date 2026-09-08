@@ -20,11 +20,19 @@
       </div>
     </div>
 
+    <el-alert class="setup-guide" type="info" :closable="false" show-icon>
+      <template #title>先在邮箱服务商处开启 SMTP，取得授权码，再填写服务器和加密方式。</template>
+      <p>「测试连接」只检查连接和认证，不会发送邮件。发送测试邮件请进入 UI/API 项目 → 邮件通知 → 添加接收组。</p>
+      <p>保存已启用的配置会将它设为当前发送配置，影响所有项目；端口和加密方式请以服务商提供的设置为准。</p>
+    </el-alert>
     <el-card class="config-list-card">
       <div class="card-header">
         <h3>配置列表</h3>
       </div>
       <div class="table-container">
+        <el-alert v-if="loadError" :title="loadError" type="error" :closable="false">
+          <el-button link type="primary" @click="loadConfigs">重新加载</el-button>
+        </el-alert>
         <el-table :data="configs" v-loading="loading" style="width: 100%" row-key="id">
           <el-table-column prop="id" label="ID" width="70" align="center" />
           <el-table-column prop="name" label="配置名称" min-width="140" show-overflow-tooltip />
@@ -33,20 +41,20 @@
           <el-table-column prop="sender_email" label="发件邮箱" min-width="180" show-overflow-tooltip />
           <el-table-column label="授权码" width="100" align="center">
             <template #default="scope">
-              <span class="password-cell">{{ scope.row.smtp_password === '***' ? '已配置' : '—' }}</span>
+              <span class="password-cell">{{ scope.row.has_password ? '已配置' : '未配置' }}</span>
             </template>
           </el-table-column>
-          <el-table-column prop="use_ssl" label="SSL" width="80" align="center">
+          <el-table-column prop="use_ssl" label="加密方式" width="120" align="center">
             <template #default="scope">
               <el-tag :type="scope.row.use_ssl ? 'success' : 'info'" size="small">
-                {{ scope.row.use_ssl ? '是' : '否' }}
+                {{ scope.row.use_ssl ? 'SSL/TLS' : 'STARTTLS' }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="is_active" label="启用" width="80" align="center">
+          <el-table-column prop="is_active" label="发送状态" width="140" align="center">
             <template #default="scope">
               <el-tag :type="scope.row.is_active ? 'success' : 'info'" size="small">
-                {{ scope.row.is_active ? '是' : '否' }}
+                {{ scope.row.is_effective ? '当前用于发送' : scope.row.is_active ? '已启用（备用）' : '已停用' }}
               </el-tag>
             </template>
           </el-table-column>
@@ -57,8 +65,8 @@
           </el-table-column>
           <el-table-column label="操作" width="200" fixed="right">
             <template #default="scope">
-              <el-button type="success" size="small" link :loading="testingId === scope.row.id" @click="testConfig(scope.row)">
-                测试
+              <el-button type="success" size="small" link :loading="testingId === scope.row.id" :disabled="testingId !== null" @click="testConfig(scope.row)">
+                测试连接
               </el-button>
               <el-button type="primary" size="small" link @click="openEditDialog(scope.row)">
                 编辑
@@ -69,7 +77,7 @@
             </template>
           </el-table-column>
         </el-table>
-        <el-empty v-if="!loading && configs.length === 0" description="暂无配置，点击「新建配置」添加" />
+        <el-empty v-if="!loading && !loadError && configs.length === 0" description="暂无配置，点击「新建配置」添加" />
       </div>
     </el-card>
 
@@ -102,9 +110,12 @@
             autocomplete="new-password"
           />
         </el-form-item>
-        <el-form-item label="使用 SSL" prop="use_ssl">
-          <el-switch v-model="form.use_ssl" />
-          <span class="form-tip-inline">465 端口通常为 true，587 端口为 false</span>
+        <el-form-item label="加密方式" prop="use_ssl">
+          <el-radio-group v-model="form.use_ssl">
+            <el-radio :value="true">SSL/TLS（常用 465）</el-radio>
+            <el-radio :value="false">STARTTLS（常用 587）</el-radio>
+          </el-radio-group>
+          <span class="form-tip-inline">两种方式都使用加密连接；切换后请核对端口。</span>
         </el-form-item>
         <el-form-item label="启用" prop="is_active">
           <el-switch v-model="form.is_active" />
@@ -129,6 +140,7 @@ import * as notificationsApi from '@/api/notifications'
 import { notificationErrorMessage } from '@/utils/notificationFeedback'
 
 const loading = ref(false)
+const loadError = ref('')
 const configs = ref([])
 const showDialog = ref(false)
 const editingConfig = ref(null)
@@ -179,17 +191,18 @@ function formatDateTime(val) {
 function isPasswordEmptyOrMasked(val) {
   if (val == null) return true
   const s = String(val).trim()
-  return s === '' || s.includes('***')
+  return s === '' || s === '***'
 }
 
 async function loadConfigs() {
   loading.value = true
+  loadError.value = ''
   try {
     const res = await notificationsApi.getEmailConfigs()
     const data = res?.data ?? res
     configs.value = Array.isArray(data) ? data : (data?.results ?? data?.items ?? [])
   } catch (e) {
-    console.error('加载邮件配置失败:', e)
+    loadError.value = notificationErrorMessage(e, '加载邮件配置失败')
     configs.value = []
   } finally {
     loading.value = false
@@ -239,13 +252,13 @@ function resetForm() {
 }
 
 async function testConfig(row) {
-  if (!row?.id) return
+  if (!row?.id || testingId.value !== null) return
   testingId.value = row.id
   try {
     await notificationsApi.testEmailConfig(row.id)
-    ElMessage.success('连接成功')
+    ElMessage.success('SMTP 连接和认证成功，尚未发送测试邮件')
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || e?.message || '连接失败')
+    ElMessage.error(notificationErrorMessage(e, 'SMTP 连接失败'))
   } finally {
     testingId.value = null
   }
@@ -299,8 +312,7 @@ function confirmDelete(row) {
       ElMessage.success('已删除')
       loadConfigs()
     } catch (e) {
-      console.error(e)
-      ElMessage.error('删除失败')
+      ElMessage.error(notificationErrorMessage(e, '删除失败'))
     }
   }).catch(() => {})
 }
@@ -311,11 +323,14 @@ onMounted(() => loadConfigs())
 <style scoped>
 .email-config-page {
   padding: 20px;
-  height: 100%;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow: auto;
 }
+
+.setup-guide { margin-bottom: 20px; flex-shrink: 0; }
+.setup-guide p { margin: 6px 0 0; }
 
 .page-header {
   margin-bottom: 20px;
@@ -406,7 +421,7 @@ onMounted(() => loadConfigs())
 }
 
 .form-tip-inline {
-  margin-left: 8px;
+  display: block;
   font-size: 12px;
   color: var(--el-text-color-secondary);
 }

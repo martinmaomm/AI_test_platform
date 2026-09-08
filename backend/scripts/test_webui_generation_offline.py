@@ -26,6 +26,11 @@ def main():
     def network_blocked(original):
         def connect(sock, address):
             if sock.family in (socket.AF_INET, socket.AF_INET6):
+                allowed_port = os.environ.get('AITS_OFFLINE_ALLOWED_LOOPBACK_PORT')
+                host = address[0] if isinstance(address, tuple) and address else None
+                port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
+                if host in {'127.0.0.1', '::1'} and allowed_port == str(port):
+                    return original(sock, address)
                 raise RuntimeError('Network access is disabled in WebUI offline tests')
             return original(sock, address)
         return connect
@@ -49,12 +54,14 @@ def main():
         django.setup()
         from django.core.management import call_command
         from django.test.runner import DiscoverRunner
-        call_command('makemigrations', 'ai_core', 'api_testing', 'web_testing', 'scheduled_tasks', dry_run=True, check=True, verbosity=1)
+        call_command('makemigrations', 'ai_core', 'api_testing', 'web_testing', 'scheduled_tasks', 'notifications', dry_run=True, check=True, verbosity=1)
         labels = sys.argv[1:] or [
             'ai_core.tests.test_webui_playwright_agent',
             'ai_core.tests.test_mcp_output_connections',
             'ai_core.tests.test_mcp_agent_budget',
             'scheduled_tasks.test_environment_contract',
+            'scheduled_tasks.test_notification_targets',
+            'notifications',
             'web_testing',
         ]
         return bool(DiscoverRunner(verbosity=1, interactive=False).run_tests(labels))

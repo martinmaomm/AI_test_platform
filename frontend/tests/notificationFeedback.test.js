@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { notificationErrorMessage, isSupportedNotificationChannel, loadNotificationPages } from '../src/utils/notificationFeedback.js'
+import { notificationErrorMessage, isSupportedNotificationChannel, loadNotificationPages, emailNotificationReceivers } from '../src/utils/notificationFeedback.js'
 
 test('receiver selection includes later pages and does not silently hide a failed page', async () => {
   const pages = []
@@ -19,8 +19,8 @@ test('receiver selection includes later pages and does not silently hide a faile
 })
 
 test('notification form shows server field validation rather than hiding Axios errors', () => {
-  const fieldError = { message: 'Request failed with status code 400', response: { data: { webhook_url: ['地址不匹配所选渠道'] } } }
-  assert.equal(notificationErrorMessage(fieldError), '地址不匹配所选渠道')
+  const fieldError = { message: 'Request failed with status code 400', response: { data: { smtp_server: ['请填写 SMTP 主机名'] } } }
+  assert.equal(notificationErrorMessage(fieldError), '请填写 SMTP 主机名')
   assert.equal(notificationErrorMessage({ response: { data: { detail: '没有项目权限' } } }), '没有项目权限')
   assert.equal(notificationErrorMessage({ response: { data: { error: { details: { target_address: ['邮箱格式无效'] } } } } }), '邮箱格式无效')
   assert.equal(notificationErrorMessage(new Error('Network Error')), 'Network Error')
@@ -28,12 +28,25 @@ test('notification form shows server field validation rather than hiding Axios e
 })
 
 test('notification UI advertises only implemented transports', () => {
-  for (const code of ['dingtalk', 'wechat_work', 'email']) assert.equal(isSupportedNotificationChannel(code), true)
-  for (const code of ['feishu', 'slack', '', undefined]) assert.equal(isSupportedNotificationChannel(code), false)
+  assert.equal(isSupportedNotificationChannel('email'), true)
+  for (const code of ['dingtalk', 'wechat_work', 'feishu', 'slack', '', undefined]) assert.equal(isSupportedNotificationChannel(code), false)
+})
+
+test('only enabled email receivers appear in scheduled task choices', () => {
+  const items = [
+    { id: 1, channel_code: 'email', is_active: true, channel_is_active: true },
+    { id: 2, channel_code: 'email', is_active: false },
+    { id: 3, channel_code: 'email', is_active: true, channel_is_active: false },
+    { id: 4, channel_code: 'dingtalk', is_active: true },
+    { id: 5, channel_code: 'wechat_work', is_active: true }
+  ]
+  assert.deepEqual(emailNotificationReceivers(items).map(row => row.id), [1, 2, 3])
+  assert.deepEqual(emailNotificationReceivers(items, { activeOnly: true }).map(row => row.id), [1])
+  assert.deepEqual(emailNotificationReceivers(null), [])
 })
 
 test('notification pages distinguish form validation failures and API failures', async () => {
-  for (const path of ['project/NotificationReceivers.vue', 'settings/ChannelConfig.vue', 'notifications/EmailConfigList.vue']) {
+  for (const path of ['project/NotificationReceivers.vue', 'notifications/EmailConfigList.vue']) {
     const source = await readFile(new URL(`../src/views/${path}`, import.meta.url), 'utf8')
     assert.match(source, /try \{ await formRef\.value\?\.validate\(\) \} catch \{ return \}/)
     assert.match(source, /ElMessage\.error\(notificationErrorMessage\(e,/)
@@ -43,5 +56,21 @@ test('notification pages distinguish form validation failures and API failures',
   assert.match(source, /version !== receiverRequestVersion/)
   assert.match(source, /const projectId = formProjectId\.value/)
   const api = await readFile(new URL('../src/api/notifications.js', import.meta.url), 'utf8')
-  assert.match(api, /function updateNotificationChannel\(id, data\) \{\s+return api\.patch/)
+  assert.doesNotMatch(api, /testReceiverConnection|createNotificationChannel|Webhook/)
+  assert.match(api, /function getEmailConfigs[\s\S]+loadNotificationPages/)
+})
+
+test('email-only forms separate SMTP connection checks from sending and show real task fields', async () => {
+  const receiver = await readFile(new URL('../src/views/project/NotificationReceivers.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(receiver, /webhook_url|form\.channel|钉钉|企业微信/)
+  assert.match(receiver, /确认发送/)
+  assert.match(receiver, /SMTP 已接受测试邮件/)
+  const smtp = await readFile(new URL('../src/views/notifications/EmailConfigList.vue', import.meta.url), 'utf8')
+  assert.match(smtp, /is_effective/)
+  assert.match(smtp, /STARTTLS/)
+  assert.match(smtp, /尚未发送测试邮件/)
+  assert.doesNotMatch(smtp, /s\.includes\('\*\*\*'\)/)
+  const detail = await readFile(new URL('../src/components/scheduledTasks/TaskDetailDialog.vue', import.meta.url), 'utf8')
+  assert.match(detail, /task.notice_targets/)
+  assert.doesNotMatch(detail, /task.notification|webhook/i)
 })

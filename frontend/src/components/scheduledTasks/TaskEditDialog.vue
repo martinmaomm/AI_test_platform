@@ -155,11 +155,11 @@
 
       <el-row :gutter="20">
         <el-col :span="14">
-          <el-form-item label="通知对象" prop="notice_targets">
+          <el-form-item label="邮件接收组" prop="notice_targets">
             <el-select
               v-model="form.notice_targets"
               multiple
-              placeholder="选择接收执行结果通知的群组（可按平台分组多选）"
+              placeholder="选择本项目已启用的邮件接收组（可多选）"
               clearable
               collapse-tags
               collapse-tags-tooltip
@@ -167,19 +167,15 @@
               style="width:100%"
               :loading="loadingChannels"
             >
-              <el-option-group
-                v-for="group in noticeTargetGroups"
-                :key="group.label"
-                :label="group.label"
-              >
-                <el-option
-                  v-for="opt in group.options"
-                  :key="opt.id"
-                  :label="opt.name"
-                  :value="opt.id"
-                />
-              </el-option-group>
+              <el-option v-for="opt in channels" :key="opt.id" :label="opt.name" :value="opt.id" />
+              <template #empty>
+                <div class="suite-empty-state" v-if="channelLoadError">
+                  <span>加载邮件接收组失败</span><el-button link type="primary" @click="loadChannels">重试</el-button>
+                </div>
+                <div class="suite-empty-state" v-else>暂无已启用的邮件接收组，请先在项目「邮件通知」中添加</div>
+              </template>
             </el-select>
+            <el-text type="info" size="small">不选择接收组则不发送邮件。</el-text>
           </el-form-item>
         </el-col>
         <el-col :span="10">
@@ -254,6 +250,7 @@ import {
 } from '../../api/scheduledTasks'
 import { getProjectEnvironments } from '../../api/projects'
 import { getNotificationReceivers } from '@/api/notifications'
+import { emailNotificationReceivers } from '@/utils/notificationFeedback'
 import { useProjectStore } from '@/stores/project'
 
 // 项目状态管理
@@ -319,28 +316,12 @@ const suites = ref([])
 const suiteLoadError = ref(false)
 const channels = ref([])
 const loadingChannels = ref(false)
+const channelLoadError = ref(false)
 let suiteRequestId = 0
 let environmentRequestId = 0
 let channelRequestId = 0
 
 const selectableSuites = computed(() => suites.value.filter((suite) => suite.selectable))
-
-const CHANNEL_TYPE_LABELS = { wechat_work: '企业微信', dingtalk: '钉钉', email: '邮件' }
-
-/** 按渠道类型分组，供 el-option-group 使用 */
-const noticeTargetGroups = computed(() => {
-  const list = channels.value || []
-  const byType = {}
-  list.forEach((c) => {
-    const t = c.channel_code || c.channel_type || 'dingtalk'
-    if (!byType[t]) byType[t] = []
-    byType[t].push({ id: c.id, name: c.name })
-  })
-  return Object.keys(byType).map((t) => ({
-    label: CHANNEL_TYPE_LABELS[t] || t,
-    options: byType[t],
-  }))
-})
 
 // 表单引用
 const formRef = ref()
@@ -486,6 +467,7 @@ const loadSuites = async () => {
 }
 
 const loadChannels = async () => {
+  channelLoadError.value = false
   const projectId = projectStore.currentProjectId
   const requestId = ++channelRequestId
   if (!projectId) {
@@ -499,10 +481,11 @@ const loadChannels = async () => {
     if (requestId !== channelRequestId || projectId !== projectStore.currentProjectId) return
     const data = res?.data ?? res
     const items = data?.results ?? data
-    channels.value = Array.isArray(items) ? items : []
+    channels.value = emailNotificationReceivers(items, { activeOnly: true })
   } catch (e) {
     if (requestId !== channelRequestId || projectId !== projectStore.currentProjectId) return
     console.error('Load notification receivers error:', e)
+    channelLoadError.value = true
     channels.value = []
   } finally {
     if (requestId === channelRequestId) loadingChannels.value = false
@@ -547,6 +530,7 @@ const getSubmitErrorMessage = (error) => {
       suite_ids: '测试套件',
       cron_expression: 'Cron表达式',
       environment: '执行环境',
+      notice_targets: '邮件接收组',
       name: '任务名称',
       non_field_errors: '任务配置'
     }

@@ -13,12 +13,15 @@ export function notificationErrorMessage(error, fallback = '通知操作失败')
 }
 
 export const NOTIFICATION_CHANNELS = [
-  { code: 'dingtalk', name: '钉钉' },
-  { code: 'wechat_work', name: '企业微信' },
   { code: 'email', name: '邮件' }
 ]
 
 export const isSupportedNotificationChannel = code => NOTIFICATION_CHANNELS.some(item => item.code === code)
+
+export function emailNotificationReceivers(items, { activeOnly = false } = {}) {
+  return (Array.isArray(items) ? items : []).filter(item => item.channel_code === 'email'
+    && (!activeOnly || (item.is_active !== false && item.channel_is_active !== false)))
+}
 
 // These configuration screens and the task selector have no pagination controls.
 // Read each page from the same scoped endpoint, never follow a returned URL.

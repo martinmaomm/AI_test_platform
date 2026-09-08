@@ -82,38 +82,28 @@
       </el-card>
 
       <!-- 通知配置 -->
-      <el-card v-if="task.notification" class="info-card">
+      <el-card class="info-card">
         <template #header>
-          <span>通知配置</span>
+          <span>邮件通知配置</span>
         </template>
         
         <el-descriptions :column="2" border>
           <el-descriptions-item label="通知方式">
-            {{ getNotificationTypeLabel(task.notification.notification_type) }}
+            {{ task.notice_targets?.length ? '邮件通知' : '不通知' }}
           </el-descriptions-item>
-          <el-descriptions-item label="成功时通知">
-            <el-tag :type="task.notification.notify_on_success ? 'success' : 'info'">
-              {{ task.notification.notify_on_success ? '是' : '否' }}
-            </el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="失败时通知">
-            <el-tag :type="task.notification.notify_on_failure ? 'success' : 'info'">
-              {{ task.notification.notify_on_failure ? '是' : '否' }}
-            </el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item v-if="task.notification.webhook_url" label="Webhook URL">
-            <el-text type="primary">{{ task.notification.webhook_url }}</el-text>
+          <el-descriptions-item label="触发条件">
+            {{ task.trigger_condition === 'fail' ? '仅失败时通知' : '始终通知' }}
           </el-descriptions-item>
         </el-descriptions>
         
-        <div v-if="task.notification.email_recipients && task.notification.email_recipients.length" class="email-recipients">
-          <h4>邮件接收者</h4>
+        <div v-if="task.notice_targets?.length" class="email-recipients">
+          <h4>邮件接收组</h4>
           <el-tag
-            v-for="email in task.notification.email_recipients"
-            :key="email"
+            v-for="target in task.notice_targets"
+            :key="target.id"
             class="email-tag"
           >
-            {{ email }}
+            {{ target.name }}：{{ target.target_address }}
           </el-tag>
         </div>
       </el-card>
@@ -381,15 +371,6 @@ const getRecentLogStatusLabel = (row) => {
   if (row.status === 'pending' || row.status === 'running' || Number(row.incomplete_cases) > 0) return '未完成'
   if (row.status === 'cancelled' || (totalCases > 0 && skippedCases === totalCases)) return '已跳过'
   return getExecutionStatusLabel(row.status)
-}
-
-const getNotificationTypeLabel = (type) => {
-  const labels = {
-    none: '不通知',
-    email: '邮件通知',
-    webhook: 'Webhook通知'
-  }
-  return labels[type] || type
 }
 
 const getSuccessRateColor = (rate) => {

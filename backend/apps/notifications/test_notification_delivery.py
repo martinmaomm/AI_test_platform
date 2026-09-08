@@ -1,124 +1,37 @@
+"""Offline SMTP delivery contracts; no real provider is contacted."""
+
+import smtplib
+import socket
+import ssl
 from unittest.mock import Mock, patch
 
-import requests
-
+from django.core import mail
+from django.core.mail import get_connection
 from django.test import SimpleTestCase, TestCase
 
 from .delivery import (
     NotificationDeliveryError,
     parse_recipients,
     send_email,
-    send_webhook,
     test_smtp_connection,
-    validate_webhook_url,
 )
 from .models import EmailConfig
 
 
-class NotificationWebhookDeliveryTests(SimpleTestCase):
-    DINGTALK_URL = "https://oapi.dingtalk.com/robot/send?access_token=receiver-secret"
-    WECHAT_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=receiver-secret"
-
-    def test_validate_webhook_url_accepts_only_official_endpoints(self):
+class RecipientParsingTests(SimpleTestCase):
+    def test_supported_separators_are_normalized_and_deduplicated(self):
         self.assertEqual(
-            validate_webhook_url("dingtalk", self.DINGTALK_URL), self.DINGTALK_URL
-        )
-        self.assertEqual(
-            validate_webhook_url(
-                "dingtalk",
-                "https://oapi.dingtalk.com:443/robot/send?access_token=receiver-secret",
-            ),
-            "https://oapi.dingtalk.com:443/robot/send?access_token=receiver-secret",
-        )
-        self.assertEqual(
-            validate_webhook_url("wechat_work", self.WECHAT_URL), self.WECHAT_URL
-        )
-        for channel, url in (
-            ("dingtalk", "http://oapi.dingtalk.com/robot/send?access_token=value"),
-            ("dingtalk", "https://attacker.example/robot/send?access_token=value"),
-            (
-                "dingtalk",
-                "https://user@oapi.dingtalk.com/robot/send?access_token=value",
-            ),
-            (
-                "dingtalk",
-                "https://oapi.dingtalk.com/robot/send?access_token=value#fragment",
-            ),
-            ("dingtalk", "https://oapi.dingtalk.com/robot/send"),
-            ("dingtalk", "https://oapi.dingtalk.com:444/robot/send?access_token=value"),
-            ("email", self.DINGTALK_URL),
-        ):
-            with self.assertRaises(NotificationDeliveryError):
-                validate_webhook_url(channel, url)
-
-    @patch("notifications.delivery.requests.post")
-    def test_send_webhook_requires_http_and_official_success_body(self, post):
-        post.return_value = Mock(
-            status_code=200, json=Mock(return_value={"errcode": 0})
+            parse_recipients("one@example.test; two@example.test\nONE@example.test"),
+            ["one@example.test", "two@example.test"],
         )
 
-        send_webhook("dingtalk", self.DINGTALK_URL, {"msgtype": "text"})
-
-        post.assert_called_once_with(
-            self.DINGTALK_URL,
-            json={"msgtype": "text"},
-            timeout=10,
-            allow_redirects=False,
-            headers={"Content-Type": "application/json"},
-        )
-        post.return_value = Mock(
-            status_code=200, json=Mock(return_value={"errcode": "0"})
-        )
-        send_webhook("dingtalk", self.DINGTALK_URL, {"msgtype": "text"})
-        for response in (
-            Mock(status_code=201, json=Mock(return_value={"errcode": 0})),
-            Mock(status_code=200, json=Mock(return_value={"errcode": 1})),
-            Mock(status_code=200, json=Mock(return_value={"errcode": True})),
-            Mock(status_code=200, json=Mock(return_value={"errcode": 0.0})),
-            Mock(status_code=200, json=Mock(return_value={"errcode": "0"})),
-            Mock(status_code=200, json=Mock(side_effect=ValueError("bad body"))),
-        ):
-            post.return_value = response
-            with self.assertRaises(NotificationDeliveryError) as error:
-                send_webhook("wechat_work", self.WECHAT_URL, {"msgtype": "text"})
-            self.assertNotIn("receiver-secret", str(error.exception))
-
-    @patch("notifications.delivery.requests.post")
-    def test_send_webhook_exposes_only_safe_status_or_errcode_context(self, post):
-        post.return_value = Mock(
-            status_code=503, json=Mock(return_value={"errcode": 0})
-        )
-        with self.assertRaisesRegex(NotificationDeliveryError, "状态码: 503"):
-            send_webhook("dingtalk", self.DINGTALK_URL, {"msgtype": "text"})
-
-        post.return_value = Mock(
-            status_code=200,
-            json=Mock(return_value={"errcode": 310000, "errmsg": "secret detail"}),
-        )
-        with self.assertRaisesRegex(
-            NotificationDeliveryError, "关键词、签名或 IP 白名单"
-        ) as error:
-            send_webhook("dingtalk", self.DINGTALK_URL, {"msgtype": "text"})
-        self.assertNotIn("secret detail", str(error.exception))
-
-        post.side_effect = requests.Timeout("private timeout detail")
-        with self.assertRaisesRegex(NotificationDeliveryError, "请求超时") as error:
-            send_webhook("dingtalk", self.DINGTALK_URL, {"msgtype": "text"})
-        self.assertNotIn("private timeout detail", str(error.exception))
-
-    def test_parse_recipients_normalizes_supported_separators_and_rejects_bad_values(
-        self,
-    ):
-        self.assertEqual(
-            parse_recipients("one@example.test; two@example.test\nthree@example.test"),
-            ["one@example.test", "two@example.test", "three@example.test"],
-        )
+    def test_empty_bad_or_empty_item_is_rejected(self):
         for value in ("", "one@example.test,", "not-an-email"):
-            with self.assertRaises(NotificationDeliveryError):
+            with self.subTest(value=value), self.assertRaises(NotificationDeliveryError):
                 parse_recipients(value)
 
 
-class NotificationEmailDeliveryTests(TestCase):
+class EmailDeliveryTests(TestCase):
     def setUp(self):
         self.config = EmailConfig.objects.create(
             name="SMTP",
@@ -129,29 +42,88 @@ class NotificationEmailDeliveryTests(TestCase):
             use_ssl=True,
         )
 
-    @patch("notifications.delivery.EmailMultiAlternatives")
-    def test_send_email_uses_enabled_smtp_timeout_and_requires_one_send(
-        self, email_message
-    ):
-        message = email_message.return_value
-        message.send.return_value = 1
-
-        send_email("subject", "body", ["one@example.test"], html_body="<p>body</p>")
-
-        connection = email_message.call_args.kwargs["connection"]
-        self.assertEqual(connection.timeout, 10)
-        self.assertTrue(connection.use_ssl)
-        self.assertFalse(connection.use_tls)
-        message.attach_alternative.assert_called_once_with("<p>body</p>", "text/html")
-        message.send.return_value = 0
-        with self.assertRaises(NotificationDeliveryError):
-            send_email("subject", "body", ["one@example.test"])
+    def _connection(self, *, refused=None, open_side_effect=None):
+        client = Mock()
+        client.sendmail.return_value = {} if refused is None else refused
+        connection = Mock(connection=client)
+        connection.open.side_effect = open_side_effect
+        return connection, client
 
     @patch("notifications.delivery._get_smtp_connection")
-    def test_test_smtp_connection_uses_shared_transport_rules(self, get_connection):
-        connection = get_connection.return_value
+    def test_send_email_builds_one_mime_message_for_all_recipients(self, get_connection):
+        connection, client = self._connection()
+        get_connection.return_value = connection
+
+        send_email(
+            "mail-subject",
+            "纯文本内容",
+            ["one@example.test", "two@example.test", "ONE@example.test"],
+            html_body="<p>HTML 内容</p>",
+        )
+
+        connection.open.assert_called_once_with()
+        connection.close.assert_called_once_with()
+        sender, recipients, raw_message = client.sendmail.call_args.args
+        self.assertEqual(sender, "sender@example.test")
+        self.assertEqual(recipients, ["one@example.test", "two@example.test"])
+        self.assertIn(b"Subject: mail-subject", raw_message)
+        self.assertIn(b"multipart/alternative", raw_message)
+
+    @patch("notifications.delivery._get_smtp_connection")
+    def test_partial_recipient_refusal_is_not_reported_as_success(self, get_connection):
+        connection, client = self._connection(
+            refused={"two@example.test": (550, b"not accepted")}
+        )
+        get_connection.return_value = connection
+
+        with self.assertRaisesRegex(NotificationDeliveryError, "部分收件人") as caught:
+            send_email("subject", "body", ["one@example.test", "two@example.test"])
+        self.assertIn("不要直接重复发送", caught.exception.safe_message)
+        connection.close.assert_called_once_with()
+        client.sendmail.assert_called_once()
+
+    @patch("notifications.delivery._get_smtp_connection")
+    def test_non_smtp_test_backend_keeps_django_message_and_outbox_contract(self, get_smtp_connection):
+        get_smtp_connection.return_value = get_connection("django.core.mail.backends.locmem.EmailBackend")
+
+        send_email("mail-subject", "body", ["one@example.test"])
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["one@example.test"])
+
+    @patch("notifications.delivery._get_smtp_connection")
+    def test_smtp_security_errors_are_safe_and_do_not_leak_credentials(self, get_connection):
+        cases = (
+            (smtplib.SMTPAuthenticationError(535, b"password=private"), "认证失败"),
+            (ssl.SSLError("private TLS detail"), "SSL/TLS"),
+            (socket.timeout("private timeout detail"), "超时"),
+        )
+        for error, expected in cases:
+            connection, _ = self._connection(open_side_effect=error)
+            get_connection.return_value = connection
+            with self.subTest(error=type(error).__name__), self.assertRaises(NotificationDeliveryError) as caught:
+                test_smtp_connection(self.config)
+            self.assertIn(expected, caught.exception.safe_message)
+            self.assertNotIn("private", caught.exception.safe_message)
+            self.assertNotIn("password", caught.exception.safe_message)
+
+    @patch("notifications.delivery._get_smtp_connection")
+    def test_connection_test_opens_and_authenticates_without_sending_email(self, get_connection):
+        connection, client = self._connection()
+        get_connection.return_value = connection
 
         test_smtp_connection(self.config)
 
         connection.open.assert_called_once_with()
         connection.close.assert_called_once_with()
+        client.sendmail.assert_not_called()
+
+    @patch("notifications.delivery.get_connection")
+    def test_starttls_is_used_when_ssl_is_disabled(self, get_connection):
+        from .delivery import _get_smtp_connection
+
+        self.config.use_ssl = False
+        _get_smtp_connection(self.config)
+
+        self.assertFalse(get_connection.call_args.kwargs["use_ssl"])
+        self.assertTrue(get_connection.call_args.kwargs["use_tls"])

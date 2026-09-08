@@ -18,7 +18,6 @@ from .delivery import (
     NotificationDeliveryError,
     parse_recipients,
     send_email,
-    send_webhook,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,17 +124,6 @@ def _report_url(execution_log) -> str:
     return f"{base_url}/reports/detail/{execution_id}"
 
 
-def _webhook_payload(
-    channel_code: str, markdown_text: str, title: str
-) -> dict[str, Any]:
-    if channel_code == "wechat_work":
-        return {"msgtype": "markdown", "markdown": {"content": markdown_text}}
-    return {
-        "msgtype": "markdown",
-        "markdown": {"title": title or "定时任务执行结果", "text": markdown_text},
-    }
-
-
 def _message_content(
     execution_log, scheduled_task_id: int, summary: dict[str, Any]
 ) -> tuple[str, str, str]:
@@ -238,7 +226,11 @@ def trigger_notification(
         task_name, markdown_text, html_body = _message_content(
             execution_log, scheduled_task_id, summary
         )
-        receivers = task.notice_targets.filter(is_active=True).select_related("channel")
+        receivers = task.notice_targets.filter(
+            is_active=True,
+            channel__channel_code="email",
+            channel__is_active=True,
+        ).select_related("channel")
         attempted = False
         all_succeeded = True
         for receiver in receivers:
@@ -249,46 +241,33 @@ def trigger_notification(
                 or not channel.is_active
             ):
                 continue
-            channel_code = str(channel.channel_code or "").strip()
-            if not channel_code:
-                continue
             attempted = True
             try:
-                if channel_code == "email":
-                    recipients = parse_recipients(receiver.target_address)
-                    subject = f"【AITS 自动化测试报告】任务: {task_name} 执行完毕"
-                    send_email(subject, markdown_text, recipients, html_body=html_body)
-                else:
-                    send_webhook(
-                        channel_code,
-                        receiver.webhook_url,
-                        _webhook_payload(channel_code, markdown_text, task_name),
-                    )
+                recipients = parse_recipients(receiver.target_address)
+                subject = f"【AITS 自动化测试报告】任务: {task_name} 执行完毕"
+                send_email(subject, markdown_text, recipients, html_body=html_body)
                 logger.info(
-                    "通知发送成功: task_id=%s log_id=%s receiver_id=%s channel=%s",
+                    "邮件通知发送成功: task_id=%s log_id=%s receiver_id=%s",
                     scheduled_task_id,
                     execution_log.pk,
                     receiver.pk,
-                    channel_code,
                 )
             except NotificationDeliveryError as exc:
                 all_succeeded = False
                 logger.warning(
-                    "通知发送失败: task_id=%s log_id=%s receiver_id=%s channel=%s reason=%s",
+                    "邮件通知发送失败: task_id=%s log_id=%s receiver_id=%s reason=%s",
                     scheduled_task_id,
                     execution_log.pk,
                     receiver.pk,
-                    channel_code,
                     str(exc),
                 )
             except Exception as exc:
                 all_succeeded = False
                 logger.warning(
-                    "通知发送发生未预期错误: task_id=%s log_id=%s receiver_id=%s channel=%s error_type=%s",
+                    "邮件通知发生未预期错误: task_id=%s log_id=%s receiver_id=%s error_type=%s",
                     scheduled_task_id,
                     execution_log.pk,
                     receiver.pk,
-                    channel_code,
                     type(exc).__name__,
                 )
 

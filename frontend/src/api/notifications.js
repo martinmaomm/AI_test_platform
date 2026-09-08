@@ -1,29 +1,8 @@
 /**
- * 消息渠道管理 API（钉钉/企微 Webhook）
+ * 邮件配置与项目邮件接收组 API
  */
 import api from './index'
 import { loadNotificationPages } from '../utils/notificationFeedback'
-
-// ---------- 全局渠道（管理员） ----------
-/** 获取全局渠道列表 */
-export function getNotificationChannels(params = {}) {
-  return api.get('/notifications/channels/', { params })
-}
-
-/** 创建全局渠道 */
-export function createNotificationChannel(data) {
-  return api.post('/notifications/channels/', data)
-}
-
-/** 更新全局渠道 */
-export function updateNotificationChannel(id, data) {
-  return api.patch(`/notifications/channels/${id}/`, data)
-}
-
-/** 删除全局渠道 */
-export function deleteNotificationChannel(id) {
-  return api.delete(`/notifications/channels/${id}/`)
-}
 
 // ---------- 项目级接收对象（嵌套在 /projects/{projectId}/notification-receivers/ 下）----------
 /** 获取项目接收对象列表 */
@@ -55,25 +34,16 @@ export function deleteNotificationReceiver(projectId, id) {
   return api.delete(`/projects/${projectId}/notification-receivers/${id}/`)
 }
 
-/** 测试连接（校验 Webhook URL 是否有效，需传 body） */
-export function testReceiverConnection(projectIdOrPayload, idOrPayload) {
-  if (typeof projectIdOrPayload === 'number' || typeof projectIdOrPayload === 'string') {
-    return api.post(`/projects/${projectIdOrPayload}/notification-receivers/test_connection/`, idOrPayload)
-  }
-  if (typeof projectIdOrPayload === 'object') {
-    return api.post('/notifications/receivers/test_connection/', projectIdOrPayload)
-  }
-  return api.post('/notifications/receivers/test_connection/', idOrPayload)
-}
-
-/** 按接收对象 ID 测试（后端从数据库读取 Webhook 发送，不传明文，防抓包） */
+/** 向保存的邮件接收组发送测试邮件 */
 export function testReceiverById(projectId, id) {
   return api.post(`/projects/${projectId}/notification-receivers/${id}/test/`)
 }
 
 // ---------- 邮件服务配置 ----------
 export function getEmailConfigs(params = {}) {
-  return api.get('/notifications/email-configs/', { params })
+  const path = '/notifications/email-configs/'
+  if (params.page) return api.get(path, { params })
+  return loadNotificationPages(page => api.get(path, { params: { ...params, page } }))
 }
 
 export function createEmailConfig(data) {

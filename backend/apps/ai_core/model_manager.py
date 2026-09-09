@@ -16,6 +16,10 @@ import time
 from datetime import datetime
 
 from .models import LLMConfiguration
+from .llm_configuration import (
+    get_html_gateway_error_message,
+    normalize_openai_compatible_base_url,
+)
 from common.websocket import websocket_message_service
 
 logger = logging.getLogger(__name__)
@@ -102,7 +106,9 @@ class ModelManager:
             'provider': config.provider,
             'enabled': True,
             'api_key': config.api_key,
-            'base_url': config.base_url,
+            'base_url': normalize_openai_compatible_base_url(
+                config.provider, config.base_url
+            ),
             'model': config.model_name,
             'extra_config': config.extra_config or {}
         }
@@ -124,6 +130,9 @@ class ModelManager:
         provider = self.config['provider']
         model_name = self.config['model']
         extra_config = self.config.get('extra_config', {})
+        base_url = normalize_openai_compatible_base_url(
+            provider, self.config.get('base_url')
+        )
         
         # 构建基础初始化参数
         init_params = {
@@ -155,7 +164,7 @@ class ModelManager:
             init_params.update({
                 'model_provider': 'deepseek',
                 'api_key': self.config.get('api_key'),
-                'base_url': self.config.get('base_url'),  # 可选，支持自定义 base_url
+                'base_url': base_url,  # 可选，支持自定义 base_url
                 'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
@@ -167,7 +176,7 @@ class ModelManager:
             init_params.update({
                 'model_provider': 'openai',  # 使用 OpenAI 兼容接口
                 'api_key': self.config.get('api_key'),
-                'base_url': self.config.get('base_url'),
+                'base_url': base_url,
                 'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
@@ -199,7 +208,7 @@ class ModelManager:
             init_params.update({
                 'model_provider': 'openai',
                 'api_key': self.config.get('api_key'),
-                'base_url': self.config.get('base_url'),
+                'base_url': base_url,
                 'timeout': extra_config.get('timeout', DEFAULT_LLM_TIMEOUT),
                 'max_retries': extra_config.get('max_retries', 3),
             })
@@ -459,9 +468,10 @@ class ModelManager:
             }
         except Exception as e:
             logger.error(f"模型连接测试失败: {e}", exc_info=True)
+            gateway_error = get_html_gateway_error_message(e)
             return {
                 'success': False,
-                'error': f'连接测试失败: {str(e)}',
+                'error': gateway_error or f'连接测试失败: {str(e)}',
                 'error_details': traceback.format_exc()
             }
 

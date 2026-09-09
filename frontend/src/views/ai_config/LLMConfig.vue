@@ -52,7 +52,7 @@
                 <div class="config-title">
                   {{ scope.row.model_name }}
                 </div>
-                <div class="config-model">接口类型：{{ scope.row.provider_display || scope.row.provider || '—' }}</div>
+                <div class="config-model">接口类型：{{ getLLMProviderInterfaceLabel(scope.row.provider) }}</div>
               </div>
             </div>
           </template>
@@ -123,13 +123,7 @@
         
         <el-form-item label="模型接口类型" prop="provider">
           <el-select v-model="modelConfigForm.provider" placeholder="选择模型接口类型" style="width: 100%">
-            <el-option label="OpenAI" value="openai" />
-            <el-option label="DeepSeek" value="deepseek" />
-            <el-option label="Ollama" value="ollama" />
-            <el-option label="通义千问" value="qwen" />
-            <el-option label="文心一言" value="ernie" />
-            <el-option label="智谱AI" value="zhipu" />
-            <el-option label="其他" value="other" />
+            <el-option v-for="option in LLM_PROVIDER_OPTIONS" :key="option.value" :label="option.label" :value="option.value" />
           </el-select>
         </el-form-item>
 
@@ -141,7 +135,7 @@
            <el-input 
              v-model="modelConfigForm.api_key" 
              type="password" 
-             placeholder="请输入API密钥" 
+             :placeholder="editingModelConfig ? '留空则保留已有密钥' : '请输入API密钥'"
              show-password 
              :disabled="modelConfigForm.provider === 'ollama'"
            />
@@ -152,6 +146,9 @@
         
         <el-form-item label="API地址" prop="base_url">
           <el-input v-model="modelConfigForm.base_url" placeholder="请输入API地址" />
+          <div class="form-tip" v-if="baseUrlHint">
+            <el-text type="info" size="small">ℹ️ {{ baseUrlHint }}</el-text>
+          </div>
         </el-form-item>
         
         <el-form-item label="模型名称" prop="model_name">
@@ -179,6 +176,13 @@ import BackButton from '@/components/BackButton.vue'
 import dayjs from 'dayjs'
 import { modelProviderLabel } from '@/composables/webUIScriptGenerationPresentation'
 import {
+  DEFAULT_LLM_PROVIDER,
+  getLLMConnectionError,
+  getLLMProviderBaseUrlHint,
+  getLLMProviderInterfaceLabel,
+  LLM_PROVIDER_OPTIONS,
+} from '@/utils/llmConfiguration'
+import {
   getLLMConfigurations,
   createLLMConfiguration,
   updateLLMConfiguration,
@@ -202,7 +206,7 @@ const configurations = ref([])
 // 模型表单数据
 const modelConfigForm = reactive({
   model_type: 'llm',
-  provider: '',
+  provider: DEFAULT_LLM_PROVIDER,
   provider_name: '',
   api_key: '',
   base_url: '',
@@ -305,7 +309,7 @@ const loadConfigurations = async () => {
 
 
 const onModelTypeChange = () => {
-  modelConfigForm.provider = ''
+  modelConfigForm.provider = DEFAULT_LLM_PROVIDER
   modelConfigForm.provider_name = ''
   modelConfigForm.api_key = ''
   modelConfigForm.model_name = ''
@@ -321,7 +325,7 @@ const resetForm = (formRef, defaultValues) => {
 const addModelConfiguration = () => {
   resetForm(modelConfigForm, {
     model_type: 'llm',
-    provider: '',
+    provider: DEFAULT_LLM_PROVIDER,
     provider_name: '',
     api_key: '',
     base_url: '',
@@ -336,7 +340,7 @@ const editConfiguration = (config) => {
   editingModelConfig.value = config
   resetForm(modelConfigForm, {
     model_type: config.model_type,
-    provider: config.provider || '',
+    provider: config.provider || DEFAULT_LLM_PROVIDER,
     provider_name: config.provider_name || '',
     api_key: config.api_key || '',
     base_url: config.base_url,
@@ -368,8 +372,9 @@ const saveModelConfiguration = async () => {
     showCreateModelDialog.value = false
     await loadConfigurations()
   } catch (error) {
-    console.error('保存模型配置失败:', error)
-    ElMessage.error('保存模型配置失败')
+    const errorData = getLLMConnectionError(error, '保存模型配置失败')
+    console.error('保存模型配置失败:', errorData.message)
+    ElMessage.error(errorData.message)
   } finally {
     saving.value = false
   }
@@ -380,7 +385,7 @@ const cancelModelEdit = () => {
   editingModelConfig.value = null
   resetForm(modelConfigForm, {
     model_type: 'llm',
-    provider: '',
+    provider: DEFAULT_LLM_PROVIDER,
     provider_name: '',
     api_key: '',
     base_url: '',
@@ -426,17 +431,17 @@ const testConnectionHandler = async (config) => {
       ElMessage.error(`连接测试失败: ${errorMsg}`)
     }
   } catch (error) {
-    console.error('连接测试失败:', error)
-    
+    const errorData = getLLMConnectionError(error)
+    console.error('连接测试失败:', errorData.message)
+
     if (error.response?.data) {
-      const errorData = error.response.data
-      const errorTitle = getErrorTitle(errorData.error_type)
+      const errorTitle = getErrorTitle(error.response.data.error_type)
       
       ElNotification({
         title: errorTitle,
         message: h('div', [
-          h('div', { style: 'margin-bottom: 8px;' }, errorData.error_detail),
-          errorData.suggestion && h('div', { 
+          h('div', { style: 'margin-bottom: 8px;' }, errorData.message),
+          errorData.suggestion && h('div', {
             style: 'font-size: 12px; color: #909399; border-top: 1px solid #ebeef5; padding-top: 8px;' 
           }, `💡 建议: ${errorData.suggestion}`)
         ]),
@@ -509,6 +514,8 @@ const getErrorTitle = (errorType) => {
   }
   return titles[errorType] || '连接测试失败'
 }
+
+const baseUrlHint = computed(() => getLLMProviderBaseUrlHint(modelConfigForm.provider))
 
 const formatDate = (dateString) => {
   return dayjs(dateString).format('YYYY-MM-DD HH:mm:ss')

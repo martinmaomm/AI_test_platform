@@ -3,6 +3,7 @@ AI核心模块的序列化器
 """
 from rest_framework import serializers
 from .models import LLMConfiguration, LLMUsageLog, RAGConfiguration
+from .llm_configuration import normalize_openai_compatible_base_url
 
 
 class LLMConfigurationSerializer(serializers.ModelSerializer):
@@ -22,10 +23,11 @@ class LLMConfigurationSerializer(serializers.ModelSerializer):
     
     def validate(self, attrs):
         """验证配置数据"""
-        provider = attrs.get('provider')
-        api_key = attrs.get('api_key', '')
-        base_url = attrs.get('base_url', '')
-        model_name = attrs.get('model_name', '')
+        instance = self.instance
+        provider = attrs.get('provider', instance.provider if instance else '')
+        api_key = attrs.get('api_key', instance.api_key if instance else '')
+        base_url = attrs.get('base_url', instance.base_url if instance else '')
+        model_name = attrs.get('model_name', instance.model_name if instance else '')
         
         # 验证必填字段
         if provider in ['openai', 'deepseek']:
@@ -48,6 +50,11 @@ class LLMConfigurationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'model_name': '必须指定模型名称'
             })
+
+        if 'base_url' in attrs:
+            attrs['base_url'] = normalize_openai_compatible_base_url(
+                provider, attrs['base_url']
+            )
         
         return attrs
     
@@ -224,4 +231,3 @@ class VisionTestConnectionSerializer(serializers.Serializer):
     """测试视觉模型连接的序列化器"""
     
     config_id = serializers.IntegerField(required=True)
-

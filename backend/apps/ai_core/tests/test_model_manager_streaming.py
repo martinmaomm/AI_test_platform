@@ -7,14 +7,17 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
+import httpx
 from django.test import SimpleTestCase
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.outputs import ChatGenerationChunk
+from openai import PermissionDeniedError
 from pydantic import BaseModel
 
 from ai_core.midscene_script_agent import MidSceneAgent
 from ai_core.model_manager import ModelManager
+from ai_core.models import LLMConfiguration
 
 
 class StructuredReply(BaseModel):
@@ -112,6 +115,107 @@ class ModelManagerInitializationStreamingTests(SimpleTestCase):
         self.assertEqual(result['response_content'], 'sync stream')
         self.assertEqual(model.sync_stream_calls, 1)
         self.assertEqual(model.generate_calls, 0)
+
+    def test_initialization_passes_normalized_openai_base_url_to_sdk(self):
+        with patch('ai_core.model_manager.init_chat_model', return_value=Mock()) as init_chat_model:
+            manager = self._manager(model_type='llm', provider='openai')
+            manager.config['base_url'] = 'https://api.example.test/v1/chat/completions/'
+            manager._initialize_model()
+
+        self.assertEqual(
+            init_chat_model.call_args.kwargs['base_url'], 'https://api.example.test/v1'
+        )
+
+    def test_config_loaded_from_existing_record_normalizes_base_url(self):
+        manager = ModelManager.__new__(ModelManager)
+        config = LLMConfiguration(
+            provider='openai',
+            api_key='test-key',
+            base_url='https://api.example.test/v1/chat/completions',
+            model_name='test-model',
+        )
+
+        loaded_config = manager._config_from_db(config)
+
+        self.assertEqual(loaded_config['base_url'], 'https://api.example.test/v1')
+
+    def test_initialization_leaves_ollama_url_unchanged(self):
+        manager = self._manager(model_type='llm', provider='ollama')
+        manager.config['base_url'] = 'http://localhost:11434/api/chat/completions/'
+        with patch.object(manager, '_check_ollama_service', return_value=True), patch(
+            'ai_core.model_manager.init_chat_model', return_value=Mock()
+        ) as init_chat_model:
+            manager._initialize_model()
+
+        self.assertEqual(
+            init_chat_model.call_args.kwargs['base_url'],
+            'http://localhost:11434/api/chat/completions/',
+        )
+
+
+class ModelManagerConnectionErrorTests(SimpleTestCase):
+    @staticmethod
+    def _manager_with_error(error: Exception) -> ModelManager:
+        manager = ModelManager.__new__(ModelManager)
+        manager.model_type = 'llm'
+        manager._initialized = True
+        manager.current_llm = Mock(invoke=Mock(side_effect=error))
+        manager.llm_type = 'test'
+        manager.config = {'provider': 'test', 'model': 'test-model'}
+        return manager
+
+    @staticmethod
+    def _response(status_code: int, content_type: str, body: str) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            headers={'content-type': content_type},
+            content=body.encode(),
+            request=httpx.Request('POST', 'https://api.example.test/v1/chat/completions'),
+        )
+
+    def test_cloudflare_permission_denied_error_has_safe_actionable_message(self):
+        response = self._response(
+            403, 'text/html; charset=UTF-8',
+            '<html><title>Attention Required! | Cloudflare</title></html>',
+        )
+        error = PermissionDeniedError('Access denied', response=response, body=response.text)
+
+        result = self._manager_with_error(error).test_connection()
+
+        self.assertFalse(result['success'])
+        self.assertEqual(
+            result['error'],
+            '模型服务网关拒绝请求（HTTP 403，Cloudflare）。'
+            '请联系服务商检查访问策略；当前无法验证密钥和模型是否可用。',
+        )
+        self.assertNotIn('<html>', result['error'])
+
+    def test_other_html_status_error_uses_gateway_message(self):
+        response = self._response(502, 'text/html', '<html>upstream unavailable</html>')
+        error = httpx.HTTPStatusError('Bad gateway', request=response.request, response=response)
+
+        result = self._manager_with_error(error).test_connection()
+
+        self.assertFalse(result['success'])
+        self.assertEqual(
+            result['error'],
+            '模型服务网关返回非模型 JSON 响应（HTTP 502）。请检查服务商网关或访问策略。',
+        )
+
+    def test_json_401_preserves_original_error_message(self):
+        response = self._response(401, 'application/json', '{"error":"invalid_api_key"}')
+        error = httpx.HTTPStatusError('Unauthorized', request=response.request, response=response)
+
+        result = self._manager_with_error(error).test_connection()
+
+        self.assertEqual(result['error'], f'连接测试失败: {error}')
+
+    def test_non_http_exception_is_not_classified_as_gateway_error(self):
+        error = RuntimeError('Cloudflare text in a local exception')
+
+        result = self._manager_with_error(error).test_connection()
+
+        self.assertEqual(result['error'], f'连接测试失败: {error}')
 
 
 class LangChainStreamingContractTests(SimpleTestCase):

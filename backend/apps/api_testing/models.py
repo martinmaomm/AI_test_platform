@@ -87,7 +87,10 @@ class BrowserDiscoveryRecord(models.Model):
         ]
         indexes = [
             models.Index(fields=['task', 'is_eligible', 'sequence']),
-            models.Index(fields=['task', 'method', 'path']),
+            # `path` remains VARCHAR(1000).  Keeping it out of this key keeps
+            # the index valid for utf8mb4 InnoDB without changing captured URL
+            # fidelity.
+            models.Index(fields=['task', 'method'], name='api_browser_task_id_8c01c0_idx'),
         ]
 
 

@@ -32,6 +32,27 @@
 
 关闭开关可隐藏新入口并停止接受新的探索任务。关闭开关不是回滚远端测试数据；不要清空 Redis 或删除既有报告。数据库与代码回退需要配套评审。
 
+### MariaDB 已执行 0019 但报 1071 时
+
+早期版本把 1000 字符的 `path` 放入联合索引，在 utf8mb4 下超过 3072 字节限制。已修正为只索引任务和方法，仍完整保留路径，不截断数据。
+
+MySQL/MariaDB 上失败前的建表和加列可能已提交，部分延迟外键/索引又尚未执行。此时不要直接清库、反复重跑原迁移或使用 `--fake`。停止后端/Celery（及 Beat）写入、备份数据库后，在 backend 虚拟环境执行：
+
+```bash
+# 只读核查与展示待补齐项，不改数据库
+python manage.py repair_api_browser_discovery_migration
+
+# 核查通过后，仅补齐缺失的索引/约束并核对完整性
+python manage.py repair_api_browser_discovery_migration --apply
+
+# 确认正常迁移流程已经没有遗漏
+python manage.py migrate api_testing
+```
+
+该命令仅处理本次 0019 的已知半迁移结构；遇到字段、索引、外键冲突或其他未知状态会停止，不删除表、列或业务数据。只有结构已补齐并验证后才登记 0019，不能当作任意迁移的跳过工具。全新数据库仍直接使用正常 `migrate`。
+
+`ai_core.RAGConfiguration (models.W036)` 是已有条件唯一约束的 MariaDB 警告，与这次索引过长的失败无关；本次不通过屏蔽警告来替代约束修复。
+
 ## 使用方法
 
 填写以下信息：

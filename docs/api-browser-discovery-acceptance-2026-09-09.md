@@ -2,6 +2,8 @@
 
 日期：2026-09-09。环境：macOS arm64、Python 3.13、本项目固定版本 Node Playwright MCP。
 
+> 部署后补充：用户在实际 MariaDB 10.5.29 的 0019 迁移遇到索引过长错误。下文原始 SQLite 迁移结果不能视为 MariaDB 部署已通过；这是首轮验证遗漏。现已修正短索引并增加专用半迁移恢复检查，操作见 [迁移恢复说明](api-browser-discovery.md#mariadb-已执行-0019-但报-1071-时)。补充实测结果见文末。
+
 ## 结论与交付范围
 
 已实现“网页探索 → 程序采集真实网络 → 选择样本 → 交接原 API 工作区 → 生成/验证/保存/requests 执行及 Python 导出”。不要求 Swagger，不依赖 UI Python 草稿或模型最终 JSON，不增加另一套执行器。
@@ -95,3 +97,31 @@ backend/.venv/bin/python backend/scripts/test_api_browser_discovery_e2e.py
 ```
 
 Node 采集测试需要可解析的固定 MCP npm 包所在 PATH；浏览器安装路径沿用项目配置。真实 NAS 测试必须通过 `test_api_browser_discovery_live.py --run-live` 显式启动，会操作测试网站并产生模型费用，不应混入常规离线 CI。
+
+## 0019 MariaDB 部署失败后的补充验证
+
+原错误为 `1071: Specified key was too long; max key length is 3072 bytes`。真实 NAS 只读确认：MariaDB 10.5.29、utf8mb4、16 KiB InnoDB 页面；0018 已登记，0019 未登记。三张新表已建好且为空，规范表的来源字段已添加，延迟外键和部分索引/唯一约束缺失。直接重跑建表迁移或 `--fake` 均不合适。
+
+修复将联合索引缩为 `(task, method)`，不更改 `path` 的 1000 字符容量。专用命令以 0019 历史模型状态核查字段、索引、外键、迁移历史、重复键与孤儿引用；默认不写入。只有 `--apply` 才追加缺失 DDL，最终复核通过后登记迁移，不删除业务数据。
+
+主 Agent 在仅绑定 localhost 的独立 MariaDB 11.4.13 容器实测：
+
+- 新库历史状态升级 0019 通过。
+- 还原原长索引，真实复现 1071；只读诊断、续接、再次续接、正常 `migrate` 均符合预期。
+- 原 Swagger、原用例、新采集记录与完整 1000 字符中文路径均保留。
+- 同名错误索引、重复唯一键、孤儿外键、字段长度不一致四类负例：只读及 `--apply` 都拒绝，未执行补齐 DDL 或登记迁移。
+- 离线恢复命令单测 5 项、原 SQLite 历史迁移验收以及 API 回归通过；未把模拟测试当作真实 MariaDB 执行。
+
+实际 NAS 10.5.29 仅运行带 SQL 写入拦截的只读诊断，确认可续接且列出 10 项补齐操作；**没有替用户运行 `--apply`**，因此尚不宣称 NAS 的最终迁移已经完成。独立容器内每次创建的随机临时数据库均在测试后删除，不影响 NAS。后续若需复现，本地专用 MariaDB 端口通过 `--port` 显式指定：
+
+```bash
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_mariadb.py --port <本地临时端口> --case fresh
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_mariadb.py --port <本地临时端口> --case partial
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_mariadb.py --port <本地临时端口> --case conflict
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_mariadb.py --port <本地临时端口> --case duplicate
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_mariadb.py --port <本地临时端口> --case orphan
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_mariadb.py --port <本地临时端口> --case mismatch
+backend/.venv/bin/python backend/scripts/test_api_browser_discovery_migration_repair.py
+```
+
+不要将该测试脚本改为连接 NAS 或普通平台库。它只连接 localhost 的专用实例，创建并清理本轮随机命名的数据库。

@@ -102,7 +102,9 @@ class Migration(migrations.Migration):
         migrations.AddIndex(model_name='browserdiscoverytask', index=models.Index(fields=['project', 'owner', '-updated_at'], name='api_browser_project_523c91_idx')),
         migrations.AddIndex(model_name='browserdiscoverytask', index=models.Index(fields=['status', 'heartbeat_at'], name='api_browser_status_bedcea_idx')),
         migrations.AddIndex(model_name='browserdiscoveryrecord', index=models.Index(fields=['task', 'is_eligible', 'sequence'], name='api_browser_task_id_0c10fb_idx')),
-        migrations.AddIndex(model_name='browserdiscoveryrecord', index=models.Index(fields=['task', 'method', 'path'], name='api_browser_task_id_8c01c0_idx')),
+        # Do not put `path` (VARCHAR(1000), utf8mb4) in this index: it exceeds
+        # the 3072-byte InnoDB key limit on the affected MySQL/MariaDB setup.
+        migrations.AddIndex(model_name='browserdiscoveryrecord', index=models.Index(fields=['task', 'method'], name='api_browser_task_id_8c01c0_idx')),
         migrations.AddConstraint(model_name='browserdiscoveryrecord', constraint=models.UniqueConstraint(fields=('task', 'sequence'), name='unique_browser_discovery_record_sequence')),
         migrations.AddConstraint(model_name='browserdiscoveryhandoff', constraint=models.UniqueConstraint(fields=('task', 'source_version', 'selection_hash'), name='unique_browser_discovery_handoff_selection')),
     ]

@@ -125,6 +125,10 @@ export async function runBootstrap() {
     screenshotDir,
     disableFileLogging,
   });
+  if (process.env.AITS_MCP_NETWORK_CAPTURE === '1') {
+    const { installPlaywrightMcpNetworkCapture } = await import('./playwright_mcp_capture.mjs');
+    await installPlaywrightMcpNetworkCapture(packageRoot);
+  }
   await import(pathToFileURL(path.join(packageRoot, 'dist/index.js')).href);
 }
 

@@ -77,7 +77,7 @@
               <el-icon>
                 <Connection />
               </el-icon>
-              <span>{{ spec.spec_type || 'swagger' }}</span>
+              <span>{{ specSourceLabel(spec) }}</span>
             </div>
             <div class="meta-item">
               <el-icon>
@@ -322,6 +322,7 @@ const getFileIconSrc = (specType, fileType) => {
     raml: '/src/assert/icons/Swagger.svg',
     api_blueprint: '/src/assert/icons/Swagger.svg',
     other: '/src/assert/icons/Swagger.svg',
+    browser_capture: '/src/assert/icons/robot.svg',
 
     // 文件类型图标（作为备选）
     pdf: '/src/assert/icons/Pdf.svg',
@@ -351,6 +352,7 @@ const getFileIconWrapperClass = (specType, fileType) => {
     raml: 'icon-swagger',
     api_blueprint: 'icon-swagger',
     other: 'icon-other',
+    browser_capture: 'icon-other',
 
     // 文件类型样式类（作为备选）
     pdf: 'icon-pdf',
@@ -367,6 +369,11 @@ const getFileIconWrapperClass = (specType, fileType) => {
   }
   return wrapperClassMap[primaryType] || 'icon-other'
 }
+
+const specSourceLabel = (spec) =>
+  spec?.source_type === 'browser_capture' || spec?.spec_type === 'browser_capture'
+    ? '网页探索发现'
+    : spec?.spec_type || 'swagger'
 
 // 方法
 const loadData = async () => {

@@ -8,10 +8,26 @@ from .views import (
 )
 from rest_framework import routers
 from .workspace_urls import urlpatterns as workspace_urlpatterns
+from .browser_discovery_views import (
+    BrowserDiscoveryCancelView,
+    BrowserDiscoveryCollectionView,
+    BrowserDiscoveryConfigView,
+    BrowserDiscoveryDetailView,
+    BrowserDiscoveryHandoffView,
+    BrowserDiscoveryRecordsView,
+)
 
 app_name = 'api_testing'
 
 urlpatterns = [
+    # Browser-captured API discovery. Raw JSONL never goes through MEDIA or a
+    # public download route; records is a bounded redacted projection.
+    path('browser-discoveries/config/', BrowserDiscoveryConfigView.as_view(), name='browser-discovery-config'),
+    path('browser-discoveries/', BrowserDiscoveryCollectionView.as_view(), name='browser-discovery-list'),
+    path('browser-discoveries/<uuid:task_id>/', BrowserDiscoveryDetailView.as_view(), name='browser-discovery-detail'),
+    path('browser-discoveries/<uuid:task_id>/records/', BrowserDiscoveryRecordsView.as_view(), name='browser-discovery-records'),
+    path('browser-discoveries/<uuid:task_id>/cancel/', BrowserDiscoveryCancelView.as_view(), name='browser-discovery-cancel'),
+    path('browser-discoveries/<uuid:task_id>/handoff/', BrowserDiscoveryHandoffView.as_view(), name='browser-discovery-handoff'),
     # 模块管理（端点测试用例页面的模块排序）
     path('modules/', views.APIModuleListView.as_view(), name='api_module_list'),
     path('modules/order/', views.APIModuleOrderView.as_view(), name='api_module_order'),

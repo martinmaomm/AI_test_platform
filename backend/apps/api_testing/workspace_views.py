@@ -186,8 +186,8 @@ class APIWorkspaceCollectionView(APIView):
                 inferred_spec_id = infer_spec_id(project.id, endpoint_ids)
                 if case and case.endpoint_id:
                     inferred_spec_id = case.endpoint.spec_id
-            spec = validate_spec_id(project.id, inferred_spec_id)
-            endpoint_specs(project.id, endpoint_ids, spec_id=spec.id if spec else None)
+            spec = validate_spec_id(project.id, inferred_spec_id, owner=request.user)
+            endpoint_specs(project.id, endpoint_ids, spec_id=spec.id if spec else None, owner=request.user)
             model_id = validate_model_id(request.data.get('model_id'), owner=request.user)
             if case and case.script_content:
                 try:

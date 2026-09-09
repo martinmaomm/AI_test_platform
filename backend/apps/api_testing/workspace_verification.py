@@ -11,6 +11,18 @@ from urllib.parse import urlsplit
 from .workspace_service import WorkspaceValidationError, normalize_draft
 
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_BROWSER_CREDENTIAL_KEYS = frozenset({
+    'authorization', 'proxyauthorization', 'cookie', 'setcookie', 'token',
+    'accesstoken', 'refreshtoken', 'idtoken', 'session', 'sessionid', 'sessiontoken',
+    'apikey', 'authtoken', 'secret', 'clientsecret',
+})
+
+
+def _browser_credential_key(name: Any, *, header=False) -> bool:
+    normalized = re.sub(r'[-_\s]', '', str(name)).lower()
+    if header and normalized.startswith('x'):
+        normalized = normalized[1:]
+    return normalized in _BROWSER_CREDENTIAL_KEYS
 
 
 def draft_hash(draft: dict[str, Any]) -> str:
@@ -32,6 +44,188 @@ def _path_matches(endpoint_path: str, request_url: str) -> bool:
     parts = re.split(r'(\{[^}/]+\})', endpoint_path.rstrip('/') or '/')
     pattern = ''.join('[^/]+' if re.fullmatch(r'\{[^}/]+\}', part) else re.escape(part) for part in parts)
     return bool(re.fullmatch(pattern, path.rstrip('/') or '/'))
+
+
+def _browser_selector_matches_source(selector: str, source_field: object) -> bool:
+    source = str(source_field or '')
+    selector = selector.removeprefix('body.')
+    if selector == source:
+        return True
+    # A capture stores a concrete list index. A fresh run may identify that
+    # same list element by an available business key, then select its bounded
+    # first result. Wildcards and a different scalar leaf remain invalid.
+    if '[?(' not in selector or '[*]' in selector or not re.search(r'\[\?\([^\]]+\)\]\[0\]', selector):
+        return False
+    strip_indices = lambda value: re.sub(r'\[[^\]]*\]', '', value)
+    return strip_indices(selector) == strip_indices(source)
+
+
+def _browser_binding_value(request: dict[str, object], location: str):
+    root, separator, remainder = location.partition('.')
+    if not separator or root not in {'json', 'params', 'data'}:
+        return None
+    current = request.get(root)
+    for name, list_index in re.findall(r'([^\.\[\]]+)|\[(\d+)\]', remainder):
+        if name:
+            if not isinstance(current, dict) or name not in current:
+                return None
+            current = current[name]
+        elif list_index:
+            if not isinstance(current, list) or int(list_index) >= len(current):
+                return None
+            current = current[int(list_index)]
+    return current
+
+
+def _browser_capture_bindings_match(
+    endpoint: dict[str, object], request: dict[str, object], *, extracted_by_endpoint: dict[int, dict[str, str]],
+    completed_endpoint_ids: set[int], endpoints: dict[int, dict[str, object]],
+) -> bool:
+    """Reject a fixed captured primary key in an observed request field."""
+    context = endpoint.get('document_context') if isinstance(endpoint.get('document_context'), dict) else {}
+    browser = context.get('browser_capture') if isinstance(context.get('browser_capture'), dict) else {}
+    samples = browser.get('observed_samples') if isinstance(browser.get('observed_samples'), list) else []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        for binding in sample.get('dependency_bindings') or []:
+            if not isinstance(binding, dict):
+                continue
+            value = _browser_binding_value(request, str(binding.get('location') or ''))
+            if value is None:
+                continue
+            match = re.fullmatch(r'(?:\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\})', value) if isinstance(value, str) else None
+            variable = next((item for item in match.groups() if item), None) if match else None
+            for source_hint in binding.get('sources') or []:
+                if not isinstance(source_hint, dict):
+                    continue
+                source_ids = [
+                    endpoint_id for endpoint_id, source in endpoints.items()
+                    if source.get('method') == source_hint.get('method') and source.get('path') == source_hint.get('path')
+                ]
+                if any(
+                    variable in extracted_by_endpoint.get(source_id, {})
+                    and _browser_selector_matches_source(extracted_by_endpoint[source_id][variable], source_hint.get('field'))
+                    for source_id in source_ids if source_id in completed_endpoint_ids
+                ):
+                    break
+            else:
+                return False
+    return True
+
+
+def _browser_capture_path_matches(
+    endpoint: dict[str, Any], request_url: str, *, extracted_by_endpoint: dict[int, dict[str, str]],
+    completed_endpoint_ids: set[int], endpoints: dict[int, dict[str, Any]],
+) -> bool | None:
+    """Require evidence-backed dynamic slots for browser-captured exact paths.
+
+    ``None`` means this endpoint has no evidence-backed dynamic path template
+    and should retain ordinary OpenAPI matching.  ``False`` intentionally also
+    rejects the observed literal ID: it belongs to the exploration session and
+    is not reusable test data.
+    """
+    context = endpoint.get('document_context') if isinstance(endpoint.get('document_context'), dict) else {}
+    browser = context.get('browser_capture') if isinstance(context.get('browser_capture'), dict) else {}
+    samples = browser.get('observed_samples') if isinstance(browser.get('observed_samples'), list) else []
+    templates = [
+        sample.get('path_template') for sample in samples
+        if isinstance(sample, dict) and isinstance(sample.get('path_template'), dict)
+    ]
+    if not templates:
+        return None
+    path = urlsplit(request_url).path or request_url.split('?', 1)[0]
+    path = path.rstrip('/') or '/'
+
+    for template in templates:
+        exact_path = template.get('exact_path')
+        slots = template.get('slots') if isinstance(template.get('slots'), list) else []
+        if not isinstance(exact_path, str) or not slots:
+            continue
+        literal_segments = (exact_path.rstrip('/') or '/').split('/')
+        candidate_segments = path.split('/')
+        if len(literal_segments) != len(candidate_segments):
+            continue
+        slot_by_index = {slot.get('segment_index'): slot for slot in slots if isinstance(slot, dict) and isinstance(slot.get('segment_index'), int)}
+        if any(
+            candidate != literal_segments[index]
+            for index, candidate in enumerate(candidate_segments) if index not in slot_by_index
+        ):
+            continue
+        valid = True
+        for index, slot in slot_by_index.items():
+            candidate = candidate_segments[index] if 0 <= index < len(candidate_segments) else ''
+            match = re.fullmatch(r'(?:\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\})', candidate)
+            variable = next((item for item in match.groups() if item), None) if match else None
+            sources = slot.get('sources') if isinstance(slot.get('sources'), list) else [{
+                'method': slot.get('source_method'), 'path': slot.get('source_path'), 'field': slot.get('source_field'),
+            }]
+            selector_matches = False
+            for source_hint in sources:
+                if not isinstance(source_hint, dict):
+                    continue
+                source_ids = [
+                    endpoint_id for endpoint_id, source in endpoints.items()
+                    if source.get('method') == source_hint.get('method') and source.get('path') == source_hint.get('path')
+                ]
+                if any(
+                    variable in extracted_by_endpoint.get(source_id, {})
+                    and _browser_selector_matches_source(extracted_by_endpoint[source_id][variable], source_hint.get('field'))
+                    for source_id in source_ids if source_id in completed_endpoint_ids
+                ):
+                    selector_matches = True
+                    break
+            if not variable or not selector_matches:
+                valid = False
+                break
+        if valid:
+            return True
+    return False
+
+
+def _require_fresh_browser_credentials(request: dict[str, Any], endpoint: dict[str, Any], *, extracted_by_endpoint: dict[int, dict[str, str]], index: int, user_variables: dict[str, Any]) -> None:
+    """A browser-capture source never authorizes replaying its Token/Cookie values."""
+    context = endpoint.get('document_context') if isinstance(endpoint.get('document_context'), dict) else {}
+    if not isinstance(context.get('browser_capture'), dict):
+        return
+    allowed_names = {name for values in extracted_by_endpoint.values() for name in values} | set(user_variables)
+
+    def require_reference(value, location):
+        if value in (None, ''):
+            return
+        variables = _variable_names(value)
+        if not variables or not variables.issubset(allowed_names):
+            raise WorkspaceValidationError(
+                f'候选步骤 {index + 1} 不能固化浏览器探索时的 {location}；请使用本场景前序提取或用户显式提供的变量。'
+            )
+
+    def inspect_values(value, location, credential=False):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                inspect_values(child, f'{location}.{key}', credential or _browser_credential_key(key, header=location == 'headers'))
+        elif isinstance(value, list):
+            for offset, child in enumerate(value):
+                # requests also accepts pairs for URL-encoded form bodies.
+                if location == 'data' and isinstance(child, (list, tuple)) and len(child) == 2:
+                    inspect_values(child[1], f'data.{child[0]}', _browser_credential_key(child[0]))
+                else:
+                    inspect_values(child, f'{location}[{offset}]', credential)
+        elif credential:
+            require_reference(value, location)
+
+    for location in ('headers', 'cookies', 'params', 'json', 'data'):
+        value = request.get(location)
+        if location == 'data' and isinstance(value, str):
+            from urllib.parse import parse_qsl
+            value = [[name, item] for name, item in parse_qsl(value, keep_blank_values=True)]
+        inspect_values(value, location, credential=location == 'cookies')
+    if request.get('raw') is not None:
+        raise WorkspaceValidationError(f'候选步骤 {index + 1} 的网页采集来源仅支持 JSON/表单正文；请用 json 或 data 保留字段结构。')
+    # A query embedded in URL must obey the same rule as request.params.
+    from urllib.parse import parse_qsl
+    for name, value in parse_qsl(urlsplit(request['url']).query, keep_blank_values=True):
+        if _browser_credential_key(name):
+            require_reference(value, f'url.query.{name}')
 
 
 def _variable_names(value: Any) -> set[str]:
@@ -288,14 +482,25 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
     scoped_values = _static_variable_values(merged_variables)
     config_headers = draft['config'].get('headers') if isinstance(draft['config'].get('headers'), dict) else {}
     available = set(merged_variables) | {'timestamp_ns', 'uuid4'}
+    extracted_by_endpoint: dict[int, dict[str, str]] = {}
     completed_dependency_ids: set[int] = set()
     for index, step in enumerate(draft['teststeps']):
         request = step['request']
         endpoint = selected.get(step.get('endpoint_id'))
         if endpoint is None:
             raise WorkspaceValidationError(f'候选步骤 {index + 1} 未引用本次规范端点。')
-        if request['method'] != str(endpoint['method']).upper() or not _path_matches(str(endpoint['path']), request['url']):
+        browser_path_matches = _browser_capture_path_matches(
+            endpoint, request['url'], extracted_by_endpoint=extracted_by_endpoint,
+            completed_endpoint_ids=completed_dependency_ids, endpoints=selected,
+        )
+        path_matches = browser_path_matches if browser_path_matches is not None else _path_matches(str(endpoint['path']), request['url'])
+        if request['method'] != str(endpoint['method']).upper() or not path_matches:
             raise WorkspaceValidationError(f'候选步骤 {index + 1} 的方法或路径与规范端点不一致。')
+        if not _browser_capture_bindings_match(
+            endpoint, request, extracted_by_endpoint=extracted_by_endpoint,
+            completed_endpoint_ids=completed_dependency_ids, endpoints=selected,
+        ):
+            raise WorkspaceValidationError(f'候选步骤 {index + 1} 不能固化浏览器探索时已证实的对象标识。')
         if urlsplit(request['url']).scheme or urlsplit(request['url']).netloc:
             raise WorkspaceValidationError(f'候选步骤 {index + 1} 不允许修改已确认目标地址。')
         if not step['validate']:
@@ -307,6 +512,7 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
         effective_step = deepcopy(step)
         effective_headers = _merge_headers(config_headers, request.get('headers', {}))
         effective_step['request']['headers'] = effective_headers
+        _require_fresh_browser_credentials(effective_step['request'], endpoint, extracted_by_endpoint=extracted_by_endpoint, index=index, user_variables=variables)
         _require_variables(
             effective_headers, scoped_values, allowed=available,
             label=f'候选步骤 {index + 1} 的有效 headers（依赖登录变量请移到登录后的步骤）',
@@ -326,6 +532,17 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
         _require_variables(step['extract'], scoped_values, allowed=available, label=f'候选步骤 {index + 1} 提取条件')
         for extracted_name in step['extract']:
             scoped_values.pop(extracted_name, None)
+        # A variable name has one live definition.  A later extraction must
+        # revoke all earlier endpoint bindings before browser path provenance
+        # is checked for subsequent steps.
+        for definitions in extracted_by_endpoint.values():
+            for extracted_name in step['extract']:
+                definitions.pop(extracted_name, None)
+        endpoint_extracts = extracted_by_endpoint.setdefault(endpoint['id'], {})
+        endpoint_extracts.update({
+            name: selector for name, selector in step['extract'].items()
+            if isinstance(name, str) and isinstance(selector, str)
+        })
         _require_variables(step['validate'], scoped_values, allowed=available | set(step['extract']), label=f'候选步骤 {index + 1} 断言')
         request['allow_redirects'] = False
         available.update(step['extract'])

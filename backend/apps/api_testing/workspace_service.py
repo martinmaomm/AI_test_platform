@@ -99,17 +99,32 @@ def require_executable_draft(value: Any) -> dict[str, Any]:
     return draft
 
 
-def validate_spec_id(project_id: int, spec_id: Any) -> APISpecification | None:
+def _require_browser_capture_source_owner(spec: APISpecification, *, owner) -> None:
+    """Enforce browser evidence ownership at user-scoped workspace boundaries.
+
+    ``endpoint_specs`` is also used by trusted internal projections and offline
+    contract tests.  Those callers have no request principal and therefore do
+    not receive an implicit project-wide grant; every HTTP workspace entry
+    passes its owner explicitly below.
+    """
+    if spec.spec_type != APISpecification.SpecType.BROWSER_CAPTURE:
+        return
+    if owner is not None and (not spec.source_task_id or spec.source_task.owner_id != owner.id):
+        raise WorkspaceValidationError('浏览器探索来源仅限其发起者用于工作区生成。')
+
+
+def validate_spec_id(project_id: int, spec_id: Any, *, owner=None) -> APISpecification | None:
     if spec_id is None:
         return None
     if not isinstance(spec_id, int) or isinstance(spec_id, bool) or spec_id <= 0:
         raise WorkspaceValidationError('spec_id 必须是正整数或 null。')
     try:
-        spec = APISpecification.objects.get(pk=spec_id, project_id=project_id)
+        spec = APISpecification.objects.select_related('source_task').get(pk=spec_id, project_id=project_id)
     except APISpecification.DoesNotExist as exc:
         raise WorkspaceValidationError('API 规范不存在或不属于当前项目。') from exc
     if spec.status != APISpecification.TaskStatus.COMPLETED:
         raise WorkspaceValidationError('API 规范尚未可用，不能用于生成。')
+    _require_browser_capture_source_owner(spec, owner=owner)
     return spec
 
 
@@ -122,7 +137,7 @@ def infer_spec_id(project_id: int, endpoint_ids: list[int]) -> int | None:
     return spec_ids[0] if len(spec_ids) == 1 else None
 
 
-def endpoint_specs(project_id: int, endpoint_ids: list[int], *, spec_id: int | None = None) -> list[dict[str, Any]]:
+def endpoint_specs(project_id: int, endpoint_ids: list[int], *, spec_id: int | None = None, owner=None) -> list[dict[str, Any]]:
     if len(endpoint_ids) > 50:
         raise WorkspaceValidationError('一次最多选择 50 个相关接口，请缩小本次生成范围。')
     ids = [value for value in endpoint_ids if isinstance(value, int) and not isinstance(value, bool) and value > 0]
@@ -131,9 +146,11 @@ def endpoint_specs(project_id: int, endpoint_ids: list[int], *, spec_id: int | N
     query = APIEndpoint.objects.filter(id__in=ids, spec__project_id=project_id)
     if spec_id is not None:
         query = query.filter(spec_id=spec_id)
-    endpoints = list(query.select_related('spec'))
+    endpoints = list(query.select_related('spec', 'spec__source_task'))
     if len(endpoints) != len(ids):
         raise WorkspaceValidationError('存在不属于当前项目的接口端点。')
+    for endpoint in endpoints:
+        _require_browser_capture_source_owner(endpoint.spec, owner=owner)
     by_id = {endpoint.id: endpoint for endpoint in endpoints}
     return [{
         'id': endpoint.id, 'method': endpoint.method, 'path': endpoint.path,
@@ -219,10 +236,10 @@ def generation_endpoint_specs(workspace: APIWorkspace) -> list[dict[str, Any]]:
             root_current_ids = list(APIEndpoint.objects.filter(spec_id=root.spec_id).values_list('id', flat=True))
         if not set(frozen_ids).issubset(set(root_current_ids)):
             raise WorkspaceValidationError('根工作区已缩小或变更选择范围，子场景的依赖范围已失效。')
-        return endpoint_specs(workspace.project_id, frozen_ids, spec_id=workspace.spec_id)
+        return endpoint_specs(workspace.project_id, frozen_ids, spec_id=workspace.spec_id, owner=workspace.owner)
     if not workspace.spec_id:
         raise WorkspaceValidationError('请先选择可用 API 规范后再生成。')
-    validate_spec_id(workspace.project_id, workspace.spec_id)
+    validate_spec_id(workspace.project_id, workspace.spec_id, owner=workspace.owner)
     endpoint_ids = workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else []
     if not endpoint_ids:
         endpoint_ids = list(APIEndpoint.objects.filter(spec_id=workspace.spec_id).values_list('id', flat=True)[:51])
@@ -230,7 +247,7 @@ def generation_endpoint_specs(workspace: APIWorkspace) -> list[dict[str, Any]]:
             raise WorkspaceValidationError('该 API 规范超过 50 个端点，请明确缩小本次生成范围。')
     if not endpoint_ids:
         raise WorkspaceValidationError('所选 API 规范没有可用端点，不能生成。')
-    return endpoint_specs(workspace.project_id, endpoint_ids, spec_id=workspace.spec_id)
+    return endpoint_specs(workspace.project_id, endpoint_ids, spec_id=workspace.spec_id, owner=workspace.owner)
 
 
 def _document_context(endpoint):
@@ -244,7 +261,7 @@ def _document_context(endpoint):
     operation = operation if isinstance(operation, dict) else {}
     components = metadata.get('components', {})
     components = components if isinstance(components, dict) else {}
-    return {
+    context = {
         'spec_id': endpoint.spec_id, 'spec_name': endpoint.spec.spec_name,
         'servers': deepcopy(operation.get('servers', path_item.get('servers', metadata.get('servers', [])))),
         'host': metadata.get('host', ''), 'basePath': metadata.get('basePath', ''),
@@ -252,6 +269,13 @@ def _document_context(endpoint):
         'security': deepcopy(operation.get('security', metadata.get('security', []))),
         'security_schemes': deepcopy(components.get('securitySchemes', metadata.get('securityDefinitions', {}))),
     }
+    # Browser capture remains a source context, not an invented OpenAPI schema.
+    # Import lazily because the source helper also reuses workspace permissions.
+    from .browser_discovery import browser_capture_context
+    source_context = browser_capture_context(endpoint)
+    if source_context is not None:
+        context['browser_capture'] = source_context
+    return context
 
 
 def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = True) -> dict[str, Any]:
@@ -400,7 +424,7 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
     title_changed = False
     next_spec_id = workspace.spec_id
     if spec_id is not _UNSET:
-        spec = validate_spec_id(workspace.project_id, spec_id)
+        spec = validate_spec_id(workspace.project_id, spec_id, owner=workspace.owner)
         next_spec_id = spec.id if spec else None
     next_endpoint_ids = workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else []
     if endpoint_ids is not _UNSET:
@@ -411,9 +435,9 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
         inferred_spec_id = infer_spec_id(workspace.project_id, next_endpoint_ids)
         if inferred_spec_id is None:
             raise WorkspaceValidationError('所选端点必须来自同一可用 API 规范，请明确选择 spec_id。')
-        next_spec_id = validate_spec_id(workspace.project_id, inferred_spec_id).id
+        next_spec_id = validate_spec_id(workspace.project_id, inferred_spec_id, owner=workspace.owner).id
     if next_endpoint_ids:
-        endpoint_specs(workspace.project_id, next_endpoint_ids, spec_id=next_spec_id)
+        endpoint_specs(workspace.project_id, next_endpoint_ids, spec_id=next_spec_id, owner=workspace.owner)
     proposed_draft = normalize_draft(draft) if draft is not _UNSET else workspace.draft
     candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
     generation = workspace.generation if isinstance(workspace.generation, dict) else {}

@@ -3,7 +3,8 @@ from projects.serializers import UploadedFileSerializer
 from .models import (
     APISpecification, APIEndpoint, APITestCase,
     APITestExecution, APITestSuite, APITestCaseExecutionDetail,
-    APITestSuiteExecutionDetail, APITestSuiteCaseExecution
+    APITestSuiteExecutionDetail, APITestSuiteCaseExecution,
+    BrowserDiscoveryRecord,
 )
 
 
@@ -38,6 +39,7 @@ class APISpecificationSerializer(serializers.ModelSerializer):
             'uploaded_file', 'spec_type',
             'status',
             'parsed_content', 'error_message',
+            'source_task', 'source_version', 'source_selection_key',
             'created_by_username',
             'endpoints_count',
             'created_at', 'updated_at'
@@ -45,6 +47,7 @@ class APISpecificationSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'id', 'uploaded_file', 'file_name', 'file_size', 'file_size_mb', 'file_type',
             'spec_type', 'status', 'parsed_content', 'error_message',
+            'source_task', 'source_version', 'source_selection_key',
             'created_by_username', 'project_name', 'endpoints_count',
             'created_at', 'updated_at'
         ]
@@ -52,6 +55,45 @@ class APISpecificationSerializer(serializers.ModelSerializer):
     def get_endpoints_count(self, obj):
         """获取端点数量"""
         return obj.endpoints.count()
+
+
+class BrowserDiscoveryCreateSerializer(serializers.Serializer):
+    # URLField normalisation can discard an SPA fragment; validation is shared
+    # with web_testing at the service boundary instead.
+    target_url = serializers.CharField(trim_whitespace=False, max_length=1000)
+    description = serializers.CharField(trim_whitespace=True, max_length=10000)
+    api_origin = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=500)
+    model_id = serializers.IntegerField(min_value=1)
+    allow_test_data_writes = serializers.BooleanField()
+    exploration_timeout_seconds = serializers.IntegerField(required=False, min_value=1)
+
+    def validate_description(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('description 不能为空。')
+        return value.strip()
+
+
+class BrowserDiscoveryRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BrowserDiscoveryRecord
+        fields = [
+            'id', 'sequence', 'request_id', 'captured_at', 'origin', 'method', 'path', 'resource_type',
+            'status_code', 'content_type', 'is_eligible', 'exclusion_reason', 'dependency_record_ids',
+            'public_summary',
+        ]
+        read_only_fields = fields
+
+
+class BrowserDiscoveryHandoffSerializer(serializers.Serializer):
+    version = serializers.IntegerField(min_value=1)
+    record_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), allow_empty=False, max_length=500,
+    )
+
+    def validate_record_ids(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError('record_ids 不能重复。')
+        return value
 
 
 class APISpecificationCreateSerializer(serializers.ModelSerializer):

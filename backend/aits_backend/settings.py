@@ -62,6 +62,40 @@ try:
 except (TypeError, ValueError):
     PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = 1200
 
+# Browser-derived API discovery is opt-in. Its budgets are intentionally
+# independent of WebUI generation and the global Celery time limit.
+API_BROWSER_DISCOVERY_ENABLED = os.getenv('AITS_API_BROWSER_DISCOVERY_ENABLED', 'false').lower() == 'true'
+
+
+def _browser_discovery_setting(name, default, minimum, maximum):
+    try:
+        return min(maximum, max(minimum, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS', 900, 60, 1800,
+)
+API_BROWSER_DISCOVERY_MAX_MODEL_STEPS = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_MAX_MODEL_STEPS', 100, 1, 100,
+)
+API_BROWSER_DISCOVERY_MAX_TOOL_CALLS = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_MAX_TOOL_CALLS', 100, 1, 100,
+)
+API_BROWSER_DISCOVERY_MAX_REQUESTS = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_MAX_REQUESTS', 500, 1, 500,
+)
+API_BROWSER_DISCOVERY_MAX_BODY_BYTES = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_MAX_BODY_BYTES', 256 * 1024, 1024, 256 * 1024,
+)
+API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES', 20 * 1024 * 1024, 1024, 20 * 1024 * 1024,
+)
+API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS = _browser_discovery_setting(
+    'AITS_API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS', 45, 10, 300,
+)
+
 # Custom User Model
 AUTH_USER_MODEL = 'users.User'
 

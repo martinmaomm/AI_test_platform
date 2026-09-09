@@ -3,8 +3,116 @@ from django.contrib.auth import get_user_model
 from django.utils.translation import gettext_lazy as _
 import os
 import hashlib
+import uuid
 
 User = get_user_model()
+
+
+class BrowserDiscoveryTask(models.Model):
+    """Owner-scoped browser discovery work, separate from API execution jobs."""
+
+    class Status(models.TextChoices):
+        QUEUED = 'queued', _('Queued')
+        RUNNING = 'running', _('Running')
+        FINALIZING = 'finalizing', _('Finalizing')
+        COMPLETED = 'completed', _('Completed')
+        PARTIAL = 'partial', _('Partial')
+        FAILED = 'failed', _('Failed')
+        CANCELLED = 'cancelled', _('Cancelled')
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey('projects.Project', on_delete=models.CASCADE, related_name='browser_discoveries')
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='browser_discoveries')
+    model_id = models.PositiveBigIntegerField()
+    target_url = models.URLField(max_length=1000)
+    description = models.TextField()
+    api_origin = models.CharField(max_length=500, blank=True)
+    allow_test_data_writes = models.BooleanField(default=False)
+    exploration_timeout_seconds = models.PositiveIntegerField(default=900)
+    limits = models.JSONField(default=dict, blank=True)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED, db_index=True)
+    version = models.PositiveIntegerField(default=1)
+    task_id = models.CharField(max_length=64, unique=True, db_index=True)
+    cancellation_requested = models.BooleanField(default=False)
+    current_action = models.CharField(max_length=500, blank=True)
+    tool_calls = models.PositiveIntegerField(default=0)
+    model_calls = models.PositiveIntegerField(default=0)
+    request_count = models.PositiveIntegerField(default=0)
+    summary = models.TextField(blank=True)
+    error_code = models.CharField(max_length=80, blank=True)
+    error_message = models.TextField(blank=True)
+    evidence_summary = models.JSONField(default=dict, blank=True)
+    source_version = models.PositiveIntegerField(default=0)
+    started_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'api_browser_discovery_tasks'
+        ordering = ['-updated_at']
+        indexes = [
+            models.Index(fields=['project', 'owner', '-updated_at']),
+            models.Index(fields=['status', 'heartbeat_at']),
+        ]
+
+
+class BrowserDiscoveryRecord(models.Model):
+    """Indexed, redacted view of a task-owned JSONL evidence line."""
+
+    task = models.ForeignKey(BrowserDiscoveryTask, on_delete=models.CASCADE, related_name='records')
+    sequence = models.PositiveIntegerField()
+    request_id = models.CharField(max_length=200, blank=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+    origin = models.CharField(max_length=500, blank=True)
+    method = models.CharField(max_length=10, blank=True)
+    path = models.CharField(max_length=1000, blank=True)
+    resource_type = models.CharField(max_length=80, blank=True)
+    status_code = models.PositiveIntegerField(null=True, blank=True)
+    content_type = models.CharField(max_length=200, blank=True)
+    is_eligible = models.BooleanField(default=False, db_index=True)
+    exclusion_reason = models.CharField(max_length=200, blank=True)
+    dependency_record_ids = models.JSONField(default=list, blank=True)
+    public_summary = models.JSONField(default=dict, blank=True)
+    raw_line = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'api_browser_discovery_records'
+        ordering = ['sequence', 'id']
+        constraints = [
+            models.UniqueConstraint(fields=['task', 'sequence'], name='unique_browser_discovery_record_sequence'),
+        ]
+        indexes = [
+            models.Index(fields=['task', 'is_eligible', 'sequence']),
+            models.Index(fields=['task', 'method', 'path']),
+        ]
+
+
+class BrowserDiscoveryHandoff(models.Model):
+    """Idempotent publication of a frozen browser-capture selection."""
+
+    task = models.ForeignKey(BrowserDiscoveryTask, on_delete=models.PROTECT, related_name='handoffs')
+    source_version = models.PositiveIntegerField()
+    selection_hash = models.CharField(max_length=64)
+    selected_record_ids = models.JSONField(default=list)
+    spec = models.ForeignKey('APISpecification', on_delete=models.PROTECT, related_name='browser_handoffs')
+    workspace = models.ForeignKey(
+        'APIWorkspace', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='browser_handoffs',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'api_browser_discovery_handoffs'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['task', 'source_version', 'selection_hash'],
+                name='unique_browser_discovery_handoff_selection',
+            ),
+        ]
 
 class APISpecification(models.Model):
     """API 规范文档模型（业务层）"""
@@ -45,6 +153,7 @@ class APISpecification(models.Model):
         POSTMAN = 'postman', 'Postman Collection'
         RAML = 'raml', 'RAML'
         API_BLUEPRINT = 'api_blueprint', 'API Blueprint'
+        BROWSER_CAPTURE = 'browser_capture', 'Browser capture'
         OTHER = 'other', '其他'
 
     spec_type = models.CharField(
@@ -63,6 +172,15 @@ class APISpecification(models.Model):
     parsed_content = models.TextField(_('parsed content'), blank=True)
     error_message = models.TextField(_('error message'), blank=True)
     metadata = models.JSONField(_('metadata'), default=dict, blank=True)
+    source_task = models.ForeignKey(
+        BrowserDiscoveryTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='published_specs',
+    )
+    source_version = models.PositiveIntegerField(default=0)
+    source_selection_key = models.CharField(max_length=64, blank=True)
 
     # ⚠️ 这里保留 created_by，表示"谁把文件放到API规范库"
     created_by = models.ForeignKey(

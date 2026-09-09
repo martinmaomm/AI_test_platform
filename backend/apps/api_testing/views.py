@@ -58,6 +58,22 @@ def _get_response_definitions(spec):
     }
 
 
+def _browser_capture_source_allowed(spec, user) -> bool:
+    """Captured browser evidence never becomes a project-wide asset."""
+    return (
+        spec.spec_type != APISpecification.SpecType.BROWSER_CAPTURE
+        or (spec.source_task_id is not None and spec.source_task.owner_id == user.id)
+    )
+
+
+def _source_visible_specifications(project_id, user):
+    """Keep legacy Swagger visibility unchanged while scoping browser captures."""
+    return APISpecification.objects.filter(project_id=project_id).filter(
+        Q(spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task__owner=user)
+        | ~Q(spec_type=APISpecification.SpecType.BROWSER_CAPTURE)
+    )
+
+
 class APISpecificationListView(generics.ListCreateAPIView):
     """API规范列表和创建视图"""
     serializer_class = APISpecificationSerializer
@@ -68,7 +84,7 @@ class APISpecificationListView(generics.ListCreateAPIView):
         # 使用URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
         if project_id:
-            return APISpecification.objects.filter(project_id=project_id)
+            return _source_visible_specifications(project_id, self.request.user)
         else:
             # 如果没有项目ID，返回空查询集
             return APISpecification.objects.none()
@@ -189,13 +205,15 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
         """获取当前项目的API规范"""
         project_id = self.kwargs.get('project_id')
         if project_id:
-            return APISpecification.objects.filter(project_id=project_id)
+            return _source_visible_specifications(project_id, self.request.user)
         return APISpecification.objects.none()
     
     def retrieve(self, request, *args, **kwargs):
         """获取API规范详情 - 使用统一响应格式"""
         try:
             instance = self.get_object()
+            if not _browser_capture_source_allowed(instance, request.user):
+                raise Http404
             serializer = self.get_serializer(instance)
             
             # 检查权限
@@ -212,10 +230,10 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                 data=serializer.data,
                 message="获取API规范详情成功"
             )
-        except APISpecification.DoesNotExist:
+        except (APISpecification.DoesNotExist, Http404):
             return response(
                 kind="error",
-                message="API规范不存在或无权限访问"
+                message="API规范不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"获取API规范详情失败: {e}", exc_info=True)
@@ -229,6 +247,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
         try:
             partial = kwargs.pop('partial', False)
             instance = self.get_object()
+            if instance.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
+                return response(kind="error", message="浏览器探索来源快照不可通过 API 规范编辑接口修改。", status_code=409)
             
             # 检查权限
             project = instance.project
@@ -255,10 +275,10 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                     message="数据验证失败",
                     errors=serializer.errors
                 )
-        except APISpecification.DoesNotExist:
+        except (APISpecification.DoesNotExist, Http404):
             return response(
                 kind="error",
-                message="API规范不存在或无权限访问"
+                message="API规范不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"更新API规范失败: {e}", exc_info=True)
@@ -271,6 +291,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
         """删除API规范 - 使用统一响应格式"""
         try:
             instance = self.get_object()
+            if instance.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
+                return response(kind="error", message="浏览器探索来源快照不可通过 API 规范删除接口删除。", status_code=409)
             instance_id = instance.id
             instance_name = instance.spec_name or (instance.uploaded_file.original_name if instance.uploaded_file else "Unknown")
             
@@ -317,10 +339,10 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                 kind="success",
                 message="API规范删除成功"
             )
-        except APISpecification.DoesNotExist:
+        except (APISpecification.DoesNotExist, Http404):
             return response(
                 kind="error",
-                message="API规范不存在或无权限访问"
+                message="API规范不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"删除API规范失败: {e}", exc_info=True)
@@ -343,7 +365,10 @@ class APIEndpointListView(generics.ListAPIView):
             return APIEndpoint.objects.none()
 
         # 检查权限：用户是否有权限查看此API规范
-        spec = APISpecification.objects.get(id=spec_id, project_id=project_id)
+        spec = get_object_or_404(
+            _source_visible_specifications(project_id, self.request.user).select_related('project', 'source_task'),
+            id=spec_id,
+        )
         if not (spec.project.created_by == self.request.user or
                 spec.project.members.filter(user=self.request.user).exists()):
             return APIEndpoint.objects.none()
@@ -400,7 +425,10 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
             return APIEndpoint.objects.none()
 
         # 检查权限：用户是否有权限查看此API规范
-        spec = APISpecification.objects.get(id=spec_id, project_id=project_id)
+        spec = get_object_or_404(
+            _source_visible_specifications(project_id, self.request.user).select_related('project', 'source_task'),
+            id=spec_id,
+        )
         if not (spec.project.created_by == self.request.user or
                 spec.project.members.filter(user=self.request.user).exists()):
             return APIEndpoint.objects.none()
@@ -435,6 +463,18 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
             data=endpoint_data,
             message="获取API端点详情成功"
         )
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.spec.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
+            return response(kind='error', message='浏览器探索来源端点不可通过普通端点接口修改。', status_code=409)
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.spec.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
+            return response(kind='error', message='浏览器探索来源端点不可通过普通端点接口删除。', status_code=409)
+        return super().destroy(request, *args, **kwargs)
 
 
 

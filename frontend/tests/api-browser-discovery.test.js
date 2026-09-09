@@ -7,6 +7,7 @@ import {
   browserDiscoveryConfig,
   browserDiscoveryElapsed,
   browserDiscoveryErrorCodeLabel,
+  browserDiscoveryFormSnapshot,
   browserDiscoveryItems,
   browserDiscoveryRecordIds,
   browserDiscoveryRecordGroups,
@@ -41,6 +42,27 @@ test("browser discovery creation requires explicit test-write confirmation and v
   assert.equal(browserDiscoveryErrorCodeLabel("cancelled"), "用户已取消探索；已完成的网站操作不会撤销。");
 });
 
+test("browser discovery form snapshots only become clean after the current values are submitted", () => {
+  const initial = {
+    target_url: "https://example.test/login",
+    description: "登录后查看订单",
+    api_origin: "",
+    model_id: 8,
+    allow_test_data_writes: false,
+    exploration_timeout_seconds: 120,
+  };
+  const submitted = browserDiscoveryFormSnapshot(initial);
+  assert.equal(submitted, browserDiscoveryFormSnapshot({ ...initial }));
+  assert.notEqual(
+    submitted,
+    browserDiscoveryFormSnapshot({ ...initial, description: "登录后查看订单并创建测试数据" }),
+  );
+  assert.equal(
+    submitted,
+    browserDiscoveryFormSnapshot({ ...initial, target_url: " https://example.test/login " }),
+  );
+});
+
 test("browser discovery rejects stale project, epoch, sequence, and task responses", () => {
   const current = { requestProjectId: 1, currentProjectId: 1, requestEpoch: 4, currentEpoch: 4, requestSequence: 7, latestSequence: 7, expectedTaskId: 9, currentTaskId: 9 };
   assert.equal(shouldApplyBrowserDiscoveryResponse(current), true);
@@ -60,12 +82,17 @@ test("browser discovery handles elapsed fallback and only uses positive record i
 });
 
 test("browser discovery panel is feature-gated and hands off record ids with version", async () => {
-  const [source, specs, workspace] = await Promise.all([
+  const [source, specs, workspace, router, documents, browser] = await Promise.all([
     readFile(new URL("../src/components/api-testing/BrowserDiscoveryPanel.vue", import.meta.url), "utf8"),
     readFile(new URL("../src/views/api-testing/ApiSpecManage.vue", import.meta.url), "utf8"),
     readFile(new URL("../src/views/api-testing/ApiWorkspace.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/router/index.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/views/api-testing/ApiWorkspaceDocuments.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/views/api-testing/ApiWorkspaceBrowser.vue", import.meta.url), "utf8"),
   ]);
-  assert.match(source, /v-if="enabled"/);
+  assert.match(source, /v-else-if="!enabled"/);
+  assert.match(source, /API_BROWSER_DISCOVERY_ENABLED/);
+  assert.match(source, /暂不能开始探索/);
   assert.match(source, /allow_test_data_writes/);
   assert.match(source, /recordIds: selectedRecordIds\.value/);
   assert.match(source, /version: props\.task\?\.version/);
@@ -76,7 +103,28 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(source, /task\.summary/);
   assert.match(source, /active\(task\) && task\.cancellation_requested/);
   assert.match(source, /BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS/);
+  assert.match(source, /data-testid="api-browser-discovery-create-form"/);
+  assert.match(source, /aria-label="完整页面 URL"/);
+  assert.match(source, /browser-discovery-timeout-\$\{disabled \|\| creating\}/);
+  assert.match(source, />开始探索</);
   assert.match(specs, /网页探索发现/);
-  assert.match(workspace, /v-model="selectedSpecId"/);
+  assert.match(workspace, /v-if="isBrowserSource"/);
+  assert.match(workspace, /data-testid="api-workspace-source-documents"/);
+  assert.match(workspace, /data-testid="api-workspace-source-browser"/);
+  assert.match(workspace, /aria-selected/);
+  assert.match(workspace, /data-testid="api-workspace-source-readonly"/);
+  assert.match(workspace, /source_type: requestSourceType/);
+  assert.match(workspace, /isDocumentSource\.value\n        \? getAPISpecifications/);
+  assert.match(workspace, /isBrowserSource\.value\n        \? initializeBrowserDiscoveries/);
+  assert.match(workspace, /requestSequence === reloadSequence/);
+  assert.match(workspace, /requestViewEpoch === viewEpoch/);
+  assert.match(workspace, /viewEpoch \+= 1/);
+  assert.match(workspace, /browserDiscoveryFormDirty/);
+  assert.match(workspace, /markCreateFormSubmitted/);
+  assert.match(source, /form-dirty-change/);
+  assert.match(router, /path: 'workspace\/documents'/);
+  assert.match(router, /path: 'workspace\/browser'/);
+  assert.match(documents, /source-type="document"/);
+  assert.match(browser, /source-type="browser_capture"/);
   assert.doesNotMatch(workspace, /selectedSpecValue|contextSpecs/);
 });

@@ -10,8 +10,26 @@
     <template v-else>
       <header class="workspace-header">
         <div>
-          <h2>API 对话工作区</h2>
-          <p>可视化编排请求步骤；AI 只提供候选，执行和保存均需明确发起。</p>
+          <h2>{{ isBrowserSource ? "网页探索 API 工作区" : "API 对话工作区" }}</h2>
+          <p>{{ isBrowserSource ? "从已确认的网页探索样本进入场景生成、调试和编辑；执行和保存均需明确发起。" : "选择接口文档、模型和接口范围后，可视化编排请求步骤；AI 只提供候选，执行和保存均需明确发起。" }}</p>
+          <div class="workspace-source-tabs" role="tablist" aria-label="API 工作区来源">
+            <button
+              type="button"
+              role="tab"
+              data-testid="api-workspace-source-documents"
+              :aria-selected="String(isDocumentSource)"
+              :class="{ 'source-tab--active': isDocumentSource }"
+              @click="switchSource('document')"
+            >从接口文档生成</button>
+            <button
+              type="button"
+              role="tab"
+              data-testid="api-workspace-source-browser"
+              :aria-selected="String(isBrowserSource)"
+              :class="{ 'source-tab--active': isBrowserSource }"
+              @click="switchSource('browser_capture')"
+            >从网页探索生成</button>
+          </div>
         </div>
         <div class="header-actions">
           <label class="workspace-select-label" for="current-workspace-select">当前工作区</label>
@@ -19,6 +37,7 @@
             id="current-workspace-select"
             v-model="workspaceId"
             class="workspace-select"
+            data-testid="api-workspace-select"
             :disabled="interactionLocked"
             placeholder="当前工作区"
             @change="selectWorkspace"
@@ -28,10 +47,19 @@
               :value="item.id"
               :label="item.title?.trim() || `未命名工作区 #${item.id}`"
           /></el-select>
-          <el-button :disabled="interactionLocked" @click="createWorkspace"
-            >新建工作区</el-button
-          >
-          <el-button :disabled="interactionLocked" @click="managerDialog = true"
+          <el-button
+            v-if="isDocumentSource"
+            data-testid="api-workspace-new"
+            :disabled="interactionLocked"
+            @click="createWorkspace"
+          >新建工作区</el-button>
+          <el-button
+            v-else
+            data-testid="api-browser-discovery-new"
+            :disabled="interactionLocked"
+            @click="startNewBrowserDiscovery"
+          >新建探索</el-button>
+          <el-button data-testid="api-workspace-manager" :disabled="interactionLocked" @click="managerDialog = true"
             >管理工作区</el-button
           >
           <el-button
@@ -43,11 +71,14 @@
         </div>
       </header>
       <BrowserDiscoveryPanel
+        v-if="isBrowserSource"
+        ref="browserDiscoveryPanelRef"
         :config="browserDiscoveryConfig"
         :tasks="browserDiscoveries"
         :task="browserDiscoveryTask"
         :records="browserDiscoveryRecords"
         :disabled="interactionLocked"
+        :config-loading="browserDiscoveryConfigLoading"
         :config-load-error="browserDiscoveryConfigLoadFailed"
         :tasks-loading="browserDiscoveryTasksLoading"
         :detail-loading="browserDiscoveryDetailLoading"
@@ -57,7 +88,6 @@
         :creating="browserDiscoveryCreating"
         :cancelling="browserDiscoveryCancelling"
         :handoff-loading="browserDiscoveryHandoffLoading"
-        @open-documents="router.push('/api-testing/api-specs')"
         @refresh="refreshBrowserDiscoveries"
         @create="submitBrowserDiscovery"
         @select="selectBrowserDiscovery"
@@ -65,7 +95,18 @@
         @load-records="loadBrowserDiscoveryRecords"
         @load-more-records="loadMoreBrowserDiscoveryRecords"
         @handoff="handoffBrowserDiscovery"
+        @form-dirty-change="browserDiscoveryFormDirty = $event"
       />
+      <el-alert
+        v-if="isDocumentSource && !specsLoading && !specsLoadFailed && !specs.length"
+        data-testid="api-workspace-no-documents"
+        title="当前项目还没有已处理的接口文档。请先到 API 规范管理上传并完成处理，再选择接口范围。"
+        type="info"
+        :closable="false"
+        show-icon
+      >
+        <template #default><el-button size="small" type="primary" plain @click="router.push('/api-testing/api-specs')">去 API 规范管理上传</el-button></template>
+      </el-alert>
       <el-alert
         v-if="conflict"
         title="草稿版本已冲突。其他人已更新此工作区；本地编辑没有被覆盖，请重新加载后决定如何处理。"
@@ -151,7 +192,7 @@
                   show-icon
                 />
               </el-form-item>
-              <el-form-item label="API 规范"
+              <el-form-item v-if="isDocumentSource" label="API 规范"
                 ><el-select
                   v-model="selectedSpecId"
                   clearable
@@ -172,16 +213,23 @@
                       `规范 ${spec.id}`
                     " /></el-select
               ></el-form-item>
-              <p v-if="specs.length === 1 && selectedSpecId" class="hint">
+              <p v-if="isDocumentSource && specs.length === 1 && selectedSpecId" class="hint">
                 当前项目仅有一个 API 规范，已自动选为工作区上下文；保存或生成时会持久化该选择。
               </p>
               <el-alert
-                v-if="specsLoadFailed"
+                v-if="isDocumentSource && specsLoadFailed"
                 title="API 规范列表加载失败，不能沿用旧范围生成并验证。"
                 type="error"
                 :closable="false"
                 show-icon
               />
+              <el-form-item v-if="isBrowserSource" label="网页探索来源" data-testid="api-workspace-source-readonly">
+                <el-descriptions :column="1" size="small" border>
+                  <el-descriptions-item label="来源名称">{{ sourceName }}</el-descriptions-item>
+                  <el-descriptions-item label="探索任务">{{ sourceTaskId || "—" }}</el-descriptions-item>
+                </el-descriptions>
+                <p class="hint">此来源及其接口范围由已确认的网页探索样本决定，不能在这里切换为 Swagger 文档。</p>
+              </el-form-item>
               <el-form-item label="供 AI 参考的端点" class="endpoint-field"
                 ><el-checkbox-group
                   v-model="endpointIds"
@@ -194,8 +242,11 @@
                     >{{ endpointLabel(endpoint) }}</el-checkbox
                   ></el-checkbox-group
                 >
-                <p class="hint">
+                <p v-if="isDocumentSource" class="hint">
                   选定规范后会加载并勾选其接口；一次最多 50 个，您可缩小范围。端点仅提供上下文和步骤关联。
+                </p>
+                <p v-else class="hint">
+                  已加载此网页探索来源确认的接口；一次最多保留 50 个，您可缩小范围，但不能切换为其他规范。
                 </p></el-form-item
               >
               <el-alert
@@ -540,7 +591,7 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { copyText } from "@/utils/reportLinks";
 import { useProjectStore } from "@/stores/project";
@@ -593,7 +644,7 @@ import {
   candidateDiff,
   childEditorEndpointIds,
   clone,
-  completedApiSpecs,
+  completedDocumentApiSpecs,
   defaultStep,
   errorMessage,
   failureActionState,
@@ -614,12 +665,23 @@ import {
   statusMeta,
   rootWorkspaceBusy,
   shouldApplyWorkspaceReload,
+  shouldApplyWorkspaceModeResponse,
   shouldClearRootGenerationPrompt,
   updateWorkspaceListItem,
   unwrap,
+  workspaceMatchesSource,
   workspaceInitializationPlan,
+  workspaceRouteForSource,
+  workspaceSourceType,
 } from "./apiWorkspace";
 
+const props = defineProps({
+  sourceType: {
+    type: String,
+    default: "document",
+    validator: (value) => ["document", "browser_capture"].includes(value),
+  },
+});
 const route = useRoute();
 const router = useRouter();
 const projectStore = useProjectStore();
@@ -642,6 +704,7 @@ const specs = ref([]);
 const specsLoadFailed = ref(false);
 const environments = ref([]);
 const browserDiscoveryConfig = ref({ enabled: false, limits: {}, models: [] });
+const browserDiscoveryConfigLoading = ref(false);
 const browserDiscoveryConfigLoadFailed = ref(false);
 const browserDiscoveries = ref([]);
 const browserDiscoveryTask = ref(null);
@@ -690,6 +753,8 @@ const conversationRef = ref(null);
 const verificationRef = ref(null);
 const visualStepsRef = ref(null);
 const currentDebugRef = ref(null);
+const browserDiscoveryPanelRef = ref(null);
+const browserDiscoveryFormDirty = ref(false);
 const debugForm = ref({ environment_id: null, variables: {} });
 const saveForm = ref({ title: "", description: "" });
 const generationForm = ref({
@@ -714,7 +779,23 @@ let browserDiscoveryListSequence = 0;
 let browserDiscoveryDetailSequence = 0;
 let browserDiscoveryRecordsSequence = 0;
 let auxiliaryLoadSequence = 0;
+let skipNextSourceLeaveConfirmation = false;
+let internalWorkspaceRouteId = null;
+let viewEpoch = 0;
+const isBrowserSource = computed(() => props.sourceType === "browser_capture");
+const isDocumentSource = computed(() => !isBrowserSource.value);
+const sourceWorkspace = computed(() => rootWorkspace.value || workspace.value);
+const sourceName = computed(
+  () => sourceWorkspace.value?.source_name || "网页探索来源",
+);
+const sourceTaskId = computed(() => sourceWorkspace.value?.source_task_id || null);
 const dirty = computed(() => draftDirty.value || contextDirty.value);
+const navigationDirty = computed(
+  () =>
+    dirty.value ||
+    Boolean(rootPrompt.value.trim()) ||
+    (isBrowserSource.value && browserDiscoveryFormDirty.value),
+);
 const rootBusy = computed(() => rootWorkspaceBusy(rootWorkspace.value));
 const editingScenario = computed(() => Boolean(workspace.value?.parent_id));
 const hasSavedRootCase = computed(
@@ -806,6 +887,7 @@ const selectedSpec = computed(() =>
 );
 const selectedSpecName = computed(
   () =>
+    (isBrowserSource.value && sourceName.value) ||
     selectedSpec.value?.spec_name ||
     selectedSpec.value?.name ||
     selectedSpec.value?.title ||
@@ -857,7 +939,9 @@ const confirmationSpecName = computed(() =>
 const generationContextError = computed(() =>
   generationContextMessage({
     specId: selectedSpecId.value,
-    specAvailable: Boolean(selectedSpec.value),
+    specAvailable: isBrowserSource.value
+      ? Boolean(selectedSpecId.value)
+      : Boolean(selectedSpec.value),
     endpointIds: endpointIds.value,
     specsLoadFailed: specsLoadFailed.value,
     endpointsLoadFailed: endpointsLoadFailed.value,
@@ -973,6 +1057,7 @@ const resetBrowserDiscoveries = () => {
   browserDiscoveryRecordsSequence += 1;
   stopBrowserDiscoveryPolling();
   browserDiscoveryConfig.value = { enabled: false, limits: {}, models: [] };
+  browserDiscoveryConfigLoading.value = false;
   browserDiscoveryConfigLoadFailed.value = false;
   browserDiscoveries.value = [];
   browserDiscoveryTask.value = null;
@@ -989,6 +1074,7 @@ const resetBrowserDiscoveries = () => {
 };
 const loadBrowserDiscoveryConfig = async (requestProjectId = projectId.value) => {
   const requestEpoch = browserDiscoveryEpoch;
+  browserDiscoveryConfigLoading.value = true;
   try {
     const response = await getBrowserDiscoveryConfig(requestProjectId);
     if (requestProjectId !== projectId.value || requestEpoch !== browserDiscoveryEpoch)
@@ -1002,6 +1088,9 @@ const loadBrowserDiscoveryConfig = async (requestProjectId = projectId.value) =>
     browserDiscoveryConfig.value = { enabled: false, limits: {}, models: [] };
     browserDiscoveryConfigLoadFailed.value = true;
     return false;
+  } finally {
+    if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
+      browserDiscoveryConfigLoading.value = false;
   }
 };
 const loadBrowserDiscoveries = async ({ quiet = false } = {}) => {
@@ -1126,7 +1215,7 @@ const submitBrowserDiscovery = async (form) => {
   try {
     const task = browserDiscoveryData(await createBrowserDiscovery(requestProjectId, payload));
     if (requestProjectId !== projectId.value || requestEpoch !== browserDiscoveryEpoch || !task?.id) return;
-    form.close?.();
+    browserDiscoveryPanelRef.value?.markCreateFormSubmitted?.();
     updateBrowserDiscoveryListItem(task);
     browserDiscoveryTaskId.value = task.id;
     browserDiscoveryTask.value = task;
@@ -1171,47 +1260,36 @@ const handoffBrowserDiscovery = async ({ taskId, version, recordIds }) => {
   if (!(await confirmDiscardDraft("转入网页探索工作区", { includePrompt: true }))) return;
   const requestProjectId = projectId.value;
   const requestEpoch = browserDiscoveryEpoch;
+  const requestViewEpoch = viewEpoch;
   initializationSequence += 1;
   reloadSequence += 1;
   initializing.value = false;
   browserDiscoveryHandoffLoading.value = true;
+  routeTransitioning.value = true;
   try {
     const result = browserDiscoveryData(await handoffBrowserDiscoveryRequest(requestProjectId, taskId, { version: Number(version), record_ids: recordIds }));
     const nextWorkspace = result?.workspace;
-    if (requestProjectId !== projectId.value || requestEpoch !== browserDiscoveryEpoch || !nextWorkspace?.id) return;
-    await loadAuxiliary();
-    const sourceSpec = result?.spec;
-    if (sourceSpec?.id && !specs.value.some((item) => String(item.id) === String(sourceSpec.id))) {
-      specs.value = [...specs.value, {
-        id: sourceSpec.id,
-        spec_name: `网页探索发现 #${sourceSpec.id}`,
-        spec_type: sourceSpec.spec_type || "browser_capture",
-        status: "completed",
-      }];
-    }
-    await loadWorkspaces();
-    await router.replace({ path: route.path, query: { workspace_id: String(nextWorkspace.id) } });
-    await reloadWorkspace({ id: nextWorkspace.id, skipDirtyCheck: true });
     if (
-      requestProjectId === projectId.value &&
-      requestEpoch === browserDiscoveryEpoch &&
-      sameWorkspaceId(nextWorkspace.id, rootWorkspace.value?.id) &&
-      sourceSpec?.id
-    ) {
-      if (!specs.value.some((item) => String(item.id) === String(sourceSpec.id))) {
-        specs.value = [...specs.value, {
-          id: sourceSpec.id,
-          spec_name: `网页探索发现 #${sourceSpec.id}`,
-          spec_type: sourceSpec.spec_type || "browser_capture",
-          status: "completed",
-        }];
-      }
-      selectedSpecId.value = sourceSpec.id;
-      endpointIds.value = Array.isArray(result?.endpoint_ids) ? result.endpoint_ids : [];
-      await nextTick();
-      await loadEndpointsForSpec({ specId: sourceSpec.id });
-      if (requestProjectId !== projectId.value || requestEpoch !== browserDiscoveryEpoch || !sameWorkspaceId(nextWorkspace.id, rootWorkspace.value?.id)) return;
-    }
+      requestProjectId !== projectId.value ||
+      requestEpoch !== browserDiscoveryEpoch ||
+      requestViewEpoch !== viewEpoch ||
+      !nextWorkspace?.id
+    )
+      return;
+    internalWorkspaceRouteId = String(nextWorkspace.id);
+    await router.replace({
+      path: workspaceRouteForSource("browser_capture"),
+      query: { workspace_id: String(nextWorkspace.id) },
+    });
+    if (
+      requestProjectId !== projectId.value ||
+      requestEpoch !== browserDiscoveryEpoch ||
+      requestViewEpoch !== viewEpoch
+    )
+      return;
+    await loadWorkspaces();
+    await reloadWorkspace({ id: nextWorkspace.id, skipDirtyCheck: true });
+    internalWorkspaceRouteId = null;
     ElMessage.success("已创建网页探索来源并加载其 API 工作区；请明确发起生成与运行确认。");
   } catch (error) {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
@@ -1219,6 +1297,8 @@ const handoffBrowserDiscovery = async ({ taskId, version, recordIds }) => {
   } finally {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
       browserDiscoveryHandoffLoading.value = false;
+    if (requestViewEpoch === viewEpoch) routeTransitioning.value = false;
+    if (requestViewEpoch === viewEpoch) internalWorkspaceRouteId = null;
   }
 };
 const pollBrowserDiscovery = async () => {
@@ -1236,10 +1316,17 @@ const startBrowserDiscoveryPolling = () => {
   browserDiscoveryPollTimer = setInterval(pollBrowserDiscovery, 1500);
 };
 const confirmDiscardDraft = async (action, { includePrompt = false } = {}) => {
-  if (!dirty.value && !(includePrompt && rootPrompt.value.trim())) return true;
+  const pendingBrowserForm =
+    isBrowserSource.value && browserDiscoveryFormDirty.value;
+  if (
+    !dirty.value &&
+    !(includePrompt && rootPrompt.value.trim()) &&
+    !pendingBrowserForm
+  )
+    return true;
   try {
     await ElMessageBox.confirm(
-      `${action}会放弃当前未保存的本地可视化编辑${includePrompt ? "和未提交的测试目标" : ""}，是否继续？`,
+      `${action}会放弃当前未保存的本地可视化编辑${includePrompt ? "和未提交的测试目标" : ""}${pendingBrowserForm ? "和未提交的网页探索表单" : ""}，是否继续？`,
       "确认放弃本地编辑",
       { confirmButtonText: "继续", cancelButtonText: "取消", type: "warning" },
     );
@@ -1262,6 +1349,18 @@ const markContextDirty = () => {
 };
 const focusRootContext = () =>
   contextPanel.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+const focusBrowserDiscoveryForm = () =>
+  browserDiscoveryPanelRef.value?.focusCreateForm?.();
+const startNewBrowserDiscovery = async () => {
+  if (!(await confirmDiscardDraft("新建网页探索", { includePrompt: false }))) return;
+  browserDiscoveryPanelRef.value?.resetCreateForm?.();
+  focusBrowserDiscoveryForm();
+};
+const switchSource = async (sourceType) => {
+  const targetPath = workspaceRouteForSource(sourceType);
+  if (route.path === targetPath) return;
+  await router.push({ path: targetPath });
+};
 const scrollToVisualSteps = () =>
   visualStepsRef.value?.scrollIntoView({ behavior: "smooth", block: "start" });
 const viewFailureEvidence = async () => {
@@ -1359,11 +1458,13 @@ const loadScenarioEndpointOptions = async (scenario) => {
     return;
   }
   const requestProjectId = projectId.value;
+  const requestSourceType = props.sourceType;
   const scenarioId = scenario.id;
   try {
     const response = await getAPIEndpoints(requestProjectId, scenario.spec_id);
     if (
       requestProjectId !== projectId.value ||
+      requestSourceType !== props.sourceType ||
       !sameWorkspaceId(scenarioId, workspace.value?.id)
     )
       return;
@@ -1396,7 +1497,7 @@ const applyRootWorkspace = (value) => {
   const next = asWorkspace(value);
   if (!next?.id) return;
   rootWorkspace.value = next;
-  if (next.generation?.source?.type === "browser_capture" && !next.generation?.status && !next.scenarios?.length && !rootPrompt.value.trim()) {
+  if (workspaceSourceType(next) === "browser_capture" && !next.generation?.status && !next.scenarios?.length && !rootPrompt.value.trim()) {
     rootPrompt.value = "请基于需求历史中的网页探索目标和已选真实接口样本，生成可独立重复执行的 API 测试场景。每个场景重新获取认证信息、使用唯一测试数据，并验证业务结果。";
   }
   workspaces.value = updateWorkspaceListItem(workspaces.value, next);
@@ -1415,7 +1516,7 @@ const applyRootWorkspace = (value) => {
       selectAll: !endpointIds.value.length,
       markAutoSelection: !endpointIds.value.length,
     });
-  } else if (specs.value.length === 1) {
+  } else if (isDocumentSource.value && specs.value.length === 1) {
     selectedSpecId.value = specs.value[0].id;
     void loadEndpointsForSpec({
       specId: selectedSpecId.value,
@@ -1444,23 +1545,45 @@ const applyWorkspace = (value) => {
   applyEditorWorkspace(next);
 };
 const loadWorkspaces = async (requestProjectId = projectId.value) => {
-  const response = await listApiWorkspaces(requestProjectId);
-  if (requestProjectId !== projectId.value) return false;
+  const requestSourceType = props.sourceType;
+  const requestViewEpoch = viewEpoch;
+  const response = await listApiWorkspaces(requestProjectId, {
+    source_type: requestSourceType,
+  });
+  if (
+    requestProjectId !== projectId.value ||
+    requestViewEpoch !== viewEpoch ||
+    !shouldApplyWorkspaceModeResponse({
+      requestSourceType,
+      currentSourceType: props.sourceType,
+    })
+  )
+    return false;
   workspaces.value = listItems(response);
   return true;
 };
 const loadAuxiliary = async () => {
   const requestProjectId = projectId.value;
+  const requestSourceType = props.sourceType;
+  const requestViewEpoch = viewEpoch;
   const requestSequence = ++auxiliaryLoadSequence;
   modelsLoading.value = true;
   specsLoading.value = true;
   const [modelsResult, specsResult, environmentsResult] =
     await Promise.allSettled([
       getLLMConfigurations(),
-      getAPISpecifications(projectId.value),
+      isDocumentSource.value
+        ? getAPISpecifications(projectId.value)
+        : Promise.resolve(null),
       getProjectEnvironments(projectId.value, { category: "api" }),
     ]);
-  if (requestProjectId !== projectId.value || requestSequence !== auxiliaryLoadSequence) return;
+  if (
+    requestProjectId !== projectId.value ||
+    requestViewEpoch !== viewEpoch ||
+    requestSourceType !== props.sourceType ||
+    requestSequence !== auxiliaryLoadSequence
+  )
+    return;
   if (modelsResult.status === "fulfilled") {
     models.value = availableChatModels(modelsResult.value);
     modelsLoaded.value = true;
@@ -1472,10 +1595,10 @@ const loadAuxiliary = async () => {
     modelsLoadFailed.value = true;
     ElMessage.warning(errorMessage(modelsResult.reason, "模型列表加载失败"));
   }
-  if (specsResult.status === "fulfilled") {
-    specs.value = completedApiSpecs(specsResult.value);
+  if (isDocumentSource.value && specsResult.status === "fulfilled") {
+    specs.value = completedDocumentApiSpecs(specsResult.value);
     specsLoadFailed.value = false;
-  } else {
+  } else if (isDocumentSource.value) {
     specs.value = [];
     specsLoadFailed.value = true;
     selectedSpecId.value = null;
@@ -1484,6 +1607,9 @@ const loadAuxiliary = async () => {
     endpointsLoadFailed.value = true;
     endpointLoadError.value = "API 规范列表加载失败，已清空旧接口范围。";
     ElMessage.warning(errorMessage(specsResult.reason, "API 规范加载失败"));
+  } else {
+    specs.value = [];
+    specsLoadFailed.value = false;
   }
   if (environmentsResult.status === "fulfilled")
     environments.value = listItems(environmentsResult.value).filter(
@@ -1497,6 +1623,10 @@ const loadAuxiliary = async () => {
   specsLoading.value = false;
 };
 const createWorkspace = async ({ fromInitialize = false } = {}) => {
+  if (isBrowserSource.value) {
+    focusBrowserDiscoveryForm();
+    return;
+  }
   if (
     busy.value ||
     routeTransitioning.value ||
@@ -1541,10 +1671,11 @@ const createWorkspace = async ({ fromInitialize = false } = {}) => {
 };
 const selectWorkspace = async (id) => {
   if (sendingMessage.value) return;
-  if (dirty.value) {
-    ElMessage.warning("请先保存或处理本地草稿，再切换工作区");
-    workspaceId.value = rootWorkspace.value?.id;
-    return;
+  if (navigationDirty.value) {
+    if (!(await confirmDiscardDraft("切换工作区", { includePrompt: true }))) {
+      workspaceId.value = rootWorkspace.value?.id;
+      return;
+    }
   }
   if (!id) return;
   routeTransitioning.value = true;
@@ -1658,11 +1789,28 @@ const reloadWorkspace = async ({
     confirmedSnapshot = workspaceEditSnapshot();
   }
   const requestSequence = ++reloadSequence;
+  const requestSourceType = props.sourceType;
+  const requestViewEpoch = viewEpoch;
   if (!quiet) loading.value = true;
   try {
     const requestProjectId = projectId.value;
     const response = await getApiWorkspace(requestProjectId, id);
     const next = asWorkspace(response);
+    if (
+      requestProjectId === projectId.value &&
+      requestSequence === reloadSequence &&
+      requestViewEpoch === viewEpoch &&
+      requestSourceType === props.sourceType &&
+      next?.id &&
+      !workspaceMatchesSource(next, requestSourceType)
+    ) {
+      skipNextSourceLeaveConfirmation = true;
+      await router.replace({
+        path: workspaceRouteForSource(workspaceSourceType(next)),
+        query: { workspace_id: String(next.id) },
+      });
+      return false;
+    }
     const expectedIsCurrent =
       expected &&
       expected.projectId === projectId.value &&
@@ -1674,13 +1822,18 @@ const reloadWorkspace = async ({
         next?.revision === expected.revision);
     if (
       !shouldApplyWorkspaceReload({
-        requestProjectId,
+      requestProjectId,
         currentProjectId: projectId.value,
         requestSequence,
         latestSequence: reloadSequence,
         dirty: dirty.value,
         confirmedSnapshot,
         currentSnapshot: workspaceEditSnapshot(),
+      }) ||
+      requestViewEpoch !== viewEpoch ||
+      !shouldApplyWorkspaceModeResponse({
+        requestSourceType,
+        currentSourceType: props.sourceType,
       }) ||
       (expected && (!expectedIsCurrent || !responseMatchesExpected))
     )
@@ -2132,6 +2285,7 @@ const loadEndpointsForSpec = async ({
 } = {}) => {
   if (!specId) return false;
   const requestProjectId = projectId.value;
+  const requestSourceType = props.sourceType;
   const requestRootWorkspaceId = rootWorkspace.value?.id;
   endpointsLoading.value = true;
   endpointsLoadFailed.value = false;
@@ -2140,6 +2294,7 @@ const loadEndpointsForSpec = async ({
     const response = await getAPIEndpoints(requestProjectId, specId);
     if (
       requestProjectId !== projectId.value ||
+      requestSourceType !== props.sourceType ||
       !sameWorkspaceId(requestRootWorkspaceId, rootWorkspace.value?.id) ||
       String(specId) !== String(selectedSpecId.value)
     )
@@ -2167,6 +2322,7 @@ const loadEndpointsForSpec = async ({
   } catch (error) {
     if (
       requestProjectId !== projectId.value ||
+      requestSourceType !== props.sourceType ||
       String(specId) !== String(selectedSpecId.value)
     )
       return false;
@@ -2179,6 +2335,7 @@ const loadEndpointsForSpec = async ({
   } finally {
     if (
       requestProjectId === projectId.value &&
+      requestSourceType === props.sourceType &&
       sameWorkspaceId(requestRootWorkspaceId, rootWorkspace.value?.id) &&
       String(specId) === String(selectedSpecId.value)
     )
@@ -2330,6 +2487,8 @@ const downloadPython = () => {
 };
 const initialize = async () => {
   const requestSequence = ++initializationSequence;
+  const requestViewEpoch = ++viewEpoch;
+  const requestSourceType = props.sourceType;
   initializing.value = true;
   if (!projectId.value) {
     await projectStore.initializeUserPreferences();
@@ -2365,13 +2524,23 @@ const initialize = async () => {
   clearPython();
   loading.value = true;
   try {
-    await Promise.all([loadWorkspaces(), loadAuxiliary(), initializeBrowserDiscoveries()]);
+    await Promise.all([
+      loadWorkspaces(),
+      loadAuxiliary(),
+      isBrowserSource.value
+        ? initializeBrowserDiscoveries()
+        : Promise.resolve(),
+    ]);
     if (
       requestSequence !== initializationSequence ||
-      requestProjectId !== projectId.value
+      requestViewEpoch !== viewEpoch ||
+      requestProjectId !== projectId.value ||
+      requestSourceType !== props.sourceType
     )
       return;
-    const plan = workspaceInitializationPlan(route.query, workspaces.value);
+    const plan = workspaceInitializationPlan(route.query, workspaces.value, {
+      sourceType: requestSourceType,
+    });
     if (plan.action === "invalid") {
       ElMessage.error(plan.message);
       return;
@@ -2380,6 +2549,14 @@ const initialize = async () => {
       await createWorkspace({ fromInitialize: true });
       return;
     }
+    if (plan.action === "documents") {
+      await router.replace({
+        path: workspaceRouteForSource("document"),
+        query: route.query,
+      });
+      return;
+    }
+    if (plan.action === "none") return;
     if (!plan.explicit) {
       await router.replace({
         path: route.path,
@@ -2388,6 +2565,7 @@ const initialize = async () => {
     }
     if (
       requestSequence === initializationSequence &&
+      requestViewEpoch === viewEpoch &&
       requestProjectId === projectId.value
     )
       await reloadWorkspace({ id: plan.workspaceId, skipDirtyCheck: true });
@@ -2401,8 +2579,45 @@ const initialize = async () => {
 watch(projectId, (next, previous) => {
   if (next && next !== previous) initialize();
 });
+watch(
+  () => route.query.workspace_id,
+  (nextWorkspaceId) => {
+    const id = Number(nextWorkspaceId);
+    if (
+      !routeTransitioning.value &&
+      Number.isSafeInteger(id) &&
+      id > 0 &&
+      !sameWorkspaceId(id, rootWorkspace.value?.id)
+    )
+      void reloadWorkspace({ id, skipDirtyCheck: true });
+  },
+);
 onMounted(initialize);
+onBeforeRouteLeave(async (to, from) => {
+  if (to.path === from.path) return true;
+  if (skipNextSourceLeaveConfirmation) {
+    skipNextSourceLeaveConfirmation = false;
+    return true;
+  }
+  return confirmDiscardDraft("切换工作区来源", { includePrompt: true });
+});
+onBeforeRouteUpdate(async (to, from) => {
+  if (to.path !== from.path || to.query.workspace_id === from.query.workspace_id)
+    return true;
+  if (
+    routeTransitioning.value ||
+    String(to.query.workspace_id || "") === internalWorkspaceRouteId
+  ) {
+    return true;
+  }
+  return confirmDiscardDraft("切换工作区", { includePrompt: true });
+});
 onBeforeUnmount(() => {
+  initializationSequence += 1;
+  viewEpoch += 1;
+  reloadSequence += 1;
+  auxiliaryLoadSequence += 1;
+  browserDiscoveryEpoch += 1;
   stopPolling();
   stopBrowserDiscoveryPolling();
 });
@@ -2424,6 +2639,24 @@ onBeforeUnmount(() => {
 .workspace-header h2,
 .workspace-header p {
   margin: 0;
+}
+.workspace-source-tabs {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.workspace-source-tabs button {
+  border: 1px solid var(--el-border-color);
+  border-radius: 4px;
+  background: var(--el-fill-color-blank);
+  color: var(--el-text-color-regular);
+  cursor: pointer;
+  padding: 6px 10px;
+}
+.workspace-source-tabs button.source-tab--active {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
 }
 .workspace-header p,
 .hint {

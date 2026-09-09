@@ -89,6 +89,16 @@ export const buildBrowserDiscoveryPayload = (form, config) => {
   };
 };
 
+export const browserDiscoveryFormSnapshot = (form) =>
+  JSON.stringify({
+    target_url: String(form?.target_url || "").trim(),
+    description: String(form?.description || "").trim(),
+    api_origin: String(form?.api_origin || "").trim(),
+    model_id: form?.model_id ?? null,
+    allow_test_data_writes: form?.allow_test_data_writes === true,
+    exploration_timeout_seconds: form?.exploration_timeout_seconds ?? null,
+  });
+
 export const isBrowserDiscoveryActive = (task) =>
   ["queued", "running", "finalizing"].includes(task?.status);
 

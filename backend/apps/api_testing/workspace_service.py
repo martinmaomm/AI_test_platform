@@ -133,7 +133,7 @@ def infer_spec_id(project_id: int, endpoint_ids: list[int]) -> int | None:
         return None
     spec_ids = list(APIEndpoint.objects.filter(
         id__in=endpoint_ids, spec__project_id=project_id,
-    ).values_list('spec_id', flat=True).distinct())
+    ).order_by().values_list('spec_id', flat=True).distinct())
     return spec_ids[0] if len(spec_ids) == 1 else None
 
 
@@ -278,8 +278,29 @@ def _document_context(endpoint):
     return context
 
 
-def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = True) -> dict[str, Any]:
+def workspace_source(workspace: APIWorkspace) -> tuple[str, str, str | None]:
+    """Return the immutable workspace origin from its root specification.
+
+    Generation metadata is deliberately transient: retries and terminal-state
+    cleanup replace it.  A child scenario also inherits the root selection, so
+    its own (possibly legacy) ``spec`` must never alter the displayed origin.
+    """
+    root = workspace.parent if workspace.parent_id else workspace
+    spec = root.spec if root.spec_id else None
+    if not spec or spec.spec_type != APISpecification.SpecType.BROWSER_CAPTURE:
+        return 'document', str(spec.spec_name or '') if spec else '', None
+    return (
+        'browser_capture',
+        str(spec.spec_name or ''),
+        str(spec.source_task_id) if spec.source_task_id else None,
+    )
+
+
+def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = True,
+                        source: tuple[str, str, str | None] | None = None) -> dict[str, Any]:
     saved_case = workspace.saved_case if workspace.saved_case_id else None
+    resolved_source = source or workspace_source(workspace)
+    source_type, source_name, source_task_id = resolved_source
     data = {
         'id': workspace.id,
         'title': workspace.title,
@@ -288,6 +309,9 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'scenario_description': workspace.scenario_description,
         'model_id': workspace.model_id,
         'spec_id': workspace.spec_id,
+        'source_type': source_type,
+        'source_name': source_name,
+        'source_task_id': source_task_id,
         'endpoint_ids': workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else [],
         'draft': workspace.draft if isinstance(workspace.draft, dict) else default_api_workspace_draft(),
         'revision': workspace.revision,
@@ -305,8 +329,15 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'updated_at': workspace.updated_at.isoformat() if workspace.updated_at else None,
     }
     if workspace.parent_id is None and include_scenarios:
-        children = list(workspace.scenarios.all().select_related('saved_case').order_by('scenario_order', 'id'))
-        data['scenarios'] = [serialize_workspace(child, include_scenarios=False) for child in children]
+        prefetched = getattr(workspace, '_prefetched_objects_cache', {})
+        if 'scenarios' in prefetched:
+            children = list(workspace.scenarios.all())
+        else:
+            children = list(workspace.scenarios.all().select_related('saved_case').order_by('scenario_order', 'id'))
+        data['scenarios'] = [
+            serialize_workspace(child, include_scenarios=False, source=resolved_source)
+            for child in children
+        ]
         data['coverage'] = workspace_coverage(workspace, children)
     return data
 
@@ -394,9 +425,16 @@ def owned_workspace(*, project_id: int, workspace_id: int, user, lock: bool = Fa
         project_id=project_id, id=workspace_id, owner=user,
     )
     if lock:
+        # Do not join nullable relations into the locking query: PostgreSQL
+        # rejects that shape and MySQL may widen the locked relation set.
         queryset = queryset.select_for_update()
     else:
-        queryset = queryset.select_related('saved_case')
+        queryset = queryset.select_related('saved_case', 'spec', 'parent__spec').prefetch_related(
+            models.Prefetch(
+                'scenarios',
+                queryset=APIWorkspace.objects.select_related('saved_case').order_by('scenario_order', 'id'),
+            ),
+        )
     try:
         return queryset.get()
     except APIWorkspace.DoesNotExist as exc:

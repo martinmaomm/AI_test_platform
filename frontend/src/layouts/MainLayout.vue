@@ -156,10 +156,17 @@
       <!-- 主内容 -->
       <el-main class="main-content">
         <router-view v-slot="{ Component, route: currentRoute }">
+          <component
+            v-if="currentRoute.meta.cache === false"
+            :is="Component"
+            :key="componentCacheKey(currentRoute)"
+          />
+          <!-- 保持缓存容器常驻：来源工作区只是不进入缓存，不能清空其他页面实例。 -->
           <keep-alive :max="15">
             <component
+              v-if="currentRoute.meta.cache !== false"
               :is="Component"
-              :key="currentRoute.fullPath + (refreshKeyMap[currentRoute.fullPath] || 0)"
+              :key="componentCacheKey(currentRoute)"
             />
           </keep-alive>
         </router-view>
@@ -287,11 +294,23 @@ const appStore = useAppStore()
 const tabListRef = ref(null)
 
 // -------- 局部刷新机制（动态 Key 击穿 keep-alive 缓存）--------
-// 每个路由 fullPath 对应一个自增计数器；计数变化 → key 变化 → keep-alive 视为新实例 → onMounted 重新执行
+// 未缓存页面按 path 计数，避免 query（例如 workspace_id）产生并存实例。
 const refreshKeyMap = ref({})
 
+const refreshScope = (target) => {
+  const resolved = router.resolve(target || route.fullPath)
+  return resolved.meta?.cache === false ? resolved.path : resolved.fullPath
+}
+
+const componentCacheKey = (currentRoute) => {
+  const scope = currentRoute.meta?.cache === false
+    ? currentRoute.path
+    : currentRoute.fullPath
+  return `${scope}:${refreshKeyMap.value[scope] || 0}`
+}
+
 const reload = (path) => {
-  const key = path || route.fullPath
+  const key = refreshScope(path)
   refreshKeyMap.value[key] = (refreshKeyMap.value[key] || 0) + 1
 }
 // 向所有子组件提供 reload 方法，子组件可通过 inject('reload') 主动触发刷新
@@ -425,6 +444,7 @@ const activeMenuIndex = computed(() => {
   const p = route.path
   // 动态路由兜底：详情页高亮对应父级菜单
   if (/^\/api-testing\/specs\/[^/]+/.test(p)) return '/api-testing/api-specs'
+  if (p.startsWith('/api-testing/workspace/')) return '/api-testing/workspace'
   if (/^\/project\/project-detail\/[^/]+/.test(p)) return '/project/project-list'
   // 模块基础路径 -> 默认子页
   if (p === '/api-testing') return '/api-testing/workspace'

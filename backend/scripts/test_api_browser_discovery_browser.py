@@ -63,6 +63,7 @@ def bootstrap(root):
     from django.core.management import call_command
     from projects.models import Project
     from ai_core.models import LLMConfiguration, ModelType
+    from api_testing.models import APISpecification, APIEndpoint, APIWorkspace
     from rest_framework_simplejwt.tokens import AccessToken
 
     call_command("migrate", run_syncdb=True, verbosity=0)
@@ -75,9 +76,19 @@ def bootstrap(root):
     LLMConfiguration.objects.create(
         created_by=user, provider="openai", model_type=ModelType.LLM, model_name="browser-disabled-model", is_active=False,
     )
+    spec = APISpecification.objects.create(
+        project=project, created_by=user, spec_name="验收 Swagger 文档", status="completed",
+        spec_type="swagger", metadata={"swagger": "2.0", "paths": {}},
+    )
+    endpoint = APIEndpoint.objects.create(spec=spec, method="GET", path="/health", summary="文档健康检查")
+    workspace = APIWorkspace.objects.create(
+        project=project, owner=user, spec=spec, title="文档来源工作区", model_id=model.pk,
+        endpoint_ids=[endpoint.pk],
+    )
     return {
         "token": str(AccessToken.for_user(user)), "user_id": user.pk,
         "project_id": project.pk, "model_id": model.pk, "config": config,
+        "document_workspace_id": workspace.pk, "document_endpoint_id": endpoint.pk,
         "cancel_started": threading.Event(), "cancel_release": threading.Event(), "workers": [],
     }
 
@@ -112,7 +123,7 @@ def simulated_runner(fixture):
         if "取消" in description:
             assert await sync_to_async(checkpoint, thread_sensitive=True)({"current_action": "正在模拟网页操作", "tool_calls": 2, "model_calls": 1})
             fixture["cancel_started"].set()
-            await asyncio.to_thread(fixture["cancel_release"].wait, timeout=20)
+            await asyncio.to_thread(fixture["cancel_release"].wait, timeout=45)
             return {"completed": False, "error_code": "cancelled", "summary": "取消前未保留证据", "tool_calls": 2, "model_calls": 1}
         if "无有效" in description:
             count, completed, eligible = 1, False, False
@@ -136,6 +147,7 @@ def verify(origin, fixture, output):
     from api_testing.models import APIEndpoint, APISpecification, APIWorkspace, APITestCase, APITestExecution, BrowserDiscoveryTask
 
     errors = []
+    requests = []
     api_base = f"/api/v1/projects/{fixture['project_id']}/api-testing/browser-discoveries/"
 
     with sync_playwright() as pw:
@@ -148,52 +160,98 @@ def verify(origin, fixture, output):
         }) + ")); localStorage.removeItem('project-store');")
         page = context.new_page()
         page.on("pageerror", lambda error: errors.append(str(error)))
+        page.on("request", lambda request: requests.append((request.method, request.url)))
 
-        def dialog():
-            return page.locator(".el-dialog:visible").last
+        def tab(source):
+            return page.get_by_test_id(f"api-workspace-source-{source}")
+
+        def switch_to(source):
+            tab(source).click()
+            expect(page).to_have_url(re.compile(rf"/workspace/{'documents' if source == 'documents' else 'browser'}(?:\?|$)"))
+            expect(tab(source)).to_have_attribute("aria-selected", "true")
+            if source == "documents":
+                expect(page.get_by_test_id("api-workspace-select")).to_contain_text("文档来源工作区")
+                expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(1)
+            elif fixture["config"].API_BROWSER_DISCOVERY_ENABLED:
+                expect(page.get_by_test_id("api-browser-discovery-create-form")).to_be_visible()
 
         def task_row(slug):
             return page.locator(".browser-discovery-panel .el-table__row").filter(has_text=slug)
 
         def create_task(slug, description):
-            page.get_by_role("button", name="从网页探索生成", exact=True).click()
-            d = dialog()
+            d = page.get_by_test_id("api-browser-discovery-create-form")
             d.get_by_role("textbox", name="完整页面 URL", exact=True).fill(f"https://web.example.test/{slug}?source=browser#fixture")
             d.get_by_role("textbox", name="API origin（可未知）", exact=True).fill("https://api.example.test")
             d.get_by_role("textbox", name="探索目标说明", exact=True).fill(description)
             d.locator(".el-form-item").filter(has_text="LLM 模型").locator(".el-select").click()
             expect(page.get_by_role("option", name="本地模拟 · browser-fixture-model", exact=True)).to_be_visible()
+            page.get_by_role("option", name="本地模拟 · browser-fixture-model", exact=True).click()
             d.get_by_role("spinbutton").fill("60")
-            d.get_by_text("我确认允许在上述授权测试范围内修改测试数据", exact=True).click()
+            consent = d.get_by_role("checkbox", name="允许测试数据写入", exact=True)
+            if not consent.is_checked():
+                d.get_by_text("我确认允许在上述授权测试范围内修改测试数据", exact=True).click()
+            expect(consent).to_be_checked()
             with page.expect_response(lambda item: item.request.method == "POST" and item.url.endswith(api_base)) as created:
                 d.get_by_role("button", name="开始探索", exact=True).click()
             assert created.value.status == 202, created.value.text()
-            expect(d).to_be_hidden()
+            expect(d.get_by_role("button", name="开始探索", exact=True)).to_be_enabled()
+            expect(page).to_have_url(re.compile(r"/workspace/browser(?:\?|$)"))
 
         try:
             page.goto(origin + "/api-testing/workspace")
             expect(page.get_by_role("heading", name="API 对话工作区")).to_be_visible(timeout=20000)
-            expect(page.get_by_role("button", name="从接口文档生成", exact=True)).to_be_visible()
-            expect(page.get_by_role("button", name="从网页探索生成", exact=True)).to_have_count(0)
+            expect(page).to_have_url(re.compile(r"/workspace/documents\?workspace_id="))
+            expect(tab("documents")).to_have_attribute("aria-selected", "true")
+            expect(page.locator(".header-actions")).to_contain_text("文档来源工作区")
+            spec_picker = page.locator(".context-panel .el-form-item").filter(has_text="API 规范").locator(".el-select")
+            expect(spec_picker).to_contain_text("验收 Swagger 文档")
+            expect(page.get_by_test_id("api-browser-discovery-panel")).to_have_count(0)
+            assert not any("browser-discoveries" in url for _, url in requests), requests
+            page.screenshot(path=str(output / "default-document-page.png"), full_page=True)
+            switch_to("browser")
+            expect(page.get_by_test_id("api-browser-discovery-create-form")).to_have_count(0)
             page.screenshot(path=str(output / "disabled-feature.png"), full_page=True)
 
             fixture["config"].API_BROWSER_DISCOVERY_ENABLED = True
             from django.conf import settings
             settings.API_BROWSER_DISCOVERY_ENABLED = True
+            requests.clear()
             page.reload()
-            expect(page.get_by_role("button", name="从网页探索生成", exact=True)).to_be_visible(timeout=15000)
-            page.get_by_role("button", name="从网页探索生成", exact=True).click()
-            d = dialog()
+            d = page.get_by_test_id("api-browser-discovery-create-form")
+            expect(d).to_be_visible(timeout=15000)
+            expect(page.locator(".context-panel")).to_have_count(0)
+            expect(page.get_by_role("button", name="新建工作区", exact=True)).to_have_count(0)
+            assert not any(re.search(r"/api-specs/(?:\?|$)", url) for _, url in requests), requests
+            assert database(lambda: APIWorkspace.objects.count()) == 1, "browser entry created an empty workspace"
             d.locator(".el-form-item").filter(has_text="LLM 模型").locator(".el-select").click()
             expect(page.get_by_role("option", name="本地模拟 · browser-fixture-model", exact=True)).to_be_visible()
             expect(page.get_by_role("option", name="browser-disabled-model", exact=True)).to_have_count(0)
             page.keyboard.press("Escape")
-            d.get_by_role("button", name="取消", exact=True).click()
+            page.screenshot(path=str(output / "inline-browser-page.png"), full_page=True)
+            url_input = d.get_by_role("textbox", name="完整页面 URL", exact=True)
+            url_input.fill("https://web.example.test/unsent")
+            tab("documents").click()
+            unsent_confirm = page.locator(".el-message-box:visible")
+            expect(unsent_confirm).to_be_visible()
+            unsent_confirm.get_by_role("button", name="取消", exact=True).click()
+            expect(url_input).to_have_value("https://web.example.test/unsent")
+            url_input.fill("")
 
             create_task("cancel", "取消任务，观察运行进度")
             assert fixture["cancel_started"].wait(timeout=15), "simulated runner did not start"
             expect(page.get_by_text("正在模拟网页操作", exact=True).first).to_be_visible(timeout=15000)
             page.screenshot(path=str(output / "running-progress.png"), full_page=True)
+            # Leaving the browser page must not send task cancellation or create a document workspace.
+            switch_to("documents")
+            assert not any(method == "POST" and "/cancel/" in url for method, url in requests)
+            assert not database(lambda: BrowserDiscoveryTask.objects.get(target_url__contains="/cancel").cancellation_requested)
+            requests.clear()
+            # Observe more than one 1500 ms poll interval after leaving. An
+            # inactive cached browser page must not keep requesting task data.
+            page.wait_for_timeout(1800)
+            assert not any("browser-discoveries" in url for _, url in requests), requests
+            switch_to("browser")
+            task_row("/cancel").get_by_role("button", name="查看", exact=True).click()
             page.get_by_role("button", name="取消探索", exact=True).click()
             fixture["cancel_release"].set()
             expect(page.get_by_text("已取消", exact=True).first).to_be_visible(timeout=15000)
@@ -259,23 +317,20 @@ def verify(origin, fixture, output):
             expect(selected_samples).to_have_count(2)
             selected_samples.nth(0).click()
             selected_samples.nth(1).click()
-            page.get_by_role("combobox", name="模型", exact=True).click()
-            page.get_by_role("option", name="本地模拟 · browser-fixture-model", exact=True).click()
-            expect(page.get_by_role("button", name="保存工作区设置", exact=True)).to_be_enabled()
-            page.get_by_role("button", name="创建来源并进入工作区", exact=True).click()
-            confirm = page.locator(".el-message-box")
-            expect(confirm).to_contain_text("转入网页探索工作区")
-            page.screenshot(path=str(output / "dirty-draft-confirmation.png"), full_page=True)
             with page.expect_response(lambda item: item.request.method == "POST" and item.url.endswith("/handoff/")) as handoff:
-                confirm.get_by_role("button", name="继续", exact=True).click()
+                page.get_by_role("button", name="创建来源并进入工作区", exact=True).click()
             assert handoff.value.status == 201, handoff.value.text()
-            expect(confirm).to_be_hidden()
+            source = handoff.value.json()["data"]["workspace"]
+            assert source["source_type"] == "browser_capture" and source["source_task_id"] and source["source_name"]
             expect(page.locator(".el-message-box:visible")).to_have_count(0)
             expect(page.get_by_text("已创建网页探索来源并加载其 API 工作区", exact=False)).to_be_visible(timeout=15000)
-            spec_picker = page.locator(".context-panel .el-form-item").filter(has_text="API 规范").locator(".el-select")
-            expect(spec_picker).to_contain_text("网页探索发现")
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?workspace_id="))
+            expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text("网页探索发现")
+            expect(page.locator(".context-panel .el-form-item").filter(has_text="API 规范").locator(".el-select")).to_have_count(0)
             expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(2)
             expect(page.get_by_role("textbox", name="描述测试目标", exact=True)).to_have_value(re.compile("需求历史"))
+            assert not any(re.search(r"/api-specs/(?:\?|$)", url) for _, url in requests if "/workspaces" not in url), requests
+            page.get_by_test_id("api-workspace-source-readonly").scroll_into_view_if_needed()
             page.screenshot(path=str(output / "handoff-workspace.png"), full_page=True)
 
             handoff_workspace = database(lambda: APIWorkspace.objects.get(title__startswith="网页探索工作区"))
@@ -288,13 +343,76 @@ def verify(origin, fixture, output):
             assert database(lambda: APITestCase.objects.count()) == 0
             assert database(lambda: APITestExecution.objects.count()) == 0
 
-            spec_picker.hover()
-            clear_spec = spec_picker.locator(".el-select__clear")
-            expect(clear_spec).to_be_visible()
-            clear_spec.click()
-            expect(spec_picker).to_contain_text("选择 API 规范")
-            expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(0)
-            page.screenshot(path=str(output / "cleared-spec-empty.png"), full_page=True)
+            # The source list is isolated, and unsent text survives cancelling a page switch.
+            page.get_by_test_id("api-workspace-select").click()
+            expect(page.get_by_role("option", name="文档来源工作区", exact=True)).to_have_count(0)
+            page.keyboard.press("Escape")
+            prompt = page.get_by_role("textbox", name="描述测试目标", exact=True)
+            prompt.fill("未提交的隔离验收描述")
+            tab("documents").click()
+            confirm = page.locator(".el-message-box:visible")
+            expect(confirm).to_be_visible()
+            page.screenshot(path=str(output / "dirty-draft-confirmation.png"), full_page=True)
+            confirm.get_by_role("button", name="取消", exact=True).click()
+            expect(tab("browser")).to_have_attribute("aria-selected", "true")
+            expect(prompt).to_have_value("未提交的隔离验收描述")
+            prompt.fill("")
+            switch_to("documents")
+            expect(page.locator(".header-actions")).to_contain_text("文档来源工作区")
+            expect(page.get_by_test_id("api-browser-discovery-panel")).to_have_count(0)
+            page.get_by_test_id("api-workspace-select").click()
+            expect(page.get_by_role("option", name=re.compile("网页探索工作区"))).to_have_count(0)
+            page.keyboard.press("Escape")
+            doc_picker = page.locator(".context-panel .el-form-item").filter(has_text="API 规范").locator(".el-select")
+            doc_picker.click()
+            expect(page.get_by_role("option", name="验收 Swagger 文档", exact=True)).to_be_visible()
+            expect(page.get_by_role("option", name=re.compile("网页探索发现"))).to_have_count(0)
+            page.keyboard.press("Escape")
+            page.screenshot(path=str(output / "document-source-isolation.png"), full_page=True)
+
+            # Provenance survives generation metadata replacement and all entry routes.
+            database(lambda: APIWorkspace.objects.filter(pk=handoff_workspace.pk).update(generation={}))
+            requests.clear()
+            page.goto(origin + f"/api-testing/workspace?workspace_id={handoff_workspace.pk}")
+            expect(page).to_have_url(re.compile(rf"/workspace/browser\?workspace_id={handoff_workspace.pk}$"), timeout=15000)
+            expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
+            expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(2)
+            page.reload()
+            expect(tab("browser")).to_have_attribute("aria-selected", "true")
+            expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
+            expect(page.get_by_test_id("api-browser-discovery-new")).to_be_enabled()
+            page.get_by_test_id("api-workspace-source-readonly").scroll_into_view_if_needed()
+            page.screenshot(path=str(output / "browser-refresh-stable-source.png"), full_page=True)
+
+            endpoint_id = handoff_workspace.endpoint_ids[0]
+            page.goto(origin + f"/api-testing/workspace?endpoint_id={endpoint_id}")
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?workspace_id="), timeout=15000)
+            expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
+            # A saved multi-endpoint scenario has no case.endpoint FK. Its actual
+            # step references must retain browser provenance when reopened.
+            case_script = {
+                "version": 1, "config": {"name": "浏览器场景深链", "base_url": "https://api.example.test"},
+                "teststeps": [
+                    {"name": f"检查接口 {index}", "endpoint_id": endpoint,
+                     "request": {"method": "GET", "url": f"/items/{index}"},
+                     "validate": [{"eq": ["status_code", 200]}]}
+                    for index, endpoint in enumerate(handoff_workspace.endpoint_ids, 1)
+                ],
+            }
+            saved_case = database(lambda: APITestCase.objects.create(
+                project_id=fixture["project_id"], created_by_id=fixture["user_id"],
+                title="浏览器场景深链", test_case_type="scenario", endpoint=None,
+                script_content=json.dumps(case_script),
+            ))
+            page.goto(origin + f"/api-testing/workspace?case_id={saved_case.pk}")
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?workspace_id="), timeout=15000)
+            expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
+            expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(2)
+            page.goto(origin + "/api-testing/workspace")
+            expect(page).to_have_url(re.compile(r"/workspace/documents\?workspace_id="), timeout=15000)
+            expect(page.locator(".header-actions")).to_contain_text("文档来源工作区")
+            assert database(lambda: APITestCase.objects.count()) == 1  # Only the explicit fixture above.
+            assert database(lambda: APITestExecution.objects.count()) == 0
             assert not errors, errors
         except Exception:
             page.screenshot(path=str(output / "failure.png"), full_page=True)

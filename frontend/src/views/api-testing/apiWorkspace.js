@@ -15,13 +15,38 @@ export const listItems = (response) => {
 export const completedApiSpecs = (response) =>
   listItems(response).filter((spec) => spec?.status === "completed");
 
+export const completedDocumentApiSpecs = (response) =>
+  completedApiSpecs(response).filter(
+    (spec) => spec?.spec_type !== "browser_capture",
+  );
+
+export const workspaceSourceType = (workspace) =>
+  workspace?.source_type === "browser_capture" ? "browser_capture" : "document";
+
+export const workspaceRouteForSource = (sourceType) =>
+  sourceType === "browser_capture"
+    ? "/api-testing/workspace/browser"
+    : "/api-testing/workspace/documents";
+
+export const workspaceMatchesSource = (workspace, sourceType) =>
+  workspaceSourceType(workspace) === sourceType;
+
+export const shouldApplyWorkspaceModeResponse = ({
+  requestSourceType,
+  currentSourceType,
+}) => requestSourceType === currentSourceType;
+
 const positiveQueryInteger = (value) => {
   if (value == null || value === "" || Array.isArray(value)) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
-export const workspaceInitializationPlan = (query = {}, workspaces = []) => {
+export const workspaceInitializationPlan = (
+  query = {},
+  workspaces = [],
+  { sourceType = "document" } = {},
+) => {
   const hasWorkspaceId = query.workspace_id != null;
   if (hasWorkspaceId) {
     const workspaceId = positiveQueryInteger(query.workspace_id);
@@ -38,12 +63,15 @@ export const workspaceInitializationPlan = (query = {}, workspaces = []) => {
     if ((hasCaseId && !caseId) || (hasEndpointId && !endpointId)) {
       return { action: "invalid", message: "工作区入口参数必须是正整数。" };
     }
-    return { action: "create", caseId, endpointId, explicit: true };
+    return sourceType === "browser_capture"
+      ? { action: "documents", caseId, endpointId, explicit: true }
+      : { action: "create", caseId, endpointId, explicit: true };
   }
 
   const workspaceId = workspaces[0]?.id;
-  return workspaceId
-    ? { action: "load", workspaceId, explicit: false }
+  if (workspaceId) return { action: "load", workspaceId, explicit: false };
+  return sourceType === "browser_capture"
+    ? { action: "none", explicit: false }
     : { action: "create", caseId: null, endpointId: null, explicit: false };
 };
 

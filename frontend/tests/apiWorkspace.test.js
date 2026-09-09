@@ -13,6 +13,7 @@ import {
   candidateDiff,
   childEditorEndpointIds,
   completedApiSpecs,
+  completedDocumentApiSpecs,
   debugHasFailure,
   defaultDraft,
   failureActionState,
@@ -35,10 +36,14 @@ import {
   reconcileWorkspaceModel,
   savedCaseDescription,
   shouldApplyWorkspaceReload,
+  shouldApplyWorkspaceModeResponse,
   shouldClearRootGenerationPrompt,
   shouldClearSubmittedMessage,
   updateWorkspaceListItem,
+  workspaceMatchesSource,
   workspaceInitializationPlan,
+  workspaceRouteForSource,
+  workspaceSourceType,
 } from "../src/views/api-testing/apiWorkspace.js";
 
 test("visual editor keeps exact filters and exposes absence assertions", async () => {
@@ -362,6 +367,40 @@ test("workspace initialization honors explicit targets before history", () => {
   assert.equal(
     workspaceInitializationPlan({ endpoint_id: ["5"] }, history).action,
     "invalid",
+  );
+});
+
+test("workspace source routes isolate document and browser history", () => {
+  assert.deepEqual(
+    completedDocumentApiSpecs({
+      data: [
+        { id: 1, status: "completed", spec_type: "openapi" },
+        { id: 2, status: "completed", spec_type: "browser_capture" },
+        { id: 3, status: "running", spec_type: "openapi" },
+      ],
+    }),
+    [{ id: 1, status: "completed", spec_type: "openapi" }],
+  );
+  assert.equal(workspaceSourceType({}), "document");
+  assert.equal(workspaceSourceType({ source_type: "browser_capture" }), "browser_capture");
+  assert.equal(workspaceMatchesSource({ source_type: "browser_capture" }, "browser_capture"), true);
+  assert.equal(workspaceMatchesSource({ source_type: "document" }, "browser_capture"), false);
+  assert.equal(workspaceRouteForSource("document"), "/api-testing/workspace/documents");
+  assert.equal(workspaceRouteForSource("browser_capture"), "/api-testing/workspace/browser");
+  assert.deepEqual(
+    workspaceInitializationPlan({}, [], { sourceType: "browser_capture" }),
+    { action: "none", explicit: false },
+  );
+  assert.deepEqual(
+    workspaceInitializationPlan({ case_id: "4" }, [], { sourceType: "browser_capture" }),
+    { action: "documents", caseId: 4, endpointId: null, explicit: true },
+  );
+  assert.equal(
+    shouldApplyWorkspaceModeResponse({
+      requestSourceType: "browser_capture",
+      currentSourceType: "document",
+    }),
+    false,
   );
 });
 
@@ -715,6 +754,14 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(api, /\$\{workspaceId\}\/python\//);
   assert.match(api, /data: \{ revision, confirmed: true \}/);
   assert.match(router, /path: 'workspace', name: 'ApiWorkspace'/);
+  assert.match(
+    router,
+    /path: 'workspace\/documents'.*title: 'API 对话工作区 · 接口文档'.*cache: false/,
+  );
+  assert.match(
+    router,
+    /path: 'workspace\/browser'.*title: 'API 对话工作区 · 网页探索'.*cache: false/,
+  );
   assert.match(router, /path: '', redirect: '\/api-testing\/workspace'/);
   assert.match(
     router,
@@ -726,6 +773,12 @@ test("workspace API, routing, navigation, and suite variables use the approved c
     mainLayout,
     /if \(p === '\/api-testing'\) return '\/api-testing\/workspace'/,
   );
+  assert.match(mainLayout, /currentRoute\.meta\.cache === false/);
+  assert.match(mainLayout, /<keep-alive :max="15">/);
+  assert.match(mainLayout, /v-if="currentRoute\.meta\.cache !== false"/);
+  assert.doesNotMatch(mainLayout, /<keep-alive v-else/);
+  assert.match(mainLayout, /currentRoute\.path/);
+  assert.match(mainLayout, /const refreshScope =/);
   assert.match(suites, /v-model="suiteForm\.variables"/);
   assert.match(suites, /套件变量会覆盖用例变量/);
   assert.match(endpointCases, /query: \{ case_id: selectedList\[0\]\.id \}/);

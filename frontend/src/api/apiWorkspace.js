@@ -3,8 +3,8 @@ import api from "./index";
 const basePath = (projectId) =>
   `/projects/${projectId}/api-testing/workspaces/`;
 
-export const listApiWorkspaces = async (projectId) => {
-  const response = await api.get(basePath(projectId));
+export const listApiWorkspaces = async (projectId, params = {}) => {
+  const response = await api.get(basePath(projectId), { params });
   return response.data;
 };
 

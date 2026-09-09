@@ -6,14 +6,18 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
+from django.db.models import Prefetch
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from projects.models import Environment, Project, ProjectMember
 from ai_core.models import LLMConfiguration
-from .models import APIEndpoint, APISpecification, APITestCase, APIWorkspace, default_api_workspace_draft
-from .workspace_service import debug_timeout_seconds, endpoint_specs, normalize_draft
+from .models import (
+    APIEndpoint, APISpecification, APITestCase, APIWorkspace,
+    BrowserDiscoveryTask, default_api_workspace_draft,
+)
+from .workspace_service import debug_timeout_seconds, endpoint_specs, normalize_draft, serialize_workspace
 from .workspace_tasks import _path_matches, _step_assertions, debug_api_workspace, generate_and_verify_api_workspace
 from .workspace_verification import draft_hash, prepare_candidate, protected_expected_values
 from .workspace_views import (
@@ -134,6 +138,124 @@ class APIWorkspaceTests(TestCase):
             self.request(other, 'get', '/'), project_id=self.project.id, workspace_id=workspace.id,
         )
         self.assertEqual(hidden.status_code, 404)
+
+    def test_workspace_source_fields_are_root_stable_and_list_filters_are_owner_scoped(self):
+        document_spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, spec_name='已处理文档',
+            status=APISpecification.TaskStatus.COMPLETED,
+        )
+        task = BrowserDiscoveryTask.objects.create(
+            project=self.project, owner=self.user, model_id=self.model.id,
+            target_url='https://browser-source.example.test', description='已确认样本',
+            task_id='workspace-source-browser-task',
+        )
+        browser_spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, spec_name='浏览器样本',
+            status=APISpecification.TaskStatus.COMPLETED,
+            spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task=task,
+        )
+        no_spec = self.workspace(title='无规范工作区')
+        document = self.workspace(title='文档工作区', spec=document_spec)
+        browser = self.workspace(title='浏览器工作区', spec=browser_spec, generation={})
+        child = self.workspace(parent=browser, spec=document_spec, title='浏览器子场景')
+
+        all_workspaces = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'get', '/'), project_id=self.project.id,
+        )
+        self.assertEqual(all_workspaces.status_code, 200, all_workspaces.data)
+        by_id = {item['id']: item for item in all_workspaces.data['data']}
+        self.assertEqual(by_id[no_spec.id]['source_type'], 'document')
+        self.assertEqual(by_id[no_spec.id]['source_name'], '')
+        self.assertIsNone(by_id[no_spec.id]['source_task_id'])
+        self.assertEqual(by_id[document.id]['source_type'], 'document')
+        self.assertEqual(by_id[document.id]['source_name'], '已处理文档')
+        self.assertIsNone(by_id[document.id]['source_task_id'])
+        self.assertEqual(by_id[browser.id]['source_type'], 'browser_capture')
+        self.assertEqual(by_id[browser.id]['source_name'], '浏览器样本')
+        self.assertEqual(by_id[browser.id]['source_task_id'], str(task.id))
+        self.assertEqual(by_id[browser.id]['scenarios'][0]['id'], child.id)
+        self.assertEqual(by_id[browser.id]['scenarios'][0]['source_type'], 'browser_capture')
+        self.assertEqual(by_id[browser.id]['scenarios'][0]['source_name'], '浏览器样本')
+
+        detail = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'get', '/'), project_id=self.project.id, workspace_id=child.id,
+        )
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data['data']['source_type'], 'browser_capture')
+        self.assertEqual(detail.data['data']['source_task_id'], str(task.id))
+
+        spoofed = APIWorkspaceDetailView.as_view()(
+            self.request(self.user, 'patch', '/', {
+                'revision': browser.revision, 'source_type': 'document',
+                'source_name': '伪造来源', 'source_task_id': 'not-a-task',
+            }), project_id=self.project.id, workspace_id=browser.id,
+        )
+        self.assertEqual(spoofed.status_code, 200, spoofed.data)
+        self.assertEqual(spoofed.data['data']['source_type'], 'browser_capture')
+        self.assertEqual(spoofed.data['data']['source_name'], '浏览器样本')
+        self.assertEqual(spoofed.data['data']['source_task_id'], str(task.id))
+
+        document_only = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'get', '/?source_type=document'), project_id=self.project.id,
+        )
+        self.assertEqual(document_only.status_code, 200, document_only.data)
+        self.assertEqual({item['id'] for item in document_only.data['data']}, {no_spec.id, document.id})
+        browser_only = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'get', '/?source_type=browser_capture'), project_id=self.project.id,
+        )
+        self.assertEqual(browser_only.status_code, 200, browser_only.data)
+        self.assertEqual([item['id'] for item in browser_only.data['data']], [browser.id])
+        invalid_filter = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'get', '/?source_type=unknown'), project_id=self.project.id,
+        )
+        self.assertEqual(invalid_filter.status_code, 400)
+
+        editor = get_user_model().objects.create_user(
+            username='workspace-source-editor', email='workspace-source-editor@example.test', password='pw',
+        )
+        ProjectMember.objects.create(project=self.project, user=editor, role='editor', can_edit=True)
+        editor_workspace = APIWorkspace.objects.create(
+            project=self.project, owner=editor, title='其他编辑者工作区', draft=default_api_workspace_draft(),
+        )
+        editor_list = APIWorkspaceCollectionView.as_view()(
+            self.request(editor, 'get', '/'), project_id=self.project.id,
+        )
+        self.assertEqual(editor_list.status_code, 200, editor_list.data)
+        self.assertEqual([item['id'] for item in editor_list.data['data']], [editor_workspace.id])
+
+    def test_workspace_serialization_uses_prefetched_children_and_orders_fallback_queries(self):
+        task = BrowserDiscoveryTask.objects.create(
+            project=self.project, owner=self.user, model_id=self.model.id,
+            target_url='https://serialization-source.example.test', description='已确认样本',
+            task_id='workspace-serialization-browser-task',
+        )
+        browser_spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, spec_name='浏览器样本',
+            status=APISpecification.TaskStatus.COMPLETED,
+            spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task=task,
+        )
+        document_spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, spec_name='子场景旧文档',
+            status=APISpecification.TaskStatus.COMPLETED,
+        )
+        root = self.workspace(spec=browser_spec)
+        second = self.workspace(parent=root, spec=document_spec, scenario_order=2)
+        first = self.workspace(parent=root, spec=document_spec, scenario_order=1)
+
+        with self.assertNumQueries(1):
+            fallback = serialize_workspace(root)
+        self.assertEqual([item['id'] for item in fallback['scenarios']], [first.id, second.id])
+
+        prefetched_root = APIWorkspace.objects.select_related('saved_case', 'spec').prefetch_related(
+            Prefetch(
+                'scenarios',
+                queryset=APIWorkspace.objects.select_related('saved_case').order_by('scenario_order', 'id'),
+            ),
+        ).get(pk=root.id)
+        with self.assertNumQueries(0):
+            prefetched = serialize_workspace(prefetched_root)
+        self.assertEqual([item['id'] for item in prefetched['scenarios']], [first.id, second.id])
+        self.assertTrue(all(item['source_type'] == 'browser_capture' for item in prefetched['scenarios']))
 
     def test_patch_revision_conflict_does_not_overwrite_draft(self):
         workspace = self.workspace()
@@ -1187,6 +1309,74 @@ class APIWorkspaceTests(TestCase):
         )
         self.assertEqual(created.status_code, 400)
         self.assertEqual(APIWorkspace.objects.count(), 0)
+
+    def test_reopen_multi_endpoint_browser_case_keeps_source_scope_and_owner_guard(self):
+        task = BrowserDiscoveryTask.objects.create(
+            project=self.project, owner=self.user, model_id=self.model.id,
+            target_url='https://case-source.example.test', description='已确认样本',
+            task_id='workspace-case-browser-task',
+        )
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, spec_name='浏览器多接口样本',
+            status=APISpecification.TaskStatus.COMPLETED,
+            spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task=task,
+        )
+        first = APIEndpoint.objects.create(spec=spec, method='GET', path='/items')
+        second = APIEndpoint.objects.create(spec=spec, method='POST', path='/items')
+        draft = default_api_workspace_draft()
+        draft['teststeps'] = [
+            {'name': '列表', 'endpoint_id': first.id, 'request': {'method': 'GET', 'url': '/items'}},
+            {'name': '创建', 'endpoint_id': second.id, 'request': {'method': 'POST', 'url': '/items'}},
+            {'name': '再次列表', 'endpoint_id': first.id, 'request': {'method': 'GET', 'url': '/items'}},
+        ]
+        case = APITestCase.objects.create(
+            project=self.project, created_by=self.user, title='浏览器多接口用例', test_case_type='scenario',
+            script_content=__import__('json').dumps(draft),
+        )
+
+        reopened = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'post', '/', {'case_id': case.id}), project_id=self.project.id,
+        )
+        self.assertEqual(reopened.status_code, 201, reopened.data)
+        self.assertEqual(reopened.data['data']['spec_id'], spec.id, reopened.data)
+        self.assertEqual(reopened.data['data']['endpoint_ids'], [first.id, second.id])
+        self.assertEqual(reopened.data['data']['source_type'], 'browser_capture')
+        self.assertEqual(reopened.data['data']['source_task_id'], str(task.id))
+
+        explicit_scope = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'post', '/', {'case_id': case.id, 'endpoint_ids': [second.id]}),
+            project_id=self.project.id,
+        )
+        self.assertEqual(explicit_scope.status_code, 201, explicit_scope.data)
+        self.assertEqual(explicit_scope.data['data']['spec_id'], spec.id)
+        self.assertEqual(explicit_scope.data['data']['endpoint_ids'], [second.id])
+
+        editor = get_user_model().objects.create_user(
+            username='workspace-case-editor', email='workspace-case-editor@example.test', password='pw',
+        )
+        ProjectMember.objects.create(project=self.project, user=editor, role='editor', can_edit=True)
+        denied = APIWorkspaceCollectionView.as_view()(
+            self.request(editor, 'post', '/', {'case_id': case.id}), project_id=self.project.id,
+        )
+        self.assertEqual(denied.status_code, 400)
+        self.assertIn('发起者', denied.data['message'])
+        self.assertFalse(APIWorkspace.objects.filter(project=self.project, owner=editor).exists())
+
+    def test_reopen_case_falls_back_to_its_endpoint_when_draft_has_no_endpoint_reference(self):
+        spec = APISpecification.objects.create(
+            project=self.project, created_by=self.user, status=APISpecification.TaskStatus.COMPLETED,
+        )
+        endpoint = APIEndpoint.objects.create(spec=spec, method='GET', path='/health')
+        case = APITestCase.objects.create(
+            project=self.project, created_by=self.user, title='端点用例', test_case_type='endpoint', endpoint=endpoint,
+        )
+
+        reopened = APIWorkspaceCollectionView.as_view()(
+            self.request(self.user, 'post', '/', {'case_id': case.id}), project_id=self.project.id,
+        )
+        self.assertEqual(reopened.status_code, 201, reopened.data)
+        self.assertEqual(reopened.data['data']['spec_id'], spec.id)
+        self.assertEqual(reopened.data['data']['endpoint_ids'], [endpoint.id])
 
     def test_save_classifies_single_endpoint_and_multi_step_scenario_without_losing_reference(self):
         endpoint = self.endpoint()

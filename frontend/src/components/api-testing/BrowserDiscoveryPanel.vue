@@ -1,23 +1,34 @@
 <template>
-  <section class="browser-discovery-panel" aria-label="接口来源">
-    <div class="source-actions">
-      <el-button plain @click="$emit('open-documents')">从接口文档生成</el-button>
-      <el-button
-        v-if="enabled"
-        type="primary"
-        plain
-        :disabled="disabled"
-        @click="openCreateDialog"
-      >从网页探索生成</el-button>
-    </div>
+  <section class="browser-discovery-panel" aria-label="网页探索接口来源" data-testid="api-browser-discovery-panel">
+    <el-skeleton v-if="configLoading" :rows="3" animated />
     <el-alert
-      v-if="configLoadError"
-      title="网页探索配置加载失败；入口暂不显示，请重新加载后再试。"
+      v-else-if="configLoadError"
+      title="网页探索配置加载失败，暂不能开始探索；请重新加载后再试。"
       type="warning"
       :closable="false"
       show-icon
     />
-    <template v-if="enabled">
+    <el-alert
+      v-else-if="!enabled"
+      title="网页探索功能未启用，请在后端配置 API_BROWSER_DISCOVERY_ENABLED 后重启服务。"
+      type="info"
+      :closable="false"
+      show-icon
+    />
+    <template v-else>
+      <el-card ref="createFormCard" shadow="never" class="create-card" data-testid="api-browser-discovery-create-form">
+        <template #header><strong>网页探索</strong></template>
+        <el-alert title="网页探索可能按您授权的测试范围执行真实页面操作。仅在测试站点和测试数据范围内使用。" type="warning" :closable="false" show-icon />
+        <el-form label-position="top" class="create-form">
+          <el-form-item label="完整页面 URL" required><el-input v-model="form.target_url" aria-label="完整页面 URL" placeholder="https://example.test/login" :disabled="disabled || creating" /></el-form-item>
+          <el-form-item label="API origin（可未知）"><el-input v-model="form.api_origin" aria-label="API origin（可未知）" placeholder="https://api.example.test；未知时留空，仅采元信息后需重新探索正文" :disabled="disabled || creating" /></el-form-item>
+          <el-form-item label="探索目标说明" required><el-input v-model="form.description" aria-label="探索目标说明" type="textarea" :rows="3" :maxlength="BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH" show-word-limit placeholder="描述要探索的业务步骤、范围和待确认目标" :disabled="disabled || creating" /></el-form-item>
+          <el-form-item label="LLM 模型" required><el-select v-model="form.model_id" aria-label="LLM 模型" placeholder="选择已启用模型" style="width:100%" :disabled="disabled || creating"><el-option v-for="model in models" :key="model.id" :value="model.id" :label="modelLabel(model)" /></el-select></el-form-item>
+          <el-form-item label="探索总时限（秒）" required><el-input-number :key="`browser-discovery-timeout-${disabled || creating}`" v-model="form.exploration_timeout_seconds" aria-label="探索总时限（秒）" :min="BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS" :max="timeoutMaximum" :step="30" :disabled="disabled || creating" /></el-form-item>
+          <el-form-item><el-checkbox v-model="form.allow_test_data_writes" aria-label="允许测试数据写入" :disabled="disabled || creating">我确认允许在上述授权测试范围内修改测试数据</el-checkbox></el-form-item>
+          <el-button type="primary" :loading="creating" :disabled="disabled" @click="submit">开始探索</el-button>
+        </el-form>
+      </el-card>
       <div class="discovery-toolbar">
         <strong>网页探索任务</strong>
         <el-button text :loading="tasksLoading" @click="$emit('refresh')">刷新</el-button>
@@ -83,35 +94,25 @@
         <el-empty v-else-if="recordsLoaded" description="没有可交接的已授权样本" :image-size="56" />
       </el-card>
     </template>
-    <el-dialog v-model="createDialog" title="从网页探索生成 API 场景" width="620px" :close-on-click-modal="false">
-      <el-alert title="网页探索可能按您授权的测试范围执行真实页面操作。仅在测试站点和测试数据范围内使用。" type="warning" :closable="false" show-icon />
-      <el-form label-position="top" class="create-form">
-        <el-form-item label="完整页面 URL" required><el-input v-model="form.target_url" aria-label="完整页面 URL" placeholder="https://example.test/login" /></el-form-item>
-        <el-form-item label="API origin（可未知）"><el-input v-model="form.api_origin" aria-label="API origin（可未知）" placeholder="https://api.example.test；未知时留空，仅采元信息后需重新探索正文" /></el-form-item>
-        <el-form-item label="探索目标说明" required><el-input v-model="form.description" aria-label="探索目标说明" type="textarea" :rows="3" :maxlength="BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH" show-word-limit placeholder="描述要探索的业务步骤、范围和待确认目标" /></el-form-item>
-        <el-form-item label="LLM 模型" required><el-select v-model="form.model_id" aria-label="LLM 模型" placeholder="选择已启用模型" style="width:100%"><el-option v-for="model in models" :key="model.id" :value="model.id" :label="modelLabel(model)" /></el-select></el-form-item>
-        <el-form-item label="探索总时限（秒）" required><el-input-number v-model="form.exploration_timeout_seconds" aria-label="探索总时限（秒）" :min="BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS" :max="timeoutMaximum" :step="30" /></el-form-item>
-        <el-form-item><el-checkbox v-model="form.allow_test_data_writes" aria-label="允许测试数据写入">我确认允许在上述授权测试范围内修改测试数据</el-checkbox></el-form-item>
-      </el-form>
-      <template #footer><el-button @click="createDialog = false">取消</el-button><el-button type="primary" :loading="creating" @click="submit">开始探索</el-button></template>
-    </el-dialog>
   </section>
 </template>
 
 <script setup>
 import { computed, ref, watch } from "vue";
-import { BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH, BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS, browserDiscoveryElapsed, browserDiscoveryErrorCodeLabel, browserDiscoveryRecordGroups, browserDiscoveryStatusMeta, browserDiscoveryTimeoutDefault, formatBrowserDiscoveryDuration, isBrowserDiscoveryActive } from "@/utils/apiBrowserDiscovery";
+import { BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH, BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS, browserDiscoveryElapsed, browserDiscoveryErrorCodeLabel, browserDiscoveryFormSnapshot, browserDiscoveryRecordGroups, browserDiscoveryStatusMeta, browserDiscoveryTimeoutDefault, formatBrowserDiscoveryDuration, isBrowserDiscoveryActive } from "@/utils/apiBrowserDiscovery";
 
 const props = defineProps({
-  config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, handoffLoading: Boolean,
+  config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, handoffLoading: Boolean,
 });
-const emit = defineEmits(["open-documents", "refresh", "create", "select", "cancel", "load-records", "load-more-records", "handoff"]);
-const createDialog = ref(false);
+const emit = defineEmits(["refresh", "create", "select", "cancel", "load-records", "load-more-records", "handoff", "form-dirty-change"]);
+const createFormCard = ref(null);
 const selectedRecordIds = ref([]);
 const enabled = computed(() => props.config?.enabled === true);
 const models = computed(() => Array.isArray(props.config?.models) ? props.config.models : []);
 const defaultForm = () => ({ target_url: "", description: "", api_origin: "", model_id: models.value[0]?.id ?? null, allow_test_data_writes: false, exploration_timeout_seconds: browserDiscoveryTimeoutDefault(props.config) });
 const form = ref(defaultForm());
+const formSnapshot = ref(browserDiscoveryFormSnapshot(form.value));
+const formDirty = computed(() => browserDiscoveryFormSnapshot(form.value) !== formSnapshot.value);
 const statusMeta = browserDiscoveryStatusMeta;
 const active = isBrowserDiscoveryActive;
 const duration = (task) => formatBrowserDiscoveryDuration(browserDiscoveryElapsed(task));
@@ -124,19 +125,36 @@ const timeoutMaximum = computed(() => {
 const modelLabel = (model) => [model?.provider_name || model?.provider, model?.model_name].filter(Boolean).join(" · ") || `模型 ${model?.id}`;
 const errorCodeLabel = browserDiscoveryErrorCodeLabel;
 const terminalReason = (task) => task?.error_code ? errorCodeLabel(task.error_code) : "";
-const openCreateDialog = () => { form.value = defaultForm(); createDialog.value = true; };
-const submit = () => emit("create", { ...form.value, close: () => { createDialog.value = false; } });
+const submit = () => emit("create", { ...form.value });
+const resetCreateForm = () => {
+  form.value = defaultForm();
+  formSnapshot.value = browserDiscoveryFormSnapshot(form.value);
+};
+const markCreateFormSubmitted = () => {
+  formSnapshot.value = browserDiscoveryFormSnapshot(form.value);
+};
+const focusCreateForm = () => {
+  createFormCard.value?.$el?.scrollIntoView({ behavior: "smooth", block: "start" });
+};
 const selectedGroupCount = computed(() => recordGroups.value.filter((group) => group.eligibleRecordIds.some((id) => selectedRecordIds.value.includes(id))).length);
 const sampleTitle = (record) => `样本 #${record.sequence ?? "—"}${record.is_eligible === true ? "" : "（不可交接）"}`;
 const sampleText = (record) => JSON.stringify(record.public_summary || { sequence: record.sequence, message: "此样本没有可展示的公开摘要。" }, null, 2);
 const handoff = () => emit("handoff", { taskId: props.task?.id, version: props.task?.version, recordIds: selectedRecordIds.value });
 watch(() => props.task?.id, () => { selectedRecordIds.value = []; });
 watch(recordGroups, (groups) => { selectedRecordIds.value = selectedRecordIds.value.filter((id) => groups.some((group) => group.eligibleRecordIds.includes(Number(id)))); });
+watch(formDirty, (value) => emit("form-dirty-change", value), { immediate: true });
+watch(
+  () => [models.value.map((model) => model.id).join(","), browserDiscoveryTimeoutDefault(props.config)],
+  () => {
+    if (!formDirty.value) resetCreateForm();
+  },
+);
+defineExpose({ focusCreateForm, markCreateFormSubmitted, resetCreateForm });
 </script>
 
 <style scoped>
 .browser-discovery-panel { display: grid; gap: 10px; margin-bottom: 16px; }
-.source-actions, .discovery-toolbar, .task-detail-header, .task-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.discovery-toolbar, .task-detail-header, .task-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .discovery-toolbar { justify-content: space-between; }
 .task-url { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-detail { display: grid; gap: 12px; }
@@ -145,5 +163,6 @@ watch(recordGroups, (groups) => { selectedRecordIds.value = selectedRecordIds.va
 .record-sample { width: 100%; }
 .sample-select { width: 100%; }
 .record-sample pre { max-height: 220px; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.create-card { display: grid; gap: 12px; }
 .create-form { margin-top: 16px; }
 </style>

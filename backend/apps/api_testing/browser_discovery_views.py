@@ -22,7 +22,7 @@ from .browser_discovery import (
 )
 from .models import APISpecification, BrowserDiscoveryTask
 from .serializers import BrowserDiscoveryCreateSerializer, BrowserDiscoveryHandoffSerializer, BrowserDiscoveryRecordSerializer
-from .workspace_service import WorkspaceConflict, WorkspaceValidationError, can_edit_project, can_execute_project, validate_model_id
+from .workspace_service import WorkspaceConflict, WorkspaceValidationError, can_edit_project, can_execute_project, validate_model_id, workspace_source
 
 logger = logging.getLogger(__name__)
 
@@ -217,10 +217,15 @@ class BrowserDiscoveryHandoffView(APIView):
                 if not can_execute_project(task.project, request.user):
                     raise PermissionError('没有权限交接此项目的浏览器探索。')
                 handoff, created = handoff_to_workspace(task=task, owner=request.user, **serializer.validated_data)
+            source_type, source_name, source_task_id = workspace_source(handoff.workspace)
             data = {
                 'spec': {'id': handoff.spec_id, 'spec_type': APISpecification.SpecType.BROWSER_CAPTURE},
                 'endpoint_ids': handoff.workspace.endpoint_ids,
-                'workspace': {'id': handoff.workspace_id, 'status': handoff.workspace.status},
+                'workspace': {
+                    'id': handoff.workspace_id, 'status': handoff.workspace.status,
+                    'source_type': source_type, 'source_name': source_name,
+                    'source_task_id': source_task_id,
+                },
                 'selection_key': handoff.selection_hash,
             }
             return response(kind='success', data=data, message='浏览器探索来源已交接工作区', status_code=201 if created else 200)

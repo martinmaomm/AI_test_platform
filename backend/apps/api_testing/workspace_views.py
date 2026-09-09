@@ -11,6 +11,7 @@ from copy import deepcopy
 from typing import Any
 
 from django.db import transaction
+from django.db.models import Prefetch, Q
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework.permissions import IsAuthenticated
@@ -18,7 +19,7 @@ from rest_framework.views import APIView
 
 from common.api import response
 from projects.models import Environment, Project
-from .models import APITestCase, APIWorkspace, default_api_workspace_draft
+from .models import APITestCase, APIWorkspace, APISpecification, default_api_workspace_draft
 from .workspace_service import (
     WorkspaceConflict, WorkspaceValidationError, _UNSET, append_message,
     can_edit_project, can_execute_project, create_or_update_case, endpoint_specs, expire_stalled_workspace,
@@ -33,6 +34,17 @@ from .workspace_verification import require_target_url
 
 def _problem(exc: Exception, status_code: int = 400):
     return response(kind='error', message=str(exc), status_code=status_code)
+
+
+def _draft_endpoint_ids(draft: dict[str, Any]) -> list[int]:
+    """Keep a saved case's ordered endpoint scope without trusting arbitrary metadata."""
+    endpoint_ids: list[int] = []
+    for step in draft.get('teststeps', []):
+        endpoint_id = step.get('endpoint_id') if isinstance(step, dict) else None
+        if isinstance(endpoint_id, int) and not isinstance(endpoint_id, bool) and endpoint_id > 0:
+            if endpoint_id not in endpoint_ids:
+                endpoint_ids.append(endpoint_id)
+    return endpoint_ids
 
 
 def _project_or_denied(project_id: int, user) -> Project:
@@ -161,11 +173,30 @@ class APIWorkspaceCollectionView(APIView):
     def get(self, request, project_id):
         try:
             _project_or_denied(project_id, request.user)
+            source_type = request.query_params.get('source_type')
+            if source_type not in {None, 'document', 'browser_capture'}:
+                raise WorkspaceValidationError('source_type 仅支持 document 或 browser_capture。')
         except PermissionError as exc:
             return _problem(exc, 403)
+        except WorkspaceValidationError as exc:
+            return _problem(exc)
+        workspaces = APIWorkspace.objects.filter(
+            project_id=project_id, owner=request.user, parent__isnull=True,
+        )
+        if source_type == 'browser_capture':
+            workspaces = workspaces.filter(spec__spec_type=APISpecification.SpecType.BROWSER_CAPTURE)
+        elif source_type == 'document':
+            workspaces = workspaces.filter(
+                Q(spec__isnull=True) | ~Q(spec__spec_type=APISpecification.SpecType.BROWSER_CAPTURE),
+            )
         workspaces = [
             expire_stalled_workspace(item)
-            for item in APIWorkspace.objects.filter(project_id=project_id, owner=request.user, parent__isnull=True).select_related('saved_case')
+            for item in workspaces.select_related('saved_case', 'spec').prefetch_related(
+                Prefetch(
+                    'scenarios',
+                    queryset=APIWorkspace.objects.select_related('saved_case').order_by('scenario_order', 'id'),
+                ),
+            )
         ]
         return response(kind='success', data=[serialize_workspace(item) for item in workspaces], message='获取工作区成功')
 
@@ -178,17 +209,6 @@ class APIWorkspaceCollectionView(APIView):
                 if not isinstance(case_id, int):
                     raise WorkspaceValidationError('case_id 必须是整数。')
                 case = APITestCase.objects.get(pk=case_id, project=project)
-            endpoint_ids = request.data.get('endpoint_ids', [])
-            if not isinstance(endpoint_ids, list):
-                raise WorkspaceValidationError('endpoint_ids 必须是数组。')
-            inferred_spec_id = request.data.get('spec_id')
-            if inferred_spec_id is None:
-                inferred_spec_id = infer_spec_id(project.id, endpoint_ids)
-                if case and case.endpoint_id:
-                    inferred_spec_id = case.endpoint.spec_id
-            spec = validate_spec_id(project.id, inferred_spec_id, owner=request.user)
-            endpoint_specs(project.id, endpoint_ids, spec_id=spec.id if spec else None, owner=request.user)
-            model_id = validate_model_id(request.data.get('model_id'), owner=request.user)
             if case and case.script_content:
                 try:
                     draft = normalize_draft(json.loads(case.script_content))
@@ -196,6 +216,21 @@ class APIWorkspaceCollectionView(APIView):
                     raise WorkspaceValidationError('关联用例的现有脚本无法解析为 requests 用例契约，请重新生成草稿。')
             else:
                 draft = default_api_workspace_draft()
+
+            endpoint_ids_provided = 'endpoint_ids' in request.data
+            endpoint_ids = request.data.get('endpoint_ids', [])
+            if not isinstance(endpoint_ids, list):
+                raise WorkspaceValidationError('endpoint_ids 必须是数组。')
+            if not endpoint_ids_provided and case:
+                endpoint_ids = _draft_endpoint_ids(draft)
+                if not endpoint_ids and case.endpoint_id:
+                    endpoint_ids = [case.endpoint_id]
+            inferred_spec_id = request.data.get('spec_id')
+            if inferred_spec_id is None:
+                inferred_spec_id = infer_spec_id(project.id, endpoint_ids)
+            spec = validate_spec_id(project.id, inferred_spec_id, owner=request.user)
+            endpoint_specs(project.id, endpoint_ids, spec_id=spec.id if spec else None, owner=request.user)
+            model_id = validate_model_id(request.data.get('model_id'), owner=request.user)
             workspace = APIWorkspace.objects.create(
                 project=project, owner=request.user, saved_case=case,
                 saved_case_updated_at=case.updated_at if case else None,

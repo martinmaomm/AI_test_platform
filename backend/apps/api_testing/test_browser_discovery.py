@@ -14,7 +14,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from ai_core.models import LLMConfiguration
 from projects.models import Project, ProjectMember
 from .browser_discovery import _response_scalar_values, expire_stale_discovery, handoff_to_workspace, ingest_trace, task_trace_file
-from .browser_discovery_views import BrowserDiscoveryCollectionView
+from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryHandoffView
 from .models import APIEndpoint, APISpecification, APIWorkspace, BrowserDiscoveryRecord, BrowserDiscoveryTask, default_api_workspace_draft
 from .tasks import _claim_browser_discovery, _finish_browser_discovery
 from .workspace_service import endpoint_specs, generation_endpoint_specs
@@ -89,6 +89,16 @@ class BrowserDiscoveryContractsTests(TestCase):
             self.assertTrue(created)
             self.assertEqual(handoff.workspace.messages[0]['content'], task.description)
             self.assertEqual(handoff.workspace.draft['config']['base_url'], task.api_origin)
+            request = self.factory.post('/', {
+                'version': task.version, 'record_ids': [records[0].id, records[1].id],
+            }, format='json')
+            force_authenticate(request, self.owner)
+            repeated = BrowserDiscoveryHandoffView.as_view()(request, project_id=self.project.id, task_id=task.id)
+            self.assertEqual(repeated.status_code, 200, repeated.data)
+            workspace_data = repeated.data['data']['workspace']
+            self.assertEqual(workspace_data['source_type'], 'browser_capture')
+            self.assertEqual(workspace_data['source_name'], handoff.spec.spec_name)
+            self.assertEqual(workspace_data['source_task_id'], str(task.id))
             endpoints = endpoint_specs(self.project.id, handoff.workspace.endpoint_ids, spec_id=handoff.spec_id, owner=self.owner)
             update = next(item for item in endpoints if item['path'] == '/items/item-123')
             browser = update['document_context']['browser_capture']

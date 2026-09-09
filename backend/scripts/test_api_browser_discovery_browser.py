@@ -451,6 +451,8 @@ def verify(origin, fixture, output):
             task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
             delete_dialog = page.locator(".el-message-box:visible")
             expect(delete_dialog).to_be_visible()
+            expect(delete_dialog).to_be_in_viewport()
+            expect(delete_dialog).to_have_css("opacity", "1")
             page.screenshot(path=str(output / "delete-failed-confirmation.png"), full_page=True, animations="disabled")
             delete_dialog.get_by_role("button", name="取消", exact=True).click()
             assert sum(method == "DELETE" for method, _ in requests) == before_delete_count

@@ -14,6 +14,7 @@ from .browser_discovery_views import (
     BrowserDiscoveryConfigView,
     BrowserDiscoveryDetailView,
     BrowserDiscoveryHandoffView,
+    BrowserDiscoveryOriginsView,
     BrowserDiscoveryRecordsView,
 )
 
@@ -26,6 +27,7 @@ urlpatterns = [
     path('browser-discoveries/', BrowserDiscoveryCollectionView.as_view(), name='browser-discovery-list'),
     path('browser-discoveries/<uuid:task_id>/', BrowserDiscoveryDetailView.as_view(), name='browser-discovery-detail'),
     path('browser-discoveries/<uuid:task_id>/records/', BrowserDiscoveryRecordsView.as_view(), name='browser-discovery-records'),
+    path('browser-discoveries/<uuid:task_id>/origins/', BrowserDiscoveryOriginsView.as_view(), name='browser-discovery-origins'),
     path('browser-discoveries/<uuid:task_id>/cancel/', BrowserDiscoveryCancelView.as_view(), name='browser-discovery-cancel'),
     path('browser-discoveries/<uuid:task_id>/handoff/', BrowserDiscoveryHandoffView.as_view(), name='browser-discovery-handoff'),
     # 模块管理（端点测试用例页面的模块排序）

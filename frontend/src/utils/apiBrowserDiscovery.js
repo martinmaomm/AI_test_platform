@@ -102,6 +102,154 @@ export const browserDiscoveryFormSnapshot = (form) =>
 export const isBrowserDiscoveryActive = (task) =>
   ["queued", "running", "finalizing"].includes(task?.status);
 
+export const browserDiscoveryBecameTerminal = (previousTask, nextTask) => {
+  if (!isBrowserDiscoveryActive(previousTask)) return false;
+  if (
+    previousTask?.id != null &&
+    nextTask?.id != null &&
+    String(previousTask.id) !== String(nextTask.id)
+  )
+    return false;
+  return ["completed", "partial", "failed", "cancelled"].includes(
+    nextTask?.status,
+  );
+};
+
+const originResolutionStates = new Set([
+  "detecting",
+  "resolved",
+  "awaiting_confirmation",
+  "awaiting_selection",
+]);
+
+const uniqueOrigins = (values) => [
+  ...new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  ),
+];
+
+export const browserDiscoveryOriginResolution = (task) => {
+  const raw = task?.origin_resolution;
+  const hasProtocol = raw && typeof raw === "object" && !Array.isArray(raw);
+  const mode = raw?.mode === "manual" ? "manual" : "auto";
+  const origins = uniqueOrigins(raw?.origins);
+  const pending = (Array.isArray(raw?.pending) ? raw.pending : [])
+    .map((candidate) => ({
+      origin: String(candidate?.origin || "").trim(),
+      method: String(candidate?.method || "").trim().toUpperCase(),
+      path: String(candidate?.path || "").trim(),
+    }))
+    .filter((candidate) => candidate.origin && candidate.method && candidate.path);
+  const selectedOrigin = String(raw?.selected_origin || "").trim() || null;
+  const state = originResolutionStates.has(raw?.state)
+    ? raw.state
+    : mode === "manual" || origins.length
+      ? "resolved"
+      : "detecting";
+  return {
+    hasProtocol,
+    mode,
+    state,
+    origins,
+    pending,
+    selectedOrigin,
+    canConfirm: raw?.can_confirm === true,
+  };
+};
+
+export const browserDiscoveryOriginStateLabel = (task) => {
+  const resolution = browserDiscoveryOriginResolution(task);
+  const terminal = ["completed", "partial", "failed", "cancelled"].includes(
+    task?.status,
+  );
+  return (
+    {
+      detecting: terminal
+        ? resolution.origins.length
+          ? "未确认接口来源"
+          : "未发现接口来源"
+        : "正在自动识别接口来源",
+      resolved: resolution.mode === "manual" ? "使用手动接口来源" : "接口来源已识别",
+      awaiting_confirmation: "等待确认跨主机请求",
+      awaiting_selection: "已采集多个来源，等待选择主来源",
+    }[resolution.state] || "来源状态未知"
+  );
+};
+
+export const browserDiscoveryOriginSummary = (task) => {
+  const resolution = browserDiscoveryOriginResolution(task);
+  const terminal = ["completed", "partial", "failed", "cancelled"].includes(
+    task?.status,
+  );
+  if (resolution.mode === "manual") return task?.api_origin || "手动接口来源";
+  if (resolution.state === "awaiting_confirmation")
+    return `待确认：${resolution.pending[0]?.origin || "跨主机接口来源"}`;
+  if (resolution.state === "awaiting_selection")
+    return `待选择：${resolution.origins.length} 个来源`;
+  if (resolution.selectedOrigin) return `已识别：${resolution.selectedOrigin}`;
+  if (terminal && resolution.state === "detecting")
+    return resolution.origins.length ? "未确认接口来源" : "未发现接口来源";
+  if (resolution.origins.length === 1) return `已识别：${resolution.origins[0]}`;
+  if (resolution.origins.length > 1) return `已识别：${resolution.origins.length} 个来源`;
+  if (terminal) return "未发现接口来源";
+  return "正在自动识别";
+};
+
+export const browserDiscoveryEvidenceCounts = (task) => {
+  const summary = task?.evidence_summary && typeof task.evidence_summary === "object"
+    ? task.evidence_summary
+    : {};
+  const count = (value) => {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+  };
+  return {
+    collected: count(summary.records ?? task?.records_count),
+    usable: count(summary.usable ?? task?.eligible_records_count),
+  };
+};
+
+export const browserDiscoveryErrorCategory = (task) => {
+  const resolution = browserDiscoveryOriginResolution(task);
+  if (resolution.state === "awaiting_confirmation") return "等待来源确认";
+  if (resolution.state === "awaiting_selection") return "多来源待选";
+  const code = String(task?.error_code || "").trim();
+  if (!code) return "无";
+  if (["no_records", "no_usable_records"].includes(code)) return "未采集到有效接口证据";
+  if (code === "capture_incomplete") return "证据采集不完整";
+  if (["TOTAL_TIMEOUT", "timeout"].includes(code)) return "探索超时";
+  if (["CANCELLED", "cancelled"].includes(code)) return "已取消";
+  return `任务异常：${code}`;
+};
+
+export const canConfirmBrowserDiscoveryOrigin = (task) => {
+  const resolution = browserDiscoveryOriginResolution(task);
+  return (
+    isBrowserDiscoveryActive(task) &&
+    resolution.state === "awaiting_confirmation" &&
+    resolution.canConfirm &&
+    resolution.pending.length > 0
+  );
+};
+
+export const canSelectBrowserDiscoveryOrigin = (task, origin) => {
+  const resolution = browserDiscoveryOriginResolution(task);
+  return (
+    ["completed", "partial"].includes(task?.status) &&
+    resolution.state === "awaiting_selection" &&
+    resolution.origins.includes(String(origin || "").trim())
+  );
+};
+
+export const canHandoffBrowserDiscovery = (task) => {
+  if (!["completed", "partial"].includes(task?.status)) return false;
+  const resolution = browserDiscoveryOriginResolution(task);
+  if (!resolution.hasProtocol || resolution.mode === "manual") return true;
+  return resolution.state === "resolved" && Boolean(resolution.selectedOrigin);
+};
+
 export const browserDiscoveryStatusMeta = (status) =>
   ({
     queued: { label: "已排队", type: "info" },

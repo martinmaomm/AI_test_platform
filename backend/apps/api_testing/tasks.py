@@ -72,7 +72,7 @@ def _claim_browser_discovery(discovery_id: str, version: int, task_id: str):
 
 def _browser_discovery_checkpoint(discovery_id: str, version: int, task_id: str, payload: dict) -> bool:
     """Persist a bounded heartbeat and safely tell the async runner to stop."""
-    from .browser_discovery import ingest_trace
+    from .browser_discovery import ingest_trace, origin_resolution, sync_auto_origin
     from .models import BrowserDiscoveryTask
 
     with transaction.atomic():
@@ -81,6 +81,8 @@ def _browser_discovery_checkpoint(discovery_id: str, version: int, task_id: str,
             return False
         if task.status not in {BrowserDiscoveryTask.Status.RUNNING, BrowserDiscoveryTask.Status.FINALIZING} or task.cancellation_requested:
             return False
+        state = sync_auto_origin(task)
+        resolution = origin_resolution(task, state=state)
         payload = payload if isinstance(payload, dict) else {}
         elapsed = payload.get('elapsed_seconds')
         if isinstance(elapsed, (int, float)) and elapsed > task.exploration_timeout_seconds:
@@ -88,7 +90,10 @@ def _browser_discovery_checkpoint(discovery_id: str, version: int, task_id: str,
             task.error_code = 'timeout'
             task.save(update_fields=['current_action', 'error_code', 'updated_at'])
             return False
-        task.current_action = str(payload.get('current_action') or payload.get('phase') or '正在探索')[:500]
+        task.current_action = (
+            '正在等待确认跨来源请求' if resolution['state'] == 'awaiting_confirmation'
+            else str(payload.get('current_action') or payload.get('phase') or '正在探索')[:500]
+        )
         task.tool_calls = min(int(payload.get('tool_calls') or 0), int(task.limits.get('max_tool_calls', 100)))
         task.model_calls = min(int(payload.get('model_calls') or 0), int(task.limits.get('max_model_steps', 100)))
         task.heartbeat_at = timezone.now()
@@ -110,8 +115,21 @@ def _browser_discovery_cancelled(discovery_id: str, version: int, task_id: str) 
     ).exists()
 
 
+def _browser_discovery_origin_pending(discovery_id: str, version: int, task_id: str) -> bool:
+    """The agent gate reads only task-scoped, credential-free Node state."""
+    from .browser_discovery import read_origin_state
+    from .models import BrowserDiscoveryTask
+
+    task = BrowserDiscoveryTask.objects.filter(
+        pk=discovery_id, version=version, task_id=task_id,
+        status__in=[BrowserDiscoveryTask.Status.RUNNING, BrowserDiscoveryTask.Status.FINALIZING],
+        cancellation_requested=False,
+    ).first()
+    return bool(task and read_origin_state(task)['pending'])
+
+
 def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, result: dict, *, exception: Exception | None = None):
-    from .browser_discovery import evidence_statistics, ingest_trace
+    from .browser_discovery import evidence_statistics, ingest_trace, sync_auto_origin
     from .models import BrowserDiscoveryTask
 
     with transaction.atomic():
@@ -136,6 +154,7 @@ def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, res
             return None
         if task.status not in {BrowserDiscoveryTask.Status.RUNNING, BrowserDiscoveryTask.Status.FINALIZING}:
             return task
+        sync_auto_origin(task)
         evidence = evidence_statistics(task, ingest_result=ingest_result)
         records_count = evidence['records']
         completed = bool(result.get('completed')) if isinstance(result, dict) else False
@@ -153,9 +172,9 @@ def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, res
             evidence[key] for key in ('incomplete', 'pending', 'invalid_lines', 'over_limit', 'truncated')
         ):
             status = BrowserDiscoveryTask.Status.COMPLETED
-        elif evidence['usable']:
+        elif evidence['usable'] or evidence['resolved_records']:
             status = BrowserDiscoveryTask.Status.PARTIAL
-            error_code = error_code or 'capture_incomplete'
+            error_code = error_code or ('capture_incomplete' if evidence['usable'] else '')
         else:
             status = BrowserDiscoveryTask.Status.FAILED
             error_code = error_code or ('no_usable_records' if records_count else 'no_records')
@@ -208,6 +227,7 @@ def run_browser_discovery_async(self, discovery_id: str, version: int, task_id: 
             capture_limits=capture_limits,
             checkpoint=lambda payload: _browser_discovery_checkpoint(discovery_id, version, task_id, payload),
             is_cancelled=lambda: _browser_discovery_cancelled(discovery_id, version, task_id),
+            origin_pending=lambda: _browser_discovery_origin_pending(discovery_id, version, task_id),
         ))
         if not isinstance(result, dict):
             raise ValueError('浏览器探索 runner 返回格式无效。')

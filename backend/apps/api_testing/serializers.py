@@ -96,6 +96,17 @@ class BrowserDiscoveryHandoffSerializer(serializers.Serializer):
         return value
 
 
+class BrowserDiscoveryOriginDecisionSerializer(serializers.Serializer):
+    version = serializers.IntegerField(min_value=1)
+    origin = serializers.CharField(trim_whitespace=True, max_length=500)
+    decision = serializers.ChoiceField(choices=('approve', 'reject', 'select'))
+
+    def validate_origin(self, value):
+        if not value:
+            raise serializers.ValidationError('origin 不能为空。')
+        return value
+
+
 class APISpecificationCreateSerializer(serializers.ModelSerializer):
     """API规范创建序列化器"""
     

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from collections import defaultdict
 from copy import deepcopy
 from datetime import timedelta
@@ -40,6 +41,9 @@ _SENSITIVE_KEY = re.compile(r'(?:authorization|cookie|token|secret|password|api[
 _SAFE_HEADER = {'content-type', 'accept'}
 _SUPPORTED_REQUEST_TYPES = {'application/json', 'application/x-www-form-urlencoded'}
 _STATIC_RESOURCE_TYPES = {'stylesheet', 'image', 'font', 'media', 'manifest'}
+_ORIGIN_STATE_MAX_BYTES = 64 * 1024
+_ORIGIN_MAX_ITEMS = 32
+_PENDING_ORIGIN_MAX_ITEMS = 16
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -118,6 +122,199 @@ def task_trace_file(task: BrowserDiscoveryTask) -> Path:
     # protocol_version=1 from the Node collector; actions.jsonl remains a
     # separate non-value-bearing action log and is never parsed as evidence.
     return task_trace_dir(task) / 'network.jsonl'
+
+
+def origin_state_file(task: BrowserDiscoveryTask) -> Path:
+    return task_trace_dir(task) / 'origin-state.json'
+
+
+def origin_control_file(task: BrowserDiscoveryTask) -> Path:
+    return task_trace_dir(task) / 'origin-control.json'
+
+
+def _origin_mode(task: BrowserDiscoveryTask) -> str:
+    return 'auto' if isinstance(task.limits, dict) and task.limits.get('origin_mode') == 'auto' else 'manual'
+
+
+def _safe_origin(value: Any) -> str:
+    try:
+        return normalize_http_url(value, label='origin', origin_only=True)
+    except WorkspaceValidationError:
+        return ''
+
+
+def _safe_pending(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    origin = _safe_origin(value.get('origin'))
+    method = str(value.get('method') or '').upper()
+    path = str(value.get('path') or '')
+    if not origin or not re.fullmatch(r'[A-Z]{1,10}', method) or not path.startswith('/') or '?' in path or '#' in path:
+        return None
+    return {'origin': origin, 'method': method, 'path': path[:1000]}
+
+
+def read_origin_state(task: BrowserDiscoveryTask) -> dict[str, Any]:
+    """Read only the bounded, credential-free collector state projection."""
+    defaults = {'version': 1, 'resolved_origins': [], 'pending': [], 'rejected_origins': []}
+    path = origin_state_file(task)
+    try:
+        if not path.is_file() or path.stat().st_size > _ORIGIN_STATE_MAX_BYTES:
+            return defaults
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, TypeError, ValueError):
+        return defaults
+    if not isinstance(value, dict) or value.get('version') != 1:
+        return defaults
+    def origins(key: str) -> list[str]:
+        result = []
+        for item in value.get(key, []) if isinstance(value.get(key), list) else []:
+            origin = _safe_origin(item)
+            if origin and origin not in result:
+                result.append(origin)
+            if len(result) >= _ORIGIN_MAX_ITEMS:
+                break
+        return result
+    resolved = origins('resolved_origins')
+    rejected = origins('rejected_origins')
+    pending = []
+    for item in value.get('pending', []) if isinstance(value.get('pending'), list) else []:
+        safe = _safe_pending(item)
+        if safe and safe['origin'] not in rejected and safe not in pending:
+            pending.append(safe)
+        if len(pending) >= _PENDING_ORIGIN_MAX_ITEMS:
+            break
+    return {'version': 1, 'resolved_origins': resolved, 'pending': pending, 'rejected_origins': rejected}
+
+
+def _read_origin_control(task: BrowserDiscoveryTask) -> dict[str, Any]:
+    defaults = {'version': 1, 'approved_origins': [], 'rejected_origins': [], 'cancelled': False}
+    path = origin_control_file(task)
+    try:
+        if not path.is_file() or path.stat().st_size > _ORIGIN_STATE_MAX_BYTES:
+            return defaults
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, TypeError, ValueError):
+        return defaults
+    if not isinstance(value, dict) or value.get('version') != 1:
+        return defaults
+    for key in ('approved_origins', 'rejected_origins'):
+        items = []
+        for item in value.get(key, []) if isinstance(value.get(key), list) else []:
+            origin = _safe_origin(item)
+            if origin and origin not in items:
+                items.append(origin)
+            if len(items) >= _ORIGIN_MAX_ITEMS:
+                break
+        defaults[key] = items
+    defaults['cancelled'] = bool(value.get('cancelled'))
+    return defaults
+
+
+def write_origin_control(task: BrowserDiscoveryTask, control: dict[str, Any]) -> None:
+    """Publish a complete control document with replace semantics for Node polling."""
+    payload = {
+        'version': 1,
+        'approved_origins': list(control.get('approved_origins') or [])[:_ORIGIN_MAX_ITEMS],
+        'rejected_origins': list(control.get('rejected_origins') or [])[:_ORIGIN_MAX_ITEMS],
+        'cancelled': bool(control.get('cancelled')),
+    }
+    path = origin_control_file(task)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix='.origin-control-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            json.dump(payload, stream, ensure_ascii=False, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def sync_auto_origin(task: BrowserDiscoveryTask, *, save: bool = True) -> dict[str, Any]:
+    """Only a sole collector-resolved auto origin becomes the current base URL."""
+    state = read_origin_state(task)
+    if _origin_mode(task) != 'auto':
+        return state
+    resolved = state['resolved_origins']
+    persisted = _safe_origin((task.limits or {}).get('selected_origin'))
+    # A terminal user choice must outlive later checkpoints/ingestion.  It is
+    # accepted only through the endpoint after collector resolution, then
+    # retained even if the state file is no longer readable during finalizing.
+    selected = persisted or (resolved[0] if len(resolved) == 1 else '')
+    if task.api_origin != selected:
+        task.api_origin = selected
+        if save:
+            task.save(update_fields=['api_origin', 'updated_at'])
+        _refresh_selected_record_eligibility(task)
+    return state
+
+
+def _refresh_selected_record_eligibility(task: BrowserDiscoveryTask) -> None:
+    """A terminal source choice changes only this task's redacted eligibility view."""
+    records = BrowserDiscoveryRecord.objects.filter(task=task)
+    for record in records:
+        summary = record.public_summary if isinstance(record.public_summary, dict) else {}
+        eligible = bool(
+            task.api_origin and record.origin == task.api_origin and summary.get('source_authorized') is True
+            and summary.get('capture_complete') is True and record.method and record.path
+            and record.resource_type not in _STATIC_RESOURCE_TYPES
+            and (not record.content_type or record.content_type in _SUPPORTED_REQUEST_TYPES)
+        )
+        exclusion = record.exclusion_reason
+        if eligible:
+            exclusion = ''
+        elif summary.get('source_authorized') is True and record.origin != task.api_origin:
+            exclusion = 'origin_not_selected'
+        if record.is_eligible != eligible or record.exclusion_reason != exclusion:
+            record.is_eligible = eligible
+            record.exclusion_reason = exclusion
+            record.save(update_fields=['is_eligible', 'exclusion_reason'])
+
+
+def selectable_origins(task: BrowserDiscoveryTask, *, state: dict[str, Any] | None = None) -> list[str]:
+    state = state or read_origin_state(task)
+    resolved = set(state['resolved_origins'])
+    collected = set()
+    for record in BrowserDiscoveryRecord.objects.filter(task=task).only('origin', 'resource_type', 'public_summary'):
+        summary = record.public_summary if isinstance(record.public_summary, dict) else {}
+        if (
+            summary.get('source_authorized') is True and summary.get('capture_complete') is True
+            and record.resource_type not in _STATIC_RESOURCE_TYPES
+        ):
+            collected.add(record.origin)
+    return sorted(resolved & collected)
+
+
+def origin_resolution(task: BrowserDiscoveryTask, *, state: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = state or read_origin_state(task)
+    active = task.status in {BrowserDiscoveryTask.Status.RUNNING, BrowserDiscoveryTask.Status.FINALIZING} and not task.cancellation_requested
+    mode = _origin_mode(task)
+    pending = state['pending'] if active and mode == 'auto' else []
+    selectable = selectable_origins(task, state=state) if mode == 'auto' else []
+    if mode == 'manual':
+        resolution_state = 'resolved' if task.api_origin else 'detecting'
+        origins = [task.api_origin] if task.api_origin else []
+    elif pending:
+        resolution_state = 'awaiting_confirmation'
+        origins = state['resolved_origins']
+    elif task.status in {BrowserDiscoveryTask.Status.COMPLETED, BrowserDiscoveryTask.Status.PARTIAL} and not task.api_origin and len(state['resolved_origins']) > 1:
+        resolution_state = 'awaiting_selection'
+        origins = selectable
+    elif task.api_origin:
+        resolution_state = 'resolved'
+        origins = state['resolved_origins'] or [task.api_origin]
+    else:
+        resolution_state = 'detecting'
+        origins = state['resolved_origins']
+    return {
+        'mode': mode, 'state': resolution_state, 'origins': origins,
+        'pending': pending, 'selected_origin': task.api_origin or None,
+        'can_confirm': bool(active and pending),
+    }
 
 
 def _redact(value: Any, *, key: str = '') -> Any:
@@ -347,7 +544,10 @@ def _record_parts(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     return request, response
 
 
-def _public_record(task: BrowserDiscoveryTask, raw: dict[str, Any], *, sequence: int, raw_line: int) -> dict[str, Any]:
+def _public_record(
+    task: BrowserDiscoveryTask, raw: dict[str, Any], *, sequence: int, raw_line: int,
+    resolved_origins: set[str] | None = None,
+) -> dict[str, Any]:
     request, response = _record_parts(raw)
     request_url = _lookup(request, 'url', 'request_url')
     parts = urlsplit(request_url) if isinstance(request_url, str) else None
@@ -386,16 +586,20 @@ def _public_record(task: BrowserDiscoveryTask, raw: dict[str, Any], *, sequence:
     excluded_content = str(response.get('reason') or request.get('reason') or '') in {
         'unsupported_content_type', 'binary_content_type', 'streaming_content_type', 'websocket',
     }
-    known_origin = bool(task.api_origin and origin == task.api_origin)
+    if resolved_origins is None:
+        state = read_origin_state(task)
+        resolved_origins = set(state['resolved_origins']) if _origin_mode(task) == 'auto' else {task.api_origin}
+    source_authorized = origin in resolved_origins
+    selected_origin = bool(task.api_origin and origin == task.api_origin)
     eligible = bool(
-        known_origin and method and path and resource_type not in _STATIC_RESOURCE_TYPES
+        source_authorized and selected_origin and method and path and resource_type not in _STATIC_RESOURCE_TYPES
         and (not content_type_base or content_type_base in _SUPPORTED_REQUEST_TYPES)
         and not incomplete
     )
     exclusion = ''
-    if not task.api_origin:
-        exclusion = 'api_origin_unknown'
-    elif not known_origin:
+    if not source_authorized:
+        exclusion = 'origin_not_resolved' if _origin_mode(task) == 'auto' else 'origin_not_selected'
+    elif not selected_origin:
         exclusion = 'origin_not_selected'
     elif resource_type in _STATIC_RESOURCE_TYPES:
         exclusion = 'static_resource'
@@ -424,12 +628,13 @@ def _public_record(task: BrowserDiscoveryTask, raw: dict[str, Any], *, sequence:
         'status_code': status_code,
         'content_type': content_type_base,
         'capture_complete': not incomplete,
+        'source_authorized': source_authorized,
         'capture_reason': str(terminal.get('reason') or '')[:200],
         'association': _redact(request.get('operation_association') or _lookup(raw, 'association', 'action') or {}),
     }
-    # A missing API origin is intentionally metadata-only.  It must not become
-    # an accidental cross-origin source or disclose a query/body sample.
-    if known_origin:
+    # A collector-unresolved origin is intentionally metadata-only.  It must
+    # not disclose a query/body sample just because a trace line names it.
+    if source_authorized:
         request_body_value = request_body.get('body', {}).get('value') if isinstance(request_body.get('body'), dict) else None
         summary['observed_request'] = {
             'query': _pairs(request.get('query'), parts.query if parts else ''),
@@ -464,6 +669,8 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
     defaults = discovery_limits()
     max_bytes = min(int(limits.get('max_total_bytes') or defaults['max_total_bytes']), defaults['max_total_bytes'])
     max_records = min(int(limits.get('max_requests') or defaults['max_requests']), defaults['max_requests'])
+    state = sync_auto_origin(task)
+    resolved_origins = set(state['resolved_origins']) if _origin_mode(task) == 'auto' else {task.api_origin}
     existing = set(BrowserDiscoveryRecord.objects.filter(task=task).values_list('sequence', flat=True))
     pending: dict[str, dict[str, Any]] = {}
     rows, invalid, total_lines, over_limit, consumed = [], 0, 0, 0, 0
@@ -494,7 +701,7 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
                 continue
             event = payload.get('event')
             request_id = payload.get('request_id')
-            if event == 'capture_started':
+            if event in {'capture_started', 'origin_resolved', 'origin_pending', 'origin_rejected'}:
                 continue
             if event == 'capture_limit':
                 over_limit += 1
@@ -531,11 +738,14 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
                 over_limit += 1
                 pending.pop(request_id, None)
                 continue
-            rows.append(BrowserDiscoveryRecord(**_public_record(task, item, sequence=sequence, raw_line=item['request_line'])))
+            rows.append(BrowserDiscoveryRecord(**_public_record(
+                task, item, sequence=sequence, raw_line=item['request_line'], resolved_origins=resolved_origins,
+            )))
             pending.pop(request_id, None)
     if rows:
         BrowserDiscoveryRecord.objects.bulk_create(rows, ignore_conflicts=True)
         _refresh_dependency_candidates(task)
+    _refresh_selected_record_eligibility(task)
     count = BrowserDiscoveryRecord.objects.filter(task=task).count()
     BrowserDiscoveryTask.objects.filter(pk=task.pk).update(request_count=count)
     return {
@@ -546,18 +756,32 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
 
 def evidence_statistics(task: BrowserDiscoveryTask, *, ingest_result: dict[str, int] | None = None) -> dict[str, int]:
     """Separate usable evidence from deliberately excluded/incomplete events."""
-    records = list(BrowserDiscoveryRecord.objects.filter(task=task).only('is_eligible', 'exclusion_reason', 'public_summary'))
+    records = list(BrowserDiscoveryRecord.objects.filter(task=task).only('origin', 'is_eligible', 'exclusion_reason', 'public_summary'))
     eligible = sum(1 for record in records if record.is_eligible)
-    incomplete_reasons = {'capture_incomplete', 'api_origin_unknown', 'invalid_request_metadata'}
+    resolved_records = sum(
+        1 for record in records
+        if isinstance(record.public_summary, dict) and record.public_summary.get('source_authorized') is True
+    )
+    def relevant(record: BrowserDiscoveryRecord) -> bool:
+        summary = record.public_summary if isinstance(record.public_summary, dict) else {}
+        if summary.get('source_authorized') is True:
+            return record.origin == task.api_origin
+        # Pre-auto-mode/manual records have no source marker.  Preserve their
+        # established completeness semantics rather than treating them as a
+        # new cross-origin source.
+        return _origin_mode(task) == 'manual'
+
+    incomplete_reasons = {'capture_incomplete', 'invalid_request_metadata'}
     incomplete = sum(
         1 for record in records
-        if record.exclusion_reason in incomplete_reasons
+        if relevant(record) and record.exclusion_reason in incomplete_reasons
         or (isinstance(record.public_summary, dict) and record.public_summary.get('capture_complete') is False
+            and relevant(record)
             and record.exclusion_reason not in {'static_resource', 'unsupported_content_type', 'origin_not_selected'})
     )
     values = ingest_result or {}
     return {
-        'records': len(records), 'usable': eligible, 'excluded': len(records) - eligible,
+        'records': len(records), 'usable': eligible, 'resolved_records': resolved_records, 'excluded': len(records) - eligible,
         'incomplete': incomplete, 'pending': int(values.get('pending') or 0),
         'invalid_lines': int(values.get('invalid') or 0), 'over_limit': int(values.get('over_limit') or 0),
         'truncated': int(values.get('truncated') or 0),
@@ -644,6 +868,7 @@ def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
         'tool_calls': task.tool_calls, 'model_calls': task.model_calls, 'request_count': task.request_count,
         'summary': task.summary, 'error_code': task.error_code, 'error_message': task.error_message,
         'evidence_summary': deepcopy(task.evidence_summary) if isinstance(task.evidence_summary, dict) else {},
+        'origin_resolution': origin_resolution(task),
         'source_version': task.source_version, 'records_count': counts['records_count'],
         'eligible_records_count': counts['eligible_records_count'],
         'started_at': task.started_at.isoformat() if task.started_at else None,
@@ -658,6 +883,8 @@ def _selection(task: BrowserDiscoveryTask, record_ids: list[int]) -> tuple[list[
     records = list(BrowserDiscoveryRecord.objects.filter(task=task, id__in=record_ids, is_eligible=True).order_by('sequence'))
     if len(records) != len(record_ids):
         raise WorkspaceValidationError('所选记录必须全部属于当前任务且为完整、已确认 origin 的可生成证据。')
+    if any(record.origin and record.origin != task.api_origin for record in records):
+        raise WorkspaceValidationError('工作区只能交接已选择主接口来源的记录，不能混合不同 origin。')
     by_id = {record.id: record for record in records}
     pending = list(records)
     while pending:
@@ -666,12 +893,12 @@ def _selection(task: BrowserDiscoveryTask, record_ids: list[int]) -> tuple[list[
         missing_ids = [value for value in dependency_ids if value not in by_id]
         if not missing_ids:
             continue
-        dependencies = list(BrowserDiscoveryRecord.objects.filter(
-            task=task, id__in=missing_ids, is_eligible=True,
-        ).order_by('sequence'))
+        dependencies = list(BrowserDiscoveryRecord.objects.filter(task=task, id__in=missing_ids, is_eligible=True).order_by('sequence'))
         if len(dependencies) != len(missing_ids):
             raise WorkspaceValidationError('所选记录包含不可用的依赖候选，不能生成可独立运行的工作区。')
         for dependency in dependencies:
+            if dependency.origin and dependency.origin != task.api_origin:
+                raise WorkspaceValidationError('所选记录依赖其他 origin，当前单 base URL 工作区不能假装为完整跨源流程。')
             if dependency.id not in by_id:
                 by_id[dependency.id] = dependency
                 pending.append(dependency)
@@ -768,6 +995,8 @@ def handoff_to_workspace(*, task: BrowserDiscoveryTask, owner, version: int, rec
         raise WorkspaceValidationError('仅已结束且有证据的探索任务可以交接工作区。')
     if not task.api_origin:
         raise WorkspaceValidationError('未确认 api_origin 的记录不能交接为可执行 API 资产。')
+    if origin_resolution(task)['state'] == 'awaiting_selection':
+        raise WorkspaceValidationError('多个已采集来源尚未选择本次工作区的主接口来源，不能混合交接。')
     if not can_edit_project(task.project, owner) or not can_execute_project(task.project, owner):
         raise PermissionError('没有权限探索或交接此项目。')
     selected, selection_hash = _selection(task, record_ids)

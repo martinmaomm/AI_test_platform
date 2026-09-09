@@ -102,7 +102,7 @@ def main():
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
     output = BACKEND / 'logs' / 'api-browser-discovery-e2e'
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='automation-browser-discovery-e2e-') as temp, running_fixture() as site, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-browser-discovery-e2e-') as temp, running_fixture(split_api=True) as site, patch.object(
         socket.socket, 'connect', loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, 'connect_ex', loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(temp))
@@ -131,20 +131,27 @@ def main():
         }}}))
         task = BrowserDiscoveryTask.objects.create(
             owner=owner, project_id=fixture['project_id'], model_id=fixture['model_id'],
-            target_url=site.origin + '/app?tenant=fixture#/items', api_origin=site.origin,
+            target_url=site.origin + '/app?tenant=fixture#/items', api_origin='',
             description='使用 fixture-user / fixture-password 登录，探索物品新增、修改、删除和精确查询，只操作本轮数据。',
-            allow_test_data_writes=True, exploration_timeout_seconds=120, limits=discovery_limits(),
+            allow_test_data_writes=True, exploration_timeout_seconds=120, limits={**discovery_limits(), 'origin_mode': 'auto'},
             task_id=str(__import__('uuid').uuid4()),
         )
         manager = SimpleNamespace(current_llm=scripted_model(site.origin))
         with patch('ai_core.model_manager.get_llm_manager', return_value=manager):
             run_browser_discovery_async.run(str(task.id), task.version, task.task_id)
         task.refresh_from_db()
-        assert task.status in {'completed', 'partial'}, (task.status, task.error_code, task.error_message)
+        assert task.status == 'completed', (task.status, task.error_code, task.error_message, task.evidence_summary)
+        assert task.api_origin == site.api_origin, ('automatic origin resolution failed', task.api_origin)
         records = list(task.records.filter(is_eligible=True).order_by('sequence'))
         assert records, 'No eligible real browser records'
         assert any(record.path == '/api/login' for record in records)
         assert any(record.method == 'PATCH' for record in records)
+        traffic = [json.loads(line) for line in task_trace_file(task).read_text().splitlines()]
+        login = next(row for row in traffic if row.get('event') == 'request' and row.get('path') == '/api/login')
+        login_body = next(row for row in traffic if row.get('event') == 'request_body' and row.get('request_id') == login['request_id'])
+        login_response = next(row for row in traffic if row.get('event') == 'response' and row.get('request_id') == login['request_id'])
+        assert login_body['body']['value']['username'] == 'fixture-user'
+        assert login_response['body']['value']['data']['token']
         assert not site.items, 'Browser exploration left fixture data'
         assert sum(item['path'] == '/api/login' for item in site.ledger) == 1, 'Capture replayed the login'
         capture_ledger_length = len(site.ledger)
@@ -156,14 +163,14 @@ def main():
         assert created and not repeated and handoff.pk == again.pk
         workspace = APIWorkspace.objects.get(pk=handoff.workspace_id)
         endpoints = endpoint_specs(workspace.project_id, workspace.endpoint_ids, spec_id=workspace.spec_id)
-        candidate = case_for(endpoints, site.origin)
+        candidate = case_for(endpoints, site.api_origin)
         assert not APITestCase.objects.exists(), 'Handoff saved a formal case without adoption'
         assert len(site.ledger) == capture_ledger_length, 'Handoff executed an API request'
         # The generation stage is deterministic in this harness, but static
         # source validation and the platform requests worker are real.
         site.tokens.clear()
         with patch.object(generate_and_verify_api_workspace, 'apply_async'), transaction.atomic():
-            _queue_pipeline(workspace, revision=workspace.revision, mode='generate', target_url=site.origin,
+            _queue_pipeline(workspace, revision=workspace.revision, mode='generate', target_url=site.api_origin,
                             variables={}, endpoints=endpoints)
         model = SimpleNamespace(stream_invoke=lambda *args, **kwargs: json.dumps(candidate))
         with patch('api_testing.workspace_tasks.get_llm_manager', return_value=model):
@@ -173,7 +180,7 @@ def main():
         accepted = workspace.candidate['draft']
         for index in range(2):
             site.tokens.clear()
-            result = requests_runner(f'fresh-replay-{index}', json.dumps(accepted), options={'allowed_origin': site.origin})
+            result = requests_runner(f'fresh-replay-{index}', json.dumps(accepted), options={'allowed_origin': site.api_origin})
             assert result['success'], result.get('error')
             assert not site.items, 'Independent replay did not remove its own data'
         site.tokens.clear()
@@ -190,6 +197,7 @@ def main():
             'generation_verification': 'passed', 'fresh_session_replays': 2, 'python_export': 'passed',
             'duplicate_delivery': 'ignored', 'handoff_idempotency': 'passed', 'remaining_items': len(site.items),
             'independent_unique_names': len(names), 'trace_file': str(task_trace_file(task)),
+            'auto_origin_cross_port': 'passed', 'first_login_body_and_response': 'captured',
             'scope': 'Real loopback website and MCP; deterministic model; no live provider/NAS/Redis',
         }
         (output / 'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')

@@ -69,11 +69,12 @@ def handler_for(fixture):
             except ValueError:
                 return self.send_json(400, {'code': 400, 'message': 'invalid JSON'})
             if parsed.path in {'/', '/app'}:
+                html = HTML.replace("fetch('/api'+path", "fetch(" + json.dumps(fixture.api_origin + '/api') + "+path")
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.send_header('Content-Length', str(len(HTML.encode())))
+                self.send_header('Content-Length', str(len(html.encode())))
                 self.end_headers()
-                self.wfile.write(HTML.encode())
+                self.wfile.write(html.encode())
                 return
             if not parsed.path.startswith('/api/'):
                 return self.send_json(404, {'code': 404})
@@ -122,20 +123,34 @@ def handler_for(fixture):
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(payload)))
+            self.send_header('Access-Control-Allow-Origin', fixture.origin)
             if cookie:
                 self.send_header('Set-Cookie', cookie)
             self.end_headers()
             self.wfile.write(payload)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header('Access-Control-Allow-Origin', fixture.origin)
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
 
         do_GET = do_POST = do_PATCH = do_DELETE = handle_request
     return Handler
 
 
 @contextmanager
-def running_fixture():
+def running_fixture(*, split_api=False, api_hostname='127.0.0.1'):
     fixture = Fixture()
     server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(fixture))
     fixture.origin = f'http://127.0.0.1:{server.server_port}'
+    api_server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(fixture)) if split_api else None
+    fixture.api_origin = f'http://{api_hostname}:{api_server.server_port}' if api_server else fixture.origin
+    api_thread = threading.Thread(target=api_server.serve_forever, daemon=True) if api_server else None
+    if api_thread:
+        api_thread.start()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -144,3 +159,7 @@ def running_fixture():
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+        if api_server:
+            api_server.shutdown()
+            api_server.server_close()
+            api_thread.join(timeout=3)

@@ -13,8 +13,13 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from ai_core.models import LLMConfiguration
 from projects.models import Project, ProjectMember
-from .browser_discovery import _response_scalar_values, expire_stale_discovery, handoff_to_workspace, ingest_trace, task_trace_file
-from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryHandoffView
+from .browser_discovery import (
+    _selection,
+    _response_scalar_values, expire_stale_discovery, handoff_to_workspace,
+    ingest_trace, origin_control_file, origin_resolution, origin_state_file,
+    read_origin_state, selectable_origins, sync_auto_origin, task_trace_file,
+)
+from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView
 from .models import APIEndpoint, APISpecification, APIWorkspace, BrowserDiscoveryRecord, BrowserDiscoveryTask, default_api_workspace_draft
 from .tasks import _claim_browser_discovery, _finish_browser_discovery
 from .workspace_service import endpoint_specs, generation_endpoint_specs
@@ -265,3 +270,167 @@ class BrowserDiscoveryContractsTests(TestCase):
             result = ingest_trace(task)
             self.assertEqual(result['truncated'], 1)
             self.assertEqual(task.records.count(), 1)
+
+    def test_auto_origin_selection_survives_final_ingest_and_never_mixes_sources(self):
+        with tempfile.TemporaryDirectory() as directory, override_settings(BASE_DIR=directory):
+            task = self.task(
+                api_origin='', status=BrowserDiscoveryTask.Status.PARTIAL,
+                limits={'origin_mode': 'auto', 'max_requests': 500, 'max_body_bytes': 256 * 1024, 'max_total_bytes': 20 * 1024 * 1024},
+                evidence_summary={'usable': 0, 'invalid_lines': 2, 'over_limit': 1, 'truncated': 1, 'pending': 0},
+            )
+            origin_state_file(task).parent.mkdir(parents=True)
+            origin_state_file(task).write_text(json.dumps({
+                'version': 1,
+                'resolved_origins': ['https://one.example.test', 'https://two.example.test'],
+                'pending': [], 'rejected_origins': [],
+            }), encoding='utf-8')
+            for sequence, origin, complete in [
+                (1, 'https://one.example.test', True),
+                (2, 'https://two.example.test', False),
+            ]:
+                BrowserDiscoveryRecord.objects.create(
+                    task=task, sequence=sequence, request_id=str(sequence), origin=origin, method='GET', path='/items',
+                    resource_type='fetch', content_type='application/json', is_eligible=False,
+                    exclusion_reason='origin_not_selected' if complete else 'capture_incomplete',
+                    public_summary={'source_authorized': True, 'capture_complete': complete},
+                )
+            self.assertEqual(origin_resolution(task)['state'], 'awaiting_selection')
+            self.assertEqual(selectable_origins(task), ['https://one.example.test'])
+            # Only the fully captured collector source can be selected, even
+            # though two origins were resolved by Node.
+            request = self.factory.post('/', {
+                'version': task.version, 'origin': 'https://one.example.test', 'decision': 'select',
+            }, format='json')
+            force_authenticate(request, self.owner)
+            reply = BrowserDiscoveryOriginsView.as_view()(request, project_id=self.project.id, task_id=task.id)
+            self.assertEqual(reply.status_code, 200, reply.data)
+            task.refresh_from_db()
+            self.assertEqual(task.api_origin, 'https://one.example.test')
+            self.assertEqual(task.limits['selected_origin'], task.api_origin)
+            self.assertEqual(task.evidence_summary['usable'], 1)
+            self.assertEqual(task.evidence_summary['invalid_lines'], 2)
+            self.assertEqual(task.evidence_summary['over_limit'], 1)
+            self.assertEqual(task.evidence_summary['truncated'], 1)
+            sync_auto_origin(task)
+            task.refresh_from_db()
+            self.assertEqual(task.api_origin, 'https://one.example.test')
+            self.assertEqual(origin_resolution(task)['state'], 'resolved')
+            self.assertTrue(task.records.get(sequence=1).is_eligible)
+            self.assertFalse(task.records.get(sequence=2).is_eligible)
+
+    def test_auto_origin_confirmation_writes_only_bounded_control_for_live_pending_candidate(self):
+        with tempfile.TemporaryDirectory() as directory, override_settings(BASE_DIR=directory):
+            task = self.task(
+                api_origin='', status=BrowserDiscoveryTask.Status.RUNNING,
+                limits={'origin_mode': 'auto', 'max_requests': 500, 'max_body_bytes': 256 * 1024, 'max_total_bytes': 20 * 1024 * 1024},
+            )
+            origin_state_file(task).parent.mkdir(parents=True)
+            origin_state_file(task).write_text(json.dumps({
+                'version': 1, 'resolved_origins': [], 'rejected_origins': [],
+                'pending': [{'origin': 'https://third.example.test', 'method': 'POST', 'path': '/items'}],
+            }), encoding='utf-8')
+            request = self.factory.post('/', {
+                'version': task.version, 'origin': 'https://third.example.test', 'decision': 'approve',
+            }, format='json')
+            force_authenticate(request, self.owner)
+            reply = BrowserDiscoveryOriginsView.as_view()(request, project_id=self.project.id, task_id=task.id)
+            self.assertEqual(reply.status_code, 200, reply.data)
+            control = json.loads(origin_control_file(task).read_text(encoding='utf-8'))
+            self.assertEqual(control, {
+                'version': 1, 'approved_origins': ['https://third.example.test'], 'rejected_origins': [], 'cancelled': False,
+            })
+            self.assertEqual(read_origin_state(task)['pending'][0]['path'], '/items')
+
+    def test_auto_origin_management_events_are_not_invalid_and_complete_when_response_is_captured(self):
+        with tempfile.TemporaryDirectory() as directory, override_settings(BASE_DIR=directory):
+            task = self.task(
+                api_origin='', status=BrowserDiscoveryTask.Status.RUNNING,
+                limits={'origin_mode': 'auto', 'max_requests': 500, 'max_body_bytes': 256 * 1024, 'max_total_bytes': 20 * 1024 * 1024},
+            )
+            origin_state_file(task).parent.mkdir(parents=True)
+            origin_state_file(task).write_text(json.dumps({
+                'version': 1, 'resolved_origins': ['https://shop.example.test'], 'pending': [], 'rejected_origins': [],
+            }), encoding='utf-8')
+            trace = task_trace_file(task)
+            trace.write_text('\n'.join(json.dumps(item) for item in [
+                self.event('origin_resolved', origin='https://shop.example.test'),
+                self.event('origin_pending', origin='https://third.example.test', method='POST', path='/x'),
+                self.event('origin_rejected', origin='https://third.example.test'),
+                self.event('request', request_id='login', request_sequence=1, method='POST', origin='https://shop.example.test',
+                           path='/login', url='https://shop.example.test/login', resource_type='fetch', capture_status='pending'),
+                self.event('request_body', request_id='login', capture_status='captured', body={'kind': 'json', 'value': {'name': 'test'}, 'bytes': 15, 'truncated': False}),
+                self.event('response', request_id='login', status=200, capture_status='captured', body={'kind': 'json', 'value': {'ok': True}, 'bytes': 11, 'truncated': False}),
+            ]) + '\n', encoding='utf-8')
+            result = ingest_trace(task)
+            self.assertEqual(result['invalid'], 0)
+            _finish_browser_discovery(str(task.id), task.version, task.task_id, {'completed': True, 'summary': '完成'})
+            task.refresh_from_db()
+            self.assertEqual(task.status, BrowserDiscoveryTask.Status.COMPLETED)
+            self.assertEqual(task.api_origin, 'https://shop.example.test')
+
+    def test_origin_decision_rejects_owner_and_state_failures_without_writing_control(self):
+        with tempfile.TemporaryDirectory() as directory, override_settings(BASE_DIR=directory):
+            def auto_task(**changes):
+                values = {
+                    'api_origin': '', 'status': BrowserDiscoveryTask.Status.RUNNING,
+                    'limits': {'origin_mode': 'auto', 'max_requests': 500, 'max_body_bytes': 256 * 1024, 'max_total_bytes': 20 * 1024 * 1024},
+                }
+                values.update(changes)
+                task = self.task(**values)
+                origin_state_file(task).parent.mkdir(parents=True)
+                origin_state_file(task).write_text(json.dumps({
+                    'version': 1, 'resolved_origins': [], 'rejected_origins': [],
+                    'pending': [{'origin': 'https://third.example.test', 'method': 'POST', 'path': '/items'}],
+                }), encoding='utf-8')
+                return task
+
+            cases = [
+                ('non_owner', auto_task(), self.other, 1, 'https://third.example.test'),
+                ('wrong_version', auto_task(), self.owner, 99, 'https://third.example.test'),
+                ('terminal', auto_task(status=BrowserDiscoveryTask.Status.PARTIAL), self.owner, 1, 'https://third.example.test'),
+                ('cancelled', auto_task(cancellation_requested=True), self.owner, 1, 'https://third.example.test'),
+                ('not_pending', auto_task(), self.owner, 1, 'https://other.example.test'),
+                ('manual', self.task(api_origin='https://api.example.test', status=BrowserDiscoveryTask.Status.RUNNING), self.owner, 1, 'https://third.example.test'),
+            ]
+            manual = cases[-1][1]
+            origin_state_file(manual).parent.mkdir(parents=True, exist_ok=True)
+            origin_state_file(manual).write_text(json.dumps({
+                'version': 1, 'resolved_origins': [], 'rejected_origins': [],
+                'pending': [{'origin': 'https://third.example.test', 'method': 'POST', 'path': '/items'}],
+            }), encoding='utf-8')
+            no_execute = get_user_model().objects.create_user(username='browser-no-execute', email='browser-no-execute@example.test', password='pw')
+            ProjectMember.objects.create(project=self.project, user=no_execute, role='editor', can_edit=True, can_execute_tests=False)
+            no_execute_task = auto_task(owner=no_execute)
+            cases.append(('no_execute', no_execute_task, no_execute, 1, 'https://third.example.test'))
+            for name, task, user, version, origin in cases:
+                with self.subTest(name=name):
+                    request = self.factory.post('/', {
+                        'version': task.version if version == 1 else version, 'origin': origin, 'decision': 'approve',
+                    }, format='json')
+                    force_authenticate(request, user)
+                    reply = BrowserDiscoveryOriginsView.as_view()(request, project_id=self.project.id, task_id=task.id)
+                    self.assertGreaterEqual(reply.status_code, 400, reply.data)
+                    self.assertFalse(origin_control_file(task).exists())
+
+    def test_cross_origin_same_path_or_dependency_cannot_be_handed_off_as_one_base_url(self):
+        task = self.task(
+            api_origin='https://one.example.test', status=BrowserDiscoveryTask.Status.PARTIAL,
+            limits={'origin_mode': 'auto', 'selected_origin': 'https://one.example.test'},
+        )
+        auth = BrowserDiscoveryRecord.objects.create(
+            task=task, sequence=1, request_id='auth', origin='https://two.example.test', method='POST', path='/session',
+            resource_type='fetch', is_eligible=True, public_summary={'source_authorized': True, 'capture_complete': True},
+        )
+        business = BrowserDiscoveryRecord.objects.create(
+            task=task, sequence=2, request_id='one', origin='https://one.example.test', method='GET', path='/items',
+            resource_type='fetch', is_eligible=True, dependency_record_ids=[auth.id],
+            public_summary={'source_authorized': True, 'capture_complete': True},
+        )
+        same_path_other = BrowserDiscoveryRecord.objects.create(
+            task=task, sequence=3, request_id='two', origin='https://two.example.test', method='GET', path='/items',
+            resource_type='fetch', is_eligible=True, public_summary={'source_authorized': True, 'capture_complete': True},
+        )
+        with self.assertRaises(WorkspaceValidationError):
+            _selection(task, [business.id])
+        with self.assertRaises(WorkspaceValidationError):
+            _selection(task, [business.id, same_path_other.id])

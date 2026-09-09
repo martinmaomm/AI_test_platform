@@ -4,15 +4,23 @@ import { readFile } from "node:fs/promises";
 import {
   BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH,
   BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS,
+  browserDiscoveryBecameTerminal,
   browserDiscoveryConfig,
   browserDiscoveryElapsed,
   browserDiscoveryErrorCodeLabel,
+  browserDiscoveryEvidenceCounts,
   browserDiscoveryFormSnapshot,
   browserDiscoveryItems,
+  browserDiscoveryOriginResolution,
+  browserDiscoveryOriginStateLabel,
+  browserDiscoveryOriginSummary,
   browserDiscoveryRecordIds,
   browserDiscoveryRecordGroups,
   browserDiscoveryTimeoutDefault,
   buildBrowserDiscoveryPayload,
+  canConfirmBrowserDiscoveryOrigin,
+  canHandoffBrowserDiscovery,
+  canSelectBrowserDiscoveryOrigin,
   isApiOrigin,
   shouldApplyBrowserDiscoveryResponse,
 } from "../src/utils/apiBrowserDiscovery.js";
@@ -72,6 +80,47 @@ test("browser discovery rejects stale project, epoch, sequence, and task respons
   assert.equal(shouldApplyBrowserDiscoveryResponse({ ...current, currentTaskId: 10 }), false);
 });
 
+test("browser discovery refreshes records exactly on the selected task's active-to-terminal transition", () => {
+  assert.equal(browserDiscoveryBecameTerminal({ id: "task-1", status: "running" }, { id: "task-1", status: "completed" }), true);
+  assert.equal(browserDiscoveryBecameTerminal({ id: "task-1", status: "finalizing" }, { id: "task-1", status: "partial" }), true);
+  assert.equal(browserDiscoveryBecameTerminal({ id: "task-1", status: "completed" }, { id: "task-1", status: "failed" }), false);
+  assert.equal(browserDiscoveryBecameTerminal({ id: "task-1", status: "running" }, { id: "task-2", status: "completed" }), false);
+});
+
+test("browser discovery exposes only protocol-approved origin decisions and blocks ambiguous handoff", () => {
+  const pending = {
+    status: "running",
+    origin_resolution: {
+      mode: "auto",
+      state: "awaiting_confirmation",
+      origins: ["https://app.example.test"],
+      pending: [{ origin: "https://api.example.test", method: "post", path: "/login" }],
+      selected_origin: null,
+      can_confirm: true,
+    },
+  };
+  assert.deepEqual(browserDiscoveryOriginResolution(pending).pending, [{ origin: "https://api.example.test", method: "POST", path: "/login" }]);
+  assert.equal(browserDiscoveryOriginSummary(pending), "待确认：https://api.example.test");
+  assert.equal(canConfirmBrowserDiscoveryOrigin(pending), true);
+  assert.equal(canConfirmBrowserDiscoveryOrigin({ ...pending, status: "completed" }), false);
+  assert.equal(canConfirmBrowserDiscoveryOrigin({ ...pending, origin_resolution: { ...pending.origin_resolution, can_confirm: false } }), false);
+  const selecting = {
+    status: "completed",
+    origin_resolution: { mode: "auto", state: "awaiting_selection", origins: ["https://app.example.test", "https://api.example.test"], pending: [], selected_origin: null, can_confirm: false },
+  };
+  assert.equal(canSelectBrowserDiscoveryOrigin(selecting, "https://api.example.test"), true);
+  assert.equal(canSelectBrowserDiscoveryOrigin({ ...selecting, status: "running" }, "https://api.example.test"), false);
+  assert.equal(canSelectBrowserDiscoveryOrigin(selecting, "https://other.example.test"), false);
+  assert.equal(canHandoffBrowserDiscovery(selecting), false);
+  const resolved = { ...selecting, origin_resolution: { ...selecting.origin_resolution, state: "resolved", selected_origin: "https://api.example.test" } };
+  assert.equal(canHandoffBrowserDiscovery(resolved), true);
+  assert.equal(browserDiscoveryOriginSummary(resolved), "已识别：https://api.example.test");
+  assert.equal(browserDiscoveryOriginStateLabel({ status: "failed", origin_resolution: { mode: "auto", state: "detecting", origins: [], pending: [], selected_origin: null, can_confirm: false } }), "未发现接口来源");
+  assert.equal(browserDiscoveryOriginSummary({ status: "cancelled", origin_resolution: { mode: "auto", state: "detecting", origins: ["https://api.example.test"], pending: [], selected_origin: null, can_confirm: false } }), "未确认接口来源");
+  assert.equal(browserDiscoveryOriginStateLabel({ status: "cancelled", origin_resolution: { mode: "auto", state: "detecting", origins: ["https://api.example.test"], pending: [], selected_origin: null, can_confirm: false } }), "未确认接口来源");
+  assert.deepEqual(browserDiscoveryEvidenceCounts({ records_count: 4, eligible_records_count: 3 }), { collected: 4, usable: 3 });
+});
+
 test("browser discovery handles elapsed fallback and only uses positive record ids", () => {
   assert.equal(browserDiscoveryElapsed({ started_at: "2026-09-09T00:00:00Z", finished_at: "2026-09-09T00:01:05Z" }), 65);
   assert.deepEqual(browserDiscoveryRecordIds([{ id: 1 }, { id: "2" }, { id: 0 }, { id: "x" }]), [1, 2]);
@@ -105,6 +154,15 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(source, /BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS/);
   assert.match(source, /data-testid="api-browser-discovery-create-form"/);
   assert.match(source, /aria-label="完整页面 URL"/);
+  assert.match(source, /默认自动识别页面实际发起的接口来源/);
+  assert.match(source, /自动确认仅覆盖页面直接发起的 fetch\/XHR/);
+  assert.match(source, /HTTP 重定向和跨站登录暂不支持/);
+  assert.match(source, /跨主机接口的当前直接请求/);
+  assert.match(source, /高级设置/);
+  assert.match(source, /aria-label="手动 API origin（可选）"/);
+  assert.match(source, /awaiting_confirmation/);
+  assert.match(source, /选择此来源/);
+  assert.match(source, /resolve-origin/);
   assert.match(source, /browser-discovery-timeout-\$\{disabled \|\| creating\}/);
   assert.match(source, />开始探索</);
   assert.match(specs, /网页探索发现/);
@@ -121,6 +179,12 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(workspace, /viewEpoch \+= 1/);
   assert.match(workspace, /browserDiscoveryFormDirty/);
   assert.match(workspace, /markCreateFormSubmitted/);
+  assert.match(workspace, /resolveBrowserDiscoveryOrigin/);
+  assert.match(workspace, /resolveSelectedBrowserDiscoveryOrigin/);
+  assert.match(workspace, /loadBrowserDiscoveryRecords\(taskId\)/);
+  assert.match(workspace, /browserDiscoveryBecameTerminal/);
+  assert.match(workspace, /loadBrowserDiscoveryRecords\(taskId, \{ quiet: true \}\)/);
+  assert.match(workspace, /browserDiscoveryOriginActionSequence/);
   assert.match(source, /form-dirty-change/);
   assert.match(router, /path: 'workspace\/documents'/);
   assert.match(router, /path: 'workspace\/browser'/);

@@ -87,11 +87,13 @@
         :records-has-more="browserDiscoveryRecordsNextAfter != null"
         :creating="browserDiscoveryCreating"
         :cancelling="browserDiscoveryCancelling"
+        :origin-action-loading="browserDiscoveryOriginActionLoading"
         :handoff-loading="browserDiscoveryHandoffLoading"
         @refresh="refreshBrowserDiscoveries"
         @create="submitBrowserDiscovery"
         @select="selectBrowserDiscovery"
         @cancel="cancelSelectedBrowserDiscovery"
+        @resolve-origin="resolveSelectedBrowserDiscoveryOrigin"
         @load-records="loadBrowserDiscoveryRecords"
         @load-more-records="loadMoreBrowserDiscoveryRecords"
         @handoff="handoffBrowserDiscovery"
@@ -617,6 +619,7 @@ import {
   getBrowserDiscoveryRecords,
   handoffBrowserDiscovery as handoffBrowserDiscoveryRequest,
   listBrowserDiscoveries,
+  resolveBrowserDiscoveryOrigin,
 } from "@/api/apiBrowserDiscovery";
 import WorkspaceConversation from "@/components/api-workspace/WorkspaceConversation.vue";
 import WorkspaceConfigEditor from "@/components/api-workspace/WorkspaceConfigEditor.vue";
@@ -630,9 +633,12 @@ import KeyValueRows from "@/components/api-workspace/KeyValueRows.vue";
 import BrowserDiscoveryPanel from "@/components/api-testing/BrowserDiscoveryPanel.vue";
 import {
   browserDiscoveryConfig as normalizeBrowserDiscoveryConfig,
+  browserDiscoveryBecameTerminal,
   browserDiscoveryData,
   browserDiscoveryItems,
   buildBrowserDiscoveryPayload,
+  canConfirmBrowserDiscoveryOrigin,
+  canSelectBrowserDiscoveryOrigin,
   isBrowserDiscoveryActive,
   shouldApplyBrowserDiscoveryResponse,
 } from "@/utils/apiBrowserDiscovery";
@@ -731,6 +737,7 @@ const browserDiscoveryDetailLoading = ref(false);
 const browserDiscoveryRecordsLoading = ref(false);
 const browserDiscoveryCreating = ref(false);
 const browserDiscoveryCancelling = ref(false);
+const browserDiscoveryOriginActionLoading = ref(false);
 const browserDiscoveryHandoffLoading = ref(false);
 const endpointsLoadFailed = ref(false);
 const endpointLoadError = ref("");
@@ -778,6 +785,7 @@ let browserDiscoveryEpoch = 0;
 let browserDiscoveryListSequence = 0;
 let browserDiscoveryDetailSequence = 0;
 let browserDiscoveryRecordsSequence = 0;
+let browserDiscoveryOriginActionSequence = 0;
 let auxiliaryLoadSequence = 0;
 let skipNextSourceLeaveConfirmation = false;
 let internalWorkspaceRouteId = null;
@@ -816,6 +824,7 @@ const interactionLocked = computed(
     adoptingCandidate.value ||
     sendingMessage.value ||
     generationDialog.value ||
+    browserDiscoveryOriginActionLoading.value ||
     loading.value ||
     initializing.value ||
     routeTransitioning.value,
@@ -1055,6 +1064,7 @@ const resetBrowserDiscoveries = () => {
   browserDiscoveryListSequence += 1;
   browserDiscoveryDetailSequence += 1;
   browserDiscoveryRecordsSequence += 1;
+  browserDiscoveryOriginActionSequence += 1;
   stopBrowserDiscoveryPolling();
   browserDiscoveryConfig.value = { enabled: false, limits: {}, models: [] };
   browserDiscoveryConfigLoading.value = false;
@@ -1070,6 +1080,7 @@ const resetBrowserDiscoveries = () => {
   browserDiscoveryRecordsLoading.value = false;
   browserDiscoveryCreating.value = false;
   browserDiscoveryCancelling.value = false;
+  browserDiscoveryOriginActionLoading.value = false;
   browserDiscoveryHandoffLoading.value = false;
 };
 const loadBrowserDiscoveryConfig = async (requestProjectId = projectId.value) => {
@@ -1131,10 +1142,16 @@ const loadBrowserDiscoveryDetail = async (taskId = browserDiscoveryTaskId.value,
   try {
     const task = browserDiscoveryData(await getBrowserDiscovery(requestProjectId, taskId));
     if (!shouldApplyBrowserDiscoveryResponse({ requestProjectId, currentProjectId: projectId.value, requestEpoch, currentEpoch: browserDiscoveryEpoch, requestSequence, latestSequence: browserDiscoveryDetailSequence, expectedTaskId: taskId, currentTaskId: browserDiscoveryTaskId.value })) return false;
+    const refreshRecords = browserDiscoveryBecameTerminal(
+      browserDiscoveryTask.value,
+      task,
+    );
     browserDiscoveryTask.value = task?.id ? task : null;
     if (browserDiscoveryTask.value) updateBrowserDiscoveryListItem(task);
     if (isBrowserDiscoveryActive(task)) startBrowserDiscoveryPolling();
     else stopBrowserDiscoveryPolling();
+    if (refreshRecords)
+      void loadBrowserDiscoveryRecords(taskId, { quiet: true });
     return Boolean(browserDiscoveryTask.value);
   } catch (error) {
     if (!quiet && requestProjectId === projectId.value)
@@ -1145,7 +1162,7 @@ const loadBrowserDiscoveryDetail = async (taskId = browserDiscoveryTaskId.value,
       browserDiscoveryDetailLoading.value = false;
   }
 };
-const loadBrowserDiscoveryRecords = async (taskId = browserDiscoveryTaskId.value, { append = false } = {}) => {
+const loadBrowserDiscoveryRecords = async (taskId = browserDiscoveryTaskId.value, { append = false, quiet = false } = {}) => {
   if (!projectId.value || !taskId || browserDiscoveryConfig.value?.enabled !== true)
     return false;
   const requestProjectId = projectId.value;
@@ -1168,7 +1185,7 @@ const loadBrowserDiscoveryRecords = async (taskId = browserDiscoveryTaskId.value
     browserDiscoveryRecordsNextAfter.value = page?.next_after ?? null;
     return true;
   } catch (error) {
-    if (requestProjectId === projectId.value)
+    if (!quiet && requestProjectId === projectId.value)
       ElMessage.error(errorMessage(error, "已授权样本加载失败"));
     return false;
   } finally {
@@ -1252,6 +1269,90 @@ const cancelSelectedBrowserDiscovery = async (taskId) => {
   } finally {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
       browserDiscoveryCancelling.value = false;
+  }
+};
+const resolveSelectedBrowserDiscoveryOrigin = async ({
+  taskId,
+  version,
+  origin,
+  decision,
+}) => {
+  if (browserDiscoveryOriginActionLoading.value || !taskId) return;
+  const task = browserDiscoveryTask.value;
+  const numericVersion = Number(version);
+  const normalizedOrigin = String(origin || "").trim();
+  if (
+    !sameWorkspaceId(taskId, browserDiscoveryTaskId.value) ||
+    !Number.isSafeInteger(numericVersion) ||
+    numericVersion !== Number(task?.version) ||
+    !normalizedOrigin ||
+    !["approve", "reject", "select"].includes(decision)
+  )
+    return ElMessage.warning("来源确认参数已过期，请刷新任务详情后再试。");
+  if (
+    (["approve", "reject"].includes(decision) &&
+      !canConfirmBrowserDiscoveryOrigin(task)) ||
+    (decision === "select" &&
+      !canSelectBrowserDiscoveryOrigin(task, normalizedOrigin))
+  )
+    return ElMessage.warning("当前任务状态不允许此来源操作，请刷新任务详情后再试。");
+  const requestProjectId = projectId.value;
+  const requestEpoch = browserDiscoveryEpoch;
+  const requestViewEpoch = viewEpoch;
+  const requestSequence = ++browserDiscoveryOriginActionSequence;
+  browserDiscoveryOriginActionLoading.value = true;
+  try {
+    const next = browserDiscoveryData(
+      await resolveBrowserDiscoveryOrigin(requestProjectId, taskId, {
+        version: numericVersion,
+        origin: normalizedOrigin,
+        decision,
+      }),
+    );
+    if (
+      requestProjectId !== projectId.value ||
+      requestEpoch !== browserDiscoveryEpoch ||
+      requestViewEpoch !== viewEpoch ||
+      requestSequence !== browserDiscoveryOriginActionSequence ||
+      !sameWorkspaceId(taskId, browserDiscoveryTaskId.value) ||
+      !next?.id
+    )
+      return;
+    browserDiscoveryTask.value = next;
+    updateBrowserDiscoveryListItem(next);
+    await Promise.all([
+      loadBrowserDiscoveryDetail(taskId, { quiet: true }),
+      loadBrowserDiscoveryRecords(taskId),
+    ]);
+    if (
+      requestProjectId === projectId.value &&
+      requestEpoch === browserDiscoveryEpoch &&
+      requestViewEpoch === viewEpoch &&
+      requestSequence === browserDiscoveryOriginActionSequence
+    )
+      ElMessage.success(
+        decision === "approve"
+          ? "已允许该来源的当前请求继续执行"
+          : decision === "reject"
+            ? "已拒绝该来源的当前请求"
+            : "已选择本次交接的主接口来源",
+      );
+  } catch (error) {
+    if (
+      requestProjectId === projectId.value &&
+      requestEpoch === browserDiscoveryEpoch &&
+      requestViewEpoch === viewEpoch &&
+      requestSequence === browserDiscoveryOriginActionSequence
+    )
+      ElMessage.error(errorMessage(error, "更新接口来源失败"));
+  } finally {
+    if (
+      requestProjectId === projectId.value &&
+      requestEpoch === browserDiscoveryEpoch &&
+      requestViewEpoch === viewEpoch &&
+      requestSequence === browserDiscoveryOriginActionSequence
+    )
+      browserDiscoveryOriginActionLoading.value = false;
   }
 };
 const handoffBrowserDiscovery = async ({ taskId, version, recordIds }) => {

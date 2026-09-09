@@ -181,7 +181,10 @@ def verify(origin, fixture, output):
         def create_task(slug, description):
             d = page.get_by_test_id("api-browser-discovery-create-form")
             d.get_by_role("textbox", name="完整页面 URL", exact=True).fill(f"https://web.example.test/{slug}?source=browser#fixture")
-            d.get_by_role("textbox", name="API origin（可未知）", exact=True).fill("https://api.example.test")
+            origin_input = d.get_by_role("textbox", name="手动 API origin（可选）", exact=True)
+            if not origin_input.is_visible():
+                d.get_by_text("高级设置", exact=True).click()
+            origin_input.fill("https://api.example.test")
             d.get_by_role("textbox", name="探索目标说明", exact=True).fill(description)
             d.locator(".el-form-item").filter(has_text="LLM 模型").locator(".el-select").click()
             expect(page.get_by_role("option", name="本地模拟 · browser-fixture-model", exact=True)).to_be_visible()

@@ -39,6 +39,18 @@ export const cancelBrowserDiscovery = async (projectId, taskId) => {
   return response.data;
 };
 
+export const resolveBrowserDiscoveryOrigin = async (
+  projectId,
+  taskId,
+  payload,
+) => {
+  const response = await api.post(
+    `${basePath(projectId)}${taskId}/origins/`,
+    payload,
+  );
+  return response.data;
+};
+
 export const handoffBrowserDiscovery = async (projectId, taskId, payload) => {
   const response = await api.post(
     `${basePath(projectId)}${taskId}/handoff/`,

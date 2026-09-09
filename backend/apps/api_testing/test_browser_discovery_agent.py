@@ -6,10 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from django.test import SimpleTestCase
+from langchain_core.callbacks import AsyncCallbackManager
 
 from .browser_discovery_agent import (
-    ALLOWED_BROWSER_TOOLS, DiscoveryStopped, DiscoveryToolGuard,
-    prepare_capture_config, run_browser_discovery,
+    ALLOWED_BROWSER_TOOLS, DiscoveryStopped, DiscoveryToolGuard, PendingOriginGate,
+    _safe_agent_summary, prepare_capture_config, run_browser_discovery,
 )
 
 
@@ -51,6 +52,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertEqual(env['MCP_NETWORK_CAPTURE'], '1')
         self.assertEqual(env['MCP_NETWORK_CAPTURE_MAX_REQUESTS'], '30')
         self.assertEqual(env['MCP_NETWORK_CAPTURE_DIR'], str(Path(self.temp.name).resolve()))
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_ORIGIN'], '0')
         self.assertNotIn('env', original['mcpServers']['playwright'])
         self.assertNotIn('MCP_NETWORK_CAPTURE', str(original))
 
@@ -59,9 +61,14 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
             prepare_capture_config({'mcpServers': {'playwright': {'command': 'npx', 'args': ['unmanaged-server']}}},
                                    self.options['task_id'], self.options['trace_file'], '', {})
 
-    def test_empty_api_origin_collects_metadata_only(self):
-        config = prepare_capture_config(self.options['mcp_config'], self.options['task_id'], self.options['trace_file'], '', {})
+    def test_empty_api_origin_enables_target_scoped_auto_collection(self):
+        config = prepare_capture_config(
+            self.options['mcp_config'], self.options['task_id'], self.options['trace_file'], '', {},
+            target_url=self.options['target_url'], auto_origin=True,
+        )
         self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS'], '')
+        self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_AUTO_ORIGIN'], '1')
+        self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_TARGET_URL'], self.options['target_url'])
 
     def test_plain_model_final_text_does_not_require_json_or_script(self):
         client, session = self.clients()
@@ -76,6 +83,10 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertIn('playwright_post', factory.call_args.kwargs['disallowed_tools'])
         self.assertIn(self.options['target_url'], agent.run.call_args.args[0])
         self.assertNotIn('save_script_draft', agent.run.call_args.args[0])
+        callbacks = factory.call_args.kwargs['callbacks']
+        self.assertIsInstance(callbacks[0], PendingOriginGate)
+        self.assertIsInstance(callbacks[1], DiscoveryToolGuard)
+        self.assertTrue(callbacks[0].run_inline)
         session.call_tool.assert_awaited_once_with('playwright_close', {})
         client.close_all_sessions.assert_awaited_once()
         self.assertEqual(checkpoint.call_args.args[0]['phase'], 'finalizing')
@@ -160,3 +171,56 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
                     guard.on_tool_end({'isError': True}, run_id=index)
         self.assertNotIn('SECRET', guard.current_action)
         self.assertEqual(guard.error.code, 'TOOL_FAILURE')
+
+    def test_observation_kinds_do_not_clear_repeated_action_or_operation_failures(self):
+        guard = DiscoveryToolGuard('https://web.example.test', '', 20)
+        for index in range(2):
+            guard.on_tool_start({'name': 'playwright_click'}, '{}', run_id=index, inputs={'selector': '#same'})
+            guard.on_tool_end({'isError': True}, run_id=index)
+            guard.on_tool_start({'name': 'playwright_get_visible_text'}, '{}', run_id=f'text-{index}', inputs={'selector': '#app'})
+            guard.on_tool_end('unchanged text', run_id=f'text-{index}')
+            guard.on_tool_start({'name': 'playwright_get_visible_html'}, '{}', run_id=f'html-{index}', inputs={'selector': '#app'})
+            guard.on_tool_end('<main>unchanged</main>', run_id=f'html-{index}')
+        with self.assertRaises(DiscoveryStopped):
+            guard.on_tool_start({'name': 'playwright_click'}, '{}', run_id='third', inputs={'selector': '#other'})
+            guard.on_tool_end({'isError': True}, run_id='third')
+        self.assertEqual(guard.error.code, 'TOOL_FAILURE')
+
+    def test_successful_clicks_with_alternating_same_observations_still_stop_repetition(self):
+        guard = DiscoveryToolGuard('https://web.example.test', '', 20)
+        for index in range(4):
+            guard.on_tool_start({'name': 'playwright_click'}, '{}', run_id=f'click-{index}', inputs={'selector': '#same'})
+            guard.on_tool_end('clicked', run_id=f'click-{index}')
+            guard.on_tool_start({'name': 'playwright_get_visible_text'}, '{}', run_id=f'text-{index}', inputs={'selector': '#app'})
+            guard.on_tool_end('same page', run_id=f'text-{index}')
+            guard.on_tool_start({'name': 'playwright_get_visible_html'}, '{}', run_id=f'html-{index}', inputs={'selector': '#app'})
+            guard.on_tool_end('<main>same page</main>', run_id=f'html-{index}')
+        with self.assertRaises(DiscoveryStopped):
+            guard.on_tool_start({'name': 'playwright_click'}, '{}', inputs={'selector': '#same'})
+        self.assertEqual(guard.error.code, 'REPEATED_OPERATION')
+
+    def test_summary_redacts_chinese_label_and_exact_description_secret(self):
+        summary = _safe_agent_summary('已登录，密码：show-me，token=also-hide', '测试密码：show-me')
+        self.assertNotIn('show-me', summary)
+        self.assertNotIn('also-hide', summary)
+        self.assertIn('<redacted>', summary)
+
+    def test_pending_origin_gate_propagates_stop(self):
+        async def stopped():
+            raise DiscoveryStopped('CANCELLED', '已取消')
+        gate = PendingOriginGate(stopped)
+        self.assertTrue(gate.raise_error)
+        with self.assertRaises(DiscoveryStopped):
+            asyncio.run(gate.on_tool_start({}, '{}'))
+
+    def test_inline_gate_stops_before_guard_counts_a_cancelled_tool(self):
+        async def stopped():
+            raise DiscoveryStopped('CANCELLED', '已取消')
+
+        guard = DiscoveryToolGuard('https://web.example.test', '', 20)
+        manager = AsyncCallbackManager(handlers=[PendingOriginGate(stopped), guard])
+        with self.assertRaises(DiscoveryStopped):
+            asyncio.run(manager.on_tool_start(
+                {'name': 'playwright_click'}, '{}', inputs={'selector': '#submit'}, run_id='cancelled-call',
+            ))
+        self.assertEqual(guard.tool_calls, 0)

@@ -25,7 +25,7 @@ async def run(page, variables):
     await page.goto('https://web.example.test/items')
     await expect(page.locator('#result')).to_be_visible()
 '''
-PARTIAL_SCRIPT = SCRIPT + '\n    # AITS_PENDING_STEP: {"reason":"后续详情页尚未观察"}\n'
+PARTIAL_SCRIPT = SCRIPT + '\n    # PENDING_STEP: {"reason":"后续详情页尚未观察"}\n'
 COMPLETE_SCRIPT = '''\
 """检查列表页结果。"""
 from playwright.async_api import expect

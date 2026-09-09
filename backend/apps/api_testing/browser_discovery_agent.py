@@ -186,13 +186,13 @@ def prepare_capture_config(mcp_config, task_id, trace_file, api_origin, capture_
         raise ValueError('采集证据文件名必须为 network.jsonl。')
     limits = capture_limits or {}
     entry.setdefault('env', {}).update({
-        'AITS_MCP_NETWORK_CAPTURE': '1',
-        'AITS_MCP_NETWORK_CAPTURE_DIR': str(evidence.parent),
-        'AITS_MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS': api_origin,
-        'AITS_MCP_NETWORK_CAPTURE_MAX_REQUESTS': str(limits.get('max_requests', 500)),
-        'AITS_MCP_NETWORK_CAPTURE_MAX_BODY_BYTES': str(limits.get('max_body_bytes', 65536)),
-        'AITS_MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES': str(limits.get('max_total_body_bytes', 10485760)),
-        'AITS_MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS': str(limits.get('body_timeout_ms', 3000)),
+        'MCP_NETWORK_CAPTURE': '1',
+        'MCP_NETWORK_CAPTURE_DIR': str(evidence.parent),
+        'MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS': api_origin,
+        'MCP_NETWORK_CAPTURE_MAX_REQUESTS': str(limits.get('max_requests', 500)),
+        'MCP_NETWORK_CAPTURE_MAX_BODY_BYTES': str(limits.get('max_body_bytes', 65536)),
+        'MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES': str(limits.get('max_total_body_bytes', 10485760)),
+        'MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS': str(limits.get('body_timeout_ms', 3000)),
     })
     return {'mcpServers': {'playwright': entry}}
 

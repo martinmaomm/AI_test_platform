@@ -90,7 +90,7 @@ class _AssertionNormalizer(ast.NodeTransformer):
 
     def visit(self, node):
         if isinstance(node, ast.AST) and _is_locator(node):
-            return ast.Name(id='__aits_locator__', ctx=ast.Load())
+            return ast.Name(id='__runtime_locator__', ctx=ast.Load())
         return super().visit(node)
 
     def visit_Call(self, node: ast.Call):

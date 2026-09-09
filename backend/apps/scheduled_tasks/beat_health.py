@@ -32,7 +32,7 @@ def heartbeat_cache_key() -> str:
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(',', ':')).encode('utf-8')
     ).hexdigest()
-    return f'aits:scheduled-tasks:beat-heartbeat:{digest}'
+    return f'automation:scheduled-tasks:beat-heartbeat:{digest}'
 
 
 def _status_payload(status: str, timestamp: float | None = None) -> dict:

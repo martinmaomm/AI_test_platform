@@ -4,7 +4,7 @@
     <el-header class="portal-header">
       <div class="header-left">
         <router-link to="/dashboard" class="logo-link">
-          <AITSBrand size="small" />
+          <PlatformBrand size="small" />
         </router-link>
       </div>
 
@@ -59,7 +59,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useTabStore } from '@/stores/tabs'
 import { useAppStore } from '@/stores/app'
 import { ArrowDown, Sunny, Moon, Monitor } from '@element-plus/icons-vue'
-import AITSBrand from '@/components/AITSBrand.vue'
+import PlatformBrand from '@/components/PlatformBrand.vue'
 
 const router = useRouter()
 const authStore = useAuthStore()

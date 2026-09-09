@@ -48,7 +48,7 @@ async def run(page, variables):
 def main():
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / 'apps')]
-    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'aits_backend.settings')
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
     from web_testing.assertion_state import evaluation_status
     from web_testing.playwright_python_runner import ExecutionConfig, PlaywrightRunner
 

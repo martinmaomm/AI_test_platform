@@ -1,5 +1,5 @@
 """
-Django settings for aits_backend project.
+Django settings for the Automation Platform project.
 """
 
 import os
@@ -56,15 +56,15 @@ INSTALLED_APPS = [
 ]
 
 # 独立知识应用；关闭后禁止提交新任务，不影响原 API RAG 或 WebUI 脚本。
-PROJECT_KNOWLEDGE_ENABLED = os.getenv('AITS_PROJECT_KNOWLEDGE_ENABLED', 'true').lower() == 'true'
+PROJECT_KNOWLEDGE_ENABLED = os.getenv('PROJECT_KNOWLEDGE_ENABLED', 'true').lower() == 'true'
 try:
-    PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = min(1500, max(30, int(os.getenv('AITS_KNOWLEDGE_TOTAL_TIMEOUT_SECONDS', '1200'))))
+    PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = min(1500, max(30, int(os.getenv('KNOWLEDGE_TOTAL_TIMEOUT_SECONDS', '1200'))))
 except (TypeError, ValueError):
     PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = 1200
 
 # Browser-derived API discovery is opt-in. Its budgets are intentionally
 # independent of WebUI generation and the global Celery time limit.
-API_BROWSER_DISCOVERY_ENABLED = os.getenv('AITS_API_BROWSER_DISCOVERY_ENABLED', 'false').lower() == 'true'
+API_BROWSER_DISCOVERY_ENABLED = os.getenv('API_BROWSER_DISCOVERY_ENABLED', 'false').lower() == 'true'
 
 
 def _browser_discovery_setting(name, default, minimum, maximum):
@@ -75,25 +75,25 @@ def _browser_discovery_setting(name, default, minimum, maximum):
 
 
 API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS', 900, 60, 1800,
+    'API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS', 900, 60, 1800,
 )
 API_BROWSER_DISCOVERY_MAX_MODEL_STEPS = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_MAX_MODEL_STEPS', 100, 1, 100,
+    'API_BROWSER_DISCOVERY_MAX_MODEL_STEPS', 100, 1, 100,
 )
 API_BROWSER_DISCOVERY_MAX_TOOL_CALLS = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_MAX_TOOL_CALLS', 100, 1, 100,
+    'API_BROWSER_DISCOVERY_MAX_TOOL_CALLS', 100, 1, 100,
 )
 API_BROWSER_DISCOVERY_MAX_REQUESTS = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_MAX_REQUESTS', 500, 1, 500,
+    'API_BROWSER_DISCOVERY_MAX_REQUESTS', 500, 1, 500,
 )
 API_BROWSER_DISCOVERY_MAX_BODY_BYTES = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_MAX_BODY_BYTES', 256 * 1024, 1024, 256 * 1024,
+    'API_BROWSER_DISCOVERY_MAX_BODY_BYTES', 256 * 1024, 1024, 256 * 1024,
 )
 API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES', 20 * 1024 * 1024, 1024, 20 * 1024 * 1024,
+    'API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES', 20 * 1024 * 1024, 1024, 20 * 1024 * 1024,
 )
 API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS = _browser_discovery_setting(
-    'AITS_API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS', 45, 10, 300,
+    'API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS', 45, 10, 300,
 )
 
 # Custom User Model
@@ -110,7 +110,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-ROOT_URLCONF = 'aits_backend.urls'
+ROOT_URLCONF = 'config.urls'
 
 TEMPLATES = [
     {
@@ -128,7 +128,7 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'aits_backend.wsgi.application'
+WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database
 DATABASES = {
@@ -343,7 +343,7 @@ SECURE_BROWSER_XSS_FILTER = False  # Disable XSS filter for development
 SECURE_CONTENT_TYPE_NOSNIFF = False  # Disable content type sniffing for development
 
 # Channels配置
-ASGI_APPLICATION = 'aits_backend.asgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
 
 # Channels层配置
 CHANNEL_LAYERS = {

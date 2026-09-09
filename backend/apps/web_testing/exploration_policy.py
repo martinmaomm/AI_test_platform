@@ -28,7 +28,7 @@ class ExplorationPolicy:
         stable_id = re.sub(r'[^a-zA-Z0-9-]', '', str(generation_id or 'local'))[:64] or 'local'
         read_only = any(_READ_ONLY_RE.search(item) for item in [str(user_constraints or ''), *plan.forbidden_actions])
         return cls(
-            namespace=f'aits-explore-{stable_id}-{uuid4().hex[:12]}',
+            namespace=f'automation-explore-{stable_id}-{uuid4().hex[:12]}',
             data_scope='scenario_namespace',
             explicit_read_only=read_only,
             allow_test_data_writes=bool(plan.allow_test_data_writes and not read_only),
@@ -37,7 +37,7 @@ class ExplorationPolicy:
 
     @classmethod
     def read_only(cls) -> 'ExplorationPolicy':
-        return cls('aits-explore-local', 'scenario_namespace', True, False, False)
+        return cls('automation-explore-local', 'scenario_namespace', True, False, False)
 
     def may_write(self) -> bool:
         return self.allow_test_data_writes

@@ -20,10 +20,10 @@
 2. 在 `backend/.env` 增加：
 
    ```dotenv
-   AITS_API_BROWSER_DISCOVERY_ENABLED=true
-   AITS_API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS=900
-   AITS_API_BROWSER_DISCOVERY_MAX_MODEL_STEPS=100
-   AITS_API_BROWSER_DISCOVERY_MAX_TOOL_CALLS=100
+   API_BROWSER_DISCOVERY_ENABLED=true
+   API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS=900
+   API_BROWSER_DISCOVERY_MAX_MODEL_STEPS=100
+   API_BROWSER_DISCOVERY_MAX_TOOL_CALLS=100
    ```
 
 3. 当前用户需要有启用的聊天模型和 Playwright MCP。沿用固定 `@executeautomation/playwright-mcp-server@1.0.12`、Node Playwright 1.57.0 与对应浏览器；不使用 Python Playwright 的浏览器目录。安装见 [安装指南](installation.md) 与 [离线浏览器说明](../backend/resource/README.md)。不需要新增 npm/Python 依赖，也不要修改 npm 缓存里的包。
@@ -86,15 +86,15 @@ python manage.py migrate api_testing
 
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
-| `AITS_API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS` | 900 秒 | 本轮探索总时限，当前最多 1800 秒 |
-| `AITS_API_BROWSER_DISCOVERY_MAX_MODEL_STEPS` | 100 | 单轮智能体模型步骤上限 |
-| `AITS_API_BROWSER_DISCOVERY_MAX_TOOL_CALLS` | 100 | 实际浏览器工具调用上限 |
-| `AITS_API_BROWSER_DISCOVERY_MAX_REQUESTS` | 500 | 每轮记录的网络请求上限 |
-| `AITS_API_BROWSER_DISCOVERY_MAX_BODY_BYTES` | 262144 | 单正文保存上限，256 KiB |
-| `AITS_API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES` | 20971520 | 单任务证据预算，20 MiB |
-| `AITS_API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS` | 45 秒 | 失联检测阈值 |
+| `API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS` | 900 秒 | 本轮探索总时限，当前最多 1800 秒 |
+| `API_BROWSER_DISCOVERY_MAX_MODEL_STEPS` | 100 | 单轮智能体模型步骤上限 |
+| `API_BROWSER_DISCOVERY_MAX_TOOL_CALLS` | 100 | 实际浏览器工具调用上限 |
+| `API_BROWSER_DISCOVERY_MAX_REQUESTS` | 500 | 每轮记录的网络请求上限 |
+| `API_BROWSER_DISCOVERY_MAX_BODY_BYTES` | 262144 | 单正文保存上限，256 KiB |
+| `API_BROWSER_DISCOVERY_MAX_TOTAL_BYTES` | 20971520 | 单任务证据预算，20 MiB |
+| `API_BROWSER_DISCOVERY_HEARTBEAT_LEASE_SECONDS` | 45 秒 | 失联检测阈值 |
 
-单次模型请求仍由 `AITS_LLM_TIMEOUT_SECONDS`/模型配置控制；后续 API 生成与验证用 `AITS_API_GENERATION_TIMEOUT_SECONDS`。这些限制彼此独立，不影响现有 UI 探索预算。
+单次模型请求仍由 `LLM_TIMEOUT_SECONDS`/模型配置控制；后续 API 生成与验证用 `API_GENERATION_TIMEOUT_SECONDS`。这些限制彼此独立，不影响现有 UI 探索预算。
 
 采集文件位于 `backend/logs/api-browser-discovery/<task-id>/`，不通过 `media` 静态地址公开：
 

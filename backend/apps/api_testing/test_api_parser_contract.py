@@ -89,7 +89,7 @@ class APIParserContractTests(unittest.TestCase):
         self.assertEqual(set(request_body['content']), {'application/x-www-form-urlencoded'})
         self.assertNotIn('application/json', request_body['content'])
         self.assertEqual(request_body['content']['application/x-www-form-urlencoded']['schema']['properties']['enabled']['type'], 'boolean')
-        self.assertEqual(request_body['x-aits-operation'], {
+        self.assertEqual(request_body['x-platform-operation'], {
             'consumes': ['application/x-www-form-urlencoded'],
             'produces': ['application/problem+json'],
             'security': [],
@@ -104,7 +104,7 @@ class APIParserContractTests(unittest.TestCase):
             document['request_body']['content']['application/json']['schema']['properties']['revision']['minimum'],
             0,
         )
-        self.assertEqual(document['request_body']['x-aits-operation']['security'], [{'api_key': []}])
+        self.assertEqual(document['request_body']['x-platform-operation']['security'], [{'api_key': []}])
 
     def test_openapi_composition_examples_and_local_ref_bounds_are_preserved(self):
         specification = {
@@ -223,12 +223,12 @@ class APIParserContractTests(unittest.TestCase):
         self.assertIn('example', saved_media)
         self.assertIsNone(saved_media['example'])
         external_schema = upload['responses']['400']['content']['text/plain']['schema']
-        self.assertEqual(external_schema['x-aits-ref-status'], 'unresolved')
+        self.assertEqual(external_schema['x-platform-ref-status'], 'unresolved')
         self.assertEqual(external_schema['$ref'], 'https://example.invalid/common.yaml#/Message')
         next_schema = node['responses']['200']['content']['application/json']['schema']['properties']['next']
         self.assertEqual(next_schema['$ref'], '#/components/schemas/Node')
-        self.assertIn(next_schema['x-aits-ref-status'], {'resolved', 'cyclic'})
-        self.assertEqual(upload['request_body']['x-aits-operation']['security'], [{'oauth': ['read']}])
+        self.assertIn(next_schema['x-platform-ref-status'], {'resolved', 'cyclic'})
+        self.assertEqual(upload['request_body']['x-platform-operation']['security'], [{'oauth': ['read']}])
 
     def test_legacy_fallback_uses_the_same_endpoint_projection(self):
         specification = {

@@ -190,9 +190,9 @@ class FinalizationTraceTests(SimpleTestCase):
         long_ref = 'A' * 128
         text = explorer._generated_runtime_value('text', long_ref)
         email = explorer._generated_runtime_value('email', long_ref)
-        self.assertLessEqual(len(text), 32)
+        self.assertLessEqual(len(text), 36)
         self.assertLessEqual(len(email), 64)
-        self.assertRegex(email, r'^aits-[0-9a-f]{8}-[0-9a-f]{16}@example\.com$')
+        self.assertRegex(email, r'^automation-[0-9a-f]{8}-[0-9a-f]{16}@example\.com$')
 
     def test_declared_but_unselected_dynamic_input_does_not_pollute_effective_plan(self):
         plan = ScenarioPlan.model_validate(plan_payload(
@@ -251,7 +251,7 @@ class FinalizationTraceTests(SimpleTestCase):
         plan = ScenarioPlan.model_validate(plan_payload())
         driver = Driver(plan)
         driver.complete_main()
-        finalize = next(tool for tool in build_finalization_tools(driver.recorder) if tool.name == 'aits_finalize_path')
+        finalize = next(tool for tool in build_finalization_tools(driver.recorder) if tool.name == 'finalize_exploration_path')
         rejected = finalize.invoke({
             'main_actions': [{'event_id': 'E000002', 'step_name': '填写测试值'}],
             'assertions': [{'assertion_id': 'A1', 'event_id': 'E000004'}],
@@ -341,7 +341,7 @@ class SingleAgentExplorerTests(SimpleTestCase):
         self.assertEqual((client.opened, client.closed), (1, 1))
         self.assertEqual((Agent.created, Agent.registrations, Agent.runs), (1, 1, 1))
         self.assertIn('finalization_protocol', Agent.prompt)
-        self.assertIn('aits_declare_generated_input', Agent.prompt['finalization_protocol']['input_rule'])
+        self.assertIn('declare_generated_input', Agent.prompt['finalization_protocol']['input_rule'])
         self.assertFalse(trace.replay_event_ids)
 
 

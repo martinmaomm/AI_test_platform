@@ -17,19 +17,19 @@ except ImportError:  # pragma: no cover - exercised only by the subprocess bound
 
 def _install_offline_network_guard() -> None:
     """Block IPv4/IPv6 socket connections only in the explicit offline harness."""
-    if os.environ.get("AITS_OFFLINE_TEST_NETWORK") != "blocked":
+    if os.environ.get("OFFLINE_TEST_NETWORK") != "blocked":
         return
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
 
     def _blocked_connect(sock: socket.socket, address: Any) -> Any:
         if sock.family in (socket.AF_INET, socket.AF_INET6):
-            raise RuntimeError("AITS offline test guard: network connections are forbidden")
+            raise RuntimeError("Automation Platform offline test guard: network connections are forbidden")
         return original_connect(sock, address)
 
     def _blocked_connect_ex(sock: socket.socket, address: Any) -> int:
         if sock.family in (socket.AF_INET, socket.AF_INET6):
-            raise RuntimeError("AITS offline test guard: network connections are forbidden")
+            raise RuntimeError("Automation Platform offline test guard: network connections are forbidden")
         return original_connect_ex(sock, address)
 
     socket.socket.connect = _blocked_connect

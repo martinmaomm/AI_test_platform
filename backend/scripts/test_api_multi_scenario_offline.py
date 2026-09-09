@@ -18,7 +18,7 @@ def main():
     def denied(*args, **kwargs):
         raise AssertionError('External sockets forbidden in multi-scenario acceptance')
 
-    with tempfile.TemporaryDirectory(prefix='aits-api-multi-') as temp, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-api-multi-') as temp, patch.object(
         socket.socket, 'connect', denied,
     ), patch.object(socket.socket, 'connect_ex', denied):
         fixture = bootstrap(Path(temp))

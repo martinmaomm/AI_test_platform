@@ -135,7 +135,7 @@ def verify(origin, fixture, output):
 def main():
     output = BACKEND / 'logs' / 'schedule-browser-check'
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='aits-schedule-browser-') as temp, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-schedule-browser-') as temp, patch.object(
         socket.socket, 'connect', loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, 'connect_ex', loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(temp))

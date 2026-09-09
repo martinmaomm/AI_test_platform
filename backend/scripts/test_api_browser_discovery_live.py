@@ -37,7 +37,7 @@ import json, os, sys
 os.environ['ANONYMIZED_TELEMETRY']='false'
 os.environ['MCP_USE_ANONYMIZED_TELEMETRY']='false'
 sys.path[:0]=['.', 'apps']
-os.environ['DJANGO_SETTINGS_MODULE']='aits_backend.settings'
+os.environ['DJANGO_SETTINGS_MODULE']='config.settings'
 import django; django.setup()
 from ai_core.models import LLMConfiguration, MCPConfiguration
 from web_testing.models import WebUIScriptGeneration
@@ -46,13 +46,13 @@ model=LLMConfiguration.objects.get(id=int(sys.argv[1]),is_active=True,model_type
 generation=WebUIScriptGeneration.objects.get(id=sys.argv[2],user_id=model.created_by_id)
 selected=resolve_active_playwright_mcp_config(model.created_by_id)
 assert selected, 'No current owner-scoped Playwright MCP'
-print('AITS_PRIVATE_CONFIG='+json.dumps({'model':{key:getattr(model,key) for key in ['provider','provider_name','model_name','api_key','base_url','extra_config']},'mcp':selected[1], 'description':generation.description_safe,'target_url':generation.target_url}))
+print('PRIVATE_CONFIG='+json.dumps({'model':{key:getattr(model,key) for key in ['provider','provider_name','model_name','api_key','base_url','extra_config']},'mcp':selected[1], 'description':generation.description_safe,'target_url':generation.target_url}))
 """
     child = subprocess.run([sys.executable, '-c', code, str(model_id), str(generation_id)], cwd=BACKEND,
                            capture_output=True, text=True, timeout=30)
     if child.returncode != 0:
         raise RuntimeError('读取现有模型/探索配置失败；未启动真实验收。')
-    row = next((line for line in child.stdout.splitlines() if line.startswith('AITS_PRIVATE_CONFIG=')), None)
+    row = next((line for line in child.stdout.splitlines() if line.startswith('PRIVATE_CONFIG=')), None)
     if not row:
         raise RuntimeError('配置读取协议无效。')
     return json.loads(row.split('=', 1)[1])
@@ -92,11 +92,11 @@ def main():
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     report = {'scope': 'live MCP and model; disposable platform database', 'completed': False}
     try:
-        with tempfile.TemporaryDirectory(prefix='aits-discovery-live-') as temp:
+        with tempfile.TemporaryDirectory(prefix='automation-discovery-live-') as temp:
             fixture = bootstrap(Path(temp))
             # Explicit --run-live opts this isolated platform instance into
             # real target requests, including its requests worker subprocess.
-            os.environ.pop('AITS_OFFLINE_TEST_NETWORK', None)
+            os.environ.pop('OFFLINE_TEST_NETWORK', None)
             from django.conf import settings
             settings.API_BROWSER_DISCOVERY_ENABLED = True
             from django.contrib.auth import get_user_model

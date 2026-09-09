@@ -27,7 +27,7 @@ class NotificationServiceTests(TestCase):
         self.legacy = NotificationChannel.objects.create(channel_code="dingtalk", channel_name="钉钉")
         with patch("scheduled_tasks.signals.register_periodic_task"):
             self.task = ScheduledTask.objects.create(
-                name="AITS notification task",
+                name="Automation Platform notification task",
                 suite_type="api",
                 suite_ids=[1],
                 cron_expression="0 9 * * *",
@@ -60,8 +60,8 @@ class NotificationServiceTests(TestCase):
         self.assertTrue(trigger_notification(self.task.id, self.execution_log))
 
         subject, body, recipients = send_email.call_args.args
-        self.assertIn("AITS 自动化测试报告", subject)
-        self.assertIn("## AITS 定时任务执行结果", body)
+        self.assertIn("自动化测试平台", subject)
+        self.assertIn("## 自动化测试平台定时任务执行结果", body)
         self.assertEqual(recipients, ["one@example.test"])
         self.assertIn("reports/detail", send_email.call_args.kwargs["html_body"])
 
@@ -136,7 +136,7 @@ class NotificationServiceTests(TestCase):
         self.assertTrue(trigger_notification(self.task.id, self.execution_log))
 
         subject, body, recipients = send_email.call_args.args
-        self.assertIn("AITS 自动化测试报告", subject)
+        self.assertIn("自动化测试平台", subject)
         self.assertIn("验证未完成", body)
         self.assertEqual(recipients, ["one@example.test"])
         self.assertIn("https://ui.example.test/reports/detail/", send_email.call_args.kwargs["html_body"])

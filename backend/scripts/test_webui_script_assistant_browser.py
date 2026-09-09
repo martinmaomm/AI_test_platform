@@ -720,7 +720,7 @@ def main():
     output = BACKEND / "logs" / "script-assistant-browser"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
-        prefix="aits-script-assistant-"
+        prefix="automation-script-assistant-"
     ) as temp, patch.object(
         socket.socket,
         "connect",

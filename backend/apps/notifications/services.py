@@ -146,7 +146,7 @@ def _message_content(
     }.get(summary["report_status"], "验证未完成")
 
     lines = [
-        "## AITS 定时任务执行结果",
+        "## 自动化测试平台定时任务执行结果",
         f"**任务名称**: {task_name}",
         f"**执行结果**: {conclusion}",
         "**通过/失败/错误/未完成/跳过/总计**: "
@@ -244,7 +244,7 @@ def trigger_notification(
             attempted = True
             try:
                 recipients = parse_recipients(receiver.target_address)
-                subject = f"【AITS 自动化测试报告】任务: {task_name} 执行完毕"
+                subject = f"【自动化测试平台】任务: {task_name} 执行完毕"
                 send_email(subject, markdown_text, recipients, html_body=html_body)
                 logger.info(
                     "邮件通知发送成功: task_id=%s log_id=%s receiver_id=%s",

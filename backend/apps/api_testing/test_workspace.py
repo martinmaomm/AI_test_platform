@@ -62,8 +62,8 @@ class APIWorkspaceTests(TestCase):
             responses={'200': {'schema': {'$ref': 'https://example.invalid/common.yaml#/Result'}}},
         )
         value = endpoint_specs(self.project.id, [endpoint.id], spec_id=spec.id)[0]
-        self.assertEqual(value['request_body']['schema']['properties']['children']['items']['x-aits-ref-status'], 'circular')
-        self.assertEqual(value['responses']['200']['schema']['x-aits-ref-status'], 'external')
+        self.assertEqual(value['request_body']['schema']['properties']['children']['items']['x-platform-ref-status'], 'circular')
+        self.assertEqual(value['responses']['200']['schema']['x-platform-ref-status'], 'external')
 
     def setUp(self):
         self.user = get_user_model().objects.create_user(username='workspace-owner', email='workspace-owner@example.test', password='pw')

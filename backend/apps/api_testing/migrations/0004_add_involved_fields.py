@@ -1,4 +1,4 @@
-# Generated manually for aits_system
+# Generated manually for automation_system
 
 from django.db import migrations, models
 

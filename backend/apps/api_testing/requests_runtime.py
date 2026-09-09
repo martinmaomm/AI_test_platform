@@ -1,6 +1,6 @@
 """A small, deterministic requests runtime for API test-case JSON.
 
-This module intentionally has no Django or AITS imports.  ``export_python``
+This module intentionally has no Django or Automation Platform imports.  ``export_python``
 embeds this exact module source in generated files, so exported tests and the
 server execute the same normalisation, substitution, extraction and assertion
 code.  It accepts only structured JSON test cases; it never evaluates hooks,
@@ -1134,7 +1134,7 @@ def export_python(value: Any) -> str:
     The generated file intentionally shows a read-only case summary and Python
     literal before the embedded runtime. It is still one-way: the source case
     remains the editor's canonical JSON and generated Python is never parsed
-    back into AITS.
+    back into Automation Platform.
     """
     case = normalize_case(value)
     runtime_source = inspect.getsource(sys.modules[__name__]).rstrip()
@@ -1145,7 +1145,7 @@ def export_python(value: Any) -> str:
     preamble = runtime_source[:marker_index + len(future_marker)]
     runtime_body = runtime_source[marker_index + len(future_marker):].lstrip(chr(10))
     scenario = json.dumps(str(case["config"].get("name") or "未命名场景"), ensure_ascii=False)
-    summary_lines = [f"# 场景：{scenario}", "# 步骤摘要（只读；请在 AITS 编辑器修改后重新导出）："]
+    summary_lines = [f"# 场景：{scenario}", "# 步骤摘要（只读；请在自动化测试平台编辑器修改后重新导出）："]
     for index, step in enumerate(case["teststeps"], start=1):
         request = step["request"]
         name = json.dumps(str(step["name"]), ensure_ascii=False)
@@ -1156,7 +1156,7 @@ def export_python(value: Any) -> str:
     return f'''{preamble}
 
 {chr(10).join(summary_lines)}
-# 下方 CASE 是排版后的只读导出；不支持从 Python 反向同步到 AITS。
+# 下方 CASE 是排版后的只读导出；不支持从 Python 反向同步到自动化测试平台。
 CASE = {case_literal}
 
 

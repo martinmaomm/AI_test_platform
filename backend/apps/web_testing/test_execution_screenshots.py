@@ -54,7 +54,7 @@ class _OfflineTask:
 class ScreenshotMediaTestCase(TestCase):
     def setUp(self):
         super().setUp()
-        media = tempfile.TemporaryDirectory(prefix='aits-screenshot-tests-')
+        media = tempfile.TemporaryDirectory(prefix='automation-screenshot-tests-')
         self.addCleanup(media.cleanup)
         override = override_settings(MEDIA_ROOT=media.name)
         override.enable()

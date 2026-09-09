@@ -40,9 +40,9 @@ def database(call):
 
 def bootstrap(root):
     sys.path[:0] = [str(BACKEND), str(BACKEND / "apps")]
-    os.environ["DJANGO_SETTINGS_MODULE"] = "aits_backend.settings"
-    os.environ["AITS_OFFLINE_TEST_NETWORK"] = "blocked"
-    from aits_backend import settings as config
+    os.environ["DJANGO_SETTINGS_MODULE"] = "config.settings"
+    os.environ["OFFLINE_TEST_NETWORK"] = "blocked"
+    from config import settings as config
 
     config.DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(root / "test.sqlite3")}}
     config.SECRET_KEY = KEY
@@ -307,7 +307,7 @@ def verify(origin, fixture, output):
 def main():
     output = BACKEND / "logs" / "api-browser-discovery-browser"
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="aits-api-browser-discovery-") as temp, patch.object(
+    with tempfile.TemporaryDirectory(prefix="automation-api-browser-discovery-") as temp, patch.object(
         socket.socket, "connect", loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, "connect_ex", loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(temp))

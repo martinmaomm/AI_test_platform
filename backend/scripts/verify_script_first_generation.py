@@ -81,7 +81,7 @@ def main():
 
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / 'apps')]
-    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'aits_backend.settings')
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
     import django
     django.setup()

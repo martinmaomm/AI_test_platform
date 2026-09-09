@@ -1,5 +1,5 @@
 """
-URL configuration for aits_backend project.
+URL configuration for the Automation Platform project.
 """
 from django.contrib import admin
 from django.urls import path, include

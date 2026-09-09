@@ -102,7 +102,7 @@ test('capture is disabled unless the task switch is exactly enabled', () => {
 test('same toolHandler browser captures navigation, login, CRUD, popup and redirect', { timeout: 60000 }, async (t) => {
   if (!fs.existsSync(chromePath)) t.skip('Google Chrome is unavailable');
   const fixture = await startFixture();
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aits-mcp-capture-'));
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-capture-'));
   const originalChrome = process.env.CHROME_EXECUTABLE_PATH;
   try {
     const packageRoot = resolvePlaywrightMcpPackageRoot();
@@ -113,8 +113,8 @@ test('same toolHandler browser captures navigation, login, CRUD, popup and redir
     await installPlaywrightMcpNetworkCapture(packageRoot, {
       [NETWORK_CAPTURE_ENV]: '1', [NETWORK_CAPTURE_DIR_ENV]: tempRoot,
       [NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV]: fixture.origin,
-      AITS_MCP_NETWORK_CAPTURE_MAX_REQUESTS: '100', AITS_MCP_NETWORK_CAPTURE_MAX_BODY_BYTES: '8192',
-      AITS_MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES: '65536', AITS_MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS: '3000',
+      MCP_NETWORK_CAPTURE_MAX_REQUESTS: '100', MCP_NETWORK_CAPTURE_MAX_BODY_BYTES: '8192',
+      MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES: '65536', MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS: '3000',
     });
     process.env.CHROME_EXECUTABLE_PATH = chromePath;
     const handler = await import(pathToFileURL(path.join(packageRoot, 'dist/toolHandler.js')).href);
@@ -205,7 +205,7 @@ test('same toolHandler browser captures navigation, login, CRUD, popup and redir
 });
 
 test('one task storage budget covers public, raw, and action JSONL files', () => {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aits-mcp-storage-budget-'));
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-storage-budget-'));
   try {
     const capture = new NetworkCapture({
       directory: tempRoot, allowedOrigins: new Set(),

@@ -11,7 +11,7 @@ async function harness(t, initial = {}) {
   const props = reactive({ projectId: 1, executionId: 2, caseExecutionId: null, screenshotPath: '', status: 'running', ...initial })
   const calls = [], created = [], revoked = []
   const api = { fetch: async () => new Blob(['fixture'], { type: 'image/png' }) }
-  const key = `__aitsScreenshotTest${++moduleId}`
+  const key = `__automationScreenshotTest${++moduleId}`
   globalThis[key] = async (...args) => { calls.push(args); return api.fetch(...args) }
   const apiModule = dataModule(`export const getWebUITestExecutionScreenshot = globalThis[${JSON.stringify(key)}]`)
   const source = (await readFile(new URL('../src/composables/useWebUIExecutionScreenshot.js', import.meta.url), 'utf8'))

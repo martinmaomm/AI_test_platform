@@ -52,13 +52,13 @@ from .target_urls import target_origin, validate_target_url
 
 logger = logging.getLogger(__name__)
 
-SCRIPT_SAVE_TOOL_NAME = 'aits_save_script'
+SCRIPT_SAVE_TOOL_NAME = 'save_script_draft'
 _CHECKPOINT_INTERVAL_SECONDS = 3.0
 _RAW_MODEL_OUTPUT_LIMIT = 20000
 _MODEL_OUTPUT_SUMMARY_LIMIT = 2000
 _MAX_SCRIPT_CHARS = 200000
-_PENDING_STEP_PREFIX = '# AITS_PENDING_STEP:'
-_PENDING_ASSERTION_PREFIX = '# AITS_PENDING_ASSERTION:'
+_PENDING_STEP_PREFIX = '# PENDING_STEP:'
+_PENDING_ASSERTION_PREFIX = '# PENDING_ASSERTION:'
 _BASE64_RE = re.compile(r'(?<![a-z0-9+/=])[a-z0-9+/]{2048,}={0,2}', re.I)
 _SCREENSHOT_DATA_RE = re.compile(r'data:image/[^;,\s]+;base64,[a-z0-9+/=\s]+', re.I)
 _LOGIN_MARKERS = ('登录', 'login', 'sign in', 'signin')
@@ -254,15 +254,15 @@ def _visible_login_form_state(output: Any) -> bool | None:
 EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览器上下文中探索并增量编写 Python 草稿。
 所有工具操作按顺序串行执行，包括填写、点击、读取页面和保存草稿；前一个完成后再执行下一个。需要根据页面结果决定的后续操作，应等待本轮工具结果后再发出。
 生成的 Python 脚本也必须按业务步骤逐个 await 浏览器操作，不使用 asyncio.gather、create_task、线程池或进程池并发执行测试步骤。
-浏览器调用上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，模型调用上限 {MCP_MAX_STEPS} 次；接近预算时停止浏览器操作，使用 aits_save_script 保存当前完整草稿和真实剩余步骤。
-每次得到足够的页面证据或修复草稿后，都必须调用 aits_save_script。该工具会返回静态检查反馈；按反馈继续完善，而不是只在最终文本一次性给代码。
-aits_save_script 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
-任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 aits_save_script 持久化最新完整草稿，不要等到最终回复。
-只根据真实观察生成 goto、定位器和断言。未实际完成的操作必须在代码中保留 # AITS_PENDING_STEP: {{\"reason\":\"...\"}}；未知断言使用 # AITS_PENDING_ASSERTION: ...。存在 pending step 或 remaining_steps 时不可声称 complete。
+浏览器调用上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，模型调用上限 {MCP_MAX_STEPS} 次；接近预算时停止浏览器操作，使用 save_script_draft 保存当前完整草稿和真实剩余步骤。
+每次得到足够的页面证据或修复草稿后，都必须调用 save_script_draft。该工具会返回静态检查反馈；按反馈继续完善，而不是只在最终文本一次性给代码。
+save_script_draft 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
+任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 save_script_draft 持久化最新完整草稿，不要等到最终回复。
+只根据真实观察生成 goto、定位器和断言。未实际完成的操作必须在代码中保留 # PENDING_STEP: {{\"reason\":\"...\"}}；未知断言使用 # PENDING_ASSERTION: ...。存在 pending step 或 remaining_steps 时不可声称 complete。
 每条真实的 Python assert 或 await expect(...).to_*/not_to_* 前，必须紧邻写 # 验证：简洁中文业务结果，仅作为每条成功断言的可读标识。不得 print 平台的通过或测试完成日志，统一执行器会在实际成功时输出它们。
 若真实完成并确认某一待补充操作或断言，只移除该项对应 marker；仅删除 marker 不构成完成证明，绝不自动清除平台侧状态。只有全部目标工作和待补充项均已真实完成时，才以 completion=complete、remaining_steps=[] 保存；否则保持 partial 并列出具体剩余项。completed_steps、remaining_steps 和 marker 的 reason 使用简洁中文。
 不得伪造按钮、页面文字、定位器或断言。禁止 playwright_evaluate、上传、关闭浏览器、外域导航，以及审批、付款、发布、下载等未授权高风险操作。浏览器只可访问本次目标站点。
-无需也不得调用任何路径定稿工具或基于 event id 的完成协议。最终回复只用中文简短说明已保存的草稿状态和剩余项，不输出推理过程；草稿的权威版本来自 aits_save_script。"""
+无需也不得调用任何路径定稿工具或基于 event id 的完成协议。最终回复只用中文简短说明已保存的草稿状态和剩余项，不输出推理过程；草稿的权威版本来自 save_script_draft。"""
 
 
 @dataclass(frozen=True)
@@ -555,7 +555,7 @@ class ScriptExplorationAgent:
     def _configure_trace(self, *, output_generation_id: str) -> None:
         explicit_read_only = bool(self._brief.get('explicit_read_only'))
         policy = ExplorationPolicy(
-            namespace=f'aits-script-{self.generation_id or "local"}',
+            namespace=f'automation-script-{self.generation_id or "local"}',
             data_scope='scenario_namespace',
             explicit_read_only=explicit_read_only,
             allow_test_data_writes=bool(self._brief.get('allow_test_data_writes')) and not explicit_read_only,
@@ -778,7 +778,7 @@ class ScriptExplorationAgent:
                 '只能整理、修复已有草稿和 saved_trace 中实际观察到的操作。',
                 '不得创建 MCP/client/browser，不得补造未知定位器、按钮、断言或业务操作。',
                 '输出完整 Python 草稿；保留或补充顶部中文场景说明和步骤注释。',
-                'page.goto 必须使用完整 HTTP(S) 网址，首次打开 target_url，保留原路径、参数和 # 路由；不依赖 base_url 或测试环境。未知操作或断言必须保留 AITS_PENDING_STEP 或 AITS_PENDING_ASSERTION 注释。',
+                'page.goto 必须使用完整 HTTP(S) 网址，首次打开 target_url，保留原路径、参数和 # 路由；不依赖 base_url 或测试环境。未知操作或断言必须保留 PENDING_STEP 或 PENDING_ASSERTION 注释。',
                 '每条真实的 Python assert 或 await expect(...).to_*/not_to_* 前必须紧邻写 # 验证：简洁中文业务结果；不得 print 平台的通过或测试完成日志，统一执行器会输出。',
             ],
         }, ensure_ascii=False)

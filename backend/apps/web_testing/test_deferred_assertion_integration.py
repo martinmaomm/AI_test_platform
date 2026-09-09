@@ -39,7 +39,7 @@ async def run(page, variables):
     await page.goto('https://fixture.example.test/items')
     # 打开详情
     await page.locator('#open-details').click()
-    # AITS_PENDING_ASSERTION: {"reason":"观察结果不足以确定业务字段的正确预期"}
+    # PENDING_ASSERTION: {"reason":"观察结果不足以确定业务字段的正确预期"}
 '''
         generation = WebUIScriptGeneration.objects.create(
             project=self.project, user=self.user,
@@ -72,7 +72,7 @@ async def run(page, variables):
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW, result)
         self.assertFalse(generation.quality_report.get('blockers'))
-        self.assertIn('AITS_PENDING_ASSERTION:', generation.script_draft)
+        self.assertIn('PENDING_ASSERTION:', generation.script_draft)
         self.assertIn('goto(', generation.script_draft)
         self.assertIn('click()', generation.script_draft)
         self.assertEqual(generation.exploration_snapshot['schema_version'], 5)
@@ -86,7 +86,7 @@ async def run(page, variables):
         })
         self.assertEqual(response.status_code, 200, response.data)
         case = WebUITestCase.objects.get(pk=response.data['data']['test_case_id'])
-        self.assertIn('AITS_PENDING_ASSERTION:', case.test_script_content)
+        self.assertIn('PENDING_ASSERTION:', case.test_script_content)
 
         _, digest = prepare_debug(generation.pk, expected_revision=revision, execution_id=11)
         finish_debug(
@@ -105,7 +105,7 @@ async def run(page, variables):
         revision = generation.workspace['revision']
         lines = []
         for line in generation.script_draft.splitlines():
-            if line.lstrip().startswith('# AITS_PENDING_ASSERTION:'):
+            if line.lstrip().startswith('# PENDING_ASSERTION:'):
                 indent = line[:len(line) - len(line.lstrip())]
                 line = indent + "await expect(page.locator('#details')).to_be_visible()"
             lines.append(line)
@@ -118,7 +118,7 @@ async def run(page, variables):
         self.assertEqual(response.status_code, 200, response.data)
         generation.refresh_from_db()
         self.assertFalse(generation.quality_report.get('blockers'))
-        self.assertNotIn('AITS_PENDING_ASSERTION:', generation.script_draft)
+        self.assertNotIn('PENDING_ASSERTION:', generation.script_draft)
         revision = generation.workspace['revision']
         _, digest = prepare_debug(generation.pk, expected_revision=revision, execution_id=12)
         finish_debug(

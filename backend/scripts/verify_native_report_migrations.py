@@ -1,6 +1,6 @@
 """Round-trip report migrations using ONLY a disposable local MariaDB database.
 
-Database is fixed to aits_reports_verify, host to loopback, and credentials are
+Database is fixed to automation_reports_verify, host to loopback, and credentials are
 test-only. The caller must create and later remove its temporary container.
 """
 from __future__ import annotations
@@ -18,10 +18,10 @@ def main():
     args = parser.parse_args()
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
-    from aits_backend import settings as config
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
+    from config import settings as config
     config.DATABASES = {'default': {
-        'ENGINE': 'django.db.backends.mysql', 'NAME': 'aits_reports_verify',
+        'ENGINE': 'django.db.backends.mysql', 'NAME': 'automation_reports_verify',
         'USER': 'root', 'PASSWORD': 'offline-migration-only',
         'HOST': '127.0.0.1', 'PORT': args.port,
         'OPTIONS': {'charset': 'utf8mb4', 'connect_timeout': 5},
@@ -31,7 +31,7 @@ def main():
     config.CELERY_BROKER_URL = 'memory://'
     config.CELERY_RESULT_BACKEND = 'cache+memory://'
     config.LOGGING = {'version': 1, 'disable_existing_loggers': True}
-    with tempfile.TemporaryDirectory(prefix='aits-report-migration-media-') as media:
+    with tempfile.TemporaryDirectory(prefix='automation-report-migration-media-') as media:
         config.MEDIA_ROOT = media
         import django
         django.setup()

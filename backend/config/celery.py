@@ -1,5 +1,5 @@
 """
-Celery configuration for aits_backend project.
+Celery configuration for the Automation Platform project.
 """
 
 import os
@@ -17,9 +17,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "apps"))
 
 # Set the default Django settings module for the 'celery' program.
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'aits_backend.settings')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
-app = Celery('aits_backend')
+app = Celery('config')
 
 # Using a string here means the worker doesn't have to serialize
 # the configuration object to child processes.

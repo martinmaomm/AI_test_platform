@@ -235,7 +235,7 @@ import {
   getDashboardTopFailures
 } from '@/api/dashboard'
 
-const LAYOUT_KEY = 'aits-cockpit-layout'
+const LAYOUT_KEY = 'platform-cockpit-layout'
 
 const appStore = useAppStore()
 const projectStore = useProjectStore()

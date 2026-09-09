@@ -102,14 +102,14 @@ def main():
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
     output = BACKEND / 'logs' / 'api-browser-discovery-e2e'
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='aits-browser-discovery-e2e-') as temp, running_fixture() as site, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-browser-discovery-e2e-') as temp, running_fixture() as site, patch.object(
         socket.socket, 'connect', loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, 'connect_ex', loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(temp))
         # This integration deliberately sends real loopback HTTP. The source
         # bootstrap blocks *all* subprocess sockets for UI-only smoke tests;
         # here requests uses its exact fixture-origin guard and redirects off.
-        os.environ.pop('AITS_OFFLINE_TEST_NETWORK', None)
+        os.environ.pop('OFFLINE_TEST_NETWORK', None)
         from django.conf import settings
         settings.API_BROWSER_DISCOVERY_ENABLED = True
         from django.contrib.auth import get_user_model

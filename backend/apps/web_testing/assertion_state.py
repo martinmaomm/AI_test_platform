@@ -16,8 +16,8 @@ import tokenize
 from typing import Any, Iterator
 
 
-PENDING_ASSERTION_PREFIX = 'AITS_PENDING_ASSERTION:'
-PENDING_STEP_PREFIX = 'AITS_PENDING_STEP:'
+PENDING_ASSERTION_PREFIX = 'PENDING_ASSERTION:'
+PENDING_STEP_PREFIX = 'PENDING_STEP:'
 RUNTIME_ASSERTION_COUNT_KEY = 'runtime_assertion_count'
 _EXPECT_METHOD_PREFIXES = ('to_', 'not_to_')
 _PROGRESS_COMMENT_RE = re.compile(r'^\s*验证\s*[:：]\s*(?P<label>\S.*)$')
@@ -242,13 +242,13 @@ def instrument_runtime_assertions(source: str) -> str:
                 label = _progress_label(labels, node.lineno, '条件断言')
                 success.append(ast.Expr(
                     value=ast.Call(
-                        func=ast.Name(id='_aits_record_assertion', ctx=ast.Load()),
+                        func=ast.Name(id='_runtime_record_assertion', ctx=ast.Load()),
                         args=[ast.Constant(value=label)], keywords=[],
                     )
                 ))
             failure = ast.Expr(
                 value=ast.Call(
-                    func=ast.Name(id='_aits_record_assertion_failure', ctx=ast.Load()),
+                    func=ast.Name(id='_runtime_record_assertion_failure', ctx=ast.Load()),
                     args=[], keywords=[],
                 )
             )
@@ -271,7 +271,7 @@ def instrument_runtime_assertions(source: str) -> str:
             matcher = node.value
             label = _progress_label(labels, node.lineno, '页面断言')
             matcher.func.value = ast.Call(
-                func=ast.Name(id='_aits_wrap_expect', ctx=ast.Load()),
+                func=ast.Name(id='_runtime_wrap_expect', ctx=ast.Load()),
                 args=[matcher.func.value, ast.Constant(value=label)],
                 keywords=[],
             )

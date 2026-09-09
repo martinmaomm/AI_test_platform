@@ -35,7 +35,7 @@ async def run(page):
     await page.goto('https://web.example.test/items')
     await expect(page.locator('#result')).to_be_visible()
 '''
-PENDING_SCRIPT = COMPLETE_SCRIPT + '\n    # AITS_PENDING_ASSERTION: {"reason":"待补充"}\n'
+PENDING_SCRIPT = COMPLETE_SCRIPT + '\n    # PENDING_ASSERTION: {"reason":"待补充"}\n'
 
 
 class _OfflineTask:

@@ -11,7 +11,7 @@
       :class="{ 'login-container--focused': isFormFocused }"
     >
       <div class="login-card">
-        <AITSBrand size="large" />
+        <PlatformBrand size="large" />
 
         <div
           class="form-focus-wrapper"
@@ -77,7 +77,7 @@ import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
-import AITSBrand from '@/components/AITSBrand.vue'
+import PlatformBrand from '@/components/PlatformBrand.vue'
 import { safeInternalRedirect } from '@/utils/reportLinks'
 
 const router = useRouter()

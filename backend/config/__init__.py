@@ -1,4 +1,4 @@
-"""Django project package."""
+"""Django configuration package."""
 
 import pymysql
 

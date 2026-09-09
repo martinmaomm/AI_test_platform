@@ -694,16 +694,16 @@ def _endpoint_contract(samples: list[BrowserDiscoveryRecord]) -> tuple[list[dict
             name = query.get('name') if isinstance(query, dict) else None
             if isinstance(name, str):
                 query_names.setdefault(name, {
-                    'name': name, 'in': 'query', 'x-aits-observed': True,
-                    'x-aits-required': 'unknown',
+                    'name': name, 'in': 'query', 'x-platform-observed': True,
+                    'x-platform-required': 'unknown',
                 })
         if sample.content_type in _SUPPORTED_REQUEST_TYPES:
-            request_content.setdefault(sample.content_type, {'x-aits-observed': True})
+            request_content.setdefault(sample.content_type, {'x-platform-observed': True})
         if sample.status_code:
-            responses.setdefault(str(sample.status_code), {'description': 'Observed browser response', 'x-aits-observed': True})
+            responses.setdefault(str(sample.status_code), {'description': 'Observed browser response', 'x-platform-observed': True})
     request_body = {}
     if request_content:
-        request_body = {'content': request_content, 'x-aits-observed': True, 'x-aits-required': 'unknown'}
+        request_body = {'content': request_content, 'x-platform-observed': True, 'x-platform-required': 'unknown'}
     return list(query_names.values()), request_body, responses
 
 

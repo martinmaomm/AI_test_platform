@@ -1,6 +1,6 @@
-# AITS · AI 自动化测试平台
+# 自动化测试平台 · Automation Platform
 
-AITS 是一个以项目为单位管理测试的平台：使用自然语言和 AI 生成 UI / API 自动化用例，在平台内调试、修复和保存，再通过测试套件、计划任务重复执行，并查看统一的执行报告。
+自动化测试平台是一个以项目为单位管理测试的平台：使用自然语言和 AI 生成 UI / API 自动化用例，在平台内调试、修复和保存，再通过测试套件、计划任务重复执行，并查看统一的执行报告。
 
 当前主要能力是 **UI 自动化、API 自动化和项目知识库**。首页的 App 自动化、性能测试是开发中入口，暂不可使用。
 
@@ -62,7 +62,7 @@ UI 流程不再要求选择测试环境或单独填写 Base URL，脚本使用�
 
 平台检查脚本结构及待补全标记，但**生成完成不等于实际运行通过**。
 
-用户可以在生成页面直接编辑和调试脚本，查看日志、失败摘要和截图。存在 `AITS_PENDING_STEP` 或 `AITS_PENDING_ASSERTION` 时，表示操作或断言仍待补全，不能当作完整验证通过。
+用户可以在生成页面直接编辑和调试脚本，查看日志、失败摘要和截图。存在 `PENDING_STEP` 或 `PENDING_ASSERTION` 时，表示操作或断言仍待补全，不能当作完整验证通过。
 
 脚本入口为 `async def run(page)` 或 `async def run(page, variables)`，浏览器由平台管理，脚本负责打开目标网址和执行业务操作。
 
@@ -152,7 +152,7 @@ API 变量覆盖顺序为：**本次执行 > 套件 > 用例 > API 环境默认�
 ## 项目结构
 
 ```text
-aits/
+automation-platform/
 ├── README.md                    # 项目总览与业务流程
 ├── docs/                        # 安装、使用、设计及验收文档
 ├── frontend/                    # Vue 前端
@@ -161,7 +161,7 @@ aits/
     ├── env.example              # 后端配置模板
     ├── requirements.txt         # Python 依赖
     ├── run_asgi.py              # 后端 HTTP / WebSocket 启动入口
-    ├── aits_backend/            # Django、Celery 等全局配置
+    ├── config/                  # Django、Celery 等全局配置
     ├── apps/
     │   ├── web_testing/         # UI 探索、Python 执行和脚本助手
     │   ├── api_testing/         # API 工作区、requests 执行和导出

@@ -19,19 +19,19 @@
     <el-alert v-if="draftDirty" type="info" :closable="false" show-icon title="本地草稿有修改，保存后会重新检查待补充步骤和断言。" />
     <el-alert v-else-if="pendingSteps.length" type="warning" :closable="false" show-icon :title="`草稿仍有 ${pendingSteps.length} 项待补充步骤`">
       <template #default>
-        <p>请先确认对应操作已真实完成，再删除该项 <code>AITS_PENDING_STEP</code> 注释并重新调试；仅删除注释不构成完成证明。</p>
+        <p>请先确认对应操作已真实完成，再删除该项 <code>PENDING_STEP</code> 注释并重新调试；仅删除注释不构成完成证明。</p>
         <ul><li v-for="item in pendingSteps" :key="`step-${item.line}-${item.assertion_id}`">第 {{ item.line || '未记录' }} 行 · 待补充步骤：{{ displayPendingReason(item.reason) }}</li></ul>
       </template>
     </el-alert>
     <el-alert v-if="!draftDirty && pendingAssertions.length" type="warning" :closable="false" show-icon :title="`草稿仍有 ${pendingAssertions.length} 项待补充断言`">
       <template #default>
-        <p>补入真实 <code>await expect(...)</code> 或 <code>assert</code> 后，请删除对应 <code>AITS_PENDING_ASSERTION</code> 注释并重新运行。</p>
+        <p>补入真实 <code>await expect(...)</code> 或 <code>assert</code> 后，请删除对应 <code>PENDING_ASSERTION</code> 注释并重新运行。</p>
         <ul><li v-for="item in pendingAssertions" :key="`assertion-${item.line}-${item.assertion_id}`">第 {{ item.line || '未记录' }} 行 · 待补充断言：{{ displayPendingReason(item.criterion, '未填写验证目标') }}（{{ displayPendingReason(item.reason) }}）</li></ul>
       </template>
     </el-alert>
     <el-alert v-else-if="!draftDirty && assertionState.status === 'incomplete' && assertionState.confirmed_count === 0" type="warning" :closable="false" show-icon title="草稿缺少有效断言">
       <template #default>
-        <p>删除 <code>AITS_PENDING_ASSERTION</code> 注释本身不会完成验证。请补入真实 <code>await expect(...)</code> 或非纯常量 <code>assert</code>，然后重新运行。</p>
+        <p>删除 <code>PENDING_ASSERTION</code> 注释本身不会完成验证。请补入真实 <code>await expect(...)</code> 或非纯常量 <code>assert</code>，然后重新运行。</p>
       </template>
     </el-alert>
 

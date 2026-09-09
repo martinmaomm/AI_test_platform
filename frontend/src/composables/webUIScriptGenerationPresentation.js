@@ -52,7 +52,7 @@ export const modelInfoLabel = (model, emptyLabel = '—') => (
 )
 
 export const generationStorageKey = (userId, projectId) => (
-  `aits:webui-script-generation:v5:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
+  `automation:webui-script-generation:v5:${String(userId || 'anonymous')}:${String(projectId || 'none')}`
 )
 
 export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(status)

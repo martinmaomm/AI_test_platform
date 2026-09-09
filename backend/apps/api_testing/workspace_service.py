@@ -176,34 +176,34 @@ def _resolve_endpoint_refs(value: Any, document: Any, resolving: frozenset[str] 
         # APIParserService persists locally-expanded schemas together with the
         # source pointer.  Prefer that checked expansion when the original
         # document is not retained in ``metadata``.
-        if value.get('x-aits-ref-status') == 'resolved':
+        if value.get('x-platform-ref-status') == 'resolved':
             return {
                 key: _resolve_endpoint_refs(item, document, resolving, depth)
-                for key, item in value.items() if key not in {'$ref', 'x-aits-ref-status'}
+                for key, item in value.items() if key not in {'$ref', 'x-platform-ref-status'}
             }
         copied = {key: _resolve_endpoint_refs(item, document, resolving, depth) for key, item in value.items()}
         if not isinstance(reference, str) or not reference.startswith('#/'):
-            copied['x-aits-ref-status'] = 'external'
+            copied['x-platform-ref-status'] = 'external'
             return copied
         if reference in resolving:
-            copied['x-aits-ref-status'] = 'circular'
+            copied['x-platform-ref-status'] = 'circular'
             return copied
         if depth >= _MAX_LOCAL_REF_DEPTH:
-            copied['x-aits-ref-status'] = 'truncated'
+            copied['x-platform-ref-status'] = 'truncated'
             return copied
         current: Any = document
         try:
             for part in reference[2:].split('/'):
                 current = current[part.replace('~1', '/').replace('~0', '~')]
         except (KeyError, IndexError, TypeError, ValueError):
-            copied['x-aits-ref-status'] = 'unresolved'
+            copied['x-platform-ref-status'] = 'unresolved'
             return copied
         resolved = _resolve_endpoint_refs(current, document, resolving | {reference}, depth + 1)
         if not isinstance(resolved, dict):
-            copied['x-aits-ref-status'] = 'unresolved'
+            copied['x-platform-ref-status'] = 'unresolved'
             return copied
         resolved.update(copied)
-        resolved['x-aits-ref-status'] = 'resolved'
+        resolved['x-platform-ref-status'] = 'resolved'
         return resolved
     return {key: _resolve_endpoint_refs(item, document, resolving, depth) for key, item in value.items()}
 
@@ -598,7 +598,7 @@ def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspa
 
 def generation_timeout_seconds() -> int:
     """Bound the complete queued generate-and-verify pipeline."""
-    configured = os.environ.get('AITS_API_GENERATION_TIMEOUT_SECONDS', '1800')
+    configured = os.environ.get('API_GENERATION_TIMEOUT_SECONDS', '1800')
     try:
         return max(60, int(configured))
     except ValueError:

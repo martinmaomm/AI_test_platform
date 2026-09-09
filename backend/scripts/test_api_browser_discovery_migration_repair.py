@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(BACKEND), str(BACKEND / 'apps')]
-os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
 os.environ['ANONYMIZED_TELEMETRY'] = 'false'
 os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
 
@@ -20,7 +20,7 @@ def deny_network(*args, **kwargs):
 
 
 with patch.object(socket.socket, 'connect', deny_network), patch.object(socket.socket, 'connect_ex', deny_network):
-    from aits_backend import settings as config
+    from config import settings as config
     config.DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}}
     config.CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
     config.CHANNEL_LAYERS = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}

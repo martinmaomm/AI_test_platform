@@ -1,5 +1,5 @@
 """
-ASGI config for aits_backend project.
+ASGI config for the Automation Platform project.
 """
 
 import os
@@ -10,7 +10,7 @@ from channels.auth import AuthMiddlewareStack
 from common.websocket import WebSocketJWTAuthMiddlewareStack
 from api_testing import routing
 
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'aits_backend.settings')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
 # 获取Django ASGI应用
 django_asgi_app = get_asgi_application()

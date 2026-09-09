@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 
-const THEME_KEY = 'aits-cockpit-theme'
+const THEME_KEY = 'platform-cockpit-theme'
 
 function getStoredTheme() {
   try {

@@ -42,9 +42,9 @@ EXPLORER_CONSTRAINTS = f"""你负责在一个连续浏览器会话中完成完�
 只创建一次连续上下文：按 instructions 顺序登录、导航、操作、验证和清理；业务步骤之间不得回到 start_path，除非确认会话丢失。
 所有 playwright_navigate 调用必须传 JSON 布尔值 headless: true。浏览器工具硬上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，智能体最多 {MCP_MAX_STEPS} 步。达到探索预算后，立即停止浏览器调用并只用本地定稿工具收尾。
 callback 轨迹是平台唯一事实来源；最终文本不提供事件、选择器、HTML 或脚本。
-平台自动记录每个 Playwright callback；失败、绕路和不稳定定位只用于诊断，绝不可静默删除。接近结束时先调用 aits_get_path_candidates，读取安全候选摘要；随后只调用一次 aits_finalize_path 提交最终主动作、已证实 assertion_id 对应的观察事件、无法确认的 pending_assertions、可选清理动作及简短中文步骤名。每个 assertion_id 必须恰好出现在 assertions 或 pending_assertions 中。平台自动将首次成功 playwright_navigate 作为入口，不要手工选择 navigate；纯读取场景可仅提交入口后的真实断言，但纯导航加全 pending 不能冒充完成。最终定稿后不得再调用浏览器工具，否则定稿会失效且必须重新定稿。
-只选择成功、顺序递增且有稳定 locator 的真实 callback。fill/select 只有精确匹配 runtime_input_values 或 aits_declare_generated_input 返回的 input ref 时才可选择；候选摘要标为 unmapped_input 的事件不可选择。固定 assertion requirement 必须严格满足原有语义。deferred requirement 的 success_criteria 只作目标上下文；其中不在 original_user_target 的页面文字不是必需条件，不得据此猜测页面提示。只有真实成功 observation 和稳定 locator 支持时，才为 deferred assertion 提交 visible、contains_ref 或 contains_literal 的具体断言；否则以带原因和相应成功步骤 after_event_id 的 pending_assertion 提交。清理动作必须在主场景后，清理验证必须在最后一个清理动作后。
-发现计划外必填输入时，先调用 aits_declare_generated_input 声明通用动态变量，再原样使用该工具返回的值；不能使用凭据变量或自行猜值代替。每次成功操作后优先一次目标 visible-text 观察；只有可见文本不足以定位或验证时才读取 HTML，不重复读取未变化页面。SPA 路由变化后优先用能返回页面状态/URL 的观察工具确认当前位置。结束前保留验证和清理页面证据。
+平台自动记录每个 Playwright callback；失败、绕路和不稳定定位只用于诊断，绝不可静默删除。接近结束时先调用 get_exploration_path_candidates，读取安全候选摘要；随后只调用一次 finalize_exploration_path 提交最终主动作、已证实 assertion_id 对应的观察事件、无法确认的 pending_assertions、可选清理动作及简短中文步骤名。每个 assertion_id 必须恰好出现在 assertions 或 pending_assertions 中。平台自动将首次成功 playwright_navigate 作为入口，不要手工选择 navigate；纯读取场景可仅提交入口后的真实断言，但纯导航加全 pending 不能冒充完成。最终定稿后不得再调用浏览器工具，否则定稿会失效且必须重新定稿。
+只选择成功、顺序递增且有稳定 locator 的真实 callback。fill/select 只有精确匹配 runtime_input_values 或 declare_generated_input 返回的 input ref 时才可选择；候选摘要标为 unmapped_input 的事件不可选择。固定 assertion requirement 必须严格满足原有语义。deferred requirement 的 success_criteria 只作目标上下文；其中不在 original_user_target 的页面文字不是必需条件，不得据此猜测页面提示。只有真实成功 observation 和稳定 locator 支持时，才为 deferred assertion 提交 visible、contains_ref 或 contains_literal 的具体断言；否则以带原因和相应成功步骤 after_event_id 的 pending_assertion 提交。清理动作必须在主场景后，清理验证必须在最后一个清理动作后。
+发现计划外必填输入时，先调用 declare_generated_input 声明通用动态变量，再原样使用该工具返回的值；不能使用凭据变量或自行猜值代替。每次成功操作后优先一次目标 visible-text 观察；只有可见文本不足以定位或验证时才读取 HTML，不重复读取未变化页面。SPA 路由变化后优先用能返回页面状态/URL 的观察工具确认当前位置。结束前保留验证和清理页面证据。
 不允许审批、付款、发布、上传、下载或未授权外部操作。只在 allow_test_data_writes=true 时操作本轮 namespace 测试数据；结果未知时停止，不得重试。
 runtime_input_values 是平台提供的唯一输入值映射。仅在实际需要填充或选择时原样使用；不得猜测 ref、不得改写值。测试环境模式允许凭据随 callback、日志和截图保留。
 元素未找到、不可见、未启用、严格模式冲突或尚未加载时，先重新观察当前页面并在预算内调整定位；不要把确认未执行的定位失败当作写入结果未知。
@@ -97,7 +97,7 @@ def build_finalization_tools(recorder: ExplorationTraceRecorder) -> list[Structu
 
     return [
         StructuredTool.from_function(
-            func=candidates, name='aits_get_path_candidates',
+            func=candidates, name='get_exploration_path_candidates',
             description='读取安全候选事件摘要；必须在最终路径定稿前调用。',
             args_schema=CandidateSummaryInput,
         ),
@@ -128,7 +128,7 @@ def build_dynamic_input_tools(
 
     return [StructuredTool.from_function(
         func=declare_generated_input,
-        name='aits_declare_generated_input',
+        name='declare_generated_input',
         description='声明页面新发现的必填输入，返回仅限本次会话使用的动态变量和值。',
         args_schema=DynamicGeneratedInputRequest,
     )]
@@ -187,7 +187,7 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
                             blocked_before_execution=True, tool_name=tool_name,
                         )
                     raise FinalizationOnlyBrowserToolError(
-                        '浏览器探索预算已用完；请立即调用 aits_get_path_candidates 和 aits_finalize_path 收尾。'
+                        '浏览器探索预算已用完；请立即调用 get_exploration_path_candidates 和 finalize_exploration_path 收尾。'
                     )
                 if tool_name in READ_ONLY_DISABLED_TOOL_MESSAGES:
                     self._blocked_write_tool_calls += 1
@@ -299,12 +299,12 @@ class MCPPageExplorer:
         ).hexdigest()[:8]
         token = secrets.token_hex(8)
         if value_kind == 'email':
-            return f'aits-{scope}-{token}@example.com'
+            return f'automation-{scope}-{token}@example.com'
         if value_kind == 'password':
-            return f'Aits!{token}9'
+            return f'Auto!{token}9'
         if value_kind == 'integer':
             return str(secrets.randbelow(900000) + 100000)
-        return f'aits-{scope}-{token}'
+        return f'automation-{scope}-{token}'
 
     async def explore_until_complete(self, *, plan: ScenarioPlan, start_path: str, target_url_safe: str, temporary_credentials: dict[str, str] | None = None) -> ExplorationTrace:
         if await self._is_cancelled():
@@ -339,10 +339,10 @@ class MCPPageExplorer:
                 'runtime_input_values': runtime_values,
                 'scope_policy': self.policy.prompt_scope(),
                 'finalization_protocol': {
-                    'candidate_tool': 'aits_get_path_candidates',
+                    'candidate_tool': 'get_exploration_path_candidates',
                     'finalization_tool': FINALIZATION_TOOL_NAME,
                     'entry_navigation': 'the platform automatically adds the first successful navigate callback',
-                    'input_rule': 'only callback-mapped runtime_input_values or aits_declare_generated_input refs may be selected for fill/select',
+                    'input_rule': 'only callback-mapped runtime_input_values or declare_generated_input refs may be selected for fill/select',
                     'staleness': 'any browser callback after finalization invalidates it',
                     'finalization_browser_call_limit': MCP_FINALIZATION_BROWSER_CALL_LIMIT,
                 },

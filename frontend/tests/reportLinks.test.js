@@ -13,7 +13,7 @@ test('login report return paths cannot navigate outside this application', () =>
 test('native report links keep project and execution ids encoded', () => {
   assert.equal(reportPath('web', 12, 34), '/reports/web/12/34')
   assert.equal(reportPath('api', 'project id', 'run/id'), '/reports/api/project%20id/run%2Fid')
-  assert.equal(reportUrl('web', 12, 34, 'https://aits.example'), 'https://aits.example/reports/web/12/34')
+  assert.equal(reportUrl('web', 12, 34, 'https://automation.example'), 'https://automation.example/reports/web/12/34')
 })
 
 test('report routes are authenticated and old static-report proxy is absent', async () => {

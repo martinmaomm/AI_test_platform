@@ -3,7 +3,7 @@
     <!-- 侧边栏 -->
     <el-aside width="220px" class="sidebar">
       <div class="sidebar-header">
-        <AITSBrand size="small" />
+        <PlatformBrand size="small" />
       </div>
 
       <!-- 工作区头部：返回链接 + 项目身份区（项目名 + 模块名） -->
@@ -181,7 +181,7 @@ import {
   Sunny, Moon, Monitor, FolderOpened
 } from '@element-plus/icons-vue'
 import { useAppStore } from '@/stores/app'
-import AITSBrand from '@/components/AITSBrand.vue'
+import PlatformBrand from '@/components/PlatformBrand.vue'
 
 // -------- 全量菜单配置（按 module 分组，供动态过滤）--------
 const MENU_CONFIG = {

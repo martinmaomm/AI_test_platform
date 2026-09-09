@@ -334,42 +334,42 @@ def {safe_name}():
     runtime_support = f'''
 
 import inspect
-_aits_runtime_assertion_count = 0
-_aits_runtime_assertion_failed = False
+_runtime_assertion_count = 0
+_runtime_assertion_failed = False
 
-def _aits_record_assertion(label):
-    global _aits_runtime_assertion_count
-    _aits_runtime_assertion_count += 1
+def _runtime_record_assertion(label):
+    global _runtime_assertion_count
+    _runtime_assertion_count += 1
     print(f"验证 {{label}} 通过", flush=True)
 
-def _aits_record_assertion_failure():
-    global _aits_runtime_assertion_failed
-    _aits_runtime_assertion_failed = True
+def _runtime_record_assertion_failure():
+    global _runtime_assertion_failed
+    _runtime_assertion_failed = True
 
-def _aits_emit_completion():
+def _runtime_emit_completion():
     if (
-        _aits_runtime_assertion_count > 0
-        and not _aits_runtime_assertion_failed
+        _runtime_assertion_count > 0
+        and not _runtime_assertion_failed
         and {assertion_state_complete!r}
     ):
         print("测试用例执行完毕", flush=True)
 
-def _aits_write_assertion_count():
+def _runtime_write_assertion_count():
     if not {runtime_count_path_literal}:
         return
     try:
-        with open({runtime_count_path_literal}, "w", encoding="utf-8") as __aits_handle:
-            json.dump({{"runtime_assertion_count": _aits_runtime_assertion_count}}, __aits_handle)
+        with open({runtime_count_path_literal}, "w", encoding="utf-8") as __runtime_handle:
+            json.dump({{"runtime_assertion_count": _runtime_assertion_count}}, __runtime_handle)
     except OSError:
         pass
 
-class _AITSExpectationProxy:
+class _AssertionExpectationProxy:
     def __init__(self, value, label):
-        self._aits_value = value
-        self._aits_label = label
+        self._runtime_value = value
+        self._runtime_label = label
 
     def __getattr__(self, name):
-        original = getattr(self._aits_value, name)
+        original = getattr(self._runtime_value, name)
         if not name.startswith(("to_", "not_to_")):
             return original
 
@@ -377,7 +377,7 @@ class _AITSExpectationProxy:
             try:
                 result = original(*args, **kwargs)
             except BaseException:
-                globals()["_aits_record_assertion_failure"]()
+                globals()["_runtime_record_assertion_failure"]()
                 raise
             if not inspect.isawaitable(result):
                 return result
@@ -386,22 +386,22 @@ class _AITSExpectationProxy:
                 try:
                     value = await result
                 except BaseException:
-                    globals()["_aits_record_assertion_failure"]()
+                    globals()["_runtime_record_assertion_failure"]()
                     raise
-                globals()["_aits_record_assertion"](self._aits_label)
+                globals()["_runtime_record_assertion"](self._runtime_label)
                 return value
 
             return await_and_record()
 
         return tracked
 
-def _aits_wrap_expect(value, label):
+def _runtime_wrap_expect(value, label):
     # AST instrumentation is the sole path that adds a progress label.
     # Unwrapping also keeps this helper safe if a manually maintained
     # script has already passed a proxied expectation.
-    if isinstance(value, _AITSExpectationProxy):
-        value = value._aits_value
-    return _AITSExpectationProxy(value, label)
+    if isinstance(value, _AssertionExpectationProxy):
+        value = value._runtime_value
+    return _AssertionExpectationProxy(value, label)
 '''
     wrapper = f'''
 
@@ -435,34 +435,34 @@ async def _run_with_managed_browser():
                     logging.getLogger(__name__).warning(
                         "执行结束截图生成失败: %s", screenshot_error
                     )
-            _aits_active_exception = sys.exc_info()[0] is not None
-            _aits_close_error = None
+            _runtime_active_exception = sys.exc_info()[0] is not None
+            _runtime_close_error = None
             try:
                 await context.close()
             except Exception as close_error:
-                _aits_close_error = close_error
-                if _aits_active_exception:
+                _runtime_close_error = close_error
+                if _runtime_active_exception:
                     logging.getLogger(__name__).warning(
                         "上下文关闭失败（保留原始执行异常）: %s", close_error
                     )
             try:
                 await browser.close()
             except Exception as close_error:
-                if _aits_active_exception:
+                if _runtime_active_exception:
                     logging.getLogger(__name__).warning(
                         "浏览器关闭失败（保留原始执行异常）: %s", close_error
                     )
-                elif _aits_close_error is None:
-                    _aits_close_error = close_error
+                elif _runtime_close_error is None:
+                    _runtime_close_error = close_error
                 else:
                     logging.getLogger(__name__).warning(
                         "浏览器关闭失败（保留先前关闭异常）: %s", close_error
                     )
             finally:
-                _aits_write_assertion_count()
-            if _aits_close_error is not None and not _aits_active_exception:
-                raise _aits_close_error
-    _aits_emit_completion()
+                _runtime_write_assertion_count()
+            if _runtime_close_error is not None and not _runtime_active_exception:
+                raise _runtime_close_error
+    _runtime_emit_completion()
 
 def {safe_name}():
     asyncio.run(_run_with_managed_browser())

@@ -103,7 +103,7 @@ class APIParserService:
             'security': security,
         }
         # APIEndpoint 没有独立 operation 元数据列；采用 JSON 扩展避免污染参数或媒体类型。
-        request_body['x-aits-operation'] = operation_metadata
+        request_body['x-platform-operation'] = operation_metadata
         endpoint_data = {
             'path': path,
             'method': method.upper(),
@@ -318,17 +318,17 @@ class APIParserService:
             return copy.deepcopy(dict(value))
         if ref in resolving:
             result = copy.deepcopy(dict(value))
-            result['x-aits-ref-status'] = 'cyclic'
+            result['x-platform-ref-status'] = 'cyclic'
             return result
         target = self._resolve_ref(ref)
         if not isinstance(target, Mapping):
             result = copy.deepcopy(dict(value))
-            result['x-aits-ref-status'] = 'unresolved'
+            result['x-platform-ref-status'] = 'unresolved'
             return result
         resolved = self._resolve_reference_object(target, resolving | {ref})
         result = copy.deepcopy(dict(resolved)) if isinstance(resolved, Mapping) else {}
         result.update(copy.deepcopy(dict(value)))
-        result['x-aits-ref-status'] = 'resolved'
+        result['x-platform-ref-status'] = 'resolved'
         return result
 
     def _extract_schema(
@@ -364,16 +364,16 @@ class APIParserService:
         if not isinstance(ref, str):
             return schema_data
         if ref in resolving:
-            schema_data['x-aits-ref-status'] = 'cyclic'
+            schema_data['x-platform-ref-status'] = 'cyclic'
             return schema_data
         target = self._resolve_ref(ref)
         if not isinstance(target, Mapping):
-            schema_data['x-aits-ref-status'] = 'unresolved'
+            schema_data['x-platform-ref-status'] = 'unresolved'
             return schema_data
         resolved = self._extract_schema(target, resolving | {ref})
         # 保留 $ref 和所有同级字段，同时使本地消费者可读取已解析 properties/constraints。
         resolved.update(schema_data)
-        resolved['x-aits-ref-status'] = 'resolved'
+        resolved['x-platform-ref-status'] = 'resolved'
         return resolved
     
     def parse_api_specification_from_file(self, spec, uploaded_file) -> Dict[str, Any]:
@@ -579,8 +579,8 @@ class APIParserService:
         request_body = self._convert_body_param_to_request_body(
             parameters, request_body, endpoint_info.get('consumes'),
         )
-        if 'x-aits-operation' not in request_body:
-            request_body['x-aits-operation'] = {
+        if 'x-platform-operation' not in request_body:
+            request_body['x-platform-operation'] = {
                 'consumes': copy.deepcopy(endpoint_info.get('consumes', [])),
                 'produces': copy.deepcopy(endpoint_info.get('produces', [])),
                 'security': copy.deepcopy(endpoint_info.get('security', [])),

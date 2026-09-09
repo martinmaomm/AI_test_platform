@@ -135,7 +135,7 @@ PYTHON_PLAYWRIGHT_BROWSERS_PATH=.python-playwright-browsers
 修改 `.env` 后需要重启 Celery Worker：
 
 ```bash
-celery -A aits_backend worker --loglevel=info --pool=solo
+celery -A config worker --loglevel=info --pool=solo
 ```
 
 ## 验证安装结果

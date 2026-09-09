@@ -288,7 +288,7 @@ test('workspace defers stale pending details after local edits and technical sec
   const resultPanel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
   const evidence = readFileSync(new URL('../src/components/webui-generation/GenerationEvidence.vue', import.meta.url), 'utf8')
   assert.match(workspace, /本地草稿有修改，保存后会重新检查待补充步骤和断言/)
-  assert.doesNotMatch(workspace, /form\.script_draft\.includes\('AITS_PENDING_STEP'\)/)
+  assert.doesNotMatch(workspace, /form\.script_draft\.includes\('PENDING_STEP'\)/)
   assert.match(resultPanel, /查看任务技术信息/)
   assert.match(resultPanel, /model_output_raw/)
   assert.match(resultPanel, /generation_error_message/)

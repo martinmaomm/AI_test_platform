@@ -10,17 +10,17 @@ from unittest.mock import patch
 def main():
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
 
     def deny(*args):
         raise RuntimeError('Network is forbidden in migration acceptance')
 
-    with tempfile.TemporaryDirectory(prefix='aits-browser-source-migration-') as temp, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-browser-source-migration-') as temp, patch.object(
         socket.socket, 'connect', deny,
     ), patch.object(socket.socket, 'connect_ex', deny):
-        from aits_backend import settings as config
+        from config import settings as config
         config.DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': str(Path(temp) / 'migration.sqlite3')}}
         config.CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
         config.CHANNEL_LAYERS = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}

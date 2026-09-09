@@ -15,7 +15,7 @@ from .browser_discovery_agent import (
 
 class BrowserDiscoveryAgentTests(SimpleTestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='aits-capture-agent-')
+        self.temp = tempfile.TemporaryDirectory(prefix='automation-capture-agent-')
         self.addCleanup(self.temp.cleanup)
         self.options = {
             'llm_model': Mock(),
@@ -48,11 +48,11 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         config = prepare_capture_config(original, self.options['task_id'], self.options['trace_file'], 'https://api.example.test', {'max_requests': 30})
         self.assertEqual(set(config['mcpServers']), {'playwright'})
         env = config['mcpServers']['playwright']['env']
-        self.assertEqual(env['AITS_MCP_NETWORK_CAPTURE'], '1')
-        self.assertEqual(env['AITS_MCP_NETWORK_CAPTURE_MAX_REQUESTS'], '30')
-        self.assertEqual(env['AITS_MCP_NETWORK_CAPTURE_DIR'], str(Path(self.temp.name).resolve()))
+        self.assertEqual(env['MCP_NETWORK_CAPTURE'], '1')
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_MAX_REQUESTS'], '30')
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_DIR'], str(Path(self.temp.name).resolve()))
         self.assertNotIn('env', original['mcpServers']['playwright'])
-        self.assertNotIn('AITS_MCP_NETWORK_CAPTURE', str(original))
+        self.assertNotIn('MCP_NETWORK_CAPTURE', str(original))
 
     def test_unsupported_package_fails_without_silently_using_another_browser(self):
         with self.assertRaisesRegex(ValueError, '固定'):
@@ -61,7 +61,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
 
     def test_empty_api_origin_collects_metadata_only(self):
         config = prepare_capture_config(self.options['mcp_config'], self.options['task_id'], self.options['trace_file'], '', {})
-        self.assertEqual(config['mcpServers']['playwright']['env']['AITS_MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS'], '')
+        self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS'], '')
 
     def test_plain_model_final_text_does_not_require_json_or_script(self):
         client, session = self.clients()
@@ -75,7 +75,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertEqual(result['error_code'], '')
         self.assertIn('playwright_post', factory.call_args.kwargs['disallowed_tools'])
         self.assertIn(self.options['target_url'], agent.run.call_args.args[0])
-        self.assertNotIn('aits_save_script', agent.run.call_args.args[0])
+        self.assertNotIn('save_script_draft', agent.run.call_args.args[0])
         session.call_tool.assert_awaited_once_with('playwright_close', {})
         client.close_all_sessions.assert_awaited_once()
         self.assertEqual(checkpoint.call_args.args[0]['phase'], 'finalizing')

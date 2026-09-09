@@ -21,7 +21,7 @@ from test_project_knowledge_browser import _NoMigrations, _QuietHandler, _static
 
 
 BACKEND = Path(__file__).resolve().parent.parent
-CHROME = Path(os.environ.get('AITS_TEST_CHROME_EXECUTABLE', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'))
+CHROME = Path(os.environ.get('TEST_CHROME_EXECUTABLE', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'))
 KEY = 'native-reports-isolated-browser-test-only-signing-key'
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
 
@@ -36,10 +36,10 @@ def loopback_only(original):
 
 def bootstrap(root):
     sys.path[:0] = [str(BACKEND), str(BACKEND / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
-    from aits_backend import settings as config
+    from config import settings as config
     config.DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': str(root / 'reports.sqlite3')}}
     config.SECRET_KEY = KEY
     config.SIMPLE_JWT = {**config.SIMPLE_JWT, 'SIGNING_KEY': KEY}
@@ -192,7 +192,7 @@ def verify_browser(origin, fixture, output):
 def main():
     output = BACKEND / 'logs' / 'native-report-browser-check'
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='aits-native-report-browser-') as temp, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-native-report-browser-') as temp, patch.object(
         socket.socket, 'connect', loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, 'connect_ex', loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(temp))

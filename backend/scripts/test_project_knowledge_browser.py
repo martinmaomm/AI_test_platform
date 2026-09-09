@@ -28,7 +28,7 @@ from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = BACKEND_DIR.parent / "frontend" / "dist"
-CHROME = Path(os.environ.get("AITS_TEST_CHROME_EXECUTABLE", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+CHROME = Path(os.environ.get("TEST_CHROME_EXECUTABLE", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 OFFLINE_JWT_SIGNING_KEY = "project-knowledge-browser-offline-only-signing-key"
 
@@ -149,11 +149,11 @@ def _inline_delay(task_id):
 
 def _bootstrap_database(root: Path):
     sys.path[:0] = [str(BACKEND_DIR), str(BACKEND_DIR / "apps")]
-    os.environ["DJANGO_SETTINGS_MODULE"] = "aits_backend.settings"
+    os.environ["DJANGO_SETTINGS_MODULE"] = "config.settings"
     os.environ["ANONYMIZED_TELEMETRY"] = "false"
     os.environ["MCP_USE_ANONYMIZED_TELEMETRY"] = "false"
 
-    from aits_backend import settings as config
+    from config import settings as config
 
     config.DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(root / "knowledge.sqlite3")}}
     # Never derive synthetic browser JWTs from a secret loaded via the user's
@@ -521,13 +521,13 @@ def main() -> int:
     if not FRONTEND_DIST.joinpath("index.html").is_file():
         raise SystemExit(f"前端构建产物不存在: {FRONTEND_DIST}")
     if not CHROME.is_file() or not os.access(CHROME, os.X_OK):
-        raise SystemExit(f"未找到可执行 Chrome: {CHROME}；可用 AITS_TEST_CHROME_EXECUTABLE 覆盖")
+        raise SystemExit(f"未找到可执行 Chrome: {CHROME}；可用 TEST_CHROME_EXECUTABLE 覆盖")
 
     original_connect, original_connect_ex = socket.socket.connect, socket.socket.connect_ex
-    with tempfile.TemporaryDirectory(prefix="aits-project-knowledge-browser-") as temporary, patch.object(socket.socket, "connect", _loopback_only(original_connect)), patch.object(socket.socket, "connect_ex", _loopback_only(original_connect_ex)):
+    with tempfile.TemporaryDirectory(prefix="automation-project-knowledge-browser-") as temporary, patch.object(socket.socket, "connect", _loopback_only(original_connect)), patch.object(socket.socket, "connect_ex", _loopback_only(original_connect_ex)):
         root = Path(temporary)
         user, project, model, token = _bootstrap_database(root)
-        from aits_backend.wsgi import application as django_app
+        from config.wsgi import application as django_app
         from project_knowledge import indexing, llm, tasks
 
         server = make_server("127.0.0.1", 0, _static_or_django(django_app), handler_class=_QuietHandler)

@@ -27,13 +27,13 @@ def main():
         parser.error('Use the dedicated container high port on 127.0.0.1')
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
     import pymysql
 
-    db_name = f'aits_bd19_test_{args.case}_{uuid.uuid4().hex[:12]}'
-    assert re.fullmatch(r'aits_bd19_test_(fresh|partial|conflict|duplicate|orphan|mismatch)_[0-9a-f]{12}', db_name)
+    db_name = f'automation_bd19_test_{args.case}_{uuid.uuid4().hex[:12]}'
+    assert re.fullmatch(r'automation_bd19_test_(fresh|partial|conflict|duplicate|orphan|mismatch)_[0-9a-f]{12}', db_name)
     admin = pymysql.connect(host='127.0.0.1', port=args.port, user='root', password='', autocommit=True)
     created = False
     connection = None
@@ -46,7 +46,7 @@ def main():
             cursor.execute(f'CREATE DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci')
             created = True
 
-        from aits_backend import settings as config
+        from config import settings as config
         config.DATABASES = {'default': {
             'ENGINE': 'django.db.backends.mysql', 'NAME': db_name,
             'HOST': '127.0.0.1', 'PORT': args.port, 'USER': 'root', 'PASSWORD': '',

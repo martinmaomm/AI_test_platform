@@ -193,7 +193,7 @@ class BudgetedMCPAgentGraphTests(SimpleTestCase):
         tool_names = [
             'playwright_navigate',
             'playwright_get_visible_text',
-            'aits_save_script',
+            'save_script_draft',
         ]
         trace = AsyncToolTrace()
         callback = ToolOrderCallback(tool_names)
@@ -212,16 +212,16 @@ class BudgetedMCPAgentGraphTests(SimpleTestCase):
         self.assertEqual(callback.events, [
             ('start', 'playwright_navigate'), ('end', 'playwright_navigate'),
             ('start', 'playwright_get_visible_text'), ('end', 'playwright_get_visible_text'),
-            ('start', 'aits_save_script'), ('end', 'aits_save_script'),
+            ('start', 'save_script_draft'), ('end', 'save_script_draft'),
         ])
 
     def test_initialized_agent_rebuilds_local_tools_without_leaking_to_new_agent(self):
         trace = AsyncToolTrace()
         read_tool = async_fixture_tool('playwright_get_visible_text', trace)
-        checkpoint_tool = async_fixture_tool('aits_local_checkpoint_fixture', trace)
+        checkpoint_tool = async_fixture_tool('automation_local_checkpoint_fixture', trace)
         agent = self.make_agent(
             ScriptedToolBatchModel(tool_batches=[[
-                'playwright_get_visible_text', 'aits_local_checkpoint_fixture',
+                'playwright_get_visible_text', 'automation_local_checkpoint_fixture',
             ]]),
             read_tool,
         )
@@ -232,7 +232,7 @@ class BudgetedMCPAgentGraphTests(SimpleTestCase):
         self.assertIsNot(agent._agent_executor, original_executor)
         self.assertEqual(output, '{"complete": true}')
         self.assertEqual(trace.started, [
-            'playwright_get_visible_text', 'aits_local_checkpoint_fixture',
+            'playwright_get_visible_text', 'automation_local_checkpoint_fixture',
         ])
 
         fresh_trace = AsyncToolTrace()
@@ -244,7 +244,7 @@ class BudgetedMCPAgentGraphTests(SimpleTestCase):
 
         self.assertEqual(fresh_output, '{"complete": true}')
         self.assertEqual(fresh_trace.started, ['playwright_get_visible_text'])
-        self.assertNotIn('aits_local_checkpoint_fixture', {tool.name for tool in fresh_agent._tools})
+        self.assertNotIn('automation_local_checkpoint_fixture', {tool.name for tool in fresh_agent._tools})
 
     def test_terminal_guard_blocks_later_same_round_browser_write(self):
         trace = AsyncToolTrace()

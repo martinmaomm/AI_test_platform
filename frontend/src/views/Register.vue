@@ -2,7 +2,7 @@
   <div class="register-container">
     <div class="register-box">
       <div class="register-header">
-        <AITSBrand size="small" />
+        <PlatformBrand size="small" />
         <p class="register-subtitle">用户注册</p>
       </div>
       
@@ -73,7 +73,7 @@ import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
-import AITSBrand from '@/components/AITSBrand.vue'
+import PlatformBrand from '@/components/PlatformBrand.vue'
 
 const router = useRouter()
 const authStore = useAuthStore()

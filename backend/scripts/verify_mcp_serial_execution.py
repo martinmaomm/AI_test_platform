@@ -72,7 +72,7 @@ async def verify(url, rounds, backend, run_id):
                 ('playwright_fill', {'selector': '[name=password]', 'value': 'fixture-password'}),
                 ('playwright_click', {'selector': 'button[type=submit]'}),
                 ('playwright_get_visible_text', {}),
-                ('aits_serial_checkpoint', {}),
+                ('automation_serial_checkpoint', {}),
             ]
             message = AIMessage(content='SERIAL_OK') if self.calls > rounds else AIMessage(
                 content='', tool_calls=[
@@ -107,7 +107,7 @@ async def verify(url, rounds, backend, run_id):
 
     checkpoints = []
 
-    @tool('aits_serial_checkpoint')
+    @tool('automation_serial_checkpoint')
     async def checkpoint() -> str:
         """Record the local draft checkpoint after observing the login result."""
         checkpoints.append(len(checkpoints) + 1)
@@ -127,7 +127,7 @@ async def verify(url, rounds, backend, run_id):
         await agent.register_local_tools([checkpoint])
         result = await agent.run('Exercise one ordered batch per fixture login.', manage_connector=False)
         expected = ['playwright_navigate', 'playwright_fill', 'playwright_fill',
-                    'playwright_click', 'playwright_get_visible_text', 'aits_serial_checkpoint'] * rounds
+                    'playwright_click', 'playwright_get_visible_text', 'automation_serial_checkpoint'] * rounds
         assert result == 'SERIAL_OK', result
         assert calls.peak == 1 and not calls.active, (calls.peak, calls.active)
         assert calls.order == expected, calls.order
@@ -145,7 +145,7 @@ def main():
     args = parser.parse_args()
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
     import django

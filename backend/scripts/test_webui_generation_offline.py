@@ -16,17 +16,17 @@ from unittest.mock import patch
 def main():
     backend_dir = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend_dir), str(backend_dir / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
-    os.environ['AITS_OFFLINE_TEST_NETWORK'] = 'blocked'
+    os.environ['OFFLINE_TEST_NETWORK'] = 'blocked'
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
 
     def network_blocked(original):
         def connect(sock, address):
             if sock.family in (socket.AF_INET, socket.AF_INET6):
-                allowed_port = os.environ.get('AITS_OFFLINE_ALLOWED_LOOPBACK_PORT')
+                allowed_port = os.environ.get('OFFLINE_ALLOWED_LOOPBACK_PORT')
                 host = address[0] if isinstance(address, tuple) and address else None
                 port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
                 if host in {'127.0.0.1', '::1'} and allowed_port == str(port):
@@ -35,10 +35,10 @@ def main():
             return original(sock, address)
         return connect
 
-    with tempfile.TemporaryDirectory(prefix='aits-webui-tests-') as test_dir, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-webui-tests-') as test_dir, patch.object(
         socket.socket, 'connect', network_blocked(original_connect),
     ), patch.object(socket.socket, 'connect_ex', network_blocked(original_connect_ex)):
-        from aits_backend import settings as config
+        from config import settings as config
         config.DATABASES = {'default': {
             'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:',
             'TEST': {'MIGRATE': False},

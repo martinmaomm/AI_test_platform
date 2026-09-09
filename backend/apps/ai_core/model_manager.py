@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 
 def _get_default_llm_timeout() -> int:
     """读取 LLM 默认请求超时，允许通过环境变量覆盖。"""
-    raw_timeout = os.getenv('AITS_LLM_TIMEOUT_SECONDS', '600')
+    raw_timeout = os.getenv('LLM_TIMEOUT_SECONDS', '600')
     try:
         return max(1, int(raw_timeout))
     except (TypeError, ValueError):
         logger.warning(
-            "AITS_LLM_TIMEOUT_SECONDS 配置无效: %r，回退到600秒",
+            "LLM_TIMEOUT_SECONDS 配置无效: %r，回退到600秒",
             raw_timeout,
         )
         return 600

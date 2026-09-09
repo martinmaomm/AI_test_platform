@@ -1,6 +1,6 @@
 <template>
-  <div class="aits-brand" :class="[`aits-brand--${size}`]">
-    <h1 class="brand-title">AITesting</h1>
+  <div class="platform-brand" :class="[`platform-brand--${size}`]">
+    <h1 class="brand-title">自动化测试平台</h1>
     <div class="brand-accent">
       <span class="brand-accent-glow" />
     </div>
@@ -21,22 +21,22 @@ const props = defineProps({
   }
 })
 
-const enSubtitle = 'AI-powered Intelligent Testing System'
-const zhSubtitle = 'AI 驱动的智能测试系统'
+const enSubtitle = 'Automation Platform'
+const zhSubtitle = '自动化测试平台'
 </script>
 
 <style scoped>
-.aits-brand {
+.platform-brand {
   text-align: center;
   width: 100%;
 }
 
-.aits-brand--large {
+.platform-brand--large {
   margin-top: 48px;
   margin-bottom: 40px;
 }
 
-.aits-brand--small {
+.platform-brand--small {
   margin-top: 18px;
   margin-bottom: 20px;
 }
@@ -55,12 +55,12 @@ const zhSubtitle = 'AI 驱动的智能测试系统'
   animation: brand-fade-in-up 0.8s ease-out forwards, shimmer 6s linear 0.8s infinite;
 }
 
-.aits-brand--large .brand-title {
+.platform-brand--large .brand-title {
   font-size: 32px;
   font-weight: 800;
 }
 
-.aits-brand--small .brand-title {
+.platform-brand--small .brand-title {
   font-size: 20px;
   font-weight: 700;
 }
@@ -94,12 +94,12 @@ const zhSubtitle = 'AI 驱动的智能测试系统'
   border-radius: 1px;
 }
 
-.aits-brand--large .brand-accent {
+.platform-brand--large .brand-accent {
   width: 60px;
   height: 2px;
 }
 
-.aits-brand--small .brand-accent {
+.platform-brand--small .brand-accent {
   width: 40px;
   height: 1.5px;
   margin-bottom: 6px;
@@ -116,7 +116,7 @@ const zhSubtitle = 'AI 驱动的智能测试系统'
   animation: accent-scan 2.5s ease-in-out infinite;
 }
 
-.aits-brand--small .brand-accent-glow {
+.platform-brand--small .brand-accent-glow {
   width: 16px;
 }
 
@@ -133,11 +133,11 @@ const zhSubtitle = 'AI 驱动的智能测试系统'
   gap: 4px;
 }
 
-.aits-brand--large .subtitle-container {
+.platform-brand--large .subtitle-container {
   padding-bottom: 10px;
 }
 
-.aits-brand--small .subtitle-container {
+.platform-brand--small .subtitle-container {
   padding-bottom: 5px;
 }
 
@@ -162,11 +162,11 @@ const zhSubtitle = 'AI 驱动的智能测试系统'
   animation: brand-subtitle-fade-in 0.6s ease-out 0.5s forwards, shimmer-sub 6s linear 1.5s infinite;
 }
 
-.aits-brand--large .brand-subtitle {
+.platform-brand--large .brand-subtitle {
   font-size: 12px;
 }
 
-.aits-brand--small .brand-subtitle {
+.platform-brand--small .brand-subtitle {
   font-size: 10px;
 }
 

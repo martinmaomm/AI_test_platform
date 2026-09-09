@@ -56,7 +56,7 @@ class AgentDraftQualityTests(SimpleTestCase):
         self.assertNotIn('SCENARIO_DESCRIPTION_MISSING', [item['code'] for item in evaluate_draft(script)['warnings']])
 
     def test_pending_step_prevents_false_pass_with_successful_assertion(self):
-        script = SCRIPT + '\n    # AITS_PENDING_STEP: {"reason":"删除尚未探索"}\n'
+        script = SCRIPT + '\n    # PENDING_STEP: {"reason":"删除尚未探索"}\n'
         result = evaluate_draft(script)
         self.assertEqual(result['blockers'], [])
         self.assertEqual(result['completion'], 'partial')
@@ -66,17 +66,17 @@ class AgentDraftQualityTests(SimpleTestCase):
         self.assertEqual(status, 'incomplete')
 
     def test_pending_quality_warning_distinguishes_steps_and_assertions(self):
-        script = SCRIPT + '\n    # AITS_PENDING_STEP: {"reason":"补充操作"}\n    # AITS_PENDING_ASSERTION: {"reason":"补充断言"}\n'
+        script = SCRIPT + '\n    # PENDING_STEP: {"reason":"补充操作"}\n    # PENDING_ASSERTION: {"reason":"补充断言"}\n'
         warning = next(item for item in evaluate_draft(script)['warnings'] if item['code'] == 'PENDING_WORK')
         self.assertIn('1 项步骤', warning['message'])
         self.assertIn('1 项断言', warning['message'])
 
     def test_pending_comment_in_string_does_not_change_status(self):
-        script = SCRIPT + "\n    example = '# AITS_PENDING_STEP: 示例文字'\n"
+        script = SCRIPT + "\n    example = '# PENDING_STEP: 示例文字'\n"
         self.assertEqual(evaluate_draft(script)['completion'], 'complete')
 
     def test_actual_failure_wins_over_pending(self):
-        script = SCRIPT + '\n    # AITS_PENDING_STEP: 未完成\n'
+        script = SCRIPT + '\n    # PENDING_STEP: 未完成\n'
         self.assertEqual(evaluation_status(script, operation_success=False, runtime_assertion_count=1)[0], 'failed')
 
     def test_missing_navigation_cannot_be_saved_as_executable_case(self):

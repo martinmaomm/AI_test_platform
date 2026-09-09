@@ -610,7 +610,7 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
             }
             repair_agent_id = str(uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f'aits:webui-repair:{generation.pk}:{self.request.id}:{round_number}',
+                f'automation:webui-repair:{generation.pk}:{self.request.id}:{round_number}',
             ))
             agent = ScriptExplorationAgent(
                 llm_model=manager.current_llm, mcp_config=mcp_config, generation_id=repair_agent_id,

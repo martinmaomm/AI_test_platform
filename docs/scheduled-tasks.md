@@ -29,13 +29,13 @@ python manage.py migrate
 自动到点执行还需要独立的 **Celery Beat 调度进程**。worker 负责执行，Beat 负责看时间、向队列派发任务：
 
 ```bash
-celery -A aits_backend worker --loglevel=info --pool=solo
+celery -A config worker --loglevel=info --pool=solo
 ```
 
 另开一个终端，激活同一虚拟环境：
 
 ```bash
-celery -A aits_backend beat --loglevel=info --logfile=logs/celery-beat.log
+celery -A config beat --loglevel=info --logfile=logs/celery-beat.log
 ```
 
 同一数据库只运行一个 Beat。启动 Beat 会实际执行已启用的任务，请先确认任务的套件和执行时间。暂停任务不会自动执行。未运行 Beat 时仍可手动触发，但不会到点自动运行。

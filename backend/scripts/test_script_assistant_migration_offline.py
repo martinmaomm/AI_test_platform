@@ -15,7 +15,7 @@ from unittest.mock import patch
 def main():
     backend = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend), str(backend / "apps")]
-    os.environ["DJANGO_SETTINGS_MODULE"] = "aits_backend.settings"
+    os.environ["DJANGO_SETTINGS_MODULE"] = "config.settings"
     os.environ["ANONYMIZED_TELEMETRY"] = "false"
     os.environ["MCP_USE_ANONYMIZED_TELEMETRY"] = "false"
 
@@ -25,11 +25,11 @@ def main():
         )
 
     with tempfile.TemporaryDirectory(
-        prefix="aits-assistant-migration-"
+        prefix="automation-assistant-migration-"
     ) as temp, patch.object(socket.socket, "connect", denied), patch.object(
         socket.socket, "connect_ex", denied
     ):
-        from aits_backend import settings as config
+        from config import settings as config
 
         config.DATABASES = {
             "default": {

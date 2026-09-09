@@ -24,7 +24,7 @@ python run_asgi.py
 ```
 
 ```bash
-celery -A aits_backend worker --loglevel=info --pool=solo
+celery -A config worker --loglevel=info --pool=solo
 ```
 
 Celery 的任务清单应出现 `project_knowledge.execute_task`。前端开发模式刷新页面即可；生产部署需要重新执行 `npm run build` 并发布产物。
@@ -33,9 +33,9 @@ Celery 的任务清单应出现 `project_knowledge.execute_task`。前端开发�
 
 | 配置 | 含义 |
 | --- | --- |
-| `AITS_PROJECT_KNOWLEDGE_ENABLED=true` | 新知识工作区写入及任务提交开关 |
-| `AITS_KNOWLEDGE_TOTAL_TIMEOUT_SECONDS=1200` | 单个知识任务总时限；限制为 30–1500 秒，从 worker 开始处理时计算 |
-| 模型 `extra_config.timeout` / `AITS_LLM_TIMEOUT_SECONDS` | 单次模型请求时间上限，不会因为任务总时限较长而自动增大 |
+| `PROJECT_KNOWLEDGE_ENABLED=true` | 新知识工作区写入及任务提交开关 |
+| `KNOWLEDGE_TOTAL_TIMEOUT_SECONDS=1200` | 单个知识任务总时限；限制为 30–1500 秒，从 worker 开始处理时计算 |
+| 模型 `extra_config.timeout` / `LLM_TIMEOUT_SECONDS` | 单次模型请求时间上限，不会因为任务总时限较长而自动增大 |
 
 新任务复用串行 Celery 队列，正在生成自动化脚本时知识任务可能排队，反之亦然。首版不改变全局并发。
 
@@ -100,7 +100,7 @@ npm run build
 backend/.venv/bin/python backend/scripts/test_project_knowledge_browser.py
 ```
 
-浏览器脚本默认使用当前 macOS 上的 Google Chrome；其他系统可设置 `AITS_TEST_CHROME_EXECUTABLE` 指向本机浏览器可执行文件。
+浏览器脚本默认使用当前 macOS 上的 Google Chrome；其他系统可设置 `TEST_CHROME_EXECUTABLE` 指向本机浏览器可执行文件。
 截图保存在已忽略的 `backend/logs/knowledge-browser-check/`，临时数据库、登录 Profile 和测试令牌随测试结束清理。
 
 浏览器测试不调用真实模型或被测网站；不能据此声称真实模型的用例质量已验收。当前 MariaDB 迁移验收使用独立临时容器，不是 NAS 数据库；实际 Milvus、真实模型及用户文件仍需上线前验证。
@@ -128,6 +128,6 @@ backend/.venv/bin/python backend/scripts/test_project_knowledge_browser.py
 
 ## 7. 暂停与回退
 
-将 `AITS_PROJECT_KNOWLEDGE_ENABLED=false` 后重启服务，禁止新的修改和任务提交；历史仍可查看，本人任务仍可取消。
+将 `PROJECT_KNOWLEDGE_ENABLED=false` 后重启服务，禁止新的修改和任务提交；历史仍可查看，本人任务仍可取消。
 这不会立即强杀已经发给提供商的请求。取消后不再接收后续结果，等待当前调用退出，必要时正常停止 worker。
 回退不要求删表、逆向迁移或重置向量库。已保存数据和索引保留供排查，不清理原 API RAG 或自动化脚本。

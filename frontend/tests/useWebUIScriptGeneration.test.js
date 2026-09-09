@@ -27,7 +27,7 @@ const deferred = () => {
 async function harness(t, initial = record(), options = {}) {
   const storage = new Map()
   if (options.storedGenerationId) {
-    storage.set('aits:webui-script-generation:v5:1:1', options.storedGenerationId)
+    storage.set('automation:webui-script-generation:v5:1:1', options.storedGenerationId)
   }
   const timers = new Map()
   const oldWindow = globalThis.window
@@ -48,7 +48,7 @@ async function harness(t, initial = record(), options = {}) {
     if (!handlers[name]) throw new Error(`Unexpected mock API call: ${name}`)
     return handlers[name](...args)
   }]))
-  const token = `__aitsWorkspaceTest${++moduleId}`
+  const token = `__automationWorkspaceTest${++moduleId}`
   globalThis[token] = api
   const apiModule = dataModule(`const api = globalThis[${JSON.stringify(token)}];\n${methods.map(name => `export const ${name} = (...args) => api.${name}(...args);`).join('\n')}`)
   const vueModule = dataModule(`export {computed,ref,unref,watch} from ${JSON.stringify(import.meta.resolve('vue'))}; export const onUnmounted = () => {};`)
@@ -75,7 +75,7 @@ test('restore reads only the scoped v5 generation id from localStorage', async t
   const reads = calls.filter(call => call.name === 'getWebUIScriptGeneration')
   assert.equal(reads.at(-1).args[1], 'test-generation')
   assert.equal(state.generation.value.id, 'test-generation')
-  assert.deepEqual([...storage.keys()], ['aits:webui-script-generation:v5:1:1'])
+  assert.deepEqual([...storage.keys()], ['automation:webui-script-generation:v5:1:1'])
 })
 
 test('polling preserves unsaved local code when a server revision changes', async t => {
@@ -586,7 +586,7 @@ test('saveDraft success preserves generation workspace and localStorage', async 
   assert.equal(state.localDraft.value?.generationId, 'test-generation')
   assert.equal(state.localDraft.value?.script_draft, 'draft draft')
   assert.equal(state.localDraft.value?.dirty, false)
-  assert.equal(storage.get('aits:webui-script-generation:v5:1:1'), 'test-generation')
+  assert.equal(storage.get('automation:webui-script-generation:v5:1:1'), 'test-generation')
   assert.equal(result.workspace?.verification?.status, 'unverified')
 })
 
@@ -628,7 +628,7 @@ test('old save completion should not clear a new save in progress', async t => {
   oldSave.resolve({ data: { test_case_id: 30 } })
   await savingOld
   assert.equal(state.generation.value.id, 'replacement')
-  assert.equal(storage.get('aits:webui-script-generation:v5:1:2'), 'replacement')
+  assert.equal(storage.get('automation:webui-script-generation:v5:1:2'), 'replacement')
   assert.equal(state.saving.value, true)
   newSave.resolve({ data: { test_case_id: 31 } })
   await savingNew
@@ -656,7 +656,7 @@ test('old save completion should not clear a new save after user switch', async 
   oldSave.resolve({ data: { test_case_id: 30 } })
   await savingOld
   assert.equal(state.generation.value.id, 'replacement-by-user')
-  assert.equal(storage.get('aits:webui-script-generation:v5:2:1'), 'replacement-by-user')
+  assert.equal(storage.get('automation:webui-script-generation:v5:2:1'), 'replacement-by-user')
   assert.equal(state.saving.value, true)
 
   newSave.resolve({ data: { test_case_id: 31 } })
@@ -678,7 +678,7 @@ test('old save result cannot clear generation after project switch and recreate'
   await saving
   assert.equal(state.generation.value.id, 'replacement')
   assert.equal(state.localDraft.value?.generationId, 'replacement')
-  assert.equal(storage.get('aits:webui-script-generation:v5:1:2'), 'replacement')
+  assert.equal(storage.get('automation:webui-script-generation:v5:1:2'), 'replacement')
 })
 
 test('incomplete debug runs load their real logs and screenshot on refresh and restore', async t => {

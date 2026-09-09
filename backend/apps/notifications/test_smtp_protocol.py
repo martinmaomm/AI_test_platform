@@ -66,7 +66,7 @@ class _SMTPHandler(socketserver.BaseRequestHandler):
             self.sock = self.server.tls_context.wrap_socket(self.sock, server_side=True)
             self.server.tls_handshakes.append("implicit")
         self.reader = self.sock.makefile("rb")
-        self._reply("220 aits-loopback-smtp")
+        self._reply("220 automation-loopback-smtp")
         pending_plain_auth = False
         try:
             while line := self.reader.readline():
@@ -155,7 +155,7 @@ class _LoopbackSMTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 @contextmanager
 def _smtp_server(*, implicit_tls: bool, accept_auth: bool = True, rejected_recipients=()):
-    with tempfile.TemporaryDirectory(prefix="aits-loopback-smtp-") as directory:
+    with tempfile.TemporaryDirectory(prefix="automation-loopback-smtp-") as directory:
         certificate, key = _write_test_certificate(Path(directory))
         server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_context.load_cert_chain(certificate, key)
@@ -170,8 +170,8 @@ def _smtp_server(*, implicit_tls: bool, accept_auth: bool = True, rejected_recip
         server.tls_handshakes = []
         server.recipients = []
         server.messages = []
-        previous_port = os.environ.get("AITS_OFFLINE_ALLOWED_LOOPBACK_PORT")
-        os.environ["AITS_OFFLINE_ALLOWED_LOOPBACK_PORT"] = str(server.server_address[1])
+        previous_port = os.environ.get("OFFLINE_ALLOWED_LOOPBACK_PORT")
+        os.environ["OFFLINE_ALLOWED_LOOPBACK_PORT"] = str(server.server_address[1])
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         client_context = ssl.create_default_context(cafile=str(certificate))
@@ -179,9 +179,9 @@ def _smtp_server(*, implicit_tls: bool, accept_auth: bool = True, rejected_recip
             yield server, client_context
         finally:
             if previous_port is None:
-                os.environ.pop("AITS_OFFLINE_ALLOWED_LOOPBACK_PORT", None)
+                os.environ.pop("OFFLINE_ALLOWED_LOOPBACK_PORT", None)
             else:
-                os.environ["AITS_OFFLINE_ALLOWED_LOOPBACK_PORT"] = previous_port
+                os.environ["OFFLINE_ALLOWED_LOOPBACK_PORT"] = previous_port
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)

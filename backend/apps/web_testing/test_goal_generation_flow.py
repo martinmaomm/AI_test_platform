@@ -167,7 +167,7 @@ class ScenarioPolicyRegressionTests(SimpleTestCase):
         writable = ScenarioPlan.model_validate(plan_payload(allow_test_data_writes=True))
         policy = ExplorationPolicy.for_plan(writable, generation_id='run-1', user_constraints='')
         self.assertTrue(policy.may_write())
-        self.assertTrue(policy.namespace.startswith('aits-explore-run-1-'))
+        self.assertTrue(policy.namespace.startswith('automation-explore-run-1-'))
 
         read_only = ExplorationPolicy.for_plan(
             writable, generation_id='run-1', user_constraints='仅查看',

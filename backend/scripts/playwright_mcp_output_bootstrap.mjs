@@ -107,13 +107,13 @@ export function buildServerArgv(packageRoot, serverArgs) {
 }
 
 export async function runBootstrap() {
-  const logFile = requiredAbsoluteEnvPath('AITS_MCP_LOG_FILE');
-  const screenshotDir = requiredAbsoluteEnvPath('AITS_MCP_SCREENSHOT_DIR');
-  const disableFileLogging = process.env.AITS_MCP_DISABLE_FILE_LOG === '1';
-  const workingDir = process.env.AITS_MCP_WORKING_DIR;
+  const logFile = requiredAbsoluteEnvPath('MCP_LOG_FILE');
+  const screenshotDir = requiredAbsoluteEnvPath('MCP_SCREENSHOT_DIR');
+  const disableFileLogging = process.env.MCP_DISABLE_FILE_LOG === '1';
+  const workingDir = process.env.MCP_WORKING_DIR;
   if (workingDir) {
     if (!path.isAbsolute(workingDir) || !fs.statSync(workingDir).isDirectory()) {
-      throw new Error('AITS_MCP_WORKING_DIR must be an existing absolute directory.');
+      throw new Error('MCP_WORKING_DIR must be an existing absolute directory.');
     }
     process.chdir(workingDir);
   }
@@ -125,7 +125,7 @@ export async function runBootstrap() {
     screenshotDir,
     disableFileLogging,
   });
-  if (process.env.AITS_MCP_NETWORK_CAPTURE === '1') {
+  if (process.env.MCP_NETWORK_CAPTURE === '1') {
     const { installPlaywrightMcpNetworkCapture } = await import('./playwright_mcp_capture.mjs');
     await installPlaywrightMcpNetworkCapture(packageRoot);
   }

@@ -224,8 +224,8 @@ async def run(page):
         pending_source = '''async def run(page):
     # 验证：页面对象可用
     assert page is not None
-    # AITS_PENDING_STEP: {"reason":"尚未确认清理结果"}
-    # AITS_PENDING_ASSERTION: {"reason":"尚未确认完整结果"}
+    # PENDING_STEP: {"reason":"尚未确认清理结果"}
+    # PENDING_ASSERTION: {"reason":"尚未确认完整结果"}
 '''
         pending_lines, pending_count, pending_error = self._execute(pending_source, test_name='test_pending')
         no_assertion_lines, no_assertion_count, no_assertion_error = self._execute(

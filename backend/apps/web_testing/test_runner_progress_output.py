@@ -11,7 +11,7 @@ from .playwright_python_runner import ExecutionConfig, PlaywrightRunner
 class RunnerProgressOutputTests(unittest.TestCase):
     def run_fixture(self, scripts):
         runner = PlaywrightRunner()
-        with tempfile.TemporaryDirectory(prefix='aits-progress-capture-') as directory:
+        with tempfile.TemporaryDirectory(prefix='automation-progress-capture-') as directory:
             runner._create_pytest_config(directory)
             for case_id, source in scripts.items():
                 Path(directory, f'test_case_{case_id}.py').write_text(source, encoding='utf-8')

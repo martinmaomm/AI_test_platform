@@ -18,7 +18,7 @@ from .script_exploration_agent import ScriptExplorationAgent, ScriptExplorationT
 PARTIAL_SCRIPT = '''\
 async def run(page, variables):
     await page.goto('https://example.test/catalog')
-    # AITS_PENDING_STEP: {"reason":"详情页操作尚未在当前 trace 中观察到。"}
+    # PENDING_STEP: {"reason":"详情页操作尚未在当前 trace 中观察到。"}
 '''
 
 COMPLETE_SCRIPT = '''\
@@ -205,7 +205,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
 
         result, client = self.run_with(Agent, callback=checkpoints.append)
         self.assertEqual((client.opened, client.closed), (1, 1))
-        self.assertEqual(Agent.tool_names, ['aits_save_script'])
+        self.assertEqual(Agent.tool_names, ['save_script_draft'])
         self.assertIn('await page.goto', result.script_draft)
         self.assertEqual(result.completion, 'partial')
         self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['确认详情页操作'])
@@ -250,8 +250,8 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             async def run(self, *_args, **_kwargs): return ''
 
         self.run_with(Agent)
-        self.assertEqual(Agent.tools, ['aits_save_script'])
-        self.assertNotIn('aits_finalize_path', Agent.instructions)
+        self.assertEqual(Agent.tools, ['save_script_draft'])
+        self.assertNotIn('finalize_exploration_path', Agent.instructions)
         self.assertNotIn('finalization_protocol', Agent.instructions)
 
     def test_observation_selector_failure_is_failed_but_page_copy_is_not(self):
@@ -336,7 +336,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertEqual(result.error_code, '')
         self.assertIn('场景：', result.script_draft)
         self.assertIn("await page.goto('https://example.test/catalog')", result.script_draft)
-        self.assertIn('AITS_PENDING_STEP:', result.script_draft)
+        self.assertIn('PENDING_STEP:', result.script_draft)
         self.assertNotIn('expect(', result.script_draft)
         self.assertEqual(result.completion, 'partial')
 
@@ -352,7 +352,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         result, _ = self.run_with(Agent, callback=checkpoints.append)
         self.assertEqual(result.error_code, 'transient')
         self.assertIn("await page.goto('https://example.test/catalog')", result.script_draft)
-        self.assertIn('AITS_PENDING_STEP:', result.script_draft)
+        self.assertIn('PENDING_STEP:', result.script_draft)
         self.assertTrue(checkpoints)
         self.assertIn('仅生成入口', checkpoints[0]['snapshot']['artifact']['remaining_steps'][0])
 
@@ -370,7 +370,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
     def test_partial_marker_text_in_string_gets_a_real_pending_comment(self):
         agent = self.make_agent()
         agent._target_url = 'https://example.test/catalog'
-        script = COMPLETE_SCRIPT + "\n    example = '# AITS_PENDING_STEP: example text'\n"
+        script = COMPLETE_SCRIPT + "\n    example = '# PENDING_STEP: example text'\n"
         feedback = agent._consider_candidate(
             script, completed_steps=[], remaining_steps=[], variables=[],
             completion='partial', source='test',
@@ -384,7 +384,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
     def test_complete_script_keeps_marker_looking_string_as_complete(self):
         agent = self.make_agent()
         agent._target_url = 'https://example.test/catalog'
-        script = COMPLETE_SCRIPT + "\n    example = '# AITS_PENDING_STEP: example text'\n"
+        script = COMPLETE_SCRIPT + "\n    example = '# PENDING_STEP: example text'\n"
         feedback = agent._consider_candidate(
             script, completed_steps=[], remaining_steps=[], variables=[],
             completion='complete', source='test',
@@ -466,7 +466,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             ))
         client_factory.assert_not_called()
         self.assertEqual(result.completion, 'partial')
-        self.assertIn('AITS_PENDING_STEP:', result.script_draft)
+        self.assertIn('PENDING_STEP:', result.script_draft)
         self.assertEqual(result.snapshot['events'], [{'event_id': 'saved'}])
 
     def test_code_only_repair_uses_current_complete_candidate_not_old_pending_steps(self):
@@ -489,7 +489,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertEqual(result.script_draft, COMPLETE_SCRIPT.strip())
         self.assertEqual(result.completion, 'complete')
         self.assertEqual(result.snapshot['artifact']['remaining_steps'], [])
-        self.assertNotIn('AITS_PENDING_STEP:', result.script_draft)
+        self.assertNotIn('PENDING_STEP:', result.script_draft)
 
     def test_code_only_keeps_current_pending_marker_not_old_snapshot_pending_step(self):
         class LLM:
@@ -511,9 +511,9 @@ class ScriptExplorationAgentTests(SimpleTestCase):
 
     def test_code_only_records_all_current_pending_marker_reasons_once(self):
         script = COMPLETE_SCRIPT + '''\
-    # AITS_PENDING_STEP: {"reason":"补充筛选操作"}
-    # AITS_PENDING_ASSERTION: {"reason":"补充筛选结果断言"}
-    # AITS_PENDING_STEP: {"reason":"补充筛选操作"}
+    # PENDING_STEP: {"reason":"补充筛选操作"}
+    # PENDING_ASSERTION: {"reason":"补充筛选结果断言"}
+    # PENDING_STEP: {"reason":"补充筛选操作"}
 '''
 
         class LLM:
@@ -538,7 +538,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             script_draft=PARTIAL_SCRIPT, code_only=True,
         ))
         self.assertEqual(result.completion, 'partial')
-        self.assertIn('AITS_PENDING_ASSERTION:', result.script_draft)
+        self.assertIn('PENDING_ASSERTION:', result.script_draft)
         self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['草稿尚无真实断言，需补充可验证结果。'])
 
     def test_code_only_static_complete_candidate_remains_partial_without_generic_pending_step(self):

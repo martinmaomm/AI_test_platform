@@ -262,7 +262,7 @@ def verify_ui(origin, fixture, output, connection_factory):
 def main():
     output = BACKEND / "logs" / "notifications-browser"
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="aits-notifications-") as root, patch.object(
+    with tempfile.TemporaryDirectory(prefix="automation-notifications-") as root, patch.object(
         socket.socket, "connect", loopback_only(socket.socket.connect)
     ), patch.object(socket.socket, "connect_ex", loopback_only(socket.socket.connect_ex)):
         fixture = bootstrap(Path(root))

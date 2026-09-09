@@ -26,10 +26,10 @@ _NEGATED_EXTRA_RISK_RE = re.compile(
 )
 
 _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE = '@executeautomation/playwright-mcp-server'
-_AITS_MCP_LOG_FILE_ENV = 'AITS_MCP_LOG_FILE'
-_AITS_MCP_SCREENSHOT_DIR_ENV = 'AITS_MCP_SCREENSHOT_DIR'
-_AITS_MCP_WORKING_DIR_ENV = 'AITS_MCP_WORKING_DIR'
-_AITS_MCP_DISABLE_FILE_LOG_ENV = 'AITS_MCP_DISABLE_FILE_LOG'
+_MCP_LOG_FILE_ENV = 'MCP_LOG_FILE'
+_MCP_SCREENSHOT_DIR_ENV = 'MCP_SCREENSHOT_DIR'
+_MCP_WORKING_DIR_ENV = 'MCP_WORKING_DIR'
+_MCP_DISABLE_FILE_LOG_ENV = 'MCP_DISABLE_FILE_LOG'
 
 
 def validate_generation_output_id(generation_id: str | None) -> str:
@@ -156,16 +156,16 @@ def prepare_playwright_mcp_output_config(
     env = playwright.setdefault('env', {})
     if not isinstance(env, dict):
         raise ValueError('MCP playwright env 必须是对象')
-    env[_AITS_MCP_LOG_FILE_ENV] = str(
+    env[_MCP_LOG_FILE_ENV] = str(
         resolved_base_dir / 'logs' / 'playwright-mcp' / f'{output_id}.log'
     )
-    env[_AITS_MCP_SCREENSHOT_DIR_ENV] = str(
+    env[_MCP_SCREENSHOT_DIR_ENV] = str(
         resolved_base_dir / 'temp' / 'playwright-mcp' / output_id / 'screenshots'
     )
     # The test workflow deliberately retains MCP artifacts for generation diagnostics.
-    env[_AITS_MCP_DISABLE_FILE_LOG_ENV] = '0'
+    env[_MCP_DISABLE_FILE_LOG_ENV] = '0'
     if resolved_cwd is not None:
-        env[_AITS_MCP_WORKING_DIR_ENV] = resolved_cwd
+        env[_MCP_WORKING_DIR_ENV] = resolved_cwd
 
     if is_wrapped:
         return config

@@ -15,7 +15,7 @@ import './assets/styles/theme.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 
 // 首屏前应用主题，避免闪烁
-const THEME_KEY = 'aits-cockpit-theme'
+const THEME_KEY = 'platform-cockpit-theme'
 function initTheme() {
   try {
     const saved = localStorage.getItem(THEME_KEY)

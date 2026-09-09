@@ -66,7 +66,7 @@ class V4SafeOutputPathRegressionTests(SimpleTestCase):
         with self.assertRaises(ValueError):
             validate_generation_output_id('../outside')
         generation_id = str(uuid4())
-        with tempfile.TemporaryDirectory(prefix='aits-output-test-') as directory:
+        with tempfile.TemporaryDirectory(prefix='automation-output-test-') as directory:
             base = Path(directory)
             scripts = base / 'scripts'
             scripts.mkdir()
@@ -87,10 +87,10 @@ class V4SafeOutputPathRegressionTests(SimpleTestCase):
                 config, generation_id, base_dir=directory,
             )
         environment = prepared['mcpServers']['playwright']['env']
-        self.assertIn(generation_id, environment['AITS_MCP_LOG_FILE'])
-        self.assertIn(generation_id, environment['AITS_MCP_SCREENSHOT_DIR'])
-        self.assertNotIn('..', environment['AITS_MCP_SCREENSHOT_DIR'])
-        self.assertEqual(environment['AITS_MCP_DISABLE_FILE_LOG'], '0')
+        self.assertIn(generation_id, environment['MCP_LOG_FILE'])
+        self.assertIn(generation_id, environment['MCP_SCREENSHOT_DIR'])
+        self.assertNotIn('..', environment['MCP_SCREENSHOT_DIR'])
+        self.assertEqual(environment['MCP_DISABLE_FILE_LOG'], '0')
 
 
 class V5EntrypointBoundaryRegressionTests(SimpleTestCase):
@@ -328,7 +328,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
         }
         generation.script_draft = '''async def run(page, variables):
     await page.goto('/items')
-    # AITS_PENDING_ASSERTION: {"reason":"尚待补充页面断言"}
+    # PENDING_ASSERTION: {"reason":"尚待补充页面断言"}
 '''
         generation.save(update_fields=['exploration_snapshot', 'script_draft'])
         retried = prepare_trace_generation_retry(
@@ -604,7 +604,7 @@ class V4GenerationPersistenceRegressionTests(TestCase):
 async def run(page, variables):
     # 打开详情页
     await page.goto('/items')
-    # AITS_PENDING_ASSERTION: {"reason":"当前证据不足以确认详情字段"}
+    # PENDING_ASSERTION: {"reason":"当前证据不足以确认详情字段"}
 '''
         with patch('web_testing.generation_orchestrator.publish_terminal'):
             result = _persist_agent_result(
@@ -614,7 +614,7 @@ async def run(page, variables):
             )
         generation.refresh_from_db()
         self.assertEqual(result['status'], WebUIScriptGeneration.Status.NEEDS_REVIEW)
-        self.assertIn('AITS_PENDING_ASSERTION:', generation.script_draft)
+        self.assertIn('PENDING_ASSERTION:', generation.script_draft)
         self.assertEqual(generation.exploration_snapshot['schema_version'], 5)
         self.assertEqual(generation.exploration_snapshot['final_message'], '已保留待补充草稿。')
         self.assertNotEqual(generation.error_code, 'FINALIZATION_REQUIRED')
@@ -686,7 +686,7 @@ class V5RunningCancellationRegressionTests(TransactionTestCase):
 async def run(page, variables):
     # 打开详情页
     await page.goto('/items')
-    # AITS_PENDING_ASSERTION: {"reason":"尚未确认详情字段"}
+    # PENDING_ASSERTION: {"reason":"尚未确认详情字段"}
 '''
         late_draft = '''"""过期草稿，不应覆盖 checkpoint。"""
 async def run(page, variables):

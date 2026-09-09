@@ -28,11 +28,11 @@ class MCPProbeOutputRoutingTests(SimpleTestCase):
         self.assertEqual(connection['env']['PLAYWRIGHT_BROWSERS_PATH'], '/test/browser-cache')
         self.assertNotIn('HOME', connection['env'])
         self.assertEqual(
-            Path(connection['env']['AITS_MCP_LOG_FILE']).parent,
+            Path(connection['env']['MCP_LOG_FILE']).parent,
             Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp',
         )
         self.assertEqual(
-            Path(connection['env']['AITS_MCP_SCREENSHOT_DIR']).parent.parent,
+            Path(connection['env']['MCP_SCREENSHOT_DIR']).parent.parent,
             Path(settings.BASE_DIR) / 'temp' / 'playwright-mcp',
         )
 
@@ -43,7 +43,7 @@ class MCPProbeOutputRoutingTests(SimpleTestCase):
         view = MCPConfigurationActionView()
         first = view._build_mcp_connections(servers)['playwright']
         second = view._build_mcp_connections(servers)['playwright']
-        self.assertNotEqual(first['env']['AITS_MCP_LOG_FILE'], second['env']['AITS_MCP_LOG_FILE'])
+        self.assertNotEqual(first['env']['MCP_LOG_FILE'], second['env']['MCP_LOG_FILE'])
 
     def test_other_mcp_servers_keep_existing_connection_options(self):
         servers = {

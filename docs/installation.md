@@ -1,6 +1,6 @@
 # 安装、配置与运行指南
 
-本文是 AITS v2 的安装与运行手册；项目能力与 UI / API 业务流程见 [README](../README.md)。命令以 macOS/zsh 为主，也可作为 Linux 部署的参考。示例仅使用本机地址和占位符，不包含实际部署凭据。
+本文是自动化测试平台（Automation Platform）的安装与运行手册；项目能力与 UI / API 业务流程见 [README](../README.md)。命令以 macOS/zsh 为主，也可作为 Linux 部署的参考。示例仅使用本机地址和占位符，不包含实际部署凭据。
 
 > 核对日期：2026-09-08。现有开发环境为 macOS 26.6.2、Python 3.13.11、Node.js 26.7.0、npm 11.19.0；Python 包元数据记录 Django 4.2.25、PyMySQL 1.2.0。这是当前环境记录，不是跨平台兼容性承诺或最低版本声明。本次仅整理文档并核对代码，没有重做全新环境安装或真实服务联调。
 
@@ -31,7 +31,7 @@
 当前依赖文件的关键事实如下：
 
 - `backend/requirements.txt` 固定 `Django==4.2.25`、`playwright==1.62.0`，Pillow 使用范围 `>=11.0.0,<13`；`PyMySQL`、`pytest` 等未锁定版本。新环境解析的依赖可能变化；需要可重复发布时应另外记录并审核实装版本。
-- `aits_backend/__init__.py` 调用 `pymysql.install_as_MySQLdb()`，因此当前数据库引擎使用 PyMySQL，不需要为此路径安装 `mysqlclient`。
+- `config/__init__.py` 调用 `pymysql.install_as_MySQLdb()`，因此当前数据库引擎使用 PyMySQL，不需要为此路径安装 `mysqlclient`。
 - Node MCP 与 Python Playwright 的浏览器不能混用，详见第 6 节。
 
 ## 3. 获取代码与建立 Python 环境
@@ -39,7 +39,7 @@
 以下命令从仓库根目录开始。路径含空格时请自行加引号。
 
 ```bash
-cd /path/to/aits_v2
+cd /path/to/automation-platform
 cd backend
 python3.13 -m venv .venv
 source .venv/bin/activate
@@ -51,6 +51,10 @@ python -m pip check
 
 建议将虚拟环境保留在 `backend/.venv`；启动 Django、Celery、Python Playwright 安装和测试时都使用同一环境。若 Python 3.13 在新机器上无法解析或编译某个依赖，先记录完整错误、Python/CPU/系统版本，再决定调整解释器或依赖版本；不要在生产机器上临时删改锁定条目来“装到能跑”。
 
+> 目录迁移注意：根目录从 `aits_v2` 改为 `automation-platform` 后，现有虚拟环境中的解释器入口可能仍指向旧绝对路径；请重建虚拟环境或逐一检查入口。VSCode 与 Codex 也应重新打开新目录。目录改名不要求、也不应手动改动现有数据库名或 `DB_NAME`；继续使用同一数据库并按正常迁移流程核对即可。
+>
+> 旧版本升级还需同步本地 `.env`：环境变量已去掉 `AITS_` 前缀，例如 `LLM_TIMEOUT_SECONDS`、`API_BROWSER_DISCOVERY_ENABLED`，旧变量名不再读取。已有生成草稿的内部标记、API 规范元数据及绝对日志路径应先备份并核对，再做定向更新；不要对整个数据库做字符串替换，也不要把历史执行日志当作配置重写。Git 历史和历史验收文档保留当时的名称与路径。
+
 ## 4. 安全初始化数据库、Redis 与 `.env`
 
 ### 4.1 创建应用库与账户
@@ -58,15 +62,15 @@ python -m pip check
 由数据库管理员在目标 MySQL/MariaDB 上创建**独立数据库和仅限本应用库的账户**。以下是需要替换尖括号内容的示例；密码应由密码管理器生成，使用受控管理会话执行，不要将实际密码留在共享命令记录或仓库：
 
 ```sql
-CREATE DATABASE <aits_database>
+CREATE DATABASE <database_name>
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 
-CREATE USER '<aits_app_user>'@'<application_host>'
+CREATE USER '<app_user>'@'<application_host>'
   IDENTIFIED BY '<generated_secret>';
 
-GRANT ALL PRIVILEGES ON <aits_database>.*
-  TO '<aits_app_user>'@'<application_host>';
+GRANT ALL PRIVILEGES ON <database_name>.*
+  TO '<app_user>'@'<application_host>';
 ```
 
 迁移需要在该数据库内创建和调整表结构；如果组织策略不允许 `ALL PRIVILEGES`，请由 DBA 授予 Django 迁移所需的同等库级 DDL/DML 权限。不要复用 root、跨项目共享账户或把数据库暴露到公网。
@@ -78,7 +82,7 @@ GRANT ALL PRIVILEGES ON <aits_database>.*
 `backend/.env` 已被 Git 忽略。仅在文件不存在时复制模板，再用本地编辑器修改；不要在工单中粘贴完整 `.env`：
 
 ```bash
-cd /path/to/aits_v2/backend
+cd /path/to/automation-platform/backend
 test -f .env || cp env.example .env
 chmod 600 .env
 ```
@@ -96,8 +100,8 @@ FRONTEND_BASE_URL=http://127.0.0.1:5173
 
 # MySQL/MariaDB；当前 settings.py 固定使用 django.db.backends.mysql，
 # 没有 DB_ENGINE 环境变量或 SQLite 切换路径
-DB_NAME=<aits_database>
-DB_USER=<aits_app_user>
+DB_NAME=<database_name>
+DB_USER=<app_user>
 DB_PASSWORD=<generated_secret>
 DB_HOST=<database-host>
 DB_PORT=3306
@@ -121,7 +125,7 @@ PYTHON_PLAYWRIGHT_BROWSERS_PATH=.python-playwright-browsers
 完成配置后，在**尚未启动任何工作进程**的 shell 中先做不发起模型/浏览器请求的 Django 检查：
 
 ```bash
-cd /path/to/aits_v2/backend
+cd /path/to/automation-platform/backend
 source .venv/bin/activate
 python manage.py check
 ```
@@ -140,10 +144,10 @@ python manage.py createsuperuser
 | 安全与浏览器来源 | `DEBUG`、`DJANGO_SECRET_KEY`、`ALLOWED_HOSTS`、`FRONTEND_BASE_URL`、`SITE_URL` | Django 导入时读取；变更后重启 ASGI、worker，计划任务场景同时重启 Beat。生产必须关闭 `DEBUG`、使用 HTTPS 与随机密钥。 |
 | 数据与队列 | `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`、`REDIS_URL` | 当前已确认的数据库键仅为这五个；Django、Celery、Channels 共用相关连接配置。变更后重启 ASGI、worker、Beat。先验证网络与权限，再迁移。 |
 | 遥测 | `ANONYMIZED_TELEMETRY`、`MCP_USE_ANONYMIZED_TELEMETRY` | 关闭 Chroma/mcp-use 匿名遥测；重启 ASGI 与 worker 后生效。 |
-| 单次模型请求 | `AITS_LLM_TIMEOUT_SECONDS`，或 LLM 页面配置的 `extra_config.timeout` | 代码未设置时默认 600 秒；`env.example` 显式写 300 秒。传给模型客户端的请求等待配置，不等于整个任务时限；流式请求还受客户端连接 / 读取超时语义影响。 |
-| API 生成验证总时限 | `AITS_API_GENERATION_TIMEOUT_SECONDS` | 默认 1800 秒，代码最低 60 秒；覆盖生成、修复和试运行的整个 pipeline。超时不撤销已经发到远端的写请求。 |
+| 单次模型请求 | `LLM_TIMEOUT_SECONDS`，或 LLM 页面配置的 `extra_config.timeout` | 代码未设置时默认 600 秒；`env.example` 显式写 300 秒。传给模型客户端的请求等待配置，不等于整个任务时限；流式请求还受客户端连接 / 读取超时语义影响。 |
+| API 生成验证总时限 | `API_GENERATION_TIMEOUT_SECONDS` | 默认 1800 秒，代码最低 60 秒；覆盖生成、修复和试运行的整个 pipeline。超时不撤销已经发到远端的写请求。 |
 | WebUI 探索总时限 | `WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS` | 默认 600 秒，代码限制在 60–1800 秒；只覆盖探索阶段。 |
-| 项目知识库任务总时限 | `AITS_KNOWLEDGE_TOTAL_TIMEOUT_SECONDS` | 默认 1200 秒，代码限制在 30–1500 秒；从 worker 开始处理计时，不含排队。`AITS_PROJECT_KNOWLEDGE_ENABLED=false` 会关闭新任务提交。 |
+| 项目知识库任务总时限 | `KNOWLEDGE_TOTAL_TIMEOUT_SECONDS` | 默认 1200 秒，代码限制在 30–1500 秒；从 worker 开始处理计时，不含排队。`PROJECT_KNOWLEDGE_ENABLED=false` 会关闭新任务提交。 |
 | Celery 任务限制配置 | `CELERY_TASK_TIME_LIMIT`（源码，30 分钟） | 与业务总时限独立；当前 solo 池在主进程内执行，不能依赖此配置保证强制中断。仍需各流程的业务超时和执行器中止机制。 |
 | MCP JSON | Playwright MCP 的 `timeout` | 若未设置，预检代码赋值为 30；它是 MCP 调用设置，不是 LLM 或 Celery 总时限。 |
 
@@ -154,7 +158,7 @@ python manage.py createsuperuser
 前端必须按 lockfile 安装：
 
 ```bash
-cd /path/to/aits_v2/frontend
+cd /path/to/automation-platform/frontend
 npm ci
 npm run dev
 ```
@@ -171,7 +175,7 @@ npm run dev
 构建生产静态资源：
 
 ```bash
-cd /path/to/aits_v2/frontend
+cd /path/to/automation-platform/frontend
 npm run build
 # 产物：frontend/dist/
 ```
@@ -207,7 +211,7 @@ WebUI AI 探索使用 **Node Playwright MCP**；实际运行 Python 测试使用
 在线安装（仅在允许下载时执行）：
 
 ```bash
-cd /path/to/aits_v2/backend
+cd /path/to/automation-platform/backend
 PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" \
   npx -y playwright@1.57.0 install chromium
 ```
@@ -219,7 +223,7 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" \
 Python 侧使用不同目录：
 
 ```bash
-cd /path/to/aits_v2/backend
+cd /path/to/automation-platform/backend
 source .venv/bin/activate
 PLAYWRIGHT_BROWSERS_PATH="$PWD/.python-playwright-browsers" \
   python -m playwright install chromium
@@ -242,7 +246,7 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 1. 启动 ASGI 后端（HTTP 与 WebSocket）：
 
    ```bash
-   cd /path/to/aits_v2/backend
+   cd /path/to/automation-platform/backend
    source .venv/bin/activate
    python run_asgi.py
    ```
@@ -252,9 +256,9 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 2. 在另一个终端启动单 worker：
 
    ```bash
-   cd /path/to/aits_v2/backend
+   cd /path/to/automation-platform/backend
    source .venv/bin/activate
-   celery -A aits_backend worker --loglevel=info --pool=solo
+   celery -A config worker --loglevel=info --pool=solo
    ```
 
    `--pool=solo` 使**这个 worker 进程**一次只执行一个任务；同一队列上的多个 worker、其他主机或其他队列仍可能并发，因而它不是全平台或外部系统的严格串行保证。不要在未评估幂等、并发和外部写入风险前增加 worker 数量。
@@ -262,9 +266,9 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 3. 只有启用“项目计划任务”自动到点执行时，才在第三个终端启动**一个** Beat：
 
    ```bash
-   cd /path/to/aits_v2/backend
+   cd /path/to/automation-platform/backend
    source .venv/bin/activate
-   celery -A aits_backend beat --loglevel=info --logfile=logs/celery-beat.log
+   celery -A config beat --loglevel=info --logfile=logs/celery-beat.log
    ```
 
    同一数据库只运行一个 Beat。Beat 会派发已启用的计划任务，启动前先核对计划、测试套件、环境和执行时间。状态、暂停及防重复执行边界见 [计划任务说明](scheduled-tasks.md)。保持上面的默认启动命令，不要附加旧的 `--scheduler django_celery_beat.schedulers:DatabaseScheduler`，否则会绕过项目的健康心跳调度器。
@@ -298,7 +302,7 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 - Redis 检查只做 PING，不读写业务键：
 
   ```bash
-  cd /path/to/aits_v2/backend
+  cd /path/to/automation-platform/backend
   source .venv/bin/activate
   python -c 'import os, redis; from dotenv import load_dotenv; load_dotenv(); print("Redis PING:", redis.Redis.from_url(os.environ["REDIS_URL"]).ping())'
   ```
@@ -306,7 +310,7 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 - 浏览器安装后可做本地空白页检查，以下不调用模型或被测网站（npx 首次可能下载 npm 包）：
 
   ```bash
-  cd /path/to/aits_v2/backend
+  cd /path/to/automation-platform/backend
   source .venv/bin/activate
   mkdir -p logs
   PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" \
@@ -362,7 +366,7 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 随后切到已审核的提交再安装与迁移；下面的 `REVIEWED_COMMIT` 必须替换为实际提交号，切换前保存好本地未提交改动：
 
 ```bash
-cd /path/to/aits_v2
+cd /path/to/automation-platform
 git fetch
 git switch --detach REVIEWED_COMMIT
 
@@ -385,7 +389,7 @@ npm run build
 
 ## 12. 当前文档与配置差异
 
-- `backend/env.example` 仍写“SQLite 开发环境默认”，但当前 `backend/aits_backend/settings.py` 固定为 MySQL backend 并读取 `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`；没有 `DB_ENGINE` 环境变量可切换引擎，`aits_backend/__init__.py` 以 PyMySQL 适配 MySQLdb。本指南以代码为准。
+- `backend/env.example` 仍写“SQLite 开发环境默认”，但当前 `backend/config/settings.py` 固定为 MySQL backend 并读取 `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`；没有 `DB_ENGINE` 环境变量可切换引擎，`config/__init__.py` 以 PyMySQL 适配 MySQLdb。本指南以代码为准。
 - `env.example` 中的 `FILE_UPLOAD_MAX_MEMORY_SIZE` / `DATA_UPLOAD_MAX_MEMORY_SIZE` 目前不会被 settings 读取；代码固定为 10 MiB，其内存限制语义与各模块文件大小校验不同。
-- `env.example` 为 `AITS_LLM_TIMEOUT_SECONDS` 写了 300 秒，而未设置该键时模型管理器代码默认 600 秒；显式 `.env` 值优先。
+- `env.example` 为 `LLM_TIMEOUT_SECONDS` 写了 300 秒，而未设置该键时模型管理器代码默认 600 秒；显式 `.env` 值优先。
 - 仓库当前没有可直接投入生产的反向代理、TLS、静态站点或进程守护配置；部署这些基础设施前应先完成安全评审。

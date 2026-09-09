@@ -19,7 +19,7 @@ def main():
     def denied(*args, **kwargs):
         raise AssertionError('External network is forbidden in dependency acceptance')
 
-    with tempfile.TemporaryDirectory(prefix='aits-api-dependencies-') as temp, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-api-dependencies-') as temp, patch.object(
         socket.socket, 'connect', denied,
     ), patch.object(socket.socket, 'connect_ex', denied):
         fixture = bootstrap(Path(temp))

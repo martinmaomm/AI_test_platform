@@ -396,7 +396,7 @@ def directed_mcp_inspect(session, task_id, evidence, runtime_variables):
         guard = ReadOnlyMCPBrowserToolGuard(
             max_tool_calls=20,
             policy=ExplorationPolicy(
-                namespace=f"aits-repair-{session.id}",
+                namespace=f"automation-repair-{session.id}",
                 data_scope="source_script",
                 explicit_read_only=False,
                 allow_test_data_writes=True,

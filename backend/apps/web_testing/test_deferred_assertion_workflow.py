@@ -40,7 +40,7 @@ from .tasks import (
 
 PENDING_SCRIPT = '''async def run(page):
     await page.goto('https://fixture.example.test/details')
-    # AITS_PENDING_ASSERTION: {"assertion_id":"A1","criterion":"详情内容正确","reason":"探索未能确认详情字段"}
+    # PENDING_ASSERTION: {"assertion_id":"A1","criterion":"详情内容正确","reason":"探索未能确认详情字段"}
 '''
 
 CONFIRMED_SCRIPT = '''from playwright.async_api import expect
@@ -132,13 +132,13 @@ async def helper(page):
     await expect(page.locator('#helper')).to_be_visible()
 
 async def run(page):
-    marker = '# AITS_PENDING_ASSERTION: {"assertion_id":"not-a-comment"}'
+    marker = '# PENDING_ASSERTION: {"assertion_id":"not-a-comment"}'
     assert True
     assert 1 == 1
     assert True and False
     expect(page.locator('#not-awaited')).to_be_visible()
     await expect(page.locator('#real')).to_be_visible()
-    # AITS_PENDING_ASSERTION: {"assertion_id":"A1","criterion":"真实目标","reason":"探索不足"}
+    # PENDING_ASSERTION: {"assertion_id":"A1","criterion":"真实目标","reason":"探索不足"}
 '''
         state = analyze_assertion_state(script)
         self.assertEqual(state['confirmed_count'], 1)
@@ -147,7 +147,7 @@ async def run(page):
         self.assertEqual(state['status'], 'incomplete')
 
     def test_invalid_indentation_and_literal_assertions_are_safe_and_incomplete(self):
-        invalid = 'async def run(page):\n    if True:\n  # AITS_PENDING_ASSERTION: {"assertion_id":"A1"}\n'
+        invalid = 'async def run(page):\n    if True:\n  # PENDING_ASSERTION: {"assertion_id":"A1"}\n'
         self.assertEqual(analyze_assertion_state(invalid)['status'], 'incomplete')
 
         constants_only = '''async def run(page):

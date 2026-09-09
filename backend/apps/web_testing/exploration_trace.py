@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .generation_contracts import AssertionRequirement, GenerationContractError, InputSpec, ScenarioPlan
 
 TRACE_SCHEMA_VERSION = 4
-FINALIZATION_TOOL_NAME = 'aits_finalize_path'
+FINALIZATION_TOOL_NAME = 'finalize_exploration_path'
 _MAX_EVENTS = 120
 _MAX_EXCERPT = 1200
 _MAX_RAW_OUTPUT = 20000
@@ -112,7 +112,7 @@ def _replace_runtime_values(
     ):
         if not runtime_value or ref in credential_refs:
             continue
-        marker = f'__AITS_RUNTIME_{index}__'
+        marker = f'__RUNTIME_{index}__'
         replacements[marker] = f'{{{{{ref}}}}}'
         text = text.replace(runtime_value, marker)
     return text, replacements

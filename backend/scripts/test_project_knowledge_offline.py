@@ -10,7 +10,7 @@ from unittest.mock import patch
 def main():
     backend_dir = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(backend_dir), str(backend_dir / 'apps')]
-    os.environ['DJANGO_SETTINGS_MODULE'] = 'aits_backend.settings'
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
     os.environ['ANONYMIZED_TELEMETRY'] = 'false'
     os.environ['MCP_USE_ANONYMIZED_TELEMETRY'] = 'false'
 
@@ -32,14 +32,14 @@ def main():
             raise RuntimeError('Knowledge tests cannot access services other than the explicit temporary database')
         return connect
 
-    with tempfile.TemporaryDirectory(prefix='aits-knowledge-tests-') as folder, patch.object(socket.socket, 'connect', guarded(original_connect)), patch.object(socket.socket, 'connect_ex', guarded(original_connect_ex)):
-        from aits_backend import settings as config
+    with tempfile.TemporaryDirectory(prefix='automation-knowledge-tests-') as folder, patch.object(socket.socket, 'connect', guarded(original_connect)), patch.object(socket.socket, 'connect_ex', guarded(original_connect_ex)):
+        from config import settings as config
         config.DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:', 'TEST': {'MIGRATE': False}}}
         if maria_port:
             config.DATABASES = {'default': {
                 'ENGINE': 'django.db.backends.mysql', 'HOST': '127.0.0.1', 'PORT': str(maria_port),
-                'NAME': 'aits_knowledge_test', 'USER': 'root', 'PASSWORD': '',
-                'OPTIONS': {'charset': 'utf8mb4'}, 'TEST': {'NAME': 'test_aits_knowledge_isolated'},
+                'NAME': 'automation_knowledge_test', 'USER': 'root', 'PASSWORD': '',
+                'OPTIONS': {'charset': 'utf8mb4'}, 'TEST': {'NAME': 'test_runtime_knowledge_isolated'},
             }}
         config.CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
         config.CHANNEL_LAYERS = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}

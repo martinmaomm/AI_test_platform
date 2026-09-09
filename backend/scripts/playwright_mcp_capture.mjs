@@ -5,13 +5,13 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 export const NETWORK_CAPTURE_PROTOCOL_VERSION = 1;
-export const NETWORK_CAPTURE_ENV = 'AITS_MCP_NETWORK_CAPTURE';
-export const NETWORK_CAPTURE_DIR_ENV = 'AITS_MCP_NETWORK_CAPTURE_DIR';
-export const NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV = 'AITS_MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS';
-export const NETWORK_CAPTURE_MAX_REQUESTS_ENV = 'AITS_MCP_NETWORK_CAPTURE_MAX_REQUESTS';
-export const NETWORK_CAPTURE_MAX_BODY_BYTES_ENV = 'AITS_MCP_NETWORK_CAPTURE_MAX_BODY_BYTES';
-export const NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES_ENV = 'AITS_MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES';
-export const NETWORK_CAPTURE_BODY_TIMEOUT_MS_ENV = 'AITS_MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS';
+export const NETWORK_CAPTURE_ENV = 'MCP_NETWORK_CAPTURE';
+export const NETWORK_CAPTURE_DIR_ENV = 'MCP_NETWORK_CAPTURE_DIR';
+export const NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV = 'MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS';
+export const NETWORK_CAPTURE_MAX_REQUESTS_ENV = 'MCP_NETWORK_CAPTURE_MAX_REQUESTS';
+export const NETWORK_CAPTURE_MAX_BODY_BYTES_ENV = 'MCP_NETWORK_CAPTURE_MAX_BODY_BYTES';
+export const NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES_ENV = 'MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES';
+export const NETWORK_CAPTURE_BODY_TIMEOUT_MS_ENV = 'MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS';
 
 const DEFAULT_LIMITS = Object.freeze({
   maxRequests: 500,
@@ -33,9 +33,9 @@ const MAX_JSON_DEPTH = 64;
 const MIN_STORAGE_LIMIT_EVENT_RESERVE_BYTES = 256;
 const MAX_STORAGE_LIMIT_EVENT_RESERVE_BYTES = 1024;
 const MIN_TOTAL_CAPTURE_BYTES = 512;
-const PATCHED_BROWSER = Symbol.for('aits.playwrightMcpCapture.browserPatched');
-const PATCHED_TOOL = Symbol.for('aits.playwrightMcpCapture.toolPatched');
-const PATCHED_LAUNCH = Symbol.for('aits.playwrightMcpCapture.launchPatched');
+const PATCHED_BROWSER = Symbol.for('automation.playwrightMcpCapture.browserPatched');
+const PATCHED_TOOL = Symbol.for('automation.playwrightMcpCapture.toolPatched');
+const PATCHED_LAUNCH = Symbol.for('automation.playwrightMcpCapture.launchPatched');
 
 function positiveInteger(value, fallback) {
   if (value === undefined || value === '') return fallback;

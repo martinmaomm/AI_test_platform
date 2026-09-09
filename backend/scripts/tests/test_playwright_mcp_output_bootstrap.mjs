@@ -18,7 +18,7 @@ const bootstrapPath = fileURLToPath(new URL('../playwright_mcp_output_bootstrap.
 const packageSpec = '@executeautomation/playwright-mcp-server@1.0.12';
 
 test('resolves npm exec package, preserves HOME, forces safe task-local outputs', async () => {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aits-mcp-bootstrap-'));
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-bootstrap-'));
   try {
     const packageRoot = resolvePlaywrightMcpPackageRoot();
     const packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
@@ -64,7 +64,7 @@ test('resolves npm exec package, preserves HOME, forces safe task-local outputs'
 });
 
 test('bootstrap keeps stdio stdout clean and accepts a custom working directory', () => {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aits-mcp-bootstrap-cwd-'));
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-bootstrap-cwd-'));
   try {
     const copiedBootstrapPath = path.join(tempRoot, 'bootstrap with spaces.mjs');
     fs.copyFileSync(bootstrapPath, copiedBootstrapPath);
@@ -74,9 +74,9 @@ test('bootstrap keeps stdio stdout clean and accepts a custom working directory'
       cwd: tempRoot,
       env: {
         ...process.env,
-        AITS_MCP_LOG_FILE: path.join(tempRoot, 'task.log'),
-        AITS_MCP_SCREENSHOT_DIR: path.join(tempRoot, 'screenshots'),
-        AITS_MCP_WORKING_DIR: tempRoot,
+        MCP_LOG_FILE: path.join(tempRoot, 'task.log'),
+        MCP_SCREENSHOT_DIR: path.join(tempRoot, 'screenshots'),
+        MCP_WORKING_DIR: tempRoot,
       },
       encoding: 'utf8',
     });

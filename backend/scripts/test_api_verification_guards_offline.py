@@ -19,7 +19,7 @@ def main():
     def denied(*args, **kwargs):
         raise AssertionError('External sockets forbidden during acceptance checks')
 
-    with tempfile.TemporaryDirectory(prefix='aits-api-verification-') as root, patch.object(
+    with tempfile.TemporaryDirectory(prefix='automation-api-verification-') as root, patch.object(
         socket.socket, 'connect', denied,
     ), patch.object(socket.socket, 'connect_ex', denied):
         fixture = bootstrap(Path(root))

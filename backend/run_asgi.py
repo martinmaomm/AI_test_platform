@@ -13,17 +13,17 @@ from django.core.asgi import get_asgi_application
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "apps"))
 
 # 设置Django环境
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'aits_backend.settings')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 django.setup()
 
 # 导入ASGI应用
-from aits_backend.asgi import application
+from config.asgi import application
 
 #if __name__ == "__main__":
     #BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # backend 目录绝对路径
 
     #APPS_DIR = os.path.join(BASE_DIR, "apps")
-   # BACKEND_DIR = os.path.join(BASE_DIR, "aits_backend")  # 如果需要
+   # BACKEND_DIR = os.path.join(BASE_DIR, "config")  # 如果需要
     #import uvicorn
     
    # print("🚀 启动ASGI服务器...")
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # backend 目录绝对路径
 
     APPS_DIR = os.path.join(BASE_DIR, "apps")
-    BACKEND_DIR = os.path.join(BASE_DIR, "aits_backend")  # 如果需要
+    BACKEND_DIR = os.path.join(BASE_DIR, "config")  # 如果需要
     import uvicorn
     
     # 获取本机IP用于打印提示（这步是可选的，为了方便你看）

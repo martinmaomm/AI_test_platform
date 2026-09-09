@@ -87,12 +87,15 @@
         :records-has-more="browserDiscoveryRecordsNextAfter != null"
         :creating="browserDiscoveryCreating"
         :cancelling="browserDiscoveryCancelling"
+        :deleting="browserDiscoveryDeleting"
+        :deleting-task-id="browserDiscoveryDeletingTaskId"
         :origin-action-loading="browserDiscoveryOriginActionLoading"
         :handoff-loading="browserDiscoveryHandoffLoading"
         @refresh="refreshBrowserDiscoveries"
         @create="submitBrowserDiscovery"
         @select="selectBrowserDiscovery"
         @cancel="cancelSelectedBrowserDiscovery"
+        @delete="deleteBrowserDiscoveryTask"
         @resolve-origin="resolveSelectedBrowserDiscoveryOrigin"
         @load-records="loadBrowserDiscoveryRecords"
         @load-more-records="loadMoreBrowserDiscoveryRecords"
@@ -614,6 +617,7 @@ import {
 import {
   cancelBrowserDiscovery,
   createBrowserDiscovery,
+  deleteBrowserDiscovery,
   getBrowserDiscovery,
   getBrowserDiscoveryConfig,
   getBrowserDiscoveryRecords,
@@ -635,6 +639,7 @@ import {
   browserDiscoveryConfig as normalizeBrowserDiscoveryConfig,
   browserDiscoveryBecameTerminal,
   browserDiscoveryData,
+  browserDiscoveryDeleteState,
   browserDiscoveryItems,
   buildBrowserDiscoveryPayload,
   canConfirmBrowserDiscoveryOrigin,
@@ -737,6 +742,8 @@ const browserDiscoveryDetailLoading = ref(false);
 const browserDiscoveryRecordsLoading = ref(false);
 const browserDiscoveryCreating = ref(false);
 const browserDiscoveryCancelling = ref(false);
+const browserDiscoveryDeleting = ref(false);
+const browserDiscoveryDeletingTaskId = ref(null);
 const browserDiscoveryOriginActionLoading = ref(false);
 const browserDiscoveryHandoffLoading = ref(false);
 const endpointsLoadFailed = ref(false);
@@ -786,6 +793,7 @@ let browserDiscoveryListSequence = 0;
 let browserDiscoveryDetailSequence = 0;
 let browserDiscoveryRecordsSequence = 0;
 let browserDiscoveryOriginActionSequence = 0;
+let browserDiscoveryDeleteSequence = 0;
 let auxiliaryLoadSequence = 0;
 let skipNextSourceLeaveConfirmation = false;
 let internalWorkspaceRouteId = null;
@@ -824,6 +832,7 @@ const interactionLocked = computed(
     adoptingCandidate.value ||
     sendingMessage.value ||
     generationDialog.value ||
+    browserDiscoveryDeleting.value ||
     browserDiscoveryOriginActionLoading.value ||
     loading.value ||
     initializing.value ||
@@ -1065,6 +1074,7 @@ const resetBrowserDiscoveries = () => {
   browserDiscoveryDetailSequence += 1;
   browserDiscoveryRecordsSequence += 1;
   browserDiscoveryOriginActionSequence += 1;
+  browserDiscoveryDeleteSequence += 1;
   stopBrowserDiscoveryPolling();
   browserDiscoveryConfig.value = { enabled: false, limits: {}, models: [] };
   browserDiscoveryConfigLoading.value = false;
@@ -1080,6 +1090,8 @@ const resetBrowserDiscoveries = () => {
   browserDiscoveryRecordsLoading.value = false;
   browserDiscoveryCreating.value = false;
   browserDiscoveryCancelling.value = false;
+  browserDiscoveryDeleting.value = false;
+  browserDiscoveryDeletingTaskId.value = null;
   browserDiscoveryOriginActionLoading.value = false;
   browserDiscoveryHandoffLoading.value = false;
 };
@@ -1251,7 +1263,7 @@ const submitBrowserDiscovery = async (form) => {
   }
 };
 const cancelSelectedBrowserDiscovery = async (taskId) => {
-  if (!taskId || browserDiscoveryCancelling.value) return;
+  if (!taskId || browserDiscoveryCancelling.value || browserDiscoveryDeleting.value) return;
   const requestProjectId = projectId.value;
   const requestEpoch = browserDiscoveryEpoch;
   browserDiscoveryCancelling.value = true;
@@ -1269,6 +1281,109 @@ const cancelSelectedBrowserDiscovery = async (taskId) => {
   } finally {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
       browserDiscoveryCancelling.value = false;
+  }
+};
+const clearDeletedBrowserDiscovery = () => {
+  browserDiscoveryDetailSequence += 1;
+  browserDiscoveryRecordsSequence += 1;
+  browserDiscoveryOriginActionSequence += 1;
+  stopBrowserDiscoveryPolling();
+  browserDiscoveryDetailLoading.value = false;
+  browserDiscoveryRecordsLoading.value = false;
+  browserDiscoveryOriginActionLoading.value = false;
+  browserDiscoveryTaskId.value = null;
+  browserDiscoveryTask.value = null;
+  browserDiscoveryRecords.value = [];
+  browserDiscoveryRecordsLoaded.value = false;
+  browserDiscoveryRecordsNextAfter.value = null;
+};
+const deleteBrowserDiscoveryTask = async (taskId) => {
+  if (!taskId || browserDiscoveryDeleting.value || interactionLocked.value) return;
+  const task = browserDiscoveries.value.find((item) => sameWorkspaceId(item.id, taskId));
+  const deletion = browserDiscoveryDeleteState(task);
+  if (!deletion.canDelete)
+    return ElMessage.warning(deletion.reason || "当前任务不能删除，请刷新后重试。");
+  const requestProjectId = projectId.value;
+  const requestEpoch = browserDiscoveryEpoch;
+  const requestViewEpoch = viewEpoch;
+  const requestSourceType = props.sourceType;
+  try {
+    await ElMessageBox.confirm(
+      "仅删除此网页探索任务及数据库中的脱敏采样记录；不会删除磁盘日志/截图、其他任务、测试用例、工作区或已发布来源。是否继续？",
+      "确认删除",
+      { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  if (
+    requestProjectId !== projectId.value ||
+    requestEpoch !== browserDiscoveryEpoch ||
+    requestViewEpoch !== viewEpoch ||
+    requestSourceType !== props.sourceType ||
+    !isBrowserSource.value
+  )
+    return;
+  const requestSequence = ++browserDiscoveryDeleteSequence;
+  if (sameWorkspaceId(taskId, browserDiscoveryTaskId.value))
+    stopBrowserDiscoveryPolling();
+  browserDiscoveryDeleting.value = true;
+  browserDiscoveryDeletingTaskId.value = taskId;
+  try {
+    await deleteBrowserDiscovery(requestProjectId, taskId);
+    if (
+      requestProjectId !== projectId.value ||
+      requestEpoch !== browserDiscoveryEpoch ||
+      requestViewEpoch !== viewEpoch ||
+      requestSourceType !== props.sourceType ||
+      !isBrowserSource.value ||
+      requestSequence !== browserDiscoveryDeleteSequence
+    )
+      return;
+    browserDiscoveryListSequence += 1;
+    browserDiscoveries.value = browserDiscoveries.value.filter(
+      (item) => !sameWorkspaceId(item.id, taskId),
+    );
+    if (sameWorkspaceId(taskId, browserDiscoveryTaskId.value))
+      clearDeletedBrowserDiscovery();
+    await loadBrowserDiscoveries();
+    if (
+      requestProjectId === projectId.value &&
+      requestEpoch === browserDiscoveryEpoch &&
+      requestViewEpoch === viewEpoch &&
+      requestSourceType === props.sourceType &&
+      isBrowserSource.value &&
+      requestSequence === browserDiscoveryDeleteSequence
+    )
+      ElMessage.success("网页探索任务及数据库采样记录已删除；排障日志和截图已保留。");
+  } catch (error) {
+    if (
+      requestProjectId === projectId.value &&
+      requestEpoch === browserDiscoveryEpoch &&
+      requestViewEpoch === viewEpoch &&
+      requestSourceType === props.sourceType &&
+      isBrowserSource.value &&
+      requestSequence === browserDiscoveryDeleteSequence
+    ) {
+      ElMessage.error(errorMessage(error, "删除网页探索任务失败"));
+      if (
+        sameWorkspaceId(taskId, browserDiscoveryTaskId.value) &&
+        isBrowserDiscoveryActive(browserDiscoveryTask.value)
+      )
+        startBrowserDiscoveryPolling();
+    }
+  } finally {
+    if (
+      requestProjectId === projectId.value &&
+      requestEpoch === browserDiscoveryEpoch &&
+      requestViewEpoch === viewEpoch &&
+      requestSourceType === props.sourceType &&
+      isBrowserSource.value &&
+      requestSequence === browserDiscoveryDeleteSequence
+    ) {
+      browserDiscoveryDeleting.value = false;
+      browserDiscoveryDeletingTaskId.value = null;
+    }
   }
 };
 const resolveSelectedBrowserDiscoveryOrigin = async ({

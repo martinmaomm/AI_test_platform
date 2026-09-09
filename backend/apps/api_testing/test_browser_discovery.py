@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db.models.deletion import ProtectedError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
@@ -19,8 +20,8 @@ from .browser_discovery import (
     ingest_trace, origin_control_file, origin_resolution, origin_state_file,
     read_origin_state, selectable_origins, sync_auto_origin, task_trace_file,
 )
-from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView
-from .models import APIEndpoint, APISpecification, APIWorkspace, BrowserDiscoveryRecord, BrowserDiscoveryTask, default_api_workspace_draft
+from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryDetailView, BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView
+from .models import APIEndpoint, APISpecification, APIWorkspace, BrowserDiscoveryHandoff, BrowserDiscoveryRecord, BrowserDiscoveryTask, default_api_workspace_draft
 from .tasks import _claim_browser_discovery, _finish_browser_discovery
 from .workspace_service import endpoint_specs, generation_endpoint_specs
 from .workspace_service import WorkspaceValidationError
@@ -53,6 +54,110 @@ class BrowserDiscoveryContractsTests(TestCase):
 
     def event(self, event, **payload):
         return {'protocol_version': 1, 'event': event, **payload}
+
+    def delete_task(self, task, user=None):
+        request = self.factory.delete('/')
+        force_authenticate(request, user or self.owner)
+        return BrowserDiscoveryDetailView.as_view()(
+            request, project_id=self.project.id, task_id=task.id,
+        )
+
+    def test_delete_each_terminal_task_cascades_records(self):
+        for status in (
+            BrowserDiscoveryTask.Status.COMPLETED,
+            BrowserDiscoveryTask.Status.PARTIAL,
+            BrowserDiscoveryTask.Status.FAILED,
+            BrowserDiscoveryTask.Status.CANCELLED,
+        ):
+            with self.subTest(status=status):
+                task = self.task(status=status)
+                record = BrowserDiscoveryRecord.objects.create(
+                    task=task, sequence=1, request_id=f'{status}-request', origin=task.api_origin,
+                    method='GET', path=f'/{status}', public_summary={'source_authorized': True},
+                )
+                reply = self.delete_task(task)
+                self.assertEqual(reply.status_code, 200, reply.data)
+                self.assertEqual(reply.data['data']['id'], str(task.id))
+                self.assertFalse(BrowserDiscoveryTask.objects.filter(pk=task.id).exists())
+                self.assertFalse(BrowserDiscoveryRecord.objects.filter(pk=record.id).exists())
+                self.assertEqual(self.delete_task(task).status_code, 404)
+
+    def test_delete_cancelled_queue_task_makes_late_claim_a_noop(self):
+        task = self.task()
+        task.status = BrowserDiscoveryTask.Status.CANCELLED
+        task.cancellation_requested = True
+        task.save(update_fields=['status', 'cancellation_requested', 'updated_at'])
+        self.assertEqual(self.delete_task(task).status_code, 200)
+        self.assertIsNone(_claim_browser_discovery(str(task.id), task.version, task.task_id))
+
+    def test_delete_requires_task_owner_and_current_project_edit_permission(self):
+        owner_task = self.task(owner=self.other, status=BrowserDiscoveryTask.Status.CANCELLED)
+        self.assertEqual(self.delete_task(owner_task, self.owner).status_code, 404)
+        ProjectMember.objects.filter(project=self.project, user=self.other).delete()
+        self.assertEqual(self.delete_task(owner_task, self.other).status_code, 403)
+        self.assertTrue(BrowserDiscoveryTask.objects.filter(pk=owner_task.id).exists())
+
+    def test_delete_rejects_active_or_unknown_status_without_expiring_task(self):
+        for status in (
+            BrowserDiscoveryTask.Status.QUEUED,
+            BrowserDiscoveryTask.Status.RUNNING,
+            BrowserDiscoveryTask.Status.FINALIZING,
+            'unknown',
+        ):
+            with self.subTest(status=status):
+                task = self.task(
+                    status=status,
+                    heartbeat_at=timezone.now() - timedelta(hours=1),
+                )
+                reply = self.delete_task(task)
+                self.assertEqual(reply.status_code, 409, reply.data)
+                self.assertIn('先取消并等待停止', reply.data['message'])
+                task.refresh_from_db()
+                self.assertEqual(task.status, status)
+
+    def test_delete_rejects_handoff_and_published_source_references(self):
+        handoff_task = self.task(status=BrowserDiscoveryTask.Status.COMPLETED)
+        handoff_spec = APISpecification.objects.create(
+            project=self.project, created_by=self.owner,
+            spec_type=APISpecification.SpecType.BROWSER_CAPTURE,
+            status=APISpecification.TaskStatus.COMPLETED, source_task=handoff_task,
+        )
+        BrowserDiscoveryHandoff.objects.create(
+            task=handoff_task, source_version=handoff_task.version,
+            selection_hash='handoff-delete-protection', spec=handoff_spec,
+        )
+        handoff_reply = self.delete_task(handoff_task)
+        self.assertEqual(handoff_reply.status_code, 409, handoff_reply.data)
+        self.assertIn('已交接', handoff_reply.data['message'])
+
+        published_task = self.task(status=BrowserDiscoveryTask.Status.PARTIAL)
+        APISpecification.objects.create(
+            project=self.project, created_by=self.owner,
+            spec_type=APISpecification.SpecType.BROWSER_CAPTURE,
+            status=APISpecification.TaskStatus.COMPLETED, source_task=published_task,
+        )
+        published_reply = self.delete_task(published_task)
+        self.assertEqual(published_reply.status_code, 409, published_reply.data)
+        self.assertIn('已发布', published_reply.data['message'])
+
+    def test_delete_serializes_state_and_maps_late_protection_to_conflict(self):
+        active = self.task(status=BrowserDiscoveryTask.Status.RUNNING)
+        request = self.factory.get('/')
+        force_authenticate(request, self.owner)
+        detail = BrowserDiscoveryDetailView.as_view()(
+            request, project_id=self.project.id, task_id=active.id,
+        )
+        self.assertFalse(detail.data['data']['can_delete'])
+        self.assertIn('先取消并等待停止', detail.data['data']['delete_block_reason'])
+
+        terminal = self.task(status=BrowserDiscoveryTask.Status.CANCELLED)
+        with patch(
+            'api_testing.browser_discovery_views.BrowserDiscoveryTask.delete',
+            side_effect=ProtectedError('late relation protection', []),
+        ):
+            reply = self.delete_task(terminal)
+        self.assertEqual(reply.status_code, 409, reply.data)
+        self.assertTrue(BrowserDiscoveryTask.objects.filter(pk=terminal.id).exists())
 
     def test_node_jsonl_preserves_pairs_redacts_unknown_and_builds_path_dependency(self):
         with tempfile.TemporaryDirectory() as directory, override_settings(BASE_DIR=directory):

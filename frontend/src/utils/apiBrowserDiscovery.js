@@ -102,6 +102,27 @@ export const browserDiscoveryFormSnapshot = (form) =>
 export const isBrowserDiscoveryActive = (task) =>
   ["queued", "running", "finalizing"].includes(task?.status);
 
+const browserDiscoveryTerminalStatuses = new Set([
+  "completed",
+  "partial",
+  "failed",
+  "cancelled",
+]);
+
+export const browserDiscoveryDeleteState = (task) => {
+  const reason = String(task?.delete_block_reason || "").trim();
+  if (!browserDiscoveryTerminalStatuses.has(task?.status))
+    return {
+      canDelete: false,
+      reason: reason || "任务仍在执行或状态未知；请先取消并等待停止后再删除。",
+    };
+  if (task?.can_delete === true) return { canDelete: true, reason: "" };
+  return {
+    canDelete: false,
+    reason: reason || "任务删除状态已过期，请刷新后重试。",
+  };
+};
+
 export const browserDiscoveryBecameTerminal = (previousTask, nextTask) => {
   if (!isBrowserDiscoveryActive(previousTask)) return false;
   if (

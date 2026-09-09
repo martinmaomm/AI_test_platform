@@ -23,6 +23,11 @@ export const getBrowserDiscovery = async (projectId, taskId) => {
   return response.data;
 };
 
+export const deleteBrowserDiscovery = async (projectId, taskId) => {
+  const response = await api.delete(`${basePath(projectId)}${taskId}/`);
+  return response.data;
+};
+
 export const getBrowserDiscoveryRecords = async (
   projectId,
   taskId,

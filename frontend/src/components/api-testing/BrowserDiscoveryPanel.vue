@@ -52,8 +52,13 @@
         <el-table-column label="当前动作" min-width="120"><template #default="{ row }">{{ row.current_action || row.phase || "—" }}</template></el-table-column>
         <el-table-column label="耗时" width="100"><template #default="{ row }">{{ duration(row) }}</template></el-table-column>
         <el-table-column label="请求" width="72"><template #default="{ row }">{{ row.request_count ?? "—" }}</template></el-table-column>
-        <el-table-column label="操作" width="88">
-          <template #default="{ row }"><el-button text type="primary" @click.stop="$emit('select', row.id)">查看</el-button></template>
+        <el-table-column label="操作" width="144">
+          <template #default="{ row }">
+            <el-button text type="primary" @click.stop="$emit('select', row.id)">查看</el-button>
+            <el-tooltip :disabled="!deleteState(row).reason" :content="deleteState(row).reason" placement="top">
+              <span><el-button text type="danger" :loading="deleting && String(deletingTaskId) === String(row.id)" :disabled="disabled || !deleteState(row).canDelete" @click.stop="$emit('delete', row.id)">删除</el-button></span>
+            </el-tooltip>
+          </template>
         </el-table-column>
       </el-table>
       <el-card v-if="task" v-loading="detailLoading" shadow="never" class="task-detail">
@@ -94,6 +99,9 @@
         <el-alert v-if="active(task) && task.cancellation_requested" title="已请求取消，正在等待当前检查点安全收敛。" type="info" :closable="false" show-icon />
         <div class="task-actions">
           <el-button v-if="active(task)" type="warning" plain :loading="cancelling" @click="$emit('cancel', task.id)">取消探索</el-button>
+          <el-tooltip :disabled="!deleteState(task).reason" :content="deleteState(task).reason" placement="top">
+            <span><el-button type="danger" plain :loading="deleting && String(deletingTaskId) === String(task.id)" :disabled="disabled || !deleteState(task).canDelete" @click="$emit('delete', task.id)">删除</el-button></span>
+          </el-tooltip>
           <el-button :loading="recordsLoading" @click="$emit('load-records', task.id)">查看已授权样本</el-button>
         </div>
         <template v-if="recordGroups.length">
@@ -127,12 +135,12 @@
 
 <script setup>
 import { computed, ref, watch } from "vue";
-import { BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH, BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS, browserDiscoveryElapsed, browserDiscoveryErrorCategory, browserDiscoveryErrorCodeLabel, browserDiscoveryEvidenceCounts, browserDiscoveryFormSnapshot, browserDiscoveryOriginResolution, browserDiscoveryOriginStateLabel, browserDiscoveryOriginSummary, browserDiscoveryRecordGroups, browserDiscoveryStatusMeta, browserDiscoveryTimeoutDefault, canConfirmBrowserDiscoveryOrigin, canHandoffBrowserDiscovery, canSelectBrowserDiscoveryOrigin, formatBrowserDiscoveryDuration, isBrowserDiscoveryActive } from "@/utils/apiBrowserDiscovery";
+import { BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH, BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS, browserDiscoveryDeleteState, browserDiscoveryElapsed, browserDiscoveryErrorCategory, browserDiscoveryErrorCodeLabel, browserDiscoveryEvidenceCounts, browserDiscoveryFormSnapshot, browserDiscoveryOriginResolution, browserDiscoveryOriginStateLabel, browserDiscoveryOriginSummary, browserDiscoveryRecordGroups, browserDiscoveryStatusMeta, browserDiscoveryTimeoutDefault, canConfirmBrowserDiscoveryOrigin, canHandoffBrowserDiscovery, canSelectBrowserDiscoveryOrigin, formatBrowserDiscoveryDuration, isBrowserDiscoveryActive } from "@/utils/apiBrowserDiscovery";
 
 const props = defineProps({
-  config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, originActionLoading: Boolean, handoffLoading: Boolean,
+  config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, deleting: Boolean, deletingTaskId: { type: [String, Number], default: null }, originActionLoading: Boolean, handoffLoading: Boolean,
 });
-const emit = defineEmits(["refresh", "create", "select", "cancel", "resolve-origin", "load-records", "load-more-records", "handoff", "form-dirty-change"]);
+const emit = defineEmits(["refresh", "create", "select", "cancel", "delete", "resolve-origin", "load-records", "load-more-records", "handoff", "form-dirty-change"]);
 const createFormCard = ref(null);
 const selectedRecordIds = ref([]);
 const enabled = computed(() => props.config?.enabled === true);
@@ -143,6 +151,7 @@ const formSnapshot = ref(browserDiscoveryFormSnapshot(form.value));
 const formDirty = computed(() => browserDiscoveryFormSnapshot(form.value) !== formSnapshot.value);
 const statusMeta = browserDiscoveryStatusMeta;
 const active = isBrowserDiscoveryActive;
+const deleteState = browserDiscoveryDeleteState;
 const duration = (task) => formatBrowserDiscoveryDuration(browserDiscoveryElapsed(task));
 const recordGroups = computed(() => browserDiscoveryRecordGroups(props.records));
 const originResolution = computed(() => browserDiscoveryOriginResolution(props.task));

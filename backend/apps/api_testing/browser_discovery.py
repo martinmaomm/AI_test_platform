@@ -859,6 +859,7 @@ def _refresh_dependency_candidates(task: BrowserDiscoveryTask) -> None:
 
 def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
     counts = task.records.aggregate(records_count=Count('id'), eligible_records_count=Count('id', filter=Q(is_eligible=True)))
+    deletion = browser_discovery_delete_state(task)
     return {
         'id': str(task.id), 'task_id': task.task_id, 'project_id': task.project_id, 'model_id': task.model_id,
         'target_url': task.target_url, 'description': task.description, 'api_origin': task.api_origin or None,
@@ -871,12 +872,38 @@ def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
         'origin_resolution': origin_resolution(task),
         'source_version': task.source_version, 'records_count': counts['records_count'],
         'eligible_records_count': counts['eligible_records_count'],
+        'can_delete': deletion['can_delete'], 'delete_block_reason': deletion['reason'],
         'started_at': task.started_at.isoformat() if task.started_at else None,
         'heartbeat_at': task.heartbeat_at.isoformat() if task.heartbeat_at else None,
         'finished_at': task.finished_at.isoformat() if task.finished_at else None,
         'created_at': task.created_at.isoformat() if task.created_at else None,
         'updated_at': task.updated_at.isoformat() if task.updated_at else None,
     }
+
+
+def browser_discovery_delete_state(task: BrowserDiscoveryTask) -> dict[str, Any]:
+    """Return a UI-safe deletion decision without changing task state."""
+    if task.handoffs.exists():
+        return {
+            'can_delete': False,
+            'reason': '任务已交接为 API 工作区来源，暂不能删除。',
+        }
+    if task.published_specs.exists():
+        return {
+            'can_delete': False,
+            'reason': '任务已发布为 API 规范来源，暂不能删除。',
+        }
+    if task.status not in {
+        BrowserDiscoveryTask.Status.COMPLETED,
+        BrowserDiscoveryTask.Status.PARTIAL,
+        BrowserDiscoveryTask.Status.FAILED,
+        BrowserDiscoveryTask.Status.CANCELLED,
+    }:
+        return {
+            'can_delete': False,
+            'reason': '任务仍在执行或状态未知；请先取消并等待停止后再删除。',
+        }
+    return {'can_delete': True, 'reason': None}
 
 
 def _selection(task: BrowserDiscoveryTask, record_ids: list[int]) -> tuple[list[BrowserDiscoveryRecord], str]:

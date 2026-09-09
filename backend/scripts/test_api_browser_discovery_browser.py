@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import threading
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 from wsgiref.simple_server import make_server
@@ -144,7 +145,7 @@ def simulated_runner(fixture):
 
 def verify(origin, fixture, output):
     from playwright.sync_api import expect, sync_playwright
-    from api_testing.models import APIEndpoint, APISpecification, APIWorkspace, APITestCase, APITestExecution, BrowserDiscoveryTask
+    from api_testing.models import APIEndpoint, APISpecification, APIWorkspace, APITestCase, APITestExecution, BrowserDiscoveryRecord, BrowserDiscoveryTask
 
     errors = []
     requests = []
@@ -243,6 +244,7 @@ def verify(origin, fixture, output):
             create_task("cancel", "取消任务，观察运行进度")
             assert fixture["cancel_started"].wait(timeout=15), "simulated runner did not start"
             expect(page.get_by_text("正在模拟网页操作", exact=True).first).to_be_visible(timeout=15000)
+            expect(task_row("/cancel").get_by_role("button", name="删除", exact=True)).to_be_disabled()
             page.screenshot(path=str(output / "running-progress.png"), full_page=True)
             # Leaving the browser page must not send task cancellation or create a document workspace.
             switch_to("documents")
@@ -411,6 +413,115 @@ def verify(origin, fixture, output):
             expect(page).to_have_url(re.compile(r"/workspace/browser\?workspace_id="), timeout=15000)
             expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
             expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(2)
+
+            # A published source keeps its provenance. Deletion must not break
+            # a saved workspace, while ended, unreferenced failures are removable.
+            expect(task_row("/partial").get_by_role("button", name="删除", exact=True)).to_be_disabled()
+
+            def failed_fixture(slug):
+                from django.utils import timezone
+
+                task = BrowserDiscoveryTask.objects.create(
+                    project_id=fixture["project_id"], owner_id=fixture["user_id"],
+                    model_id=fixture["model_id"], task_id=str(uuid.uuid4()),
+                    target_url=f"https://web.example.test/{slug}",
+                    description="独立失败删除验收", api_origin="https://api.example.test",
+                    status=BrowserDiscoveryTask.Status.FAILED, finished_at=timezone.now(),
+                    error_code="fixture_failure", error_message="隔离模拟失败",
+                )
+                BrowserDiscoveryRecord.objects.create(
+                    task=task, sequence=1, method="GET", path=f"/{slug}",
+                    origin="https://api.example.test", resource_type="fetch",
+                    status_code=200, is_eligible=True,
+                )
+                return str(task.pk)
+
+            failed_id = database(lambda: failed_fixture("delete-failed"))
+            other_id = database(lambda: failed_fixture("delete-other"))
+            page.locator(".discovery-toolbar").get_by_role("button", name="刷新", exact=True).click()
+            expect(task_row("/delete-failed")).to_be_visible(timeout=15000)
+            task_row("/delete-failed").get_by_role("button", name="查看", exact=True).click()
+            detail = page.locator(".browser-discovery-panel .task-detail")
+            expect(detail).to_contain_text(failed_id)
+            page.get_by_role("button", name="查看已授权样本", exact=True).click()
+            expect(detail).to_contain_text("GET /delete-failed")
+
+            # Cancelling confirmation does not send a DELETE or change selection.
+            before_delete_count = sum(method == "DELETE" for method, _ in requests)
+            task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
+            delete_dialog = page.locator(".el-message-box:visible")
+            expect(delete_dialog).to_be_visible()
+            page.screenshot(path=str(output / "delete-failed-confirmation.png"), full_page=True, animations="disabled")
+            delete_dialog.get_by_role("button", name="取消", exact=True).click()
+            assert sum(method == "DELETE" for method, _ in requests) == before_delete_count
+            assert database(lambda: BrowserDiscoveryTask.objects.filter(pk=failed_id).exists())
+            expect(detail).to_contain_text(failed_id)
+
+            # If the rendered row is stale, the server still owns the decision.
+            # A conflict must keep the task and show an actionable error.
+            database(lambda: BrowserDiscoveryTask.objects.filter(pk=failed_id).update(status="running"))
+            task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
+            with page.expect_response(lambda item: item.request.method == "DELETE" and item.url.endswith(f"{api_base}{failed_id}/")) as refused:
+                delete_dialog.get_by_role("button", name=re.compile("删除")).click()
+            assert refused.value.status == 409, refused.value.text()
+            expect(page.locator(".el-message--error").last).to_be_visible()
+            expect(task_row("/delete-failed")).to_be_visible()
+            expect(detail).to_contain_text(failed_id)
+            assert database(lambda: BrowserDiscoveryRecord.objects.filter(task_id=failed_id).exists())
+            database(lambda: BrowserDiscoveryTask.objects.filter(pk=failed_id).update(status="failed"))
+            page.locator(".discovery-toolbar").get_by_role("button", name="刷新", exact=True).click()
+            expect(task_row("/delete-failed").get_by_role("button", name="删除", exact=True)).to_be_enabled()
+
+            # Removing another row must keep the selected task and its samples.
+            task_row("/delete-other").get_by_role("button", name="删除", exact=True).click()
+            with page.expect_response(lambda item: item.request.method == "DELETE" and item.url.endswith(f"{api_base}{other_id}/")) as deleted:
+                delete_dialog.get_by_role("button", name=re.compile("删除")).click()
+            assert deleted.value.status == 200, deleted.value.text()
+            expect(task_row("/delete-other")).to_have_count(0)
+            expect(detail).to_contain_text(failed_id)
+            expect(detail).to_contain_text("GET /delete-failed")
+            assert not database(lambda: BrowserDiscoveryRecord.objects.filter(task_id=other_id).exists())
+
+            # Deleting the selected failure clears the detail without a manual
+            # refresh and leaves already-created cases/workspaces/specs intact.
+            held_samples = []
+
+            def hold_samples(route):
+                # Save a real pre-deletion response, but deliver it only after
+                # DELETE succeeds. A late read must not resurrect old samples.
+                held_samples.append((route, route.fetch()))
+
+            sample_route = re.compile(rf"{re.escape(api_base)}{re.escape(failed_id)}/records/.*")
+            page.route(sample_route, hold_samples)
+            with page.expect_request(lambda item: f"{api_base}{failed_id}/records/" in item.url):
+                page.get_by_role("button", name="查看已授权样本", exact=True).click()
+            # request events precede route handlers; pump Playwright's event
+            # loop until the real response has been captured for delayed delivery.
+            for _ in range(100):
+                if held_samples:
+                    break
+                page.wait_for_timeout(50)
+            assert len(held_samples) == 1
+            task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
+            with page.expect_response(lambda item: item.request.method == "DELETE" and item.url.endswith(f"{api_base}{failed_id}/")) as deleted:
+                delete_dialog.get_by_role("button", name=re.compile("删除")).click()
+            assert deleted.value.status == 200, deleted.value.text()
+            expect(task_row("/delete-failed")).to_have_count(0)
+            expect(detail).to_have_count(0)
+            for held_route, saved_response in held_samples:
+                held_route.fulfill(response=saved_response)
+            page.unroute(sample_route, hold_samples)
+            page.wait_for_timeout(200)
+            expect(detail).to_have_count(0)
+            assert not database(lambda: BrowserDiscoveryTask.objects.filter(pk=failed_id).exists())
+            assert not database(lambda: BrowserDiscoveryRecord.objects.filter(task_id=failed_id).exists())
+            assert database(lambda: APISpecification.objects.filter(pk=spec.pk).exists())
+            assert database(lambda: APIWorkspace.objects.filter(pk=handoff_workspace.pk).exists())
+            page.reload()
+            expect(task_row("/partial")).to_be_visible(timeout=15000)
+            expect(task_row("/delete-failed")).to_have_count(0)
+            expect(task_row("/delete-other")).to_have_count(0)
+            page.screenshot(path=str(output / "deleted-failures-preserved-workspace.png"), full_page=True)
             page.goto(origin + "/api-testing/workspace")
             expect(page).to_have_url(re.compile(r"/workspace/documents\?workspace_id="), timeout=15000)
             expect(page.locator(".header-actions")).to_contain_text("文档来源工作区")

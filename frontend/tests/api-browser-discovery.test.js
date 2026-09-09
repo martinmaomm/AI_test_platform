@@ -6,6 +6,7 @@ import {
   BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS,
   browserDiscoveryBecameTerminal,
   browserDiscoveryConfig,
+  browserDiscoveryDeleteState,
   browserDiscoveryElapsed,
   browserDiscoveryErrorCodeLabel,
   browserDiscoveryEvidenceCounts,
@@ -130,6 +131,23 @@ test("browser discovery handles elapsed fallback and only uses positive record i
   assert.deepEqual(group.dependencyRecordIds, [3]);
 });
 
+test("browser discovery requires an explicit server deletion grant for an ended task", () => {
+  assert.deepEqual(
+    browserDiscoveryDeleteState({ status: "failed", can_delete: true }),
+    { canDelete: true, reason: "" },
+  );
+  assert.deepEqual(
+    browserDiscoveryDeleteState({ status: "completed", can_delete: false, delete_block_reason: "任务已交接为 API 工作区来源，暂不能删除。" }),
+    { canDelete: false, reason: "任务已交接为 API 工作区来源，暂不能删除。" },
+  );
+  assert.equal(browserDiscoveryDeleteState({ status: "running", can_delete: true }).canDelete, false);
+  assert.match(browserDiscoveryDeleteState({ status: "unknown" }).reason, /先取消并等待停止/);
+  assert.deepEqual(
+    browserDiscoveryDeleteState({ status: "cancelled" }),
+    { canDelete: false, reason: "任务删除状态已过期，请刷新后重试。" },
+  );
+});
+
 test("browser discovery panel is feature-gated and hands off record ids with version", async () => {
   const [source, specs, workspace, router, documents, browser] = await Promise.all([
     readFile(new URL("../src/components/api-testing/BrowserDiscoveryPanel.vue", import.meta.url), "utf8"),
@@ -152,6 +170,8 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(source, /task\.summary/);
   assert.match(source, /active\(task\) && task\.cancellation_requested/);
   assert.match(source, /BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS/);
+  assert.match(source, /删除/);
+  assert.match(source, /deleteState\(row\)/);
   assert.match(source, /data-testid="api-browser-discovery-create-form"/);
   assert.match(source, /aria-label="完整页面 URL"/);
   assert.match(source, /默认自动识别页面实际发起的接口来源/);
@@ -185,6 +205,11 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(workspace, /browserDiscoveryBecameTerminal/);
   assert.match(workspace, /loadBrowserDiscoveryRecords\(taskId, \{ quiet: true \}\)/);
   assert.match(workspace, /browserDiscoveryOriginActionSequence/);
+  assert.match(workspace, /deleteBrowserDiscoveryTask/);
+  assert.match(workspace, /确认删除/);
+  assert.match(workspace, /不会删除磁盘日志\/截图、其他任务、测试用例、工作区或已发布来源/);
+  assert.match(workspace, /clearDeletedBrowserDiscovery/);
+  assert.match(workspace, /browserDiscoveryDeleteSequence/);
   assert.match(source, /form-dirty-change/);
   assert.match(router, /path: 'workspace\/documents'/);
   assert.match(router, /path: 'workspace\/browser'/);

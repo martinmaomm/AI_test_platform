@@ -5,6 +5,7 @@ import uuid
 import logging
 
 from django.db import transaction
+from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -14,6 +15,7 @@ from common.api import response
 from projects.models import Project
 from .browser_discovery import (
     browser_discovery_enabled,
+    browser_discovery_delete_state,
     discovery_limits,
     evidence_statistics,
     expire_stale_discovery,
@@ -163,6 +165,30 @@ class BrowserDiscoveryDetailView(APIView):
             return _problem(exc, 403)
         except LookupError as exc:
             return _problem(exc, 404)
+
+    def delete(self, request, project_id, task_id):
+        try:
+            with transaction.atomic():
+                task = _owned_task(project_id, task_id, request.user, lock=True)
+                deletion = browser_discovery_delete_state(task)
+                if not deletion['can_delete']:
+                    raise WorkspaceConflict(deletion['reason'])
+                deleted_task_id = str(task.id)
+                # Task-owned records cascade in the database.  Trace JSONL and
+                # screenshots deliberately remain on disk for diagnostics.
+                task.delete()
+            return response(
+                kind='success', data={'id': deleted_task_id},
+                message='浏览器探索任务及数据库采样记录已删除；排障日志和截图已保留。',
+            )
+        except PermissionError as exc:
+            return _problem(exc, 403)
+        except LookupError as exc:
+            return _problem(exc, 404)
+        except WorkspaceConflict as exc:
+            return _problem(exc, 409)
+        except ProtectedError:
+            return _problem(WorkspaceConflict('任务已被交接或发布来源引用，暂不能删除。'), 409)
 
 
 class BrowserDiscoveryRecordsView(APIView):

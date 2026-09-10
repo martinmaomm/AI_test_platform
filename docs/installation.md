@@ -75,6 +75,19 @@ GRANT ALL PRIVILEGES ON <database_name>.*
 
 迁移需要在该数据库内创建和调整表结构；如果组织策略不允许 `ALL PRIVILEGES`，请由 DBA 授予 Django 迁移所需的同等库级 DDL/DML 权限。不要复用 root、跨项目共享账户或把数据库暴露到公网。
 
+### 4.1.1 Unraid 上持久化 MariaDB 数据目录
+
+Unraid 的根文件系统 `/` 位于内存中的 rootfs；把 MariaDB 数据目录放在未映射到真实磁盘的 `/opt` 等根文件系统路径，会占用内存，并在重启后丢失。参见 [Unraid 官方存储说明](https://docs.unraid.net/unraid-os/getting-started/what-is-unraid/)。创建或迁移容器前，先检查已存在的父目录的挂载来源和可用空间；若实际缓存池不叫 `cache`，请替换为已确认的池路径：
+
+```bash
+findmnt -T /mnt/cache/appdata
+df -hT /mnt/cache/appdata
+```
+
+确认父目录位于真实磁盘后才创建 `/mnt/cache/appdata/mariadb105/data`，并用上述两条命令再次检查该数据目录。目录名称本身不能证明数据已经落盘。容器绑定数据目录时优先使用 `--mount type=bind,src=<host-data-dir>,dst=<image-data-dir>`，因为源目录缺失时会明确报错；`-v <host-data-dir>:<image-data-dir>` 可能自动创建缺失目录，从而把配置错误伪装成可用挂载。`<image-data-dir>` 应以当前镜像的实际 MariaDB datadir 为准，参见 [Docker bind mount 说明](https://docs.docker.com/engine/storage/bind-mounts/)。
+
+不要把运行中的 MariaDB datadir 直接复制为一致性备份；缓存页、redo/undo 日志和正在写入的表可能使副本无法可靠恢复。应按恢复目标制定定期逻辑 SQL 备份，使用受控账户执行 `mariadb-dump` 或镜像支持的等效工具，将备份复制到不同磁盘或独立备份介质，并定期在隔离数据库中实际恢复和核对；不能仅凭备份文件存在就认为它可用。
+
 确认 Redis 使用独立库/实例，并为跨主机部署启用访问控制、网络隔离与 TLS/认证策略（如组织环境支持）。不要把 Redis、MySQL 或模型服务直接暴露给互联网。
 
 ### 4.2 创建 `.env`

@@ -51,6 +51,20 @@ test("browser discovery creation requires explicit test-write confirmation and v
   assert.equal(browserDiscoveryErrorCodeLabel("cancelled"), "用户已取消探索；已完成的网站操作不会撤销。");
 });
 
+test("browser discovery guard failures show actionable Chinese reasons", () => {
+  const reasons = {
+    TOOL_FAILURE: /连续页面操作失败/,
+    TOOL_NOT_ALLOWED: /不允许的工具/,
+    TOOL_BUDGET: /调用达到本轮上限/,
+    REPEATED_OPERATION: /相同操作反复执行/,
+    TARGET_OUT_OF_SCOPE: /授权范围以外/,
+  };
+  for (const [code, message] of Object.entries(reasons)) {
+    assert.match(browserDiscoveryErrorCodeLabel(code), message);
+    assert.doesNotMatch(browserDiscoveryErrorCodeLabel(code), /任务技术代码/);
+  }
+});
+
 test("browser discovery form snapshots only become clean after the current values are submitted", () => {
   const initial = {
     target_url: "https://example.test/login",

@@ -7,11 +7,222 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from django.test import SimpleTestCase
 from langchain_core.callbacks import AsyncCallbackManager
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from mcp.types import Prompt, Resource, Tool
 
 from .browser_discovery_agent import (
-    ALLOWED_BROWSER_TOOLS, DiscoveryStopped, DiscoveryToolGuard, PendingOriginGate,
+    ALLOWED_BROWSER_TOOLS, BrowserDiscoveryMCPAgent, DiscoveryStopped, DiscoveryToolGuard, PendingOriginGate,
     _safe_agent_summary, prepare_capture_config, run_browser_discovery,
 )
+
+
+class ScriptedBrowserModel(BaseChatModel):
+    """A local model that exercises the real LangChain tool execution graph."""
+
+    calls: int = 0
+    script: list[tuple[str, dict]] = []
+
+    @property
+    def _llm_type(self):
+        return 'browser_discovery_regression'
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        index = self.calls
+        self.calls += 1
+        if index < len(self.script):
+            name, arguments = self.script[index]
+            message = AIMessage(content='', tool_calls=[{
+                'name': name, 'args': arguments, 'id': f'browser-discovery-{index}', 'type': 'tool_call',
+            }])
+        else:
+            message = AIMessage(content='探索结束')
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._generate(messages, stop, run_manager, **kwargs)
+
+
+class FakeBrowserConnector:
+    """Minimal in-memory MCP connector for real mcp-use adapter conversion."""
+
+    def __init__(self):
+        self.tools = [object()]  # The adapter uses this only as initialization state.
+        self.calls = []
+        self.error_tools = set()
+        generic_schema = {'type': 'object', 'properties': {}}
+        navigation_schema = {
+            'type': 'object',
+            'properties': {
+                'url': {'type': 'string'},
+                'headless': {'type': 'boolean'},
+            },
+            'required': ['url', 'headless'],
+        }
+        click_schema = {
+            'type': 'object', 'properties': {'selector': {'type': 'string'}}, 'required': ['selector'],
+        }
+        self._tools = [Tool(
+            name=name, description=f'fixture {name}',
+            inputSchema=(navigation_schema if name == 'playwright_navigate'
+                         else click_schema if name == 'playwright_click' else generic_schema),
+        ) for name in [*ALLOWED_BROWSER_TOOLS, 'playwright_evaluate', 'playwright_post']]
+
+    async def list_tools(self):
+        return self._tools
+
+    async def list_resources(self):
+        return [Resource(name='browser_console_logs', uri='resource://browser-console')]
+
+    async def list_prompts(self):
+        return [Prompt(name='direct_api_prompt', description='must not reach browser discovery model')]
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, dict(arguments)))
+        if name in self.error_tools:
+            return SimpleNamespace(content=['fixture MCP error'], isError=True)
+        return SimpleNamespace(content=['fixture success'], isError=False)
+
+
+class FakeBrowserClient:
+    def __init__(self, connector):
+        self._record_telemetry = False
+        self.active_sessions = ['playwright']
+        self._sessions = {'playwright': SimpleNamespace(connector=connector)}
+
+    def get_all_active_sessions(self):
+        return self._sessions
+
+
+class BrowserDiscoveryMCPAgentTests(SimpleTestCase):
+    def make_agent(self, model, guard=None):
+        connector = FakeBrowserConnector()
+        agent = BrowserDiscoveryMCPAgent(
+            llm=model, client=FakeBrowserClient(connector), max_steps=20,
+            callbacks=[guard] if guard else [], memory_enabled=False,
+            pretty_print=False, verbose=False,
+        )
+        return agent, connector
+
+    def test_real_adapter_filters_resources_prompts_and_hides_platform_headless(self):
+        agent, connector = self.make_agent(ScriptedBrowserModel(script=[
+            # The model deliberately omits headless; the wrapper owns it.
+            ('playwright_navigate', {'url': 'https://web.example.test/app'}),
+        ]))
+
+        asyncio.run(agent.initialize())
+
+        self.assertEqual({tool.name for tool in agent._tools}, ALLOWED_BROWSER_TOOLS)
+        self.assertNotIn('headless', agent._tools[[tool.name for tool in agent._tools].index('playwright_navigate')].args_schema.model_fields)
+        self.assertNotIn('browser_console_logs', str(agent.get_system_message().content))
+        self.assertNotIn('direct_api_prompt', str(agent.get_system_message().content))
+        self.assertNotIn('playwright_evaluate', str(agent.get_system_message().content))
+
+        asyncio.run(agent.run('navigate once', manage_connector=False))
+        self.assertEqual(connector.calls, [(
+            'playwright_navigate', {'url': 'https://web.example.test/app', 'headless': True},
+        )])
+
+    def test_navigation_wrapper_forces_boolean_headless_for_any_supplied_value(self):
+        agent, connector = self.make_agent(ScriptedBrowserModel())
+        asyncio.run(agent.initialize())
+        navigate = next(tool for tool in agent._tools if tool.name == 'playwright_navigate')
+
+        for value in (False, 'true', None):
+            asyncio.run(navigate.ainvoke({'url': 'https://web.example.test/app', 'headless': value}))
+
+        self.assertEqual([arguments for _, arguments in connector.calls], [
+            {'url': 'https://web.example.test/app', 'headless': True},
+            {'url': 'https://web.example.test/app', 'headless': True},
+            {'url': 'https://web.example.test/app', 'headless': True},
+        ])
+
+    def test_real_langchain_validation_failures_count_once_despite_successful_observations(self):
+        guard = DiscoveryToolGuard('https://web.example.test', '', 20)
+        agent, connector = self.make_agent(ScriptedBrowserModel(script=[
+            ('playwright_click', {}),
+            ('playwright_get_visible_text', {}),
+            ('playwright_click', {}),
+            ('playwright_screenshot', {}),
+            ('playwright_click', {}),
+        ]), guard)
+        asyncio.run(agent.initialize())
+
+        with self.assertRaises(DiscoveryStopped):
+            asyncio.run(agent.run('validation failure regression', manage_connector=False))
+
+        self.assertEqual(guard.error.code, 'TOOL_FAILURE')
+        self.assertIn('参数校验失败', str(guard.error))
+        self.assertIn('点击页面元素', str(guard.error))
+        self.assertNotIn('selector', str(guard.error))
+        self.assertEqual(guard.tool_calls, 5)
+        self.assertEqual(guard._failures, 3)
+        self.assertEqual(connector.calls, [
+            ('playwright_get_visible_text', {}), ('playwright_screenshot', {}),
+        ])
+
+    def test_real_graph_unchanged_toolmessage_content_does_not_reset_repeated_click_limit(self):
+        guard = DiscoveryToolGuard('https://web.example.test', '', 20)
+        script = []
+        for _ in range(4):
+            script.extend([
+                ('playwright_click', {'selector': '#same'}),
+                ('playwright_get_visible_text', {}),
+            ])
+        script.append(('playwright_click', {'selector': '#same'}))
+        agent, connector = self.make_agent(ScriptedBrowserModel(script=script), guard)
+        asyncio.run(agent.initialize())
+
+        with self.assertRaises(DiscoveryStopped):
+            asyncio.run(agent.run('unchanged page repeat regression', manage_connector=False))
+
+        self.assertEqual(guard.error.code, 'REPEATED_OPERATION')
+        self.assertEqual(guard.tool_calls, 8)
+        self.assertEqual([name for name, _ in connector.calls], [
+            'playwright_click', 'playwright_get_visible_text',
+            'playwright_click', 'playwright_get_visible_text',
+            'playwright_click', 'playwright_get_visible_text',
+            'playwright_click', 'playwright_get_visible_text',
+        ])
+
+    def test_real_adapter_mcp_error_tool_calls_count_once_despite_successful_observations(self):
+        guard = DiscoveryToolGuard('https://web.example.test', '', 20)
+        agent, connector = self.make_agent(ScriptedBrowserModel(), guard)
+        connector.error_tools.add('playwright_click')
+        asyncio.run(agent.initialize())
+        tools = {tool.name: tool for tool in agent._tools}
+
+        async def invoke(name, args, call_id):
+            return await tools[name].ainvoke({
+                'name': name, 'args': args, 'id': call_id, 'type': 'tool_call',
+            }, config={'callbacks': [guard]})
+
+        async def exercise():
+            first = await invoke('playwright_click', {'selector': '#one'}, 'mcp-error-1')
+            self.assertEqual(first.artifact, {'isError': True})
+            self.assertIn('fixture MCP error', str(first.content))
+            await invoke('playwright_get_visible_text', {}, 'read-after-error-1')
+            second = await invoke('playwright_click', {'selector': '#two'}, 'mcp-error-2')
+            self.assertEqual(second.artifact, {'isError': True})
+            self.assertIn('fixture MCP error', str(second.content))
+            await invoke('playwright_screenshot', {}, 'screenshot-after-error-2')
+            with self.assertRaises(DiscoveryStopped):
+                await invoke('playwright_click', {'selector': '#three'}, 'mcp-error-3')
+
+        asyncio.run(exercise())
+
+        self.assertEqual(guard.error.code, 'TOOL_FAILURE')
+        self.assertIn('页面工具执行失败', str(guard.error))
+        self.assertEqual(guard.tool_calls, 5)
+        self.assertEqual(guard._failures, 3)
+        self.assertEqual([name for name, _ in connector.calls], [
+            'playwright_click', 'playwright_get_visible_text', 'playwright_click',
+            'playwright_screenshot', 'playwright_click',
+        ])
 
 
 class BrowserDiscoveryAgentTests(SimpleTestCase):
@@ -75,7 +286,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         agent = SimpleNamespace(initialize=AsyncMock(), run=AsyncMock(return_value='完成，无需 JSON'))
         checkpoint = Mock(return_value=True)
         with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client), patch(
-            'api_testing.browser_discovery_agent.BudgetedMCPAgent', return_value=agent,
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', return_value=agent,
         ) as factory:
             result = asyncio.run(run_browser_discovery(**self.options, checkpoint=checkpoint))
         self.assertTrue(result['completed'])
@@ -113,7 +324,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         agent.run = stalled_run
         options = {**self.options, 'timeout_seconds': 0.2}
         with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client), patch(
-            'api_testing.browser_discovery_agent.BudgetedMCPAgent', return_value=agent,
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', return_value=agent,
         ):
             result = asyncio.run(run_browser_discovery(**options))
         self.assertEqual(result['error_code'], 'TOTAL_TIMEOUT')
@@ -124,7 +335,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         client, _ = self.clients()
         agent = SimpleNamespace(initialize=AsyncMock(), run=AsyncMock(side_effect=RuntimeError('SECRET_PASSWORD API_KEY TOKEN')))
         with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client), patch(
-            'api_testing.browser_discovery_agent.BudgetedMCPAgent', return_value=agent,
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', return_value=agent,
         ):
             result = asyncio.run(run_browser_discovery(**self.options))
         self.assertFalse(result['completed'])

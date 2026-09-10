@@ -166,6 +166,11 @@ def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, res
         elif ingest_error:
             error_code = 'capture_incomplete'
             task.error_message = ingest_error
+        elif error_code and error_code.lower() != 'cancelled' and not completed:
+            # Failed runner summaries are platform-generated diagnostics, not
+            # the model's free-form completion. Preserve them in the field
+            # displayed by the task detail instead of showing only a code.
+            task.error_message = summary or '网页探索未完成，请查看任务诊断。'
         if task.cancellation_requested or error_code.lower() == 'cancelled':
             status = BrowserDiscoveryTask.Status.CANCELLED
         elif completed and evidence['usable'] and not any(

@@ -35,11 +35,19 @@ def scripted_model(origin):
             return 'browser-discovery-loopback-fixture'
 
         def bind_tools(self, tools, **kwargs):
+            from api_testing.browser_discovery_agent import ALLOWED_BROWSER_TOOLS
+
+            names = {tool.name for tool in tools}
+            assert names <= ALLOWED_BROWSER_TOOLS, ('Unexpected model-visible tools', names - ALLOWED_BROWSER_TOOLS)
+            navigate = next(tool for tool in tools if tool.name == 'playwright_navigate')
+            assert 'headless' not in navigate.args, 'The model must not configure browser headless mode'
             return self
 
         def _generate(self, messages, stop=None, run_manager=None, **kwargs):
             operations = [
-                ('playwright_navigate', {'url': origin + '/app?tenant=fixture#/items', 'headless': True}),
+                # Reproduce the real failure: no model-supplied headless value.
+                # The platform must add it before calling the actual MCP tool.
+                ('playwright_navigate', {'url': origin + '/app?tenant=fixture#/items'}),
                 ('playwright_fill', {'selector': '#username', 'value': 'fixture-user'}),
                 ('playwright_fill', {'selector': '#password', 'value': 'fixture-password'}),
                 ('playwright_click', {'selector': '#login'}),
@@ -141,6 +149,15 @@ def main():
             run_browser_discovery_async.run(str(task.id), task.version, task.task_id)
         task.refresh_from_db()
         assert task.status == 'completed', (task.status, task.error_code, task.error_message, task.evidence_summary)
+        mcp_log = BACKEND / 'logs' / 'playwright-mcp' / f'{task.task_id}.log'
+        calls = [
+            row.get('context', {}).get('body', {}).get('params', {})
+            for row in map(json.loads, mcp_log.read_text(encoding='utf-8').splitlines())
+            if row.get('message') == 'Incoming CallTool request'
+        ]
+        navigations = [call for call in calls if call.get('name') == 'playwright_navigate']
+        assert len(navigations) == 1, 'Navigation was missing or retried'
+        assert navigations[0]['arguments']['headless'] is True, 'MCP did not receive platform-controlled headless mode'
         assert task.api_origin == site.api_origin, ('automatic origin resolution failed', task.api_origin)
         records = list(task.records.filter(is_eligible=True).order_by('sequence'))
         assert records, 'No eligible real browser records'
@@ -198,6 +215,7 @@ def main():
             'duplicate_delivery': 'ignored', 'handoff_idempotency': 'passed', 'remaining_items': len(site.items),
             'independent_unique_names': len(names), 'trace_file': str(task_trace_file(task)),
             'auto_origin_cross_port': 'passed', 'first_login_body_and_response': 'captured',
+            'platform_headless_without_model_argument': 'passed', 'model_tool_whitelist': 'passed',
             'scope': 'Real loopback website and MCP; deterministic model; no live provider/NAS/Redis',
         }
         (output / 'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')

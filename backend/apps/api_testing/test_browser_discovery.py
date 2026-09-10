@@ -280,6 +280,42 @@ class BrowserDiscoveryContractsTests(TestCase):
         cancelled.refresh_from_db()
         self.assertEqual(cancelled.status, BrowserDiscoveryTask.Status.CANCELLED)
 
+    def test_runner_stop_reason_is_persisted_and_visible_in_task_detail(self):
+        for code, message in [
+            ('TOOL_FAILURE', '连续三次页面操作失败，已停止探索；请检查当前页面和登录条件。'),
+            ('TOOL_NOT_ALLOWED', '本轮仅允许网页操作，不允许直接请求接口、执行任意代码或文件操作。'),
+            ('TOTAL_TIMEOUT', '网页探索达到本轮总时限，已保留已收到的请求证据。'),
+        ]:
+            with self.subTest(code=code):
+                task = self.task(status=BrowserDiscoveryTask.Status.RUNNING)
+                with patch('api_testing.browser_discovery.ingest_trace', return_value={}):
+                    _finish_browser_discovery(str(task.id), task.version, task.task_id, {
+                        'completed': False, 'error_code': code, 'summary': message,
+                    })
+                task.refresh_from_db()
+                self.assertEqual(task.status, BrowserDiscoveryTask.Status.FAILED)
+                self.assertEqual(task.error_code, code)
+                self.assertEqual(task.error_message, message)
+                request = self.factory.get('/')
+                force_authenticate(request, self.owner)
+                reply = BrowserDiscoveryDetailView.as_view()(
+                    request, project_id=self.project.id, task_id=task.id,
+                )
+                self.assertEqual(reply.status_code, 200)
+                self.assertEqual(reply.data['data']['error_message'], message)
+
+    def test_finish_exception_diagnostic_takes_precedence_over_runner_summary(self):
+        task = self.task(status=BrowserDiscoveryTask.Status.RUNNING)
+        with patch('api_testing.browser_discovery.ingest_trace', return_value={}):
+            _finish_browser_discovery(str(task.id), task.version, task.task_id, {
+                'completed': False, 'error_code': 'TOOL_FAILURE', 'summary': '先前的中止原因',
+            }, exception=RuntimeError('SECRET_EXCEPTION_CONTENT'))
+        task.refresh_from_db()
+        self.assertEqual(task.error_code, 'runner_failed')
+        self.assertIn('RuntimeError', task.error_message)
+        self.assertNotIn('SECRET', task.error_message)
+        self.assertNotIn('先前', task.error_message)
+
     def test_browser_capture_workspace_source_is_owner_scoped_at_create_patch_and_messages(self):
         task = self.task()
         spec = APISpecification.objects.create(

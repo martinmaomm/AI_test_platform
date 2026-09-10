@@ -329,6 +329,7 @@
           />
           <WorkspaceConversation
             v-if="editingScenario || hasSavedRootCase"
+            :key="workspace.id"
             ref="conversationRef"
             :messages="workspace.messages || []"
             :candidate="workspace.candidate"
@@ -337,6 +338,7 @@
             :busy="interactionLocked"
             :disabled="conflict"
             :generation-disabled="conversationGenerationDisabled"
+            @dirty-change="conversationDirty = $event"
             :can-repair="canRepair"
             :allow-generate="hasSavedRootCase"
             :allow-scenario-regenerate="editingScenario"
@@ -680,6 +682,7 @@ import {
   shouldClearRootGenerationPrompt,
   updateWorkspaceListItem,
   unwrap,
+  workspaceNavigationSnapshot,
   workspaceMatchesSource,
   workspaceInitializationPlan,
   workspaceRouteForSource,
@@ -759,9 +762,12 @@ const renameDialog = ref(false);
 const workspaceMutation = ref(false);
 const renameForm = ref({ id: null, revision: null, title: "" });
 const rootPrompt = ref("");
+const navigationWorkspaceBaseline = ref(null);
+const rootPromptBaseline = ref("");
 const scenarioEndpointOptions = ref([]);
 const scenarioModelId = ref(null);
 const scenarioModelDirty = ref(false);
+const conversationDirty = ref(false);
 const contextPanel = ref(null);
 const conversationRef = ref(null);
 const verificationRef = ref(null);
@@ -795,6 +801,7 @@ let browserDiscoveryRecordsSequence = 0;
 let browserDiscoveryOriginActionSequence = 0;
 let browserDiscoveryDeleteSequence = 0;
 let auxiliaryLoadSequence = 0;
+let endpointSelectionEditSequence = 0;
 let skipNextSourceLeaveConfirmation = false;
 let internalWorkspaceRouteId = null;
 let viewEpoch = 0;
@@ -806,10 +813,21 @@ const sourceName = computed(
 );
 const sourceTaskId = computed(() => sourceWorkspace.value?.source_task_id || null);
 const dirty = computed(() => draftDirty.value || contextDirty.value);
+const navigationWorkspaceDirty = computed(
+  () =>
+    navigationWorkspaceBaseline.value != null &&
+    navigationWorkspaceBaseline.value !== workspaceEditSnapshot(),
+);
+const rootPromptDirty = computed(
+  () =>
+    Boolean(rootPrompt.value.trim()) &&
+    rootPromptBaseline.value !== rootPrompt.value.trim(),
+);
 const navigationDirty = computed(
   () =>
-    dirty.value ||
-    Boolean(rootPrompt.value.trim()) ||
+    navigationWorkspaceDirty.value ||
+    rootPromptDirty.value ||
+    conversationDirty.value ||
     (isBrowserSource.value && browserDiscoveryFormDirty.value),
 );
 const rootBusy = computed(() => rootWorkspaceBusy(rootWorkspace.value));
@@ -1006,6 +1024,7 @@ const reconcileModelSelection = () => {
   modelId.value = selection.modelId;
   unavailableModel.value = true;
   contextDirty.value = true;
+  resetNavigationWorkspaceBaseline(["modelId"]);
 };
 const selectModel = (selectedId) => {
   unavailableModel.value = hasAvailableChatModel(models.value, selectedId)
@@ -1039,11 +1058,28 @@ const routeInteger = (key) => {
 };
 const sameWorkspaceId = (left, right) => String(left) === String(right);
 const workspaceEditSnapshot = () =>
-  JSON.stringify({
+  workspaceNavigationSnapshot({
     draft: draft.value,
     modelId: modelId.value,
+    specId: selectedSpecId.value,
     endpointIds: endpointIds.value,
+    scenarioModelId: scenarioModelId.value,
   });
+const resetNavigationWorkspaceBaseline = (fields = null) => {
+  const current = JSON.parse(workspaceEditSnapshot());
+  const baseline = navigationWorkspaceBaseline.value
+    ? JSON.parse(navigationWorkspaceBaseline.value)
+    : current;
+  for (const field of fields || Object.keys(current)) baseline[field] = current[field];
+  navigationWorkspaceBaseline.value = JSON.stringify(baseline);
+};
+const resetRootPromptBaseline = () => {
+  rootPromptBaseline.value = rootPrompt.value.trim();
+};
+const resetNavigationBaseline = () => {
+  resetNavigationWorkspaceBaseline();
+  resetRootPromptBaseline();
+};
 const clearPython = () => {
   python.value = {
     code: "",
@@ -1534,15 +1570,17 @@ const startBrowserDiscoveryPolling = () => {
 const confirmDiscardDraft = async (action, { includePrompt = false } = {}) => {
   const pendingBrowserForm =
     isBrowserSource.value && browserDiscoveryFormDirty.value;
+  const pendingConversation = conversationDirty.value;
   if (
-    !dirty.value &&
-    !(includePrompt && rootPrompt.value.trim()) &&
-    !pendingBrowserForm
+    !navigationWorkspaceDirty.value &&
+    !(includePrompt && rootPromptDirty.value) &&
+    !pendingBrowserForm &&
+    !pendingConversation
   )
     return true;
   try {
     await ElMessageBox.confirm(
-      `${action}会放弃当前未保存的本地可视化编辑${includePrompt ? "和未提交的测试目标" : ""}${pendingBrowserForm ? "和未提交的网页探索表单" : ""}，是否继续？`,
+      `${action}会放弃当前未保存的修改或未提交的输入，是否继续？`,
       "确认放弃本地编辑",
       { confirmButtonText: "继续", cancelButtonText: "取消", type: "warning" },
     );
@@ -1706,15 +1744,24 @@ const applyEditorWorkspace = (next) => {
   scenarioModelId.value = next.parent_id ? next.model_id ?? null : null;
   scenarioModelDirty.value = false;
   conflict.value = false;
+  resetNavigationWorkspaceBaseline(["draft", "scenarioModelId"]);
   if (next.parent_id) void loadScenarioEndpointOptions(next);
   else scenarioEndpointOptions.value = [];
 };
 const applyRootWorkspace = (value) => {
   const next = asWorkspace(value);
   if (!next?.id) return;
+  const switchedRootWorkspace =
+    rootWorkspace.value?.id != null &&
+    !sameWorkspaceId(rootWorkspace.value.id, next.id);
+  if (switchedRootWorkspace) {
+    rootPrompt.value = "";
+    resetRootPromptBaseline();
+  }
   rootWorkspace.value = next;
   if (workspaceSourceType(next) === "browser_capture" && !next.generation?.status && !next.scenarios?.length && !rootPrompt.value.trim()) {
     rootPrompt.value = "请基于需求历史中的网页探索目标和已选真实接口样本，生成可独立重复执行的 API 测试场景。每个场景重新获取认证信息、使用唯一测试数据，并验证业务结果。";
+    resetRootPromptBaseline();
   }
   workspaces.value = updateWorkspaceListItem(workspaces.value, next);
   workspaceId.value = next.id;
@@ -1743,6 +1790,7 @@ const applyRootWorkspace = (value) => {
   const scenario = activeScenario(next, activeScenarioId.value);
   activeScenarioId.value = scenario?.id ?? null;
   applyEditorWorkspace(scenario || next);
+  resetNavigationWorkspaceBaseline();
   if (rootBusy.value) startPolling();
   else stopPolling();
 };
@@ -1850,7 +1898,7 @@ const createWorkspace = async ({ fromInitialize = false } = {}) => {
     sendingMessage.value
   )
     return;
-  if (!(await confirmDiscardDraft("新建工作区"))) return;
+  if (!(await confirmDiscardDraft("新建工作区", { includePrompt: true }))) return;
   const caseRaw = route.query.case_id;
   const endpointRaw = route.query.endpoint_id;
   const caseId = routeInteger("case_id");
@@ -2000,7 +2048,7 @@ const reloadWorkspace = async ({
 } = {}) => {
   if (!projectId.value || !id || sendingMessage.value) return false;
   let confirmedSnapshot = skipDirtyCheck ? workspaceEditSnapshot() : null;
-  if (dirty.value && !skipDirtyCheck) {
+  if (navigationWorkspaceDirty.value && !skipDirtyCheck) {
     if (quiet || !(await confirmDiscardDraft("重新加载工作区"))) return false;
     confirmedSnapshot = workspaceEditSnapshot();
   }
@@ -2042,7 +2090,7 @@ const reloadWorkspace = async ({
         currentProjectId: projectId.value,
         requestSequence,
         latestSequence: reloadSequence,
-        dirty: dirty.value,
+        dirty: navigationWorkspaceDirty.value,
         confirmedSnapshot,
         currentSnapshot: workspaceEditSnapshot(),
       }) ||
@@ -2163,6 +2211,7 @@ const saveRootContext = async ({ notify = true } = {}) => {
         updated_at: next.updated_at,
       };
     }
+    resetNavigationWorkspaceBaseline(["modelId", "specId", "endpointIds"]);
     if (notify) ElMessage.success("工作区设置已保存");
     return true;
   } catch (error) {
@@ -2320,8 +2369,10 @@ const confirmGeneration = async () => {
         generationForm.value.message,
         rootPrompt.value,
       )
-    )
+    ) {
       rootPrompt.value = "";
+      resetRootPromptBaseline();
+    }
   } else conversationRef.value?.clearSubmittedMessage(generationForm.value.message);
 };
 const sendMessage = async ({ mode, message, base_url, variables, workspaceId: targetId, rootPlan = false }) => {
@@ -2488,6 +2539,7 @@ const selectSpec = async (specId) => {
   await loadEndpointsForSpec({ specId, selectAll: true });
 };
 const selectEndpoints = (ids) => {
+  endpointSelectionEditSequence += 1;
   if (ids.length > 50) {
     endpointIds.value = ids.slice(0, 50);
     ElMessage.warning("一次最多选择 50 个 API 接口，已保留前 50 个。");
@@ -2503,6 +2555,7 @@ const loadEndpointsForSpec = async ({
   const requestProjectId = projectId.value;
   const requestSourceType = props.sourceType;
   const requestRootWorkspaceId = rootWorkspace.value?.id;
+  const requestEndpointSelectionEditSequence = endpointSelectionEditSequence;
   endpointsLoading.value = true;
   endpointsLoadFailed.value = false;
   endpointLoadError.value = "";
@@ -2523,13 +2576,21 @@ const loadEndpointsForSpec = async ({
       return false;
     }
     if (selectAll) {
+      if (
+        markAutoSelection &&
+        requestEndpointSelectionEditSequence !== endpointSelectionEditSequence
+      )
+        return true;
       if (loaded.length > 50) {
         endpointIds.value = [];
         endpointLoadError.value = `该 API 规范包含 ${loaded.length} 个接口，请手动选择至多 50 个。`;
         return false;
       }
       endpointIds.value = loaded.map((endpoint) => endpoint.id);
-      if (markAutoSelection) markContextDirty();
+      if (markAutoSelection) {
+        markContextDirty();
+        resetNavigationWorkspaceBaseline(["endpointIds"]);
+      }
     } else {
       const knownIds = new Set(loaded.map((endpoint) => String(endpoint.id)));
       endpointIds.value = endpointIds.value.filter((id) => knownIds.has(String(id)));
@@ -2732,6 +2793,7 @@ const initialize = async () => {
   endpointOptions.value = [];
   draftDirty.value = false;
   contextDirty.value = false;
+  resetNavigationBaseline();
   conflict.value = false;
   savingDraft.value = false;
   savingCase.value = false;

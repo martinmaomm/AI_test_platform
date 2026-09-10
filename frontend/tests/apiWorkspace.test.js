@@ -40,6 +40,7 @@ import {
   shouldClearRootGenerationPrompt,
   shouldClearSubmittedMessage,
   updateWorkspaceListItem,
+  workspaceNavigationSnapshot,
   workspaceMatchesSource,
   workspaceInitializationPlan,
   workspaceRouteForSource,
@@ -458,6 +459,69 @@ test("workspace save metadata and reload guards preserve the intended local stat
   assert.equal(shouldClearRootGenerationPrompt(true, "目标", "后续目标 "), false);
 });
 
+test("navigation snapshot distinguishes automatic defaults from user edits", () => {
+  const baseline = workspaceNavigationSnapshot({
+    draft: defaultDraft(),
+    modelId: null,
+    specId: 7,
+    endpointIds: [12, 11],
+  });
+  assert.equal(
+    workspaceNavigationSnapshot({
+      draft: defaultDraft(),
+      modelId: null,
+      specId: 7,
+      endpointIds: [11, 12],
+    }),
+    baseline,
+    "automatic endpoint selection has a stable baseline",
+  );
+  assert.notEqual(
+    workspaceNavigationSnapshot({
+      draft: {
+        ...defaultDraft(),
+        config: { ...defaultDraft().config, name: "已编辑" },
+      },
+      modelId: null,
+      specId: 7,
+      endpointIds: [11, 12],
+    }),
+    baseline,
+    "draft edits remain protected",
+  );
+  assert.notEqual(
+    workspaceNavigationSnapshot({
+      draft: defaultDraft(),
+      modelId: 3,
+      specId: 7,
+      endpointIds: [11, 12],
+    }),
+    baseline,
+    "manual model selection remains protected",
+  );
+  assert.notEqual(
+    workspaceNavigationSnapshot({
+      draft: defaultDraft(),
+      modelId: null,
+      specId: 7,
+      endpointIds: [11, 12],
+      scenarioModelId: 4,
+    }),
+    baseline,
+    "manual scenario model selection remains protected",
+  );
+  assert.equal(
+    workspaceNavigationSnapshot({
+      draft: defaultDraft(),
+      modelId: null,
+      specId: 7,
+      endpointIds: [12, 11],
+    }),
+    baseline,
+    "returning content to its baseline clears the navigation prompt",
+  );
+});
+
 test("adopted verification stays current until the draft or context changes", () => {
   const passedGeneration = {
     status: "passed",
@@ -819,6 +883,14 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, /adoptingCandidate\.value \|\|/);
   assert.match(workspace, /adoptingCandidate\.value = true/);
   assert.match(workspace, /contextDirty\.value/);
+  assert.match(workspace, /resetNavigationWorkspaceBaseline\(\["draft", "scenarioModelId"\]\)/);
+  assert.match(workspace, /resetNavigationWorkspaceBaseline\(\["modelId", "specId", "endpointIds"\]\)/);
+  assert.match(workspace, /Boolean\(rootPrompt\.value\.trim\(\)\)/);
+  assert.match(workspace, /rootPrompt\.value = "请基于需求历史.*?";\s+resetRootPromptBaseline\(\)/);
+  assert.match(workspace, /const switchedRootWorkspace =/);
+  assert.match(workspace, /if \(switchedRootWorkspace\) \{\s+rootPrompt\.value = "";/s);
+  assert.match(workspace, /:key="workspace\.id"/);
+  assert.match(workspace, /@dirty-change="conversationDirty = \$event"/);
   assert.match(workspace, /execution_confirmed: true/);
   assert.match(workspace, /:send-message="prepareGeneration"/);
   assert.match(workspace, /workspaceInitializationPlan/);
@@ -828,7 +900,9 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(conversation, /props\.generationDisabled/);
   assert.match(conversation, /await props\.sendMessage/);
   assert.match(conversation, /const focusInput = async/);
-  assert.match(conversation, /defineExpose\(\{ clearSubmittedMessage, focusInput \}\)/);
+  assert.match(conversation, /defineEmits\(\["adopt", "dirty-change"\]\)/);
+  assert.doesNotMatch(conversation, /discardPendingMessage/);
+  assert.match(conversation, /onBeforeUnmount\(\(\) => emit\("dirty-change", false\)\)/);
   assert.match(conversation, /submitting/);
   assert.match(conversation, />生成并验证</);
   assert.match(conversation, />重新生成本场景</);

@@ -269,6 +269,25 @@ export const shouldClearRootGenerationPrompt = (
   accepted === true &&
   submittedMessage === String(currentPrompt ?? "").trim();
 
+// Generation/save dirty state also tracks safe automatic defaults. Navigation
+// confirmation needs a separate snapshot so it only protects user edits.
+export const workspaceNavigationSnapshot = ({
+  draft,
+  modelId = null,
+  specId = null,
+  endpointIds = [],
+  scenarioModelId = null,
+} = {}) =>
+  JSON.stringify({
+    draft,
+    modelId,
+    specId,
+    endpointIds: Array.isArray(endpointIds)
+      ? [...endpointIds].map(String).sort()
+      : [],
+    scenarioModelId,
+  });
+
 export const isHttpUrl = (value) => {
   try {
     const url = new URL(String(value || "").trim());

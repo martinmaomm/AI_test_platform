@@ -110,7 +110,7 @@
 </template>
 
 <script setup>
-import { nextTick, ref } from "vue";
+import { nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { shouldClearSubmittedMessage } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
@@ -133,7 +133,7 @@ const props = defineProps({
   workspaceError: String,
   sendMessage: { type: Function, required: true },
 });
-const emit = defineEmits(["adopt"]);
+const emit = defineEmits(["adopt", "dirty-change"]);
 const message = ref("");
 const messageInput = ref(null);
 const mode = ref("generate");
@@ -167,6 +167,12 @@ const send = async (nextMode) => {
 const clearSubmittedMessage = (submittedMessage) => {
   if (message.value === submittedMessage) message.value = "";
 };
+watch(
+  () => message.value.trim(),
+  (value) => emit("dirty-change", Boolean(value)),
+  { immediate: true },
+);
+onBeforeUnmount(() => emit("dirty-change", false));
 const focusInput = async () => {
   await nextTick();
   const input = messageInput.value?.textarea || messageInput.value?.$el?.querySelector("textarea");

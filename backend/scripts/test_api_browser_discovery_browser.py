@@ -94,15 +94,18 @@ def bootstrap(root):
     }
 
 
-def trace_lines(path, api_origin, count, *, eligible=True, same_path=False):
+def trace_lines(path, api_origin, count, *, eligible=True, same_path=False, repeat_first=False, repeat_last=False):
     """Write only local synthetic collector output; task code still ingests it."""
     lines = []
     for sequence in range(1, count + 1):
         request_id = f"fixture-{sequence}"
+        sample_id = max(1, sequence - 1) if repeat_first else sequence
+        if repeat_last and sequence == count:
+            sample_id = 1
         resource_type = "fetch" if eligible else "image"
         lines.append({
             "protocol_version": 1, "event": "request", "request_id": request_id,
-            "request_sequence": sequence, "url": f"{api_origin}/items/{1 if same_path else sequence}",
+            "request_sequence": sequence, "url": f"{api_origin}/items/{1 if same_path else sample_id}",
             "method": "GET", "resource_type": resource_type,
             "headers": {"Content-Type": "application/json", "Authorization": "must-not-escape"},
         })
@@ -110,7 +113,7 @@ def trace_lines(path, api_origin, count, *, eligible=True, same_path=False):
             "protocol_version": 1, "event": "response", "request_id": request_id,
             "status": 200, "headers": {"Content-Type": "application/json", "Set-Cookie": "must-not-escape"},
             **({"capture_status": "metadata_only"} if not eligible else {}),
-            "body": {"id": sequence, "token": "must-not-escape"},
+            "body": {"id": sample_id, "token": "must-not-escape"},
         })
     path.write_text("\n".join(json.dumps(item) for item in lines) + "\n", encoding="utf-8")
 
@@ -129,14 +132,18 @@ def simulated_runner(fixture):
         if "无有效" in description:
             count, completed, eligible = 1, False, False
         elif "分页" in description:
-            count, completed, eligible = 51, True, True
+            count, completed, eligible = 52, True, True
         elif "多个样本" in description:
             count, completed, eligible = 2, True, True
         else:
-            count, completed, eligible = 2, False, True
+            count, completed, eligible = 3, False, True
         trace = Path(kwargs["trace_file"])
         trace.parent.mkdir(parents=True, exist_ok=True)
-        trace_lines(trace, kwargs["api_origin"], count, eligible=eligible, same_path="多个样本" in description)
+        trace_lines(
+            trace, kwargs["api_origin"], count, eligible=eligible,
+            same_path="多个样本" in description, repeat_first="部分失败" in description,
+            repeat_last="分页" in description,
+        )
         assert await sync_to_async(checkpoint, thread_sensitive=True)({"current_action": "正在整理已观察接口", "tool_calls": 4, "model_calls": 2})
         return {"completed": completed, "summary": "隔离 runner 已保留观察样本", "tool_calls": 4, "model_calls": 2}
 
@@ -272,6 +279,14 @@ def verify(origin, fixture, output):
             page.get_by_role("button", name="查看已授权样本", exact=True).click()
             expect(page.get_by_text("GET /items/1", exact=True)).to_be_visible(timeout=15000)
             expect(page.get_by_text("已观察：请求/响应样本", exact=False)).to_be_visible()
+            # Three captured requests contain only two publicly distinct samples.
+            # The list must collapse the duplicate but keep its evidence at handoff.
+            expect(page.locator(".sample-select .el-checkbox")).to_have_count(2)
+            expect(page.locator(".record-sample .el-collapse-item__header")).to_have_count(2)
+            duplicate_row = page.locator(".record-row").filter(has_text="GET /items/1")
+            expect(duplicate_row).to_contain_text("采集 2 次")
+            expect(duplicate_row).to_contain_text("合并 1")
+            assert database(lambda: BrowserDiscoveryRecord.objects.filter(task__target_url__contains="/partial").count()) == 3
             page.screenshot(path=str(output / "partial-records.png"), full_page=True)
 
             create_task("multiple", "同组多个样本，核对后续响应")
@@ -311,6 +326,13 @@ def verify(origin, fixture, output):
             page.get_by_role("button", name="加载更多样本", exact=True).click()
             sample_51 = page.locator(".sample-select .el-checkbox").filter(has_text="样本 #51")
             expect(sample_51).to_be_visible(timeout=15000)
+            expect(samples).to_have_count(51)
+            first_page_sample = page.locator(".record-row").filter(
+                has=page.get_by_text("GET /items/1", exact=True),
+            )
+            expect(first_page_sample).to_contain_text("采集 2 次")
+            expect(first_page_sample.locator(".sample-select .el-checkbox")).to_have_class(re.compile(r"is-checked"))
+            expect(page.locator(".sample-select .el-checkbox").filter(has_text="样本 #52")).to_have_count(0)
             sample_51.click()
             expect(page.get_by_text("最多可选择 50 组接口", exact=False)).to_be_visible()
             expect(page.get_by_role("button", name="创建来源并进入工作区", exact=True)).to_be_disabled()
@@ -325,6 +347,11 @@ def verify(origin, fixture, output):
             with page.expect_response(lambda item: item.request.method == "POST" and item.url.endswith("/handoff/")) as handoff:
                 page.get_by_role("button", name="创建来源并进入工作区", exact=True).click()
             assert handoff.value.status == 201, handoff.value.text()
+            handed_ids = handoff.value.request.post_data_json["record_ids"]
+            expected_ids = database(lambda: list(BrowserDiscoveryRecord.objects.filter(
+                task__target_url__contains="/partial",
+            ).order_by("id").values_list("id", flat=True)))
+            assert sorted(handed_ids) == expected_ids, "merged selection lost raw evidence IDs"
             source = handoff.value.json()["data"]["workspace"]
             assert source["source_type"] == "browser_capture" and source["source_task_id"] and source["source_name"]
             expect(page.locator(".el-message-box:visible")).to_have_count(0)
@@ -341,6 +368,8 @@ def verify(origin, fixture, output):
             handoff_workspace = database(lambda: APIWorkspace.objects.get(title__startswith="网页探索工作区"))
             spec = database(lambda: APISpecification.objects.get(pk=handoff_workspace.spec_id))
             assert spec.spec_type == "browser_capture" and spec.description
+            assert sorted(spec.metadata["browser_capture"]["selected_record_ids"]) == expected_ids
+            assert len(spec.metadata["browser_capture"]["observed_samples"]) == 3
             assert handoff_workspace.draft['config']['base_url'] == "https://api.example.test"
             assert sorted(handoff_workspace.endpoint_ids) == sorted(database(lambda: list(APIEndpoint.objects.filter(spec=spec).values_list("id", flat=True))))
             assert database(lambda: BrowserDiscoveryTask.objects.get(task_id=handoff_workspace.generation["source"]["task_id"])).description == "部分失败后仍可交接"

@@ -105,17 +105,22 @@
           <el-button :loading="recordsLoading" @click="$emit('load-records', task.id)">查看已授权样本</el-button>
         </div>
         <template v-if="recordGroups.length">
-          <p class="records-hint">仅显示后端提供的公开脱敏摘要。已观察：请求/响应样本；推断：当前不把单次样本泛化为契约；未知：必填性、完整 Schema、枚举和其他响应分支。</p>
+          <p class="records-hint">仅显示后端提供的公开脱敏摘要。公开内容相同的样本合并展示，原始采集记录及依赖保留。已观察：请求/响应样本；未知：必填性、完整 Schema、枚举和其他响应分支，不能将样本视为完整接口规范。</p>
           <div v-for="group in recordGroups" :key="group.key" class="record-row">
               <strong>{{ group.method }} {{ group.path }}</strong>
-              <span>{{ group.origins.join(' / ') }} · {{ group.statusCodes.join(' / ') }} · {{ group.count }} 条样本</span>
+              <span>{{ group.origins.join(' / ') }} · {{ group.statusCodes.join(' / ') }} · {{ group.sampleCount }} 种样本 · 采集 {{ group.count }} 次<span v-if="group.mergedCount">（合并 {{ group.mergedCount }} 条重复）</span></span>
               <el-tag v-if="group.dependencyRecordIds.length" size="small" type="info">依赖记录 {{ group.dependencyRecordIds.join(', ') }}</el-tag>
               <el-tag v-for="reason in group.exclusionReasons" :key="reason" size="small" type="warning">{{ reason }}</el-tag>
               <el-checkbox-group v-model="selectedRecordIds" :disabled="handoffLoading || !canHandoff" class="sample-select">
-                <el-checkbox v-for="record in group.records" :key="record.id" :label="record.id" :disabled="record.is_eligible !== true">样本 #{{ record.sequence }}{{ record.is_eligible ? '' : '（不可交接）' }}</el-checkbox>
+                <el-checkbox
+                  v-for="record in group.records"
+                  :key="record.representativeId"
+                  :label="record.representativeId"
+                  :disabled="record.eligibleRecordIds.length === 0"
+                >{{ sampleLabel(record) }}{{ record.eligibleRecordIds.length === 0 ? '（不可交接）' : '' }}</el-checkbox>
               </el-checkbox-group>
               <el-collapse v-if="group.records.length" class="record-sample">
-                <el-collapse-item v-for="record in group.records" :key="`sample-${record.id}`" :title="sampleTitle(record)">
+                <el-collapse-item v-for="record in group.records" :key="`sample-${record.representativeId}`" :title="sampleTitle(record)">
                   <pre>{{ sampleText(record) }}</pre>
                 </el-collapse-item>
               </el-collapse>
@@ -135,7 +140,28 @@
 
 <script setup>
 import { computed, ref, watch } from "vue";
-import { BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH, BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS, browserDiscoveryDeleteState, browserDiscoveryElapsed, browserDiscoveryErrorCategory, browserDiscoveryErrorCodeLabel, browserDiscoveryEvidenceCounts, browserDiscoveryFormSnapshot, browserDiscoveryOriginResolution, browserDiscoveryOriginStateLabel, browserDiscoveryOriginSummary, browserDiscoveryRecordGroups, browserDiscoveryStatusMeta, browserDiscoveryTimeoutDefault, canConfirmBrowserDiscoveryOrigin, canHandoffBrowserDiscovery, canSelectBrowserDiscoveryOrigin, formatBrowserDiscoveryDuration, isBrowserDiscoveryActive } from "@/utils/apiBrowserDiscovery";
+import {
+  BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH,
+  BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS,
+  browserDiscoveryDeleteState,
+  browserDiscoveryElapsed,
+  browserDiscoveryErrorCategory,
+  browserDiscoveryErrorCodeLabel,
+  browserDiscoveryEvidenceCounts,
+  browserDiscoveryExpandSelectedRecordIds,
+  browserDiscoveryFormSnapshot,
+  browserDiscoveryOriginResolution,
+  browserDiscoveryOriginStateLabel,
+  browserDiscoveryOriginSummary,
+  browserDiscoveryRecordGroups,
+  browserDiscoveryStatusMeta,
+  browserDiscoveryTimeoutDefault,
+  canConfirmBrowserDiscoveryOrigin,
+  canHandoffBrowserDiscovery,
+  canSelectBrowserDiscoveryOrigin,
+  formatBrowserDiscoveryDuration,
+  isBrowserDiscoveryActive,
+} from "@/utils/apiBrowserDiscovery";
 
 const props = defineProps({
   config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, deleting: Boolean, deletingTaskId: { type: [String, Number], default: null }, originActionLoading: Boolean, handoffLoading: Boolean,
@@ -180,13 +206,37 @@ const markCreateFormSubmitted = () => {
 const focusCreateForm = () => {
   createFormCard.value?.$el?.scrollIntoView({ behavior: "smooth", block: "start" });
 };
-const selectedGroupCount = computed(() => recordGroups.value.filter((group) => group.eligibleRecordIds.some((id) => selectedRecordIds.value.includes(id))).length);
-const sampleTitle = (record) => `样本 #${record.sequence ?? "—"}${record.is_eligible === true ? "" : "（不可交接）"}`;
+const selectedRecordIdSet = computed(() => new Set(selectedRecordIds.value.map((id) => String(id))));
+const selectedGroupCount = computed(() =>
+  recordGroups.value.filter((group) =>
+    group.eligibleRepresentativeIds.some((id) => selectedRecordIdSet.value.has(String(id))),
+  ).length,
+);
+const sampleTitle = (record) => {
+  const repeatText = (record.duplicateCount ?? 1) > 1 ? `（采集 ${record.duplicateCount} 次）` : "";
+  const sequenceText = record.sourceSequenceNumbers?.length
+    ? ` · 原始序号 ${record.sourceSequenceNumbers.join(", ")}`
+    : "";
+  return `样本 #${record.sequence ?? "—"}${repeatText}${sequenceText}`;
+};
+const sampleLabel = (record) => {
+  const repeatText = (record.duplicateCount ?? 1) > 1 ? `（采集 ${record.duplicateCount} 次）` : "";
+  return `样本 #${record.sequence ?? "—"}${repeatText}`;
+};
 const sampleText = (record) => JSON.stringify(record.public_summary || { sequence: record.sequence, message: "此样本没有可展示的公开摘要。" }, null, 2);
-const handoff = () => emit("handoff", { taskId: props.task?.id, version: props.task?.version, recordIds: selectedRecordIds.value });
+const handoff = () => emit("handoff", {
+  taskId: props.task?.id,
+  version: props.task?.version,
+  recordIds: browserDiscoveryExpandSelectedRecordIds(selectedRecordIds.value, recordGroups.value),
+});
 const resolveOrigin = (origin, decision) => emit("resolve-origin", { taskId: props.task?.id, version: props.task?.version, origin, decision });
 watch(() => props.task?.id, () => { selectedRecordIds.value = []; });
-watch(recordGroups, (groups) => { selectedRecordIds.value = selectedRecordIds.value.filter((id) => groups.some((group) => group.eligibleRecordIds.includes(Number(id)))); });
+watch(recordGroups, (groups) => {
+  const eligibleIds = new Set(
+    groups.flatMap((group) => group.eligibleRepresentativeIds ?? []).map((id) => String(id)),
+  );
+  selectedRecordIds.value = selectedRecordIds.value.filter((id) => eligibleIds.has(String(id)));
+});
 watch(formDirty, (value) => emit("form-dirty-change", value), { immediate: true });
 watch(
   () => [models.value.map((model) => model.id).join(","), browserDiscoveryTimeoutDefault(props.config)],

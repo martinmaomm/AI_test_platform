@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { nextTick, ref, watch } from "vue";
 import {
   BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH,
   BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS,
@@ -15,6 +16,7 @@ import {
   browserDiscoveryOriginResolution,
   browserDiscoveryOriginStateLabel,
   browserDiscoveryOriginSummary,
+  browserDiscoveryExpandSelectedRecordIds,
   browserDiscoveryRecordIds,
   browserDiscoveryRecordGroups,
   browserDiscoveryTimeoutDefault,
@@ -145,6 +147,401 @@ test("browser discovery handles elapsed fallback and only uses positive record i
   assert.deepEqual(group.dependencyRecordIds, [3]);
 });
 
+test("browser discovery merges公开样本 only when authorized public summary and top-level contract are identical", () => {
+  const makeSummary = () => ({
+    capture_complete: true,
+    source_authorized: true,
+    capture_reason: "ok",
+    observed_request: {
+      headers: { a: "1", "content-type": "application/json" },
+      body: { page: 1 },
+      auth_hints: { header: "Authorization", location: "header" },
+    },
+    observed_response: {
+      headers: { "content-type": "application/json" },
+      body: { total: 2 },
+    },
+  });
+  const records = [
+    {
+      id: 3,
+      method: "get",
+      path: "/orders",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 3,
+      public_summary: makeSummary(),
+      request_id: "r-3",
+      captured_at: "2026-09-10T00:00:00Z",
+      dependency_record_ids: [10],
+      association: { node: "detail" },
+    },
+    {
+      id: 6,
+      method: "GET",
+      path: "/orders",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 6,
+      public_summary: {
+        capture_complete: true,
+        source_authorized: true,
+        capture_reason: "ok",
+        observed_response: {
+          headers: { "content-type": "application/json" },
+          body: { total: 2 },
+        },
+        observed_request: {
+          auth_hints: { location: "header", header: "Authorization" },
+          body: { page: 1 },
+          headers: { "content-type": "application/json", a: "1" },
+        },
+      },
+      request_id: "r-6",
+      captured_at: "2026-09-10T00:00:10Z",
+      dependency_record_ids: [11],
+      association: { node: "list" },
+    },
+    {
+      id: 4,
+      method: "GET",
+      path: "/orders",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "list",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 4,
+      public_summary: makeSummary(),
+    },
+    {
+      id: 7,
+      method: "GET",
+      path: "/orders",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "list",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 7,
+      public_summary: makeSummary(),
+    },
+  ];
+  const group = browserDiscoveryRecordGroups(records)[0];
+  assert.equal(group.sampleCount, 2);
+  assert.equal(group.count, 4);
+  assert.equal(group.mergedCount, 2);
+  const mergedSamples = group.records.filter((record) => record.duplicateCount > 1);
+  assert.deepEqual(mergedSamples.length, 2);
+  const first = mergedSamples.find((item) => item.representativeId === 3);
+  assert.deepEqual(first?.sourceRecordIds.sort((a, b) => a - b), [3, 6]);
+  const second = mergedSamples.find((item) => item.representativeId === 4);
+  assert.deepEqual(second?.sourceRecordIds.sort((a, b) => a - b), [4, 7]);
+  assert.equal(group.records[0].representativeId, 3);
+  assert.equal(group.records[1].representativeId, 4);
+});
+
+test("browser discovery uses smallest legal representative id for stability", () => {
+  const summary = {
+    capture_complete: true,
+    source_authorized: true,
+    capture_reason: "ok",
+    observed_request: {
+      headers: { a: "1", "content-type": "application/json" },
+      body: { page: 1 },
+      auth_hints: { header: "Authorization", location: "header" },
+    },
+    observed_response: {
+      headers: { "content-type": "application/json" },
+      body: { total: 2 },
+    },
+  };
+  const group = browserDiscoveryRecordGroups([
+    {
+      id: 11,
+      method: "GET",
+      path: "/stable",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      public_summary: summary,
+    },
+    {
+      id: 5,
+      method: "GET",
+      path: "/stable",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      public_summary: summary,
+    },
+  ])[0];
+  assert.equal(group.sampleCount, 1);
+  assert.equal(group.records.length, 1);
+  assert.equal(group.records[0].representativeId, 5);
+  assert.deepEqual(group.records[0].sourceRecordIds.sort((a, b) => a - b), [5, 11]);
+});
+
+test("browser discovery keeps differences in public request/response/auth hints/order out of dedupe", () => {
+  const base = {
+    id: 21, sequence: 1, method: "POST", path: "/orders",
+    origin: "https://api.example.test", status_code: 200,
+    content_type: "application/json", resource_type: "fetch",
+    is_eligible: true, exclusion_reason: "",
+    public_summary: {
+      capture_complete: true, source_authorized: true, capture_reason: "",
+      observed_request: {
+        query: [{ name: "tag", value: "first" }, { name: "tag", value: "second" }],
+        headers: { "content-type": "application/json" },
+        json: { page: 1 }, form: null,
+        auth_hints: [{ name: "Authorization", scheme: "Bearer", value_sha256: "hash-a" }],
+      },
+      observed_response: {
+        headers: { "content-type": "application/json" },
+        auth_hints: [], body: { code: 200, data: [1, 2] },
+      },
+    },
+  };
+  const distinctSamples = (records) => browserDiscoveryRecordGroups(records)
+    .reduce((total, group) => total + group.sampleCount, 0);
+  const duplicate = { ...structuredClone(base), id: 22, sequence: 2 };
+  // Control proves these fixtures actually reach the comparison path.
+  assert.equal(distinctSamples([base, duplicate]), 1);
+  const mutations = [
+    ["query value", r => { r.public_summary.observed_request.query[0].value = "changed"; }],
+    ["repeated query order", r => { r.public_summary.observed_request.query.reverse(); }],
+    ["request number vs string", r => { r.public_summary.observed_request.json.page = "1"; }],
+    ["request body", r => { r.public_summary.observed_request.json.page = 2; }],
+    ["form body", r => { r.public_summary.observed_request.form = [{ name: "page", value: "1" }]; }],
+    ["request header", r => { r.public_summary.observed_request.headers.accept = "application/json"; }],
+    ["authentication", r => { r.public_summary.observed_request.auth_hints[0].value_sha256 = "hash-b"; }],
+    ["response header", r => { r.public_summary.observed_response.headers["content-type"] = "text/plain"; }],
+    ["response business status", r => { r.public_summary.observed_response.body.code = 500; }],
+    ["response array order", r => { r.public_summary.observed_response.body.data.reverse(); }],
+    ["HTTP status", r => { r.status_code = 500; }],
+    ["origin", r => { r.origin = "https://other.example.test"; }],
+    ["method", r => { r.method = "GET"; }],
+    ["path", r => { r.path = "/other"; }],
+    ["content type", r => { r.content_type = "application/x-www-form-urlencoded"; }],
+    ["resource type", r => { r.resource_type = "xhr"; }],
+    ["eligibility", r => { r.is_eligible = false; }],
+    ["exclusion", r => { r.exclusion_reason = "origin_not_selected"; }],
+    ["capture reason", r => { r.public_summary.capture_reason = "unknown"; }],
+    ["missing evidence", r => { delete r.public_summary.observed_response; }],
+    ["unauthorized", r => { r.public_summary.source_authorized = false; }],
+    ["incomplete", r => { r.public_summary.capture_complete = false; }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const changed = structuredClone(duplicate);
+    mutate(changed);
+    assert.equal(distinctSamples([base, changed]), 2, label);
+  }
+});
+
+test("browser discovery watch keeps selected representative ids when group ids are numeric and string-coerced", async () => {
+  const summary = {
+    origin: "https://api.example.test",
+    method: "GET",
+    path: "/watch",
+    status_code: 200,
+    content_type: "application/json",
+    resource_type: "api",
+    is_eligible: true,
+    exclusion_reason: null,
+    capture_complete: true,
+    source_authorized: true,
+    capture_reason: "ok",
+    observed_request: { headers: {}, auth_hints: {} },
+    observed_response: { headers: {}, body: {} },
+  };
+
+  const records = [
+    { id: 60, method: "get", path: "/watch", origin: "https://api.example.test", status_code: 200, content_type: "application/json", resource_type: "api", is_eligible: true, exclusion_reason: null, sequence: 60, public_summary: summary },
+    { id: 61, method: "get", path: "/watch", origin: "https://api.example.test", status_code: 200, content_type: "application/json", resource_type: "api", is_eligible: true, exclusion_reason: null, sequence: 61, public_summary: summary },
+  ];
+
+  const selectedRecordIds = ref([String(records[0].id)]);
+  const groups = ref(browserDiscoveryRecordGroups(records));
+
+  watch(
+    groups,
+    (nextGroups) => {
+      const eligibleIds = new Set(
+        nextGroups.flatMap((group) => group.eligibleRepresentativeIds ?? []).map((id) => String(id)),
+      );
+      selectedRecordIds.value = selectedRecordIds.value.filter((id) => eligibleIds.has(String(id)));
+    },
+    { immediate: true },
+  );
+  await nextTick();
+
+  assert.deepEqual(selectedRecordIds.value, [String(records[0].id)]);
+
+  groups.value = browserDiscoveryRecordGroups(records);
+  await nextTick();
+  assert.deepEqual(selectedRecordIds.value, [String(records[0].id)]);
+
+  groups.value = browserDiscoveryRecordGroups([
+    { id: 61, method: "get", path: "/watch", origin: "https://api.example.test", status_code: 200, content_type: "application/json", resource_type: "api", is_eligible: true, exclusion_reason: null, sequence: 61, public_summary: summary },
+  ]);
+  await nextTick();
+  assert.deepEqual(selectedRecordIds.value, []);
+});
+
+test("browser discovery refuses to dedupe incomplete/unauthorized samples and does not mutate input records", () => {
+  const makeSummary = (overrides = {}) => ({
+    capture_complete: true,
+    source_authorized: true,
+    capture_reason: "ok",
+    observed_request: {
+      headers: { accept: "application/json" },
+      auth_hints: { header: "Authorization" },
+      body: { id: 1 },
+    },
+    observed_response: {
+      headers: { "content-type": "application/json" },
+      body: { ok: true },
+      status: 200,
+    },
+    ...overrides,
+  });
+  const records = [
+    {
+      id: 31,
+      method: "get",
+      path: "/profile",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 31,
+      public_summary: makeSummary(),
+    },
+    {
+      id: 32,
+      method: "GET",
+      path: "/profile",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 32,
+      public_summary: makeSummary({ source_authorized: false }),
+    },
+    {
+      id: 33,
+      method: "GET",
+      path: "/profile",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 33,
+      public_summary: makeSummary({ capture_complete: false }),
+    },
+    {
+      id: 34,
+      method: "GET",
+      path: "/profile",
+      origin: "https://api.example.test",
+      status_code: 200,
+      content_type: "application/json",
+      resource_type: "api",
+      is_eligible: true,
+      exclusion_reason: null,
+      sequence: 34,
+    },
+  ];
+  const recordsCopy = structuredClone(records);
+  const group = browserDiscoveryRecordGroups(records)[0];
+  assert.equal(group.sampleCount, records.length);
+  assert.equal(group.count, records.length);
+  assert.deepEqual(records, recordsCopy);
+});
+
+test("browser discovery avoids duplicate counting from repeated pagination ids", () => {
+  const makeSummary = () => ({
+    origin: "https://api.example.test",
+    method: "GET",
+    path: "/paging",
+    status_code: 200,
+    content_type: "application/json",
+    resource_type: "api",
+    is_eligible: true,
+    exclusion_reason: null,
+    capture_complete: true,
+    source_authorized: true,
+    capture_reason: "ok",
+    observed_request: { headers: {}, auth_hints: {} },
+    observed_response: { headers: {}, body: {} },
+  });
+  const records = [
+    { id: 41, method: "get", path: "/paging", origin: "https://api.example.test", status_code: 200, is_eligible: true, public_summary: makeSummary(), sequence: 1 },
+    { id: 41, method: "get", path: "/paging", origin: "https://api.example.test", status_code: 200, is_eligible: true, public_summary: makeSummary(), sequence: 2 },
+  ];
+  const group = browserDiscoveryRecordGroups(records)[0];
+  assert.equal(group.count, 1);
+  assert.equal(group.recordIds.length, 1);
+  assert.deepEqual(group.recordIds, [41]);
+});
+
+test("browser discovery helper expands selected representative ids to raw ids and excludes disabled sample", () => {
+  const baseSummary = {
+    origin: "https://api.example.test",
+    method: "GET",
+    path: "/health",
+    status_code: 200,
+    content_type: "application/json",
+    resource_type: "api",
+    is_eligible: true,
+    exclusion_reason: null,
+    capture_complete: true,
+    source_authorized: true,
+    capture_reason: "ok",
+    observed_request: { headers: {}, auth_hints: {} },
+    observed_response: { headers: {}, body: { ok: true } },
+  };
+  const disabledSummary = {
+    ...baseSummary,
+    is_eligible: false,
+  };
+  const groups = browserDiscoveryRecordGroups([
+    { id: 51, method: "get", path: "/health", origin: "https://api.example.test", status_code: 200, is_eligible: true, public_summary: baseSummary, sequence: 1 },
+    { id: 52, method: "get", path: "/health", origin: "https://api.example.test", status_code: 200, is_eligible: true, public_summary: baseSummary, sequence: 2 },
+    { id: 53, method: "get", path: "/health", origin: "https://api.example.test", status_code: 200, is_eligible: false, public_summary: disabledSummary, sequence: 3 },
+  ].map((record) => ({ ...record, content_type: "application/json", resource_type: "fetch", exclusion_reason: "" })));
+  const group = groups[0];
+  assert.equal(group.records.length, 2);
+  assert.deepEqual(group.records[0].sourceRecordIds, [51, 52]);
+  const expanded = browserDiscoveryExpandSelectedRecordIds(
+    [group.records[0].representativeId, group.records[1].representativeId],
+    groups,
+  );
+  assert.deepEqual(expanded.sort((a, b) => a - b), [51, 52]);
+});
+
 test("browser discovery requires an explicit server deletion grant for an ended task", () => {
   assert.deepEqual(
     browserDiscoveryDeleteState({ status: "failed", can_delete: true }),
@@ -175,7 +572,7 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(source, /API_BROWSER_DISCOVERY_ENABLED/);
   assert.match(source, /暂不能开始探索/);
   assert.match(source, /allow_test_data_writes/);
-  assert.match(source, /recordIds: selectedRecordIds\.value/);
+  assert.match(source, /browserDiscoveryExpandSelectedRecordIds\(selectedRecordIds\.value, recordGroups\.value\)/);
   assert.match(source, /version: props\.task\?\.version/);
   assert.match(source, /公开脱敏摘要/);
   assert.match(source, /load-more-records/);

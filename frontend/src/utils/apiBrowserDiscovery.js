@@ -348,9 +348,116 @@ export const browserDiscoveryRecordIds = (records) =>
     .map((record) => Number(typeof record === "object" ? record?.id : record))
     .filter((id) => Number.isSafeInteger(id) && id > 0);
 
+const browserDiscoveryPublicSummary = (record) =>
+  record?.public_summary && typeof record.public_summary === "object" && !Array.isArray(record.public_summary)
+    ? record.public_summary
+    : null;
+
+const browserDiscoveryNormalizeForComparison = (value) => {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(browserDiscoveryNormalizeForComparison);
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, browserDiscoveryNormalizeForComparison(value[key])]),
+  );
+};
+
+const browserDiscoveryComparableSummary = (record) => {
+  const summary = browserDiscoveryPublicSummary(record);
+  if (!summary) return null;
+
+  const requiredTopKeys = [
+    "origin",
+    "method",
+    "path",
+    "status_code",
+    "content_type",
+    "resource_type",
+  ];
+  const topValues = {
+    origin: String(record?.origin ?? "").trim(),
+    method: String(record?.method ?? "").trim().toUpperCase(),
+    path: String(record?.path ?? "").trim(),
+    status_code: record?.status_code,
+    content_type: record?.content_type,
+    resource_type: record?.resource_type,
+  };
+  for (const key of requiredTopKeys) {
+    if (!Object.prototype.hasOwnProperty.call(record ?? {}, key)) return null;
+    if (topValues[key] === null || topValues[key] === undefined) return null;
+  }
+
+  if (
+    summary.capture_complete !== true ||
+    summary.source_authorized !== true ||
+    !Object.prototype.hasOwnProperty.call(summary, "capture_reason") ||
+    !summary.observed_request ||
+    !summary.observed_response
+  ) return null;
+
+  if (
+    typeof summary.observed_request !== "object" ||
+    Array.isArray(summary.observed_request) ||
+    typeof summary.observed_response !== "object" ||
+    Array.isArray(summary.observed_response)
+  ) return null;
+
+  if (
+    typeof record?.is_eligible !== "boolean" ||
+    typeof record?.exclusion_reason === "undefined"
+  ) return null;
+
+  const values = {
+    ...topValues,
+    is_eligible: record.is_eligible,
+    exclusion_reason: record.exclusion_reason,
+    capture_complete: true,
+    capture_reason: summary.capture_reason,
+    source_authorized: true,
+    observed_request: summary.observed_request,
+    observed_response: summary.observed_response,
+  };
+  return JSON.stringify(browserDiscoveryNormalizeForComparison(values));
+};
+
+const browserDiscoveryMergeSafeId = (value) => {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+};
+
+export const browserDiscoveryExpandSelectedRecordIds = (selectedRepresentativeIds, groups) => {
+  const selected = new Set(
+    (Array.isArray(selectedRepresentativeIds) ? selectedRepresentativeIds : []).map((value) => String(value)),
+  );
+  const expanded = new Set();
+  for (const group of Array.isArray(groups) ? groups : []) {
+    for (const sample of Array.isArray(group?.records) ? group.records : []) {
+      if (!selected.has(String(sample?.representativeId))) continue;
+      for (const id of browserDiscoveryRecordIds(sample?.eligibleRecordIds)) expanded.add(id);
+    }
+  }
+  return [...expanded];
+};
+
 export const browserDiscoveryRecordGroups = (records) => {
   const groups = new Map();
-  for (const record of Array.isArray(records) ? records : []) {
+  const seenIds = new Set();
+  // The earliest stored ID remains the representative across refreshes/pages.
+  // Keep a copy so sorting never mutates the API response held by the parent.
+  const normalizedRecords = (Array.isArray(records) ? [...records] : []).sort(
+    (left, right) =>
+      (browserDiscoveryMergeSafeId(left?.id) ?? Number.MAX_SAFE_INTEGER) -
+      (browserDiscoveryMergeSafeId(right?.id) ?? Number.MAX_SAFE_INTEGER),
+  );
+
+  for (const record of normalizedRecords) {
+    const id = browserDiscoveryMergeSafeId(record?.id);
+    if (id != null) {
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+    }
+
     const method = String(record?.method || "?").toUpperCase();
     const path = record?.path || "—";
     const origin = record?.origin || "—";
@@ -367,32 +474,61 @@ export const browserDiscoveryRecordGroups = (records) => {
       eligibleRecordIds: [],
       exclusionReasons: new Set(),
       dependencyRecordIds: new Set(),
-      samples: [],
       records: [],
+      sampleSignatures: new Map(),
+      sampleCount: 0,
     };
     group.origins.add(origin);
     group.statusCodes.add(statusCode);
-    const id = Number(record?.id);
     group.count += 1;
     if (Number.isSafeInteger(id) && id > 0) {
       group.recordIds.push(id);
-      if (record?.is_eligible === true) group.eligibleRecordIds.push(id);
+      if (record?.is_eligible === true && !group.eligibleRecordIds.includes(id))
+        group.eligibleRecordIds.push(id);
     }
     if (record?.exclusion_reason) group.exclusionReasons.add(record.exclusion_reason);
-    for (const dependencyId of browserDiscoveryRecordIds(
-      record?.dependency_record_ids,
-    ))
+    for (const dependencyId of browserDiscoveryRecordIds(record?.dependency_record_ids))
       group.dependencyRecordIds.add(dependencyId);
-    if (record?.public_summary && typeof record.public_summary === "object")
-      group.samples.push(record.public_summary);
-    group.records.push(record);
+
+    const summarySignature = browserDiscoveryComparableSummary(record);
+    const existing = summarySignature == null ? null : group.sampleSignatures.get(summarySignature);
+    if (existing) {
+      if (id != null && !existing.sourceRecordIds.includes(id)) existing.sourceRecordIds.push(id);
+      if (record?.sequence != null && !existing.sourceSequenceNumbers.includes(record.sequence))
+        existing.sourceSequenceNumbers.push(record.sequence);
+      if (record?.is_eligible === true && id != null && !existing.eligibleRecordIds.includes(id))
+        existing.eligibleRecordIds.push(id);
+      existing.duplicateCount += 1;
+      continue;
+    }
+
+    const representativeId = id ?? `rep-${key}-${group.sampleCount}-${group.records.length}`;
+    const sample = {
+      ...record,
+      representativeId,
+      sourceRecordIds: id == null ? [] : [id],
+      sourceSequenceNumbers: record?.sequence == null ? [] : [record.sequence],
+      duplicateCount: 1,
+      eligibleRecordIds: id != null && record?.is_eligible === true ? [id] : [],
+    };
+    if (summarySignature != null) group.sampleSignatures.set(summarySignature, sample);
+    group.records.push(sample);
+    group.sampleCount += 1;
     groups.set(key, group);
   }
-  return [...groups.values()].map((group) => ({
-    ...group,
-    origins: [...group.origins],
-    statusCodes: [...group.statusCodes],
-    exclusionReasons: [...group.exclusionReasons],
-    dependencyRecordIds: [...group.dependencyRecordIds],
-  }));
+
+  return [...groups.values()].map((group) => {
+    const { sampleSignatures, ...publicGroup } = group;
+    return {
+      ...publicGroup,
+      origins: [...group.origins],
+      statusCodes: [...group.statusCodes],
+      exclusionReasons: [...group.exclusionReasons],
+      dependencyRecordIds: [...group.dependencyRecordIds],
+      eligibleRepresentativeIds: group.records
+        .filter((sample) => sample.eligibleRecordIds.length > 0)
+        .map((sample) => sample.representativeId),
+      mergedCount: group.count - group.sampleCount,
+    };
+  });
 };

@@ -128,7 +128,8 @@ const KNOWN_GENERATION_ERROR_MESSAGES = {
   MODEL_AUTHENTICATION_FAILED: '模型认证或权限校验失败，请检查模型配置。',
   MODEL_RATE_LIMITED: '模型服务触发限流，请稍后重试。',
   exploration_timeout: '页面探索达到总时限，已保留当前证据。',
-  login_failed: '登录后页面仍显示登录表单，请检查测试账号或登录流程。',
+  repeated_interaction: '相同操作在当前页面状态下重复执行，已达到纠错上限；请查看操作记录和页面结果。',
+  interaction_failure: '浏览器定位或交互连续失败，已停止探索；请查看定位器和页面状态。',
   external_domain_blocked: '探索尝试访问目标站点以外的地址，已停止。',
   transient: '连接暂时中断，已保留当前草稿和探索证据。'
 }

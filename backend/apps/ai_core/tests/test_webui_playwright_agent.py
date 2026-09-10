@@ -14,13 +14,14 @@ from ai_core.webui_playwright_agent import (
     MCP_ERROR_BROWSER,
     MCP_ERROR_GRAPH_RECURSION,
     MCP_ERROR_INTERACTION_FAILURE,
-    MCP_ERROR_LOGIN_FAILED,
     MCP_ERROR_REPEATED_INTERACTION,
     MCP_ERROR_TOOL_PARAMETER,
     MCP_ERROR_TOOL_BUDGET,
     MCP_ERROR_RATE_LIMIT,
     MCP_ERROR_TRANSIENT,
     MCP_EXPLORATION_CONSTRAINTS,
+    MCP_INTERACTION_CORRECTION_LIMIT,
+    MCP_INTERACTION_REPEAT_LIMIT,
     MCP_MAX_STEPS,
     MCPBrowserToolGuard,
     MCPToolGuardError,
@@ -271,19 +272,23 @@ class WebUIPlaywrightAgentRetryTests(unittest.IsolatedAsyncioTestCase):
 
 class MCPBrowserToolGuardTests(unittest.TestCase):
     @staticmethod
-    def _start(guard, tool_name, inputs=None):
+    def _start(guard, tool_name, inputs=None, input_str=""):
         run_id = uuid4()
         guard.on_tool_start(
             {"name": tool_name},
-            "",
+            input_str,
             run_id=run_id,
-            inputs=inputs or {},
+            inputs=inputs if inputs is not None else {},
         )
         return run_id
 
     @staticmethod
     def _end(guard, run_id, tool_name, output="ok"):
         guard.on_tool_end(output, run_id=run_id, name=tool_name)
+
+    def test_interaction_limits_have_stable_public_names(self):
+        self.assertEqual(MCP_INTERACTION_REPEAT_LIMIT, 2)
+        self.assertEqual(MCP_INTERACTION_CORRECTION_LIMIT, 3)
 
     def test_hard_budget_stops_before_next_tool_execution(self):
         guard = MCPBrowserToolGuard(max_tool_calls=2)
@@ -369,6 +374,31 @@ class MCPBrowserToolGuardTests(unittest.TestCase):
 
         with self.assertRaises(MCPToolGuardError) as raised:
             self._start(guard, "playwright_click", {"selector": "button.expand"})
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
+
+    def test_changed_wrapper_ids_with_same_body_do_not_reset_interaction_loop(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        first_read = self._start(guard, "playwright_get_visible_text")
+        self._end(
+            guard,
+            first_read,
+            "playwright_get_visible_text",
+            ToolMessage(content="same page body", tool_call_id="call-1"),
+        )
+        for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+            run_id = self._start(guard, "playwright_click", {"selector": "button.retry"})
+            self._end(guard, run_id, "playwright_click", "Clicked")
+        second_read = self._start(guard, "playwright_get_visible_text")
+        self._end(
+            guard,
+            second_read,
+            "playwright_get_visible_text",
+            ToolMessage(content="same page body", tool_call_id="call-2"),
+        )
+
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", {"selector": "button.retry"})
 
         self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
 
@@ -498,71 +528,189 @@ class MCPBrowserToolGuardTests(unittest.TestCase):
 
         self.assertEqual(guard.consecutive_interaction_failures, 0)
 
-    def _submit_login(self, guard):
-        username = self._start(
-            guard,
-            "playwright_fill",
-            {"selector": 'input[placeholder="请输入用户名"]', "value": "user"},
+    def test_empty_submit_then_opaque_field_changes_allow_submit_retry(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=12)
+        page = '<form><input name="f17"><input name="f23"><button>Continue</button></form>'
+        observation = self._start(guard, "playwright_get_visible_html")
+        self._end(guard, observation, "playwright_get_visible_html", page)
+        first_submit = self._start(
+            guard, "playwright_click", {"selector": "form button"},
         )
-        self._end(guard, username, "playwright_fill", "Filled")
-        password = self._start(
-            guard,
-            "playwright_fill",
-            {"selector": 'input[placeholder="请输入密码"]', "value": "secret"},
-        )
-        self._end(guard, password, "playwright_fill", "Filled")
-        submit = self._start(
-            guard,
-            "playwright_click",
-            {"selector": 'button:has-text("登录")'},
-        )
-        self._end(guard, submit, "playwright_click", "Clicked")
-
-    def test_two_login_page_checks_stop_failed_login(self):
-        guard = MCPBrowserToolGuard(max_tool_calls=10)
-        self._submit_login(guard)
-        visible_text = "mall-admin-web 登录 获取体验账号"
-
-        first = self._start(guard, "playwright_get_visible_text")
-        self._end(guard, first, "playwright_get_visible_text", visible_text)
-        second = self._start(guard, "playwright_get_visible_html")
-        with self.assertRaises(MCPToolGuardError) as raised:
-            self._end(
-                guard,
-                second,
-                "playwright_get_visible_html",
-                '<input placeholder="请输入用户名"><input type="password">登录',
-            )
-
-        self.assertEqual(raised.exception.error_kind, MCP_ERROR_LOGIN_FAILED)
-
-    def test_successful_post_login_page_check_marks_login_verified(self):
-        guard = MCPBrowserToolGuard(max_tool_calls=10)
-        self._submit_login(guard)
-
-        check = self._start(guard, "playwright_get_visible_text")
+        self._end(guard, first_submit, "playwright_click", "Clicked")
+        validation = self._start(guard, "playwright_get_visible_html")
         self._end(
             guard,
-            check,
-            "playwright_get_visible_text",
-            "首页 权限 用户列表 角色列表",
+            validation,
+            "playwright_get_visible_html",
+            page.replace("</form>", '<span class="error">required</span></form>'),
         )
+        for selector, value in (("[name=f17]", "alpha"), ("[name=f23]", "beta")):
+            fill = self._start(
+                guard,
+                "playwright_fill",
+                {"selector": selector, "value": value},
+            )
+            self._end(guard, fill, "playwright_fill", "Filled")
 
-        self.assertTrue(guard.login_verified)
-        self.assertEqual(guard.login_checks_since_attempt, 0)
+        retry = self._start(guard, "playwright_click", {"selector": "form button"})
+        self._end(guard, retry, "playwright_click", "Clicked")
 
-    def test_second_login_submission_before_verification_is_stopped(self):
+        self.assertIsNone(guard.terminal_error)
+        self.assertEqual(guard.get_stats()["tool_counts"]["playwright_click"], 2)
+
+    def test_arbitrary_form_and_login_words_have_no_special_semantics(self):
         guard = MCPBrowserToolGuard(max_tool_calls=10)
-        self._submit_login(guard)
+        page = (
+            '<form class="login-form"><input name="username">'
+            '<input name="password"><button>login</button></form>'
+        )
+        for _ in range(3):
+            observation = self._start(guard, "playwright_get_visible_html")
+            self._end(guard, observation, "playwright_get_visible_html", page)
+
+        for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+            click = self._start(guard, "playwright_click", {"selector": "form button"})
+            self._end(guard, click, "playwright_click", "Clicked")
+
+        self.assertIsNone(guard.terminal_error)
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", {"selector": "form button"})
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
+
+    def test_duplicate_successful_fill_does_not_reset_submit_repeat_limit(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        fill_inputs = {"selector": "#f7", "value": "same"}
+        fill = self._start(guard, "playwright_fill", fill_inputs)
+        self._end(guard, fill, "playwright_fill", "Filled")
+        for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+            click = self._start(guard, "playwright_click", {"selector": "#go"})
+            self._end(guard, click, "playwright_click", "Clicked")
+        duplicate = self._start(guard, "playwright_fill", fill_inputs)
+        self._end(guard, duplicate, "playwright_fill", "Filled")
 
         with self.assertRaises(MCPToolGuardError) as raised:
-            self._start(
-                guard,
-                "playwright_click",
-                {"selector": 'button:has-text("登录")'},
-            )
+            self._start(guard, "playwright_click", {"selector": "#go"})
 
-        self.assertEqual(raised.exception.error_kind, MCP_ERROR_LOGIN_FAILED)
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
+
+    def test_failed_fill_does_not_reset_submit_repeat_limit(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+            click = self._start(guard, "playwright_click", {"selector": "#go"})
+            self._end(guard, click, "playwright_click", "Clicked")
+        failed_fill = self._start(
+            guard,
+            "playwright_fill",
+            {"selector": "#f7", "value": "changed"},
+        )
+        self._end(
+            guard,
+            failed_fill,
+            "playwright_fill",
+            "Operation failed: waiting for locator",
+        )
+
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", {"selector": "#go"})
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
+
+    def test_changed_input_allows_retry_but_non_input_corrections_are_bounded(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=16)
+        for value in ("first", "corrected", "another"):
+            fill = self._start(
+                guard,
+                "playwright_fill",
+                {"selector": "#f7", "value": value},
+            )
+            self._end(guard, fill, "playwright_fill", "Filled")
+            click = self._start(guard, "playwright_click", {"selector": "#go"})
+            self._end(guard, click, "playwright_click", "Clicked")
+
+        fourth_fill = self._start(
+            guard,
+            "playwright_fill",
+            {"selector": "#f7", "value": "fourth"},
+        )
+        self._end(guard, fourth_fill, "playwright_fill", "Filled")
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", {"selector": "#go"})
+
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
+        self.assertEqual(
+            guard.get_stats()["tool_counts"]["playwright_click"],
+            MCP_INTERACTION_CORRECTION_LIMIT,
+        )
+
+    def test_input_str_json_fallback_tracks_successful_input_change(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+            click = self._start(guard, "playwright_click", {"selector": "#go"})
+            self._end(guard, click, "playwright_click", "Clicked")
+        fill = self._start(
+            guard,
+            "playwright_fill",
+            inputs=None,
+            input_str='{"selector":"#f7","value":"changed"}',
+        )
+        self._end(guard, fill, "playwright_fill", "Filled")
+
+        retry = self._start(guard, "playwright_click", {"selector": "#go"})
+        self._end(guard, retry, "playwright_click", "Clicked")
+
+        self.assertIsNone(guard.terminal_error)
+
+    def test_iframe_fill_and_select_track_successful_input_changes(self):
+        input_operations = (
+            (
+                "playwright_iframe_fill",
+                {"iframe_selector": "#frame", "selector": "#f7", "value": "changed"},
+            ),
+            (
+                "playwright_select",
+                {"selector": "#f7", "value": "changed"},
+            ),
+        )
+        for tool_name, inputs in input_operations:
+            with self.subTest(tool_name=tool_name):
+                guard = MCPBrowserToolGuard(max_tool_calls=10)
+                for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+                    click = self._start(guard, "playwright_click", {"selector": "#go"})
+                    self._end(guard, click, "playwright_click", "Clicked")
+                input_run = self._start(guard, tool_name, inputs)
+                self._end(guard, input_run, tool_name, "Changed")
+
+                retry = self._start(guard, "playwright_click", {"selector": "#go"})
+                self._end(guard, retry, "playwright_click", "Clicked")
+
+                self.assertIsNone(guard.terminal_error)
+
+    def test_rotating_input_back_to_known_state_does_not_refresh_repeat_limit(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=12)
+
+        first_fill = self._start(
+            guard,
+            "playwright_fill",
+            {"selector": "#f7", "value": "A"},
+        )
+        self._end(guard, first_fill, "playwright_fill", "Filled")
+        first_state = guard._input_state_fingerprint()
+        for _ in range(MCP_INTERACTION_REPEAT_LIMIT):
+            click = self._start(guard, "playwright_click", {"selector": "#go"})
+            self._end(guard, click, "playwright_click", "Clicked")
+
+        for value in ("B", "A"):
+            fill = self._start(
+                guard,
+                "playwright_fill",
+                {"selector": "#f7", "value": value},
+            )
+            self._end(guard, fill, "playwright_fill", "Filled")
+
+        self.assertEqual(guard._input_state_fingerprint(), first_state)
+        with self.assertRaises(MCPToolGuardError) as raised:
+            self._start(guard, "playwright_click", {"selector": "#go"})
+        self.assertEqual(raised.exception.error_kind, MCP_ERROR_REPEATED_INTERACTION)
 
     def test_guard_stats_log_contains_counts_without_inputs(self):
         agent = WebUIPlaywrightAgent.__new__(WebUIPlaywrightAgent)

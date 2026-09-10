@@ -14,7 +14,6 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -28,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai_core.mcp_agent_budget import BudgetedMCPAgent as MCPAgent
 from ai_core.webui_playwright_agent import (
     MCP_BROWSER_TOOL_CALL_LIMIT,
+    MCP_INTERACTION_CORRECTION_LIMIT,
+    MCP_INTERACTION_REPEAT_LIMIT,
     MCP_MAX_STEPS,
     _classify_mcp_error,
     _get_mcp_error_message,
@@ -61,194 +62,6 @@ _PENDING_STEP_PREFIX = '# PENDING_STEP:'
 _PENDING_ASSERTION_PREFIX = '# PENDING_ASSERTION:'
 _BASE64_RE = re.compile(r'(?<![a-z0-9+/=])[a-z0-9+/]{2048,}={0,2}', re.I)
 _SCREENSHOT_DATA_RE = re.compile(r'data:image/[^;,\s]+;base64,[a-z0-9+/=\s]+', re.I)
-_LOGIN_MARKERS = ('登录', 'login', 'sign in', 'signin')
-_HIDDEN_STYLE_RE = re.compile(
-    r'(?:display\s*:\s*none|visibility\s*:\s*hidden)', re.I,
-)
-_VOID_HTML_TAGS = frozenset({
-    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta',
-    'param', 'source', 'track', 'wbr',
-})
-
-
-def _mcp_html_payload(output: Any) -> str | None:
-    """Extract an HTML payload from known MCP wrappers without evaluating text.
-
-    Some MCP versions stringify a list of ``TextContent`` objects, for example
-    ``[TextContent(..., text='HTML content:\\n<html>...')]``.  That is not JSON
-    and must never be evaluated.  Parsing its Python representation and reading
-    only ``ast.Constant`` string values is sufficient to recover the text field.
-    """
-
-    candidates: list[str] = []
-    seen: set[int] = set()
-
-    def collect(value: Any) -> None:
-        if value is None or id(value) in seen:
-            return
-        seen.add(id(value))
-        if isinstance(value, str):
-            candidates.append(value)
-            return
-        if isinstance(value, dict):
-            for key in ('text', 'content', 'output', 'result', 'data'):
-                if key in value:
-                    collect(value[key])
-            return
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                collect(item)
-            return
-        for attribute in ('text', 'content', 'output', 'result', 'data'):
-            if hasattr(value, attribute):
-                try:
-                    collect(getattr(value, attribute))
-                except Exception:
-                    continue
-        # Keep the diagnostic representation as a last resort.  It is parsed
-        # below, never executed.
-        candidates.append(str(value))
-
-    def as_html(text: str) -> str | None:
-        marker = text.lower().find('html content:')
-        if marker >= 0:
-            candidate = text[marker + len('html content:'):].lstrip()
-            if '<' in candidate:
-                return candidate[candidate.find('<'):]
-        if re.search(r'<(?:html|body|form|section|main)\b', text, re.I):
-            return text[text.find('<'):]
-        return None
-
-    collect(output)
-    for value in candidates:
-        # The repr form contains escaped HTML attribute quotes.  Recover its
-        # actual TextContent.text constant before trying to parse markup.
-        is_text_content_repr = 'TextContent(' in value
-        if not is_text_content_repr:
-            if html := as_html(value):
-                return html
-        # Bounds parsing work on unfamiliar, potentially huge error output.
-        if len(value) > 500_000:
-            continue
-        try:
-            tree = ast.parse(value, mode='eval')
-        except (SyntaxError, ValueError, TypeError):
-            if not is_text_content_repr and (html := as_html(value)):
-                return html
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if html := as_html(node.value):
-                    return html
-        if is_text_content_repr:
-            continue
-        if html := as_html(value):
-            return html
-    return None
-
-
-class _LoginFormVisibilityParser(HTMLParser):
-    """Recognize a visible username/password form while respecting ancestors."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.forms: list[dict[str, Any]] = []
-        self._stack: list[tuple[str, bool, dict[str, Any] | None]] = []
-        self.saw_tag = False
-
-    @staticmethod
-    def _is_hidden(attrs: dict[str, str]) -> bool:
-        return (
-            'hidden' in attrs
-            or attrs.get('aria-hidden', '').strip().lower() == 'true'
-            or bool(_HIDDEN_STYLE_RE.search(attrs.get('style', '')))
-        )
-
-    @staticmethod
-    def _has_login_marker(text: str) -> bool:
-        normalized = text.lower()
-        return any(marker in normalized for marker in _LOGIN_MARKERS)
-
-    def _current_form(self) -> dict[str, Any] | None:
-        for _tag, _hidden, form in reversed(self._stack):
-            if form is not None:
-                return form
-        return None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.saw_tag = True
-        tag = tag.lower()
-        attributes = {str(key).lower(): str(value or '') for key, value in attrs}
-        inherited_hidden = self._stack[-1][1] if self._stack else False
-        hidden = inherited_hidden or self._is_hidden(attributes)
-        form: dict[str, Any] | None = None
-        if tag == 'form':
-            attr_text = ' '.join(attributes.values())
-            form = {
-                'hidden': hidden,
-                'login_marker': self._has_login_marker(attr_text),
-                'username': False,
-                'password': False,
-                'visible_username': False,
-                'visible_password': False,
-            }
-            self.forms.append(form)
-        elif tag == 'input' and (form := self._current_form()) is not None:
-            input_text = ' '.join(attributes.values()).lower()
-            input_type = attributes.get('type', '').lower()
-            is_password = input_type == 'password' or 'password' in input_text or '密码' in input_text
-            is_username = any(marker in input_text for marker in (
-                'username', 'user-name', '用户名', 'account', 'email', '邮箱',
-            ))
-            if is_password:
-                form['password'] = True
-                form['visible_password'] |= not hidden and input_type != 'hidden'
-            if is_username:
-                form['username'] = True
-                form['visible_username'] |= not hidden and input_type != 'hidden'
-        if tag not in _VOID_HTML_TAGS:
-            self._stack.append((tag, hidden, form))
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.handle_starttag(tag, attrs)
-        self.handle_endtag(tag)
-
-    def handle_data(self, data: str) -> None:
-        if form := self._current_form():
-            form['login_marker'] |= self._has_login_marker(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        for index in range(len(self._stack) - 1, -1, -1):
-            if self._stack[index][0] == tag:
-                del self._stack[index:]
-                return
-
-    def visible_login_form(self) -> bool:
-        return any(
-            form['login_marker']
-            and form['username']
-            and form['password']
-            and not form['hidden']
-            and form['visible_username']
-            and form['visible_password']
-            for form in self.forms
-        )
-
-
-def _visible_login_form_state(output: Any) -> bool | None:
-    """Return a structural login-page decision, or None for non-HTML output."""
-
-    html = _mcp_html_payload(output)
-    if not html:
-        return None
-    parser = _LoginFormVisibilityParser()
-    try:
-        parser.feed(html)
-        parser.close()
-    except Exception:
-        return None
-    return parser.visible_login_form() if parser.saw_tag else None
 
 
 EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览器上下文中探索并增量编写 Python 草稿。
@@ -258,6 +71,9 @@ EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览
 每次得到足够的页面证据或修复草稿后，都必须调用 save_script_draft。该工具会返回静态检查反馈；按反馈继续完善，而不是只在最终文本一次性给代码。
 save_script_draft 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
 任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 save_script_draft 持久化最新完整草稿，不要等到最终回复。
+操作表单前先检查当前可见结构、控件状态及约束，根据用户目标和已提供数据完成填写，再提交；不要为了查找字段而先点击尚未检查的提交按钮。不要依赖固定语言的按钮文案或固定字段名推断业务意图。
+工具返回点击成功只说明动作已执行，不代表认证或业务成功；页面仍有表单也不代表认证失败。提交后先观察实际校验提示、控件状态及目标结果；页面仍在加载时先等待和观察，不连续点击。
+发现校验未通过或填错时，使用已有证据和用户提供的数据修正输入后允许重试；不得猜测凭据。只有成功执行且值确实变化的填写/选择才算输入纠正，重复填入同值、失败的填写、重复读取页面都不算。相同页面状态与输入状态下，同一操作最多执行 {MCP_INTERACTION_REPEAT_LIMIT} 次；相同页面状态下，即使修改输入，同一非输入操作累计也最多执行 {MCP_INTERACTION_CORRECTION_LIMIT} 次。达到上限前保存草稿和具体未完成原因，不能以轮换输入、变换同一元素的定位写法或反复刷新规避限制。缺少可靠结果证据时标记未确认，不编造成功或账号错误结论。
 只根据真实观察生成 goto、定位器和断言。未实际完成的操作必须在代码中保留 # PENDING_STEP: {{\"reason\":\"...\"}}；未知断言使用 # PENDING_ASSERTION: ...。存在 pending step 或 remaining_steps 时不可声称 complete。
 每条真实的 Python assert 或 await expect(...).to_*/not_to_* 前，必须紧邻写 # 验证：简洁中文业务结果，仅作为每条成功断言的可读标识。不得 print 平台的通过或测试完成日志，统一执行器会在实际成功时输出它们。
 若真实完成并确认某一待补充操作或断言，只移除该项对应 marker；仅删除 marker 不构成完成证明，绝不自动清除平台侧状态。只有全部目标工作和待补充项均已真实完成时，才以 completion=complete、remaining_steps=[] 保存；否则保持 partial 并列出具体剩余项。completed_steps、remaining_steps 和 marker 的 reason 使用简洁中文。
@@ -292,13 +108,11 @@ class ScriptExplorationAgentError(RuntimeError):
 
 
 class ScriptExplorationToolGuard(ReadOnlyMCPBrowserToolGuard):
-    """Use the established safety guard without its old 60-call tail mode.
+    """Add task/origin constraints to the generic interaction recovery guard.
 
-    The base guard's login heuristic treats any page text containing credentials
-    as a login page.  MCP visible-text output can include hidden templates, so
-    this subclass accepts login failure evidence only from visible HTML form
-    structure.  It intentionally leaves repeat-operation and budget safeguards
-    in the base guard intact.
+    Authentication and other business outcomes are not inferred from labels,
+    field names, or the presence/absence of a form.  The shared guard bounds
+    repeated operations; the agent must verify outcomes from actual evidence.
     """
 
     def __init__(
@@ -339,53 +153,6 @@ class ScriptExplorationToolGuard(ReadOnlyMCPBrowserToolGuard):
                     blocked_before_execution=True, tool_name=tool_name,
                 )
         return super().on_tool_start(serialized, input_str, inputs=inputs, **kwargs)
-
-    def _is_login_submission(self, tool_name: str, inputs: Any, input_str: str) -> bool:
-        """Keep explicit login submits, never classify every later click as one."""
-
-        text = json.dumps(inputs, ensure_ascii=False, default=str).lower() if isinstance(inputs, dict) else str(input_str or '').lower()
-        if tool_name.endswith('_click'):
-            return any(marker in text for marker in _LOGIN_MARKERS)
-        if tool_name.endswith('_press_key'):
-            return (
-                'enter' in text
-                and self.login_page_detected
-                and self.login_form_seen
-                and not self.login_verified
-            )
-        return super()._is_login_submission(tool_name, inputs, input_str)
-
-    def _record_page_check(self, tool_name: str, output: Any, *, failed: bool | None = None):
-        """Advance login state only when visible HTML can prove it.
-
-        Plain visible text is deliberately ignored here: pages may expose a
-        hidden login template in their text payload.  A structurally visible
-        login form can still produce the original two-check login failure.
-        Conversely, an HTML page without a visible login form confirms that a
-        prior explicit login submit is no longer on that form.
-        """
-
-        if tool_name != 'playwright_get_visible_html' or failed is True:
-            return
-        state = _visible_login_form_state(output)
-        if state is None:
-            return
-        if state:
-            self.login_page_detected = True
-            self.login_form_seen = True
-            if self.login_attempts and not self.login_verified:
-                self.login_checks_since_attempt += 1
-                if self.login_checks_since_attempt >= 2:
-                    self._raise_guard(
-                        'login_failed',
-                        '登录失败：提交登录后连续两次可见 HTML 页面检查仍显示登录表单，已终止脚本生成。请检查登录流程后重试。',
-                        tool_name=tool_name,
-                    )
-            return
-        if self.login_attempts or self.login_form_seen:
-            self.login_page_detected = False
-            self.login_verified = True
-            self.login_checks_since_attempt = 0
 
     def on_tool_end(self, output, *, run_id=None, **kwargs):
         try:

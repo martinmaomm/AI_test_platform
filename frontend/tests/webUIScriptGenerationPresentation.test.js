@@ -171,6 +171,16 @@ test('actual generation error takes priority over trace termination text', () =>
   assert.equal(generationFailureReason({ exploration_snapshot: { final_message: '已停止', termination_reason: 'MODEL_GATEWAY_TIMEOUT' } }), '模型响应超时，请稍后重试。')
 })
 
+test('generic interaction stops do not blame authentication or test credentials', () => {
+  for (const code of ['repeated_interaction', 'interaction_failure']) {
+    const message = generationFailureReason({ error_code: code })
+    assert.match(message, /操作|交互/)
+    assert.doesNotMatch(message, /登录|密码|账号/)
+  }
+  const diagnostic = '相同页面下的操作已达到纠错上限，已停止本次探索。'
+  assert.equal(generationFailureReason({ error_code: 'repeated_interaction', error_message: diagnostic }), diagnostic)
+})
+
 test('model free text stays technical while normal warnings are bounded Chinese summaries', () => {
   const english = 'I inspected several possible selectors and considered a long chain of alternatives. '.repeat(12)
   const pending = `待补充断言：${english}`

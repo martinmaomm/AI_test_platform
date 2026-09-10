@@ -12,7 +12,11 @@ from django.test import SimpleTestCase, override_settings
 
 from .exploration_policy import ExplorationPolicy
 from .exploration_trace import ExplorationTraceRecorder, _tool_failed
-from .script_exploration_agent import ScriptExplorationAgent, ScriptExplorationToolGuard
+from .script_exploration_agent import (
+    EXPLORATION_SCRIPT_CONSTRAINTS,
+    ScriptExplorationAgent,
+    ScriptExplorationToolGuard,
+)
 
 
 PARTIAL_SCRIPT = '''\
@@ -95,82 +99,82 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         return "[TextContent(type='text', text=" + repr('HTML content:\n' + html) + ')]'
 
     @staticmethod
-    def login_form(*, wrapper_attrs: str = '') -> str:
-        return f'''\
-<html><body><form id="login-form" {wrapper_attrs}>
-  <input name="username" /><input type="password" name="password" />
-  <button type="submit">登录</button>
-</form></body></html>'''
-
-    def page_check(self, guard: ScriptExplorationToolGuard, output: str, run_id: str) -> None:
-        guard.on_tool_start(
-            {'name': 'playwright_get_visible_html'}, '', run_id=run_id,
-            inputs={'selector': 'body'},
-        )
+    def operation(guard, tool_name, inputs=None, output='ok'):
+        run_id = uuid4()
+        guard.on_tool_start({'name': tool_name}, '', run_id=run_id, inputs=inputs or {})
         guard.on_tool_end(output, run_id=run_id)
 
-    def login_attempt(self, guard: ScriptExplorationToolGuard) -> None:
-        guard.on_tool_start(
-            {'name': 'playwright_click'}, '', run_id='login-submit',
-            inputs={'selector': '#login-submit'},
+    def test_empty_submit_then_corrected_fields_can_retry_in_any_language(self):
+        # Reproduce the incident, with opaque field names and unrelated labels.
+        # The callback guard must not assign authentication semantics to either.
+        for label in ('登录', 'Continue', 'Weiter', '進む', 'Enviar'):
+            with self.subTest(label=label):
+                guard = self.make_guard()
+                page = self.html_output(
+                    '<form><input name="f17"><input name="f23" type="password">'
+                    f'<button>{label}</button></form>'
+                )
+                self.operation(guard, 'playwright_get_visible_html', output=page)
+                self.operation(guard, 'playwright_click', {'selector': f'text={label}'})
+                self.operation(guard, 'playwright_get_visible_text', output='×')
+                self.operation(guard, 'playwright_get_visible_html', output=page)
+                self.operation(guard, 'playwright_fill', {'selector': '[name=f17]', 'value': 'fixture-user'})
+                self.operation(guard, 'playwright_get_visible_text', output='×')
+                self.operation(guard, 'playwright_fill', {'selector': '[name=f23]', 'value': 'fixture-value'})
+                self.operation(guard, 'playwright_get_visible_text', output='×')
+                self.operation(guard, 'playwright_click', {'selector': f'text={label}'})
+                self.assertIsNone(guard.terminal_error)
+                self.assertEqual(guard.get_stats()['tool_counts']['playwright_click'], 2)
+                self.assertEqual(guard.get_stats()['blocked_tool_calls'], 0)
+
+    def test_repeated_form_observations_do_not_claim_authentication_failure(self):
+        guard = self.make_guard()
+        page = self.html_output(
+            '<form class="login-form"><input name="username">'
+            '<input name="password" type="password"><button>登录</button></form>'
         )
-        guard.on_tool_end('clicked', run_id='login-submit')
-
-    def test_hidden_login_form_repr_confirms_success_and_allows_later_click(self):
-        guard = self.make_guard()
-        self.page_check(guard, self.html_output(self.login_form()), 'visible-login')
-        self.login_attempt(guard)
-        # The real MCP wrapper is a string repr.  The hidden template must be
-        # decoded by AST constants before style visibility is assessed.
-        post_login = self.login_form(wrapper_attrs='style="display:none"') + (
-            '<section id="records"><button id="next-action">继续</button></section>'
-        )
-        self.page_check(guard, self.html_output(post_login), 'hidden-login')
-        self.assertTrue(guard.login_verified)
-        self.assertEqual(guard.login_checks_since_attempt, 0)
-        guard.on_tool_start(
-            {'name': 'playwright_click'}, '', run_id='next-action',
-            inputs={'selector': '#next-action'},
-        )
-        guard.on_tool_end('clicked', run_id='next-action')
-        self.assertEqual(guard.login_attempts, 1)
-
-    def test_hidden_void_input_does_not_hide_visible_login_siblings(self):
-        guard = self.make_guard()
-        # ``input`` has no end tag.  Its hidden attribute must not leak to the
-        # following visible username/password fields through the parser stack.
-        html = '''\
-<html><body><form class="login-form">
-  <input type="hidden" hidden name="csrf" />
-  <input name="username" /><input type="password" name="password" />
-  <button>登录</button>
-</form></body></html>'''
-        self.page_check(guard, self.html_output(html), 'visible-after-hidden-input')
-        self.assertTrue(guard.login_page_detected)
-        self.assertTrue(guard.login_form_seen)
-
-    def test_visible_login_form_after_explicit_submit_still_stops_on_second_html_check(self):
-        guard = self.make_guard()
-        output = self.html_output(self.login_form())
-        self.page_check(guard, output, 'before-submit')
-        self.login_attempt(guard)
-        self.page_check(guard, output, 'still-login-once')
-        with self.assertRaisesRegex(Exception, '连续两次可见 HTML'):
-            self.page_check(guard, output, 'still-login-twice')
-        self.assertEqual(guard.termination_reason, 'login_failed')
-
-    def test_plain_text_or_empty_data_does_not_increment_login_failure(self):
-        guard = self.make_guard()
-        self.page_check(guard, self.html_output(self.login_form()), 'before-submit')
-        self.login_attempt(guard)
-        for run_id in ('empty-data-once', 'empty-data-twice'):
-            guard.on_tool_start(
-                {'name': 'playwright_get_visible_text'}, '', run_id=run_id,
-                inputs={'selector': 'main'},
-            )
-            guard.on_tool_end('暂无数据，未找到匹配记录。', run_id=run_id)
-        self.assertEqual(guard.login_checks_since_attempt, 0)
+        self.operation(guard, 'playwright_get_visible_html', output=page)
+        self.operation(guard, 'playwright_click', {'selector': 'button'})
+        for _ in range(3):
+            self.operation(guard, 'playwright_get_visible_html', output=page)
         self.assertIsNone(guard.terminal_error)
+
+    def test_hidden_form_and_error_copy_do_not_create_authentication_state(self):
+        guard = self.make_guard()
+        page = self.html_output(
+            '<div hidden><form class="login-form"><input name="username">'
+            '<input type="password"><button>登录</button></form></div>'
+            '<main><button id="next">登录记录</button><p>没有找到匹配记录</p></main>'
+        )
+        self.operation(guard, 'playwright_get_visible_html', output=page)
+        self.operation(guard, 'playwright_click', {'selector': '#next'})
+        self.operation(guard, 'playwright_get_visible_html', output=page)
+        self.operation(guard, 'playwright_click', {'selector': '#next'})
+        self.assertIsNone(guard.terminal_error)
+        # An unchanged third operation still stops, for the generic loop reason.
+        with self.assertRaisesRegex(Exception, '相同|重复'):
+            self.operation(guard, 'playwright_click', {'selector': '#next'})
+        self.assertEqual(guard.termination_reason, 'repeated_interaction')
+
+    def test_successful_input_correction_allows_retry_when_visible_output_is_unchanged(self):
+        guard = self.make_guard()
+        page = self.html_output(
+            '<section><input id="f7"><button id="go">↪</button></section>'
+        )
+        self.operation(guard, 'playwright_get_visible_html', output=page)
+        self.operation(guard, 'playwright_fill', {'selector': '#f7', 'value': 'first'})
+        for _ in range(2):
+            self.operation(guard, 'playwright_click', {'selector': '#go'})
+            self.operation(guard, 'playwright_get_visible_html', output=page)
+        self.operation(guard, 'playwright_fill', {'selector': '#f7', 'value': 'corrected'})
+        self.operation(guard, 'playwright_get_visible_html', output=page)
+        self.operation(guard, 'playwright_click', {'selector': '#go'})
+        self.assertIsNone(guard.terminal_error)
+        # Further value changes must not turn the correction window into a loop.
+        self.operation(guard, 'playwright_fill', {'selector': '#f7', 'value': 'another'})
+        with self.assertRaisesRegex(Exception, '纠错|重复|相同'):
+            self.operation(guard, 'playwright_click', {'selector': '#go'})
+        self.assertEqual(guard.termination_reason, 'repeated_interaction')
 
     def test_fake_agent_incrementally_saves_full_draft_and_checkpoints(self):
         checkpoints = []
@@ -435,6 +439,18 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertNotIn('start_path', prompt)
         agent._install_entry_seed()
         self.assertIn(repr(agent._target_url), agent._last_valid_script)
+
+    def test_prompt_explains_evidence_based_bounded_form_recovery(self):
+        from ai_core.webui_playwright_agent import (
+            MCP_INTERACTION_REPEAT_LIMIT,
+            MCP_INTERACTION_CORRECTION_LIMIT,
+        )
+        self.assertIn('先检查当前可见结构', EXPLORATION_SCRIPT_CONSTRAINTS)
+        self.assertIn('不代表认证或业务成功', EXPLORATION_SCRIPT_CONSTRAINTS)
+        self.assertIn('不得猜测凭据', EXPLORATION_SCRIPT_CONSTRAINTS)
+        self.assertIn('不要依赖固定语言', EXPLORATION_SCRIPT_CONSTRAINTS)
+        self.assertIn(f'最多执行 {MCP_INTERACTION_REPEAT_LIMIT} 次', EXPLORATION_SCRIPT_CONSTRAINTS)
+        self.assertIn(f'最多执行 {MCP_INTERACTION_CORRECTION_LIMIT} 次', EXPLORATION_SCRIPT_CONSTRAINTS)
 
     def test_final_text_static_complete_fallback_stays_partial_without_generic_pending_step(self):
         class Agent:
@@ -808,6 +824,33 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertEqual(result.script_draft, PARTIAL_SCRIPT.strip())
         self.assertNotIn('仅生成入口', result.script_draft)
         self.assertEqual(result.completion, 'partial')
+
+    def test_generic_loop_stop_keeps_draft_trace_and_objective_reason(self):
+        class Agent:
+            def __init__(self, **kwargs): self.guard = kwargs['callbacks'][0]
+
+            async def initialize(self): pass
+
+            async def register_local_tools(self, tools): self.tools = tools
+
+            async def run(self, *_args, **_kwargs):
+                await self.tools[0].ainvoke({'code': PARTIAL_SCRIPT, 'completion': 'partial'})
+                for _ in range(3):
+                    ScriptExplorationAgentTests.operation(
+                        self.guard, 'playwright_click', {'selector': '#opaque-action'}, 'Clicked',
+                    )
+
+        result, _ = self.run_with(Agent)
+        self.assertEqual(result.error_code, 'repeated_interaction')
+        self.assertEqual(result.completion, 'partial')
+        self.assertEqual(result.script_draft, PARTIAL_SCRIPT.strip())
+        self.assertEqual(result.snapshot['tool_stats']['total_tool_calls'], 2)
+        self.assertEqual(result.snapshot['tool_stats']['blocked_tool_calls'], 1)
+        self.assertEqual([event['status'] for event in result.snapshot['events']], [
+            'succeeded', 'succeeded', 'blocked',
+        ])
+        self.assertNotIn('登录失败', result.error_message)
+        self.assertNotIn('账号', result.error_message)
 
     def test_original_guard_termination_reason_is_kept(self):
         class Agent:

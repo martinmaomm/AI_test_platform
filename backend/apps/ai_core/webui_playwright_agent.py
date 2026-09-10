@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 MCP_MAX_STEPS = 100
 MCP_BROWSER_TOOL_CALL_LIMIT = 72
+MCP_INTERACTION_REPEAT_LIMIT = 2
+MCP_INTERACTION_CORRECTION_LIMIT = 3
 
 MCP_EXPLORATION_CONSTRAINTS = f"""- 调用 `playwright_navigate` 时必须显式传入 JSON 布尔值 `headless: true`，不得省略，也不得传字符串 `\"true\"`。
 - 所有浏览器工具调用合计最多 {MCP_BROWSER_TOOL_CALL_LIMIT} 次；仅在缺少必要页面结构、可见文本或定位器时调用工具。
@@ -54,7 +56,6 @@ MCP_ERROR_OTHER = "other"
 MCP_ERROR_TOOL_BUDGET = "tool_budget"
 MCP_ERROR_REPEATED_INTERACTION = "repeated_interaction"
 MCP_ERROR_INTERACTION_FAILURE = "interaction_failure"
-MCP_ERROR_LOGIN_FAILED = "login_failed"
 
 _PLAYWRIGHT_TOOL_PARAMETER_ERROR_MARKERS = (
     "headless: expected boolean",
@@ -102,7 +103,6 @@ _MCP_TOOL_GUARD_ERROR_KINDS = {
     MCP_ERROR_TOOL_BUDGET,
     MCP_ERROR_REPEATED_INTERACTION,
     MCP_ERROR_INTERACTION_FAILURE,
-    MCP_ERROR_LOGIN_FAILED,
 }
 
 _PAGE_CHECK_TOOLS = {"playwright_get_visible_text", "playwright_get_visible_html"}
@@ -123,11 +123,12 @@ _LOCATOR_INTERACTION_TOOLS = {
     "playwright_drag",
     "playwright_press_key",
 }
-_LOGIN_MARKERS = ("登录", "login", "sign in", "signin")
-_SENSITIVE_INPUT_KEY = re.compile(
-    r"password|passwd|pwd|token|secret|authorization|api[_-]?key|密码|口令",
-    re.IGNORECASE,
-)
+_INPUT_INTERACTION_TOOLS = {
+    "playwright_fill",
+    "playwright_iframe_fill",
+    "playwright_select",
+}
+_INPUT_VALUE_KEY = "value"
 
 
 def _guard_tool_name(serialized: Optional[Dict[str, Any]]) -> str:
@@ -136,43 +137,82 @@ def _guard_tool_name(serialized: Optional[Dict[str, Any]]) -> str:
     return str(serialized.get("name") or "").strip().lower()
 
 
-def _guard_input_text(inputs: Any, input_str: str = "") -> str:
-    if isinstance(inputs, dict):
+def _guard_input_payload(inputs: Any, input_str: str = "") -> Any:
+    """Prefer structured callback inputs, with JSON input_str as a fallback."""
+    if isinstance(inputs, dict) and inputs:
+        return inputs
+    if input_str:
         try:
-            return json.dumps(inputs, ensure_ascii=False, sort_keys=True, default=str)
+            decoded = json.loads(input_str)
         except (TypeError, ValueError):
-            return str(inputs)
+            decoded = None
+        if isinstance(decoded, dict):
+            return decoded
+    if isinstance(inputs, dict):
+        return inputs
     return str(input_str or "")
 
 
-def _normalize_guard_value(value: Any, key: str = "") -> Any:
-    if _SENSITIVE_INPUT_KEY.search(key):
-        return "<redacted>"
+def _normalize_guard_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            str(item_key): _normalize_guard_value(item_value, str(item_key))
+            str(item_key): _normalize_guard_value(item_value)
             for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
         }
     if isinstance(value, (list, tuple)):
         return [_normalize_guard_value(item) for item in value]
     if isinstance(value, set):
-        return sorted(_normalize_guard_value(item) for item in value)
+        return sorted(
+            (_normalize_guard_value(item) for item in value),
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+        )
     return value
 
 
+def _guard_fingerprint(value: Any) -> str:
+    normalized = _normalize_guard_value(value)
+    serialized = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _normalize_guard_input(inputs: Any, input_str: str = "") -> str:
-    source = inputs if isinstance(inputs, dict) else input_str
-    normalized = _normalize_guard_value(source)
-    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return _guard_fingerprint(_guard_input_payload(inputs, input_str))
+
+
+def _guard_input_change(inputs: Any, input_str: str = "") -> tuple[str, str] | None:
+    """Return hashed control/value identities for a structured input operation."""
+    payload = _guard_input_payload(inputs, input_str)
+    if not isinstance(payload, dict) or _INPUT_VALUE_KEY not in payload:
+        return None
+    control = {
+        key: value
+        for key, value in payload.items()
+        if key != _INPUT_VALUE_KEY
+    }
+    return _guard_fingerprint(control), _guard_fingerprint(payload[_INPUT_VALUE_KEY])
 
 
 def _guard_output_text(output: Any) -> str:
-    if hasattr(output, "content"):
-        return _guard_output_text(output.content)
+    if isinstance(output, str):
+        # Some MCP versions return a TextContent(...) repr.  Keep it as opaque
+        # text; never evaluate a tool-controlled representation.
+        return output
     if isinstance(output, dict):
+        for key in ("text", "content"):
+            if key in output:
+                return _guard_output_text(output[key])
         return json.dumps(output, ensure_ascii=False, sort_keys=True, default=str)
     if isinstance(output, (list, tuple)):
         return " ".join(_guard_output_text(item) for item in output)
+    for attribute in ("text", "content"):
+        if hasattr(output, attribute):
+            return _guard_output_text(getattr(output, attribute))
     return str(output or "")
 
 
@@ -188,18 +228,15 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         self.total_tool_calls = 0
         self.tool_call_counts = Counter()
         self.interaction_call_counts = Counter()
+        self.interaction_correction_counts = Counter()
         self.failed_tool_calls = 0
         self.blocked_tool_calls = 0
         self.consecutive_interaction_failures = 0
-        self.login_page_detected = False
-        self.login_form_seen = False
-        self.login_attempts = 0
-        self.login_checks_since_attempt = 0
-        self.login_verified = False
         self.termination_reason = None
         self._terminal_error = None
         self._observed_page_state_fingerprints = {}
         self._page_state_version = 0
+        self._known_input_value_fingerprints = {}
         self._active_tools = {}
         self._last_operation = None
         self._last_blocked_operation = None
@@ -215,26 +252,6 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             MCPBrowserToolGuard._is_browser_tool(tool_name)
             and tool_name not in _READ_ONLY_BROWSER_TOOLS
         )
-
-    @staticmethod
-    def _is_login_page(output: Any) -> bool:
-        text = _guard_output_text(output).lower()
-        if not text.strip():
-            return False
-        has_login_marker = any(marker in text for marker in _LOGIN_MARKERS)
-        has_username_field = "请输入用户名" in text or "username" in text
-        has_password_field = "请输入密码" in text or "password" in text
-        has_login_form = (
-            (has_username_field and has_password_field)
-            or "获取体验账号" in text
-            or "login-form" in text
-        )
-        return has_login_marker and has_login_form
-
-    @staticmethod
-    def _is_meaningful_page_check(output: Any) -> bool:
-        text = _guard_output_text(output).strip().lower()
-        return bool(text) and not MCPBrowserToolGuard._is_failed_output(output)
 
     @staticmethod
     def _is_failed_output(output: Any) -> bool:
@@ -294,21 +311,16 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         if previous is not None and previous != fingerprint:
             self._page_state_version += 1
 
-    def _is_login_submission(self, tool_name: str, inputs: Any, input_str: str) -> bool:
-        text = _guard_input_text(inputs, input_str).lower()
-        if tool_name.endswith("_press_key"):
-            return "enter" in text and self.login_form_seen
-        if tool_name.endswith("_click"):
-            return (
-                any(marker in text for marker in _LOGIN_MARKERS)
-                or (self.login_page_detected and self.login_form_seen)
-            )
-        if tool_name == "playwright_evaluate":
-            return (
-                any(marker in text for marker in _LOGIN_MARKERS)
-                and any(marker in text for marker in ("fetch", "submit", ".click", "/login"))
-            )
-        return False
+    def _input_state_fingerprint(self) -> str:
+        return _guard_fingerprint(self._known_input_value_fingerprints)
+
+    def _record_input_change(self, input_change: tuple[str, str] | None):
+        if input_change is None:
+            return
+        control_fingerprint, value_fingerprint = input_change
+        if self._known_input_value_fingerprints.get(control_fingerprint) == value_fingerprint:
+            return
+        self._known_input_value_fingerprints[control_fingerprint] = value_fingerprint
 
     def _raise_guard(
         self,
@@ -340,34 +352,9 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         if self.consecutive_interaction_failures >= 3:
             self._raise_guard(
                 MCP_ERROR_INTERACTION_FAILURE,
-                "浏览器定位交互连续失败 3 次，已终止脚本生成。请检查定位器、页面状态或登录结果后重试。",
+                "浏览器定位交互连续失败 3 次，已终止脚本生成。请检查定位器或页面状态后重试。",
                 tool_name=tool_name,
             )
-
-    def _record_page_check(self, tool_name: str, output: Any, *, failed: bool | None = None):
-        meaningful = (
-            self._is_meaningful_page_check(output)
-            if failed is None
-            else bool(_guard_output_text(output).strip()) and not failed
-        )
-        if (
-            tool_name not in _PAGE_CHECK_TOOLS
-            or not meaningful
-        ):
-            return
-        if self._is_login_page(output):
-            self.login_page_detected = True
-            if self.login_attempts and not self.login_verified:
-                self.login_checks_since_attempt += 1
-                if self.login_checks_since_attempt >= 2:
-                    self._raise_guard(
-                        MCP_ERROR_LOGIN_FAILED,
-                        "登录失败：提交登录后连续两次页面检查仍停留在登录页，已终止脚本生成。请检查登录流程后重试。",
-                        tool_name=tool_name,
-                    )
-        elif self.login_attempts or self.login_form_seen:
-            self.login_verified = True
-            self.login_checks_since_attempt = 0
 
     def on_tool_start(
         self,
@@ -393,36 +380,44 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                     tool_name=tool_name,
                 )
 
-            if tool_name == "playwright_fill":
-                text = _guard_input_text(inputs, input_str).lower()
-                if "password" in text or "密码" in text or "username" in text or "用户名" in text:
-                    self.login_form_seen = True
-
-            if self._is_login_submission(tool_name, inputs, input_str) and not self.login_verified:
-                if self.login_attempts >= 1:
-                    self._raise_guard(
-                        MCP_ERROR_LOGIN_FAILED,
-                        "登录失败：尚未确认登录成功前再次提交登录，已终止脚本生成。请检查登录流程后重试。",
-                        blocked_before_execution=True,
-                        tool_name=tool_name,
-                    )
-                self.login_attempts += 1
-                self.login_checks_since_attempt = 0
-
             interaction_key = None
+            correction_key = None
+            input_change = None
             if self._is_interaction_tool(tool_name):
+                operation_fingerprint = _normalize_guard_input(inputs, input_str)
                 interaction_key = (
                     tool_name,
-                    _normalize_guard_input(inputs, input_str),
+                    operation_fingerprint,
                     self._page_state_version,
+                    self._input_state_fingerprint(),
                 )
-                if self.interaction_call_counts[interaction_key] >= 2:
+                if self.interaction_call_counts[interaction_key] >= MCP_INTERACTION_REPEAT_LIMIT:
                     self._raise_guard(
                         MCP_ERROR_REPEATED_INTERACTION,
-                        "未观察到页面状态变化，且相同的交互操作及参数已执行 2 次，已终止脚本生成。请检查定位器或操作流程后重试。",
+                        "未观察到页面或有效输入状态变化，且相同的交互操作及参数已执行 "
+                        f"{MCP_INTERACTION_REPEAT_LIMIT} 次，已终止脚本生成。请检查定位器或操作流程后重试。",
                         blocked_before_execution=True,
                         tool_name=tool_name,
                     )
+                if tool_name in _INPUT_INTERACTION_TOOLS:
+                    input_change = _guard_input_change(inputs, input_str)
+                else:
+                    correction_key = (
+                        tool_name,
+                        operation_fingerprint,
+                        self._page_state_version,
+                    )
+                    if (
+                        self.interaction_correction_counts[correction_key]
+                        >= MCP_INTERACTION_CORRECTION_LIMIT
+                    ):
+                        self._raise_guard(
+                            MCP_ERROR_REPEATED_INTERACTION,
+                            "同一页面状态下，相同非输入操作的纠错执行已达到 "
+                            f"{MCP_INTERACTION_CORRECTION_LIMIT} 次上限，已终止脚本生成。",
+                            blocked_before_execution=True,
+                            tool_name=tool_name,
+                        )
 
             self.total_tool_calls += 1
             self.tool_call_counts[tool_name] += 1
@@ -433,9 +428,12 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             }
             if interaction_key is not None:
                 self.interaction_call_counts[interaction_key] += 1
+            if correction_key is not None:
+                self.interaction_correction_counts[correction_key] += 1
             self._active_tools[run_id] = {
                 "tool_name": tool_name,
                 "is_locator_interaction": tool_name in _LOCATOR_INTERACTION_TOOLS,
+                "input_change": input_change,
                 "call_index": self.total_tool_calls,
             }
 
@@ -457,8 +455,9 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
                     self._record_interaction_failure(tool_name)
                 else:
                     self.consecutive_interaction_failures = 0
+            if not failed:
+                self._record_input_change(active_tool.get("input_change"))
             self._record_observed_state(tool_name, output, failed=failed)
-            self._record_page_check(tool_name, output, failed=failed)
 
     def on_tool_error(self, error: BaseException, *, run_id=None, parent_run_id=None, **kwargs):
         with self._lock:

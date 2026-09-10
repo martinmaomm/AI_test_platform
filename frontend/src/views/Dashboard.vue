@@ -266,8 +266,8 @@ const defaultLayout = [
   { x: 16, y: 2, w: 8, h: 10, i: 'top-failures', minW: 6, minH: 6 },
   { x: 0, y: 12, w: 6, h: 5, i: 'portal-api', minW: 4, minH: 4 },
   { x: 6, y: 12, w: 6, h: 5, i: 'portal-web', minW: 4, minH: 4 },
-  { x: 12, y: 12, w: 6, h: 5, i: 'portal-app', minW: 4, minH: 4 },
-  { x: 18, y: 12, w: 6, h: 5, i: 'portal-perf', minW: 4, minH: 4 },
+  { x: 12, y: 12, w: 6, h: 5, i: 'portal-perf', minW: 4, minH: 4 },
+  { x: 18, y: 12, w: 6, h: 5, i: 'portal-app', minW: 4, minH: 4 },
   { x: 0, y: 17, w: 24, h: 1, i: 'section-infra', minW: 24, minH: 1 },
   { x: 0, y: 18, w: 12, h: 5, i: 'portal-ai-config', minW: 6, minH: 4 },
   { x: 12, y: 18, w: 12, h: 5, i: 'portal-settings', minW: 6, minH: 4 }
@@ -510,7 +510,7 @@ function getPortalTitle(i) {
 
 function getPortalDesc(i) {
   const map = {
-    'portal-api': '多协议接口测试、复杂场景链路编排。',
+    'portal-api': '基于接口文档或网页探索，通过 AI 对话生成、验证和修复接口测试用例。',
     'portal-web': '基于 Playwright MCP 自动生成自动化代码，支持自动修复和运行。',
     'portal-app': '移动端 UI 自动化、POM 解析与智能体。',
     'portal-perf': '负载压测、性能分析与专项测试。',

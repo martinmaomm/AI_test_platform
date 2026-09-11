@@ -105,7 +105,7 @@ class ExecutionScreenshotPersistenceTests(ScreenshotMediaTestCase):
             'runtime_assertion_count': 1 if success else 0,
             'error': '' if success else 'fixture browser failure',
             'result': {
-                'stdout': 'fixture stdout', 'stderr': '', 'test_file': '',
+                'stdout': 'fixture stdout', 'stderr': '', 'test_file': '/ephemeral/runner-workspace',
                 'screenshot_path': screenshot_path,
             },
         }
@@ -119,7 +119,10 @@ class ExecutionScreenshotPersistenceTests(ScreenshotMediaTestCase):
         return run
 
     def assert_persisted_screenshot(self, execution, detail):
+        execution.refresh_from_db()
         detail.refresh_from_db()
+        self.assertEqual(execution.log_path, '')
+        self.assertIn('fixture stdout', detail.log)
         expected_prefix = f'webui_failure_screenshots/execution_{execution.id}/'
         self.assertTrue(detail.screenshot_path.startswith(expected_prefix))
         self.assertTrue(os.path.isfile(os.path.join(str(settings.MEDIA_ROOT), detail.screenshot_path)))

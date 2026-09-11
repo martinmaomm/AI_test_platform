@@ -214,7 +214,7 @@ class AssistedDebuggingTests(TestCase):
             'runtime_assertion_count': runtime_assertion_count,
             'error': '' if passed else 'runner failed',
             'result': {
-                'stdout': stdout, 'stderr': '', 'test_file': '',
+                'stdout': stdout, 'stderr': '', 'test_file': '/ephemeral/runner-workspace',
                 'screenshot_path': None,
             },
         }
@@ -255,6 +255,10 @@ class AssistedDebuggingTests(TestCase):
                 args=(str(generation.id), 0, digest), task_id='repair-worker',
             ).get()
         self.assertEqual(result['status'], 'candidate_passed')
+        executions = list(WebUITestExecution.objects.order_by('id'))
+        self.assertEqual([item.status for item in executions], ['failed', 'passed'])
+        self.assertEqual([item.log_path for item in executions], ['', ''])
+        self.assertIn('Locator.click:', executions[0].case_execution_detail.log)
         self.assertTrue(calls[0]['code_only'])
         self.assertFalse(calls[1]['code_only'])
         self.assertEqual(calls[1]['script_draft'], candidates[0])

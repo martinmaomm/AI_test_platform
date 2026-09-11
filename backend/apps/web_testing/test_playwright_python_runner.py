@@ -17,6 +17,54 @@ from .playwright_python_runner import (
 
 
 class PlaywrightRunnerContractTests(unittest.TestCase):
+    def test_public_results_do_not_advertise_deleted_workspaces(self):
+        script = "async def run(page):\n    await page.goto('https://web.example.test/')\n"
+        for suite in (False, True):
+            for return_code in (0, 1):
+                with self.subTest(suite=suite, return_code=return_code), tempfile.TemporaryDirectory() as base:
+                    runner = PlaywrightRunner()
+                    runner.temp_base_dir = base
+                    completed = SimpleNamespace(
+                        returncode=return_code,
+                        stdout='offline execution output',
+                        stderr='offline diagnostic',
+                    )
+                    with patch('web_testing.playwright_python_runner._runner', runner), patch.object(
+                        runner, '_run_pytest_command', return_value=completed,
+                    ):
+                        if suite:
+                            result = playwright_suite_runner('fixture', [
+                                {'test_case_id': 1, 'script_content': script},
+                            ])
+                        else:
+                            result = playwright_runner('fixture', script)
+
+                    self.assertEqual(os.listdir(base), [])
+                    self.assertEqual(result['stdout'], completed.stdout)
+                    self.assertEqual(result['stderr'], completed.stderr)
+                    self.assertEqual(result['operation_success'], return_code == 0)
+                    for name in ('test_file', 'test_files', 'work_dir'):
+                        self.assertNotIn(name, result)
+                        self.assertNotIn(name, result.get('execution_info', {}))
+
+    def test_task_payload_preserves_output_without_promoting_a_temporary_path(self):
+        from .tasks import _run_test_script
+
+        with patch('web_testing.playwright_python_runner.playwright_runner', return_value={
+            'success': True, 'operation_success': True,
+            'stdout': 'offline stdout', 'stderr': 'offline stderr',
+            'test_file': '/ephemeral/runner-workspace',
+            'screenshot_path': '/controlled/screenshot.png',
+            'runtime_assertion_count': 1,
+        }):
+            result = _run_test_script('async def run(page):\n    assert True\n', {})
+
+        payload = result['result']
+        self.assertNotIn('test_file', payload)
+        self.assertEqual(payload['stdout'], 'offline stdout')
+        self.assertEqual(payload['stderr'], 'offline stderr')
+        self.assertEqual(payload['screenshot_path'], '/controlled/screenshot.png')
+
     def test_public_runner_contracts_and_execution_config_have_no_base_url(self):
         self.assertNotIn('base_url', ExecutionConfig.__dataclass_fields__)
         self.assertNotIn('generate_allure', ExecutionConfig.__dataclass_fields__)

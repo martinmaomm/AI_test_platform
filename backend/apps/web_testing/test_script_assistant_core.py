@@ -106,6 +106,7 @@ class ScriptAssistantCoreTests(TestCase):
                 "runtime_assertion_count": 1,
                 "stdout": "ok",
                 "stderr": "",
+                "test_file": "/ephemeral/runner-workspace",
             },
         }
         with patch("web_testing.tasks._run_test_script", return_value=runner_result):
@@ -113,6 +114,8 @@ class ScriptAssistantCoreTests(TestCase):
         execution = WebUITestExecution.objects.get(pk=attempt["execution_id"])
         self.assertEqual(attempt["status"], "passed")
         self.assertEqual(execution.error_message, "")
+        self.assertEqual(execution.log_path, "")
+        self.assertIn("ok", execution.case_execution_detail.log)
         self.assertEqual(execution.case_execution_detail.error_message, None)
 
     def test_verify_uses_fresh_authorization_without_an_active_model(self):

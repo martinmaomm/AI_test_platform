@@ -28,6 +28,7 @@ from .serializers import WebUIScriptGenerationSerializer, WebUITestCaseDetailSer
 from .views import (
     WebUIScriptGenerationDebugView,
     WebUIScriptGenerationDraftView,
+    WebUIScriptGenerationRepairView,
     WebUIScriptGenerationSaveView,
 )
 
@@ -121,6 +122,87 @@ async def run(page):
             project_id=self.project.id, generation_id=generation.id,
         )
         self.assertEqual(duplicate.status_code, 409)
+
+    def test_debug_requires_edit_and_execute_before_creating_or_dispatching(self):
+        membership = ProjectMember.objects.get(project=self.project, user=self.member)
+        membership.can_edit = True
+        membership.can_execute_tests = False
+        membership.save(update_fields=['can_edit', 'can_execute_tests'])
+        generation = self.generation(user=self.member)
+        with patch('web_testing.views.debug_webui_script_generation_task.delay') as dispatch:
+            response = WebUIScriptGenerationDebugView.as_view()(
+                self.request(self.member, 'POST', '/debug/', {
+                    'expected_revision': 0, 'confirm_execution': True,
+                }),
+                project_id=self.project.id, generation_id=generation.id,
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(WebUITestExecution.objects.exists())
+        dispatch.assert_not_called()
+
+    def test_repair_requires_edit_and_execute_before_state_change_or_dispatch(self):
+        membership = ProjectMember.objects.get(project=self.project, user=self.member)
+        membership.can_edit = True
+        membership.can_execute_tests = False
+        membership.save(update_fields=['can_edit', 'can_execute_tests'])
+        generation = self.generation(user=self.member, workspace={
+            'revision': 0, 'variables': [],
+            'verification': {
+                'status': 'failed', 'script_hash': script_hash(VALID_SCRIPT),
+                'locked_revision': 0, 'execution_id': 7,
+                'diagnostics': [{'code': 'RUNTIME_FAILURE', 'message': 'failed'}],
+            },
+        })
+        with patch('web_testing.views.repair_webui_script_generation_task.delay') as dispatch:
+            response = WebUIScriptGenerationRepairView.as_view()(
+                self.request(self.member, 'POST', '/repair/', {
+                    'expected_revision': 0, 'confirm_execution': True,
+                }),
+                project_id=self.project.id, generation_id=generation.id,
+            )
+        self.assertEqual(response.status_code, 403)
+        dispatch.assert_not_called()
+        generation.refresh_from_db()
+        self.assertEqual(workspace_for_generation(generation)['repair']['status'], 'idle')
+
+    def test_editor_with_edit_and_execute_can_debug_and_repair_owned_generation(self):
+        membership = ProjectMember.objects.get(project=self.project, user=self.member)
+        membership.can_edit = True
+        membership.can_execute_tests = True
+        membership.save(update_fields=['can_edit', 'can_execute_tests'])
+
+        debug_generation = self.generation(user=self.member)
+        with patch(
+            'web_testing.views.debug_webui_script_generation_task.delay',
+            return_value=SimpleNamespace(id='member-debug'),
+        ):
+            response = WebUIScriptGenerationDebugView.as_view()(
+                self.request(self.member, 'POST', '/debug/', {
+                    'expected_revision': 0, 'confirm_execution': True,
+                }),
+                project_id=self.project.id, generation_id=debug_generation.id,
+            )
+        self.assertEqual(response.status_code, 202, response.data)
+
+        repair_generation = self.generation(user=self.member, workspace={
+            'revision': 0, 'variables': [],
+            'verification': {
+                'status': 'failed', 'script_hash': script_hash(VALID_SCRIPT),
+                'locked_revision': 0, 'execution_id': 7,
+                'diagnostics': [{'code': 'RUNTIME_FAILURE', 'message': 'failed'}],
+            },
+        })
+        with patch(
+            'web_testing.views.repair_webui_script_generation_task.delay',
+            return_value=SimpleNamespace(id='member-repair'),
+        ):
+            response = WebUIScriptGenerationRepairView.as_view()(
+                self.request(self.member, 'POST', '/repair/', {
+                    'expected_revision': 0, 'confirm_execution': True,
+                }),
+                project_id=self.project.id, generation_id=repair_generation.id,
+            )
+        self.assertEqual(response.status_code, 202, response.data)
 
     def test_stale_task_completion_cannot_mark_new_draft_passed(self):
         generation = self.generation(workspace={
@@ -312,6 +394,63 @@ async def run(page):
             project_id=self.project.id, generation_id=generation.id,
         )
         self.assertEqual(response.status_code, 409)
+
+    def test_entry_url_mismatch_blocks_debug_and_save_before_execution(self):
+        changed_script = VALID_SCRIPT.replace('/users', '/other?mode=test#/entry')
+        generation = self.generation(script_draft=changed_script)
+        with patch('web_testing.views.debug_webui_script_generation_task.delay') as dispatch:
+            response = WebUIScriptGenerationDebugView.as_view()(
+                self.request(self.user, 'POST', '/debug/', {
+                    'expected_revision': 0, 'confirm_execution': True,
+                }),
+                project_id=self.project.id, generation_id=generation.id,
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(WebUITestExecution.objects.exists())
+        dispatch.assert_not_called()
+
+        response = WebUIScriptGenerationSaveView.as_view()(
+            self.request(self.user, 'POST', '/save/', {
+                'mode': 'draft', 'expected_revision': 0,
+            }),
+            project_id=self.project.id, generation_id=generation.id,
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(WebUITestCase.objects.exists())
+
+    def test_unconfirmed_dynamic_entry_cannot_be_saved_as_verified(self):
+        dynamic_script = VALID_SCRIPT.replace(
+            "async def run(page):\n    await page.goto('https://web.example.test/users')",
+            "async def run(page, variables):\n    await page.goto(variables['TARGET_URL'])",
+        )
+        generation = self.generation(script_draft=dynamic_script)
+        _, digest = prepare_debug(generation.id, expected_revision=0, execution_id=4)
+        self.assertTrue(finish_debug(
+            generation.id, execution_id=4, locked_revision=0, locked_hash=digest,
+            status='passed', diagnostics=[], runtime_assertion_count=1,
+        ))
+        response = WebUIScriptGenerationSaveView.as_view()(
+            self.request(self.user, 'POST', '/save/', {
+                'mode': 'verified', 'expected_revision': 0,
+            }),
+            project_id=self.project.id, generation_id=generation.id,
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(WebUITestCase.objects.exists())
+        # The frontend chooses its save mode from this response state. It must
+        # offer a draft save, not get trapped retrying an impossible verified save.
+        verification = response.data['data']['workspace']['verification']
+        self.assertEqual(verification['status'], 'incomplete')
+        self.assertIn('入口网址尚未确认', verification['message'])
+        response = WebUIScriptGenerationSaveView.as_view()(
+            self.request(self.user, 'POST', '/save/', {
+                'mode': 'draft', 'expected_revision': 0,
+            }),
+            project_id=self.project.id, generation_id=generation.id,
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        saved = WebUITestCase.objects.get()
+        self.assertEqual(saved.generation_metadata['verification']['status'], 'unverified')
 
     def test_case_script_or_variables_edit_invalidates_previous_execution(self):
         for changes in (

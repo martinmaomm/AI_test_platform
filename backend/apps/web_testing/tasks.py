@@ -173,7 +173,6 @@ def _run_test_script(
         'script_id': script_id,
         'stdout': result.get('stdout', ''),
         'stderr': result.get('stderr', ''),
-        'test_file': result.get('test_file', ''),
         'return_code': result.get('return_code', 0 if result.get('success') else 1),
         'screenshot_path': result.get('screenshot_path'),
     }
@@ -297,7 +296,8 @@ def _execute_webui_test_case_logic(
         execution.error_message = error_message
         execution.end_time = end_time
         execution.duration = duration
-        execution.log_path = result_data.get('test_file') or ''
+        # Execution logs live in the detail record, not the runner's temporary directory.
+        execution.log_path = ''
         execution.save()
 
         case_detail.status = execution.status
@@ -443,7 +443,7 @@ def debug_webui_script_generation_task(
         execution.error_message = error_message
         execution.end_time = end_time
         execution.duration = (end_time - execution.start_time).total_seconds()
-        execution.log_path = result_data.get('test_file') or ''
+        execution.log_path = ''
         execution.save(update_fields=['status', 'error_message', 'end_time', 'duration', 'log_path', 'updated_at'])
         detail.status = execution.status
         detail.end_time = end_time
@@ -770,7 +770,7 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
             execution.error_message = error_message
             execution.end_time = ended
             execution.duration = (ended - execution.start_time).total_seconds()
-            execution.log_path = safe_result_data.get('test_file') or ''
+            execution.log_path = ''
             execution.save()
             detail.status = execution_status
             detail.end_time = ended

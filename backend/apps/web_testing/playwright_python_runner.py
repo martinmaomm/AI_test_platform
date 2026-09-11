@@ -575,8 +575,8 @@ def playwright_runner(
         'return_code': result.return_code,
         'stdout': result.stdout,
         'stderr': result.stderr,
-        'test_file': result.work_dir,
-        'work_dir': result.work_dir,
+        # The workspace is temporary, not a persisted log or downloadable artifact.
+        # Consumers retain stdout/stderr and the separately stored screenshot.
         'browser': result.config.browser,
         'headed': result.config.headed,
         'timeout': result.config.timeout,
@@ -615,12 +615,10 @@ def playwright_suite_runner(suite_id: str, test_cases_data: List[Dict[str, Any]]
         'stderr': result.stderr,
         'error': error_msg,
         'return_code': result.return_code,
-        'test_files': [result.work_dir],
         'case_results': result.case_results,
         'execution_info': {
             'browser': result.config.browser,
             'headed': result.config.headed,
             'timeout': result.config.timeout,
-            'work_dir': result.work_dir
         }
     }

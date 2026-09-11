@@ -121,7 +121,77 @@ class AgentDraftQualityTests(SimpleTestCase):
         self.assertEqual(report['blockers'], [])
         self.assertNotIn('TARGET_URL_CHANGED', [item['code'] for item in report['warnings']])
         changed = evaluate_draft(script, target_url='https://example.test/other')
-        self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in changed['warnings']])
+        self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in changed['blockers']])
+
+    def test_only_statically_ordered_entry_must_match_full_target_url(self):
+        target = 'https://example.test/start?mode=test#/entry'
+        script = SCRIPT.replace(
+            "    await page.goto('https://example.test/')",
+            "    await page.goto('https://example.test/start?mode=test#/entry')\n"
+            "    await page.goto('https://example.test/legitimate-next-page')",
+        )
+        report = evaluate_draft(script, target_url=target)
+        self.assertNotIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+
+        changed = script.replace(target, 'https://example.test/start?mode=other#/entry', 1)
+        report = evaluate_draft(changed, target_url=target)
+        self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+
+    def test_source_earlier_unused_helper_goto_is_not_the_entry(self):
+        target = 'https://example.test/start?mode=test#/entry'
+        helper = '''async def unused_helper(page):
+    await page.goto("https://example.test/not-the-entry")
+
+'''
+        script = helper + SCRIPT.replace('https://example.test/', target)
+        report = evaluate_draft(script, target_url=target)
+        self.assertNotIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+
+    def test_simple_called_helper_entry_is_checked_but_complex_entry_is_unconfirmed(self):
+        helper_script = '''async def open_entry(page):
+    await page.goto("https://example.test/wrong")
+
+async def run(page):
+    await open_entry(page)
+    assert True
+'''
+        report = evaluate_draft(helper_script, target_url='https://example.test/expected')
+        self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+
+        complex_script = helper_script.replace(
+            '    await page.goto("https://example.test/wrong")',
+            '    if True:\n        await page.goto("https://example.test/wrong")',
+        )
+        report = evaluate_draft(complex_script, target_url='https://example.test/expected')
+        self.assertNotIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+        self.assertIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+
+    def test_uncertain_helper_execution_cannot_certify_a_later_literal_entry(self):
+        helper = '''async def open_entry(page):
+    await page.goto("https://example.test/other")
+
+'''
+        for prefix in (
+            '    if True:\n        await open_entry(page)\n',
+            '    open_entry(page)\n',
+            '    navigate = open_entry\n    await navigate(page)\n',
+        ):
+            with self.subTest(prefix=prefix):
+                script = helper + 'async def run(page):\n' + prefix + (
+                    '    await page.goto("https://example.test/expected")\n'
+                    '    assert True\n'
+                )
+                report = evaluate_draft(script, target_url='https://example.test/expected')
+                self.assertNotIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+                self.assertIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+
+    def test_unreachable_goto_after_return_is_not_an_entry(self):
+        report = evaluate_draft('''async def run(page):
+    return
+    await page.goto("https://example.test/expected")
+    assert True
+''', target_url='https://example.test/expected')
+        self.assertIn('ENTRY_NAVIGATION_MISSING', [item['code'] for item in report['blockers']])
 
     def test_no_assertion_is_editable_but_not_complete(self):
         script = SCRIPT.replace("    await expect(page.locator('#result')).to_have_text(name)\n", '')

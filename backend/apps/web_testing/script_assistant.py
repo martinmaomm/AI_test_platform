@@ -744,15 +744,14 @@ def _execute_candidate(session, candidate, variables, round_number, *, label="AI
         execution.error_message,
         execution.end_time,
         execution.duration,
-        outcome_log,
     ) = (
         outcome["status"],
         summary[:2000],
         ended,
         (ended - started).total_seconds(),
-        payload.get("test_file") or "",
     )
-    execution.log_path = outcome_log
+    # The detail contains the persisted log; the runner's work directory is ephemeral.
+    execution.log_path = ""
     execution.save(
         update_fields=[
             "status",

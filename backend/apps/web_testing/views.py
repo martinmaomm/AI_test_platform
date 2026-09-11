@@ -385,6 +385,7 @@ class WebUIScriptGenerationDebugView(APIView):
     permission_classes = [IsAuthenticated]
 
     @project_access_required(EDIT)
+    @project_access_required(EXECUTE)
     def post(self, request, project_id, generation_id):
         project = get_project_for_user(project_id, request.user, EDIT)
         try:
@@ -460,6 +461,7 @@ class WebUIScriptGenerationRepairView(APIView):
     permission_classes = [IsAuthenticated]
 
     @project_access_required(EDIT)
+    @project_access_required(EXECUTE)
     def post(self, request, project_id, generation_id):
         project = get_project_for_user(project_id, request.user, EDIT)
         try:
@@ -618,6 +620,16 @@ class WebUIScriptGenerationSaveView(APIView):
                 normalized_script = normalize_for_storage(generation.script_draft)
                 assertion_state = analyze_assertion_state(normalized_script)
                 verification = workspace['verification']
+                entry_unconfirmed = any(
+                    item.get('code') == 'ENTRY_NAVIGATION_UNCONFIRMED'
+                    for item in quality_report.get('warnings', [])
+                    if isinstance(item, dict)
+                )
+                if requested_mode == 'verified' and entry_unconfirmed:
+                    return Response(
+                        {'success': False, 'message': '无法确认脚本的完整入口网址，请明确首次导航地址，或保存为未验证草稿。', 'data': WebUIScriptGenerationSerializer(generation).data},
+                        status=status.HTTP_409_CONFLICT,
+                    )
                 if requested_mode == 'verified' and not (
                     verification.get('status') == 'passed'
                     and assertion_state['status'] == 'complete'

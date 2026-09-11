@@ -285,6 +285,13 @@ def workspace_for_response(generation: WebUIScriptGeneration) -> dict[str, Any]:
     ):
         verification['status'] = 'unverified'
         verification['message'] = '脚本版本、变量定义或目标网址已变化，旧调试结果不能代表当前配置。'
+    if verification.get('status') == 'passed' and any(
+        isinstance(item, dict) and item.get('code') == 'ENTRY_NAVIGATION_UNCONFIRMED'
+        for item in (generation.quality_report or {}).get('warnings', [])
+    ):
+        verification['status'] = 'incomplete'
+        verification['message'] = '本次脚本运行通过，但入口网址尚未确认；可以保存为未验证草稿。'
+        verification['error_message'] = verification['message']
     return workspace
 
 

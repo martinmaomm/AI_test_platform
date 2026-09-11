@@ -121,3 +121,21 @@ export const assistantAttemptStatusLabel = status => ({
   running: '正在执行',
   not_run: '未实际执行'
 })[status] || '未验证'
+
+// The latest verification normally points to a row already in attempts.
+// Keep a single entry for each execution, without changing stored history.
+export const assistantExecutionEntries = assistant => {
+  const entries = []
+  const seen = new Set()
+  const append = entry => {
+    if (!entry?.execution_id) return
+    const key = String(entry.execution_id)
+    if (seen.has(key)) return
+    seen.add(key)
+    entries.push({ ...entry })
+  }
+  for (const attempt of Array.isArray(assistant?.attempts) ? assistant.attempts : []) append(attempt)
+  const latest = assistant?.verification
+  if (latest?.execution_id) append({ ...latest, execution_status: latest.status })
+  return entries
+}

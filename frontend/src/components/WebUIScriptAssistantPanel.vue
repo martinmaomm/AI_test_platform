@@ -39,7 +39,14 @@
 
     <template v-if="isEdit && !assistant">
       <el-input v-model="messageText" type="textarea" :rows="4" maxlength="2000" show-word-limit placeholder="说明你希望如何修改脚本…" :disabled="!editContext?.testCaseId || acting" />
-      <div class="message-actions"><el-button type="primary" :disabled="!canStartEdit" :loading="acting" @click="sendMessage(false)">发送</el-button></div>
+      <div class="message-actions">
+        <span class="assistant-action-with-help">
+          <el-button type="primary" :disabled="!canStartEdit" :loading="acting" @click="sendMessage(false)">发送</el-button>
+          <el-tooltip :content="sendHelp" :trigger="['hover', 'focus']" placement="top" popper-class="assistant-action-help-popper">
+            <button type="button" class="assistant-help" aria-label="发送说明"><el-icon><QuestionFilled /></el-icon></button>
+          </el-tooltip>
+        </span>
+      </div>
     </template>
 
     <template v-if="assistant">
@@ -60,7 +67,6 @@
         <pre>{{ candidateView === 'full' ? assistant.candidate_script : (assistant.candidate_diff || assistant.candidate_script) }}</pre>
         <div class="candidate-actions">
           <el-button v-if="isEdit" type="primary" :disabled="!canContinue || acting" @click="applyToEditor">采用到编辑器</el-button>
-          <el-button v-if="isEdit" :disabled="!canContinue || !modelConfigId || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
           <el-button v-if="isEdit" type="warning" plain :disabled="!canVerify || acting" @click="requestVerify">调试验证</el-button>
           <el-button v-if="isRepair" type="warning" plain :disabled="!canVerify || acting" :loading="acting" @click="requestVerify">运行验证</el-button>
           <el-button v-if="isRepair" :type="requiresManualReview ? 'warning' : 'primary'" :disabled="!canApplyRepair || acting" :loading="acting" @click="requestApply">{{ requiresManualReview ? '人工确认并保存' : '采用并保存' }}</el-button>
@@ -73,12 +79,11 @@
         <el-form-item label="调试超时（秒）"><el-input-number v-model="runtimeTimeout" :min="30" :max="1800" /></el-form-item>
       </section>
 
-      <section v-if="assistant.attempts?.length || assistant.verification?.execution_id" class="attempt-section">
-        <h5>本轮执行与截图</h5>
-        <el-button v-for="attempt in assistant.attempts || []" :key="`${attempt.round}-${attempt.execution_id}`" size="small" plain :disabled="!attempt.execution_id" @click="loadAttempt(attempt.execution_id)">
-          第 {{ attempt.round || '—' }} 轮：{{ attemptStatusLabel(attempt.execution_status) }}{{ attempt.has_screenshot ? '（有截图）' : '' }}
+      <section v-if="executionEntries.length" class="attempt-section">
+        <h5>验证记录与截图</h5>
+        <el-button v-for="(attempt, index) in executionEntries" :key="attempt.execution_id" size="small" plain @click="loadAttempt(attempt.execution_id)">
+          第 {{ index + 1 }} 次验证：{{ attemptStatusLabel(attempt.execution_status) }}{{ attempt.has_screenshot ? '（有截图）' : '' }}
         </el-button>
-        <el-button v-if="assistant.verification?.execution_id" size="small" plain @click="loadAttempt(assistant.verification.execution_id)">查看调试验证详情</el-button>
         <WebUITestCaseExecutionDetail v-if="attemptExecution" :execution="attemptExecution" hide-ai-repair />
       </section>
 
@@ -86,7 +91,20 @@
         <h5>会话</h5>
         <div class="message-list"><article v-for="(item, index) in assistant.messages || []" :key="`${item.created_at || index}-${item.role}`" :class="['message', item.role]">{{ item.content }}</article></div>
         <el-input v-model="messageText" type="textarea" :rows="3" maxlength="2000" show-word-limit placeholder="说明你希望如何修改脚本…" :disabled="active || acting" />
-        <div class="message-actions"><el-button type="primary" :disabled="!canSend" :loading="acting" @click="sendMessage(false)">发送</el-button></div>
+        <div class="message-actions">
+          <span class="assistant-action-with-help">
+            <el-button :disabled="!canContinue || !modelConfigId || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
+            <el-tooltip :content="continueHelp" :trigger="['hover', 'focus']" placement="top" popper-class="assistant-action-help-popper">
+              <button type="button" class="assistant-help" aria-label="继续调整候选说明"><el-icon><QuestionFilled /></el-icon></button>
+            </el-tooltip>
+          </span>
+          <span class="assistant-action-with-help">
+            <el-button type="primary" :disabled="!canSend" :loading="acting" @click="sendMessage(false)">发送</el-button>
+            <el-tooltip :content="sendHelp" :trigger="['hover', 'focus']" placement="top" popper-class="assistant-action-help-popper">
+              <button type="button" class="assistant-help" aria-label="发送说明"><el-icon><QuestionFilled /></el-icon></button>
+            </el-tooltip>
+          </span>
+        </div>
       </section>
     </template>
   </section>
@@ -95,9 +113,10 @@
 <script setup>
 import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { QuestionFilled } from '@element-plus/icons-vue'
 import { getWebUITestCaseExecution } from '@/api/webTesting'
 import { useWebUIScriptAssistant } from '@/composables/useWebUIScriptAssistant'
-import { assistantAttemptStatusLabel, assistantModelLabel, assistantPanelContext, canApplyRepairCandidate, canContinueCandidate, canVerifyCandidate, repairAdoptionState, verificationLabel, verificationTagType, verifyActionState } from '@/composables/webUIScriptAssistantPresentation'
+import { assistantAttemptStatusLabel, assistantExecutionEntries, assistantModelLabel, assistantPanelContext, canApplyRepairCandidate, canContinueCandidate, canVerifyCandidate, repairAdoptionState, verificationLabel, verificationTagType, verifyActionState } from '@/composables/webUIScriptAssistantPresentation'
 
 const WebUITestCaseExecutionDetail = defineAsyncComponent(() => import('@/components/WebUITestCaseExecutionDetail.vue'))
 const props = defineProps({
@@ -106,6 +125,8 @@ const props = defineProps({
   repairContext: { type: Object, default: null }
 })
 const emit = defineEmits(['apply-to-editor'])
+const sendHelp = '将输入框中的修改要求发送给 AI，以当前编辑器里的脚本为基础修改，包含你的手工改动。必须填写修改要求；只生成候选，不会自动运行或保存。'
+const continueHelp = '将同一输入框中的修改要求发送给 AI，以最新的候选脚本为基础继续修改，不包含候选生成后对编辑器的手工改动。需先有候选；未填写新要求时默认让 AI 继续调整，不会自动运行或保存。'
 const context = computed(() => assistantPanelContext(props.editContext, props.repairContext))
 const isEdit = computed(() => Boolean(props.editContext))
 const isRepair = computed(() => Boolean(props.repairContext))
@@ -128,6 +149,7 @@ const selectedAssistantId = computed({ get: () => assistant.value?.id || null, s
   if (selected?.id) loadAssistant(selected.id, { quiet: true })
 } })
 const hasCandidate = computed(() => Boolean(assistant.value?.candidate_hash && assistant.value?.candidate_script))
+const executionEntries = computed(() => assistantExecutionEntries(assistant.value))
 const showSessionStatus = computed(() => !isEdit.value || assistant.value?.status !== 'idle')
 const canContinue = computed(() => canContinueCandidate(assistant.value))
 const canVerify = computed(() => canVerifyCandidate(assistant.value))
@@ -358,5 +380,10 @@ const loadAttempt = async executionId => {
 </script>
 
 <style scoped>
+.assistant-action-with-help { display:inline-flex; align-items:center; gap:4px; max-width:100%; }
+.assistant-help { display:inline-flex; align-items:center; justify-content:center; width:24px; height:28px; padding:0; flex-shrink:0; border:0; border-radius:4px; background:transparent; color:var(--app-text-secondary); cursor:help; }
+.assistant-help:hover,.assistant-help:focus-visible { color:var(--el-color-primary); }
+.assistant-help:focus-visible { outline:2px solid var(--el-color-primary); outline-offset:2px; }
+:global(.assistant-action-help-popper) { max-width:min(320px, calc(100vw - 32px)); line-height:1.6; }
 .assistant-panel { display:grid; gap:14px; padding:16px; border:1px solid var(--app-border); border-radius:10px; background:var(--page-content-bg); }.assistant-heading,.assistant-heading-actions,.assistant-config,.session-status,.candidate-heading,.candidate-actions,.message-actions { display:flex; align-items:center; gap:10px; }.assistant-heading { justify-content:space-between; }.assistant-heading h4,.assistant-summary h5,.candidate-section h5,.attempt-section h5,.conversation-section h5 { margin:0; }.assistant-heading p { margin:5px 0 0; color:var(--app-text-secondary); font-size:13px; }.assistant-config > * { flex:1; }.refresh-state { display:flex; justify-content:flex-end; }.model-switch-hint { margin:-8px 0 0; color:var(--app-text-secondary); font-size:12px; }.runtime-heading { display:flex; justify-content:space-between; align-items:center; }.runtime-row { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; }.session-status { flex-wrap:wrap; color:var(--app-text-secondary); font-size:13px; }.assistant-summary,.candidate-section,.attempt-section,.conversation-section,.verification-options { display:grid; gap:10px; }.assistant-summary p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }.candidate-heading { justify-content:space-between; }.candidate-section pre { max-height:380px; overflow:auto; margin:0; padding:12px; border-radius:6px; background:var(--el-fill-color-light); white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.6; }.candidate-actions,.message-actions { justify-content:flex-end; flex-wrap:wrap; }.message-list { display:grid; gap:8px; max-height:260px; overflow:auto; }.message { padding:9px 11px; border-radius:6px; white-space:pre-wrap; overflow-wrap:anywhere; }.message.user { background:var(--el-color-primary-light-9); }.message.assistant { background:var(--el-fill-color-light); }.attempt-section { min-width:0; overflow:hidden; }.attempt-section :deep(.test-report-container) { block-size:min(480px, 52vh); min-height:0; max-block-size:min(480px, 52vh); margin-top:6px; overflow:hidden; border:1px solid var(--app-border); border-radius:8px; }.attempt-section :deep(.report-content) { block-size:100%; min-height:0; overflow:hidden; }.attempt-section :deep(.main-content) { block-size:100%; min-height:0; max-height:none; overflow-x:hidden; overflow-y:auto; } @media (max-width:700px) { .assistant-heading { align-items:flex-start; flex-direction:column; }.assistant-config,.runtime-row { grid-template-columns:1fr; display:grid; }.candidate-actions :deep(.el-button) { flex:1 1 100%; } }
 </style>

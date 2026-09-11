@@ -393,6 +393,16 @@ def verify_ui(origin, fixture, output):
                 panel.get_by_role("button", name="最近会话", exact=True)
             ).to_have_count(0)
             expect(panel.locator(".assistant-config .el-select")).to_have_count(1)
+            expect(
+                panel.get_by_role("button", name="发送", exact=True)
+            ).to_be_disabled()
+            panel.get_by_role("button", name="发送说明", exact=True).hover()
+            expect(
+                page.get_by_role("tooltip").filter(
+                    has_text="以当前编辑器里的脚本为基础修改"
+                )
+            ).to_be_visible()
+            assert not MODEL_CALLS, "Reading action help must not invoke a model"
             panel.locator(".assistant-config .el-select").click()
             page.get_by_role(
                 "option", name="隔离模型提供商 · offline-assistant", exact=True
@@ -417,6 +427,40 @@ def verify_ui(origin, fixture, output):
             assert not [
                 r for r in requests if r.method == "PATCH"
             ], "An AI reply must not save the case"
+            actions = panel.locator(".conversation-section .message-actions")
+            expect(
+                actions.get_by_role("button", name="发送", exact=True)
+            ).to_be_disabled()
+            expect(
+                actions.get_by_role("button", name="继续调整候选", exact=True)
+            ).to_be_enabled()
+            expect(
+                panel.locator(".candidate-actions").get_by_role(
+                    "button", name="继续调整候选", exact=True
+                )
+            ).to_have_count(0)
+            help_calls = len(MODEL_CALLS)
+            actions.get_by_role("button", name="继续调整候选说明", exact=True).click()
+            expect(
+                page.get_by_role("tooltip").filter(
+                    has_text="以最新的候选脚本为基础继续修改"
+                )
+            ).to_be_visible()
+            page.wait_for_function(
+                """() => [...document.querySelectorAll('.assistant-action-help-popper')].some(node => node.textContent.includes('以最新的候选脚本为基础继续修改') && getComputedStyle(node).opacity === '1' && getComputedStyle(node).visibility === 'visible' && node.getBoundingClientRect().height > 0 && !node.className.includes('leave'))"""
+            )
+            assert len(MODEL_CALLS) == help_calls
+            page.screenshot(
+                path=str(output / "chat-action-help.png"),
+                full_page=True,
+                animations="disabled",
+            )
+            actions.get_by_role("button", name="发送说明", exact=True).focus()
+            expect(
+                page.get_by_role("tooltip").filter(
+                    has_text="以当前编辑器里的脚本为基础修改"
+                )
+            ).to_be_visible()
             page.screenshot(
                 path=str(output / "chat-candidate.png"),
                 full_page=True,
@@ -459,6 +503,14 @@ def verify_ui(origin, fixture, output):
                 timeout=30000
             )
             assert len(RUNS) == 1, (RUNS, WORKER_RESULTS)
+            expect(
+                panel.locator(".attempt-section").get_by_role(
+                    "button", name=re.compile("第 .* 次验证")
+                )
+            ).to_have_count(1)
+            expect(
+                panel.get_by_role("button", name="查看调试验证详情", exact=True)
+            ).to_have_count(0)
             page.screenshot(
                 path=str(output / "chat-verified.png"),
                 full_page=True,
@@ -497,7 +549,12 @@ def verify_ui(origin, fixture, output):
             )
             assert len(RUNS) == 2, (RUNS, WORKER_RESULTS)
             assert RUNS[-1]["options"]["headed"] is False, RUNS[-1]
-            panel.get_by_role("button", name=re.compile("第 1 轮")).click()
+            expect(
+                panel.locator(".attempt-section").get_by_role(
+                    "button", name=re.compile("第 .* 次验证")
+                )
+            ).to_have_count(1)
+            panel.get_by_role("button", name=re.compile("第 1 次验证")).click()
             expect(panel.get_by_role("img").first).to_be_visible()
             page.wait_for_function(
                 "document.querySelector('[aria-label=\"AI 脚本助手\"] img')?.naturalWidth > 0"
@@ -614,7 +671,7 @@ def verify_ui(origin, fixture, output):
                 timeout=20000
             )
             assert len(RUNS) == 4, (RUNS, WORKER_RESULTS)
-            panel.get_by_role("button", name=re.compile("第 1 轮")).click()
+            panel.get_by_role("button", name=re.compile("第 1 次验证")).click()
             expect(panel.get_by_role("img").first).to_be_visible()
             panel.get_by_role(
                 "button", name="查看原始 stdout / stderr / log", exact=True
@@ -650,10 +707,18 @@ def verify_ui(origin, fixture, output):
                 timeout=20000
             )
             assert len(RUNS) == 5, (RUNS, WORKER_RESULTS)
+            expect(
+                panel.locator(".attempt-section").get_by_role(
+                    "button", name=re.compile("第 .* 次验证")
+                )
+            ).to_have_count(2)
+            expect(
+                panel.get_by_role("button", name="查看调试验证详情", exact=True)
+            ).to_have_count(0)
             assert RUNS[-1]["script"] == REVIEW_CANDIDATE
             assert RUNS[-1]["options"]["headed"] is False
             assert RUNS[-1]["environment_variables"]["QA_LABEL"] == "review-value"
-            panel.get_by_role("button", name=re.compile("第 2 轮")).click()
+            panel.get_by_role("button", name=re.compile("第 2 次验证")).click()
             expect(panel.get_by_role("img").first).to_be_visible()
             panel.get_by_role(
                 "button", name="查看原始 stdout / stderr / log", exact=True

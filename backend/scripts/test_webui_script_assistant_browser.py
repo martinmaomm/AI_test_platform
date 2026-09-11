@@ -40,6 +40,7 @@ REVIEW_CANDIDATE = CANDIDATE.replace(
 UNSAVED = "# 当前编辑器尚未保存的备注\n" + SCRIPT
 RUNS = []
 MODEL_CALLS = []
+MODEL_IDS = []
 WORKER_RESULTS = []
 STREAM_RELEASE = threading.Event()
 STREAM_RELEASE.set()
@@ -151,6 +152,15 @@ def add_fixtures(fixture):
         provider="openai",
         provider_name="隔离模型提供商",
         model_name="offline-assistant",
+        api_key="offline-only",
+        is_active=True,
+        created_by=user,
+    )
+    next_model = LLMConfiguration.objects.create(
+        model_type=ModelType.LLM,
+        provider="openai",
+        provider_name="下轮隔离提供商",
+        model_name="offline-next-assistant",
         api_key="offline-only",
         is_active=True,
         created_by=user,
@@ -284,6 +294,7 @@ def add_fixtures(fixture):
     fixture.update(
         project={"id": project.pk, "name": project.name, "project_type": "web"},
         model_id=model.pk,
+        next_model_id=next_model.pk,
         edit_case_id=cases[0].pk,
         repair_case_id=cases[1].pk,
         repair_execution_id=execution.pk,
@@ -330,6 +341,19 @@ def verify_ui(origin, fixture, output):
                 else route.abort()
             ),
         )
+        fail_first_edit_restore = [True]
+
+        def restore_fixture(route):
+            if fail_first_edit_restore[0] and "mode=edit" in route.request.url:
+                fail_first_edit_restore[0] = False
+                route.fulfill(status=503, json={"message": "isolated restore failure"})
+            else:
+                route.continue_()
+
+        context.route(
+            re.compile(re.escape(origin) + r"/api/.*?/script-assistants/\?"),
+            restore_fixture,
+        )
         context.add_init_script(
             "localStorage.setItem('auth-store', JSON.stringify("
             + json.dumps(
@@ -355,6 +379,24 @@ def verify_ui(origin, fixture, output):
             editor.get_by_role("button", name="AI 对话编辑", exact=True).click()
             panel = page.get_by_label("AI 脚本助手", exact=True)
             expect(panel).to_be_visible()
+            expect(
+                panel.get_by_role("button", name="重新获取状态", exact=True)
+            ).to_be_visible()
+            expect(
+                panel.get_by_role("button", name="新建会话", exact=True)
+            ).to_be_disabled()
+            panel.get_by_role("button", name="重新获取状态", exact=True).click()
+            expect(
+                panel.get_by_role("button", name="重新获取状态", exact=True)
+            ).to_have_count(0)
+            expect(
+                panel.get_by_role("button", name="最近会话", exact=True)
+            ).to_have_count(0)
+            expect(panel.locator(".assistant-config .el-select")).to_have_count(1)
+            panel.locator(".assistant-config .el-select").click()
+            page.get_by_role(
+                "option", name="隔离模型提供商 · offline-assistant", exact=True
+            ).click()
             panel.get_by_placeholder("说明你希望如何修改脚本…").fill(
                 "保留断言，修复变量错误并添加中文日志。"
             )
@@ -370,6 +412,7 @@ def verify_ui(origin, fixture, output):
             expect(
                 panel.get_by_role("button", name="采用到编辑器", exact=True)
             ).to_be_enabled(timeout=20000)
+            assert MODEL_IDS[-1] == fixture["model_id"], MODEL_IDS
             assert not RUNS, "A conversation edit must not execute a browser script"
             assert not [
                 r for r in requests if r.method == "PATCH"
@@ -384,6 +427,10 @@ def verify_ui(origin, fixture, output):
             expect(
                 panel.get_by_role("button", name="采用到编辑器", exact=True)
             ).to_be_enabled()
+            panel.locator(".assistant-config .el-select").click()
+            page.get_by_role(
+                "option", name="下轮隔离提供商 · offline-next-assistant", exact=True
+            ).click()
             panel.get_by_placeholder("说明你希望如何修改脚本…").fill(
                 "继续保留业务断言，确认日志准确。"
             )
@@ -394,9 +441,17 @@ def verify_ui(origin, fixture, output):
                 panel.get_by_role("button", name="继续调整候选", exact=True).click()
             assert continued.value.status == 202, continued.value.text()
             assert continued.value.request.post_data_json["use_candidate"] is True
+            assert (
+                continued.value.request.post_data_json["model_config_id"]
+                == fixture["next_model_id"]
+            )
+            expect(panel.locator(".assistant-config .el-tag")).to_contain_text(
+                "offline-next-assistant"
+            )
             expect(
                 panel.get_by_role("button", name="采用到编辑器", exact=True)
             ).to_be_enabled()
+            assert MODEL_IDS[-1] == fixture["next_model_id"], MODEL_IDS
             assert not RUNS, "Continuing a candidate must not execute it"
             panel.get_by_role("button", name="调试验证", exact=True).click()
             page.get_by_role("button", name="确认执行", exact=True).click()
@@ -684,23 +739,95 @@ def verify_ui(origin, fixture, output):
             editor = page.locator(".el-drawer").filter(has_text="编辑测试脚本")
             editor.get_by_role("button", name="AI 对话编辑", exact=True).click()
             panel = page.get_by_label("AI 脚本助手", exact=True)
+            expect(
+                panel.get_by_role("button", name="新建会话", exact=True)
+            ).to_be_enabled()
             panel.get_by_role("button", name="新建会话", exact=True).click()
+            page.locator(".el-message-box").get_by_role(
+                "button", name="取消", exact=True
+            ).click()
+            expect(panel.locator(".candidate-section")).to_be_visible()
+            panel.get_by_role("button", name="新建会话", exact=True).click()
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/reset/")
+            ) as reset:
+                page.locator(".el-message-box").get_by_role(
+                    "button", name="清空并新建", exact=True
+                ).click()
+            assert reset.value.status == 200, reset.value.text()
+            blank = reset.value.json()["data"]
+            assert blank["messages"] == [] and blank["candidate_script"] == "", blank
+            assert blank["attempts"] == [] and blank["verification"] == {}, blank
+            expect(panel.locator(".candidate-section")).to_have_count(0)
+            # Closing/reopening remounts the assistant and reads the real API.
+            editor.get_by_role("button", name="收起 AI 助手", exact=True).click()
+            editor.get_by_role("button", name="AI 对话编辑", exact=True).click()
+            expect(
+                panel.get_by_role("button", name="新建会话", exact=True)
+            ).to_be_enabled()
+            expect(panel.locator(".candidate-section")).to_have_count(0)
+            expect(panel.locator(".message-list article")).to_have_count(0)
+            panel.locator(".assistant-config .el-select").click()
+            page.get_by_role(
+                "option", name="隔离模型提供商 · offline-assistant", exact=True
+            ).click()
             STREAM_RELEASE.clear()
             panel.get_by_placeholder("说明你希望如何修改脚本…").fill(
                 "等待取消验收，请保留业务动作。"
             )
             panel.get_by_role("button", name="发送", exact=True).click()
+            expect(panel.get_by_text("正在生成候选脚本", exact=True)).to_be_visible(
+                timeout=15000
+            )
+            expect(
+                panel.get_by_role("button", name="新建会话", exact=True)
+            ).to_be_disabled()
+            assert MODEL_IDS[-1] == fixture["model_id"], MODEL_IDS
+            panel.locator(".assistant-config .el-select").click()
+            page.get_by_role(
+                "option", name="下轮隔离提供商 · offline-next-assistant", exact=True
+            ).click()
+            # A real polling response must leave the next-round model alone.
+            with page.expect_response(
+                lambda response: response.request.method == "GET"
+                and f'/script-assistants/{blank["id"]}/' in response.url
+            ):
+                pass
+            expect(panel.locator(".assistant-config .el-select")).to_contain_text(
+                "offline-next-assistant"
+            )
+            assert MODEL_IDS[-1] == fixture["model_id"], MODEL_IDS
             panel.get_by_role("button", name="取消任务", exact=True).click()
             page.locator(".el-message-box").get_by_role(
                 "button", name="取消任务", exact=True
             ).click()
             expect(panel.get_by_text("已取消", exact=True)).to_be_visible()
             STREAM_RELEASE.set()
-            panel.get_by_role("button", name="最近会话", exact=True).click()
+            expect(
+                panel.get_by_role("button", name="最近会话", exact=True)
+            ).to_have_count(0)
             expect(panel.get_by_text("已取消", exact=True)).to_be_visible()
+            panel.get_by_placeholder("说明你希望如何修改脚本…").fill(
+                "继续基于当前编辑器完善中文日志。"
+            )
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/messages/")
+            ) as next_round:
+                panel.get_by_role("button", name="发送", exact=True).click()
+            assert next_round.value.status == 202, next_round.value.text()
+            assert (
+                next_round.value.request.post_data_json["model_config_id"]
+                == fixture["next_model_id"]
+            )
+            expect(
+                panel.get_by_role("button", name="采用到编辑器", exact=True)
+            ).to_be_enabled(timeout=20000)
+            assert MODEL_IDS[-1] == fixture["next_model_id"], MODEL_IDS
             assert len(RUNS) == 5, "Cancelling a conversation must not start a browser"
             page.screenshot(
-                path=str(output / "cancelled-conversation.png"),
+                path=str(output / "reset-and-model-switch.png"),
                 full_page=True,
                 animations="disabled",
             )
@@ -740,7 +867,10 @@ def main():
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         with ThreadPoolExecutor(max_workers=1) as workers, patch(
-            "web_testing.script_assistant.get_llm_manager", return_value=FakeManager()
+            "web_testing.script_assistant.get_llm_manager",
+            side_effect=lambda config_id: (MODEL_IDS.append(config_id), FakeManager())[
+                1
+            ],
         ), patch("web_testing.tasks._run_test_script", side_effect=fake_runner), patch(
             "web_testing.tasks.run_script_assistant_operation_task.apply_async"
         ) as dispatch:

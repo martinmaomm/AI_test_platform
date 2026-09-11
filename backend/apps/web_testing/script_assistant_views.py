@@ -318,6 +318,22 @@ def _repair_source(project_id: int, execution_id: object, suite_case_id: object 
     )
 
 
+def _create_edit_session(*, test_case, expected_edit_version, **fields):
+    # Serialize first creation for this case. New conversations subsequently
+    # reset this same record instead of creating selectable history records.
+    with transaction.atomic():
+        case = WebUITestCase.objects.select_for_update().get(pk=test_case.pk)
+        if expected_edit_version != case_edit_version(case):
+            raise ScriptAssistantConflict("用例已变化，请刷新后再开始对话。")
+        if WebUIScriptAssistant.objects.filter(
+            test_case=case, user=fields["user"], mode="edit"
+        ).exists():
+            raise ScriptAssistantConflict(
+                "当前用例已有对话，请刷新后继续或点击新建会话。"
+            )
+        return WebUIScriptAssistant.objects.create(test_case=case, **fields)
+
+
 class ScriptAssistantListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -341,9 +357,13 @@ class ScriptAssistantListCreateView(APIView):
                     query = query.filter(**{key: value})
         except ValueError as exc:
             return response(kind="error", message=str(exc), status_code=400)
+        limit = 1 if mode == "edit" and request.query_params.get("test_case_id") else 20
         return response(
             kind="success",
-            data=[assistant_payload(expire_if_needed(item)) for item in query[:20]],
+            data=[
+                assistant_payload(expire_if_needed(item))
+                for item in query[:limit]
+            ],
             message="获取近期助手会话成功",
         )
 
@@ -378,7 +398,8 @@ class ScriptAssistantListCreateView(APIView):
                     if request.data.get("variables") is not None
                     else case.variables
                 )
-                item = WebUIScriptAssistant.objects.create(
+                item = _create_edit_session(
+                    expected_edit_version=request.data.get("expected_edit_version"),
                     project_id=project_id,
                     user=request.user,
                     test_case=case,
@@ -455,6 +476,7 @@ class ScriptAssistantListCreateView(APIView):
             item = _queue(
                 item,
                 operation=mode,
+                expected_revision=item.revision,
                 runtime_variables=runtime if mode == "repair" else None,
             )
         except (ValueError, ExecutionVariableError, ScriptAssistantConflict) as exc:
@@ -508,6 +530,18 @@ class ScriptAssistantMessageView(APIView):
                 raise ScriptAssistantConflict(
                     "修复会话不接受消息；请验证候选或重新发起修复。"
                 )
+            # The model is frozen when this round is queued. Merely selecting
+            # another model in the UI must not change an in-flight operation.
+            config = _model(
+                request, request.data.get("model_config_id", item.model_config_id)
+            )
+            case = get_object_or_404(
+                WebUITestCase, pk=item.test_case_id, project_id=project_id
+            )
+            if "expected_edit_version" in request.data and request.data[
+                "expected_edit_version"
+            ] != case_edit_version(case):
+                raise ScriptAssistantConflict("用例已变化，请刷新后再发送。")
             script = str(request.data.get("script_content") or "")
             if not script.strip():
                 raise ValueError("script_content 不能为空。")
@@ -533,6 +567,8 @@ class ScriptAssistantMessageView(APIView):
                 }
             )
             updates = {
+                "model_config_id": config.id,
+                "model_info": model_info(config),
                 "pending_script": script,
                 "pending_description": description,
                 "pending_variables": normalize_variable_definitions(
@@ -547,6 +583,8 @@ class ScriptAssistantMessageView(APIView):
                 # Do not strip it: trailing whitespace is meaningful to the UI
                 # optimistic comparison and the source snapshot contract.
                 updates["source_script"] = script
+                updates["source_script_version"] = case.script_version
+                updates["source_edit_version"] = case_edit_version(case)
                 updates["source_variables"] = copy.deepcopy(
                     updates["pending_variables"]
                 )
@@ -571,6 +609,65 @@ class ScriptAssistantMessageView(APIView):
             data=assistant_payload(item),
             message="助手消息已排队",
             status_code=202,
+        )
+
+
+class ScriptAssistantResetView(APIView):
+    """Start a blank conversation without touching the case or its executions."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    def post(self, request, project_id, session_id):
+        try:
+            expected = int(request.data.get("expected_revision"))
+        except (TypeError, ValueError):
+            return response(
+                kind="error", message="expected_revision 必填。", status_code=400
+            )
+        try:
+            with transaction.atomic():
+                item = get_object_or_404(
+                    WebUIScriptAssistant.objects.select_for_update(),
+                    pk=session_id,
+                    project_id=project_id,
+                    user=request.user,
+                )
+                if item.mode != WebUIScriptAssistant.Mode.EDIT:
+                    raise ScriptAssistantConflict("只有用例编辑对话可以清空重建。")
+                if item.revision != expected:
+                    raise ScriptAssistantConflict("会话已变化，请刷新后重试。")
+                if item.status in {"queued", "running"}:
+                    raise ScriptAssistantConflict(
+                        "任务正在运行，请等待完成或取消后再新建会话。"
+                    )
+                # Reset all transient content from model defaults, retaining
+                # only identity/scope, timestamps and the last-used model.
+                # Revision invalidation fences out delayed worker writes.
+                retained = {
+                    "id",
+                    "project",
+                    "user",
+                    "test_case",
+                    "mode",
+                    "model_config_id",
+                    "model_info",
+                    "revision",
+                    "created_at",
+                    "updated_at",
+                }
+                fields = []
+                for field in item._meta.concrete_fields:
+                    if field.name not in retained:
+                        setattr(item, field.attname, field.get_default())
+                        fields.append(field.name)
+                item.revision += 1
+                item.message = "已新建会话，请输入对当前脚本的修改要求。"
+                item.save(update_fields=[*fields, "revision", "updated_at"])
+        except ScriptAssistantConflict as exc:
+            return response(kind="error", message=str(exc), status_code=409)
+        return response(
+            kind="success", data=assistant_payload(item), message="已清空并新建会话"
         )
 
 

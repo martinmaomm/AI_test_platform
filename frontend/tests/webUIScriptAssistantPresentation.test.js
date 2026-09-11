@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import { createServer } from 'vite'
+import { ref } from 'vue'
 import {
   assistantList,
   assistantListParams,
@@ -17,6 +19,46 @@ import {
   verificationTagType,
   verificationLabel
 } from '../src/composables/webUIScriptAssistantPresentation.js'
+
+const deferred = () => {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise })
+  return { promise, resolve, reject }
+}
+
+const flush = async () => {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
+const withAssistantComposable = async callback => {
+  const originalWarn = console.warn
+  const previous = {
+    document: globalThis.document,
+    location: globalThis.location,
+    window: globalThis.window
+  }
+  const location = { protocol: 'http:', host: 'localhost', pathname: '/', search: '', hash: '', href: 'http://localhost/', assign () {}, replace () {} }
+  globalThis.location = location
+  globalThis.window = { navigator: { userAgent: 'node' }, history: { state: null, replaceState () {}, pushState () {} }, location, addEventListener () {}, removeEventListener () {} }
+  globalThis.document = { addEventListener () {}, removeEventListener () {}, querySelector () { return null }, createElement () { return { style: {}, setAttribute () {}, appendChild () {}, removeChild () {} } }, body: {} }
+  const server = await createServer({ root: new URL('..', import.meta.url).pathname, server: { middlewareMode: true }, appType: 'custom' })
+  try {
+    console.warn = (...args) => {
+      if (String(args[0]).includes('onBeforeUnmount is called when there is no active component instance')) return
+      originalWarn(...args)
+    }
+    const { useWebUIScriptAssistant } = await server.ssrLoadModule('/src/composables/useWebUIScriptAssistant.js')
+    return await callback(useWebUIScriptAssistant)
+  } finally {
+    await server.close()
+    console.warn = originalWarn
+    globalThis.document = previous.document
+    globalThis.location = previous.location
+    globalThis.window = previous.window
+  }
+}
 
 test('verification labels distinguish execution results and interrupted pending work', () => {
   assert.equal(verificationLabel({ status: 'incomplete' }), '已实际运行但验证不完整')
@@ -122,6 +164,114 @@ test('assistant panel supports the first edit message and keeps repair out of th
   assert.match(source, /placeholder="说明你希望如何修改脚本…"/)
   assert.match(source, /sendMessage\(true\)/)
   assert.match(source, /<section v-if="isEdit" class="conversation-section">/)
+})
+
+test('edit reset is isolated from repair, keeps the next-send model, and rejects stale recovery', async () => {
+  const panel = await readFile(new URL('../src/components/WebUIScriptAssistantPanel.vue', import.meta.url), 'utf8')
+  const composable = await readFile(new URL('../src/composables/useWebUIScriptAssistant.js', import.meta.url), 'utf8')
+  const api = await readFile(new URL('../src/api/webTesting.js', import.meta.url), 'utf8')
+  assert.match(panel, /v-if="isRepair" size="small" :loading="loading" @click="\(\) => loadRecent\(\)"/)
+  assert.match(panel, /v-if="isRepair && assistants\.length"/)
+  assert.match(panel, /isEdit \? \(loading \|\| refreshRequired \|\| active \|\| acting\) : \(active \|\| acting\)/)
+  assert.match(panel, /confirmButtonText: '清空并新建'/)
+  assert.match(panel, /clearEditConversation\(\)/)
+  assert.match(panel, /await reset\(\)/)
+  assert.match(panel, /showSessionStatus = computed\(\(\) => !isEdit\.value \|\| assistant\.value\?\.status !== 'idle'\)/)
+  assert.match(panel, /模型切换从下一次发送生效。/)
+  assert.match(panel, /本轮\/上次模型/)
+  assert.match(panel, /expected_edit_version: props\.editContext\.editVersion, model_config_id: modelConfigId\.value/)
+  assert.match(panel, /watch\(assistant, value => \{[\s\S]*if \(isEdit\.value\) \{[\s\S]*initializeEditModel\(\)/)
+  assert.match(panel, /isEdit && refreshRequired/)
+  assert.match(composable, /const clearEditConversation = \(\) => \{[\s\S]*requestVersion \+= 1/)
+  assert.match(composable, /const reset = async \(\) => \{[\s\S]*const request = \+\+requestVersion[\s\S]*requests\.reset/)
+  assert.match(composable, /request !== requestVersion/)
+  assert.match(composable, /会话自动刷新失败，请重新获取状态。/)
+  assert.match(api, /resetWebUIScriptAssistant[\s\S]*\/reset\//)
+})
+
+test('edit composable ignores late list, poll, and message responses around create and reset', async () => {
+  await withAssistantComposable(async useWebUIScriptAssistant => {
+    const initialList = deferred()
+    const latePoll = deferred()
+    const lateMessagePoll = deferred()
+    const original = { id: 'assistant-1', mode: 'edit', revision: 3, status: 'candidate_ready', messages: [{ role: 'user', content: '旧消息' }], candidate_hash: 'old-hash', candidate_script: 'old script' }
+    const created = { id: 'assistant-2', mode: 'edit', revision: 1, status: 'candidate_ready', messages: [{ role: 'user', content: '新消息' }], candidate_hash: 'new-hash', candidate_script: 'new script' }
+    const reset = { id: 'assistant-2', mode: 'edit', revision: 2, status: 'idle', model_info: { config_id: 9 }, messages: [], attempts: [], verification: null }
+    const messaged = { id: 'assistant-2', mode: 'edit', revision: 3, status: 'candidate_ready', messages: [{ role: 'user', content: '下一条消息' }], candidate_hash: 'next-hash', candidate_script: 'next script' }
+    let getCalls = 0
+    const requests = {
+      apply: async () => { throw new Error('not used') },
+      cancel: async () => { throw new Error('not used') },
+      create: async () => ({ data: created }),
+      get: async () => {
+        getCalls += 1
+        return getCalls === 1 ? latePoll.promise : lateMessagePoll.promise
+      },
+      list: async () => initialList.promise,
+      message: async () => ({ data: messaged }),
+      reset: async () => ({ data: reset }),
+      verify: async () => { throw new Error('not used') }
+    }
+    const state = useWebUIScriptAssistant({ projectId: ref(1), context: ref({ mode: 'edit', testCaseId: 7 }), requests, loadModelConfigs: async () => [] })
+    await flush()
+
+    await state.create({ mode: 'edit', model_config_id: 9 })
+    initialList.resolve({ data: { results: [original] } })
+    await flush()
+    assert.equal(state.assistant.value.id, created.id)
+
+    const staleBeforeReset = state.loadAssistant(created.id, { quiet: true })
+    await flush()
+    await state.reset()
+    latePoll.resolve({ data: created })
+    await staleBeforeReset
+    assert.equal(state.assistant.value.status, 'idle')
+    assert.deepEqual(state.assistant.value.messages, [])
+    assert.equal(state.assistant.value.candidate_script, undefined)
+
+    const staleBeforeMessage = state.loadAssistant(created.id, { quiet: true })
+    await flush()
+    await state.message({ expected_revision: 2, expected_edit_version: 5, model_config_id: 11, message: '下一条消息', use_candidate: false })
+    lateMessagePoll.resolve({ data: reset })
+    await staleBeforeMessage
+    assert.equal(state.assistant.value.revision, 3)
+    assert.equal(state.assistant.value.candidate_hash, 'next-hash')
+  })
+})
+
+test('edit composable exposes a retry after initial recovery failure and clears it after an empty list succeeds', async () => {
+  await withAssistantComposable(async useWebUIScriptAssistant => {
+    let failList = true
+    const requests = {
+      apply: async () => { throw new Error('not used') },
+      cancel: async () => { throw new Error('not used') },
+      create: async () => { throw new Error('not used') },
+      get: async () => { throw new Error('not used') },
+      list: async () => {
+        if (failList) throw new Error('offline')
+        return { data: { results: [] } }
+      },
+      message: async () => { throw new Error('not used') },
+      reset: async () => { throw new Error('not used') },
+      verify: async () => { throw new Error('not used') }
+    }
+    const state = useWebUIScriptAssistant({ projectId: ref(1), context: ref({ mode: 'edit', testCaseId: 7 }), requests, loadModelConfigs: async () => [] })
+    await flush()
+    assert.equal(state.assistant.value, null)
+    assert.equal(state.refreshRequired.value, true)
+    assert.equal(state.lastError.value, '加载 AI 会话失败，请重新获取状态。')
+
+    state.acting.value = true
+    await state.loadRecent()
+    assert.equal(state.refreshRequired.value, true)
+    state.acting.value = false
+
+    failList = false
+    await state.loadRecent()
+    assert.deepEqual(state.assistants.value, [])
+    assert.equal(state.refreshRequired.value, false)
+    assert.equal(state.lastError.value, '')
+  })
 })
 
 test('assistant attempt details use their own clipped, scrollable viewport', async () => {

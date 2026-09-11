@@ -6,25 +6,27 @@
         <p>{{ isEdit ? '对话只生成候选，不会调用浏览器或保存用例。' : '修复和验证会实际运行测试网站；仅使用测试账号和测试数据。' }}</p>
       </div>
       <div class="assistant-heading-actions">
-        <el-button size="small" :loading="loading" @click="() => loadRecent()">最近会话</el-button>
-        <el-button size="small" :disabled="active || acting" @click="newConversation">新建会话</el-button>
+        <el-button v-if="isRepair" size="small" :loading="loading" @click="() => loadRecent()">最近会话</el-button>
+        <el-button size="small" :disabled="isEdit ? (loading || refreshRequired || active || acting) : (active || acting)" @click="newConversation">新建会话</el-button>
         <el-button v-if="assistant && active" size="small" type="danger" plain :loading="acting" @click="requestCancel">取消任务</el-button>
       </div>
     </header>
 
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon />
+    <div v-if="isEdit && refreshRequired" class="refresh-state"><el-button size="small" type="primary" plain :loading="loading" :disabled="acting" @click="() => loadRecent()">重新获取状态</el-button></div>
     <el-alert v-if="isEdit && !editContext?.testCaseId" title="新建用例需先保存，才能使用 AI 对话编辑。" type="info" :closable="false" show-icon />
     <el-alert v-if="isRepair" title="确认后，模型、MCP（如需要）和测试网站会接收必要上下文；执行日志或截图可能包含测试信息。已发生的网站操作不会因取消而回滚。" type="warning" :closable="false" show-icon />
 
     <div class="assistant-config">
-      <el-select v-model="modelConfigId" :loading="loadingModels" :disabled="acting" placeholder="选择模型和提供商">
+      <el-select v-model="modelConfigId" :loading="loadingModels" :disabled="acting" :placeholder="isEdit ? '选择下次发送使用的模型' : '选择模型和提供商'" @change="markModelSelectionTouched">
         <el-option v-for="model in modelConfigs" :key="model.id" :label="assistantModelLabel(model)" :value="model.id" />
       </el-select>
-      <el-tag v-if="assistant?.model_info" effect="plain">当前会话：{{ assistantModelLabel(assistant.model_info) }}</el-tag>
-      <el-select v-if="assistants.length" v-model="selectedAssistantId" :disabled="acting" placeholder="最近会话">
+      <el-tag v-if="assistant?.model_info" effect="plain">{{ isEdit ? '本轮/上次模型：' : '当前会话：' }}{{ assistantModelLabel(assistant.model_info) }}</el-tag>
+      <el-select v-if="isRepair && assistants.length" v-model="selectedAssistantId" :disabled="acting" placeholder="最近会话">
         <el-option v-for="item in assistants" :key="item.id" :label="recentLabel(item)" :value="item.id" />
       </el-select>
     </div>
+    <p v-if="isEdit" class="model-switch-hint">模型切换从下一次发送生效。</p>
 
     <template v-if="isRepair && !assistant">
       <div class="runtime-heading"><strong>本次运行变量</strong><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div>
@@ -41,7 +43,7 @@
     </template>
 
     <template v-if="assistant">
-      <div class="session-status">
+      <div v-if="showSessionStatus" class="session-status">
         <el-tag :type="statusTagType(assistant.status)" effect="plain">{{ statusLabel(assistant.status) }}</el-tag>
         <span>{{ assistant.message || '会话状态已恢复。' }}</span>
         <el-tag :type="verificationTagType(assistant.verification, assistant.status)" effect="plain">{{ verificationLabel(assistant.verification, assistant.status) }}</el-tag>
@@ -58,7 +60,7 @@
         <pre>{{ candidateView === 'full' ? assistant.candidate_script : (assistant.candidate_diff || assistant.candidate_script) }}</pre>
         <div class="candidate-actions">
           <el-button v-if="isEdit" type="primary" :disabled="!canContinue || acting" @click="applyToEditor">采用到编辑器</el-button>
-          <el-button v-if="isEdit" :disabled="!canContinue || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
+          <el-button v-if="isEdit" :disabled="!canContinue || !modelConfigId || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
           <el-button v-if="isEdit" type="warning" plain :disabled="!canVerify || acting" @click="requestVerify">调试验证</el-button>
           <el-button v-if="isRepair" type="warning" plain :disabled="!canVerify || acting" :loading="acting" @click="requestVerify">运行验证</el-button>
           <el-button v-if="isRepair" :type="requiresManualReview ? 'warning' : 'primary'" :disabled="!canApplyRepair || acting" :loading="acting" @click="requestApply">{{ requiresManualReview ? '人工确认并保存' : '采用并保存' }}</el-button>
@@ -107,8 +109,9 @@ const emit = defineEmits(['apply-to-editor'])
 const context = computed(() => assistantPanelContext(props.editContext, props.repairContext))
 const isEdit = computed(() => Boolean(props.editContext))
 const isRepair = computed(() => Boolean(props.repairContext))
-const { assistants, assistant, modelConfigs, loading, loadingModels, acting, active, lastError, selectAssistant, loadRecent, loadAssistant, create, message, verify, apply, cancel } = useWebUIScriptAssistant({ projectId: computed(() => props.projectId), context })
+const { assistants, assistant, modelConfigs, loading, loadingModels, acting, active, lastError, refreshRequired, selectAssistant, loadRecent, loadAssistant, clearEditConversation, create, message, reset, verify, apply, cancel } = useWebUIScriptAssistant({ projectId: computed(() => props.projectId), context })
 const modelConfigId = ref(null)
+const modelSelectionTouched = ref(false)
 const messageText = ref('')
 const candidateView = ref('diff')
 const runtimeVariables = ref([])
@@ -125,6 +128,7 @@ const selectedAssistantId = computed({ get: () => assistant.value?.id || null, s
   if (selected?.id) loadAssistant(selected.id, { quiet: true })
 } })
 const hasCandidate = computed(() => Boolean(assistant.value?.candidate_hash && assistant.value?.candidate_script))
+const showSessionStatus = computed(() => !isEdit.value || assistant.value?.status !== 'idle')
 const canContinue = computed(() => canContinueCandidate(assistant.value))
 const canVerify = computed(() => canVerifyCandidate(assistant.value))
 const verifyAction = computed(() => verifyActionState(assistant.value))
@@ -162,18 +166,38 @@ const candidateTagType = computed(() => {
   if (assistant.value?.status === 'applied') return 'success'
   return requiresManualReview.value ? 'warning' : 'info'
 })
-const canSend = computed(() => Boolean(messageText.value.trim() && assistant.value && !active.value && !acting.value))
-const canStartEdit = computed(() => Boolean(messageText.value.trim() && modelConfigId.value && props.editContext?.testCaseId && !acting.value))
+const canSend = computed(() => Boolean(messageText.value.trim() && modelConfigId.value && assistant.value && !active.value && !acting.value))
+const canStartEdit = computed(() => Boolean(messageText.value.trim() && modelConfigId.value && props.editContext?.testCaseId && !loading.value && !refreshRequired.value && !acting.value))
 
-watch(modelConfigs, items => {
+const hasModelConfig = (items, id) => items.some(item => String(item.id) === String(id))
+const initializeEditModel = () => {
+  if (modelSelectionTouched.value) return
   const sessionConfigId = assistant.value?.model_info?.config_id ?? assistant.value?.model_config_id
-  if (sessionConfigId && items.some(item => String(item.id) === String(sessionConfigId))) modelConfigId.value = sessionConfigId
-  else if (!items.some(item => item.id === modelConfigId.value)) modelConfigId.value = items[0]?.id || null
+  if (sessionConfigId && hasModelConfig(modelConfigs.value, sessionConfigId)) modelConfigId.value = sessionConfigId
+  else if (!hasModelConfig(modelConfigs.value, modelConfigId.value)) modelConfigId.value = modelConfigs.value[0]?.id || null
+}
+const markModelSelectionTouched = () => { modelSelectionTouched.value = true }
+watch(modelConfigs, items => {
+  if (isEdit.value) initializeEditModel()
+  else {
+    const configId = assistant.value?.model_info?.config_id ?? assistant.value?.model_config_id
+    if (configId && hasModelConfig(items, configId)) modelConfigId.value = configId
+    else if (!hasModelConfig(items, modelConfigId.value)) modelConfigId.value = items[0]?.id || null
+  }
 }, { immediate: true })
 watch(assistant, value => {
+  if (isEdit.value) {
+    initializeEditModel()
+    return
+  }
   const configId = value?.model_info?.config_id ?? value?.model_config_id
-  if (configId && modelConfigs.value.some(item => String(item.id) === String(configId))) modelConfigId.value = configId
+  if (configId && hasModelConfig(modelConfigs.value, configId)) modelConfigId.value = configId
 }, { immediate: true })
+watch([() => props.projectId, () => JSON.stringify(context.value)], () => {
+  modelSelectionTouched.value = false
+  modelConfigId.value = null
+  initializeEditModel()
+})
 watch([() => props.projectId, () => JSON.stringify(context.value), () => assistant.value?.id], clearAttempt, { flush: 'sync' })
 onBeforeUnmount(clearAttempt)
 
@@ -181,11 +205,35 @@ const statusLabel = status => ({ idle: '等待操作', queued: '已排队', runn
 const statusTagType = status => ({ queued: 'warning', running: 'warning', candidate_ready: 'warning', candidate_passed: 'success', failed: 'danger', cancelled: 'info', applied: 'success' })[status] || 'info'
 const attemptStatusLabel = assistantAttemptStatusLabel
 const recentLabel = item => `${item.mode === 'repair' ? '修复' : '编辑'} · ${statusLabel(item.status)} · ${new Date(item.updated_at || item.created_at || Date.now()).toLocaleString()}`
-const newConversation = () => {
-  selectAssistant(null)
+const clearConversationView = () => {
   messageText.value = ''
+  candidateView.value = 'diff'
   runtimeVariables.value = []
-  attemptExecution.value = null
+  clearAttempt()
+}
+const newConversation = async () => {
+  if (isRepair.value) {
+    selectAssistant(null)
+    clearConversationView()
+    return
+  }
+  if (loading.value || refreshRequired.value || active.value || acting.value) return
+  if (!assistant.value) {
+    if (clearEditConversation()) clearConversationView()
+    return
+  }
+  const frozen = { projectId: props.projectId, id: assistant.value.id, revision: assistant.value.revision }
+  try {
+    await ElMessageBox.confirm('新建会话会清空当前 AI 对话、候选和执行展示，但不会修改编辑器中的脚本。确认继续？', '确认新建会话', { type: 'warning', confirmButtonText: '清空并新建', cancelButtonText: '取消' })
+    if (props.projectId !== frozen.projectId || assistant.value?.id !== frozen.id || assistant.value?.revision !== frozen.revision) {
+      ElMessage.warning('当前对话已变化，请重新确认后再清空。')
+      return
+    }
+    const value = await reset()
+    if (!value) return
+    clearConversationView()
+    ElMessage.success('已新建当前对话；编辑器内容保持不变。')
+  } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '新建 AI 会话失败') }
 }
 const addRuntimeVariable = () => runtimeVariables.value.push({ name: '', value: '', is_secret: false })
 const runtimePayload = () => {
@@ -212,7 +260,7 @@ const sendMessage = async useCandidate => {
     if (!assistant.value) {
       await create({ mode: 'edit', model_config_id: modelConfigId.value, ...editPayload() })
     } else {
-      await message({ expected_revision: assistant.value.revision, message: messageText.value.trim(), script_content: props.editContext.scriptContent, description: props.editContext.description, variables: props.editContext.variables, use_candidate: useCandidate })
+      await message({ expected_revision: assistant.value.revision, expected_edit_version: props.editContext.editVersion, model_config_id: modelConfigId.value, message: messageText.value.trim(), script_content: props.editContext.scriptContent, description: props.editContext.description, variables: props.editContext.variables, use_candidate: useCandidate })
     }
     messageText.value = ''
   } catch { ElMessage.error(lastError.value || '发送消息失败') }
@@ -310,5 +358,5 @@ const loadAttempt = async executionId => {
 </script>
 
 <style scoped>
-.assistant-panel { display:grid; gap:14px; padding:16px; border:1px solid var(--app-border); border-radius:10px; background:var(--page-content-bg); }.assistant-heading,.assistant-heading-actions,.assistant-config,.session-status,.candidate-heading,.candidate-actions,.message-actions { display:flex; align-items:center; gap:10px; }.assistant-heading { justify-content:space-between; }.assistant-heading h4,.assistant-summary h5,.candidate-section h5,.attempt-section h5,.conversation-section h5 { margin:0; }.assistant-heading p { margin:5px 0 0; color:var(--app-text-secondary); font-size:13px; }.assistant-config > * { flex:1; }.runtime-heading { display:flex; justify-content:space-between; align-items:center; }.runtime-row { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; }.session-status { flex-wrap:wrap; color:var(--app-text-secondary); font-size:13px; }.assistant-summary,.candidate-section,.attempt-section,.conversation-section,.verification-options { display:grid; gap:10px; }.assistant-summary p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }.candidate-heading { justify-content:space-between; }.candidate-section pre { max-height:380px; overflow:auto; margin:0; padding:12px; border-radius:6px; background:var(--el-fill-color-light); white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.6; }.candidate-actions,.message-actions { justify-content:flex-end; flex-wrap:wrap; }.message-list { display:grid; gap:8px; max-height:260px; overflow:auto; }.message { padding:9px 11px; border-radius:6px; white-space:pre-wrap; overflow-wrap:anywhere; }.message.user { background:var(--el-color-primary-light-9); }.message.assistant { background:var(--el-fill-color-light); }.attempt-section { min-width:0; overflow:hidden; }.attempt-section :deep(.test-report-container) { block-size:min(480px, 52vh); min-height:0; max-block-size:min(480px, 52vh); margin-top:6px; overflow:hidden; border:1px solid var(--app-border); border-radius:8px; }.attempt-section :deep(.report-content) { block-size:100%; min-height:0; overflow:hidden; }.attempt-section :deep(.main-content) { block-size:100%; min-height:0; max-height:none; overflow-x:hidden; overflow-y:auto; } @media (max-width:700px) { .assistant-heading { align-items:flex-start; flex-direction:column; }.assistant-config,.runtime-row { grid-template-columns:1fr; display:grid; }.candidate-actions :deep(.el-button) { flex:1 1 100%; } }
+.assistant-panel { display:grid; gap:14px; padding:16px; border:1px solid var(--app-border); border-radius:10px; background:var(--page-content-bg); }.assistant-heading,.assistant-heading-actions,.assistant-config,.session-status,.candidate-heading,.candidate-actions,.message-actions { display:flex; align-items:center; gap:10px; }.assistant-heading { justify-content:space-between; }.assistant-heading h4,.assistant-summary h5,.candidate-section h5,.attempt-section h5,.conversation-section h5 { margin:0; }.assistant-heading p { margin:5px 0 0; color:var(--app-text-secondary); font-size:13px; }.assistant-config > * { flex:1; }.refresh-state { display:flex; justify-content:flex-end; }.model-switch-hint { margin:-8px 0 0; color:var(--app-text-secondary); font-size:12px; }.runtime-heading { display:flex; justify-content:space-between; align-items:center; }.runtime-row { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; }.session-status { flex-wrap:wrap; color:var(--app-text-secondary); font-size:13px; }.assistant-summary,.candidate-section,.attempt-section,.conversation-section,.verification-options { display:grid; gap:10px; }.assistant-summary p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }.candidate-heading { justify-content:space-between; }.candidate-section pre { max-height:380px; overflow:auto; margin:0; padding:12px; border-radius:6px; background:var(--el-fill-color-light); white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.6; }.candidate-actions,.message-actions { justify-content:flex-end; flex-wrap:wrap; }.message-list { display:grid; gap:8px; max-height:260px; overflow:auto; }.message { padding:9px 11px; border-radius:6px; white-space:pre-wrap; overflow-wrap:anywhere; }.message.user { background:var(--el-color-primary-light-9); }.message.assistant { background:var(--el-fill-color-light); }.attempt-section { min-width:0; overflow:hidden; }.attempt-section :deep(.test-report-container) { block-size:min(480px, 52vh); min-height:0; max-block-size:min(480px, 52vh); margin-top:6px; overflow:hidden; border:1px solid var(--app-border); border-radius:8px; }.attempt-section :deep(.report-content) { block-size:100%; min-height:0; overflow:hidden; }.attempt-section :deep(.main-content) { block-size:100%; min-height:0; max-height:none; overflow-x:hidden; overflow-y:auto; } @media (max-width:700px) { .assistant-heading { align-items:flex-start; flex-direction:column; }.assistant-config,.runtime-row { grid-template-columns:1fr; display:grid; }.candidate-actions :deep(.el-button) { flex:1 1 100%; } }
 </style>

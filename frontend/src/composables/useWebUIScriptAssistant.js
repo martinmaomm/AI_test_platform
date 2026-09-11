@@ -1,13 +1,23 @@
 import { computed, onBeforeUnmount, ref, unref, watch } from 'vue'
 import { getLLMConfigurations } from '@/api/aiConfig'
-import { applyWebUIScriptAssistant, cancelWebUIScriptAssistant, createWebUIScriptAssistant, getWebUIScriptAssistant, getWebUIScriptAssistants, sendWebUIScriptAssistantMessage, verifyWebUIScriptAssistant } from '@/api/webTesting'
+import { applyWebUIScriptAssistant, cancelWebUIScriptAssistant, createWebUIScriptAssistant, getWebUIScriptAssistant, getWebUIScriptAssistants, resetWebUIScriptAssistant, sendWebUIScriptAssistantMessage, verifyWebUIScriptAssistant } from '@/api/webTesting'
 import { assistantErrorMessage, assistantList, assistantListParams, assistantsForContext, isAssistantActive, unwrapAssistantResponse } from './webUIScriptAssistantPresentation'
 
 const POLL_INTERVAL_MS = 1500
 const MAX_POLL_FAILURES = 3
 const configuredModels = response => assistantList(response).filter(item => item?.is_active && item?.model_type === 'llm')
+const defaultRequests = {
+  apply: applyWebUIScriptAssistant,
+  cancel: cancelWebUIScriptAssistant,
+  create: createWebUIScriptAssistant,
+  get: getWebUIScriptAssistant,
+  list: getWebUIScriptAssistants,
+  message: sendWebUIScriptAssistantMessage,
+  reset: resetWebUIScriptAssistant,
+  verify: verifyWebUIScriptAssistant
+}
 
-export const useWebUIScriptAssistant = ({ projectId, context }) => {
+export const useWebUIScriptAssistant = ({ projectId, context, requests = defaultRequests, loadModelConfigs = getLLMConfigurations }) => {
   const assistants = ref([])
   const assistant = ref(null)
   const modelConfigs = ref([])
@@ -15,6 +25,7 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
   const loadingModels = ref(false)
   const acting = ref(false)
   const lastError = ref('')
+  const refreshRequired = ref(false)
   let pollTimer = null
   let requestVersion = 0
   let scopeVersion = 0
@@ -34,6 +45,7 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
     assistant.value = null
     acting.value = false
     lastError.value = ''
+    refreshRequired.value = false
   }
   const schedulePoll = () => {
     stopPolling()
@@ -55,7 +67,7 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
   const loadModels = async (scope = scopeVersion) => {
     loadingModels.value = true
     try {
-      const models = configuredModels(await getLLMConfigurations())
+      const models = configuredModels(await loadModelConfigs())
       if (inScope(scope)) modelConfigs.value = models
     } catch {
       if (inScope(scope)) modelConfigs.value = []
@@ -63,40 +75,55 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
   }
   const loadRecent = async (scope = scopeVersion) => {
     const project = currentProjectId()
-    if (!project || !inScope(scope)) return
+    if (!project || !inScope(scope) || (currentContext().mode === 'edit' && acting.value)) return
     const request = ++requestVersion
     loading.value = true
     try {
-      const items = assistantsForContext(assistantList(await getWebUIScriptAssistants(project, assistantListParams(currentContext()))), currentContext())
+      const items = assistantsForContext(assistantList(await requests.list(project, assistantListParams(currentContext()))), currentContext())
       if (!inScope(scope) || request !== requestVersion) return
       assistants.value = items
+      lastError.value = ''
+      refreshRequired.value = false
       const selectedId = assistant.value?.id
       const selected = items.find(item => String(item.id) === String(selectedId)) || items[0] || null
       stopPolling()
       assistant.value = selected
       if (!selected?.id) return
-      const detail = unwrapAssistantResponse(await getWebUIScriptAssistant(project, selected.id))
+      const detail = unwrapAssistantResponse(await requests.get(project, selected.id))
       if (!inScope(scope) || request !== requestVersion || detail?.mode !== currentContext().mode) return
+      refreshRequired.value = false
       replaceAssistant(detail)
     } catch (error) {
       if (inScope(scope) && request === requestVersion && assistant.value?.id) schedulePoll()
-      if (inScope(scope) && request === requestVersion) lastError.value = assistantErrorMessage(error, '加载最近 AI 会话失败')
+      if (inScope(scope) && request === requestVersion) {
+        if (currentContext().mode === 'edit') {
+          refreshRequired.value = true
+          lastError.value = '加载 AI 会话失败，请重新获取状态。'
+        } else lastError.value = assistantErrorMessage(error, '加载最近 AI 会话失败')
+      }
     } finally { if (inScope(scope) && request === requestVersion) loading.value = false }
   }
   const loadAssistant = async (id = assistant.value?.id, { quiet = false, scope = scopeVersion } = {}) => {
     const project = currentProjectId()
-    if (!project || !id || !inScope(scope)) return null
+    if (!project || !id || !inScope(scope) || (!quiet && currentContext().mode === 'edit' && acting.value)) return null
     const request = ++requestVersion
     if (!quiet) loading.value = true
     try {
-      const value = unwrapAssistantResponse(await getWebUIScriptAssistant(project, id))
+      const value = unwrapAssistantResponse(await requests.get(project, id))
       if (!inScope(scope) || request !== requestVersion || String(assistant.value?.id) !== String(id) || value?.mode !== currentContext().mode) return null
       pollFailures = 0
+      lastError.value = ''
+      refreshRequired.value = false
       return replaceAssistant(value)
     } catch (error) {
       if (inScope(scope) && request === requestVersion && String(assistant.value?.id) === String(id)) {
         if (quiet && active.value && ++pollFailures < MAX_POLL_FAILURES) schedulePoll()
-        else if (quiet && active.value) lastError.value = '会话自动刷新已暂停，请点击“最近会话”恢复。'
+        else if (quiet && active.value) {
+          if (currentContext().mode === 'edit') {
+            refreshRequired.value = true
+            lastError.value = '会话自动刷新失败，请重新获取状态。'
+          } else lastError.value = '会话自动刷新已暂停，请点击“最近会话”恢复。'
+        }
         else lastError.value = assistantErrorMessage(error, '加载 AI 会话失败')
       }
       return null
@@ -106,13 +133,22 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
     const project = currentProjectId()
     const scope = scopeVersion
     if (!project || acting.value) return null
+    const isEditRequest = currentContext().mode === 'edit'
+    const request = isEditRequest ? ++requestVersion : requestVersion
+    if (isEditRequest) {
+      stopPolling()
+      loading.value = false
+    }
     acting.value = true
     lastError.value = ''
     try {
-      const value = unwrapAssistantResponse(await createWebUIScriptAssistant(project, payload))
-      return inScope(scope) ? replaceAssistant(value) : null
+      const value = unwrapAssistantResponse(await requests.create(project, payload))
+      return inScope(scope) && (!isEditRequest || request === requestVersion) ? replaceAssistant(value) : null
     } catch (error) {
-      if (inScope(scope)) lastError.value = assistantErrorMessage(error, '创建 AI 会话失败')
+      if (inScope(scope)) {
+        lastError.value = assistantErrorMessage(error, '创建 AI 会话失败')
+        if (isEditRequest && error?.response?.status === 409) refreshRequired.value = true
+      }
       throw error
     } finally { if (inScope(scope)) acting.value = false }
   }
@@ -121,21 +157,67 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
     const sessionId = assistant.value?.id
     const scope = scopeVersion
     if (!project || !sessionId || acting.value) return null
+    const isEditAction = currentContext().mode === 'edit'
+    const actionVersion = isEditAction ? ++requestVersion : requestVersion
+    if (isEditAction) {
+      stopPolling()
+      loading.value = false
+    }
     acting.value = true
     lastError.value = ''
     try {
       const value = unwrapAssistantResponse(await request(project, sessionId))
-      if (!inScope(scope) || String(assistant.value?.id) !== String(sessionId)) return null
+      if (!inScope(scope) || (isEditAction && actionVersion !== requestVersion) || String(assistant.value?.id) !== String(sessionId)) return null
       return reload ? (await loadAssistant(sessionId, { quiet: true, scope }) || value) : replaceAssistant(value)
     } catch (error) {
-      if (inScope(scope)) lastError.value = assistantErrorMessage(error, fallback)
+      if (inScope(scope)) {
+        lastError.value = assistantErrorMessage(error, fallback)
+        if (isEditAction && error?.response?.status === 409) refreshRequired.value = true
+        if (isEditAction && active.value) schedulePoll()
+      }
       throw error
     } finally { if (inScope(scope)) acting.value = false }
   }
-  const message = payload => runAction((project, id) => sendWebUIScriptAssistantMessage(project, id, payload), '发送消息失败')
-  const verify = payload => runAction((project, id) => verifyWebUIScriptAssistant(project, id, payload), '启动调试验证失败')
-  const apply = payload => runAction((project, id) => applyWebUIScriptAssistant(project, id, payload), '采用候选失败', { reload: true })
-  const cancel = () => runAction((project, id) => cancelWebUIScriptAssistant(project, id, { expected_revision: assistant.value?.revision }), '取消任务失败')
+  const message = payload => runAction((project, id) => requests.message(project, id, payload), '发送消息失败')
+  const clearEditConversation = () => {
+    if (currentContext().mode !== 'edit' || loading.value || refreshRequired.value || acting.value || active.value) return false
+    requestVersion += 1
+    pollFailures = 0
+    stopPolling()
+    assistants.value = []
+    assistant.value = null
+    lastError.value = ''
+    refreshRequired.value = false
+    return true
+  }
+  const reset = async () => {
+    const project = currentProjectId()
+    const session = assistant.value
+    const scope = scopeVersion
+    if (!project || !session?.id || currentContext().mode !== 'edit' || loading.value || acting.value || active.value) return null
+    const sessionId = session.id
+    const revision = session.revision
+    const request = ++requestVersion
+    pollFailures = 0
+    stopPolling()
+    acting.value = true
+    try {
+      const value = unwrapAssistantResponse(await requests.reset(project, sessionId, { expected_revision: revision }))
+      if (!inScope(scope) || request !== requestVersion || String(assistant.value?.id) !== String(sessionId) || value?.mode !== 'edit') return null
+      lastError.value = ''
+      refreshRequired.value = false
+      return replaceAssistant(value)
+    } catch (error) {
+      if (inScope(scope) && request === requestVersion && String(assistant.value?.id) === String(sessionId)) {
+        lastError.value = assistantErrorMessage(error, '新建 AI 会话失败')
+        if (error?.response?.status === 409) refreshRequired.value = true
+      }
+      throw error
+    } finally { if (inScope(scope) && request === requestVersion) acting.value = false }
+  }
+  const verify = payload => runAction((project, id) => requests.verify(project, id, payload), '启动调试验证失败')
+  const apply = payload => runAction((project, id) => requests.apply(project, id, payload), '采用候选失败', { reload: true })
+  const cancel = () => runAction((project, id) => requests.cancel(project, id, { expected_revision: assistant.value?.revision }), '取消任务失败')
 
   watch([() => currentProjectId(), () => JSON.stringify(assistantListParams(currentContext()))], () => {
     resetScope()
@@ -145,5 +227,5 @@ export const useWebUIScriptAssistant = ({ projectId, context }) => {
   }, { immediate: true })
   onBeforeUnmount(resetScope)
 
-  return { assistants, assistant, modelConfigs, loading, loadingModels, acting, active, lastError, selectAssistant, loadRecent, loadAssistant, create, message, verify, apply, cancel }
+  return { assistants, assistant, modelConfigs, loading, loadingModels, acting, active, lastError, refreshRequired, selectAssistant, loadRecent, loadAssistant, clearEditConversation, create, message, reset, verify, apply, cancel }
 }

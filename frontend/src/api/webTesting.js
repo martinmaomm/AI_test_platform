@@ -110,6 +110,9 @@ export const getWebUIScriptAssistant = async (projectId, assistantId) =>
 export const sendWebUIScriptAssistantMessage = async (projectId, assistantId, data) =>
   (await api.post(`${base(projectId)}/script-assistants/${assistantId}/messages/`, data)).data
 
+export const resetWebUIScriptAssistant = async (projectId, assistantId, data) =>
+  (await api.post(`${base(projectId)}/script-assistants/${assistantId}/reset/`, data)).data
+
 export const verifyWebUIScriptAssistant = async (projectId, assistantId, data) =>
   (await api.post(`${base(projectId)}/script-assistants/${assistantId}/verify/`, data)).data
 

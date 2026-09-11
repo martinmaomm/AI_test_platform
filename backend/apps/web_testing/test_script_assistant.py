@@ -20,13 +20,14 @@ from .models import (
     WebUITestExecution,
     WebUITestSuite,
 )
-from .script_assistant import candidate_hash, case_edit_version
+from .script_assistant import _persist, candidate_hash, case_edit_version
 from .script_assistant_views import (
     ScriptAssistantApplyView,
     ScriptAssistantCancelView,
     ScriptAssistantDetailView,
     ScriptAssistantListCreateView,
     ScriptAssistantMessageView,
+    ScriptAssistantResetView,
     ScriptAssistantVerifyView,
 )
 from .views import ExecuteWebUITestCaseView, WebUITestCaseRetrieveUpdateDestroyView
@@ -141,6 +142,264 @@ class ScriptAssistantApiTests(TestCase):
         self.assertIsNotNone(session.deadline_at)
         self.assertEqual(session.source_script, SCRIPT + " \n")
         self.assertEqual(session.source_edit_version, case_edit_version(self.case))
+
+    def test_reset_clears_conversation_durably_without_modifying_case_or_execution(
+        self,
+    ):
+        session = self._create_edit()
+        execution = self._failed_case_execution()
+        session.status = "candidate_ready"
+        session.candidate_script = SCRIPT
+        session.candidate_hash = candidate_hash(SCRIPT)
+        session.candidate_diff = "old diff"
+        session.summary = "old summary"
+        session.blockers = [{"message": "old blocker"}]
+        session.quality_report = {"old": True}
+        session.attempts = [{"execution_id": execution.id}]
+        session.verification = {"execution_id": execution.id, "status": "failed"}
+        session.pending_use_candidate = True
+        session.save()
+        old_revision, old_task = session.revision, session.task_id
+        before_case = case_edit_version(self.case)
+        with patch("web_testing.script_assistant_views._dispatch") as dispatch:
+            result = self._post(
+                ScriptAssistantResetView,
+                {"expected_revision": session.revision},
+                session_id=session.id,
+            )
+        self.assertEqual(result.status_code, 200, result.data)
+        dispatch.assert_not_called()
+        session.refresh_from_db()
+        self.assertEqual(session.status, "idle")
+        self.assertEqual(session.revision, old_revision + 1)
+        for field in (
+            "source_script",
+            "source_edit_version",
+            "candidate_script",
+            "candidate_hash",
+            "candidate_diff",
+            "summary",
+            "blockers",
+            "quality_report",
+            "messages",
+            "attempts",
+            "verification",
+            "source_variables",
+            "source_options",
+            "pending_script",
+            "pending_description",
+            "pending_variables",
+            "pending_message",
+            "pending_use_candidate",
+            "task_id",
+            "deadline_at",
+            "cancel_requested_at",
+        ):
+            self.assertFalse(getattr(session, field), field)
+        self.assertEqual(session.model_config_id, self.model.id)
+        self.assertFalse(
+            _persist(session.id, old_revision, old_task, candidate_script="late")
+        )
+        restored = self._get(
+            ScriptAssistantListCreateView, f"mode=edit&test_case_id={self.case.id}"
+        ).data["data"]
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0]["id"], str(session.id))
+        self.assertEqual(restored[0]["messages"], [])
+        self.case.refresh_from_db()
+        self.assertEqual(case_edit_version(self.case), before_case)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, "failed")
+        self.assertEqual(WebUITestExecution.objects.count(), 1)
+
+    def test_reset_rejects_running_and_stale_requests_without_clearing(self):
+        session = self._create_edit()
+        original_messages = session.messages
+        for status in ("queued", "running", "candidate_ready"):
+            with self.subTest(status=status):
+                session.status = status
+                session.save(update_fields=["status"])
+                result = self._post(
+                    ScriptAssistantResetView,
+                    {
+                        "expected_revision": session.revision
+                        + (status == "candidate_ready")
+                    },
+                    session_id=session.id,
+                )
+                self.assertEqual(result.status_code, 409, result.data)
+                session.refresh_from_db()
+                self.assertEqual(session.messages, original_messages)
+
+    def test_reset_does_not_accept_repair_or_other_user_sessions(self):
+        session = self._create_edit()
+        other = get_user_model().objects.create_user(
+            username="reset-other", email="reset-other@example.test"
+        )
+        ProjectMember.objects.create(
+            project=self.project, user=other, role="editor", can_edit=True
+        )
+        result = self._post(
+            ScriptAssistantResetView,
+            {"expected_revision": session.revision},
+            session_id=session.id,
+            user=other,
+        )
+        self.assertEqual(result.status_code, 404)
+        session.mode, session.status = "repair", "candidate_ready"
+        session.save(update_fields=["mode", "status"])
+        result = self._post(
+            ScriptAssistantResetView,
+            {"expected_revision": session.revision},
+            session_id=session.id,
+        )
+        self.assertEqual(result.status_code, 409)
+        session.refresh_from_db()
+        self.assertTrue(session.messages)
+
+    def test_edit_has_single_conversation_and_new_message_after_reset_uses_same_id(
+        self,
+    ):
+        session = self._create_edit()
+        payload = {
+            "mode": "edit",
+            "model_config_id": self.model.id,
+            "test_case_id": self.case.id,
+            "expected_edit_version": case_edit_version(self.case),
+            "script_content": SCRIPT,
+            "message": "new",
+            "variables": [],
+        }
+        with patch("web_testing.script_assistant_views._dispatch") as dispatch:
+            duplicate = self._post(ScriptAssistantListCreateView, payload)
+        self.assertEqual(duplicate.status_code, 409, duplicate.data)
+        dispatch.assert_not_called()
+        session.status = "cancelled"
+        session.save(update_fields=["status"])
+        result = self._post(
+            ScriptAssistantResetView,
+            {"expected_revision": session.revision},
+            session_id=session.id,
+        )
+        self.assertEqual(result.status_code, 200, result.data)
+        session.refresh_from_db()
+        with patch("web_testing.script_assistant_views._dispatch"):
+            sent = self._post(
+                ScriptAssistantMessageView,
+                {
+                    **payload,
+                    "expected_revision": session.revision,
+                    "use_candidate": False,
+                },
+                session_id=session.id,
+            )
+        self.assertEqual(sent.status_code, 202, sent.data)
+        session.refresh_from_db()
+        self.assertEqual([entry["content"] for entry in session.messages], ["new"])
+        self.assertEqual(session.source_script, SCRIPT)
+        self.assertEqual(session.source_edit_version, case_edit_version(self.case))
+        self.assertEqual(WebUIScriptAssistant.objects.filter(mode="edit").count(), 1)
+
+    def test_case_edit_list_returns_only_current_conversation(self):
+        old = self._create_edit()
+        current = WebUIScriptAssistant.objects.create(
+            project=self.project,
+            user=self.user,
+            test_case=self.case,
+            mode="edit",
+            model_config_id=self.model.id,
+            status="idle",
+            messages=[],
+        )
+        result = self._get(
+            ScriptAssistantListCreateView, f"mode=edit&test_case_id={self.case.id}"
+        )
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual([row["id"] for row in result.data["data"]], [str(current.id)])
+        # No destructive migration of older records, and repair lists retain
+        # their existing behavior. The case editor exposes just one dialogue.
+        self.assertTrue(WebUIScriptAssistant.objects.filter(pk=old.id).exists())
+
+    def test_next_message_switches_model_atomically_not_during_running_task(self):
+        session = self._create_edit()
+        replacement = LLMConfiguration.objects.create(
+            model_type=ModelType.LLM,
+            provider="openai",
+            provider_name="Next provider",
+            model_name="next-model",
+            api_key="offline-only",
+            is_active=True,
+            created_by=self.user,
+        )
+        payload = {
+            "expected_revision": session.revision,
+            "model_config_id": replacement.id,
+            "expected_edit_version": case_edit_version(self.case),
+            "script_content": SCRIPT,
+            "message": "use new model",
+            "use_candidate": False,
+        }
+        with patch("web_testing.script_assistant_views._dispatch") as dispatch:
+            busy = self._post(
+                ScriptAssistantMessageView, payload, session_id=session.id
+            )
+            self.assertEqual(busy.status_code, 409, busy.data)
+            dispatch.assert_not_called()
+        session.refresh_from_db()
+        self.assertEqual(session.model_config_id, self.model.id)
+        session.status = "candidate_ready"
+        session.save(update_fields=["status"])
+        with patch("web_testing.script_assistant_views._dispatch") as dispatch:
+            result = self._post(
+                ScriptAssistantMessageView, payload, session_id=session.id
+            )
+        self.assertEqual(result.status_code, 202, result.data)
+        dispatch.assert_called_once()
+        session.refresh_from_db()
+        self.assertEqual(session.model_config_id, replacement.id)
+        self.assertEqual(session.model_info["provider_name"], "Next provider")
+        self.assertEqual(session.messages[-1]["content"], "use new model")
+
+    def test_message_rejects_disabled_foreign_or_missing_model_without_mutation(self):
+        session = self._create_edit()
+        session.status = "candidate_ready"
+        session.save(update_fields=["status"])
+        before = (session.revision, session.model_config_id, session.messages)
+        other = get_user_model().objects.create_user(
+            username="model-other", email="model-other@example.test"
+        )
+        foreign = LLMConfiguration.objects.create(
+            model_type=ModelType.LLM,
+            provider="openai",
+            model_name="foreign",
+            api_key="offline-only",
+            is_active=True,
+            created_by=other,
+        )
+        self.model.is_active = False
+        self.model.save(update_fields=["is_active"])
+        for config_id in (self.model.id, foreign.id, 999999):
+            with self.subTest(config_id=config_id), patch(
+                "web_testing.script_assistant_views._dispatch"
+            ) as dispatch:
+                result = self._post(
+                    ScriptAssistantMessageView,
+                    {
+                        "expected_revision": session.revision,
+                        "model_config_id": config_id,
+                        "script_content": SCRIPT,
+                        "message": "next",
+                        "use_candidate": False,
+                    },
+                    session_id=session.id,
+                )
+                self.assertEqual(result.status_code, 400, result.data)
+                dispatch.assert_not_called()
+                session.refresh_from_db()
+                self.assertEqual(
+                    (session.revision, session.model_config_id, session.messages),
+                    before,
+                )
 
     def test_message_revision_conflict_does_not_mutate_pending_payload(self):
         session = self._create_edit()

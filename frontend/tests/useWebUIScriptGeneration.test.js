@@ -10,6 +10,7 @@ let moduleId = 0
 const methods = [
   'applyWebUIScriptGenerationRepair',
   'cancelWebUIScriptGeneration', 'createWebUIScriptGeneration', 'debugWebUIScriptGeneration',
+  'deleteWebUIScriptGeneration',
   'discardWebUIScriptGenerationRepair',
   'getWebUIScriptGeneration', 'getWebUIScriptGenerations', 'getWebUITestCaseExecution', 'repairWebUIScriptGeneration',
   'resolveWebUIScriptGeneration', 'resumeWebUIScriptGenerationExploration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
@@ -138,6 +139,7 @@ test('history selection rejects a mismatched detail and blocks edits, mutations,
   assert.equal(await state.create({ description: 'must not create' }), null)
   assert.equal(await state.save('must not save'), null)
   assert.equal(await state.debug(), null)
+  assert.equal(await state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z', can_delete: true }), null)
   state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'must not edit during switch' })
   assert.equal(state.localDraft.value.dirty, false)
   assert.equal(calls.filter(call => ['createWebUIScriptGeneration', 'saveWebUIScriptGeneration', 'debugWebUIScriptGeneration'].includes(call.name)).length, 1)
@@ -188,6 +190,116 @@ test('history switching is blocked while work is active', async t => {
   assert.equal(active.state.isHistorySwitchBlocked.value, true)
   assert.equal(await active.state.openHistoryGeneration('other-record'), null)
   assert.equal(active.calls.some(call => call.name === 'getWebUIScriptGeneration'), false)
+})
+
+test('history deletion confirmation freezes workspace context before it can dispatch', async () => {
+  const source = await readFile(new URL('../src/views/web-testing/WebUIAutoTest.vue', import.meta.url), 'utf8')
+  assert.match(source, /const historyDeleteConfirming = ref\(false\)/)
+  assert.match(source, /:delete-disabled="isHistorySwitchBlocked \|\| historyDeleteConfirming"/)
+  assert.match(source, /projectId: projectId\.value,\s*userId: userId\.value,\s*currentGenerationId: generation\.value\?\.id \?\? null,\s*currentGenerationRevision: generationRevision\(\)/s)
+  assert.match(source, /if \(!isCurrentHistoryDeleteContext\(context\) \|\| isHistorySwitchBlocked\.value\) return/)
+  assert.match(source, /finally \{\s*historyDeleteConfirming\.value = false\s*\}/s)
+})
+
+test('deletion sends the captured revision, clears only the current workspace, and refreshes history', async t => {
+  const { state, handlers, calls, storage } = await harness(t)
+  const updatedAt = '2026-09-11T02:03:04Z'
+  handlers.deleteWebUIScriptGeneration = async () => ({ success: true, data: { id: 'test-generation' } })
+  handlers.getWebUIScriptGenerations = async () => ({ success: true, data: { items: [], page: 1, page_size: 20, total: 0 } })
+
+  const result = await state.deleteGeneration({ id: 'test-generation', updated_at: updatedAt, can_delete: true })
+
+  assert.deepEqual(result, { id: 'test-generation' })
+  assert.deepEqual(calls.find(call => call.name === 'deleteWebUIScriptGeneration').args, [1, 'test-generation', { confirmed: true, expected_updated_at: updatedAt }])
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
+  assert.equal(storage.has(state.storageKey.value), false)
+  assert.equal(calls.filter(call => call.name === 'getWebUIScriptGenerations').length, 1)
+})
+
+test('deletion has a composable double-click guard and does not allow polling refreshes', async t => {
+  const { state, handlers, calls } = await harness(t)
+  const pendingResponse = deferred()
+  handlers.deleteWebUIScriptGeneration = () => pendingResponse.promise
+
+  const first = state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z', can_delete: true })
+  assert.equal(await state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z', can_delete: true }), null)
+  assert.equal(await state.refresh(), null)
+  assert.equal(calls.filter(call => call.name === 'deleteWebUIScriptGeneration').length, 1)
+
+  pendingResponse.resolve({ success: true, data: { id: 'test-generation' } })
+  await first
+})
+
+test('deletion never guesses permission and a 409 preserves the local draft while refreshing history', async t => {
+  const { state, handlers, calls } = await harness(t)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'local draft must survive deletion conflict' })
+  assert.equal(await state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z' }), null)
+  assert.equal(calls.some(call => call.name === 'deleteWebUIScriptGeneration'), false)
+
+  handlers.deleteWebUIScriptGeneration = async () => { throw { response: { status: 409, data: { message: 'stale' } } } }
+  handlers.getWebUIScriptGenerations = async () => ({ success: true, data: { items: [{ id: 'test-generation', can_delete: false }], page: 1, page_size: 20, total: 1 } })
+  await assert.rejects(state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z', can_delete: true }))
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.equal(state.localDraft.value.script_draft, 'local draft must survive deletion conflict')
+  assert.match(state.lastError.value, /当前本地编辑仍保留/)
+  assert.equal(state.historyItems.value[0].can_delete, false)
+})
+
+test('a stale deletion response cannot clear a new project workspace', async t => {
+  const { state, handlers, projectId } = await harness(t)
+  const deletion = deferred()
+  handlers.deleteWebUIScriptGeneration = () => deletion.promise
+  const pending = state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z', can_delete: true })
+
+  projectId.value = 2
+  await nextTick()
+  handlers.createWebUIScriptGeneration = async () => ({ success: true, data: { ...record(), id: 'new-project-record' } })
+  await state.create({ description: 'new project work' })
+  deletion.resolve({ success: true, data: { id: 'test-generation' } })
+  await pending
+
+  assert.equal(state.generation.value.id, 'new-project-record')
+  assert.equal(state.localDraft.value.generationId, 'new-project-record')
+})
+
+test('a refresh started before deletion cannot restore the deleted workspace', async t => {
+  const { state, handlers, storage } = await harness(t)
+  const staleRefresh = deferred()
+  handlers.getWebUIScriptGeneration = () => staleRefresh.promise
+  handlers.deleteWebUIScriptGeneration = async () => ({ success: true, data: { id: 'test-generation' } })
+
+  const pendingRefresh = state.refresh()
+  await state.deleteGeneration({ id: 'test-generation', updated_at: '2026-09-11T02:03:04Z', can_delete: true })
+  staleRefresh.resolve({ success: true, data: record() })
+  await pendingRefresh
+
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
+  assert.equal(storage.has(state.storageKey.value), false)
+})
+
+test('deleting the last item on a history page returns to the previous page', async t => {
+  const { state, handlers, calls } = await harness(t)
+  let historyRead = 0
+  handlers.getWebUIScriptGenerations = async () => {
+    historyRead += 1
+    if (historyRead === 1) return { success: true, data: { items: [{ id: 'last-page-item' }], page: 2, page_size: 20, total: 21 } }
+    if (historyRead === 2) return { success: true, data: { items: [], page: 2, page_size: 20, total: 20 } }
+    return { success: true, data: { items: [{ id: 'previous-page-item' }], page: 1, page_size: 20, total: 20 } }
+  }
+  handlers.deleteWebUIScriptGeneration = async () => ({ success: true, data: { id: 'last-page-item' } })
+
+  await state.loadHistory(2)
+  await state.deleteGeneration({ id: 'last-page-item', updated_at: '2026-09-11T02:03:04Z', can_delete: true })
+
+  assert.deepEqual(calls.filter(call => call.name === 'getWebUIScriptGenerations').map(call => call.args[1]), [
+    { page: 2, page_size: 20 },
+    { page: 2, page_size: 20 },
+    { page: 1, page_size: 20 }
+  ])
+  assert.equal(state.historyPage.value, 1)
+  assert.equal(state.historyItems.value[0].id, 'previous-page-item')
 })
 
 test('polling preserves unsaved local code when a server revision changes', async t => {

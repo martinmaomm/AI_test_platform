@@ -20,6 +20,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.api import response
+from projects.models import ProjectMember
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .assertion_state import analyze_assertion_state
@@ -39,6 +40,7 @@ from .exploration_timeout import (
     exploration_total_timeout_seconds,
 )
 from .generation_events import publish_terminal
+from .generation_deletion import generation_delete_block_reason
 from .generation_lifecycle import reconcile_stale_generation, reconcile_stale_generations
 from .generation_repository import (
     GenerationResolutionConflict,
@@ -95,6 +97,7 @@ from .project_access import (
 from .script_contract import ScriptContractError, normalize_for_storage, store_script_content
 from .serializers import (
     WebUIScriptGenerationCreateSerializer,
+    WebUIScriptGenerationDeleteSerializer,
     WebUIScriptGenerationDebugSerializer,
     WebUIScriptGenerationDraftSerializer,
     WebUIScriptGenerationHistoryQuerySerializer,
@@ -150,8 +153,14 @@ def _is_generation_owner(project, generation, user) -> bool:
 class WebUIScriptGenerationCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @project_access_required(READ)
     def get(self, request, project_id):
+        project = get_project_for_user(project_id, request.user, READ)
+        can_delete_records = (
+            request.user.id in {project.owner_id, project.created_by_id}
+            or ProjectMember.objects.filter(
+                project=project, user=request.user, can_delete=True,
+            ).exists()
+        )
         query_serializer = WebUIScriptGenerationHistoryQuerySerializer(
             data=request.query_params,
         )
@@ -167,6 +176,8 @@ class WebUIScriptGenerationCreateView(APIView):
             'scenario_spec', 'model_info',
         ).annotate(
             lifecycle_metadata=models.F('workspace___generation_lifecycle'),
+            delete_verification_status=models.F('workspace__verification__status'),
+            delete_repair_status=models.F('workspace__repair__status'),
         ).order_by('-created_at', '-id')
         total = queryset.count()
         offset = (page - 1) * page_size
@@ -175,7 +186,9 @@ class WebUIScriptGenerationCreateView(APIView):
         return Response({
             'success': True,
             'data': {
-                'items': WebUIScriptGenerationHistorySerializer(items, many=True).data,
+                'items': WebUIScriptGenerationHistorySerializer(
+                    items, many=True, context={'can_delete_records': can_delete_records},
+                ).data,
                 'page': page,
                 'page_size': page_size,
                 'total': total,
@@ -255,6 +268,32 @@ class WebUIScriptGenerationDetailView(APIView):
             raise PermissionDenied('只能查看自己创建的生成记录')
         generation = reconcile_stale_generation(generation.pk)
         return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
+
+    def delete(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, DELETE)
+        serializer = WebUIScriptGenerationDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # The same row lock serializes deletion with resume, save, debug and
+        # repair. Recheck the confirmed version after acquiring it.
+        with transaction.atomic():
+            generation = get_object_or_404(
+                WebUIScriptGeneration.objects.select_for_update(),
+                pk=generation_id, project_id=project_id,
+            )
+            if not _is_generation_owner(project, generation, request.user):
+                raise PermissionDenied('只能删除自己创建的生成记录')
+            reason = generation_delete_block_reason(generation)
+            if not reason and generation.updated_at != serializer.validated_data['expected_updated_at']:
+                reason = '生成记录已发生变化，请刷新列表并重新确认删除。'
+            if reason:
+                return Response(
+                    {'success': False, 'message': reason}, status=status.HTTP_409_CONFLICT,
+                )
+            deleted_id = str(generation.pk)
+            # No artifact cleanup: saved cases and execution report/log files
+            # are independent assets and must survive deletion of this draft.
+            generation.delete()
+        return Response({'success': True, 'data': {'id': deleted_id}})
 
 
 class WebUIScriptGenerationCancelView(APIView):

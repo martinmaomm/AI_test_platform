@@ -6,14 +6,14 @@
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
     <div class="generation-layout">
-      <GenerationInputPanel :project-id="selectedProject.id" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="submitting || isWorkspaceBusy || hasRepairCandidate || saving || resolving || debugging || repairing || repairApplying || repairDiscarding || draftSaving || historySwitching" :generation-active="isActive" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
+      <GenerationInputPanel :project-id="selectedProject.id" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="submitting || isWorkspaceBusy || hasRepairCandidate || saving || resolving || debugging || repairing || repairApplying || repairDiscarding || draftSaving || isDeletingGeneration || historySwitching" :generation-active="isActive" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
-        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :repair-applying="repairApplying" :repair-discarding="repairDiscarding" :busy="isActive || isWorkspaceBusy || hasRepairCandidate || submitting || saving || resolving || draftSaving || debugging || repairing || repairApplying || repairDiscarding || historySwitching" :repair-busy="isActive || isWorkspaceBusy || submitting || saving || resolving || draftSaving || debugging || repairing || repairApplying || repairDiscarding || historySwitching" :draft-conflict="draftConflict" :can-resume-exploration="canResumeExploration" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" :repair-execution="repairExecution" :repair-execution-loading="repairExecutionLoading" :selected-repair-execution-id="selectedRepairExecutionId" @resolve="handleResolve" @resume-exploration="handleResumeExploration" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @apply-repair="handleApplyRepair" @discard-repair="handleDiscardRepair" @view-repair-execution="handleViewRepairExecution" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
+        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :repair-applying="repairApplying" :repair-discarding="repairDiscarding" :busy="isActive || isWorkspaceBusy || hasRepairCandidate || submitting || saving || resolving || draftSaving || debugging || repairing || repairApplying || repairDiscarding || isDeletingGeneration || historySwitching" :repair-busy="isActive || isWorkspaceBusy || submitting || saving || resolving || draftSaving || debugging || repairing || repairApplying || repairDiscarding || isDeletingGeneration || historySwitching" :draft-conflict="draftConflict" :can-resume-exploration="canResumeExploration" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" :repair-execution="repairExecution" :repair-execution-loading="repairExecutionLoading" :selected-repair-execution-id="selectedRepairExecutionId" @resolve="handleResolve" @resume-exploration="handleResumeExploration" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @apply-repair="handleApplyRepair" @discard-repair="handleDiscardRepair" @view-repair-execution="handleViewRepairExecution" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
         <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。未保存到测试用例的生成记录可在刷新后恢复；保存成功后会清空当前工作区。" class="empty-result" />
       </div>
     </div>
-    <GenerationHistoryPanel :visible="historyVisible" :items="historyItems" :page="historyPage" :page-size="historyPageSize" :total="historyTotal" :error="historyError" :loading="historyLoading" :switching="historySwitching" :switch-disabled="isHistorySwitchBlocked" :current-generation-id="generation?.id" @close="historyVisible = false" @load="loadHistory" @select="handleHistorySelect" />
+    <GenerationHistoryPanel :visible="historyVisible" :items="historyItems" :page="historyPage" :page-size="historyPageSize" :total="historyTotal" :error="historyError" :loading="historyLoading" :switching="historySwitching" :switch-disabled="isHistorySwitchBlocked" :delete-disabled="isHistorySwitchBlocked || historyDeleteConfirming" :deleting-generation-id="deletingGenerationId" :current-generation-id="generation?.id" @close="historyVisible = false" @load="loadHistory" @select="handleHistorySelect" @delete="handleHistoryDelete" />
   </div>
   <el-alert v-else title="请先选择一个项目" type="info" :closable="false" show-icon><template #default><el-button type="primary" size="small" @click="router.push('/project/project-list')">前往项目管理</el-button></template></el-alert>
 </template>
@@ -47,9 +47,10 @@ const loadingModules = ref(false)
 const loadingModels = ref(false)
 const isConnected = ref(false)
 const historyVisible = ref(false)
+const historyDeleteConfirming = ref(false)
 let websocketManager = null
 
-const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, repairApplying, repairDiscarding, debugExecution, debugExecutionLoading, repairExecution, repairExecutionLoading, selectedRepairExecutionId, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, hasUnsavedDraft, hasUnpersistedGeneration, hasRepairCandidate, canResumeExploration, historyItems, historyPage, historyPageSize, historyTotal, historyLoading, historyError, historySwitching, isHistorySwitchBlocked, create, cancel, resolve: resolveGeneration, resumeExploration, retryGeneration, save, saveDraft, debug, repair, applyRepairCandidate, discardRepairCandidate, loadRepairExecution, loadHistory, openHistoryGeneration, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
+const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, repairApplying, repairDiscarding, debugExecution, debugExecutionLoading, repairExecution, repairExecutionLoading, selectedRepairExecutionId, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, hasUnsavedDraft, hasUnpersistedGeneration, hasRepairCandidate, canResumeExploration, historyItems, historyPage, historyPageSize, historyTotal, historyLoading, historyError, historySwitching, isHistorySwitchBlocked, deletingGenerationId, isDeletingGeneration, create, cancel, resolve: resolveGeneration, resumeExploration, retryGeneration, save, saveDraft, debug, repair, applyRepairCandidate, discardRepairCandidate, loadRepairExecution, loadHistory, openHistoryGeneration, deleteGeneration, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
 const needsReplacementConfirmation = computed(() => hasUnsavedDraft.value || hasUnpersistedGeneration.value)
 
 const asList = (response) => {
@@ -111,6 +112,40 @@ const handleHistorySelect = async (generationId) => {
     if (result) { historyVisible.value = false; ElMessage.success('已恢复历史生成记录') }
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error(historyError.value || '读取生成记录失败')
+  }
+}
+const generationRevision = () => Number(generation.value?.workspace?.revision ?? generation.value?.revision ?? 0)
+const isCurrentHistoryDeleteContext = context => (
+  String(projectId.value ?? '') === String(context.projectId ?? '')
+  && String(userId.value ?? '') === String(context.userId ?? '')
+  && String(generation.value?.id ?? '') === String(context.currentGenerationId ?? '')
+  && generationRevision() === context.currentGenerationRevision
+)
+const handleHistoryDelete = async (item) => {
+  if (!item?.id || item.can_delete !== true || historyDeleteConfirming.value || isHistorySwitchBlocked.value) return
+  const target = { id: item.id, updated_at: item.updated_at, can_delete: true }
+  const context = {
+    projectId: projectId.value,
+    userId: userId.value,
+    currentGenerationId: generation.value?.id ?? null,
+    currentGenerationRevision: generationRevision()
+  }
+  const deletingCurrent = String(generation.value?.id || '') === String(target.id)
+  const unsavedCurrentDraft = deletingCurrent && hasUnsavedDraft.value
+  historyDeleteConfirming.value = true
+  try {
+    await ElMessageBox.confirm(
+      `删除后将永久删除此生成草稿及其探索和生成轨迹，且不可撤销。已保存的测试用例、执行记录、报告和文件不会被删除。${unsavedCurrentDraft ? '当前记录还有未保存的本地编辑，删除后这些编辑也会丢失。' : ''}`,
+      '确认删除生成记录',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
+    )
+    if (!isCurrentHistoryDeleteContext(context) || isHistorySwitchBlocked.value) return
+    const result = await deleteGeneration(target)
+    if (result) ElMessage.success('生成记录已删除')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '删除生成记录失败')
+  } finally {
+    historyDeleteConfirming.value = false
   }
 }
 const handleCancel = async () => {

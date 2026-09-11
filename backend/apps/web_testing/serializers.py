@@ -12,6 +12,7 @@ from .models import (
     WebUIScriptGeneration,
 )
 from .generation_repository import create_generation
+from .generation_deletion import generation_delete_block_reason
 from .generation_lifecycle import lifecycle_for_generation
 from .exploration_timeout import (
     EXPLORATION_TIMEOUT_MAX_SECONDS,
@@ -114,6 +115,16 @@ class WebUIScriptGenerationHistorySerializer(serializers.Serializer):
     updated_at = serializers.DateTimeField(read_only=True)
     test_case_id = serializers.IntegerField(read_only=True, allow_null=True)
     model_info = serializers.SerializerMethodField()
+    can_delete = serializers.SerializerMethodField()
+    delete_block_reason = serializers.SerializerMethodField()
+
+    def get_can_delete(self, obj):
+        return not self.get_delete_block_reason(obj)
+
+    def get_delete_block_reason(self, obj):
+        if not self.context.get('can_delete_records', False):
+            return '没有删除此项目生成记录的权限。'
+        return generation_delete_block_reason(obj)
 
     def get_title(self, obj):
         scenario_spec = obj.scenario_spec if isinstance(obj.scenario_spec, dict) else {}
@@ -130,6 +141,17 @@ class WebUIScriptGenerationHistorySerializer(serializers.Serializer):
             'provider_name': provider_name if isinstance(provider_name, str) else '',
             'model_name': model_name if isinstance(model_name, str) else '',
         }
+
+
+class WebUIScriptGenerationDeleteSerializer(serializers.Serializer):
+    confirmed = serializers.BooleanField()
+    expected_updated_at = serializers.DateTimeField()
+
+    def validate_confirmed(self, value):
+        if self.initial_data.get('confirmed') is not True:
+            raise serializers.ValidationError('删除不可恢复，必须明确确认 confirmed=true。')
+        return value
+
 
 class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
     """Validate a new generation request with an explicit description URL."""

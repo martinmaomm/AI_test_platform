@@ -18,6 +18,9 @@
               <el-tag :type="statusType(item.status)" effect="plain" size="small">{{ generationStatusLabel(item.status) }}</el-tag>
               <el-tag v-if="item.test_case_id" type="success" effect="plain" size="small">已保存</el-tag>
               <el-button link type="primary" :loading="switching && !isCurrent(item)" :disabled="switchDisabled || isCurrent(item)" @click="emit('select', item.id)">{{ isCurrent(item) ? '当前记录' : '恢复' }}</el-button>
+              <el-tooltip :content="deleteBlockReason(item)" :disabled="canDelete(item)">
+                <el-button link type="danger" :loading="String(deletingGenerationId || '') === String(item.id || '')" :disabled="deleteDisabled || !canDelete(item)" @click="emit('delete', item)">删除</el-button>
+              </el-tooltip>
             </div>
           </article>
         </div>
@@ -40,10 +43,17 @@ const props = defineProps({
   loading: Boolean,
   switching: Boolean,
   switchDisabled: Boolean,
+  deleteDisabled: Boolean,
+  deletingGenerationId: { type: [String, Number], default: null },
   currentGenerationId: { type: [String, Number], default: null }
 })
-const emit = defineEmits(['close', 'load', 'select'])
+const emit = defineEmits(['close', 'load', 'select', 'delete'])
 const isCurrent = item => String(item?.id || '') === String(props.currentGenerationId || '')
+const canDelete = item => item?.can_delete === true
+const deleteBlockReason = item => {
+  if (canDelete(item)) return ''
+  return String(item?.delete_block_reason || '').trim() || '当前记录暂不能删除。'
+}
 const statusType = status => {
   if (status === 'ready') return 'success'
   if (['failed'].includes(status)) return 'danger'

@@ -189,7 +189,10 @@ class WebUIScriptGenerationHistoryTests(TestCase):
         for item in payload['items']:
             self.assertEqual(
                 set(item),
-                {'id', 'title', 'status', 'created_at', 'updated_at', 'test_case_id', 'model_info'},
+                {
+                    'id', 'title', 'status', 'created_at', 'updated_at', 'test_case_id',
+                    'model_info', 'can_delete', 'delete_block_reason',
+                },
             )
             self.assertEqual(set(item['model_info']), {'provider_name', 'model_name'})
         rendered = str(payload)

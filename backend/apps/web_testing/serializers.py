@@ -778,6 +778,7 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     report_url = serializers.SerializerMethodField()
     project_id = serializers.IntegerField(source='execution.project_id', read_only=True)
     screenshot_path = serializers.SerializerMethodField()
+    repair_availability = serializers.SerializerMethodField()
     
     class Meta:
         model = WebUITestCaseExecutionDetail
@@ -785,7 +786,7 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
             'id', 'execution', 'project_id', 'test_case', 'test_case_title', 'test_case_description',
             'status', 'exec_type', 'executor_name', 'name', 'description', 'report_url', 'browser',
             'start_time', 'end_time', 'duration',
-            'error_message', 'log', 'screenshot_path', 'video_path'
+            'error_message', 'log', 'screenshot_path', 'video_path', 'repair_availability'
         ]
         read_only_fields = ['id', 'execution']
     
@@ -795,18 +796,23 @@ class WebUITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
     def get_report_url(self, obj):
         return f'/reports/web/{obj.execution.project_id}/{obj.execution_id}'
 
+    def get_repair_availability(self, obj):
+        from .repair_availability import execution_repair_availability
+        return execution_repair_availability(obj)
+
 
 class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
     """套件用例执行明细序列化器"""
     test_case_title = serializers.CharField(source='name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    repair_availability = serializers.SerializerMethodField()
     
     class Meta:
         model = WebUITestSuiteCaseExecution
         fields = [
             'id', 'suite_execution', 'test_case', 'test_case_title',
             'name', 'description', 'module_name', 'execution_order', 'status', 'status_display', 'duration',
-            'error_message', 'log', 'screenshot_path', 'video_path', 'stdout'
+            'error_message', 'log', 'screenshot_path', 'video_path', 'stdout', 'repair_availability'
         ]
         read_only_fields = ['id', 'suite_execution']
 
@@ -814,3 +820,7 @@ class WebUITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):
 
     def get_screenshot_path(self, obj):
         return safe_screenshot_relative_path(obj.screenshot_path)
+
+    def get_repair_availability(self, obj):
+        from .repair_availability import execution_repair_availability
+        return execution_repair_availability(obj, suite_case=True)

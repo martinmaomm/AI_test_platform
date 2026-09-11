@@ -569,6 +569,16 @@ def verify_ui(origin, fixture, output):
             page.get_by_role("button", name="AI 修复", exact=True).click()
             panel = page.get_by_label("AI 脚本助手", exact=True)
             expect(panel).to_be_visible()
+            expect(
+                panel.get_by_role("heading", name="执行失败 AI 修复", exact=True)
+            ).to_be_visible()
+            for label in ("最近会话", "新建会话"):
+                expect(
+                    panel.get_by_role("button", name=label, exact=True)
+                ).to_have_count(0)
+            expect(
+                panel.get_by_role("button", name="刷新修复状态", exact=True)
+            ).to_have_count(1)
             panel.get_by_role("button", name="确认并开始 AI 修复", exact=True).click()
             page.get_by_role("button", name="确认执行", exact=True).click()
             expect(panel.get_by_text("候选已实际验证", exact=True)).to_be_visible(
@@ -819,7 +829,7 @@ def verify_ui(origin, fixture, output):
                 full_page=True,
                 animations="disabled",
             )
-            panel.get_by_role("button", name="最近会话", exact=True).click()
+            panel.get_by_role("button", name="刷新修复状态", exact=True).click()
             expect(
                 panel.get_by_role("button", name="采用并保存", exact=True)
             ).to_be_disabled()

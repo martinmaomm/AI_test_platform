@@ -40,7 +40,7 @@ async function createWorkspaceHarness(initialDraft = draft()) {
   }
 
   const vueModule = dataModule(`
-    export { computed, reactive, watch } from ${JSON.stringify(import.meta.resolve('vue'))}
+    export { computed, nextTick, reactive, ref, watch } from ${JSON.stringify(import.meta.resolve('vue'))}
   `)
   const elementModule = dataModule(`
     export const ElMessage = { success: () => {}, warning: () => {}, error: () => {} }
@@ -53,6 +53,7 @@ async function createWorkspaceHarness(initialDraft = draft()) {
   const moduleSource = `
     const token = ${JSON.stringify(token)}
     const emitted = globalThis[token].emitted
+    const defineExpose = () => {}
     const defineProps = () => globalThis[token].props
     const defineEmits = () => (...value) => emitted.push(value)
     ${script}

@@ -55,20 +55,24 @@
       <el-button :loading="draftSaving" :disabled="busy || !canSaveDraft" @click="emit('save-draft')">保存草稿</el-button>
       <el-button type="warning" :loading="debugging" :disabled="busy || !canDebug" @click="requestDebug">真实调试</el-button>
       <el-button v-if="canRepair" type="danger" plain :loading="repairing" :disabled="busy" @click="requestRepair">AI 分析并修复</el-button>
+      <el-button v-if="hasRepairContent" type="primary" plain @click="revealRepair">查看草稿 AI 修复</el-button>
     </div>
+
+    <el-alert v-if="repairNotice" class="repair-notice" :type="repairNotice.type" :closable="false" show-icon :title="repairNotice.title" />
+    <div ref="repairAnchor" class="repair-slot"><slot name="repair" /></div>
 
     <el-alert v-if="verification.message || verification.error_message" class="verification-message" type="warning" :closable="false" show-icon :title="verification.message || verification.error_message" />
 
     <section v-if="debugExecution || debugExecutionLoading" class="workspace-section execution-section">
       <div class="section-heading"><div><h5>调试详情</h5><p>正常结束和执行异常都会尝试截图，可在下方放大查看；失败原因和原始日志按实际结果展示。</p></div></div>
       <el-skeleton v-if="debugExecutionLoading && !debugExecution" :rows="5" animated />
-      <WebUITestCaseExecutionDetail v-else-if="debugExecution" :execution="debugExecution" />
+      <WebUITestCaseExecutionDetail v-else-if="debugExecution" :execution="debugExecution" hide-ai-repair />
     </section>
   </div>
 </template>
 
 <script setup>
-import { computed, reactive, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MonacoEditor from '@/components/MonacoEditor.vue'
 import WebUITestCaseExecutionDetail from '@/components/WebUITestCaseExecutionDetail.vue'
@@ -84,6 +88,16 @@ const form = reactive({ script_draft: '', variables: [] })
 const runtimeOverrides = reactive({})
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
 const verification = computed(() => workspace.value.verification || {})
+const repair = computed(() => workspace.value.repair || {})
+const repairStatus = computed(() => repair.value.status || '')
+const hasRepairContent = computed(() => repairStatus.value && repairStatus.value !== 'idle')
+const repairNotice = computed(() => {
+  if (!hasRepairContent.value) return null
+  if (repairStatus.value === 'candidate_ready') return { type: 'warning', title: '草稿 AI 修复已有候选待审核；请查看候选差异和静态/执行结果后再决定是否采用。' }
+  if (repairStatus.value === 'candidate_passed') return { type: 'success', title: '草稿 AI 修复候选已通过实际验证；仍需审核差异后再采用。' }
+  if (repairStatus.value === 'failed') return { type: 'error', title: '草稿 AI 修复未完成；可查看历史轮次和具体原因。' }
+  return { type: 'info', title: '草稿 AI 修复正在处理；可在下方查看当前进度。' }
+})
 const draftDirty = computed(() => Boolean(props.draft?.dirty))
 const hasQualityReport = computed(() => Boolean(props.generation?.quality_report && Object.keys(props.generation.quality_report).length))
 const staticBlockers = computed(() => draftDirty.value ? [] : staticReportBlockers(props.generation?.quality_report))
@@ -110,6 +124,22 @@ const canRepair = computed(() => {
     && !draftDirty.value
     && !props.busy
 })
+const repairAnchor = ref(null)
+const repairStateKey = computed(() => `${repairStatus.value}:${repair.value.candidate_hash || ''}`)
+let lastRepairStateKey = ''
+let repairRevealRequested = false
+const revealRepair = async () => {
+  await nextTick()
+  repairAnchor.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+}
+defineExpose({ revealRepair })
+watch(repairStateKey, (stateKey) => {
+  if (!stateKey || stateKey === lastRepairStateKey) return
+  lastRepairStateKey = stateKey
+  if (!repairRevealRequested) return
+  repairRevealRequested = false
+  void revealRepair()
+}, { flush: 'post' })
 let lastSyncedGenerationId = null
 
 const copyVariables = (variables) => (variables || []).map(item => ({
@@ -181,6 +211,7 @@ const requestRepair = async () => {
   if (!canRepair.value) return
   try {
     await ElMessageBox.confirm('AI 会读取本次失败证据，必要时访问目标网站，并实际运行候选脚本验证。单次请求最多尝试 2 轮。覆盖值不会作为变量配置写入工作区，但会发送给当前模型服务商、MCP 和目标网站，开发日志或截图也可能出现，只能使用测试账号。是否确认继续？', '确认 AI 分析并修复', { type: 'warning', confirmButtonText: '确认并开始', cancelButtonText: '取消' })
+    repairRevealRequested = true
     emit('repair', executionVariables())
     replaceRuntimeOverrides()
   } catch (error) {

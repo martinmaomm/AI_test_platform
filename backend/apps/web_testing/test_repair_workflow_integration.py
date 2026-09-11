@@ -73,3 +73,7 @@ class WorkflowAcceptance(TestCase):
         self.assertEqual(runs, 0, (result, repair))
         self.assertEqual(repair['status'], 'candidate_ready', (result, repair))
         self.assertTrue(repair['candidate_quality_report']['blockers'])
+        for attempt in repair['attempts']:
+            self.assertEqual(attempt['execution_status'], 'not_run')
+            self.assertIsNone(attempt['execution_id'])
+        self.assertIn('ASSERTION_REGRESSION', [item['code'] for item in repair['attempts'][0]['blockers']])

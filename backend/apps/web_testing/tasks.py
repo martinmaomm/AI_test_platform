@@ -7,6 +7,7 @@ import os
 import shutil
 import traceback
 import uuid
+from copy import deepcopy
 from difflib import unified_diff
 from typing import Any, Dict
 
@@ -643,7 +644,8 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
                 attempts.append({'round': round_number, 'candidate_hash': script_hash(candidate), 'mcp_checked': use_mcp,
                                  'static_status': quality.get('status'), 'execution_id': None,
                                  'execution_status': 'not_run', 'summary': agent_error_message or '修复智能体异常，候选未执行。',
-                                 'has_screenshot': False, 'runtime_assertion_count': 0})
+                                 'has_screenshot': False, 'runtime_assertion_count': 0,
+                                 'blockers': deepcopy(quality.get('blockers') or [])})
                 if not update_repair_state(
                     generation_id, locked_revision=locked_revision, locked_hash=locked_hash, attempts=attempts,
                     candidate_script=candidate, candidate_diff=diff, candidate_quality_report=quality,
@@ -676,6 +678,7 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
             latest = (candidate, diff, quality)
             if quality.get('blockers') or quality.get('status') == 'needs_review':
                 attempt['summary'] = '候选未通过静态检查，未执行浏览器验证。'
+                attempt['blockers'] = deepcopy(quality.get('blockers') or [])
                 attempts.append(attempt)
                 attempt_script, attempt_snapshot = candidate, candidate_snapshot
                 continue

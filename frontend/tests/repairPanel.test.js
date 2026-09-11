@@ -29,6 +29,9 @@ async function createRepairHarness(repair) {
       attemptLabel: value => executionStatusLabel(attemptExecutionStatus(value)),
       attemptType: value => attemptTagType(attemptExecutionStatus(value)),
       attemptFailure,
+      attemptBlockers,
+      isStaticFailure,
+      finalCandidateBlockers: () => finalCandidateBlockers.value,
       hasExecutionId,
       isSelectedAttempt,
       selectedExecutionTitle: () => selectedExecutionTitle.value,
@@ -52,15 +55,66 @@ test('RepairPanel maps backend repair fields to Chinese using execution_status o
   assert.equal(hooks.attemptStatus({ execution_status: 'passed' }), 'passed')
   assert.equal(hooks.attemptLabel({ execution_status: 'passed' }), '执行通过')
   assert.equal(hooks.attemptStatus({ execution_status: 'not_run' }), 'not_run')
-  assert.equal(hooks.attemptLabel({ execution_status: 'not_run' }), '未执行浏览器验证')
+  assert.equal(hooks.attemptLabel({ execution_status: 'not_run' }), '未进入浏览器验证')
   assert.equal(hooks.attemptType({ execution_status: 'not_run' }), 'warning')
   assert.equal(hooks.attemptFailure({ summary: '候选登录断言失败' }), '候选登录断言失败')
   assert.equal(hooks.blockerText({ message: '目标站点暂不可访问' }), '目标站点暂不可访问')
+  assert.equal(hooks.blockerText({ code: 'ASSERTION_REGRESSION', message: '候选减少已确认断言', line: 18 }), '[ASSERTION_REGRESSION] 候选减少已确认断言（第 18 行）')
   assert.equal(hooks.blockerText('账号无权限'), '账号无权限')
 
   hooks.setRepair({ phase: 'validating' })
   await nextTick()
   assert.equal(hooks.phaseLabel(), '验证候选脚本')
+})
+
+test('RepairPanel displays per-round blockers and the final quality blockers for old candidate_ready records', async () => {
+  const staticBlocker = { code: 'ASSERTION_REGRESSION', message: '候选断言保护检查未通过', line: 12 }
+  const hooks = await createRepairHarness({
+    status: 'candidate_ready',
+    attempts: [
+      { execution_status: 'not_run', execution_id: null, blockers: [staticBlocker] },
+      { execution_status: 'not_run', execution_id: null }
+    ],
+    candidate_quality_report: { blockers: [staticBlocker] }
+  })
+
+  assert.equal(hooks.isStaticFailure({ execution_status: 'not_run', execution_id: null, static_status: 'needs_review' }), true)
+  assert.equal(hooks.isStaticFailure({ execution_status: 'not_run', execution_id: null, blockers: [staticBlocker] }), true)
+  assert.equal(hooks.isStaticFailure({ execution_status: 'not_run', execution_id: null }), false)
+  assert.equal(hooks.isStaticFailure({ execution_status: 'failed', execution_id: 41 }), false)
+  assert.deepEqual(hooks.attemptBlockers({ blockers: [staticBlocker] }), [staticBlocker])
+  assert.deepEqual(hooks.attemptBlockers({}), [])
+  assert.deepEqual(hooks.finalCandidateBlockers(), [staticBlocker])
+})
+
+test('RepairPanel does not mislabel a model-error not_run attempt as a static rejection', async () => {
+  const hooks = await createRepairHarness({ phase: 'completed' })
+  const modelErrorAttempt = {
+    execution_status: 'not_run', execution_id: null, static_status: 'error',
+    summary: '修复智能体未生成有变化的候选。'
+  }
+
+  assert.equal(hooks.attemptLabel(modelErrorAttempt), '未进入浏览器验证')
+  assert.equal(hooks.attemptFailure(modelErrorAttempt), '修复智能体未生成有变化的候选。')
+  assert.equal(hooks.isStaticFailure(modelErrorAttempt), false)
+})
+
+test('repair UI keeps AI repair hidden inside embedded execution details and mounts in the workspace action slot', async () => {
+  const [workspace, resultPanel, repairPanel] = await Promise.all([
+    readFile(new URL('../src/components/webui-generation/GenerationWorkspace.vue', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/webui-generation/RepairPanel.vue', import.meta.url), 'utf8')
+  ])
+  assert.match(workspace, /<slot name="repair" \/>/)
+  assert.match(workspace, /defineExpose\(\{ revealRepair \}\)/)
+  assert.match(workspace, /<WebUITestCaseExecutionDetail[^>]*hide-ai-repair/)
+  assert.match(resultPanel, /<template #repair><RepairPanel/)
+  assert.match(resultPanel, /草稿 AI 修复：\{\{ repairEntry\.label \}\}/)
+  assert.match(resultPanel, /@click="openRepair"/)
+  assert.match(resultPanel, /workspaceRef\.value\?\.revealRepair\?\.\(\)/)
+  assert.match(repairPanel, /<h5>草稿 AI 修复<\/h5>/)
+  assert.match(repairPanel, /<WebUITestCaseExecutionDetail[^>]*hide-ai-repair/)
+  assert.match(repairPanel, /candidate_quality_report\?\.blockers/)
 })
 
 test('RepairPanel only emits apply after a complete candidate is present and confirmed', async () => {

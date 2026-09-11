@@ -44,6 +44,7 @@
             <div class="case-title"><span>{{ caseItem.test_case_title || caseItem.name || '未命名用例' }}</span><el-tag :type="statusType(caseItem.status)" size="small">{{ caseItem.status_display || statusText(caseItem.status) }}</el-tag><small>{{ formatDuration(caseItem.duration) }}</small><el-button v-if="canRepairCase(caseItem)" size="small" type="danger" plain @click.stop="toggleRepairCase(caseItem)">AI 修复</el-button></div>
           </template>
           <pre v-if="caseItem.error_message" class="case-error">{{ caseItem.error_message }}</pre>
+          <el-alert v-if="['failed', 'error'].includes(caseItem.status) && caseItem.repair_availability?.available === false" :title="caseItem.repair_availability.reason" type="info" :closable="false" show-icon />
           <WebUIScriptAssistantPanel
             v-if="selectedRepairCaseId === String(caseItem.id) && canRepairCase(caseItem)"
             :ref="element => setRepairPanelRef(caseItem.id, element)"
@@ -85,7 +86,7 @@ let requestVersion = 0
 
 const filteredCases = computed(() => onlyFailures.value ? caseExecutions.value.filter(item => ['failed', 'error'].includes(item.status)) : caseExecutions.value)
 const actualUrl = computed(() => props.execution?.diagnostics?.actual_url || props.execution?.actual_url || '')
-const canRepairCase = item => ['failed', 'error'].includes(item?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id) && item?.id)
+const canRepairCase = item => item?.repair_availability?.available === true && ['failed', 'error'].includes(item?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id) && item?.id)
 const setRepairPanelRef = (id, element) => {
   const key = String(id)
   if (element) repairPanelRefs.set(key, element)

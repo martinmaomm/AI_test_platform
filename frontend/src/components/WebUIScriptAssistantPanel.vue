@@ -2,39 +2,40 @@
   <section class="assistant-panel" aria-label="AI 脚本助手">
     <header class="assistant-heading">
       <div>
-        <h4>AI 脚本助手</h4>
+        <h4>{{ isRepair ? '执行失败 AI 修复' : 'AI 脚本助手' }}</h4>
         <p>{{ isEdit ? '对话只生成候选，不会调用浏览器或保存用例。' : '修复和验证会实际运行测试网站；仅使用测试账号和测试数据。' }}</p>
       </div>
       <div class="assistant-heading-actions">
-        <el-button v-if="isRepair" size="small" :loading="loading" @click="() => loadRecent()">最近会话</el-button>
-        <el-button size="small" :disabled="isEdit ? (loading || refreshRequired || active || acting) : (active || acting)" @click="newConversation">新建会话</el-button>
-        <el-button v-if="assistant && active" size="small" type="danger" plain :loading="acting" @click="requestCancel">取消任务</el-button>
+        <el-button v-if="isRepair" size="small" :loading="loading" :disabled="loading || acting" @click="refreshRepairStatus">刷新修复状态</el-button>
+        <el-button v-if="isEdit" size="small" :disabled="loading || refreshRequired || active || acting" @click="newConversation">新建会话</el-button>
+        <el-button v-if="isRepair" size="small" :disabled="loading || refreshRequired || active || acting" @click="startRepairAnalysis">重新分析本次失败</el-button>
+        <el-button v-if="assistant && active" size="small" type="danger" plain :loading="acting" :disabled="loading || acting" @click="requestCancel">取消任务</el-button>
       </div>
     </header>
 
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon />
-    <div v-if="isEdit && refreshRequired" class="refresh-state"><el-button size="small" type="primary" plain :loading="loading" :disabled="acting" @click="() => loadRecent()">重新获取状态</el-button></div>
+    <div v-if="isEdit && refreshRequired" class="refresh-state"><el-button size="small" type="primary" plain :loading="loading" :disabled="loading || acting" @click="refreshAssistantState">重新获取状态</el-button></div>
     <el-alert v-if="isEdit && !editContext?.testCaseId" title="新建用例需先保存，才能使用 AI 对话编辑。" type="info" :closable="false" show-icon />
     <el-alert v-if="isRepair" title="确认后，模型、MCP（如需要）和测试网站会接收必要上下文；执行日志或截图可能包含测试信息。已发生的网站操作不会因取消而回滚。" type="warning" :closable="false" show-icon />
 
     <div class="assistant-config">
-      <el-select v-model="modelConfigId" :loading="loadingModels" :disabled="acting" :placeholder="isEdit ? '选择下次发送使用的模型' : '选择模型和提供商'" @change="markModelSelectionTouched">
+      <el-select v-model="modelConfigId" :loading="loadingModels" :disabled="acting || (isRepair && (loading || refreshRequired))" :placeholder="isEdit ? '选择下次发送使用的模型' : '选择模型和提供商'" @change="markModelSelectionTouched">
         <el-option v-for="model in modelConfigs" :key="model.id" :label="assistantModelLabel(model)" :value="model.id" />
       </el-select>
-      <el-tag v-if="assistant?.model_info" effect="plain">{{ isEdit ? '本轮/上次模型：' : '当前会话：' }}{{ assistantModelLabel(assistant.model_info) }}</el-tag>
-      <el-select v-if="isRepair && assistants.length" v-model="selectedAssistantId" :disabled="acting" placeholder="最近会话">
-        <el-option v-for="item in assistants" :key="item.id" :label="recentLabel(item)" :value="item.id" />
+      <el-tag v-if="assistant?.model_info" effect="plain">{{ isEdit ? '本轮/上次模型：' : '本条修复记录：' }}{{ assistantModelLabel(assistant.model_info) }}</el-tag>
+      <el-select v-if="isRepair && assistants.length" v-model="selectedAssistantId" :disabled="loading || acting" placeholder="修复记录">
+        <el-option v-for="item in assistants" :key="item.id" :label="repairRecordLabel(item)" :value="item.id" />
       </el-select>
     </div>
     <p v-if="isEdit" class="model-switch-hint">模型切换从下一次发送生效。</p>
 
-    <template v-if="isRepair && !assistant">
+    <template v-if="isRepair && readyToStartRepair">
       <div class="runtime-heading"><strong>本次运行变量</strong><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div>
       <div v-for="(item, index) in runtimeVariables" :key="index" class="runtime-row">
         <el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="本次值" /><el-button text type="danger" @click="runtimeVariables.splice(index, 1)">删除</el-button>
       </div>
       <el-form-item label="运行超时（秒）"><el-input-number v-model="runtimeTimeout" :min="30" :max="1800" /></el-form-item>
-      <el-button type="danger" :disabled="!modelConfigId || acting" :loading="acting" @click="requestRepair">确认并开始 AI 修复</el-button>
+      <el-button type="danger" :disabled="!modelConfigId || loading || refreshRequired || acting" :loading="acting" @click="requestRepair">确认并开始 AI 修复</el-button>
     </template>
 
     <template v-if="isEdit && !assistant">
@@ -52,7 +53,7 @@
     <template v-if="assistant">
       <div v-if="showSessionStatus" class="session-status">
         <el-tag :type="statusTagType(assistant.status)" effect="plain">{{ statusLabel(assistant.status) }}</el-tag>
-        <span>{{ assistant.message || '会话状态已恢复。' }}</span>
+        <span>{{ assistant.message || (isRepair ? '修复状态已恢复。' : '会话状态已恢复。') }}</span>
         <el-tag :type="verificationTagType(assistant.verification, assistant.status)" effect="plain">{{ verificationLabel(assistant.verification, assistant.status) }}</el-tag>
       </div>
 
@@ -68,15 +69,15 @@
         <div class="candidate-actions">
           <el-button v-if="isEdit" type="primary" :disabled="!canContinue || acting" @click="applyToEditor">采用到编辑器</el-button>
           <el-button v-if="isEdit" type="warning" plain :disabled="!canVerify || acting" @click="requestVerify">调试验证</el-button>
-          <el-button v-if="isRepair" type="warning" plain :disabled="!canVerify || acting" :loading="acting" @click="requestVerify">运行验证</el-button>
-          <el-button v-if="isRepair" :type="requiresManualReview ? 'warning' : 'primary'" :disabled="!canApplyRepair || acting" :loading="acting" @click="requestApply">{{ requiresManualReview ? '人工确认并保存' : '采用并保存' }}</el-button>
+          <el-button v-if="isRepair" type="warning" plain :disabled="!canVerify || loading || refreshRequired || acting" :loading="acting" @click="requestVerify">运行验证</el-button>
+          <el-button v-if="isRepair" :type="requiresManualReview ? 'warning' : 'primary'" :disabled="!canApplyRepair || loading || refreshRequired || acting" :loading="acting" @click="requestApply">{{ requiresManualReview ? '人工确认并保存' : '采用并保存' }}</el-button>
         </div>
       </section>
 
       <section v-if="(isEdit || isRepair) && hasCandidate && canVerify" class="verification-options">
         <div class="runtime-heading"><strong>{{ isRepair ? '运行验证的本次变量' : '调试验证的本次变量' }}</strong><el-button text type="primary" @click="addRuntimeVariable">添加</el-button></div>
         <div v-for="(item, index) in runtimeVariables" :key="index" class="runtime-row"><el-input v-model="item.name" placeholder="变量名" /><el-input v-model="item.value" :type="item.is_secret ? 'password' : 'text'" show-password placeholder="本次值" /><el-button text type="danger" @click="runtimeVariables.splice(index, 1)">删除</el-button></div>
-        <el-form-item label="调试超时（秒）"><el-input-number v-model="runtimeTimeout" :min="30" :max="1800" /></el-form-item>
+        <el-form-item :label="isRepair ? '运行超时（秒）' : '调试超时（秒）'"><el-input-number v-model="runtimeTimeout" :min="30" :max="1800" /></el-form-item>
       </section>
 
       <section v-if="executionEntries.length" class="attempt-section">
@@ -149,6 +150,7 @@ const selectedAssistantId = computed({ get: () => assistant.value?.id || null, s
   if (selected?.id) loadAssistant(selected.id, { quiet: true })
 } })
 const hasCandidate = computed(() => Boolean(assistant.value?.candidate_hash && assistant.value?.candidate_script))
+const readyToStartRepair = computed(() => !assistant.value && !loading.value && !refreshRequired.value && !acting.value)
 const executionEntries = computed(() => assistantExecutionEntries(assistant.value))
 const showSessionStatus = computed(() => !isEdit.value || assistant.value?.status !== 'idle')
 const canContinue = computed(() => canContinueCandidate(assistant.value))
@@ -226,7 +228,7 @@ onBeforeUnmount(clearAttempt)
 const statusLabel = status => ({ idle: '等待操作', queued: '已排队', running: '处理中', candidate_ready: '候选待审核', candidate_passed: '候选已实际验证', failed: '处理失败', cancelled: '已取消', applied: '已采用' })[status] || '状态未知'
 const statusTagType = status => ({ queued: 'warning', running: 'warning', candidate_ready: 'warning', candidate_passed: 'success', failed: 'danger', cancelled: 'info', applied: 'success' })[status] || 'info'
 const attemptStatusLabel = assistantAttemptStatusLabel
-const recentLabel = item => `${item.mode === 'repair' ? '修复' : '编辑'} · ${statusLabel(item.status)} · ${new Date(item.updated_at || item.created_at || Date.now()).toLocaleString()}`
+const repairRecordLabel = item => `修复 · ${statusLabel(item.status)} · ${new Date(item.updated_at || item.created_at || Date.now()).toLocaleString()}`
 const clearConversationView = () => {
   messageText.value = ''
   candidateView.value = 'diff'
@@ -234,11 +236,6 @@ const clearConversationView = () => {
   clearAttempt()
 }
 const newConversation = async () => {
-  if (isRepair.value) {
-    selectAssistant(null)
-    clearConversationView()
-    return
-  }
   if (loading.value || refreshRequired.value || active.value || acting.value) return
   if (!assistant.value) {
     if (clearEditConversation()) clearConversationView()
@@ -257,6 +254,32 @@ const newConversation = async () => {
     ElMessage.success('已新建当前对话；编辑器内容保持不变。')
   } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '新建 AI 会话失败') }
 }
+const refreshAssistantState = () => {
+  if (loading.value || acting.value) return
+  return loadRecent()
+}
+const refreshRepairStatus = () => {
+  if (!isRepair.value || loading.value || acting.value) return
+  return loadRecent()
+}
+const startRepairAnalysis = async () => {
+  if (!isRepair.value || loading.value || refreshRequired.value || active.value || acting.value) return
+  const current = assistant.value
+  const hasPendingCandidate = Boolean(current?.candidate_hash && current?.candidate_script && current?.status !== 'applied')
+  if (hasPendingCandidate) {
+    const frozen = { projectId: props.projectId, id: current.id, revision: current.revision, candidateHash: current.candidate_hash }
+    try {
+      await ElMessageBox.confirm('当前候选尚未采用。重新分析会保留该修复记录和候选，不会删除历史记录；确认后请再次明确开始执行。', '保留修复记录并重新分析', { type: 'warning', confirmButtonText: '保留并重新分析', cancelButtonText: '取消' })
+    } catch { return }
+    const latest = assistant.value
+    if (props.projectId !== frozen.projectId || !latest || String(latest.id) !== String(frozen.id) || latest.revision !== frozen.revision || latest.candidate_hash !== frozen.candidateHash) {
+      ElMessage.warning('修复记录已变化，请刷新后重新确认。')
+      return
+    }
+  }
+  selectAssistant(null)
+  clearConversationView()
+}
 const addRuntimeVariable = () => runtimeVariables.value.push({ name: '', value: '', is_secret: false })
 const runtimePayload = () => {
   if (runtimeVariables.value.some(item => !item.name?.trim())) throw new Error('变量名不能为空')
@@ -271,6 +294,7 @@ const editPayload = () => ({
   message: messageText.value.trim()
 })
 const requestRepair = async () => {
+  if (loading.value || refreshRequired.value || acting.value) return
   try {
     const runtime = runtimePayload()
     await ElMessageBox.confirm('确认后将对测试网站执行修复验证，可能写入测试数据。请确认仅使用测试账号和测试数据。', '确认 AI 修复', { type: 'warning', confirmButtonText: '确认执行', cancelButtonText: '取消' })
@@ -309,7 +333,8 @@ const applyToEditor = async () => {
   ElMessage.success('候选已采用到编辑器；点击页面“保存”后才会写入用例。')
 }
 const requestVerify = async () => {
-  if (!canVerify.value) return ElMessage.warning('候选正在处理、已采用或存在安全限制，不能调试验证。')
+  if (isRepair.value && (loading.value || refreshRequired.value || acting.value)) return
+  if (!canVerify.value) return ElMessage.warning(`候选正在处理、已采用或存在安全限制，不能${isRepair.value ? '运行验证' : '调试验证'}。`)
   try {
     const runtime = runtimePayload()
     const frozen = {
@@ -332,9 +357,10 @@ const requestVerify = async () => {
     }
     clearAttempt()
     await verify({ expected_revision: frozen.revision, candidate_hash: frozen.candidateHash, confirm_execution: true, acknowledge_review: frozen.acknowledgeReview, runtime_variables: frozen.runtime, options: frozen.options })
-  } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '启动调试验证失败') }
+  } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || (isRepair.value ? '启动运行验证失败' : '启动调试验证失败')) }
 }
 const requestApply = async () => {
+  if (isRepair.value && (loading.value || refreshRequired.value || acting.value)) return
   if (!canApplyRepair.value) return ElMessage.warning('候选正在处理、已采用或不符合保存条件，不能采用并保存。')
   const frozen = {
     id: assistant.value.id,

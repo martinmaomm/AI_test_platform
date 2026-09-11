@@ -151,8 +151,8 @@ const createWorkspaceHarness = async ({
   globalThis[token] = { emitted, props }
 
   const vueModule = dataModule(`
-    import { computed as vueComputed, reactive as vueReactive, watch as vueWatch } from ${JSON.stringify(import.meta.resolve('vue'))}
-    export { vueComputed as computed, vueReactive as reactive, vueWatch as watch }
+    import { computed as vueComputed, nextTick as vueNextTick, reactive as vueReactive, ref as vueRef, watch as vueWatch } from ${JSON.stringify(import.meta.resolve('vue'))}
+    export { vueComputed as computed, vueNextTick as nextTick, vueReactive as reactive, vueRef as ref, vueWatch as watch }
   `)
   const elementModule = dataModule(`
     export const ElMessage = { success: () => {}, warning: () => {}, error: () => {} }
@@ -165,6 +165,7 @@ const createWorkspaceHarness = async ({
   const source = `
     const token = ${JSON.stringify(token)}
     const emitted = globalThis[token].emitted
+    const defineExpose = () => {}
     const defineProps = () => globalThis[token].props
     const defineEmits = () => (...value) => emitted.push(value)
     ${scriptSource}

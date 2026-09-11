@@ -200,6 +200,7 @@ def _sanitize_repair_attempts(value: Any) -> list[dict[str, Any]]:
         entry['summary'] = str(entry.get('summary') or '')[:MAX_REPAIR_SUMMARY_CHARS]
         entry['has_screenshot'] = bool(entry.get('has_screenshot'))
         entry['runtime_assertion_count'] = max(0, int(entry.get('runtime_assertion_count') or 0))
+        entry['blockers'] = _sanitize_repair_blockers(item.get('blockers'))
         cleaned.append(entry)
     return cleaned
 

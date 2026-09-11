@@ -43,6 +43,7 @@ export const useWebUIScriptAssistant = ({ projectId, context, requests = default
     stopPolling()
     assistants.value = []
     assistant.value = null
+    loading.value = false
     acting.value = false
     lastError.value = ''
     refreshRequired.value = false
@@ -75,7 +76,8 @@ export const useWebUIScriptAssistant = ({ projectId, context, requests = default
   }
   const loadRecent = async (scope = scopeVersion) => {
     const project = currentProjectId()
-    if (!project || !inScope(scope) || (currentContext().mode === 'edit' && acting.value)) return
+    if (!project || !inScope(scope) || loading.value || acting.value) return
+    stopPolling()
     const request = ++requestVersion
     loading.value = true
     try {
@@ -99,13 +101,16 @@ export const useWebUIScriptAssistant = ({ projectId, context, requests = default
         if (currentContext().mode === 'edit') {
           refreshRequired.value = true
           lastError.value = '加载 AI 会话失败，请重新获取状态。'
-        } else lastError.value = assistantErrorMessage(error, '加载最近 AI 会话失败')
+        } else {
+          refreshRequired.value = true
+          lastError.value = assistantErrorMessage(error, '加载修复记录失败，请刷新修复状态后再重新分析。')
+        }
       }
     } finally { if (inScope(scope) && request === requestVersion) loading.value = false }
   }
   const loadAssistant = async (id = assistant.value?.id, { quiet = false, scope = scopeVersion } = {}) => {
     const project = currentProjectId()
-    if (!project || !id || !inScope(scope) || (!quiet && currentContext().mode === 'edit' && acting.value)) return null
+    if (!project || !id || !inScope(scope) || (!quiet && acting.value)) return null
     const request = ++requestVersion
     if (!quiet) loading.value = true
     try {
@@ -122,9 +127,16 @@ export const useWebUIScriptAssistant = ({ projectId, context, requests = default
           if (currentContext().mode === 'edit') {
             refreshRequired.value = true
             lastError.value = '会话自动刷新失败，请重新获取状态。'
-          } else lastError.value = '会话自动刷新已暂停，请点击“最近会话”恢复。'
+          } else {
+            refreshRequired.value = true
+            lastError.value = '修复状态自动刷新失败，请点击“刷新修复状态”恢复。'
+          }
+        } else {
+          const isRepair = currentContext().mode === 'repair'
+          if (isRepair) refreshRequired.value = true
+          const fallback = isRepair ? '加载修复状态失败，请刷新修复状态后重试。' : '加载 AI 会话失败'
+          lastError.value = assistantErrorMessage(error, fallback)
         }
-        else lastError.value = assistantErrorMessage(error, '加载 AI 会话失败')
       }
       return null
     } finally { if (inScope(scope) && request === requestVersion && !quiet) loading.value = false }
@@ -146,8 +158,8 @@ export const useWebUIScriptAssistant = ({ projectId, context, requests = default
       return inScope(scope) && (!isEditRequest || request === requestVersion) ? replaceAssistant(value) : null
     } catch (error) {
       if (inScope(scope)) {
-        lastError.value = assistantErrorMessage(error, '创建 AI 会话失败')
-        if (isEditRequest && error?.response?.status === 409) refreshRequired.value = true
+        lastError.value = assistantErrorMessage(error, isEditRequest ? '创建 AI 会话失败' : '启动 AI 修复失败')
+        if (error?.response?.status === 409) refreshRequired.value = true
       }
       throw error
     } finally { if (inScope(scope)) acting.value = false }
@@ -215,7 +227,7 @@ export const useWebUIScriptAssistant = ({ projectId, context, requests = default
       throw error
     } finally { if (inScope(scope) && request === requestVersion) acting.value = false }
   }
-  const verify = payload => runAction((project, id) => requests.verify(project, id, payload), '启动调试验证失败')
+  const verify = payload => runAction((project, id) => requests.verify(project, id, payload), currentContext().mode === 'repair' ? '启动运行验证失败' : '启动调试验证失败')
   const apply = payload => runAction((project, id) => requests.apply(project, id, payload), '采用候选失败', { reload: true })
   const cancel = () => runAction((project, id) => requests.cancel(project, id, { expected_revision: assistant.value?.revision }), '取消任务失败')
 

@@ -1693,6 +1693,7 @@ class TestExecutionCasesView(APIView):
 
     @project_access_required(REPORT)
     def get(self, request, project_id, pk):
+        from .repair_availability import execution_repair_availability
         execution = get_object_or_404(
             WebUITestExecution,
             pk=pk,
@@ -1725,6 +1726,7 @@ class TestExecutionCasesView(APIView):
                 'screenshot_path': safe_screenshot_relative_path(item.screenshot_path),
                 'video_path': item.video_path,
                 'stdout': item.stdout,
+                'repair_availability': execution_repair_availability(item, suite_case=True),
             }
             for item in cases
         ]

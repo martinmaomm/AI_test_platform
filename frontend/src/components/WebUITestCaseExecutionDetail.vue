@@ -4,6 +4,7 @@
     <div class="report-content">
       <!-- 主内容区域 -->
       <div class="main-content">
+        <el-alert v-if="repairUnavailableReason" :title="repairUnavailableReason" type="info" :closable="false" show-icon />
         <section v-if="canRepair" class="assistant-entry">
           <div><strong>AI 修复失败脚本</strong><p>会从本次执行冻结快照读取脚本；确认后才可能运行测试网站。</p></div>
           <el-button type="danger" plain @click="assistantVisible = !assistantVisible">{{ assistantVisible ? '收起 AI 修复' : 'AI 修复' }}</el-button>
@@ -112,7 +113,8 @@ const props = defineProps({
 const emit = defineEmits(['close'])
 const openLogSections = ref([])
 const assistantVisible = ref(false)
-const canRepair = computed(() => !props.hideAiRepair && ['failed', 'error'].includes(props.execution?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id)))
+const canRepair = computed(() => !props.hideAiRepair && props.execution?.repair_availability?.available === true && ['failed', 'error'].includes(props.execution?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id)))
+const repairUnavailableReason = computed(() => !props.hideAiRepair && ['failed', 'error'].includes(props.execution?.status) && props.execution?.repair_availability?.available === false ? props.execution.repair_availability.reason : '')
 watch(() => props.execution?.execution || props.execution?.id, () => { assistantVisible.value = false })
 
 const technicalLog = computed(() => {

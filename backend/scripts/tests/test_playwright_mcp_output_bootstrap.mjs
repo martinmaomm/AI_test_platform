@@ -16,6 +16,7 @@ import {
 
 const bootstrapPath = fileURLToPath(new URL('../playwright_mcp_output_bootstrap.mjs', import.meta.url));
 const diagnosticsPath = fileURLToPath(new URL('../playwright_mcp_diagnostics.mjs', import.meta.url));
+const observationPath = fileURLToPath(new URL('../playwright_mcp_observation.mjs', import.meta.url));
 const packageSpec = '@executeautomation/playwright-mcp-server@1.0.12';
 
 test('resolves npm exec package, preserves HOME, forces safe task-local outputs', async () => {
@@ -70,6 +71,7 @@ test('bootstrap keeps stdio stdout clean and accepts a custom working directory'
     const copiedBootstrapPath = path.join(tempRoot, 'bootstrap with spaces.mjs');
     fs.copyFileSync(bootstrapPath, copiedBootstrapPath);
     fs.copyFileSync(diagnosticsPath, path.join(tempRoot, 'playwright_mcp_diagnostics.mjs'));
+    fs.copyFileSync(observationPath, path.join(tempRoot, 'playwright_mcp_observation.mjs'));
     const result = spawnSync('npx', [
       '--offline', '--yes', '--package', packageSpec, '--', 'node', copiedBootstrapPath, '--help',
     ], {

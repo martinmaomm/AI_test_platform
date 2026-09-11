@@ -2,15 +2,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { MAX_OBSERVATION_JSON_CHARS, OBSERVATION_VERSION, collectPageObservation, renderPageObservation } from './playwright_mcp_observation.mjs';
 
 export const PAGE_DIAGNOSTICS_ENV = 'MCP_PAGE_DIAGNOSTICS';
 export const PAGE_DIAGNOSTICS_PROTOCOL_PREFIX = 'PLATFORM_BROWSER_DIAGNOSTICS_V1:';
+export { MAX_OBSERVATION_JSON_CHARS, OBSERVATION_VERSION, collectPageObservation, renderPageObservation };
 
 const DIAGNOSTIC_TIMEOUT_MS = 1000;
 const FAILURE_SCREENSHOT_TIMEOUT_MS = 3000;
 const MAX_TEXT_LENGTH = 300;
 const MAX_SELECTOR_LENGTH = 1000;
 const PATCHED_TOOL = Symbol.for('automation.playwrightMcpDiagnostics.toolPatched');
+const PATCHED_PAGE_READER = Symbol.for('automation.playwrightMcpDiagnostics.pageReaderPatched');
 
 function boundedText(value, limit = MAX_TEXT_LENGTH) {
   if (typeof value !== 'string') return '';
@@ -311,6 +314,102 @@ function thrownErrorResponse(error) {
   };
 }
 
+function observationScope(args) {
+  return typeof args?.selector === 'string' && args.selector.trim()
+    ? boundedText(args.selector, MAX_SELECTOR_LENGTH)
+    : 'page';
+}
+
+function unavailableObservation(scope, note) {
+  return {
+    version: OBSERVATION_VERSION,
+    page_url: '',
+    page_title: '',
+    scope,
+    fingerprint: crypto.createHash('sha256')
+      .update('PLATFORM_BROWSER_DIAGNOSTICS_V1:observation_unavailable')
+      .digest('hex'),
+    settled: false,
+    truncated: false,
+    notes: [note],
+    elements: [],
+    text: [],
+  };
+}
+
+function observationFailureText(error, observation) {
+  const descriptions = {
+    page_unavailable: '页面不可用或已关闭',
+    scope_not_visible: '指定范围当前不可见',
+    scope_ambiguous: '指定范围匹配多个元素',
+    scope_invalid_selector: '指定范围选择器无效',
+    scope_not_found_or_not_visible: '指定范围不存在或未能确认其可见性',
+    observation_unavailable: '浏览器未能建立页面观察证据',
+  };
+  return '页面观察失败：' + (descriptions[error] || descriptions.observation_unavailable)
+    + '；没有以隐藏内容或未过滤 HTML 代替观察。范围：' + observation.scope;
+}
+
+export function replaceVisiblePageReaderTool(Tool, { screenshotDir } = {}) {
+  if (!Tool?.prototype?.execute || Tool.prototype.execute[PATCHED_PAGE_READER]) return false;
+
+  async function executeWithBrowserObservation(args, context) {
+    const scope = observationScope(args);
+    const browserDisconnected = context?.browser
+      && typeof context.browser.isConnected === 'function'
+      && !context.browser.isConnected();
+    const collected = browserDisconnected
+      ? {
+        ok: false,
+        error: 'page_unavailable',
+        observation: unavailableObservation(scope, 'browser_disconnected'),
+      }
+      : await collectPageObservation(context?.page, {
+        selector: args?.selector,
+      });
+    const metadata = emptyMetadata(args, 'selector');
+    metadata.page_url = collected.observation.page_url;
+    metadata.page_title = collected.observation.page_title;
+    metadata.observation = collected.observation;
+    metadata.tool_failed = !collected.ok;
+    metadata.reason_code = collected.ok ? 'observation_completed' : collected.error;
+    if (!collected.ok) {
+      const failureReason = metadata.reason_code;
+      const pageBudget = diagnosticBudget();
+      try {
+        await readPageContext(context?.page, metadata, pageBudget);
+      } catch {
+        // The explicit observation failure remains authoritative if enrichment fails.
+      }
+      metadata.diagnostic_reads += pageBudget.reads;
+      metadata.reason_code = failureReason;
+      try {
+        await captureFailureScreenshot(context?.page, screenshotDir, metadata);
+      } catch {
+        metadata.screenshot_status = 'unavailable';
+        metadata.screenshot_message = '失败现场截图不可用：DiagnosticsError';
+      }
+    }
+    const result = collected.ok
+      ? {
+        content: [{
+          type: 'text',
+          text: renderPageObservation(collected.observation, { maxLength: args?.maxLength }),
+        }],
+        isError: false,
+      }
+      : {
+        content: [{ type: 'text', text: observationFailureText(collected.error, collected.observation) }],
+        isError: true,
+      };
+    return appendDiagnostics(result, metadata);
+  }
+
+  Object.defineProperty(executeWithBrowserObservation, PATCHED_PAGE_READER, { value: true });
+  Tool.prototype.execute = executeWithBrowserObservation;
+  return true;
+}
+
 export function wrapToolForPageDiagnostics(Tool, spec, { screenshotDir }) {
   if (!Tool?.prototype?.execute || Tool.prototype.execute[PATCHED_TOOL]) return false;
   const originalExecute = Tool.prototype.execute;
@@ -412,11 +511,11 @@ export async function installPlaywrightMcpPageDiagnostics(packageRoot, {
     [interaction.EvaluateTool, {}],
     [interaction.DragTool, { selectorKey: 'sourceSelector' }],
     [interaction.PressKeyTool, { selectorKey: 'selector' }],
-    [visiblePage.VisibleTextTool, {}],
-    [visiblePage.VisibleHtmlTool, {}],
   ];
   for (const [Tool, spec] of mappings) {
     wrapToolForPageDiagnostics(Tool, spec, { screenshotDir: resolvedScreenshotDir });
   }
+  replaceVisiblePageReaderTool(visiblePage.VisibleTextTool, { screenshotDir: resolvedScreenshotDir });
+  replaceVisiblePageReaderTool(visiblePage.VisibleHtmlTool, { screenshotDir: resolvedScreenshotDir });
   return { screenshotDir: resolvedScreenshotDir };
 }

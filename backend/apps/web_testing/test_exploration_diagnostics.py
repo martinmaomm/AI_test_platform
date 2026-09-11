@@ -14,7 +14,10 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from ai_core.mcp_exploration_runtime import project_messages
 from projects.models import Project, ProjectMember
-from .exploration_diagnostics import extract_page_context, failure_context
+from .exploration_diagnostics import (
+    MAX_OBSERVATION_JSON_CHARS, extract_page_context, failure_context,
+    render_observation, render_observation_unavailable,
+)
 from .exploration_trace import ExplorationTraceRecorder, _tool_failed
 from .models import WebUIScriptGeneration
 from .script_exploration_agent import ScriptExplorationAgent
@@ -34,6 +37,20 @@ def trailer(**overrides):
     data.update(overrides)
     encoded = base64.urlsafe_b64encode(json.dumps(data, ensure_ascii=False).encode()).decode().rstrip('=')
     return 'PLATFORM_BROWSER_DIAGNOSTICS_V1:' + encoded
+
+
+def browser_observation(fingerprint='a' * 64, *, scope='page', text=None, elements=None):
+    return {
+        'version': 1, 'page_url': 'https://fixture.example.test/#/catalog',
+        'page_title': 'Catalog', 'scope': scope, 'fingerprint': fingerprint,
+        'settled': True, 'truncated': False, 'notes': [],
+        'elements': elements if elements is not None else [{
+            'tag': 'input', 'role': 'textbox', 'name': 'Display name', 'id': 'f17',
+            'type': 'text', 'placeholder': 'Name', 'visible': True, 'enabled': True,
+            'container': 'Create entry',
+        }],
+        'text': text if text is not None else ['Create entry'],
+    }
 
 
 class ExplorationDiagnosticsTests(SimpleTestCase):
@@ -67,6 +84,86 @@ class ExplorationDiagnosticsTests(SimpleTestCase):
         state = recorder.evidence_snapshot()['page_states'][0]
         self.assertEqual(state['relative_path'], '/#/catalog')
         self.assertEqual(state['page_context']['page_title'], 'Catalog')
+
+    def test_validated_observation_is_decoded_from_textcontent_repr_and_bounds_oversize(self):
+        raw = f"[TextContent(type='text', text='{trailer(tool_failed=False, observation=browser_observation(text=['x' * 500] * 80))}') ]"
+        context, without = extract_page_context(raw)
+        observation = context['observation']
+        self.assertEqual(observation['fingerprint'], 'a' * 64)
+        self.assertTrue(observation['truncated'])
+        self.assertLessEqual(len(json.dumps(observation, ensure_ascii=False, separators=(',', ':'))), MAX_OBSERVATION_JSON_CHARS)
+        self.assertNotIn('PLATFORM_BROWSER_DIAGNOSTICS', without)
+
+    def test_invalid_observation_keeps_valid_legacy_diagnostics(self):
+        context, _ = extract_page_context(trailer(
+            tool_failed=False, observation=browser_observation(fingerprint='not-a-fingerprint'),
+        ))
+        self.assertEqual(context['page_title'], 'Catalog')
+        self.assertNotIn('observation', context)
+        self.assertEqual(context['observation_error'], 'invalid')
+        self.assertIn('不可用', render_observation_unavailable(context))
+
+    def test_projection_reserves_a_complete_truncation_marker_at_near_exact_budget(self):
+        context, _ = extract_page_context(trailer(
+            tool_failed=False, observation=browser_observation(text=['late text ' * 30]),
+        ))
+        source = json.dumps(context, ensure_ascii=False, sort_keys=True)
+        without_text = {**context, 'observation': {**context['observation'], 'text': []}}
+        budget = len(render_observation(without_text)) + 3
+        rendered = render_observation(context, limit=budget)
+        self.assertLessEqual(len(rendered), budget)
+        self.assertIn('截断', rendered)
+        self.assertNotIn('late text', rendered)
+        self.assertEqual(json.dumps(context, ensure_ascii=False, sort_keys=True), source)
+
+    def test_boolean_observation_version_is_invalid(self):
+        context, _ = extract_page_context(trailer(
+            tool_failed=False, observation={**browser_observation(), 'version': True},
+        ))
+        self.assertEqual(context['observation_error'], 'invalid')
+
+    def test_about_blank_and_consumer_truncation_are_explicit(self):
+        observation = browser_observation(
+            text=['t' * 600] * 81,
+            elements=[{
+                'tag': 'input', 'role': 'textbox', 'name': 'n' * 310, 'id': 'i',
+                'type': 'text', 'placeholder': '', 'visible': True, 'enabled': True,
+                'container': 'page',
+            }] * 49,
+        )
+        observation['page_url'] = 'about:blank'
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        normalized = context['observation']
+        self.assertEqual(normalized['page_url'], 'about:blank')
+        self.assertTrue(normalized['truncated'])
+        self.assertLessEqual(len(normalized['elements']), 48)
+        self.assertLessEqual(len(normalized['text']), 80)
+
+    def test_invalid_observation_does_not_create_a_proven_page_state(self):
+        output = 'Traceback\nError executing tool\n' + trailer(
+            tool_failed=False, observation=browser_observation(fingerprint='invalid'),
+        )
+        self.assertFalse(_tool_failed(output, tool_name='playwright_get_visible_html'))
+        recorder = ExplorationTraceRecorder('/')
+        recorder.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id='invalid-read', inputs={})
+        recorder.on_tool_end(output, run_id='invalid-read')
+        self.assertEqual(recorder.evidence_snapshot()['page_states'], [])
+
+    def test_successful_structured_read_ignores_error_like_page_copy_and_reuses_browser_state(self):
+        first = 'Traceback\nError executing tool\n' + trailer(
+            tool_failed=False, observation=browser_observation(scope='form#entry'),
+        )
+        second = '<main>Error executing tool</main>' + trailer(
+            tool_failed=False, observation=browser_observation(scope='page'),
+        )
+        self.assertFalse(_tool_failed(first, tool_name='playwright_get_visible_html'))
+        recorder = ExplorationTraceRecorder('/')
+        for index, output in enumerate((first, second), 1):
+            recorder.on_tool_start({'name': 'playwright_get_visible_html'}, '', run_id=f'read-{index}', inputs={})
+            recorder.on_tool_end(output, run_id=f'read-{index}')
+        states = recorder.evidence_snapshot()['page_states']
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0]['fingerprint'], 'a' * 16)
 
     def test_trailer_is_removed_from_model_projection_not_durable_source(self):
         text = 'Operation failed. 平台现场：输入框不可见。\n' + trailer()

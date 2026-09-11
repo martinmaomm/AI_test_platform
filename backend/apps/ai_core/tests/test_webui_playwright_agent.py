@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -30,6 +32,32 @@ from ai_core.webui_playwright_agent import (
     _get_mcp_error_message,
     _is_non_retryable_mcp_error,
 )
+
+
+def observation_wire(fingerprint='a' * 64, *, scope='page', text='page copy'):
+    payload = {
+        'page_url': 'https://fixture.example.test/#/catalog', 'tool_failed': False,
+        'observation': {
+            'version': 1, 'page_url': 'https://fixture.example.test/#/catalog',
+            'page_title': 'Catalog', 'scope': scope, 'fingerprint': fingerprint,
+            'settled': True, 'truncated': False, 'notes': [], 'elements': [], 'text': [text],
+        },
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+    return 'PLATFORM_BROWSER_DIAGNOSTICS_V1:' + encoded
+
+
+def invalid_observation_wire():
+    payload = {
+        'tool_failed': False,
+        'observation': {
+            'version': 2, 'page_url': 'https://fixture.example.test/', 'page_title': 'Catalog',
+            'scope': 'page', 'fingerprint': 'invalid', 'settled': True, 'truncated': False,
+            'notes': [], 'elements': [], 'text': [],
+        },
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+    return 'PLATFORM_BROWSER_DIAGNOSTICS_V1:' + encoded
 
 
 class WebUIPlaywrightAgentStabilityTests(unittest.TestCase):
@@ -289,6 +317,29 @@ class MCPBrowserToolGuardTests(unittest.TestCase):
     def test_interaction_limits_have_stable_public_names(self):
         self.assertEqual(MCP_INTERACTION_REPEAT_LIMIT, 2)
         self.assertEqual(MCP_INTERACTION_CORRECTION_LIMIT, 3)
+
+    def test_validated_observation_ignores_error_copy_and_uses_global_fingerprint(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        first = 'Traceback\nError executing tool\n' + observation_wire(scope='form#entry')
+        alternate_format = '<main>Error executing tool</main>\n' + observation_wire(scope='page')
+        changed = observation_wire('b' * 64, text='modal is now visible')
+        self.assertFalse(guard._is_failed_output(first))
+        for index, output in enumerate((first, alternate_format, changed), 1):
+            run_id = self._start(guard, 'playwright_get_visible_text')
+            self._end(guard, run_id, 'playwright_get_visible_text', output)
+            if index < 3:
+                self.assertEqual(guard._page_state_version, 0)
+        self.assertEqual(guard._page_state_version, 1)
+        self.assertTrue(guard._is_failed_output({'isError': True, 'content': first}))
+
+    def test_invalid_declared_observation_does_not_advance_legacy_state(self):
+        guard = MCPBrowserToolGuard(max_tool_calls=10)
+        first = self._start(guard, 'playwright_get_visible_text')
+        self._end(guard, first, 'playwright_get_visible_text', 'legacy state')
+        invalid = self._start(guard, 'playwright_get_visible_text')
+        self._end(guard, invalid, 'playwright_get_visible_text', 'Error executing tool\n' + invalid_observation_wire())
+        self.assertFalse(guard._is_failed_output('Error executing tool\n' + invalid_observation_wire()))
+        self.assertEqual(guard._page_state_version, 0)
 
     def test_hard_budget_stops_before_next_tool_execution(self):
         guard = MCPBrowserToolGuard(max_tool_calls=2)

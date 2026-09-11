@@ -1,6 +1,8 @@
 """Offline regressions for MCP exploration context and automatic observations."""
 
 import asyncio
+import base64
+import json
 from collections import Counter
 
 from django.test import SimpleTestCase
@@ -18,6 +20,43 @@ from ai_core.mcp_exploration_runtime import (
 from ai_core.tests.test_mcp_agent_budget import ScriptedToolBatchModel
 from ai_core.webui_playwright_agent import MCPBrowserToolGuard
 from web_testing.exploration_trace import _tool_failed
+
+
+def observation_wire(fingerprint='a' * 64, *, scope='page'):
+    payload = {
+        'page_url': 'https://fixture.example.test/#/catalog', 'page_title': 'Catalog',
+        'tool_failed': False,
+        'observation': {
+            'version': 1, 'page_url': 'https://fixture.example.test/#/catalog',
+            'page_title': 'Catalog', 'scope': scope, 'fingerprint': fingerprint,
+            'settled': True, 'truncated': False, 'notes': ['read completed'],
+            'elements': [{
+                'tag': 'dialog', 'role': 'dialog', 'name': 'Editor', 'id': 'edit',
+                'type': '', 'placeholder': '', 'visible': True, 'enabled': True,
+                'container': 'page',
+            }, {
+                'tag': 'input', 'role': 'textbox', 'name': 'Late field', 'id': 'late',
+                'type': 'text', 'placeholder': '', 'visible': True, 'enabled': True,
+                'container': 'Editor',
+            }],
+            'text': ['Editor opened'],
+        },
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+    return 'PLATFORM_BROWSER_DIAGNOSTICS_V1:' + encoded
+
+
+def invalid_observation_wire():
+    payload = {
+        'tool_failed': False,
+        'observation': {
+            'version': 2, 'page_url': 'https://fixture.example.test/', 'page_title': 'Catalog',
+            'scope': 'page', 'fingerprint': 'invalid', 'settled': True, 'truncated': False,
+            'notes': [], 'elements': [], 'text': [],
+        },
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+    return 'PLATFORM_BROWSER_DIAGNOSTICS_V1:' + encoded
 
 
 class AsyncToolProbe:
@@ -116,6 +155,31 @@ class ProjectMessagesTests(SimpleTestCase):
         ))
         self.assertTrue({"round-3", "round-4"}.issubset(retained_call_ids))
 
+    def test_structured_observation_precedes_huge_legacy_prefix_without_raw_metadata(self):
+        source = ToolMessage(
+            content=('legacy html ' + ('x' * 12000) + '\n' + observation_wire()),
+            tool_call_id='read-1', name='playwright_get_visible_html',
+        )
+        original = source.model_dump()
+        projected, _ = project_messages([source], page_limit=1200)
+        content = projected[0].content
+        self.assertEqual(source.model_dump(), original)
+        self.assertIn('[平台页面观察]', content)
+        self.assertIn('Late field', content)
+        self.assertLess(content.index('<dialog>'), content.index('<input>'))
+        self.assertNotIn('PLATFORM_BROWSER_DIAGNOSTICS', content)
+        self.assertNotIn('x' * 100, content)
+
+    def test_invalid_declared_observation_is_not_projected_as_page_evidence(self):
+        source = ToolMessage(
+            content='Error executing tool\n' + ('legacy html ' * 2000) + invalid_observation_wire(),
+            tool_call_id='read-invalid', name='playwright_get_visible_html',
+        )
+        projected, _ = project_messages([source], page_limit=1200)
+        self.assertIn('观察不可用', projected[0].content)
+        self.assertNotIn('legacy html', projected[0].content)
+        self.assertNotIn('PLATFORM_BROWSER_DIAGNOSTICS', projected[0].content)
+
 
 class AutomaticObservationGraphTests(SimpleTestCase):
     def make_agent(self, tool_names, outputs, *, batches):
@@ -173,6 +237,27 @@ class AutomaticObservationGraphTests(SimpleTestCase):
         self.assertEqual(stats["automatic_observations"], 1)
         self.assertEqual(stats["automatic_observation_failures"], 0)
         self.assertIn(OBSERVATION_MARKER, self.action_message(result, action).content)
+
+    def test_automatic_observation_retains_wire_tail_until_model_projection(self):
+        action = 'playwright_navigate'
+        reader = 'playwright_get_visible_text'
+        agent, probe, stats = self.make_agent(
+            [action, reader],
+            {action: 'action-ok', reader: ('legacy ' + ('x' * 12000) + '\n' + observation_wire())},
+            batches=[[action]],
+        )
+        callback = ToolCallbackCounter()
+        result = self.run_agent(agent, callback)
+        action_message = self.action_message(result, action)
+        projected, _ = project_messages(result['messages'], page_limit=1200)
+        projected_action = next(item for item in projected if isinstance(item, ToolMessage) and item.name == action)
+
+        self.assertEqual(probe.events, [('start', action), ('end', action), ('start', reader), ('end', reader)])
+        self.assertEqual(callback.starts, Counter({action: 1, reader: 1}))
+        self.assertEqual(stats['automatic_observations'], 1)
+        self.assertIn('PLATFORM_BROWSER_DIAGNOSTICS', action_message.content)
+        self.assertIn('[平台页面观察]', projected_action.content)
+        self.assertNotIn('PLATFORM_BROWSER_DIAGNOSTICS', projected_action.content)
 
     def test_explicit_following_read_skips_automatic_observation(self):
         action = "playwright_navigate"

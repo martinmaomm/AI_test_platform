@@ -260,6 +260,14 @@ def _tool_failed(output: Any, *, tool_name: str = '') -> bool:
     browser_context, text = extract_page_context(text)
     if browser_context.get('tool_failed') is True:
         return True
+    # A validated semantic observation is the browser's authoritative result
+    # for a successful read.  Page copy may contain error-looking words.
+    if (
+        _action(tool_name) == 'observe'
+        and browser_context.get('tool_failed') is False
+        and (browser_context.get('observation') or browser_context.get('observation_error'))
+    ):
+        return False
     if re.search(
         r'error executing tool|tool[ _-]?error|'
         r'(^|[\r\n])\s*(?:error|exception)\s*:|traceback',
@@ -1196,8 +1204,18 @@ class ExplorationTraceRecorder:
             credential_refs=self._credential_refs,
         )
         state_id = ''
-        if action == 'observe' and status == 'succeeded' and excerpt:
-            fingerprint = hashlib.sha256(f'{path}|{excerpt}'.encode()).hexdigest()[:16]
+        if (
+            action == 'observe' and status == 'succeeded' and excerpt
+            and not page_context.get('observation_error')
+        ):
+            observation = page_context.get('observation')
+            # Keep v4's bounded PageState shape while sharing the browser's
+            # global semantic state identity with the interaction guard.
+            fingerprint = (
+                observation['fingerprint'][:16]
+                if isinstance(observation, dict) and observation.get('fingerprint')
+                else hashlib.sha256(f'{path}|{excerpt}'.encode()).hexdigest()[:16]
+            )
             state_id = f'P{fingerprint}'
             if not any(item.state_id == state_id for item in self._states):
                 self._states.append(PageState(

@@ -235,6 +235,7 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         self.termination_reason = None
         self._terminal_error = None
         self._observed_page_state_fingerprints = {}
+        self._observed_global_page_state_fingerprint = None
         self._page_state_version = 0
         self._known_input_value_fingerprints = {}
         self._active_tools = {}
@@ -268,7 +269,21 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             or getattr(output, "status", None) == "error"
         ):
             return True
-        text = _guard_output_text(output).strip().lower()
+        raw_text = _guard_output_text(output)
+        # A TextContent repr can retain an explicit browser failure only in
+        # the bounded trailer.  Consume it as data; never evaluate the repr.
+        try:
+            from web_testing.exploration_diagnostics import extract_page_context
+            context, _ = extract_page_context(raw_text)
+            if context.get("tool_failed") is True:
+                return True
+            if context.get("tool_failed") is False and context.get("observation"):
+                return False
+            if context.get("tool_failed") is False and context.get("observation_error"):
+                return False
+        except Exception:
+            pass
+        text = raw_text.strip().lower()
         return bool(
             re.search(
                 r"operation failed|error executing tool|timeout .* exceeded|"
@@ -284,13 +299,43 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
         return self._is_failed_output(output)
 
     @staticmethod
+    def _observation_fingerprint(output: Any) -> str | None:
+        """Return the validated browser global state marker, when supplied."""
+        try:
+            from web_testing.exploration_diagnostics import extract_page_context
+            context, _ = extract_page_context(_guard_output_text(output))
+            observation = context.get("observation")
+            return observation["fingerprint"][:16] if observation else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _has_invalid_observation(output: Any) -> bool:
+        try:
+            from web_testing.exploration_diagnostics import extract_page_context
+            context, _ = extract_page_context(_guard_output_text(output))
+            return bool(context.get("observation_error"))
+        except Exception:
+            return False
+
+    @staticmethod
     def _state_fingerprint(output: Any, *, failed: bool | None = None) -> str | None:
-        """Keep an in-memory state marker without retaining page content."""
+        """Legacy per-reader marker without retaining page content."""
         if failed is True or (
             failed is None and MCPBrowserToolGuard._is_failed_output(output)
         ):
             return None
-        text = re.sub(r"\s+", " ", _guard_output_text(output).strip())
+        raw_text = _guard_output_text(output)
+        try:
+            from web_testing.exploration_diagnostics import extract_page_context
+            _, text = extract_page_context(raw_text)
+        except Exception:
+            text = raw_text
+        # Do not reinterpret legacy HTML/text as a unified semantic state.
+        # Keep historical per-tool behavior while removing only diagnostic
+        # framing whose changing capture time is not page progress.
+        text = re.sub(r"(?im)^\s*(?:captured[_ -]?at|timestamp)\s*[:=].*$", "", text)
+        text = re.sub(r"\s+", " ", text.strip())
         if not text:
             return None
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -303,11 +348,18 @@ class MCPBrowserToolGuard(BaseCallbackHandler):
             return
         if failed is True:
             return
-        fingerprint = self._state_fingerprint(output, failed=failed)
-        if fingerprint is None:
+        if self._has_invalid_observation(output):
             return
-        previous = self._observed_page_state_fingerprints.get(tool_name)
-        self._observed_page_state_fingerprints[tool_name] = fingerprint
+        fingerprint = self._observation_fingerprint(output)
+        if fingerprint is not None:
+            previous = self._observed_global_page_state_fingerprint
+            self._observed_global_page_state_fingerprint = fingerprint
+        else:
+            fingerprint = self._state_fingerprint(output, failed=failed)
+            if fingerprint is None:
+                return
+            previous = self._observed_page_state_fingerprints.get(tool_name)
+            self._observed_page_state_fingerprints[tool_name] = fingerprint
         if previous is not None and previous != fingerprint:
             self._page_state_version += 1
 

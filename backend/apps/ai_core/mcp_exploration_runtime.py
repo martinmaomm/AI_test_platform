@@ -43,6 +43,61 @@ def compact_page(value, limit=8000):
     return bounded_text(text, limit)
 
 
+def _bounded_observation_source(value, limit=8000):
+    """Keep a validated trailer at the end of an automatic read excerpt.
+
+    Automatic reads are assembled into an action ToolMessage before model
+    projection.  A regular prefix truncation can otherwise discard the only
+    structured observation.  The trailer still never reaches the model: the
+    projector decodes it into a bounded semantic summary below.
+    """
+    from web_testing.exploration_diagnostics import DIAGNOSTICS_MARKER, extract_page_context
+
+    text = as_text(value)
+    context, stripped = extract_page_context(text)
+    matches = list(DIAGNOSTICS_MARKER.finditer(text))
+    if not (context.get('observation') or context.get('observation_error')) or not matches:
+        return compact_page(text, limit)
+    return compact_page(stripped, limit) + '\n' + matches[-1].group(0)
+
+
+def _project_tool_content(message, page_limit):
+    """Prefer trusted structured observation to duplicated raw reader HTML."""
+    from web_testing.exploration_diagnostics import (
+        extract_page_context, render_observation, render_observation_unavailable,
+        render_target_diagnostics,
+    )
+
+    content = as_text(message.content)
+    context, stripped = extract_page_context(content)
+    rendered = render_observation(context, limit=page_limit)
+    if not rendered:
+        target = render_target_diagnostics(context)
+        unavailable = render_observation_unavailable(context)
+        if unavailable and (message.name in READ_TOOLS or OBSERVATION_MARKER in content):
+            action_result = stripped.split(OBSERVATION_MARKER, 1)[0].rstrip()
+            raw = bounded_text(action_result, page_limit) if OBSERVATION_MARKER in stripped else ''
+            return '\n'.join(item for item in (raw, unavailable, target) if item)
+        if message.name in READ_TOOLS or OBSERVATION_MARKER in content:
+            raw = compact_page(stripped, page_limit)
+        else:
+            raw = stripped
+        return raw + ('\n' + target if target else '')
+
+    # An automatic observation follows a successful action.  Preserve the
+    # action result, but do not append the reader's raw HTML/text a second time.
+    if OBSERVATION_MARKER in stripped:
+        action_result = stripped.split(OBSERVATION_MARKER, 1)[0].rstrip()
+        return (bounded_text(action_result, page_limit) + '\n' if action_result else '') + rendered
+    if message.name in READ_TOOLS:
+        # A failed reader keeps its actual error while successful reads avoid
+        # transmitting duplicated raw HTML/text beside the semantic snapshot.
+        if context.get('tool_failed') is True:
+            return compact_page(stripped, page_limit) + '\n' + rendered
+        return rendered
+    return (bounded_text(stripped, page_limit) + '\n' if stripped.strip() else '') + rendered
+
+
 def compact_saved_evidence(snapshot):
     """Small historical reference, not a replacement for the saved trace."""
     source = snapshot if isinstance(snapshot, dict) else {}
@@ -77,14 +132,9 @@ def project_messages(messages, *, budget=48000, page_limit=8000):
     projected = []
     for message in messages:
         if isinstance(message, ToolMessage):
-            from web_testing.exploration_diagnostics import DIAGNOSTICS_MARKER
-            content = message.content
-            if isinstance(content, str) and DIAGNOSTICS_MARKER.search(content):
-                message = message.model_copy(update={'content': DIAGNOSTICS_MARKER.sub('', content)})
-        if isinstance(message, ToolMessage) and (
-            message.name in READ_TOOLS or OBSERVATION_MARKER in as_text(message.content)
-        ):
-            message = message.model_copy(update={'content': compact_page(message.content, page_limit)})
+            message = message.model_copy(update={
+                'content': _project_tool_content(message, page_limit),
+            })
         projected.append(message)
 
     groups = []
@@ -105,7 +155,9 @@ def project_messages(messages, *, budget=48000, page_limit=8000):
     latest_page = next((
         group for group in reversed(groups)
         if any(isinstance(item, ToolMessage) and (
-            item.name in READ_TOOLS or OBSERVATION_MARKER in as_text(item.content)
+            item.name in READ_TOOLS
+            or OBSERVATION_MARKER in as_text(item.content)
+            or '[平台页面观察]' in as_text(item.content)
         ) for item in projected[group[0]:group[1]])
     ), None)
     protected = set(groups[-2:]) | ({latest_page} if latest_page else set())
@@ -172,7 +224,7 @@ class ExplorationRuntimeMiddleware(AgentMiddleware):
                 }))
                 if self.failed(observed, tool_name=self.reader.name):
                     raise ValueError(bounded_text(getattr(observed, 'content', str(observed)), 1000))
-                observation = compact_page(getattr(observed, 'content', str(observed)))
+                observation = _bounded_observation_source(getattr(observed, 'content', str(observed)))
             except Exception as exc:
                 # The action already executed: never replay it as a read retry.
                 self.stats['automatic_observation_failures'] += 1

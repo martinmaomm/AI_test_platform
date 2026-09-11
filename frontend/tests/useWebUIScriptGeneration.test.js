@@ -517,6 +517,104 @@ test('no execution is started until the explicit debug action', async t => {
   assert.equal(state.isWorkspaceBusy.value, true)
 })
 
+test('static debug rejection syncs the matching clean report without creating a draft conflict', async t => {
+  const { state, handlers } = await harness(t)
+  const latest = {
+    ...record(),
+    script_draft: 'server source must not overwrite the current source',
+    quality_report: { blockers: [
+      { code: 'SYNTAX_ERROR', message: '缺少右括号', line: 3 },
+      { code: 'UNDEFINED_NAME', message: '未定义名称 datetime', line: null }
+    ] }
+  }
+  handlers.debugWebUIScriptGeneration = async () => {
+    throw { response: { status: 400, data: { success: false, code: 'SCRIPT_STATIC_CHECK_FAILED', message: '脚本未通过静态检查。', data: latest } } }
+  }
+
+  await assert.rejects(state.debug())
+
+  assert.deepEqual(state.generation.value.quality_report, latest.quality_report)
+  assert.equal(state.generation.value.script_draft, record().script_draft)
+  assert.equal(state.localDraft.value.script_draft, record().script_draft)
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(state.draftConflict.value, false)
+  assert.match(state.lastError.value, /第 3 行：缺少右括号；未定义名称 datetime/)
+})
+
+test('static save-case rejection syncs only its matching clean revision, while non-static 409 remains a conflict', async t => {
+  const { state, handlers } = await harness(t)
+  const staticLatest = {
+    ...record(),
+    quality_report: { blockers: [{ code: 'SYNTAX_ERROR', message: '缩进错误', line: 4 }] }
+  }
+  handlers.saveWebUIScriptGeneration = async () => {
+    throw { response: { status: 400, data: { success: false, code: 'SCRIPT_STATIC_CHECK_FAILED', data: staticLatest } } }
+  }
+
+  await assert.rejects(state.save('测试草稿'))
+  assert.deepEqual(state.generation.value.quality_report, staticLatest.quality_report)
+  assert.equal(state.draftConflict.value, false)
+
+  handlers.debugWebUIScriptGeneration = async () => {
+    throw { response: { status: 409, data: { code: 'REVISION_CONFLICT', message: '版本已更新' } } }
+  }
+  await assert.rejects(state.debug())
+  assert.equal(state.draftConflict.value, true)
+  assert.equal(state.lastError.value, '版本已更新')
+})
+
+test('static rejection never replaces dirty code or a different workspace revision', async t => {
+  const { state, handlers } = await harness(t)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'local unsaved source' })
+  const latest = {
+    ...record({ revision: 1 }),
+    script_draft: 'server static source',
+    quality_report: { blockers: [{ code: 'SYNTAX_ERROR', message: '服务端错误', line: 2 }] }
+  }
+  handlers.updateWebUIScriptGenerationDraft = async () => {
+    throw { response: { status: 400, data: { code: 'SCRIPT_STATIC_CHECK_FAILED', data: latest } } }
+  }
+
+  await assert.rejects(state.debug())
+
+  assert.equal(state.localDraft.value.script_draft, 'local unsaved source')
+  assert.equal(state.localDraft.value.dirty, true)
+  assert.equal(state.generation.value.quality_report, undefined)
+})
+
+test('static rejection with a mismatched clean workspace revision leaves the current report untouched', async t => {
+  const { state, handlers } = await harness(t)
+  const latest = {
+    ...record({ revision: 1 }),
+    quality_report: { blockers: [{ code: 'SYNTAX_ERROR', message: '其他修订的错误', line: 2 }] }
+  }
+  handlers.debugWebUIScriptGeneration = async () => {
+    throw { response: { status: 400, data: { code: 'SCRIPT_STATIC_CHECK_FAILED', data: latest } } }
+  }
+
+  await assert.rejects(state.debug())
+
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(state.generation.value.quality_report, undefined)
+})
+
+test('saving a draft keeps static blockers and immediately syncs the checked revision', async t => {
+  const { state, handlers } = await harness(t)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'saved invalid draft' })
+  const saved = {
+    ...record({ revision: 1 }),
+    script_draft: 'saved invalid draft',
+    quality_report: { blockers: [{ code: 'UNDEFINED_NAME', message: '未定义名称 datetime', line: null }] }
+  }
+  handlers.updateWebUIScriptGenerationDraft = async () => ({ success: true, data: saved })
+
+  await state.saveDraft()
+
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(state.localDraft.value.revision, 1)
+  assert.deepEqual(state.generation.value.quality_report, saved.quality_report)
+})
+
 test('debug saves unified variable defaults first and sends only one-time overrides', async t => {
   const { state, handlers, calls } = await harness(t)
   const variables = [{ name: 'TEST_LABEL', value: 'saved-default', description: '测试名称', required: false, is_secret: false }]

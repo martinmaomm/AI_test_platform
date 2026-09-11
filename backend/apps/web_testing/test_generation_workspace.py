@@ -123,6 +123,66 @@ async def run(page):
         )
         self.assertEqual(duplicate.status_code, 409)
 
+    def test_static_errors_are_actionable_without_creating_execution_or_case(self):
+        scripts = {
+            'missing_import': (VALID_SCRIPT + '\n    suffix = datetime.now()\n', 'UNDEFINED_NAME'),
+            'syntax': (VALID_SCRIPT + '\n    suffix = (\n', 'SCRIPT_CONTRACT_INVALID'),
+        }
+        for kind, (script, code) in scripts.items():
+            with self.subTest(kind=kind):
+                generation = self.generation()
+                edited = WebUIScriptGenerationDraftView.as_view()(
+                    self.request(self.user, 'PATCH', '/draft/', {
+                        'script_draft': script, 'expected_revision': 0, 'variables': [],
+                    }), project_id=self.project.id, generation_id=generation.id,
+                )
+                # Invalid drafts remain editable and durable.
+                self.assertEqual(edited.status_code, 200)
+                self.assertEqual(edited.data['data']['quality_report']['blockers'][0]['code'], code)
+                with patch('web_testing.views.debug_webui_script_generation_task.delay') as dispatch:
+                    debug = WebUIScriptGenerationDebugView.as_view()(
+                        self.request(self.user, 'POST', '/debug/', {
+                            'expected_revision': 1, 'confirm_execution': True,
+                        }), project_id=self.project.id, generation_id=generation.id,
+                    )
+                dispatch.assert_not_called()
+                saved = WebUIScriptGenerationSaveView.as_view()(
+                    self.request(self.user, 'POST', '/save/', {'expected_revision': 1, 'mode': 'draft'}),
+                    project_id=self.project.id, generation_id=generation.id,
+                )
+                for response in (debug, saved):
+                    self.assertEqual(response.status_code, 400, response.data)
+                    self.assertEqual(response.data['code'], 'SCRIPT_STATIC_CHECK_FAILED')
+                    record = response.data['data']
+                    self.assertEqual(str(record['id']), str(generation.id))
+                    self.assertEqual(record['workspace']['revision'], 1)
+                    issue = record['quality_report']['blockers'][0]
+                    self.assertEqual(issue['code'], code)
+                    if kind == 'missing_import':
+                        self.assertIn('datetime', issue['message'])
+                    else:
+                        self.assertEqual(issue['line'], 8)
+                self.assertFalse(WebUITestExecution.objects.exists())
+                self.assertFalse(WebUITestCase.objects.exists())
+                generation.refresh_from_db()
+                self.assertEqual(generation.script_draft, script)
+
+    def test_revision_conflicts_take_precedence_over_static_errors(self):
+        generation = self.generation(script_draft='async def run(page):\n    await page.goto(\n')
+        for view, payload in (
+            (WebUIScriptGenerationDebugView, {'expected_revision': 99, 'confirm_execution': True}),
+            (WebUIScriptGenerationSaveView, {'expected_revision': 99, 'mode': 'draft'}),
+        ):
+            with self.subTest(view=view.__name__):
+                response = view.as_view()(
+                    self.request(self.user, 'POST', '/', payload),
+                    project_id=self.project.id, generation_id=generation.id,
+                )
+                self.assertEqual(response.status_code, 409)
+                self.assertNotIn('code', response.data)
+                self.assertIn('版本', response.data['message'])
+        self.assertFalse(WebUITestExecution.objects.exists())
+
     def test_debug_requires_edit_and_execute_before_creating_or_dispatching(self):
         membership = ProjectMember.objects.get(project=self.project, user=self.member)
         membership.can_edit = True
@@ -393,7 +453,11 @@ async def run(page):
             self.request(self.user, 'POST', '/save/', {'mode': 'verified', 'expected_revision': 0}),
             project_id=self.project.id, generation_id=generation.id,
         )
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'SCRIPT_STATIC_CHECK_FAILED')
+        self.assertIn('NAVIGATION_OUTSIDE_TARGET', [
+            item['code'] for item in response.data['data']['quality_report']['blockers']
+        ])
 
     def test_entry_url_mismatch_blocks_debug_and_save_before_execution(self):
         changed_script = VALID_SCRIPT.replace('/users', '/other?mode=test#/entry')
@@ -405,7 +469,8 @@ async def run(page):
                 }),
                 project_id=self.project.id, generation_id=generation.id,
             )
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'SCRIPT_STATIC_CHECK_FAILED')
         self.assertFalse(WebUITestExecution.objects.exists())
         dispatch.assert_not_called()
 
@@ -415,7 +480,8 @@ async def run(page):
             }),
             project_id=self.project.id, generation_id=generation.id,
         )
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'SCRIPT_STATIC_CHECK_FAILED')
         self.assertFalse(WebUITestCase.objects.exists())
 
     def test_unconfirmed_dynamic_entry_cannot_be_saved_as_verified(self):

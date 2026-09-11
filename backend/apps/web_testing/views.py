@@ -60,6 +60,7 @@ from .generation_workspace import (
     BUSY_REPAIR_STATUSES,
     BUSY_VERIFICATION_STATUSES,
     REPAIR_CANDIDATE_STATUSES,
+    DraftStaticCheckFailed,
     WorkspaceConflict,
     attach_debug_task,
     attach_repair_task,
@@ -589,6 +590,15 @@ class WebUIScriptGenerationDraftView(APIView):
         return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
 
 
+def _script_static_check_response(generation, message):
+    return Response({
+        'success': False,
+        'code': 'SCRIPT_STATIC_CHECK_FAILED',
+        'message': message,
+        'data': WebUIScriptGenerationSerializer(generation).data,
+    }, status=status.HTTP_400_BAD_REQUEST)
+
+
 class WebUIScriptGenerationDebugView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -605,11 +615,6 @@ class WebUIScriptGenerationDebugView(APIView):
         serializer = WebUIScriptGenerationDebugSerializer(data=request.data or {})
         serializer.is_valid(raise_exception=True)
         try:
-            # Invalid work-in-progress is durable, but never reaches the executor.
-            normalize_for_storage(generation.script_draft)
-        except ScriptContractError as exc:
-            return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_400_BAD_REQUEST)
-        try:
             with transaction.atomic():
                 execution = WebUITestExecution.objects.create(
                     exec_type='case', name='生成草稿调试', description=generation.description_safe,
@@ -623,6 +628,11 @@ class WebUIScriptGenerationDebugView(APIView):
                     execution_id=execution.id,
                     runtime_variables_present=bool(serializer.validated_data['runtime_variables']),
                 )
+        except DraftStaticCheckFailed as exc:
+            # prepare_debug checks ownership/revision/state before the same
+            # quality gate used for saved drafts. The transaction above rolls
+            # back the temporary execution; invalid code is never dispatched.
+            return _script_static_check_response(exc.generation, str(exc))
         except WorkspaceConflict as exc:
             return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
 
@@ -819,9 +829,8 @@ class WebUIScriptGenerationSaveView(APIView):
                 if quality_report.get('status') == 'needs_review' or quality_report.get('blockers'):
                     generation.quality_report = quality_report
                     generation.save(update_fields=['quality_report', 'updated_at'])
-                    return Response(
-                        {'success': False, 'message': '草稿未通过静态检查，不能保存为测试用例。'},
-                        status=status.HTTP_409_CONFLICT,
+                    return _script_static_check_response(
+                        generation, '草稿未通过静态检查，不能保存为测试用例。',
                     )
                 generation.quality_report = quality_report
                 generation.save(update_fields=['quality_report', 'updated_at'])

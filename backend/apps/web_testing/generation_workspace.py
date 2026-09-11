@@ -45,6 +45,10 @@ class WorkspaceConflict(ValueError):
         self.generation = generation
 
 
+class DraftStaticCheckFailed(WorkspaceConflict):
+    """The current revision has code errors, not a concurrent edit conflict."""
+
+
 def script_hash(script: str | None) -> str:
     # Keep the user's draft byte-for-byte, but match ScriptContract's storage canonicalization.
     return hashlib.sha256((script or '').strip().encode('utf-8')).hexdigest()
@@ -404,7 +408,7 @@ def prepare_debug(generation_id: Any, *, expected_revision: int, execution_id: i
         if report.get('status') == 'needs_review' or report.get('blockers'):
             generation.quality_report = report
             generation.save(update_fields=['quality_report', 'updated_at'])
-            raise WorkspaceConflict('当前草稿未通过静态检查，不能执行调试。', generation)
+            raise DraftStaticCheckFailed('当前草稿未通过静态检查，不能执行调试。', generation)
         generation.quality_report = report
         generation.save(update_fields=['quality_report', 'updated_at'])
         current_hash = script_hash(generation.script_draft)

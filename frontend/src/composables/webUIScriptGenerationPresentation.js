@@ -125,6 +125,26 @@ export const generationHasStaticBlockers = (generation) => {
     : (report.checks || []).some(item => item?.level === 'blocker')
 }
 
+/** Static diagnostics are plain text only; line numbers must be positive integers. */
+export const staticReportBlockers = (report) => (Array.isArray(report?.blockers) ? report.blockers : [])
+  .map(item => ({
+    code: String(item?.code || '').trim(),
+    message: String(item?.message || '').trim(),
+    line: typeof item?.line === 'number' && Number.isSafeInteger(item.line) && item.line > 0 ? item.line : null
+  }))
+  .filter(item => item.message)
+
+export const isScriptStaticCheckFailure = (error) => {
+  const body = error?.response?.data
+  return error?.response?.status === 400 && body?.code === 'SCRIPT_STATIC_CHECK_FAILED'
+}
+
+export const scriptStaticCheckFailureGeneration = (error) => {
+  if (!isScriptStaticCheckFailure(error)) return null
+  const record = error?.response?.data?.data
+  return record?.id ? record : null
+}
+
 export const canSaveGeneratedDraft = (generation, draft, busy = false) => (
   !busy
   && Boolean((draft?.script_draft || generation?.script_draft || '').trim())
@@ -317,6 +337,15 @@ const collectErrorDetails = (value, field = '') => {
 /** Prefer actionable field validation over Axios' generic HTTP error text. */
 export const generationApiErrorMessage = (error, fallback) => {
   const body = error?.response?.data
+  if (isScriptStaticCheckFailure(error)) {
+    const blockers = staticReportBlockers(body?.data?.quality_report)
+    if (blockers.length) {
+      const visible = blockers.slice(0, 3).map(item => (
+        item.line ? `第 ${item.line} 行：${item.message}` : item.message
+      ))
+      return `${visible.join('；')}${blockers.length > visible.length ? `；其余 ${blockers.length - visible.length} 项请在脚本编辑区查看。` : ''}`
+    }
+  }
   const details = body?.error?.details ?? body?.errors
   const detailMessages = collectErrorDetails(details)
   if (detailMessages.length) return detailMessages.slice(0, 3).join('；')

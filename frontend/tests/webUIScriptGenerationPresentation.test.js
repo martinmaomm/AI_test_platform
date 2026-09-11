@@ -23,6 +23,7 @@ import {
   generationUserMessage,
   generationActionRequired,
   generationApiErrorMessage,
+  isScriptStaticCheckFailure,
   generationResolutionHint,
   generationStatusLabel,
   generationStorageKey,
@@ -36,7 +37,8 @@ import {
   modelInfoLabel,
   workspaceVerificationLabel,
   workspaceVerificationTagType,
-  shouldShowGenerationStopContext
+  shouldShowGenerationStopContext,
+  staticReportBlockers
 } from '../src/composables/webUIScriptGenerationPresentation.js'
 
 test('v5 storage state is isolated from old generation state', () => {
@@ -75,6 +77,38 @@ test('generic generation status boundaries remain mapped', () => {
   assert.equal(shouldShowGenerationStopContext('preflighting'), false)
   assert.equal(shouldShowGenerationStopContext('exploring'), false)
   assert.equal(shouldShowGenerationStopContext('ready'), false)
+})
+
+test('static check errors prefer current blocker details, preserving only valid line numbers', () => {
+  const error = {
+    response: {
+      status: 400,
+      data: {
+        success: false,
+        code: 'SCRIPT_STATIC_CHECK_FAILED',
+        message: '脚本未通过静态检查。',
+        data: {
+          quality_report: {
+            blockers: [
+              { code: 'SYNTAX_ERROR', message: '第一个语法错误', line: 7 },
+              { code: 'UNDEFINED_NAME', message: '未定义名称 datetime', line: null },
+              { code: 'OTHER', message: '第三个错误', line: '12' },
+              { code: 'FOURTH', message: '第四个错误', line: true }
+            ]
+          }
+        }
+      }
+    }
+  }
+  assert.equal(isScriptStaticCheckFailure(error), true)
+  assert.deepEqual(staticReportBlockers(error.response.data.data.quality_report), [
+    { code: 'SYNTAX_ERROR', message: '第一个语法错误', line: 7 },
+    { code: 'UNDEFINED_NAME', message: '未定义名称 datetime', line: null },
+    { code: 'OTHER', message: '第三个错误', line: null },
+    { code: 'FOURTH', message: '第四个错误', line: null }
+  ])
+  assert.equal(generationApiErrorMessage(error, 'fallback'), '第 7 行：第一个语法错误；未定义名称 datetime；第三个错误；其余 1 项请在脚本编辑区查看。')
+  assert.equal(isScriptStaticCheckFailure({ response: { status: 409, data: error.response.data } }), false)
 })
 
 test('interrupted lifecycle is explicit and never inferred from missing heartbeats', () => {
@@ -419,6 +453,12 @@ test('workspace defers stale pending details after local edits and technical sec
   const resultPanel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
   const evidence = readFileSync(new URL('../src/components/webui-generation/GenerationEvidence.vue', import.meta.url), 'utf8')
   assert.match(workspace, /本地草稿有修改，保存后会重新检查待补充步骤和断言/)
+  assert.match(workspace, /上一版静态检查结果已失效并隐藏/)
+  assert.match(workspace, /staticBlockers/)
+  assert.match(workspace, /item\.message/)
+  assert.doesNotMatch(workspace, /v-html/)
+  assert.match(resultPanel, /qualityReport/)
+  assert.match(resultPanel, /status: 'stale'/)
   assert.doesNotMatch(workspace, /form\.script_draft\.includes\('PENDING_STEP'\)/)
   assert.match(resultPanel, /查看任务技术信息/)
   assert.match(resultPanel, /model_output_raw/)

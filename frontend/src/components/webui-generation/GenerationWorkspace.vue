@@ -16,7 +16,12 @@
       <div class="script-editor"><MonacoEditor :value="form.script_draft" language="python" theme="vs-dark" :read-only="busy" height="100%" @update:value="updateScript" /></div>
     </section>
 
-    <el-alert v-if="draftDirty" type="info" :closable="false" show-icon title="本地草稿有修改，保存后会重新检查待补充步骤和断言。" />
+    <el-alert v-if="draftDirty" type="info" :closable="false" show-icon :title="hasQualityReport ? '本地草稿已修改，上一版静态检查结果已失效并隐藏；保存草稿后会显示本版结果。' : '本地草稿有修改，保存后会重新检查待补充步骤和断言。'" />
+    <el-alert v-else-if="staticBlockers.length" type="error" :closable="false" show-icon :title="`当前草稿有 ${staticBlockers.length} 项静态检查问题`">
+      <template #default>
+        <ul class="static-blocker-list"><li v-for="(item, index) in staticBlockers" :key="`${item.code}-${item.line || 'none'}-${index}`"><span>{{ item.message }}</span><small v-if="item.line">第 {{ item.line }} 行</small></li></ul>
+      </template>
+    </el-alert>
     <el-alert v-else-if="pendingSteps.length" type="warning" :closable="false" show-icon :title="`草稿仍有 ${pendingSteps.length} 项待补充步骤`">
       <template #default>
         <p>请先确认对应操作已真实完成，再删除该项 <code>PENDING_STEP</code> 注释并重新调试；仅删除注释不构成完成证明。</p>
@@ -67,7 +72,7 @@ import { computed, reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MonacoEditor from '@/components/MonacoEditor.vue'
 import WebUITestCaseExecutionDetail from '@/components/WebUITestCaseExecutionDetail.vue'
-import { generationUserMessage, isActiveGeneration, isCurrentRevisionVerified, workspaceVerificationLabel, workspaceVerificationTagType } from '@/composables/webUIScriptGenerationPresentation'
+import { generationUserMessage, isActiveGeneration, isCurrentRevisionVerified, staticReportBlockers, workspaceVerificationLabel, workspaceVerificationTagType } from '@/composables/webUIScriptGenerationPresentation'
 
 const props = defineProps({
   generation: { type: Object, default: null }, draft: { type: Object, default: null }, busy: Boolean,
@@ -80,6 +85,8 @@ const runtimeOverrides = reactive({})
 const workspace = computed(() => props.generation?.workspace || { revision: 0, verification: {}, repair: {} })
 const verification = computed(() => workspace.value.verification || {})
 const draftDirty = computed(() => Boolean(props.draft?.dirty))
+const hasQualityReport = computed(() => Boolean(props.generation?.quality_report && Object.keys(props.generation.quality_report).length))
+const staticBlockers = computed(() => draftDirty.value ? [] : staticReportBlockers(props.generation?.quality_report))
 const assertionState = computed(() => verification.value.assertion_state || { status: '', pending: [], pending_count: 0, confirmed_count: 0 })
 const pendingItems = computed(() => draftDirty.value ? [] : (Array.isArray(assertionState.value.pending) ? assertionState.value.pending : []))
 const pendingSteps = computed(() => pendingItems.value.filter(item => item?.kind === 'step'))
@@ -183,5 +190,5 @@ const requestRepair = async () => {
 </script>
 
 <style scoped>
-.workspace { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; max-width: 100%; }.workspace-status, .section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; min-width: 0; }.workspace-status h5, .section-heading h5 { margin: 0; color: var(--app-text-primary); font-size: 14px; }.workspace-status p, .section-heading p { margin: 5px 0 0; color: var(--app-text-secondary); font-size: 13px; line-height: 1.6; }.workspace-section, .script-section, .script-editor { min-width: 0; max-width: 100%; }.workspace-section { padding: 16px; border: 1px solid var(--app-border); border-radius: 8px; }.script-editor { height: clamp(520px, 64vh, 820px); min-height: 420px; resize: vertical; overflow: hidden; margin-top: 12px; }.workspace-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.verification-message { margin-top: -4px; }.execution-section { padding: 0; overflow: hidden; }.execution-section > .section-heading { padding: 16px 16px 0; }.workspace :deep(.el-table) { width: 100%; max-width: 100%; }.workspace :deep(.el-table__body-wrapper), .workspace :deep(.el-scrollbar__wrap) { overflow-x: auto; }.workspace :deep(.monaco-editor-container) { min-width: 0; max-width: 100%; } @media (max-width: 640px) { .workspace-status, .section-heading { flex-direction: column; }.workspace-actions :deep(.el-button) { flex: 1 1 100%; margin-left: 0; } }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; max-width: 100%; }.workspace-status, .section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; min-width: 0; }.workspace-status h5, .section-heading h5 { margin: 0; color: var(--app-text-primary); font-size: 14px; }.workspace-status p, .section-heading p { margin: 5px 0 0; color: var(--app-text-secondary); font-size: 13px; line-height: 1.6; }.workspace-section, .script-section, .script-editor { min-width: 0; max-width: 100%; }.workspace-section { padding: 16px; border: 1px solid var(--app-border); border-radius: 8px; }.script-editor { height: clamp(520px, 64vh, 820px); min-height: 420px; resize: vertical; overflow: hidden; margin-top: 12px; }.workspace-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.static-blocker-list { display: grid; gap: 6px; margin: 0; padding-left: 20px; }.static-blocker-list li { display: flex; gap: 8px; align-items: flex-start; }.static-blocker-list small { margin-left: auto; color: var(--app-text-secondary); white-space: nowrap; }.verification-message { margin-top: -4px; }.execution-section { padding: 0; overflow: hidden; }.execution-section > .section-heading { padding: 16px 16px 0; }.workspace :deep(.el-table) { width: 100%; max-width: 100%; }.workspace :deep(.el-table__body-wrapper), .workspace :deep(.el-scrollbar__wrap) { overflow-x: auto; }.workspace :deep(.monaco-editor-container) { min-width: 0; max-width: 100%; } @media (max-width: 640px) { .workspace-status, .section-heading { flex-direction: column; }.workspace-actions :deep(.el-button) { flex: 1 1 100%; margin-left: 0; } }
 </style>

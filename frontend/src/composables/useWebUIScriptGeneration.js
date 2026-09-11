@@ -19,13 +19,15 @@ import {
 import {
   generationApiErrorMessage,
   generationStorageKey,
+  isScriptStaticCheckFailure,
   isActiveGeneration,
   canResumeInterruptedExploration,
   isCurrentRevisionVerified,
   isPausedGeneration,
   isTerminalGeneration,
   isWorkspaceActive,
-  matchesGenerationWebSocketEvent
+  matchesGenerationWebSocketEvent,
+  scriptStaticCheckFailureGeneration
 } from './webUIScriptGenerationPresentation'
 
 const POLL_INTERVAL_MS = 2000
@@ -324,6 +326,25 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     const normalizedId = Number(testCaseId)
     return Number.isSafeInteger(normalizedId) && normalizedId > 0
   }
+  const syncStaticCheckFailure = (error, generationId) => {
+    const latest = scriptStaticCheckFailureGeneration(error)
+    const currentRevision = Number(localDraft.value?.revision ?? generation.value?.workspace?.revision ?? 0)
+    const latestRevision = latest?.workspace?.revision
+    if (
+      !latest ||
+      localDraft.value?.dirty ||
+      String(latest.id) !== String(generationId) ||
+      String(generation.value?.id) !== String(generationId) ||
+      !Number.isSafeInteger(latestRevision) ||
+      latestRevision !== currentRevision ||
+      !Object.prototype.hasOwnProperty.call(latest, 'quality_report')
+    ) return false
+    // A static rejection carries diagnostics for this exact revision. Keep the
+    // current source and workspace untouched: only its current report is safe
+    // to adopt here, and dirty source is deliberately excluded above.
+    generation.value = { ...generation.value, quality_report: latest.quality_report }
+    return true
+  }
 
   const loadHistory = async (page = historyPage.value) => {
     const requestProjectId = currentProjectId.value
@@ -558,6 +579,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       throw new Error('保存响应缺少测试用例标识，无法确认保存结果')
     } catch (error) {
       if (!isCurrentGenerationScope(requestScope, requestProjectId, generationId)) return null
+      syncStaticCheckFailure(error, generationId)
       lastError.value = generationApiErrorMessage(error, '保存失败')
       throw error
     } finally {
@@ -635,6 +657,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     } catch (error) {
       if (!isCurrentScope(requestScope, requestProjectId) || String(generation.value?.id) !== String(generationId)) return null
       if (error?.response?.status === 409) draftConflict.value = true
+      syncStaticCheckFailure(error, generationId)
       lastError.value = generationApiErrorMessage(error, '启动调试失败')
       throw error
     } finally {

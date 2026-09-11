@@ -8,7 +8,15 @@ import {
   canRetryScriptFromTrace,
   canResumeInterruptedExploration,
   canSaveGeneratedDraft,
+  failedEventPageEvidence,
+  failedEventTargetEvidence,
+  failureActionText,
+  failureEvidenceBreadcrumbs,
+  failureEvidenceText,
   formatGenerationLifecycleTime,
+  generationFailureContext,
+  generationFailureContextLocationLabel,
+  generationFailureContextReason,
   generationDraftCompletion,
   generationFailureReason,
   generationLifecycleStateLabel,
@@ -27,7 +35,8 @@ import {
   modelConfigurationLabel,
   modelInfoLabel,
   workspaceVerificationLabel,
-  workspaceVerificationTagType
+  workspaceVerificationTagType,
+  shouldShowGenerationStopContext
 } from '../src/composables/webUIScriptGenerationPresentation.js'
 
 test('v5 storage state is isolated from old generation state', () => {
@@ -60,6 +69,12 @@ test('generic generation status boundaries remain mapped', () => {
   assert.equal(isActiveGeneration('validating'), true)
   assert.equal(isPausedGeneration('needs_credentials'), false)
   assert.equal(isTerminalGeneration('needs_review'), true)
+  assert.equal(shouldShowGenerationStopContext('failed'), true)
+  assert.equal(shouldShowGenerationStopContext('needs_review'), true)
+  assert.equal(shouldShowGenerationStopContext('cancelled'), true)
+  assert.equal(shouldShowGenerationStopContext('preflighting'), false)
+  assert.equal(shouldShowGenerationStopContext('exploring'), false)
+  assert.equal(shouldShowGenerationStopContext('ready'), false)
 })
 
 test('interrupted lifecycle is explicit and never inferred from missing heartbeats', () => {
@@ -73,15 +88,20 @@ test('interrupted lifecycle is explicit and never inferred from missing heartbea
   assert.equal(canResumeInterruptedExploration({ status: 'needs_review', lifecycle: { state: 'idle', can_resume: true } }), true)
   assert.equal(canResumeInterruptedExploration({ status: 'cancelled', lifecycle: { state: 'idle', can_resume: true } }), true)
   assert.equal(canResumeInterruptedExploration({ status: 'failed', lifecycle: { state: 'idle', can_resume: false } }), false)
-  assert.match(generationResolutionHint(interrupted), /已完成操作不会自动重放/)
+  assert.match(generationResolutionHint({ ...interrupted, status: 'failed' }, { draftDirty: true }), /补充现场说明并继续/)
+  assert.match(generationResolutionHint(interrupted), /补充现场说明并继续/)
+  assert.match(generationResolutionHint(interrupted), /智能体会按说明继续探索，请先核对已有数据/)
 })
 
 test('resume dialog requires notes and cancel stays local without an API action', () => {
   const panel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
-  assert.match(panel, /确认现场后继续探索/)
-  assert.match(panel, /本地草稿尚未保存，请先保存草稿后再确认现场继续探索/)
+  assert.match(panel, /补充现场说明并继续/)
+  assert.match(panel, /本地草稿尚未保存，请先保存草稿后再补充现场说明并继续/)
   assert.match(panel, /请填写现场恢复说明/)
-  assert.match(panel, /已完成操作不会自动重放/)
+  assert.match(panel, /不会直接重放旧脚本/)
+  assert.match(panel, /智能体会按说明继续探索，请核对已有数据/)
+  assert.match(panel, /不是从失败代码行断点续跑/)
+  assert.match(panel, /已新增的数据标识/)
   assert.match(panel, /cancelButtonText: '取消恢复'/)
   assert.match(panel, /生成记录已变更，请重新打开恢复窗口并确认现场/)
   assert.match(panel, /if \(error !== 'cancel' && error !== 'close'\)/)
@@ -244,6 +264,72 @@ test('interrupted drafts retain a Chinese error hint and all summary branches ar
   const message = generationUserMessage('中文'.repeat(200) + ' detailed message '.repeat(200), '')
   assert.ok(message.length <= 181)
   assert.match(message, /…$/)
+})
+
+test('stop context uses only the backend failure snapshot and makes missing evidence explicit', () => {
+  const generation = {
+    target_url: 'https://must-not-be-used.example/',
+    exploration_snapshot: {
+      failure_context: {
+        event_id: 'evt-7', page_url: 'https://captured.example/orders', page_title: '订单页',
+        breadcrumbs: ['业务', '订单'], action: '提交', element_label: '确认区域',
+        container_label: '订单表单', selector: '[data-testid="submit"]',
+        message: '提交后页面未进入下一步。', reason_code: 'interaction_failure', location_source: 'failure_event', screenshot_status: 'captured'
+      }
+    }
+  }
+  const context = generationFailureContext(generation)
+  assert.equal(context.page_url, 'https://captured.example/orders')
+  assert.equal(failureEvidenceText(undefined), '未采集')
+  assert.equal(failureEvidenceBreadcrumbs(['业务', '订单']), '业务 / 订单')
+  assert.equal(generationFailureContextLocationLabel(context), '停止位置')
+  assert.equal(generationFailureContextReason(context), '提交后页面未进入下一步。')
+  assert.equal(generationFailureContext({ exploration_snapshot: { failure_context: null } }), null)
+  assert.equal(generationFailureContext({ exploration_snapshot: { failure_context: {} } }), null)
+  assert.equal(failureActionText('fill'), '输入内容')
+  assert.equal(failureActionText('click'), '触发页面操作')
+  assert.equal(failureActionText('unexpected_tool'), '页面操作（具体动作未采集）')
+  assert.doesNotMatch(JSON.stringify(context), /must-not-be-used/)
+})
+
+test('last observed pages are not presented as failure scenes or browser interaction failures', () => {
+  const context = { location_source: 'last_observed', message: '点击失败', reason_code: 'interaction_failure' }
+  const generation = { status: 'failed', error_code: 'MODEL_GATEWAY_TIMEOUT', error_message: '模型响应超时，请稍后重试。' }
+  assert.equal(generationFailureContextLocationLabel(context), '最后记录的页面（不代表失败现场）')
+  assert.equal(generationFailureContextReason(context, generation), '模型响应超时，请稍后重试。')
+  assert.equal(generationFailureContextLocationLabel({}), '位置来源未采集')
+})
+
+test('failed-event page and target evidence never reuse a later page or an unscoped event URL', () => {
+  const event = {
+    url: 'https://must-not-be-used.example/current', element_label: 'must not use',
+    page_context: { page_title: '结算页', page_url: 'https://captured.example/checkout', element_label: '提交订单', container_label: '结算表单' }
+  }
+  assert.equal(failedEventPageEvidence(event), '结算页 · https://captured.example/checkout')
+  assert.equal(failedEventTargetEvidence(event), '提交订单；所属：结算表单')
+  assert.equal(failedEventPageEvidence({ url: 'https://must-not-be-used.example/' }), '未采集')
+  assert.equal(failedEventTargetEvidence({ element_label: 'must not use' }), '未采集')
+})
+
+test('stop context and failure-event UI preserve evidence boundaries and raw diagnostics', () => {
+  const panel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
+  const stopContext = readFileSync(new URL('../src/components/webui-generation/GenerationStopContext.vue', import.meta.url), 'utf8')
+  const evidence = readFileSync(new URL('../src/components/webui-generation/GenerationEvidence.vue', import.meta.url), 'utf8')
+  const api = readFileSync(new URL('../src/api/webTesting.js', import.meta.url), 'utf8')
+  assert.match(panel, /<GenerationStopContext/)
+  assert.match(stopContext, /页面标题/)
+  assert.match(stopContext, /页面地址/)
+  assert.match(stopContext, /查看具体定位器/)
+  assert.match(stopContext, /failureActionText\(context\.action\)/)
+  assert.match(stopContext, /preview-src-list/)
+  assert.match(stopContext, /generationFailureContext\(props\.generation\)/)
+  assert.match(stopContext, /location_source/)
+  assert.match(evidence, /failedEventPageEvidence/)
+  assert.match(evidence, /failedEventTargetEvidence/)
+  assert.match(evidence, /查看原始报错/)
+  assert.match(api, /failure-screenshot/)
+  assert.match(api, /responseType: 'blob'/)
+  assert.match(api, /event_id: eventId, captured_at: capturedAt \|\| undefined/)
 })
 
 test('current assertion state supersedes exploration todos after an edited draft is saved', () => {

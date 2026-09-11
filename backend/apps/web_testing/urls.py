@@ -17,6 +17,7 @@ urlpatterns = [
     path('script-generation-settings/', views.WebUIScriptGenerationSettingsView.as_view(), name='script-generation-settings'),
     path('script-generations/', views.WebUIScriptGenerationCreateView.as_view(), name='script-generation-create'),
     path('script-generations/<uuid:generation_id>/', views.WebUIScriptGenerationDetailView.as_view(), name='script-generation-detail'),
+    path('script-generations/<uuid:generation_id>/failure-screenshot/', views.WebUIScriptGenerationFailureScreenshotView.as_view(), name='script-generation-failure-screenshot'),
     path('script-generations/<uuid:generation_id>/cancel/', views.WebUIScriptGenerationCancelView.as_view(), name='script-generation-cancel'),
     path('script-generations/<uuid:generation_id>/resolve/', views.WebUIScriptGenerationResolveView.as_view(), name='script-generation-resolve'),
     path('script-generations/<uuid:generation_id>/retry-generation/', views.WebUIScriptGenerationRetryView.as_view(), name='script-generation-retry-generation'),

@@ -43,6 +43,7 @@ from common.parsers import extract_python_from_output
 from .exploration_policy import ExplorationPolicy
 from .exploration_timeout import exploration_total_timeout_seconds
 from .exploration_trace import ExplorationTraceRecorder, _tool_failed
+from .exploration_diagnostics import failure_context
 from .script_draft_edits import apply_script_edits
 from .generation_preflight import (
     prepare_playwright_mcp_output_config,
@@ -77,7 +78,7 @@ EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览
 每完成一个有意义的业务子步骤或修复后，都保存草稿。首次或整体重写调用 save_script_draft，后续优先 patch_script_draft 局部更新，避免反复输出整份代码；需要准确片段时调用 read_script_draft。保存工具会返回修订号和静态检查反馈；按反馈继续完善，不只在最终文本给代码。
 save_script_draft 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
 点击、导航、按键等关键动作后，平台在工具结果中尽可能附带一次当前页面观察。先利用该观察决定下一步；只有观察缺失、失败、被截断或仍在加载时才补充读取。已观察表单的独立字段可以顺序连续填写，不要求每填一个字段都再读整页；联动字段改变结构时仍应观察。不得为了写脚本而刷新入口或重复已确认的流程。完成业务子步骤后用保存或局部修改工具持久化，不要等到最终回复。
-操作表单前先检查当前可见结构、控件状态及约束，根据用户目标和已提供数据完成填写，再提交；不要为了查找字段而先点击尚未检查的提交按钮。不要依赖固定语言的按钮文案或固定字段名推断业务意图。
+操作表单前先检查当前可见结构、控件状态及约束，根据用户目标和已提供数据完成填写，再提交；不要为了查找字段而先点击尚未检查的提交按钮。不要依赖固定语言的按钮文案或固定字段名推断业务意图。HTML 中仍有表单不代表它在屏幕上可见；以平台浏览器现场的 visible/enabled 状态为准。提交后弹窗可能已关闭，不得继续填写隐藏表单或仅更换定位写法重试；先观察当前可见页面，再按目标打开正确表单。不得用 force 或 JavaScript 绕过可见性。平台只读诊断不会替你打开弹窗，也不代表业务操作已验证成功。
 工具返回点击成功只说明动作已执行，不代表认证或业务成功；页面仍有表单也不代表认证失败。提交后先观察实际校验提示、控件状态及目标结果；页面仍在加载时先等待和观察，不连续点击。
 发现校验未通过或填错时，使用已有证据和用户提供的数据修正输入后允许重试；不得猜测凭据。只有成功执行且值确实变化的填写/选择才算输入纠正，重复填入同值、失败的填写、重复读取页面都不算。相同页面状态与输入状态下，同一操作最多执行 {MCP_INTERACTION_REPEAT_LIMIT} 次；相同页面状态下，即使修改输入，同一非输入操作累计也最多执行 {MCP_INTERACTION_CORRECTION_LIMIT} 次。达到上限前保存草稿和具体未完成原因，不能以轮换输入、变换同一元素的定位写法或反复刷新规避限制。缺少可靠结果证据时标记未确认，不编造成功或账号错误结论。
 只根据真实观察生成 goto、定位器和断言。未实际完成的操作必须在代码中保留 # PENDING_STEP: {{\"reason\":\"...\"}}；未知断言使用 # PENDING_ASSERTION: ...。存在 pending step 或 remaining_steps 时不可声称 complete。
@@ -315,9 +316,13 @@ class ScriptExplorationAgent:
             output_generation_id = validate_generation_output_id(self.generation_id or None)
             self._configure_trace(output_generation_id=output_generation_id)
             deadline = time.monotonic() + self.exploration_timeout_seconds
-            client = MCPClient.from_dict(prepare_playwright_mcp_output_config(
+            output_config = prepare_playwright_mcp_output_config(
                 self.mcp_config, output_generation_id,
-            ))
+            )
+            playwright_config = (output_config.get('mcpServers') or {}).get('playwright')
+            if isinstance(playwright_config, dict):
+                playwright_config.setdefault('env', {})['MCP_PAGE_DIAGNOSTICS'] = '1'
+            client = MCPClient.from_dict(output_config)
             await self._await_task(asyncio.create_task(client.create_all_sessions()), deadline)
             agent = MCPAgent(
                 llm=self.llm_model,
@@ -802,6 +807,7 @@ class ScriptExplorationAgent:
             locator_evidence = data['locator_evidence']
         stats['efficiency'] = dict(self._efficiency_stats)
         raw_output = self._raw_model_output
+        termination_reason = self._termination_reason or str(stats.get('termination_reason') or '')
         return {
             'schema_version': 5,
             'trace_path': self._trace_path or self._saved_trace_data.get('trace_path', ''),
@@ -811,7 +817,8 @@ class ScriptExplorationAgent:
             'page_states': page_states,
             'locator_evidence': locator_evidence,
             'tool_stats': stats,
-            'termination_reason': self._termination_reason or str(stats.get('termination_reason') or ''),
+            'termination_reason': termination_reason,
+            'failure_context': failure_context(events, termination_reason, self._final_message),
             'final_message': self._final_message,
             'model_output_raw': raw_output,
             'model_output_summary': self._summary(raw_output),

@@ -39,7 +39,7 @@
 
     <div v-if="failedEvents.length" class="trace-section">
       <h5>失败或拦截动作</h5>
-      <el-table :data="failedEvents" size="small" max-height="220"><el-table-column prop="event_id" label="事件" width="100" /><el-table-column prop="tool_name" label="工具" min-width="130" /><el-table-column prop="status" label="结果" width="100" /><el-table-column label="原因" min-width="250"><template #default="{ row }">{{ eventSummary(row) }}</template></el-table-column></el-table>
+      <el-table :data="failedEvents" size="small" max-height="280"><el-table-column prop="event_id" label="事件" width="100" /><el-table-column prop="tool_name" label="工具" min-width="130" /><el-table-column prop="status" label="结果" width="100" /><el-table-column label="页面" min-width="220"><template #default="{ row }">{{ failedEventPageEvidence(row) }}</template></el-table-column><el-table-column label="操作对象" min-width="180"><template #default="{ row }">{{ failedEventTargetEvidence(row) }}</template></el-table-column><el-table-column label="原因" min-width="220"><template #default="{ row }">{{ eventSummary(row) }}</template></el-table-column><el-table-column label="原始报错" min-width="140"><template #default="{ row }"><el-collapse v-if="eventRawError(row)" accordion class="raw-error-collapse"><el-collapse-item title="查看原始报错"><pre>{{ eventRawError(row) }}</pre></el-collapse-item></el-collapse><span v-else>未采集</span></template></el-table-column></el-table>
     </div>
 
     <div class="trace-section">
@@ -62,7 +62,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { generationUserMessage } from '@/composables/webUIScriptGenerationPresentation'
+import { failedEventPageEvidence, failedEventTargetEvidence, generationUserMessage } from '@/composables/webUIScriptGenerationPresentation'
 
 const props = defineProps({
   snapshot: { type: Object, default: () => ({}) },
@@ -98,6 +98,7 @@ const pageLocation = item => item?.relative_path || item?.path || item?.url || i
 const pageSummary = item => item?.excerpt || item?.summary || item?.title || item?.result_excerpt || item?.message || '—'
 const eventLocation = item => item?.relative_path || item?.path || item?.url || '—'
 const eventSummary = (item) => item?.result_excerpt || item?.message || item?.error_message || item?.summary || Object.entries(item?.locator_input || {}).map(([key, value]) => `${key}: ${value}`).join('；') || '—'
+const eventRawError = item => item?.error_message || item?.message || item?.result_excerpt || ''
 const stepText = step => {
   const value = typeof step === 'string' ? step : step?.title || step?.name || step?.id || ''
   return generationUserMessage(value, value ? '原始步骤说明请在技术信息查看' : '未命名步骤')
@@ -113,5 +114,5 @@ const variableRequired = item => typeof item === 'object' && Boolean(item?.requi
 </script>
 
 <style scoped>
-.trace-content { display: grid; gap: 18px; }.trace-section { padding: 12px; border: 1px solid var(--app-border); border-radius: 8px; }.trace-section h5 { margin: 0 0 10px; color: var(--app-text-primary); font-size: 14px; }.trace-section p, .trace-section strong { color: var(--app-text-secondary); font-size: 13px; }.trace-section p { margin: 6px 0; }.trace-section ul { margin: 8px 0 0; padding-left: 20px; color: var(--app-text-primary); font-size: 13px; line-height: 1.7; }.path-tag { margin: 0 8px 8px 0; }
+.trace-content { display: grid; gap: 18px; }.trace-section { padding: 12px; border: 1px solid var(--app-border); border-radius: 8px; }.trace-section h5 { margin: 0 0 10px; color: var(--app-text-primary); font-size: 14px; }.trace-section p, .trace-section strong { color: var(--app-text-secondary); font-size: 13px; }.trace-section p { margin: 6px 0; }.trace-section ul { margin: 8px 0 0; padding-left: 20px; color: var(--app-text-primary); font-size: 13px; line-height: 1.7; }.path-tag { margin: 0 8px 8px 0; }.raw-error-collapse :deep(.el-collapse-item__header) { height: auto; min-height: 28px; line-height: 1.4; font-size: 12px; }.raw-error-collapse pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 </style>

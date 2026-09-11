@@ -124,6 +124,21 @@ def _restore_runtime_markers(text: str, replacements: Mapping[str, str]) -> str:
     return text
 
 
+def _template_page_context(context, runtime_values, credential_refs):
+    """Keep repair's runtime-value policy without stripping the observed URL."""
+    result = dict(context)
+    def template(value):
+        text, replacements = _replace_runtime_values(value, runtime_values, credential_refs)
+        return _restore_runtime_markers(text, replacements)
+
+    for key in ('page_url', 'page_title', 'element_label', 'container_label', 'selector', 'message'):
+        if isinstance(result.get(key), str):
+            result[key] = template(result[key])
+    if isinstance(result.get('breadcrumbs'), list):
+        result['breadcrumbs'] = [template(item) for item in result['breadcrumbs']]
+    return result
+
+
 def _safe_text(
     value: Any,
     *,
@@ -241,6 +256,10 @@ def _tool_failed(output: Any, *, tool_name: str = '') -> bool:
     ):
         return True
     text = _output_text(output)
+    from .exploration_diagnostics import extract_page_context
+    browser_context, text = extract_page_context(text)
+    if browser_context.get('tool_failed') is True:
+        return True
     if re.search(
         r'error executing tool|tool[ _-]?error|'
         r'(^|[\r\n])\s*(?:error|exception)\s*:|traceback',
@@ -394,6 +413,7 @@ class PageState(BaseModel):
     relative_path: str = Field(pattern=r'^/')
     fingerprint: str = Field(pattern=r'^[a-f0-9]{16}$')
     excerpt: str = Field(max_length=_MAX_EXCERPT)
+    page_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExplorationEvent(BaseModel):
@@ -417,6 +437,7 @@ class ExplorationEvent(BaseModel):
     # bounded raw observation for code repair and audit recovery.
     raw_output: str = Field(default='', max_length=_MAX_RAW_OUTPUT)
     screenshot_path: str = Field(default='', max_length=500)
+    page_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class AssertionEvidence(BaseModel):
@@ -1154,8 +1175,11 @@ class ExplorationTraceRecorder:
         runtime_values = active['runtime_values']
         input_sources = active['input_sources']
         action = _action(tool_name)
-        raw_output = _output_text(output)
-        callback_path = _location_from_callback(output)
+        from .exploration_diagnostics import extract_page_context
+
+        page_context, raw_output = extract_page_context(_output_text(output))
+        page_context = _template_page_context(page_context, runtime_values, self._credential_refs)
+        callback_path = _relative_path(page_context.get('page_url')) or _location_from_callback(output)
         input_path = ''
         if action == 'navigate':
             input_path = next((
@@ -1179,6 +1203,7 @@ class ExplorationTraceRecorder:
                 self._states.append(PageState(
                     state_id=state_id, relative_path=path or '/',
                     fingerprint=fingerprint, excerpt=excerpt,
+                    page_context=page_context,
                 ))
             self._last_state_id = state_id
         screenshot_path = ''
@@ -1213,6 +1238,7 @@ class ExplorationTraceRecorder:
             result_excerpt=excerpt,
             raw_output=raw_observation,
             screenshot_path=screenshot_path,
+            page_context=page_context,
         )
         self._events.append(event)
         if self._finalization.status == 'valid':

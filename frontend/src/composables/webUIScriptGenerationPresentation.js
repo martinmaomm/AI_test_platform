@@ -58,10 +58,11 @@ export const generationStorageKey = (userId, projectId) => (
 export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(status)
 export const isPausedGeneration = (status) => PAUSED_GENERATION_STATUSES.has(status)
 export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has(status)
+export const shouldShowGenerationStopContext = (status) => ['failed', 'needs_review', 'cancelled'].includes(status)
 
 export const generationLifecycleStateLabel = (state) => ({
   queued: '等待恢复任务启动',
-  running: '恢复探索进行中',
+  running: '探索任务进行中',
   interrupted: '探索已中断',
   idle: '未启动恢复探索'
 })[state] || '生命周期状态未知'
@@ -187,6 +188,81 @@ export const generationFailureReason = (generation) => {
     ? '本次生成失败，原始诊断请查看技术信息。'
     : '本次生成未完整结束，原始诊断请查看技术信息。'
   return ''
+}
+
+const asEvidenceObject = value => value && typeof value === 'object' && !Array.isArray(value) ? value : null
+
+/**
+ * Stop-location evidence is intentionally only read from failure_context.
+ * In particular, target_url and later page states must not be used to invent
+ * the page where an earlier failure happened.
+ */
+export const generationFailureContext = (generation) => {
+  const context = asEvidenceObject(generation?.exploration_snapshot?.failure_context)
+  return context && Object.keys(context).length ? context : null
+}
+
+export const failureEvidenceText = (value) => (
+  value === null || value === undefined || String(value).trim() === '' ? '未采集' : String(value)
+)
+
+export const failureEvidenceBreadcrumbs = (value) => {
+  if (!Array.isArray(value) || !value.length) return '未采集'
+  const items = value.map(item => failureEvidenceText(item)).filter(item => item !== '未采集')
+  return items.length ? items.join(' / ') : '未采集'
+}
+
+const GENERIC_FAILURE_ACTIONS = {
+  goto: '打开页面', navigate: '打开页面', click: '触发页面操作', dblclick: '触发页面操作',
+  fill: '输入内容', type: '输入内容', press: '按键操作', select: '选择内容',
+  select_option: '选择内容', check: '切换选项状态', uncheck: '切换选项状态',
+  hover: '悬停查看页面状态', wait_for: '等待页面状态', wait_for_selector: '等待页面状态',
+  screenshot: '获取页面截图', evaluate: '读取页面信息'
+}
+
+/** Convert tool verbs only; do not maintain a site-specific button vocabulary. */
+export const failureActionText = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return '未采集'
+  const normalized = raw.toLowerCase().replace(/[\s-]+/g, '_')
+  if (GENERIC_FAILURE_ACTIONS[normalized]) return GENERIC_FAILURE_ACTIONS[normalized]
+  return generationUserMessage(raw, '页面操作（具体动作未采集）')
+}
+
+export const generationFailureContextLocationLabel = (context) => ({
+  failure_event: '停止位置',
+  last_observed: '最后记录的页面（不代表失败现场）'
+})[context?.location_source] || '位置来源未采集'
+
+export const generationFailureContextReason = (context, generation = null) => {
+  const generationReason = generationFailureReason(generation)
+  const code = String(generation?.error_code || context?.reason_code || '')
+  // A last observation is context only. Do not turn it into an interaction
+  // failure when the actual terminal reason was an LLM or infrastructure error.
+  if (context?.location_source === 'last_observed') return generationReason || '本次停止原因未采集。'
+  if (code.startsWith('MODEL_')) return generationReason || '模型服务异常，具体原因未采集。'
+  const message = generationUserMessage(context?.message, '')
+  if (message) return message
+  return generationReason || generationFailureReason({ status: 'failed', error_code: context?.reason_code }) || '探索已停止，具体原因未采集。'
+}
+
+/** Failed-event location must only use the evidence captured by that event. */
+export const failedEventPageEvidence = (event) => {
+  const page = asEvidenceObject(event?.page_context)
+  if (!page) return '未采集'
+  const title = failureEvidenceText(page.page_title)
+  const url = failureEvidenceText(page.page_url)
+  if (title === '未采集' && url === '未采集') return '未采集'
+  return [title === '未采集' ? '' : title, url === '未采集' ? '' : url].filter(Boolean).join(' · ')
+}
+
+export const failedEventTargetEvidence = (event) => {
+  const page = asEvidenceObject(event?.page_context)
+  if (!page) return '未采集'
+  const element = failureEvidenceText(page.element_label)
+  const container = failureEvidenceText(page.container_label)
+  if (element === '未采集' && container === '未采集') return '未采集'
+  return [element === '未采集' ? '' : element, container === '未采集' ? '' : `所属：${container}`].filter(Boolean).join('；')
 }
 
 const generationPendingSummary = (generation) => {
@@ -322,8 +398,8 @@ export const generationResolutionHint = (generation, { draftDirty = false } = {}
   const status = generation?.status
   if (generation?.lifecycle?.state === 'interrupted') {
     return draftDirty
-      ? '探索已中断，草稿和轨迹已保留。请先保存本地草稿，再确认现场后继续探索；也可查看历史记录。'
-      : '探索已中断，草稿和轨迹已保留。可查看历史记录，或确认现场后继续探索；已完成操作不会自动重放。'
+      ? '探索已中断，草稿和轨迹已保留。请先保存本地草稿，再补充现场说明并继续；也可查看历史记录。'
+      : '探索已中断，草稿和轨迹已保留。可查看历史记录，或补充现场说明并继续；将启动新的浏览器，智能体会按说明继续探索，请先核对已有数据。'
   }
   if (status === 'needs_input') return '请补充明确的测试目标、操作步骤和至少一个可验证结果后重新分析。页面元素和平台默认清理策略不需要填写。'
   if (status === 'needs_confirmation') return '请确认本次测试目标范围。平台会在一个连续会话中自行探索页面元素；额外高风险操作仍需单独调整目标。'

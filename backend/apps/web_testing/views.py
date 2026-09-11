@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import copy
+from pathlib import Path
 
 from django.conf import settings
 from django.db import models, transaction
@@ -41,6 +42,7 @@ from .exploration_timeout import (
 )
 from .generation_events import publish_terminal
 from .generation_deletion import generation_delete_block_reason
+from .exploration_diagnostics import SCREENSHOT_NAME
 from .generation_lifecycle import reconcile_stale_generation, reconcile_stale_generations
 from .generation_repository import (
     GenerationResolutionConflict,
@@ -294,6 +296,48 @@ class WebUIScriptGenerationDetailView(APIView):
             # are independent assets and must survive deletion of this draft.
             generation.delete()
         return Response({'success': True, 'data': {'id': deleted_id}})
+
+
+class WebUIScriptGenerationFailureScreenshotView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(READ)
+    def get(self, request, project_id, generation_id):
+        generation = get_object_or_404(
+            WebUIScriptGeneration.objects.select_related('project'),
+            pk=generation_id, project_id=project_id,
+        )
+        if not _is_generation_owner(generation.project, generation, request.user):
+            raise PermissionDenied('只能查看自己创建的生成记录')
+        snapshot = generation.exploration_snapshot or {}
+        failure = snapshot.get('failure_context') or {}
+        event_id = request.query_params.get('event_id')
+        captured_at = request.query_params.get('captured_at')
+        if not event_id or event_id != failure.get('event_id'):
+            raise Http404('失败现场已变化，请刷新生成记录')
+        if captured_at is not None and captured_at != failure.get('captured_at'):
+            raise Http404('失败现场已变化，请刷新生成记录')
+        filename = failure.get('screenshot_file')
+        if failure.get('screenshot_status') != 'captured' or not isinstance(filename, str) or not SCREENSHOT_NAME.fullmatch(filename):
+            raise Http404('本次没有可用的失败截图')
+        root = Path(settings.BASE_DIR).resolve() / 'temp' / 'playwright-mcp' / str(generation.pk) / 'screenshots'
+        candidate = root / filename
+        # Never serve a client-supplied path, another task's image or a symlink
+        # escaping the task directory. Public media routing is not used here.
+        try:
+            if candidate.is_symlink() or candidate.resolve().parent != root or not candidate.is_file():
+                raise Http404('失败截图不存在')
+            stream = candidate.open('rb')
+        except OSError as exc:
+            raise Http404('失败截图不存在') from exc
+        if stream.read(8) != b'\x89PNG\r\n\x1a\n':
+            stream.close()
+            raise Http404('失败截图格式无效')
+        stream.seek(0)
+        response = FileResponse(stream, content_type='image/png')
+        response['Cache-Control'] = 'private, no-store'
+        response['X-Content-Type-Options'] = 'nosniff'
+        return response
 
 
 class WebUIScriptGenerationCancelView(APIView):

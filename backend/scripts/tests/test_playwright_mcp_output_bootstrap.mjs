@@ -15,6 +15,7 @@ import {
 } from '../playwright_mcp_output_bootstrap.mjs';
 
 const bootstrapPath = fileURLToPath(new URL('../playwright_mcp_output_bootstrap.mjs', import.meta.url));
+const diagnosticsPath = fileURLToPath(new URL('../playwright_mcp_diagnostics.mjs', import.meta.url));
 const packageSpec = '@executeautomation/playwright-mcp-server@1.0.12';
 
 test('resolves npm exec package, preserves HOME, forces safe task-local outputs', async () => {
@@ -68,6 +69,7 @@ test('bootstrap keeps stdio stdout clean and accepts a custom working directory'
   try {
     const copiedBootstrapPath = path.join(tempRoot, 'bootstrap with spaces.mjs');
     fs.copyFileSync(bootstrapPath, copiedBootstrapPath);
+    fs.copyFileSync(diagnosticsPath, path.join(tempRoot, 'playwright_mcp_diagnostics.mjs'));
     const result = spawnSync('npx', [
       '--offline', '--yes', '--package', packageSpec, '--', 'node', copiedBootstrapPath, '--help',
     ], {
@@ -77,12 +79,14 @@ test('bootstrap keeps stdio stdout clean and accepts a custom working directory'
         MCP_LOG_FILE: path.join(tempRoot, 'task.log'),
         MCP_SCREENSHOT_DIR: path.join(tempRoot, 'screenshots'),
         MCP_WORKING_DIR: tempRoot,
+        MCP_PAGE_DIAGNOSTICS: '1',
       },
       encoding: 'utf8',
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /Playwright MCP Server/);
+    assert.equal(fs.existsSync(path.join(tempRoot, 'screenshots')), true);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

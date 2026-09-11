@@ -76,6 +76,11 @@ def project_messages(messages, *, budget=48000, page_limit=8000):
     """
     projected = []
     for message in messages:
+        if isinstance(message, ToolMessage):
+            from web_testing.exploration_diagnostics import DIAGNOSTICS_MARKER
+            content = message.content
+            if isinstance(content, str) and DIAGNOSTICS_MARKER.search(content):
+                message = message.model_copy(update={'content': DIAGNOSTICS_MARKER.sub('', content)})
         if isinstance(message, ToolMessage) and (
             message.name in READ_TOOLS or OBSERVATION_MARKER in as_text(message.content)
         ):

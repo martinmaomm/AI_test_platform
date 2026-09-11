@@ -56,6 +56,14 @@ export const getWebUIScriptGenerationSettings = async (projectId) =>
 export const getWebUIScriptGeneration = async (projectId, generationId) =>
   (await api.get(`${base(projectId)}/script-generations/${generationId}/`)).data
 
+// The API client adds the current JWT. Keep this relative to the configured
+// API base so a screenshot is never fetched from a backend-supplied URL.
+export const getWebUIScriptGenerationFailureScreenshot = async (projectId, generationId, eventId, capturedAt) =>
+  (await api.get(`${base(projectId)}/script-generations/${generationId}/failure-screenshot/`, {
+    params: { event_id: eventId, captured_at: capturedAt || undefined },
+    responseType: 'blob'
+  })).data
+
 export const getWebUIScriptGenerations = async (projectId, params = {}) =>
   (await api.get(`${base(projectId)}/script-generations/`, { params })).data
 

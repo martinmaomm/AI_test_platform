@@ -2,17 +2,18 @@
   <div v-if="selectedProject" class="webui-generation-page">
     <header class="page-header">
       <div><h3>连续探索并编写测试脚本</h3><p>AI 理解测试目标后连续探索页面、编写 Python 草稿并进行静态检查；草稿就绪不代表实际调试通过</p></div>
-      <el-tag :type="isConnected ? 'success' : 'info'" effect="plain">{{ isConnected ? '实时通知已连接' : '使用详情查询恢复状态' }}</el-tag>
+      <div class="header-actions"><el-button plain :loading="historyLoading" @click="handleOpenHistory">我的生成记录</el-button><el-tag :type="isConnected ? 'success' : 'info'" effect="plain">{{ isConnected ? '实时通知已连接' : '使用详情查询恢复状态' }}</el-tag></div>
     </header>
     <el-alert v-if="lastError" :title="lastError" type="warning" :closable="false" show-icon class="page-alert" />
     <div class="generation-layout">
-      <GenerationInputPanel :project-id="selectedProject.id" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="submitting || isWorkspaceBusy || hasRepairCandidate || saving || resolving || debugging || repairing || repairApplying || repairDiscarding || draftSaving" :generation-active="isActive" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
+      <GenerationInputPanel :project-id="selectedProject.id" :modules="modules" :model-configs="modelConfigs" :exploration-settings="explorationSettings" :loading-modules="loadingModules" :loading-models="loadingModels" :busy="submitting || isWorkspaceBusy || hasRepairCandidate || saving || resolving || debugging || repairing || repairApplying || repairDiscarding || draftSaving || historySwitching" :generation-active="isActive" :paused="isPaused" :submitting="submitting" :cancelling="cancelling" @submit="handleCreate" @cancel="handleCancel" />
       <div class="result-column">
         <GenerationTimeline v-if="generation" :generation="generation" />
-        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :repair-applying="repairApplying" :repair-discarding="repairDiscarding" :busy="isActive || isWorkspaceBusy || hasRepairCandidate || submitting || saving || draftSaving || debugging || repairing || repairApplying || repairDiscarding" :repair-busy="isActive || isWorkspaceBusy || submitting || saving || draftSaving || debugging || repairing || repairApplying || repairDiscarding" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" :repair-execution="repairExecution" :repair-execution-loading="repairExecutionLoading" :selected-repair-execution-id="selectedRepairExecutionId" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @apply-repair="handleApplyRepair" @discard-repair="handleDiscardRepair" @view-repair-execution="handleViewRepairExecution" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
+        <GenerationResultPanel v-if="generation" :generation="generation" :draft="localDraft" :saving="saving" :resolving="resolving" :draft-saving="draftSaving" :debugging="debugging" :repairing="repairing" :repair-applying="repairApplying" :repair-discarding="repairDiscarding" :busy="isActive || isWorkspaceBusy || hasRepairCandidate || submitting || saving || draftSaving || debugging || repairing || repairApplying || repairDiscarding || historySwitching" :repair-busy="isActive || isWorkspaceBusy || submitting || saving || draftSaving || debugging || repairing || repairApplying || repairDiscarding || historySwitching" :draft-conflict="draftConflict" :debug-execution="debugExecution" :debug-execution-loading="debugExecutionLoading" :repair-execution="repairExecution" :repair-execution-loading="repairExecutionLoading" :selected-repair-execution-id="selectedRepairExecutionId" @resolve="handleResolve" @retry-generation="handleRetryGeneration" @cancel="handleCancel" @save="handleSave" @update-draft="updateLocalDraft" @save-draft="handleSaveDraft" @debug="handleDebug" @repair="handleRepair" @apply-repair="handleApplyRepair" @discard-repair="handleDiscardRepair" @view-repair-execution="handleViewRepairExecution" @discard-local-draft="handleDiscardLocalDraft" @open-test-case="router.push('/web-testing/test-cases')" />
         <el-empty v-else :image-size="96" description="填写场景并确认目标范围后开始。未保存到测试用例的生成记录可在刷新后恢复；保存成功后会清空当前工作区。" class="empty-result" />
       </div>
     </div>
+    <GenerationHistoryPanel :visible="historyVisible" :items="historyItems" :page="historyPage" :page-size="historyPageSize" :total="historyTotal" :error="historyError" :loading="historyLoading" :switching="historySwitching" :switch-disabled="isHistorySwitchBlocked" :current-generation-id="generation?.id" @close="historyVisible = false" @load="loadHistory" @select="handleHistorySelect" />
   </div>
   <el-alert v-else title="请先选择一个项目" type="info" :closable="false" show-icon><template #default><el-button type="primary" size="small" @click="router.push('/project/project-list')">前往项目管理</el-button></template></el-alert>
 </template>
@@ -31,6 +32,7 @@ import { normalizeExplorationTimeoutSettings } from '@/composables/webuiExplorat
 import GenerationInputPanel from '@/components/webui-generation/GenerationInputPanel.vue'
 import GenerationTimeline from '@/components/webui-generation/GenerationTimeline.vue'
 import GenerationResultPanel from '@/components/webui-generation/GenerationResultPanel.vue'
+import GenerationHistoryPanel from '@/components/webui-generation/GenerationHistoryPanel.vue'
 
 const router = useRouter()
 const projectStore = useProjectStore()
@@ -44,9 +46,11 @@ const explorationSettings = ref(null)
 const loadingModules = ref(false)
 const loadingModels = ref(false)
 const isConnected = ref(false)
+const historyVisible = ref(false)
 let websocketManager = null
 
-const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, repairApplying, repairDiscarding, debugExecution, debugExecutionLoading, repairExecution, repairExecutionLoading, selectedRepairExecutionId, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, hasRepairCandidate, create, cancel, resolve: resolveGeneration, retryGeneration, save, saveDraft, debug, repair, applyRepairCandidate, discardRepairCandidate, loadRepairExecution, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
+const { generation, localDraft, submitting, saving, cancelling, resolving, draftSaving, debugging, repairing, repairApplying, repairDiscarding, debugExecution, debugExecutionLoading, repairExecution, repairExecutionLoading, selectedRepairExecutionId, draftConflict, lastError, isActive, isPaused, isWorkspaceBusy, hasUnsavedDraft, hasUnpersistedGeneration, hasRepairCandidate, historyItems, historyPage, historyPageSize, historyTotal, historyLoading, historyError, historySwitching, isHistorySwitchBlocked, create, cancel, resolve: resolveGeneration, retryGeneration, save, saveDraft, debug, repair, applyRepairCandidate, discardRepairCandidate, loadRepairExecution, loadHistory, openHistoryGeneration, updateLocalDraft, discardLocalDraftAndRefresh, handleWebSocketEvent } = useWebUIScriptGeneration({ projectId, userId })
+const needsReplacementConfirmation = computed(() => hasUnsavedDraft.value || hasUnpersistedGeneration.value)
 
 const asList = (response) => {
   const body = response?.data ?? response ?? {}
@@ -84,14 +88,29 @@ const initWebSocket = () => {
 }
 const handleCreate = async (payload) => {
   try {
-    if (localDraft.value?.dirty) {
-      await ElMessageBox.confirm('当前草稿有未保存的编辑。创建新的生成任务后，这些本地编辑将被丢弃。', '创建新的生成任务', { type: 'warning', confirmButtonText: '丢弃并新建', cancelButtonText: '返回保存草稿' })
+    if (needsReplacementConfirmation.value) {
+      const dirty = hasUnsavedDraft.value
+      await ElMessageBox.confirm(dirty ? '当前草稿有未保存的本地编辑。创建新的生成任务后，这些编辑将无法恢复；“我的生成记录”只能找回上次服务端保存的版本。' : '当前生成记录尚未保存为测试用例。创建新的生成任务后，仍可从“我的生成记录”找回该记录的服务端保存版本。', '创建新的生成任务', { type: 'warning', confirmButtonText: dirty ? '丢弃并新建' : '新建并保留记录', cancelButtonText: dirty ? '返回保存草稿' : '取消' })
     }
     const result = await create(payload)
     if (!result) return
     ElMessage.success('已创建生成记录，正在按阶段处理。')
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') ElMessage.error(lastError.value || '创建生成任务失败')
+  }
+}
+const handleOpenHistory = async () => { historyVisible.value = true; await loadHistory(1) }
+const handleHistorySelect = async (generationId) => {
+  if (String(generation.value?.id || '') === String(generationId || '') || isHistorySwitchBlocked.value) return
+  try {
+    if (needsReplacementConfirmation.value) {
+      const dirty = hasUnsavedDraft.value
+      await ElMessageBox.confirm(dirty ? '当前草稿有未保存的本地编辑。恢复历史记录会明确丢弃这些编辑，且无法恢复；“我的生成记录”只能找回上次服务端保存的版本。' : '当前生成记录尚未保存为测试用例。恢复历史记录后，当前内容仍可从“我的生成记录”找回其服务端保存版本。', '恢复历史记录', { type: 'warning', confirmButtonText: dirty ? '丢弃并恢复' : '恢复记录', cancelButtonText: dirty ? '保留当前草稿' : '取消' })
+    }
+    const result = await openHistoryGeneration(generationId)
+    if (result) { historyVisible.value = false; ElMessage.success('已恢复历史生成记录') }
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(historyError.value || '读取生成记录失败')
   }
 }
 const handleCancel = async () => {
@@ -115,5 +134,5 @@ onUnmounted(closeWebSocket)
 </script>
 
 <style scoped>
-.webui-generation-page { height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 16px; padding-right: 4px; scrollbar-gutter: stable; }.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px; background: var(--page-content-bg); border: 1px solid var(--app-border); border-radius: 10px; }.page-header h3 { margin: 0; color: var(--app-text-primary); font-size: 20px; }.page-header p { margin: 7px 0 0; color: var(--app-text-secondary); font-size: 13px; }.page-alert { margin: 0; }.generation-layout { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(460px, 1.35fr); gap: 16px; align-items: start; }.result-column { display: grid; gap: 16px; min-width: 0; }.empty-result { min-height: 360px; padding: 36px 20px; background: var(--page-content-bg); border: 1px solid var(--app-border); border-radius: 10px; } @media (max-width: 1050px) { .generation-layout { grid-template-columns: 1fr; }.page-header { flex-direction: column; } }
+.webui-generation-page { height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 16px; padding-right: 4px; scrollbar-gutter: stable; }.page-header, .header-actions { display: flex; align-items: flex-start; gap: 12px; }.page-header { justify-content: space-between; padding: 18px 20px; background: var(--page-content-bg); border: 1px solid var(--app-border); border-radius: 10px; }.header-actions { flex-wrap: wrap; justify-content: flex-end; }.page-header h3 { margin: 0; color: var(--app-text-primary); font-size: 20px; }.page-header p { margin: 7px 0 0; color: var(--app-text-secondary); font-size: 13px; }.page-alert { margin: 0; }.generation-layout { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(460px, 1.35fr); gap: 16px; align-items: start; }.result-column { display: grid; gap: 16px; min-width: 0; }.empty-result { min-height: 360px; padding: 36px 20px; background: var(--page-content-bg); border: 1px solid var(--app-border); border-radius: 10px; } @media (max-width: 1050px) { .generation-layout { grid-template-columns: 1fr; }.page-header { flex-direction: column; }.header-actions { justify-content: flex-start; } }
 </style>

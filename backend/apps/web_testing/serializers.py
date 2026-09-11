@@ -12,7 +12,6 @@ from .models import (
     WebUIScriptGeneration,
 )
 from .generation_repository import create_generation
-from .generation_preflight import exploration_requires_write_confirmation
 from .exploration_timeout import (
     EXPLORATION_TIMEOUT_MAX_SECONDS,
     EXPLORATION_TIMEOUT_MIN_SECONDS,
@@ -68,6 +67,52 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'error_code', 'error_message',
             'cancel_requested_at', 'started_at', 'completed_at', 'created_at', 'updated_at',
         ]
+
+
+class WebUIScriptGenerationHistoryQuerySerializer(serializers.Serializer):
+    page = serializers.IntegerField(min_value=1, default=1)
+    page_size = serializers.IntegerField(min_value=1, max_value=50, default=20)
+
+    def validate(self, attrs):
+        for field in ('page', 'page_size'):
+            raw_value = self.initial_data.get(field)
+            if raw_value is None:
+                continue
+            if (
+                not isinstance(raw_value, str)
+                or not raw_value.isascii()
+                or not raw_value.isdigit()
+            ):
+                raise serializers.ValidationError({field: '必须是十进制正整数。'})
+        return attrs
+
+
+class WebUIScriptGenerationHistorySerializer(serializers.Serializer):
+    """Minimal, non-sensitive projection for a user's generation history."""
+
+    id = serializers.UUIDField(read_only=True)
+    title = serializers.SerializerMethodField()
+    status = serializers.CharField(read_only=True)
+    created_at = serializers.DateTimeField(read_only=True)
+    updated_at = serializers.DateTimeField(read_only=True)
+    test_case_id = serializers.IntegerField(read_only=True, allow_null=True)
+    model_info = serializers.SerializerMethodField()
+
+    def get_title(self, obj):
+        scenario_spec = obj.scenario_spec if isinstance(obj.scenario_spec, dict) else {}
+        title = scenario_spec.get('title')
+        if isinstance(title, str) and title.strip() and len(title.strip()) <= 200:
+            return title.strip()
+        return 'UI 脚本生成'
+
+    def get_model_info(self, obj):
+        model_info = obj.model_info if isinstance(obj.model_info, dict) else {}
+        provider_name = model_info.get('provider_name')
+        model_name = model_info.get('model_name')
+        return {
+            'provider_name': provider_name if isinstance(provider_name, str) else '',
+            'model_name': model_name if isinstance(model_name, str) else '',
+        }
 
 
 class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
@@ -268,14 +313,7 @@ class WebUIScriptGenerationResolveSerializer(serializers.Serializer):
             if not description:
                 raise serializers.ValidationError({'description': '请补充完整的测试描述。'})
         elif generation.status == WebUIScriptGeneration.Status.NEEDS_CONFIRMATION:
-            if generation.error_code in {'EXPLORATION_WRITE_CONFIRMATION_REQUIRED', 'EXPLORATION_EXTRA_RISK_BLOCKED'}:
-                if generation.error_code == 'EXPLORATION_EXTRA_RISK_BLOCKED' and not description:
-                    raise serializers.ValidationError({'description': '请修订测试目标，移除当前不支持的额外风险操作。'})
-                if exploration_requires_write_confirmation(description or generation.description_safe):
-                    raise serializers.ValidationError({
-                        'description': '本次自动探索支持目标范围内的测试数据操作；请移除审批、支付、发布及未授权文件/外部消息操作后继续。'
-                    })
-            elif generation.error_code == 'INPUT_AMBIGUOUS':
+            if generation.error_code == 'INPUT_AMBIGUOUS':
                 auto_explore = (
                     generation.current_stage == WebUIScriptGeneration.Stage.PREFLIGHTING
                     and not answers

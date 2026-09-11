@@ -28,7 +28,6 @@ from projects.models import Project
 from .generation_contracts import GenerationTransitionError
 from .generation_events import publish_terminal
 from .generation_preflight import (
-    exploration_requires_write_confirmation,
     prepare_playwright_mcp_output_config,
     validate_generation_output_id,
 )
@@ -52,15 +51,13 @@ from .views import WebUIScriptGenerationCreateView
 
 
 class V4SafeOutputPathRegressionTests(SimpleTestCase):
-    def test_explicit_target_url_and_high_risk_guards(self):
+    def test_explicit_target_url_preserves_entry_and_rejects_ambiguity(self):
         with self.assertRaisesRegex(ValueError, '目标网址'):
             extract_target_url('检查 https://one.example.test 与 https://two.example.test。')
         self.assertEqual(
             extract_target_url('目标网址：https://web.example.test/items?tab=all#details\n检查详情。'),
             'https://web.example.test/items?tab=all#details',
         )
-        self.assertTrue(exploration_requires_write_confirmation('提交付款并发布结果。'))
-        self.assertFalse(exploration_requires_write_confirmation('不要付款或发布，只检查页面。'))
 
     def test_generation_output_id_and_mcp_artifact_paths_are_confined(self):
         with self.assertRaises(ValueError):

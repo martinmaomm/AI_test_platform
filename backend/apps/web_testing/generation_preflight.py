@@ -1,10 +1,9 @@
-"""Deterministic v4 generation preflight; this module never calls a model or browser."""
+"""Configuration preflight; page semantics belong to the exploring agent."""
 
 from __future__ import annotations
 
 import copy
 import os
-import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -14,16 +13,6 @@ from django.conf import settings
 
 from ai_core.models import LLMConfiguration, MCPConfiguration, ModelType
 
-
-_EXTRA_RISK_ACTION_RE = re.compile(
-    r'(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
-    re.IGNORECASE,
-)
-_NEGATED_EXTRA_RISK_RE = re.compile(
-    r'(?:不要|禁止|不得|避免|不允许|不可|不应|别|勿|do\s+not|don[\'’]?t|never)'
-    r'.{0,24}(?:审批|付款|支付|发布|上传|发短信|发送邮件|approve|pay(?:ment)?|publish|upload|send\s+(?:sms|email))',
-    re.IGNORECASE,
-)
 
 _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE = '@executeautomation/playwright-mcp-server'
 _MCP_LOG_FILE_ENV = 'MCP_LOG_FILE'
@@ -181,18 +170,6 @@ def prepare_playwright_mcp_output_config(
     return config
 
 
-def exploration_requires_write_confirmation(description: str) -> bool:
-    """Keep only a dedicated high-risk safety deny-list.
-
-    This does not identify goals, browser writes, event coverage, or replay
-    evidence. Normal interactions are governed exclusively by scenario policy.
-    """
-    for clause in re.split(r'[。！？!?.\n；;]+', str(description or '')):
-        if _EXTRA_RISK_ACTION_RE.search(clause) and not _NEGATED_EXTRA_RISK_RE.search(clause):
-            return True
-    return False
-
-
 @dataclass(frozen=True)
 class PreflightResult:
     outcome: Literal['continue', 'needs_confirmation', 'failed']
@@ -275,12 +252,9 @@ def run_safety_preflight(generation, brief: Any) -> PreflightResult:
     if not mcp_selection:
         return PreflightResult('failed', 'MCP_CONFIG_MISSING', '没有可用的 Playwright MCP 配置。')
 
-    if exploration_requires_write_confirmation(generation.description_safe):
-        return PreflightResult(
-            'needs_confirmation',
-            'EXPLORATION_EXTRA_RISK_BLOCKED',
-            '本次探索包含审批、支付、发布或文件/外部消息操作，超出普通测试数据操作范围，请调整目标后继续。',
-        )
+    # A description may name a page without authorizing its business action.
+    # Text matching cannot establish that distinction. Keep preflight limited
+    # to configuration/scope and enforce concrete capabilities at tool dispatch.
     mcp_config_id, mcp_config = mcp_selection
     discovery_notes = brief.get('discovery_notes') or []
     discovery_count = len(set(discovery_notes)) if isinstance(discovery_notes, list) else 0

@@ -55,7 +55,6 @@ READ_ONLY_DISABLED_TOOL_MESSAGES = {
     'playwright_upload_file': '页面探索不允许上传文件。',
     'playwright_close': '页面探索不允许关闭浏览器。',
 }
-_HIGH_RISK_MARKERS = ('审批', '付款', '支付', '发布', '上传', '下载', 'approve', 'pay', 'publish', 'upload', 'download')
 
 
 class FinalizationInput(BaseModel):
@@ -170,7 +169,13 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
         run_id = kwargs.get('run_id')
         self.trace_recorder.on_tool_start(serialized, input_str, run_id=run_id, inputs=inputs)
         tool_name = str((serialized or {}).get('name') or '').lower()
-        text = json.dumps(inputs, ensure_ascii=False).lower() if isinstance(inputs, dict) else str(input_str or '').lower()
+        tool_inputs = inputs
+        if not isinstance(tool_inputs, dict):
+            try:
+                tool_inputs = json.loads(input_str or '{}')
+            except (ValueError, TypeError):
+                tool_inputs = {}
+        pressed_key = str(tool_inputs.get('key') or '').casefold() if isinstance(tool_inputs, dict) else ''
         try:
             with self._lock:
                 if (
@@ -192,14 +197,13 @@ class ReadOnlyMCPBrowserToolGuard(MCPBrowserToolGuard):
                 if tool_name in READ_ONLY_DISABLED_TOOL_MESSAGES:
                     self._blocked_write_tool_calls += 1
                     self._raise_guard('read_only_violation', READ_ONLY_DISABLED_TOOL_MESSAGES[tool_name], blocked_before_execution=True, tool_name=tool_name)
-                if tool_name.endswith(('_click', '_press_key')) and any(marker in text for marker in _HIGH_RISK_MARKERS):
-                    self._blocked_write_tool_calls += 1
-                    self._raise_guard('extra_risk_action', '探索阶段不允许额外高风险操作。', blocked_before_execution=True, tool_name=tool_name)
+                # Selectors and page labels do not identify an operation's
+                # business effect. Enforce tool capabilities, not substrings.
                 if tool_name.endswith(('_click', '_press_key')):
                     if self.policy.may_write():
                         self._potential_write_tool_calls += 1
                         self._possible_write_runs.add(run_id)
-                    elif self.policy.explicit_read_only and ('enter' in text or 'submit' in text):
+                    elif self.policy.explicit_read_only and tool_name.endswith('_press_key') and pressed_key in {'enter', 'return'}:
                         self._blocked_write_tool_calls += 1
                         self._raise_guard('read_only_violation', '当前场景是观察性目标，禁止可能提交表单的操作。', blocked_before_execution=True, tool_name=tool_name)
             return super().on_tool_start(serialized, input_str, inputs=inputs, **kwargs)

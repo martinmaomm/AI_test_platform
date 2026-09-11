@@ -11,7 +11,7 @@ const methods = [
   'applyWebUIScriptGenerationRepair',
   'cancelWebUIScriptGeneration', 'createWebUIScriptGeneration', 'debugWebUIScriptGeneration',
   'discardWebUIScriptGenerationRepair',
-  'getWebUIScriptGeneration', 'getWebUITestCaseExecution', 'repairWebUIScriptGeneration',
+  'getWebUIScriptGeneration', 'getWebUIScriptGenerations', 'getWebUITestCaseExecution', 'repairWebUIScriptGeneration',
   'resolveWebUIScriptGeneration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
 ]
 const record = (workspace = {}) => ({
@@ -41,6 +41,7 @@ async function harness(t, initial = record(), options = {}) {
   const handlers = {
     createWebUIScriptGeneration: async () => ({ success: true, data: structuredClone(initial) }),
     getWebUIScriptGeneration: async () => ({ success: true, data: structuredClone(initial) }),
+    getWebUIScriptGenerations: async () => ({ success: true, data: { items: [], page: 1, page_size: 20, total: 0 } }),
     getWebUITestCaseExecution: async (_project, id) => ({ success: true, data: { id } })
   }
   const api = Object.fromEntries(methods.map(name => [name, async (...args) => {
@@ -76,6 +77,117 @@ test('restore reads only the scoped v5 generation id from localStorage', async t
   assert.equal(reads.at(-1).args[1], 'test-generation')
   assert.equal(state.generation.value.id, 'test-generation')
   assert.deepEqual([...storage.keys()], ['automation:webui-script-generation:v5:1:1'])
+})
+
+test('history listing is paginated and never creates a generation', async t => {
+  const { state, handlers, calls } = await harness(t, record(), { create: false })
+  handlers.getWebUIScriptGenerations = async () => ({ success: true, data: {
+    items: [{ id: 'older', title: '旧草稿', status: 'failed', created_at: '2026-09-11T00:00:00Z', test_case_id: null, model_info: { provider_name: 'local', model_name: 'fixture' } }],
+    page: 2, page_size: 20, total: 23
+  } })
+
+  await state.loadHistory(2)
+
+  assert.deepEqual(calls.find(call => call.name === 'getWebUIScriptGenerations').args, [1, { page: 2, page_size: 20 }])
+  assert.equal(calls.some(call => call.name === 'createWebUIScriptGeneration'), false)
+  assert.equal(state.historyPage.value, 2)
+  assert.equal(state.historyTotal.value, 23)
+  assert.equal(state.historyItems.value[0].id, 'older')
+})
+
+test('history selection preserves the prior draft and pointer when detail loading fails', async t => {
+  const { state, handlers, storage, calls } = await harness(t)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'keep this local draft' })
+  for (const error of [{ response: { status: 404, data: { message: 'not found' } } }, new Error('network unavailable')]) {
+    handlers.getWebUIScriptGeneration = async () => { throw error }
+    await assert.rejects(state.openHistoryGeneration('missing-history'))
+    assert.equal(state.generation.value.id, 'test-generation')
+    assert.equal(state.localDraft.value.script_draft, 'keep this local draft')
+    assert.equal(storage.get(state.storageKey.value), 'test-generation')
+  }
+  assert.deepEqual(calls.filter(call => call.name === 'getWebUIScriptGeneration').map(call => call.args), [[1, 'missing-history'], [1, 'missing-history']])
+})
+
+test('history selection restores its draft, pointer, and existing debug detail without creating work', async t => {
+  const { state, handlers, calls, storage } = await harness(t)
+  const older = { ...record({ verification: { status: 'failed', execution_id: 14 } }), id: 'older-history', script_draft: 'older recovered draft' }
+  const debugDetail = { id: 41, execution: 14, project_id: 1, status: 'failed', log: 'saved debug evidence' }
+  handlers.getWebUIScriptGeneration = async () => ({ success: true, data: older })
+  handlers.getWebUITestCaseExecution = async () => ({ success: true, data: debugDetail })
+
+  await state.openHistoryGeneration('older-history')
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(state.generation.value.id, 'older-history')
+  assert.equal(state.localDraft.value.script_draft, 'older recovered draft')
+  assert.equal(storage.get(state.storageKey.value), 'older-history')
+  assert.deepEqual(state.debugExecution.value, debugDetail)
+  assert.equal(calls.filter(call => call.name === 'createWebUIScriptGeneration').length, 1)
+  assert.equal(calls.some(call => ['resolveWebUIScriptGeneration', 'retryWebUIScriptGenerationFromTrace'].includes(call.name)), false)
+})
+
+test('history selection rejects a mismatched detail and blocks edits, mutations, and stale refreshes', async t => {
+  const { state, handlers, calls } = await harness(t)
+  const oldRefresh = deferred()
+  const historyDetail = deferred()
+  let detailCalls = 0
+  handlers.getWebUIScriptGeneration = () => (++detailCalls === 1 ? oldRefresh.promise : historyDetail.promise)
+  const refresh = state.refresh()
+  const opening = state.openHistoryGeneration('requested-history')
+
+  assert.equal(await state.create({ description: 'must not create' }), null)
+  assert.equal(await state.save('must not save'), null)
+  assert.equal(await state.debug(), null)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'must not edit during switch' })
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(calls.filter(call => ['createWebUIScriptGeneration', 'saveWebUIScriptGeneration', 'debugWebUIScriptGeneration'].includes(call.name)).length, 1)
+
+  historyDetail.resolve({ success: true, data: { ...record(), id: 'wrong-history' } })
+  await assert.rejects(opening)
+  oldRefresh.resolve({ success: true, data: { ...record(), script_draft: 'stale refresh must not apply' } })
+  await refresh
+
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.equal(state.localDraft.value.script_draft, record().script_draft)
+  assert.equal(state.historyError.value, '读取生成记录失败')
+})
+
+test('history loads ignore out-of-order pages and a switched project scope', async t => {
+  const { state, handlers, projectId } = await harness(t, record(), { create: false })
+  const first = deferred()
+  const second = deferred()
+  let calls = 0
+  handlers.getWebUIScriptGenerations = () => (++calls === 1 ? first.promise : second.promise)
+  const firstLoad = state.loadHistory(1)
+  const secondLoad = state.loadHistory(2)
+  second.resolve({ success: true, data: { items: [{ id: 'page-two' }], page: 2, page_size: 20, total: 21 } })
+  await secondLoad
+  first.resolve({ success: true, data: { items: [{ id: 'stale-page-one' }], page: 1, page_size: 20, total: 21 } })
+  await firstLoad
+  assert.equal(state.historyItems.value[0].id, 'page-two')
+
+  const oldProject = deferred()
+  handlers.getWebUIScriptGenerations = () => oldProject.promise
+  const pending = state.loadHistory(1)
+  projectId.value = 2
+  await nextTick()
+  oldProject.resolve({ success: true, data: { items: [{ id: 'wrong-project' }], page: 1, page_size: 20, total: 1 } })
+  await pending
+  assert.deepEqual(state.historyItems.value, [])
+})
+
+test('blank workspace needs no replacement confirmation while an unsaved generation does', async t => {
+  const blank = await harness(t, record(), { create: false })
+  assert.equal(blank.state.hasUnpersistedGeneration.value, false)
+  await blank.state.create({ description: 'new unsaved record' })
+  assert.equal(blank.state.hasUnpersistedGeneration.value, true)
+})
+
+test('history switching is blocked while work is active', async t => {
+  const active = await harness(t, { ...record(), status: 'exploring', current_stage: 'exploring' })
+  assert.equal(active.state.isHistorySwitchBlocked.value, true)
+  assert.equal(await active.state.openHistoryGeneration('other-record'), null)
+  assert.equal(active.calls.some(call => call.name === 'getWebUIScriptGeneration'), false)
 })
 
 test('polling preserves unsaved local code when a server revision changes', async t => {

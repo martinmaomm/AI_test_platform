@@ -6,6 +6,7 @@ import {
   debugWebUIScriptGeneration,
   discardWebUIScriptGenerationRepair,
   getWebUIScriptGeneration,
+  getWebUIScriptGenerations,
   getWebUITestCaseExecution,
   repairWebUIScriptGeneration,
   retryWebUIScriptGenerationFromTrace,
@@ -86,6 +87,13 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const repairExecutionLoading = ref(false)
   const selectedRepairExecutionId = ref(null)
   const lastError = ref('')
+  const historyItems = ref([])
+  const historyPage = ref(1)
+  const historyPageSize = ref(20)
+  const historyTotal = ref(0)
+  const historyLoading = ref(false)
+  const historyError = ref('')
+  const historySwitching = ref(false)
   let pollingTimer = null
   let refreshPromise = null
   let refreshScope = ''
@@ -94,6 +102,8 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   let repairExecutionRequestVersion = 0
   let repairExecutionSelectionManual = false
   let scopeVersion = 0
+  let historyLoadVersion = 0
+  let historySwitchVersion = 0
 
   const currentProjectId = computed(() => unref(projectId))
   const currentUserId = computed(() => unref(userId))
@@ -122,6 +132,23 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
       && !repairApplying.value
       && !repairDiscarding.value
   })
+  const hasUnpersistedGeneration = computed(() => (
+    Boolean(generation.value?.id) && !hasPersistedSaveResult(generation.value)
+  ))
+  const isHistorySwitchBlocked = computed(() => (
+    historySwitching.value
+    || submitting.value
+    || saving.value
+    || cancelling.value
+    || resolving.value
+    || draftSaving.value
+    || debugging.value
+    || repairing.value
+    || repairApplying.value
+    || repairDiscarding.value
+    || isActive.value
+    || isWorkspaceBusy.value
+  ))
 
   const stopPolling = () => {
     if (pollingTimer) window.clearInterval(pollingTimer)
@@ -141,6 +168,12 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     lastError.value = ''
     refreshPromise = null
     refreshScope = ''
+    historyItems.value = []
+    historyPage.value = 1
+    historyTotal.value = 0
+    historyError.value = ''
+    historyLoading.value = false
+    historySwitching.value = false
     if (removeStorageKey) clearStoredGeneration()
   }
 
@@ -239,6 +272,9 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     repairExecutionRequestId = null
     repairExecutionRequestVersion += 1
     repairExecutionSelectionManual = false
+    historyLoadVersion += 1
+    historySwitchVersion += 1
+    historyLoading.value = false
   }
   const isCurrentScope = (requestScope, requestProjectId) => (
     requestScope === scopeVersion && String(currentProjectId.value || '') === String(requestProjectId || '')
@@ -255,9 +291,70 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
     return Number.isSafeInteger(normalizedId) && normalizedId > 0
   }
 
+  const loadHistory = async (page = historyPage.value) => {
+    const requestProjectId = currentProjectId.value
+    if (!requestProjectId) return null
+    const requestScope = scopeVersion
+    const requestVersion = ++historyLoadVersion
+    const requestPage = Math.max(1, Number(page) || 1)
+    historyLoading.value = true
+    historyError.value = ''
+    try {
+      const response = await getWebUIScriptGenerations(requestProjectId, {
+        page: requestPage,
+        page_size: historyPageSize.value
+      })
+      if (!isCurrentScope(requestScope, requestProjectId) || requestVersion !== historyLoadVersion) return null
+      const data = apiData(response)
+      if (response?.success === false || !Array.isArray(data?.items)) throw new Error(response?.message || '读取生成记录列表失败')
+      historyItems.value = data.items
+      historyPage.value = Math.max(1, Number(data.page) || requestPage)
+      historyPageSize.value = Math.min(50, Math.max(1, Number(data.page_size) || historyPageSize.value))
+      historyTotal.value = Math.max(0, Number(data.total) || 0)
+      return data
+    } catch (error) {
+      if (!isCurrentScope(requestScope, requestProjectId) || requestVersion !== historyLoadVersion) return null
+      historyError.value = generationApiErrorMessage(error, '读取生成记录列表失败')
+      return null
+    } finally {
+      if (isCurrentScope(requestScope, requestProjectId) && requestVersion === historyLoadVersion) historyLoading.value = false
+    }
+  }
+
+  const openHistoryGeneration = async (generationId) => {
+    if (!generationId || String(generation.value?.id || '') === String(generationId)) return generation.value
+    if (isHistorySwitchBlocked.value) return null
+    invalidateScope()
+    stopPolling()
+    const requestProjectId = currentProjectId.value
+    const requestScope = scopeVersion
+    const requestVersion = ++historySwitchVersion
+    historySwitching.value = true
+    historyError.value = ''
+    try {
+      const response = await getWebUIScriptGeneration(requestProjectId, generationId)
+      if (!isCurrentScope(requestScope, requestProjectId) || requestVersion !== historySwitchVersion) return null
+      const record = apiData(response)
+      if (response?.success === false || !record?.id || String(record.id) !== String(generationId)) throw new Error(response?.message || '读取生成记录失败')
+      debugExecution.value = null
+      repairExecution.value = null
+      selectedRepairExecutionId.value = null
+      const applied = applyGeneration(record)
+      void loadDebugExecution(applied)
+      void loadSelectedRepairExecution(applied)
+      return applied
+    } catch (error) {
+      if (!isCurrentScope(requestScope, requestProjectId) || requestVersion !== historySwitchVersion) return null
+      historyError.value = generationApiErrorMessage(error, '读取生成记录失败')
+      throw error
+    } finally {
+      if (isCurrentScope(requestScope, requestProjectId) && requestVersion === historySwitchVersion) historySwitching.value = false
+    }
+  }
+
   const refresh = async (generationId = generation.value?.id) => {
     const requestProjectId = currentProjectId.value
-    if (!generationId || !requestProjectId || submitting.value) return null
+    if (!generationId || !requestProjectId || submitting.value || historySwitching.value) return null
     const requestScope = scopeVersion
     const requestKey = `${requestScope}:${requestProjectId}:${generationId}`
     if (refreshPromise && refreshScope === requestKey) return refreshPromise
@@ -302,6 +399,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const create = async (payload) => {
     const requestProjectId = currentProjectId.value
     if (!requestProjectId) throw new Error('请先选择项目')
+    if (submitting.value || historySwitching.value || isActive.value || isWorkspaceBusy.value || saving.value || resolving.value || draftSaving.value || debugging.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
     invalidateScope()
     stopPolling()
     const requestScope = scopeVersion
@@ -327,7 +425,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const cancel = async () => {
-    if (!generation.value?.id || cancelling.value) return null
+    if (!generation.value?.id || historySwitching.value || cancelling.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     invalidateScope()
@@ -350,7 +448,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const save = async (title) => {
-    if (!generation.value?.id || saving.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
+    if (!generation.value?.id || historySwitching.value || saving.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion
@@ -381,7 +479,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const updateLocalDraft = (draft) => {
-    if (!generation.value?.id || !draft || String(draft.generationId || generation.value.id) !== String(generation.value.id)) return
+    if (!generation.value?.id || historySwitching.value || !draft || String(draft.generationId || generation.value.id) !== String(generation.value.id)) return
     localDraft.value = {
       generationId: generation.value.id,
       revision: Number(draft.revision ?? localDraft.value?.revision ?? generation.value.workspace?.revision ?? 0),
@@ -393,7 +491,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const saveDraft = async () => {
-    if (!generation.value?.id || !localDraft.value || draftSaving.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
+    if (!generation.value?.id || historySwitching.value || !localDraft.value || draftSaving.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion
@@ -429,7 +527,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const debug = async (runtimeVariables = []) => {
-    if (!generation.value?.id || debugging.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
+    if (!generation.value?.id || historySwitching.value || debugging.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion
@@ -474,7 +572,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const repair = async (runtimeVariables = []) => {
-    if (!generation.value?.id || !canStartRepair.value) return null
+    if (!generation.value?.id || historySwitching.value || !canStartRepair.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion
@@ -505,6 +603,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const applyRepairCandidate = async (candidateHash = generation.value?.workspace?.repair?.candidate_hash) => {
     if (
       !generation.value?.id ||
+      historySwitching.value ||
       !canApplyRepairCandidate.value ||
       candidateHash !== workspace.value.repair?.candidate_hash ||
       repairApplying.value ||
@@ -539,6 +638,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   const discardRepairCandidate = async (candidateHash = generation.value?.workspace?.repair?.candidate_hash) => {
     if (
       !generation.value?.id ||
+      historySwitching.value ||
       !canDiscardRepairCandidate.value ||
       candidateHash !== workspace.value.repair?.candidate_hash ||
       repairDiscarding.value ||
@@ -658,13 +758,13 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const discardLocalDraftAndRefresh = async () => {
-    if (!generation.value?.id) return null
+    if (!generation.value?.id || historySwitching.value) return null
     resetLocalDraft(generation.value)
     return refresh(generation.value.id)
   }
 
   const resolve = async (payload) => {
-    if (!generation.value?.id || resolving.value) return null
+    if (!generation.value?.id || historySwitching.value || resolving.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion
@@ -688,7 +788,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const retryGeneration = async () => {
-    if (!generation.value?.id || resolving.value || isActive.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
+    if (!generation.value?.id || historySwitching.value || resolving.value || isActive.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id
     const requestScope = scopeVersion
@@ -723,8 +823,9 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   return {
     generation, workspace, localDraft, loading, submitting, saving, cancelling, resolving,
     draftSaving, debugging, repairing, repairApplying, repairDiscarding, debugExecution, debugExecutionLoading, repairExecution, repairExecutionLoading, selectedRepairExecutionId, draftConflict,
-    lastError, isActive, isPaused, isTerminal, isWorkspaceBusy, hasUnsavedDraft, hasRepairCandidate, canApplyRepairCandidate, canDiscardRepairCandidate, canStartRepair,
-    create, refresh, restore, cancel, resolve, retryGeneration, save, saveDraft, debug, repair, applyRepairCandidate, discardRepairCandidate, updateLocalDraft,
+    lastError, isActive, isPaused, isTerminal, isWorkspaceBusy, hasUnsavedDraft, hasUnpersistedGeneration, hasRepairCandidate, canApplyRepairCandidate, canDiscardRepairCandidate, canStartRepair,
+    historyItems, historyPage, historyPageSize, historyTotal, historyLoading, historyError, historySwitching, isHistorySwitchBlocked,
+    create, refresh, restore, loadHistory, openHistoryGeneration, cancel, resolve, retryGeneration, save, saveDraft, debug, repair, applyRepairCandidate, discardRepairCandidate, updateLocalDraft,
     discardLocalDraftAndRefresh, loadRepairExecution, stopPolling, handleWebSocketEvent, clearStoredGeneration, storageKey
   }
 }

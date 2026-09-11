@@ -56,6 +56,9 @@ export const getWebUIScriptGenerationSettings = async (projectId) =>
 export const getWebUIScriptGeneration = async (projectId, generationId) =>
   (await api.get(`${base(projectId)}/script-generations/${generationId}/`)).data
 
+export const getWebUIScriptGenerations = async (projectId, params = {}) =>
+  (await api.get(`${base(projectId)}/script-generations/`, { params })).data
+
 export const cancelWebUIScriptGeneration = async (projectId, generationId) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/cancel/`)).data
 

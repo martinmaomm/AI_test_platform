@@ -95,6 +95,8 @@ from .serializers import (
     WebUIScriptGenerationCreateSerializer,
     WebUIScriptGenerationDebugSerializer,
     WebUIScriptGenerationDraftSerializer,
+    WebUIScriptGenerationHistoryQuerySerializer,
+    WebUIScriptGenerationHistorySerializer,
     WebUIScriptGenerationRepairSerializer,
     WebUIScriptGenerationRepairApplySerializer,
     WebUIScriptGenerationRepairDiscardSerializer,
@@ -144,6 +146,34 @@ def _is_generation_owner(project, generation, user) -> bool:
 
 class WebUIScriptGenerationCreateView(APIView):
     permission_classes = [IsAuthenticated]
+
+    @project_access_required(READ)
+    def get(self, request, project_id):
+        query_serializer = WebUIScriptGenerationHistoryQuerySerializer(
+            data=request.query_params,
+        )
+        query_serializer.is_valid(raise_exception=True)
+        page = query_serializer.validated_data['page']
+        page_size = query_serializer.validated_data['page_size']
+        queryset = WebUIScriptGeneration.objects.filter(
+            project_id=project_id,
+            user_id=request.user.id,
+        ).only(
+            'id', 'status', 'created_at', 'updated_at', 'test_case_id',
+            'scenario_spec', 'model_info',
+        ).order_by('-created_at', '-id')
+        total = queryset.count()
+        offset = (page - 1) * page_size
+        items = [] if offset >= total else queryset[offset:offset + page_size]
+        return Response({
+            'success': True,
+            'data': {
+                'items': WebUIScriptGenerationHistorySerializer(items, many=True).data,
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+            },
+        })
 
     @project_access_required(EDIT)
     def post(self, request, project_id):

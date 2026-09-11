@@ -65,6 +65,9 @@ export const cancelWebUIScriptGeneration = async (projectId, generationId) =>
 export const resolveWebUIScriptGeneration = async (projectId, generationId, data) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/resolve/`, data)).data
 
+export const resumeWebUIScriptGenerationExploration = async (projectId, generationId, data) =>
+  (await api.post(`${base(projectId)}/script-generations/${generationId}/resume-exploration/`, data)).data
+
 export const retryWebUIScriptGenerationFromTrace = async (projectId, generationId, data) =>
   (await api.post(`${base(projectId)}/script-generations/${generationId}/retry-generation/`, data)).data
 

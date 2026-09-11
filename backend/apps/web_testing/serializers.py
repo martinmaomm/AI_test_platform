@@ -12,6 +12,7 @@ from .models import (
     WebUIScriptGeneration,
 )
 from .generation_repository import create_generation
+from .generation_lifecycle import lifecycle_for_generation
 from .exploration_timeout import (
     EXPLORATION_TIMEOUT_MAX_SECONDS,
     EXPLORATION_TIMEOUT_MIN_SECONDS,
@@ -34,12 +35,28 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
     module_name = serializers.CharField(source='module.name', read_only=True, allow_null=True)
     is_saved = serializers.SerializerMethodField()
     workspace = serializers.SerializerMethodField()
+    lifecycle = serializers.SerializerMethodField()
+    clarifications = serializers.SerializerMethodField()
 
     def get_is_saved(self, obj):
         return is_generation_saved(obj)
 
     def get_workspace(self, obj):
-        return workspace_for_response(obj)
+        workspace = workspace_for_response(obj)
+        return {key: value for key, value in workspace.items() if not key.startswith('_')}
+
+    def get_lifecycle(self, obj):
+        return lifecycle_for_generation(obj)
+
+    def get_clarifications(self, obj):
+        items = obj.clarifications if isinstance(obj.clarifications, list) else []
+        return [
+            {
+                key: value for key, value in item.items()
+                if key not in {'task_id', 'previous_task_id'}
+            }
+            for item in items if isinstance(item, dict)
+        ]
 
     class Meta:
         model = WebUIScriptGeneration
@@ -49,7 +66,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'celery_task_id', 'status', 'current_stage', 'progress',
             'target_url', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
-            'workspace',
+            'workspace', 'lifecycle',
             'model_info', 'tool_stats', 'repair_count',
             'revision', 'resume_count', 'clarifications',
             'error_code', 'error_message',
@@ -61,7 +78,7 @@ class WebUIScriptGenerationSerializer(serializers.ModelSerializer):
             'celery_task_id', 'status', 'current_stage', 'progress',
             'target_url', 'description_safe', 'exploration_timeout_seconds', 'scenario_spec',
             'exploration_snapshot', 'script_draft', 'quality_report', 'warnings',
-            'workspace',
+            'workspace', 'lifecycle',
             'model_info', 'tool_stats', 'repair_count',
             'revision', 'resume_count', 'clarifications',
             'error_code', 'error_message',
@@ -113,7 +130,6 @@ class WebUIScriptGenerationHistorySerializer(serializers.Serializer):
             'provider_name': provider_name if isinstance(provider_name, str) else '',
             'model_name': model_name if isinstance(model_name, str) else '',
         }
-
 
 class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
     """Validate a new generation request with an explicit description URL."""
@@ -231,6 +247,29 @@ class WebUIScriptGenerationDraftSerializer(serializers.Serializer):
 
 class WebUIScriptGenerationRetrySerializer(serializers.Serializer):
     expected_revision = serializers.IntegerField(min_value=0)
+
+
+class WebUIScriptGenerationResumeExplorationSerializer(serializers.Serializer):
+    expected_revision = serializers.IntegerField(min_value=0)
+    confirmed = serializers.BooleanField()
+    recovery_notes = serializers.CharField(
+        min_length=1, max_length=2000, trim_whitespace=True,
+    )
+
+    def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            return super().to_internal_value(data)
+        unknown = set(data.keys()) - set(self.fields)
+        if unknown:
+            raise serializers.ValidationError({
+                field: '该字段不属于探索恢复请求。' for field in sorted(unknown)
+            })
+        return super().to_internal_value(data)
+
+    def validate_confirmed(self, value):
+        if value is not True:
+            raise serializers.ValidationError('恢复会再次访问目标网站，必须明确确认 confirmed=true。')
+        return value
 
 
 class WebUIScriptGenerationDebugSerializer(serializers.Serializer):

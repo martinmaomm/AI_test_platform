@@ -19,6 +19,8 @@ class BudgetedMCPAgent(MCPAgent):
     """Keep the model budget and run each ordered tool batch sequentially."""
 
     def __init__(self, *args, **kwargs):
+        # Opt-in extension: API/v4 agents keep their existing behavior.
+        self._runtime_factory = kwargs.pop('runtime_factory', None)
         super().__init__(*args, **kwargs)
         if not self._is_remote:
             self.recursion_limit = mcp_graph_recursion_limit(self.max_steps)
@@ -32,6 +34,8 @@ class BudgetedMCPAgent(MCPAgent):
         middleware.append(
             ModelCallLimitMiddleware(run_limit=self.max_steps, exit_behavior="error")
         )
+        if self._runtime_factory:
+            middleware.append(self._runtime_factory(tuple(self._tools)))
 
         llm_model = self.llm
         assert isinstance(llm_model, BaseChatModel), "LLM must be a BaseChatModel instance"

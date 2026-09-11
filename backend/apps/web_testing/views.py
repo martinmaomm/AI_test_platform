@@ -39,14 +39,16 @@ from .exploration_timeout import (
     exploration_total_timeout_seconds,
 )
 from .generation_events import publish_terminal
+from .generation_lifecycle import reconcile_stale_generation, reconcile_stale_generations
 from .generation_repository import (
     GenerationResolutionConflict,
     attach_celery_task,
     cancel_generation,
+    fail_queued_generation_dispatch,
     get_generation_for_project,
+    prepare_exploration_resume,
     prepare_trace_generation_retry,
     prepare_generation_resolution,
-    transition_generation,
 )
 from .generation_save_state import generation_reference, is_generation_saved
 from .generation_workspace import (
@@ -101,6 +103,7 @@ from .serializers import (
     WebUIScriptGenerationRepairApplySerializer,
     WebUIScriptGenerationRepairDiscardSerializer,
     WebUIScriptGenerationRetrySerializer,
+    WebUIScriptGenerationResumeExplorationSerializer,
     WebUIScriptGenerationResolveSerializer,
     WebUIScriptGenerationSaveSerializer,
     WebUIScriptGenerationSerializer,
@@ -158,13 +161,17 @@ class WebUIScriptGenerationCreateView(APIView):
         queryset = WebUIScriptGeneration.objects.filter(
             project_id=project_id,
             user_id=request.user.id,
-        ).only(
+        )
+        queryset = queryset.only(
             'id', 'status', 'created_at', 'updated_at', 'test_case_id',
             'scenario_spec', 'model_info',
+        ).annotate(
+            lifecycle_metadata=models.F('workspace___generation_lifecycle'),
         ).order_by('-created_at', '-id')
         total = queryset.count()
         offset = (page - 1) * page_size
-        items = [] if offset >= total else queryset[offset:offset + page_size]
+        items = [] if offset >= total else list(queryset[offset:offset + page_size])
+        items = reconcile_stale_generations(items)
         return Response({
             'success': True,
             'data': {
@@ -176,6 +183,7 @@ class WebUIScriptGenerationCreateView(APIView):
         })
 
     @project_access_required(EDIT)
+    @project_access_required(EXECUTE)
     def post(self, request, project_id):
         project = get_project_for_user(project_id, request.user, EDIT)
         serializer = WebUIScriptGenerationCreateSerializer(
@@ -184,14 +192,17 @@ class WebUIScriptGenerationCreateView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         generation = serializer.save()
+        prepared_revision = generation.revision
         try:
             task = generate_webui_script_generation_task.delay(str(generation.pk))
-            generation = attach_celery_task(generation.pk, task.id)
+            generation = attach_celery_task(
+                generation.pk, task.id, expected_revision=prepared_revision,
+            )
         except Exception:
             logger.exception('WebUI 脚本生成任务调度失败: generation_id=%s', generation.pk)
-            generation = transition_generation(
+            generation = fail_queued_generation_dispatch(
                 generation.pk,
-                WebUIScriptGeneration.Status.FAILED,
+                expected_revision=prepared_revision,
                 error_code='TRANSIENT_SERVICE_ERROR',
                 error_message='脚本生成任务暂时无法调度，请稍后重试。',
             )
@@ -239,6 +250,10 @@ class WebUIScriptGenerationDetailView(APIView):
             generation = get_generation_for_project(generation_id, project_id)
         except WebUIScriptGeneration.DoesNotExist as exc:
             raise Http404('生成记录不存在') from exc
+        project = generation.project
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能查看自己创建的生成记录')
+        generation = reconcile_stale_generation(generation.pk)
         return Response({'success': True, 'data': WebUIScriptGenerationSerializer(generation).data})
 
 
@@ -272,6 +287,7 @@ class WebUIScriptGenerationResolveView(APIView):
     permission_classes = [IsAuthenticated]
 
     @project_access_required(EDIT)
+    @project_access_required(EXECUTE)
     def post(self, request, project_id, generation_id):
         project = get_project_for_user(project_id, request.user, EDIT)
         try:
@@ -317,18 +333,22 @@ class WebUIScriptGenerationResolveView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        prepared_revision = generation.revision
         try:
             task = generate_webui_script_generation_task.delay(str(generation.pk))
-            generation = attach_celery_task(generation.pk, task.id)
+            generation = attach_celery_task(
+                generation.pk, task.id, expected_revision=prepared_revision,
+            )
         except Exception:
             logger.exception('WebUI 暂停任务恢复失败: generation_id=%s', generation.pk)
-            generation = transition_generation(
+            generation = fail_queued_generation_dispatch(
                 generation.pk,
-                WebUIScriptGeneration.Status.FAILED,
+                expected_revision=prepared_revision,
                 error_code='TRANSIENT_SERVICE_ERROR',
                 error_message='脚本生成任务暂时无法恢复，请稍后重试。',
             )
-            publish_terminal(generation)
+            if generation.status == WebUIScriptGeneration.Status.FAILED:
+                publish_terminal(generation)
             return Response(
                 {
                     'success': False,
@@ -363,23 +383,98 @@ class WebUIScriptGenerationRetryView(APIView):
             raise PermissionDenied('只能重试自己创建的生成记录')
         serializer = WebUIScriptGenerationRetrySerializer(data=request.data or {})
         serializer.is_valid(raise_exception=True)
+        prepared_revision = None
         try:
             generation = prepare_trace_generation_retry(
                 generation.pk, expected_revision=serializer.validated_data['expected_revision'],
             )
+            prepared_revision = generation.revision
             task = retry_webui_script_generation_from_trace_task.delay(str(generation.pk))
-            generation = attach_celery_task(generation.pk, task.id)
+            generation = attach_celery_task(
+                generation.pk, task.id, expected_revision=prepared_revision,
+            )
         except GenerationResolutionConflict as exc:
             return Response({'success': False, 'message': str(exc), 'data': WebUIScriptGenerationSerializer(exc.generation).data}, status=status.HTTP_409_CONFLICT)
         except Exception:
             logger.exception('仅重试脚本生成任务调度失败: generation_id=%s', generation_id)
-            generation = transition_generation(
-                generation_id, WebUIScriptGeneration.Status.FAILED,
+            generation = fail_queued_generation_dispatch(
+                generation_id,
+                expected_revision=prepared_revision if prepared_revision is not None else -1,
                 error_code='TRANSIENT_SERVICE_ERROR', error_message='脚本生成重试任务暂时无法调度，请稍后重试。',
             )
-            publish_terminal(generation)
+            if generation.status == WebUIScriptGeneration.Status.FAILED:
+                publish_terminal(generation)
             return Response({'success': False, 'message': generation.error_message, 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response({'success': True, 'message': '正在基于已保存的探索轨迹重新生成脚本。', 'data': WebUIScriptGenerationSerializer(generation).data}, status=status.HTTP_202_ACCEPTED)
+
+
+class WebUIScriptGenerationResumeExplorationView(APIView):
+    """Explicitly resume browser exploration from preserved v5 evidence."""
+
+    permission_classes = [IsAuthenticated]
+
+    @project_access_required(EDIT)
+    @project_access_required(EXECUTE)
+    def post(self, request, project_id, generation_id):
+        project = get_project_for_user(project_id, request.user, EDIT)
+        try:
+            generation = get_generation_for_project(generation_id, project_id)
+        except WebUIScriptGeneration.DoesNotExist as exc:
+            raise Http404('生成记录不存在') from exc
+        if not _is_generation_owner(project, generation, request.user):
+            raise PermissionDenied('只能恢复自己创建的生成记录')
+        serializer = WebUIScriptGenerationResumeExplorationSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        try:
+            generation = prepare_exploration_resume(
+                generation.pk,
+                expected_revision=values['expected_revision'],
+                recovery_notes=values['recovery_notes'],
+                user_id=request.user.id,
+            )
+        except GenerationResolutionConflict as exc:
+            return Response(
+                {
+                    'success': False,
+                    'message': str(exc),
+                    'data': WebUIScriptGenerationSerializer(exc.generation).data,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        prepared_revision = generation.revision
+        try:
+            task = generate_webui_script_generation_task.delay(str(generation.pk))
+            generation = attach_celery_task(
+                generation.pk, task.id, expected_revision=prepared_revision,
+            )
+        except Exception:
+            logger.exception('页面探索恢复任务调度失败: generation_id=%s', generation.pk)
+            generation = fail_queued_generation_dispatch(
+                generation.pk,
+                expected_revision=prepared_revision,
+                error_code='TRANSIENT_SERVICE_ERROR',
+                error_message='页面探索恢复任务暂时无法调度，请稍后重试。',
+            )
+            if generation.status == WebUIScriptGeneration.Status.FAILED:
+                publish_terminal(generation)
+            return Response(
+                {
+                    'success': False,
+                    'message': '页面探索恢复任务暂时无法调度，请刷新后重试。',
+                    'data': WebUIScriptGenerationSerializer(generation).data,
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response(
+            {
+                'success': True,
+                'message': '已保留现有产物，正在恢复页面探索。',
+                'data': WebUIScriptGenerationSerializer(generation).data,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class WebUIScriptGenerationDraftView(APIView):

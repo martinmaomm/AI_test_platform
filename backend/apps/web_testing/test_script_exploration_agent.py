@@ -209,7 +209,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
 
         result, client = self.run_with(Agent, callback=checkpoints.append)
         self.assertEqual((client.opened, client.closed), (1, 1))
-        self.assertEqual(Agent.tool_names, ['save_script_draft'])
+        self.assertEqual(Agent.tool_names, ['save_script_draft', 'patch_script_draft', 'read_script_draft'])
         self.assertIn('await page.goto', result.script_draft)
         self.assertEqual(result.completion, 'partial')
         self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['确认详情页操作'])
@@ -254,7 +254,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             async def run(self, *_args, **_kwargs): return ''
 
         self.run_with(Agent)
-        self.assertEqual(Agent.tools, ['save_script_draft'])
+        self.assertEqual(Agent.tools, ['save_script_draft', 'patch_script_draft', 'read_script_draft'])
         self.assertNotIn('finalize_exploration_path', Agent.instructions)
         self.assertNotIn('finalization_protocol', Agent.instructions)
 

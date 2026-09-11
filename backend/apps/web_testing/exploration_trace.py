@@ -722,9 +722,9 @@ def _evidence_locator(
     return None
 
 
-def build_locator_evidence(trace: ExplorationTrace) -> ExplorationTrace:
+def _locator_evidence(events, page_states) -> list[LocatorEvidence]:
     evidence: list[LocatorEvidence] = []
-    for event in trace.events:
+    for event in events:
         if event.status != 'succeeded':
             continue
         item = _evidence_locator(event)
@@ -732,7 +732,7 @@ def build_locator_evidence(trace: ExplorationTrace) -> ExplorationTrace:
             continue
         strategy, value, kwargs, validation, reasons = item
         fingerprint = next((
-            state.fingerprint for state in trace.page_states
+            state.fingerprint for state in page_states
             if state.state_id in {event.after_state_id, event.before_state_id}
         ), '')
         evidence.append(LocatorEvidence(
@@ -741,7 +741,11 @@ def build_locator_evidence(trace: ExplorationTrace) -> ExplorationTrace:
             value=value, kwargs=kwargs, validation=validation,
             validation_reasons=reasons, state_fingerprint=fingerprint,
         ))
-    return trace.model_copy(update={'locator_evidence': evidence})
+    return evidence
+
+
+def build_locator_evidence(trace: ExplorationTrace) -> ExplorationTrace:
+    return trace.model_copy(update={'locator_evidence': _locator_evidence(trace.events, trace.page_states)})
 
 
 class ExplorationTraceRecorder:
@@ -1239,6 +1243,14 @@ class ExplorationTraceRecorder:
         if run_id not in self._active:
             self.on_tool_start(serialized, input_str, run_id=run_id, inputs=inputs)
         self._complete(error or 'blocked by safety policy', run_id=run_id, status='blocked')
+
+    def evidence_snapshot(self) -> dict[str, Any]:
+        """Callback evidence without v4 path-finalization/business semantics."""
+        return {
+            'events': [event.model_dump(mode='json') for event in self._events],
+            'page_states': [state.model_dump(mode='json') for state in self._states],
+            'locator_evidence': [item.model_dump(mode='json') for item in _locator_evidence(self._events, self._states)],
+        }
 
     def build(
         self,

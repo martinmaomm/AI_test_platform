@@ -11,12 +11,16 @@ import asyncio
 import ast
 import json
 import logging
+import os
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from asgiref.sync import sync_to_async
 from django.conf import settings
@@ -25,6 +29,7 @@ from mcp_use import MCPClient
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_core.mcp_agent_budget import BudgetedMCPAgent as MCPAgent
+from ai_core.mcp_exploration_runtime import ExplorationRuntimeMiddleware, compact_saved_evidence
 from ai_core.webui_playwright_agent import (
     MCP_BROWSER_TOOL_CALL_LIMIT,
     MCP_INTERACTION_CORRECTION_LIMIT,
@@ -37,7 +42,8 @@ from common.parsers import extract_python_from_output
 
 from .exploration_policy import ExplorationPolicy
 from .exploration_timeout import exploration_total_timeout_seconds
-from .exploration_trace import ExplorationTraceRecorder
+from .exploration_trace import ExplorationTraceRecorder, _tool_failed
+from .script_draft_edits import apply_script_edits
 from .generation_preflight import (
     prepare_playwright_mcp_output_config,
     validate_generation_output_id,
@@ -68,9 +74,9 @@ EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览
 所有工具操作按顺序串行执行，包括填写、点击、读取页面和保存草稿；前一个完成后再执行下一个。需要根据页面结果决定的后续操作，应等待本轮工具结果后再发出。
 生成的 Python 脚本也必须按业务步骤逐个 await 浏览器操作，不使用 asyncio.gather、create_task、线程池或进程池并发执行测试步骤。
 浏览器调用上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，模型调用上限 {MCP_MAX_STEPS} 次；接近预算时停止浏览器操作，使用 save_script_draft 保存当前完整草稿和真实剩余步骤。
-每次得到足够的页面证据或修复草稿后，都必须调用 save_script_draft。该工具会返回静态检查反馈；按反馈继续完善，而不是只在最终文本一次性给代码。
+每完成一个有意义的业务子步骤或修复后，都保存草稿。首次或整体重写调用 save_script_draft，后续优先 patch_script_draft 局部更新，避免反复输出整份代码；需要准确片段时调用 read_script_draft。保存工具会返回修订号和静态检查反馈；按反馈继续完善，不只在最终文本给代码。
 save_script_draft 的 code 必须是完整可替换 Python 草稿，保留顶部中文“场景/目标”说明和主要步骤注释，入口为 async def run(page, variables)，不得自行启动或关闭浏览器。脚本首次 page.goto 必须使用 target_url 完整网址，原样保留路径、查询参数和 # 路由；后续导航也必须使用完整 HTTP(S) 网址，禁止依赖 '/'、相对路径、base_url 或测试环境。MCP 的 playwright_navigate 也使用完整网址并显式传 JSON 布尔值 headless: true。登录账号和密码只从原始测试描述理解，不存在独立登录信息表单或测试环境配置；缺少信息时明确说明，不编造账号。固定数据值和可选 variables 可以混用，仅需唯一值时使用 time.time_ns()。原始用户描述不可改写为虚构业务。
-任何会改变页面状态的提交、点击、导航或填写后，先用一次可见文本或 HTML 观察确认当前状态，再决定下一步；不得为了写脚本而刷新入口或重复已确认的流程。每完成一个业务子步骤（包含登录、导航、提交、验证或清理），立即调用 save_script_draft 持久化最新完整草稿，不要等到最终回复。
+点击、导航、按键等关键动作后，平台在工具结果中尽可能附带一次当前页面观察。先利用该观察决定下一步；只有观察缺失、失败、被截断或仍在加载时才补充读取。已观察表单的独立字段可以顺序连续填写，不要求每填一个字段都再读整页；联动字段改变结构时仍应观察。不得为了写脚本而刷新入口或重复已确认的流程。完成业务子步骤后用保存或局部修改工具持久化，不要等到最终回复。
 操作表单前先检查当前可见结构、控件状态及约束，根据用户目标和已提供数据完成填写，再提交；不要为了查找字段而先点击尚未检查的提交按钮。不要依赖固定语言的按钮文案或固定字段名推断业务意图。
 工具返回点击成功只说明动作已执行，不代表认证或业务成功；页面仍有表单也不代表认证失败。提交后先观察实际校验提示、控件状态及目标结果；页面仍在加载时先等待和观察，不连续点击。
 发现校验未通过或填错时，使用已有证据和用户提供的数据修正输入后允许重试；不得猜测凭据。只有成功执行且值确实变化的填写/选择才算输入纠正，重复填入同值、失败的填写、重复读取页面都不算。相同页面状态与输入状态下，同一操作最多执行 {MCP_INTERACTION_REPEAT_LIMIT} 次；相同页面状态下，即使修改输入，同一非输入操作累计也最多执行 {MCP_INTERACTION_CORRECTION_LIMIT} 次。达到上限前保存草稿和具体未完成原因，不能以轮换输入、变换同一元素的定位写法或反复刷新规避限制。缺少可靠结果证据时标记未确认，不编造成功或账号错误结论。
@@ -79,6 +85,7 @@ save_script_draft 的 code 必须是完整可替换 Python 草稿，保留顶部
 若真实完成并确认某一待补充操作或断言，只移除该项对应 marker；仅删除 marker 不构成完成证明，绝不自动清除平台侧状态。只有全部目标工作和待补充项均已真实完成时，才以 completion=complete、remaining_steps=[] 保存；否则保持 partial 并列出具体剩余项。completed_steps、remaining_steps 和 marker 的 reason 使用简洁中文。
 不得伪造按钮、页面文字、定位器或断言。禁止 playwright_evaluate、上传、关闭浏览器、外域导航，以及审批、付款、发布、下载等未授权高风险操作。浏览器只可访问本次目标站点。
 页面或定位器的名称不等于操作授权；按用户目标和实际页面证据区分查看页面与产生业务副作用，不因页面文案直接判定风险。无法确认授权范围的动作不要执行，先保存草稿并说明具体原因。
+若 brief.recovery_context 存在，这是用户明确确认后的中断恢复，不是从头重跑。当前浏览器是新会话，旧轨迹仅是历史证据；先观察当前现场，按需重新登录、导航和只读查询，核对用户补充说明及已完成步骤。不得直接执行整个已保存脚本或重复新增、修改、删除；结果不明确时先查询确认，无法确认则保存 partial 草稿并停止。只探索明确尚未完成且仍在原目标授权内的操作，保留已有代码和待补充标记。
 无需也不得调用任何路径定稿工具或基于 event id 的完成协议。最终回复只用中文简短说明已保存的草稿状态和剩余项，不输出推理过程；草稿的权威版本来自 save_script_draft。"""
 
 
@@ -100,6 +107,22 @@ class ScriptSaveInput(BaseModel):
     remaining_steps: list[str] = Field(default_factory=list, max_length=100)
     variables: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     completion: str = Field(default='partial', pattern=r'^(?:partial|complete|unknown)$')
+
+
+class ScriptPatchInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    expected_revision: int = Field(ge=0, strict=True)
+    edits: list[dict[str, str]] = Field(min_length=1, max_length=20)
+    completed_steps: list[str] | None = Field(default=None, max_length=100)
+    remaining_steps: list[str] | None = Field(default=None, max_length=100)
+    variables: list[dict[str, Any]] | None = Field(default=None, max_length=100)
+    completion: str | None = Field(default=None, pattern=r'^(?:partial|complete|unknown)$')
+
+
+class ScriptReadInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    start_line: int = Field(default=1, ge=1)
+    line_count: int = Field(default=100, ge=1, le=150)
 
 
 class ScriptExplorationAgentError(RuntimeError):
@@ -201,6 +224,9 @@ class ScriptExplorationAgent:
         self._target_url = ''
         self._trace_recorder = ExplorationTraceRecorder('/')
         self._guard: ScriptExplorationToolGuard | None = None
+        self._trace_path = ''
+        self._prior_attempts: list[dict[str, Any]] = []
+        self._efficiency_stats = Counter()
         self._last_valid_script = ''
         self._latest_candidate = ''
         self._artifact = {
@@ -210,6 +236,8 @@ class ScriptExplorationAgent:
             'remaining_steps': [],
             'variables': [],
         }
+        self._durable_script = ''
+        self._durable_artifact = deepcopy(self._artifact)
         self._final_message = ''
         self._raw_model_output = ''
         # Keep the unmodified model reply only for immediate local extraction.
@@ -253,12 +281,21 @@ class ScriptExplorationAgent:
         if parsed.fragment:
             self._start_path += '#' + parsed.fragment
         self._restore_snapshot(saved_snapshot)
+        if not code_only and self._brief.get('recovery_context') and saved_snapshot:
+            # Keep attempt-local event IDs separate. Historical observations
+            # must not masquerade as evidence from the new browser session.
+            self._prior_attempts.append({
+                key: self._saved_trace_data.get(key)
+                for key in ('events', 'page_states', 'locator_evidence', 'tool_stats', 'artifact', 'trace_path')
+            })
         self._last_valid_script = str(script_draft or self._restored_last_valid_script or '').strip()
         if self._last_valid_script:
             # A pre-existing draft is a rollback candidate even when it needs
             # repair; a bad later model proposal must never erase it.
             if self._artifact['completion'] == 'unknown':
                 self._artifact['completion'] = 'partial'
+        self._durable_script = self._last_valid_script
+        self._durable_artifact = deepcopy(self._artifact)
 
         if await self._is_cancelled():
             return self._result('TASK_CANCELLED', '用户已取消任务。')
@@ -289,10 +326,13 @@ class ScriptExplorationAgent:
                 additional_instructions=EXPLORATION_SCRIPT_CONSTRAINTS,
                 disallowed_tools=list(READ_ONLY_DISABLED_TOOL_MESSAGES),
                 callbacks=[self._guard],
+                runtime_factory=self._runtime_factory,
             )
             await self._await_task(asyncio.create_task(agent.initialize()), deadline)
             await self._await_task(
-                asyncio.create_task(agent.register_local_tools([self._save_tool()])), deadline,
+                asyncio.create_task(agent.register_local_tools([
+                    self._save_tool(), self._patch_tool(), self._read_tool(),
+                ])), deadline,
             )
             with suppress_mcp_raw_query_logs():
                 model_result = await self._await_task(
@@ -329,7 +369,10 @@ class ScriptExplorationAgent:
             allow_test_data_writes=bool(self._brief.get('allow_test_data_writes')) and not explicit_read_only,
             cleanup_expected=bool(self._brief.get('cleanup_expected')) and not explicit_read_only,
         )
-        trace_file = Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp' / f'{output_generation_id}.script-v5.trace.jsonl'
+        # The recorder truncates its file on creation. A new attempt must never
+        # erase the previous attempt's forensic evidence.
+        trace_file = Path(settings.BASE_DIR) / 'logs' / 'playwright-mcp' / f'{output_generation_id}.{uuid4().hex}.script-v5.trace.jsonl'
+        self._trace_path = str(trace_file)
         trace_file.parent.mkdir(parents=True, exist_ok=True)
         self._trace_recorder = ExplorationTraceRecorder(
             self._start_path, runtime_namespace=policy.namespace, trace_file=trace_file,
@@ -365,6 +408,8 @@ class ScriptExplorationAgent:
             variables: list[dict[str, Any]] | None = None,
             completion: str = 'partial',
         ) -> dict[str, Any]:
+            self._efficiency_stats['full_save_calls'] += 1
+            self._efficiency_stats['draft_submitted_chars'] += len(code)
             feedback = self._consider_candidate(
                 code,
                 completed_steps=completed_steps or [],
@@ -392,6 +437,65 @@ class ScriptExplorationAgent:
                 'code 必填，remaining_steps 非空时 completion 必须为 partial。'
             ),
             args_schema=ScriptSaveInput,
+        )
+
+    def _runtime_factory(self, tools):
+        try:
+            context_chars = max(12000, min(200000, int(os.environ.get('WEBUI_EXPLORATION_CONTEXT_CHARS', 48000))))
+        except (ValueError, TypeError):
+            context_chars = 48000
+        return ExplorationRuntimeMiddleware(
+            tools, checkpoint=lambda: dict(self._artifact), failed=_tool_failed,
+            stats=self._efficiency_stats, context_chars=context_chars,
+            auto_observe=os.environ.get('WEBUI_EXPLORATION_AUTO_OBSERVE', 'true').lower() not in {'0', 'false', 'no'},
+        )
+
+    def _read_tool(self):
+        async def read_script(start_line=1, line_count=100):
+            lines = self._last_valid_script.splitlines(keepends=True)
+            excerpt = ''.join(lines[start_line - 1:start_line - 1 + line_count])
+            return {
+                **self._artifact, 'start_line': start_line, 'total_lines': len(lines),
+                'code': excerpt[:16000], 'truncated': len(excerpt) > 16000,
+                'note': '片段不是完整脚本；如截断请缩小行范围读取，不能用截断片段覆盖完整草稿。',
+            }
+        return StructuredTool.from_function(
+            coroutine=read_script, name='read_script_draft', args_schema=ScriptReadInput,
+            description='按行读取当前权威草稿及修订号。局部修改前按需读取；只读，不打开浏览器。',
+        )
+
+    def _patch_tool(self):
+        async def patch_script(expected_revision, edits, completed_steps=None, remaining_steps=None, variables=None, completion=None):
+            self._efficiency_stats['patch_calls'] += 1
+            self._efficiency_stats['draft_submitted_chars'] += len(json.dumps(edits, ensure_ascii=False))
+            try:
+                candidate = apply_script_edits(
+                    self._last_valid_script, current_revision=self._artifact['revision'],
+                    expected_revision=expected_revision, edits=edits, max_chars=_MAX_SCRIPT_CHARS,
+                )
+            except ValueError as exc:
+                return {'status': 'rejected', 'revision': self._artifact['revision'], 'message': str(exc)}
+            feedback = self._consider_candidate(
+                candidate,
+                completed_steps=self._artifact['completed_steps'] if completed_steps is None else completed_steps,
+                remaining_steps=self._artifact['remaining_steps'] if remaining_steps is None else remaining_steps,
+                variables=self._artifact['variables'] if variables is None else variables,
+                completion=self._artifact['completion'] if completion is None else completion,
+                source='patch_tool',
+            )
+            if feedback['status'] == 'accepted':
+                if not await self._persist_checkpoint(force=True):
+                    return {**feedback, 'status': 'unsaved', 'error_code': 'CHECKPOINT_FAILED', 'message': self._checkpoint_failure}
+                self._efficiency_stats['patch_accepted'] += 1
+                self._efficiency_stats['patch_result_chars'] += len(candidate)
+            return feedback
+        return StructuredTool.from_function(
+            coroutine=patch_script, name='patch_script_draft', args_schema=ScriptPatchInput,
+            description=(
+                '增量保存草稿：expected_revision 必须匹配；edits 中 old 在当前代码恰好出现一次，替换为 new。'
+                '所有项通过后才保存；省略进度字段表示保留。先用 read_script_draft 获取准确片段，勿猜测；'
+                '完成待办时需同时修改对应代码标记和 remaining_steps，不自动宣称已验证。'
+            ),
         )
 
     def _consider_candidate(
@@ -538,7 +642,7 @@ class ScriptExplorationAgent:
             'mode': 'code_only',
             'brief': self._brief,
             'target_url': self._target_url,
-            'saved_trace': self._saved_trace_data,
+            'saved_trace': compact_saved_evidence(self._saved_trace_data),
             'existing_script_draft': self._last_valid_script,
             'diagnostics': diagnostics,
             'repair_diagnostics': self._saved_repair_diagnostics,
@@ -607,7 +711,16 @@ class ScriptExplorationAgent:
                 raise ScriptExplorationAgentError('CHECKPOINT_FAILED', self._checkpoint_failure)
             await self._persist_checkpoint()
             await asyncio.wait({task}, timeout=0.25)
-        return await task
+        result = await task
+        # A fast graph can finish between polling ticks. An automatic read may
+        # already have hit a guard even if the model immediately says "done".
+        if self._guard is not None and self._guard.terminal_error is not None:
+            raise self._guard.terminal_error
+        if self._checkpoint_failure:
+            raise ScriptExplorationAgentError('CHECKPOINT_FAILED', self._checkpoint_failure)
+        if time.monotonic() >= deadline:
+            raise ScriptExplorationAgentError('exploration_timeout', '页面探索已达到总时限。')
+        return result
 
     async def _is_cancelled(self) -> bool:
         return bool(await self._async_cancel_check())
@@ -634,6 +747,8 @@ class ScriptExplorationAgent:
 
     async def _persist_checkpoint(self, *, force: bool = False) -> bool:
         if self.checkpoint_callback is None:
+            self._durable_script = self._last_valid_script
+            self._durable_artifact = deepcopy(self._artifact)
             return True
         if self._checkpoint_failure:
             return False
@@ -652,9 +767,15 @@ class ScriptExplorationAgent:
             saved = await sync_to_async(self.checkpoint_callback, thread_sensitive=True)(payload)
             if saved is False:
                 raise RuntimeError('checkpoint_callback 返回 False')
+            persisted_artifact = payload['snapshot']['artifact']
+            if persisted_artifact['revision'] >= self._durable_artifact['revision']:
+                self._durable_script = payload['script_draft']
+                self._durable_artifact = deepcopy(persisted_artifact)
             return True
         except Exception:
-            logger.warning('v5 草稿 checkpoint 失败，探索继续保留内存中的最后有效草稿。', exc_info=True)
+            logger.warning('v5 草稿 checkpoint 失败，停止探索并恢复最后持久化草稿；失败候选保留用于诊断。', exc_info=True)
+            self._last_valid_script = self._durable_script
+            self._artifact = deepcopy(self._durable_artifact)
             self._checkpoint_failure = '草稿 checkpoint 未保存，任务已停止；请以最后一次成功持久化版本为准。'
             self._termination_reason = 'CHECKPOINT_FAILED'
             self._warnings.append(self._checkpoint_failure)
@@ -669,24 +790,22 @@ class ScriptExplorationAgent:
             locator_evidence = list(trace_data.get('locator_evidence') or [])
         else:
             stats = self._guard.get_stats()
-            trace = self._trace_recorder.build(
-                tool_stats={
+            data = self._trace_recorder.evidence_snapshot()
+            stats = {
                     **stats,
                     'model_calls': self._guard.model_call_count,
                     'browser_call_limit': MCP_BROWSER_TOOL_CALL_LIMIT,
                     'model_call_limit': MCP_MAX_STEPS,
-                },
-                termination_reason=self._termination_reason or str(stats.get('termination_reason') or ''),
-                warnings=self._warnings,
-            )
-            data = trace.model_dump(mode='json')
+            }
             events = data['events']
             page_states = data['page_states']
             locator_evidence = data['locator_evidence']
-            stats = data['tool_stats']
+        stats['efficiency'] = dict(self._efficiency_stats)
         raw_output = self._raw_model_output
         return {
             'schema_version': 5,
+            'trace_path': self._trace_path or self._saved_trace_data.get('trace_path', ''),
+            'prior_attempts': self._prior_attempts,
             'target_url': self._target_url,
             'events': events,
             'page_states': page_states,
@@ -733,8 +852,8 @@ class ScriptExplorationAgent:
         return json.dumps({
             'brief': self._brief,
             'target_url': self._target_url,
-            'saved_snapshot': self._saved_trace_data,
-            'existing_script_draft': self._last_valid_script,
+            'saved_snapshot': compact_saved_evidence(self._saved_trace_data),
+            'existing_script_draft': self._last_valid_script if len(self._last_valid_script) <= 16000 else '草稿较长，使用 read_script_draft 分段读取当前代码。',
             'artifact': self._artifact,
             'scope': {
                 'allow_test_data_writes': bool(self._brief.get('allow_test_data_writes')),
@@ -746,6 +865,7 @@ class ScriptExplorationAgent:
     def _restore_snapshot(self, snapshot: dict | None) -> None:
         value = snapshot if isinstance(snapshot, dict) else {}
         self._saved_trace_data = dict(value)
+        self._prior_attempts = [item for item in value.get('prior_attempts', []) if isinstance(item, dict)] if isinstance(value.get('prior_attempts'), list) else []
         for key, default in (
             ('events', []), ('page_states', []), ('locator_evidence', []), ('tool_stats', {}),
         ):

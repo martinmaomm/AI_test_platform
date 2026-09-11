@@ -14,8 +14,19 @@ from .generation_contracts import (
     stage_for_status,
     validate_transition,
 )
+from .generation_lifecycle import (
+    GENERATION_ACTIVE_STATUSES,
+    checkpoint_lifecycle_metadata,
+    claim_lifecycle_metadata,
+    run_matches,
+)
 from .models import WebUIScriptGeneration
-from .generation_workspace import REPAIR_CANDIDATE_STATUSES, workspace_for_generation
+from .generation_workspace import (
+    BUSY_REPAIR_STATUSES,
+    BUSY_VERIFICATION_STATUSES,
+    REPAIR_CANDIDATE_STATUSES,
+    workspace_for_generation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +36,22 @@ PAUSED_GENERATION_STATUSES = frozenset({
     WebUIScriptGeneration.Status.NEEDS_INPUT,
     WebUIScriptGeneration.Status.NEEDS_CONFIRMATION,
 })
+
+
+def _invalidate_previous_run(workspace: dict[str, Any], previous_task_id: str | None) -> dict[str, Any]:
+    result = dict(workspace)
+    obsolete = result.get('_obsolete_generation_task_ids')
+    obsolete = list(obsolete) if isinstance(obsolete, list) else []
+    if previous_task_id:
+        obsolete.append(str(previous_task_id))
+    # Code-only retries have no product-level attempt cap.  Dropping an older
+    # delivery id would eventually let that obsolete Celery message claim a
+    # later revision before its new task id is attached.
+    result['_obsolete_generation_task_ids'] = list(dict.fromkeys(obsolete))
+    result.pop('_agent_run', None)
+    result.pop('_generation_dispatch', None)
+    result.pop('_trace_generation_dispatch', None)
+    return result
 
 
 class GenerationResolutionConflict(ValueError):
@@ -54,11 +81,22 @@ def transition_generation(
     error_code: str | None = None,
     error_message: str | None = None,
     updates: dict[str, Any] | None = None,
-) -> WebUIScriptGeneration:
+    generation_revision: int | None = None,
+    task_id: str | None = None,
+) -> WebUIScriptGeneration | None:
     """Apply an idempotent, validated status update under a row lock."""
     updates = updates or {}
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        if generation_revision is not None or task_id is not None:
+            if generation_revision is None or task_id is None:
+                raise ValueError('generation_revision 和 task_id 必须同时提供')
+            if not run_matches(
+                generation,
+                generation_revision=generation_revision,
+                task_id=task_id,
+            ):
+                return None
         validate_transition(generation.status, target_status)
 
         changed_fields: set[str] = set()
@@ -106,10 +144,17 @@ def transition_generation(
     return generation
 
 
-def attach_celery_task(generation_id: Any, celery_task_id: str) -> WebUIScriptGeneration:
+def attach_celery_task(
+    generation_id: Any,
+    celery_task_id: str,
+    *,
+    expected_revision: int | None = None,
+) -> WebUIScriptGeneration:
     """Attach the id-only task payload once; duplicate retries are harmless."""
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        if expected_revision is not None and generation.revision != expected_revision:
+            raise GenerationTransitionError('生成记录版本已变化，不能关联旧任务')
         if generation.celery_task_id and generation.celery_task_id != celery_task_id:
             raise GenerationTransitionError('生成记录已关联到另一个 Celery 任务')
         if generation.celery_task_id != celery_task_id:
@@ -122,7 +167,7 @@ def claim_generation_worker(generation_id: Any, celery_task_id: str | None) -> W
     """Claim one durable generation attempt without replaying browser writes.
 
     A crashed worker is deliberately not auto-restarted from the beginning.
-    The user must inspect the outcome and explicitly start a new generation.
+    The user must inspect the preserved outcome and explicitly resume it.
     """
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
@@ -134,11 +179,14 @@ def claim_generation_worker(generation_id: Any, celery_task_id: str | None) -> W
         if celery_task_id and generation.celery_task_id and generation.celery_task_id != celery_task_id:
             return None
         workspace = dict(generation.workspace or {})
+        obsolete_task_ids = workspace.get('_obsolete_generation_task_ids')
+        obsolete_task_ids = obsolete_task_ids if isinstance(obsolete_task_ids, list) else []
         previous = workspace.get('_generation_dispatch') or {}
         if previous.get('revision') == generation.revision:
             return None
         if celery_task_id and (
             previous.get('task_id') == celery_task_id
+            or celery_task_id in obsolete_task_ids
             or any(item.get('previous_task_id') == celery_task_id for item in generation.clarifications or [])
         ):
             return None
@@ -146,11 +194,11 @@ def claim_generation_worker(generation_id: Any, celery_task_id: str | None) -> W
             'revision': generation.revision, 'task_id': celery_task_id or '<direct>',
             'claimed_at': timezone.now().isoformat(),
         }
-        workspace['_agent_run'] = {
-            'generation_revision': generation.revision,
-            'task_id': celery_task_id or '<direct>',
-            'started_at': timezone.now().isoformat(),
-        }
+        workspace = claim_lifecycle_metadata(
+            workspace,
+            generation_revision=generation.revision,
+            task_id=celery_task_id,
+        )
         generation.workspace = workspace
         fields = ['workspace', 'updated_at']
         if celery_task_id and not generation.celery_task_id:
@@ -222,8 +270,10 @@ def prepare_generation_resolution(
                 'description_revised': description_safe is not None,
                 'resolved_by': int(user_id),
                 'resolved_at': timezone.now().isoformat(),
-                'previous_task_id': previous_task_id or '',
             })
+            generation.workspace = _invalidate_previous_run(
+                dict(generation.workspace or {}), previous_task_id,
+            )
             generation.clarifications = history
             generation.revision += 1
             generation.resume_count += 1
@@ -243,6 +293,7 @@ def prepare_generation_resolution(
                 'clarifications', 'revision', 'resume_count', 'status',
                 'current_stage', 'progress', 'celery_task_id', 'error_code',
                 'error_message', 'warnings', 'completed_at', 'description_safe', 'target_url',
+                'workspace',
             ]
             if target_status == WebUIScriptGeneration.Status.NORMALIZING:
                 generation.scenario_spec = {}
@@ -291,6 +342,10 @@ def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int
     with transaction.atomic():
         generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
         workspace = workspace_for_generation(generation)
+        if workspace['verification'].get('status') in BUSY_VERIFICATION_STATUSES:
+            raise GenerationResolutionConflict('草稿调试正在运行，请等待完成后再整理代码。', generation)
+        if workspace['repair'].get('status') in BUSY_REPAIR_STATUSES:
+            raise GenerationResolutionConflict('草稿修复正在运行，请等待完成后再整理代码。', generation)
         if workspace['repair'].get('status') in REPAIR_CANDIDATE_STATUSES:
             raise GenerationResolutionConflict('请先采用或放弃当前候选。', generation)
         snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
@@ -304,15 +359,34 @@ def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int
             raise GenerationResolutionConflict('当前记录没有可用于代码整理的真实轨迹或草稿，不能重试。', generation)
         if generation.revision != expected_revision or snapshot.get('schema_version') != 5:
             raise GenerationResolutionConflict('仅支持当前 v5 产物的代码整理；旧版记录请手动处理源码。', generation)
+        previous_task_id = generation.celery_task_id
+        next_revision = generation.revision + 1
+        raw_workspace = _invalidate_previous_run(
+            dict(generation.workspace or {}), previous_task_id,
+        )
+        previous_lifecycle = (
+            generation.workspace.get('_generation_lifecycle')
+            if isinstance(generation.workspace, dict) else {}
+        )
+        previous_lifecycle = previous_lifecycle if isinstance(previous_lifecycle, dict) else {}
+        raw_workspace['_generation_lifecycle'] = {
+            'revision': next_revision,
+            'task_id': '',
+            'claimed_at': None,
+            'heartbeat_at': None,
+            'last_checkpoint_at': previous_lifecycle.get('last_checkpoint_at'),
+            'interrupted_at': None,
+        }
+        generation.workspace = raw_workspace
         generation.status = WebUIScriptGeneration.Status.GENERATING
         generation.current_stage = WebUIScriptGeneration.Stage.GENERATING
         generation.progress = 60
-        generation.revision += 1
+        generation.revision = next_revision
         generation.error_code = ''
         generation.error_message = ''
         generation.completed_at = None
         generation.celery_task_id = None
-        generation.save(update_fields=['status', 'current_stage', 'progress', 'revision', 'error_code', 'error_message', 'completed_at', 'celery_task_id', 'updated_at'])
+        generation.save(update_fields=['workspace', 'status', 'current_stage', 'progress', 'revision', 'error_code', 'error_message', 'completed_at', 'celery_task_id', 'updated_at'])
         return generation
 
 
@@ -328,8 +402,12 @@ def claim_trace_generation_retry(
         if celery_task_id and generation.celery_task_id and generation.celery_task_id != celery_task_id:
             return None
         workspace = dict(generation.workspace or {})
+        obsolete_task_ids = workspace.get('_obsolete_generation_task_ids')
+        obsolete_task_ids = obsolete_task_ids if isinstance(obsolete_task_ids, list) else []
         dispatch = workspace.get('_trace_generation_dispatch') or {}
         task_marker = celery_task_id or '<direct>'
+        if task_marker in obsolete_task_ids:
+            return None
         if dispatch.get('revision') == generation.revision and dispatch.get('task_id') == task_marker:
             return None
         workspace['_trace_generation_dispatch'] = {
@@ -337,12 +415,12 @@ def claim_trace_generation_retry(
             'task_id': task_marker,
             'claimed_at': timezone.now().isoformat(),
         }
-        workspace['_agent_run'] = {
-            'generation_revision': generation.revision,
-            'task_id': task_marker,
-            'started_at': timezone.now().isoformat(),
-            'code_only': True,
-        }
+        workspace = claim_lifecycle_metadata(
+            workspace,
+            generation_revision=generation.revision,
+            task_id=task_marker,
+        )
+        workspace['_agent_run']['code_only'] = True
         generation.workspace = workspace
         fields = ['workspace', 'updated_at']
         # The worker can start before the HTTP dispatcher attaches its id.
@@ -420,6 +498,7 @@ def persist_generation_checkpoint(
                 else:
                     history[-1] = entry
             workspace['artifact_history'] = history[-MAX_ARTIFACT_HISTORY:]
+            workspace = checkpoint_lifecycle_metadata(workspace)
             if normalized_variables is not None:
                 workspace['variables'] = normalized_variables
             if changed:
@@ -548,3 +627,167 @@ def finalize_generation_artifact(
             'tool_stats', 'warnings', 'completed_at', 'updated_at',
         ])
     return generation
+
+
+def fail_generation_run(
+    generation_id: Any,
+    *,
+    task_id: str,
+    error_code: str,
+    error_message: str,
+    generation_revision: int | None = None,
+) -> WebUIScriptGeneration | None:
+    """Fail only the currently owned run and preserve every durable artifact."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        expected_revision = generation.revision if generation_revision is None else int(generation_revision)
+        if (
+            generation.status not in GENERATION_ACTIVE_STATUSES
+            or not run_matches(
+                generation,
+                generation_revision=expected_revision,
+                task_id=task_id,
+            )
+        ):
+            return None
+        actual_failure_stage = generation.current_stage
+        snapshot = dict(generation.exploration_snapshot or {})
+        snapshot['actual_failure_stage'] = actual_failure_stage
+        snapshot['termination_reason'] = error_code
+        generation.exploration_snapshot = snapshot
+        generation.status = WebUIScriptGeneration.Status.FAILED
+        generation.current_stage = WebUIScriptGeneration.Stage.COMPLETED
+        generation.progress = 100
+        generation.error_code = error_code
+        generation.error_message = error_message
+        generation.completed_at = generation.completed_at or timezone.now()
+        generation.save(update_fields=[
+            'exploration_snapshot', 'status', 'current_stage', 'progress',
+            'error_code', 'error_message', 'completed_at', 'updated_at',
+        ])
+        return generation
+
+
+def fail_queued_generation_dispatch(
+    generation_id: Any,
+    *,
+    expected_revision: int,
+    error_code: str,
+    error_message: str,
+) -> WebUIScriptGeneration:
+    """Fail a broker dispatch only if no worker has claimed that revision."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        workspace = dict(generation.workspace or {})
+        run = workspace.get('_agent_run') if isinstance(workspace.get('_agent_run'), dict) else {}
+        if generation.revision != expected_revision or run:
+            return generation
+        if generation.status not in GENERATION_ACTIVE_STATUSES:
+            return generation
+        snapshot = dict(generation.exploration_snapshot or {})
+        snapshot['actual_failure_stage'] = generation.current_stage
+        snapshot['termination_reason'] = error_code
+        generation.exploration_snapshot = snapshot
+        generation.status = WebUIScriptGeneration.Status.FAILED
+        generation.current_stage = WebUIScriptGeneration.Stage.COMPLETED
+        generation.progress = 100
+        generation.error_code = error_code
+        generation.error_message = error_message
+        generation.completed_at = generation.completed_at or timezone.now()
+        generation.save(update_fields=[
+            'exploration_snapshot', 'status', 'current_stage', 'progress',
+            'error_code', 'error_message', 'completed_at', 'updated_at',
+        ])
+        return generation
+
+
+def prepare_exploration_resume(
+    generation_id: Any,
+    *,
+    expected_revision: int,
+    recovery_notes: str,
+    user_id: int,
+) -> WebUIScriptGeneration:
+    """Prepare one explicit browser exploration resume without clearing evidence."""
+    with transaction.atomic():
+        generation = WebUIScriptGeneration.objects.select_for_update().get(pk=generation_id)
+        workspace = workspace_for_generation(generation)
+        snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
+        artifact = snapshot.get('artifact') if isinstance(snapshot.get('artifact'), dict) else {}
+        if generation.revision != expected_revision:
+            raise GenerationResolutionConflict('生成状态已变化，请刷新后重试。', generation)
+        if generation.status not in {
+            WebUIScriptGeneration.Status.FAILED,
+            WebUIScriptGeneration.Status.NEEDS_REVIEW,
+            WebUIScriptGeneration.Status.CANCELLED,
+        }:
+            raise GenerationResolutionConflict('当前生成记录不能恢复页面探索。', generation)
+        if snapshot.get('schema_version') != 5 or not (
+            snapshot.get('events') or (generation.script_draft or '').strip()
+        ):
+            raise GenerationResolutionConflict('当前记录没有可恢复的 v5 轨迹或草稿。', generation)
+        if generation.resume_count >= MAX_GENERATION_RESUME_COUNT:
+            raise GenerationResolutionConflict('恢复次数已达到上限，请新建生成任务。', generation)
+        if workspace['verification'].get('status') in BUSY_VERIFICATION_STATUSES:
+            raise GenerationResolutionConflict('当前草稿仍在调试，不能恢复页面探索。', generation)
+        repair_status = workspace['repair'].get('status')
+        if repair_status in BUSY_REPAIR_STATUSES:
+            raise GenerationResolutionConflict('当前草稿仍在修复，不能恢复页面探索。', generation)
+        if repair_status in REPAIR_CANDIDATE_STATUSES:
+            raise GenerationResolutionConflict('请先采用或放弃当前修复候选。', generation)
+
+        source_status = generation.status
+        previous_lifecycle = (
+            generation.workspace.get('_generation_lifecycle')
+            if isinstance(generation.workspace, dict) else {}
+        )
+        previous_lifecycle = previous_lifecycle if isinstance(previous_lifecycle, dict) else {}
+        history = list(generation.clarifications or [])
+        next_revision = generation.revision + 1
+        now = timezone.now()
+        history.append({
+            'revision': next_revision,
+            'source_status': source_status,
+            'error_code': generation.error_code,
+            'recovery_notes': recovery_notes,
+            'resumed_by': int(user_id),
+            'resumed_at': now.isoformat(),
+        })
+
+        raw_workspace = _invalidate_previous_run(
+            dict(generation.workspace or {}), generation.celery_task_id,
+        )
+        raw_workspace['_generation_lifecycle'] = {
+            'revision': next_revision,
+            'task_id': '',
+            'claimed_at': None,
+            'heartbeat_at': None,
+            'last_checkpoint_at': previous_lifecycle.get('last_checkpoint_at'),
+            'interrupted_at': None,
+        }
+        raw_workspace['_generation_recovery'] = {
+            'revision': next_revision,
+            'notes': recovery_notes,
+            'completed_steps': list(artifact.get('completed_steps') or []),
+            'remaining_steps': list(artifact.get('remaining_steps') or []),
+            'previous_status': source_status,
+            'last_checkpoint_at': previous_lifecycle.get('last_checkpoint_at'),
+        }
+        generation.workspace = raw_workspace
+        generation.clarifications = history
+        generation.revision = next_revision
+        generation.resume_count += 1
+        generation.status = WebUIScriptGeneration.Status.PREFLIGHTING
+        generation.current_stage = WebUIScriptGeneration.Stage.PREFLIGHTING
+        generation.progress = 25
+        generation.celery_task_id = None
+        generation.cancel_requested_at = None
+        generation.error_code = ''
+        generation.error_message = ''
+        generation.completed_at = None
+        generation.save(update_fields=[
+            'workspace', 'clarifications', 'revision', 'resume_count', 'status',
+            'current_stage', 'progress', 'celery_task_id', 'cancel_requested_at',
+            'error_code', 'error_message', 'completed_at', 'updated_at',
+        ])
+        return generation

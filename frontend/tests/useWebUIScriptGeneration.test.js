@@ -12,7 +12,7 @@ const methods = [
   'cancelWebUIScriptGeneration', 'createWebUIScriptGeneration', 'debugWebUIScriptGeneration',
   'discardWebUIScriptGenerationRepair',
   'getWebUIScriptGeneration', 'getWebUIScriptGenerations', 'getWebUITestCaseExecution', 'repairWebUIScriptGeneration',
-  'resolveWebUIScriptGeneration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
+  'resolveWebUIScriptGeneration', 'resumeWebUIScriptGenerationExploration', 'retryWebUIScriptGenerationFromTrace', 'saveWebUIScriptGeneration', 'updateWebUIScriptGenerationDraft'
 ]
 const record = (workspace = {}) => ({
   id: 'test-generation', status: 'ready', target_url: 'https://example.test/', script_draft: 'async def run(page):\n    pass',
@@ -261,6 +261,137 @@ test('409 on saving preserves the editable draft and exposes conflict', async t 
   await assert.rejects(state.saveDraft())
   assert.equal(state.draftConflict.value, true)
   assert.equal(state.localDraft.value.script_draft, 'user edits must survive')
+})
+
+test('interrupted exploration only resumes from a clean, resumable lifecycle state', async t => {
+  const interrupted = {
+    ...record({ revision: 7 }), revision: 7, status: 'needs_review',
+    lifecycle: { state: 'interrupted', can_resume: true, heartbeat_at: '2026-09-11T01:00:00Z', last_checkpoint_at: '2026-09-11T00:59:00Z', interrupted_at: '2026-09-11T01:01:00Z' }
+  }
+  const { state, calls } = await harness(t, interrupted)
+
+  assert.equal(state.canResumeExploration.value, true)
+  state.updateLocalDraft({ ...state.localDraft.value, script_draft: 'unsaved recovery edit' })
+  assert.equal(state.canResumeExploration.value, false)
+  await assert.rejects(state.resumeExploration('页面停在列表，尚未创建数据。'), /请先保存草稿/)
+  assert.equal(calls.some(call => call.name === 'resumeWebUIScriptGenerationExploration'), false)
+})
+
+test('resume exploration validates notes and starts polling only after the matching response', async t => {
+  const interrupted = {
+    ...record({ revision: 7 }), revision: 7, status: 'needs_review',
+    lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const { state, handlers, calls, timers } = await harness(t, interrupted)
+  await assert.rejects(state.resumeExploration('   '), /请填写现场恢复说明/)
+  assert.equal(calls.some(call => call.name === 'resumeWebUIScriptGenerationExploration'), false)
+
+  handlers.resumeWebUIScriptGenerationExploration = async () => ({ success: true, data: {
+    ...interrupted, revision: 8, status: 'exploring', current_stage: 'exploring', lifecycle: { state: 'running', can_resume: false, heartbeat_at: '2026-09-11T01:02:00Z' }
+  } })
+  await state.resumeExploration('当前停在列表页，未创建测试数据，仍需验证搜索结果。')
+
+  const resumeCall = calls.find(call => call.name === 'resumeWebUIScriptGenerationExploration')
+  assert.deepEqual(resumeCall.args, [1, 'test-generation', {
+    expected_revision: 7,
+    confirmed: true,
+    recovery_notes: '当前停在列表页，未创建测试数据，仍需验证搜索结果。'
+  }])
+  assert.equal(state.generation.value.lifecycle.state, 'running')
+  assert.equal(timers.size, 1)
+})
+
+test('resume exploration has a composable double-click guard', async t => {
+  const interrupted = {
+    ...record({ revision: 7 }), revision: 7, status: 'needs_review', lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const { state, handlers, calls } = await harness(t, interrupted)
+  const pendingResponse = deferred()
+  handlers.resumeWebUIScriptGenerationExploration = () => pendingResponse.promise
+
+  const first = state.resumeExploration('页面停在列表页，仍需完成断言。')
+  const second = await state.resumeExploration('不应发出第二次请求。')
+  assert.equal(second, null)
+  assert.equal(calls.filter(call => call.name === 'resumeWebUIScriptGenerationExploration').length, 1)
+
+  pendingResponse.resolve({ success: true, data: { ...interrupted, status: 'exploring', lifecycle: { state: 'queued', can_resume: false } } })
+  await first
+  assert.equal(state.resolving.value, false)
+})
+
+test('resume refuses a dialog payload whose generation or revision is no longer current', async t => {
+  const interrupted = {
+    ...record({ revision: 7 }), revision: 7, status: 'needs_review', lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const { state, calls } = await harness(t, interrupted)
+  assert.equal(await state.resumeExploration('当前页面仍停在列表，未创建数据。', { generationId: 'other-generation', revision: 7 }), null)
+  assert.equal(await state.resumeExploration('当前页面仍停在列表，未创建数据。', { generationId: 'test-generation', revision: 8 }), null)
+  assert.equal(calls.some(call => call.name === 'resumeWebUIScriptGenerationExploration'), false)
+})
+
+test('resume 409 applies only the matching latest record and preserves the workspace', async t => {
+  const interrupted = {
+    ...record({ revision: 7, variables: [{ name: 'TEST_LABEL', value: 'local-value', is_secret: false }] }), revision: 7, status: 'needs_review', lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const latest = { ...interrupted, revision: 8, lifecycle: { state: 'idle', can_resume: false } }
+  const { state, handlers } = await harness(t, interrupted)
+  handlers.resumeWebUIScriptGenerationExploration = async () => {
+    throw { response: { status: 409, data: { message: 'stale', data: latest } } }
+  }
+
+  await assert.rejects(state.resumeExploration('当前页面仍停在列表，未创建数据。'))
+  assert.equal(state.generation.value.revision, 8)
+  assert.equal(state.generation.value.lifecycle.state, 'idle')
+  assert.equal(state.localDraft.value.generationId, 'test-generation')
+  assert.equal(state.localDraft.value.revision, 7)
+  assert.equal(state.localDraft.value.variables[0].value, 'local-value')
+  assert.equal(state.localDraft.value.dirty, true)
+  assert.equal(state.draftConflict.value, true)
+  assert.match(state.lastError.value, /明确丢弃本地编辑并刷新/)
+})
+
+test('resume rejects a wrong-id success response without replacing the current workspace', async t => {
+  const interrupted = {
+    ...record({ revision: 7 }), revision: 7, status: 'needs_review', lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const { state, handlers } = await harness(t, interrupted)
+  handlers.resumeWebUIScriptGenerationExploration = async () => ({ success: true, data: { ...interrupted, id: 'wrong-generation', status: 'exploring' } })
+
+  await assert.rejects(state.resumeExploration('当前页面仍停在列表，未创建数据。'), /响应与当前生成记录不一致/)
+  assert.equal(state.generation.value.id, 'test-generation')
+  assert.equal(state.localDraft.value.generationId, 'test-generation')
+  assert.equal(state.draftConflict.value, false)
+})
+
+test('resume network failure preserves the current workspace and local draft', async t => {
+  const interrupted = {
+    ...record({ revision: 7, variables: [{ name: 'TEST_LABEL', value: 'keep-value', is_secret: false }] }), revision: 7, status: 'needs_review', lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const { state, handlers } = await harness(t, interrupted)
+  handlers.resumeWebUIScriptGenerationExploration = async () => { throw new Error('network unavailable') }
+
+  await assert.rejects(state.resumeExploration('当前页面仍停在列表，未创建数据。'), /network unavailable/)
+  assert.equal(state.generation.value.lifecycle.state, 'interrupted')
+  assert.equal(state.localDraft.value.variables[0].value, 'keep-value')
+  assert.equal(state.localDraft.value.dirty, false)
+  assert.equal(state.draftConflict.value, false)
+})
+
+test('late resume responses cannot restore a generation after project switch', async t => {
+  const interrupted = {
+    ...record({ revision: 7 }), revision: 7, status: 'needs_review', lifecycle: { state: 'interrupted', can_resume: true }
+  }
+  const { state, projectId, handlers } = await harness(t, interrupted)
+  const pendingResponse = deferred()
+  handlers.resumeWebUIScriptGenerationExploration = () => pendingResponse.promise
+  const pending = state.resumeExploration('当前页面仍停在列表，未创建数据。')
+  projectId.value = 2
+  await nextTick()
+  pendingResponse.resolve({ success: true, data: { ...interrupted, status: 'exploring', lifecycle: { state: 'running', can_resume: false } } })
+  await pending
+
+  assert.equal(state.generation.value, null)
+  assert.equal(state.localDraft.value, null)
 })
 
 test('no execution is started until the explicit debug action', async t => {

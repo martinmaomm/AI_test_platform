@@ -12,10 +12,15 @@ from ai_core.model_manager import get_llm_manager
 
 from .exploration_timeout import exploration_total_timeout_seconds
 from .generation_events import publish_stage_changed, publish_terminal
+from .generation_lifecycle import (
+    generation_heartbeat,
+    is_generation_run_active,
+    recovery_context_for_generation,
+)
 from .generation_preflight import run_safety_preflight
 from .generation_repository import (
     PAUSED_GENERATION_STATUSES, claim_generation_worker, claim_trace_generation_retry,
-    finalize_generation_artifact, is_cancel_requested,
+    fail_generation_run, finalize_generation_artifact, is_cancel_requested,
     persist_generation_checkpoint, transition_generation,
 )
 from .generation_workspace import evaluate_workspace_draft, workspace_for_generation
@@ -29,23 +34,48 @@ def _terminal_cancel(generation_id: str, task_id: str | None) -> bool:
     return bool(task_id and cache.get(f'celery:cancel:{task_id}')) or is_cancel_requested(generation_id)
 
 
-def _fail(generation_id: str, code: str, message: str) -> dict[str, Any]:
-    logger.warning('WebUI v5 generation stopped: generation_id=%s error_code=%s', generation_id, code)
+def _run_should_stop(
+    generation_id: str, *, generation_revision: int, task_id: str,
+) -> bool:
+    """One high-frequency DB read covers both cancellation and lost ownership."""
+    return bool(task_id != '<direct>' and cache.get(f'celery:cancel:{task_id}')) or not is_generation_run_active(
+        generation_id,
+        generation_revision=generation_revision,
+        task_id=task_id,
+    )
+
+
+def _fail(
+    generation: WebUIScriptGeneration,
+    *,
+    task_id: str,
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    logger.warning('WebUI v5 generation stopped: generation_id=%s error_code=%s', generation.pk, code)
     try:
-        generation = transition_generation(
-            generation_id, WebUIScriptGeneration.Status.FAILED, progress=100,
-            error_code=code, error_message=message,
+        failed = fail_generation_run(
+            generation.pk,
+            generation_revision=generation.revision,
+            task_id=task_id,
+            error_code=code,
+            error_message=message,
         )
-        publish_terminal(generation)
-        return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': code}
+        if failed is None:
+            return {'generation_id': str(generation.pk), 'status': 'stale', 'error_code': 'STALE_AGENT_RESULT'}
+        publish_terminal(failed)
+        return {'generation_id': str(failed.pk), 'status': failed.status, 'error_code': code}
     except Exception:
-        logger.exception('无法持久化生成失败状态: generation_id=%s', generation_id)
-        return {'generation_id': str(generation_id), 'status': 'persistence_failed', 'error_code': 'PERSISTENCE_FAILED'}
+        logger.exception('无法持久化生成失败状态: generation_id=%s', generation.pk)
+        return {'generation_id': str(generation.pk), 'status': 'persistence_failed', 'error_code': 'PERSISTENCE_FAILED'}
 
 
-def fail_unexpected_generation(generation_id: str) -> dict[str, Any]:
+def fail_unexpected_generation(generation_id: str, celery_task_id: str | None) -> dict[str, Any]:
     try:
-        generation = WebUIScriptGeneration.objects.only('pk', 'status', 'error_code').get(pk=generation_id)
+        generation = WebUIScriptGeneration.objects.only(
+            'pk', 'status', 'current_stage', 'progress', 'error_code', 'revision',
+            'celery_task_id', 'workspace', 'exploration_snapshot', 'completed_at',
+        ).get(pk=generation_id)
     except Exception:
         return {'generation_id': str(generation_id), 'status': 'persistence_failed', 'error_code': 'INTERNAL_GENERATION_ERROR'}
     if generation.status in {
@@ -54,7 +84,35 @@ def fail_unexpected_generation(generation_id: str) -> dict[str, Any]:
         WebUIScriptGeneration.Status.CANCELLED,
     }:
         return {'generation_id': str(generation.pk), 'status': generation.status, 'error_code': generation.error_code}
-    return _fail(str(generation.pk), 'INTERNAL_GENERATION_ERROR', '生成任务发生内部错误，请稍后重试。')
+    # The exception belongs only to the delivery that reported it.  Never
+    # borrow the task id currently stored on the row: that may already belong
+    # to a newer explicitly resumed attempt.
+    task_marker = celery_task_id or '<direct>'
+    # The synthetic initial-delivery case has no prior run to fence against.
+    # Every resumed/new revision must have an exact claim and task match.
+    if (
+        generation.revision == 0
+        and generation.status == WebUIScriptGeneration.Status.CREATED
+        and not generation.celery_task_id
+        and not (generation.workspace or {}).get('_agent_run')
+    ):
+        workspace = dict(generation.workspace or {})
+        from .generation_lifecycle import claim_lifecycle_metadata
+        workspace = claim_lifecycle_metadata(
+            workspace, generation_revision=0, task_id=task_marker,
+        )
+        WebUIScriptGeneration.objects.filter(
+            pk=generation.pk, revision=0, status=WebUIScriptGeneration.Status.CREATED,
+            celery_task_id__isnull=True,
+        ).update(workspace=workspace, celery_task_id=task_marker)
+        generation.celery_task_id = task_marker
+        generation.workspace = workspace
+    return _fail(
+        generation,
+        task_id=task_marker,
+        code='INTERNAL_GENERATION_ERROR',
+        message='生成任务发生内部错误，请稍后重试。',
+    )
 
 
 def _brief_for_generation(generation: WebUIScriptGeneration) -> dict[str, Any]:
@@ -138,7 +196,16 @@ def _persist_agent_result(
         incoming_revision = int((snapshot.get('artifact') or {}).get('revision') or 0)
     except (TypeError, ValueError):
         current_revision = incoming_revision = 0
-    if current_revision > incoming_revision:
+    if error_code == 'CHECKPOINT_FAILED':
+        # An unsaved in-memory proposal is diagnostic material, not a new
+        # authoritative draft. Re-read the durable version even if its revision
+        # is lower than the failed proposal's revision.
+        failed_candidate = (snapshot.get('draft_state') or {}).get('latest_candidate') or script_draft
+        snapshot = current_snapshot
+        snapshot['checkpoint_failure_candidate'] = failed_candidate
+        script_draft = current.script_draft
+        completion = str((snapshot.get('artifact') or {}).get('completion') or 'partial')
+    elif current_revision > incoming_revision:
         snapshot = current_snapshot
         script_draft = current.script_draft
     elif not script_draft.strip():
@@ -214,28 +281,38 @@ def _persist_agent_result(
 
 def _run_agent(
     generation: WebUIScriptGeneration, *, celery_task_id: str | None, brief: dict[str, Any],
-    mcp_config: dict[str, Any], code_only: bool,
+    mcp_config: dict[str, Any], code_only: bool, resume_existing: bool = False,
 ) -> dict[str, Any]:
     from .script_exploration_agent import ScriptExplorationAgent
 
     task_marker = generation.celery_task_id or celery_task_id or '<direct>'
-    if _terminal_cancel(str(generation.pk), celery_task_id):
+    if _run_should_stop(
+        str(generation.pk), generation_revision=generation.revision, task_id=task_marker,
+    ):
         return {'generation_id': str(generation.pk), 'status': 'cancelled', 'error_code': 'TASK_CANCELLED'}
     stage = WebUIScriptGeneration.Status.GENERATING if code_only else WebUIScriptGeneration.Status.EXPLORING
-    generation = transition_generation(generation.pk, stage, progress=55 if code_only else 45)
+    generation_id = str(generation.pk)
+    generation = transition_generation(
+        generation.pk, stage, progress=55 if code_only else 45,
+        generation_revision=generation.revision, task_id=task_marker,
+    )
+    if generation is None:
+        return {'generation_id': generation_id, 'status': 'stale', 'error_code': 'STALE_AGENT_RESULT'}
     publish_stage_changed(generation, '整理现有草稿' if code_only else '探索页面并编写脚本')
     try:
         manager = get_llm_manager(config_id=generation.model_info['config_id'])
         agent = ScriptExplorationAgent(
             llm_model=manager.current_llm, mcp_config=mcp_config, generation_id=str(generation.pk),
-            cancel_check=lambda: _terminal_cancel(str(generation.pk), celery_task_id),
+            cancel_check=lambda: _run_should_stop(
+                str(generation.pk), generation_revision=generation.revision, task_id=task_marker,
+            ),
             exploration_timeout_seconds=generation.exploration_timeout_seconds or exploration_total_timeout_seconds(),
             checkpoint_callback=_checkpoint_callback(generation),
         )
         result = asyncio.run(agent.generate(
             brief=brief, target_url=generation.target_url,
-            saved_snapshot=generation.exploration_snapshot if code_only else None,
-            script_draft=generation.script_draft if code_only else '', code_only=code_only,
+            saved_snapshot=generation.exploration_snapshot if code_only or resume_existing else None,
+            script_draft=generation.script_draft if code_only or resume_existing else '', code_only=code_only,
         ))
     except Exception as exc:
         logger.exception(
@@ -248,7 +325,9 @@ def _run_agent(
             generation, task_id=task_marker, script_draft='', snapshot=generation.exploration_snapshot,
             completion='unknown', error_code=code, error_message=message, final_message='',
         )
-    if _terminal_cancel(str(generation.pk), celery_task_id):
+    if _run_should_stop(
+        str(generation.pk), generation_revision=generation.revision, task_id=task_marker,
+    ):
         return {'generation_id': str(generation.pk), 'status': 'cancelled', 'error_code': 'TASK_CANCELLED'}
     return _persist_agent_result(
         generation, task_id=task_marker, script_draft=str(getattr(result, 'script_draft', '') or ''),
@@ -277,25 +356,58 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
     generation = claim_generation_worker(generation.pk, celery_task_id)
     if generation is None:
         return {'generation_id': str(generation_id), 'status': 'skipped'}
+    task_marker = generation.celery_task_id or celery_task_id or '<direct>'
+    with generation_heartbeat(generation.pk, generation.revision, task_marker):
+        return _run_claimed_generation(generation, celery_task_id=celery_task_id, task_marker=task_marker)
+
+
+def _run_claimed_generation(
+    generation: WebUIScriptGeneration,
+    *,
+    celery_task_id: str | None,
+    task_marker: str,
+) -> dict[str, Any]:
     if generation.status == WebUIScriptGeneration.Status.CREATED:
-        generation = transition_generation(generation.pk, WebUIScriptGeneration.Status.NORMALIZING, progress=10)
+        generation_id = str(generation.pk)
+        generation = transition_generation(
+            generation.pk, WebUIScriptGeneration.Status.NORMALIZING, progress=10,
+            generation_revision=generation.revision, task_id=task_marker,
+        )
+        if generation is None:
+            return {'generation_id': generation_id, 'status': 'stale', 'error_code': 'STALE_AGENT_RESULT'}
     if generation.status == WebUIScriptGeneration.Status.NORMALIZING:
         publish_stage_changed(generation, '整理测试目标')
         try:
             brief = _brief_for_generation(generation)
         except Exception:
             logger.exception('生成 brief 失败: generation_id=%s', generation.pk)
-            return _fail(str(generation.pk), 'INPUT_INVALID', '无法整理测试目标，请检查描述后重试。')
+            return _fail(
+                generation, task_id=task_marker, code='INPUT_INVALID',
+                message='无法整理测试目标，请检查描述后重试。',
+            )
+        generation_id = str(generation.pk)
         generation = transition_generation(
             generation.pk, WebUIScriptGeneration.Status.PREFLIGHTING, progress=25,
             updates={'scenario_spec': brief},
+            generation_revision=generation.revision, task_id=task_marker,
         )
+        if generation is None:
+            return {'generation_id': generation_id, 'status': 'stale', 'error_code': 'STALE_AGENT_RESULT'}
     elif generation.status == WebUIScriptGeneration.Status.PREFLIGHTING:
         brief = generation.scenario_spec if isinstance(generation.scenario_spec, dict) else {}
         if brief.get('schema_version') != 5:
-            return _fail(str(generation.pk), 'LEGACY_GENERATION_UNSUPPORTED', '旧版生成记录不能自动恢复，请手动处理已有源码。')
+            return _fail(
+                generation, task_id=task_marker, code='LEGACY_GENERATION_UNSUPPORTED',
+                message='旧版生成记录不能自动恢复，请手动处理已有源码。',
+            )
     else:
-        return _fail(str(generation.pk), 'TRANSIENT_SERVICE_ERROR', '当前生成阶段不能继续。')
+        return _fail(
+            generation, task_id=task_marker, code='TRANSIENT_SERVICE_ERROR',
+            message='当前生成阶段不能继续。',
+        )
+    recovery_context = recovery_context_for_generation(generation)
+    if recovery_context is not None:
+        brief = {**brief, 'recovery_context': recovery_context}
     preflight = run_safety_preflight(generation, brief)
     if preflight.outcome != 'continue':
         target = {
@@ -305,13 +417,17 @@ def run_generation(generation_id: str, *, celery_task_id: str | None = None) -> 
         paused = transition_generation(
             generation.pk, target, progress=25, error_code=preflight.error_code,
             error_message=preflight.message, updates={'warnings': preflight.warnings},
+            generation_revision=generation.revision, task_id=task_marker,
         )
+        if paused is None:
+            return {'generation_id': str(generation.pk), 'status': 'stale', 'error_code': 'STALE_AGENT_RESULT'}
         if target == WebUIScriptGeneration.Status.FAILED:
             publish_terminal(paused)
         return {'generation_id': str(paused.pk), 'status': paused.status, 'error_code': paused.error_code}
     return _run_agent(
         generation, celery_task_id=celery_task_id, brief=brief,
         mcp_config=preflight.mcp_config or {}, code_only=False,
+        resume_existing=recovery_context is not None,
     )
 
 
@@ -320,11 +436,16 @@ def run_generation_from_trace(generation_id: str, *, celery_task_id: str | None 
     generation = claim_trace_generation_retry(generation_id, celery_task_id)
     if generation is None:
         return {'generation_id': str(generation_id), 'status': 'skipped'}
-    brief = generation.scenario_spec if isinstance(generation.scenario_spec, dict) else {}
-    snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
-    if brief.get('schema_version') != 5 or snapshot.get('schema_version') != 5:
-        return _fail(str(generation.pk), 'LEGACY_GENERATION_UNSUPPORTED', '旧版记录不能自动恢复，请手动处理已有源码。')
-    return _run_agent(
-        generation, celery_task_id=celery_task_id, brief=brief,
-        mcp_config={}, code_only=True,
-    )
+    task_marker = generation.celery_task_id or celery_task_id or '<direct>'
+    with generation_heartbeat(generation.pk, generation.revision, task_marker):
+        brief = generation.scenario_spec if isinstance(generation.scenario_spec, dict) else {}
+        snapshot = generation.exploration_snapshot if isinstance(generation.exploration_snapshot, dict) else {}
+        if brief.get('schema_version') != 5 or snapshot.get('schema_version') != 5:
+            return _fail(
+                generation, task_id=task_marker, code='LEGACY_GENERATION_UNSUPPORTED',
+                message='旧版记录不能自动恢复，请手动处理已有源码。',
+            )
+        return _run_agent(
+            generation, celery_task_id=celery_task_id, brief=brief,
+            mcp_config={}, code_only=True,
+        )

@@ -53,7 +53,7 @@ def _run_generation_with_terminal_guard(generation_id: str, celery_task_id: str 
         logger.exception('WebUI 生成 Celery 任务发生未处理异常: generation_id=%s', generation_id)
         from .generation_orchestrator import fail_unexpected_generation
 
-        return fail_unexpected_generation(generation_id)
+        return fail_unexpected_generation(generation_id, celery_task_id)
 
 
 def _failure_screenshot_paths(execution_id: int, filename: str):

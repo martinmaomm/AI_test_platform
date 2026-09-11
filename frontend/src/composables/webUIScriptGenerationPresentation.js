@@ -59,6 +59,33 @@ export const isActiveGeneration = (status) => ACTIVE_GENERATION_STATUSES.has(sta
 export const isPausedGeneration = (status) => PAUSED_GENERATION_STATUSES.has(status)
 export const isTerminalGeneration = (status) => TERMINAL_GENERATION_STATUSES.has(status)
 
+export const generationLifecycleStateLabel = (state) => ({
+  queued: '等待恢复任务启动',
+  running: '恢复探索进行中',
+  interrupted: '探索已中断',
+  idle: '未启动恢复探索'
+})[state] || '生命周期状态未知'
+
+export const formatGenerationLifecycleTime = (value) => {
+  if (!value) return '—'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+export const canResumeInterruptedExploration = (generation, {
+  busy = false,
+  draftDirty = false,
+  hasRepairCandidate = false
+} = {}) => (
+  (generation?.lifecycle?.state === 'interrupted' || (
+    generation?.lifecycle?.state === 'idle' && ['failed', 'needs_review', 'cancelled'].includes(generation?.status)
+  ))
+  && generation?.lifecycle?.can_resume === true
+  && !busy
+  && !draftDirty
+  && !hasRepairCandidate
+)
+
 const WORKSPACE_ACTIVITY_STATUSES = new Set(['pending', 'running'])
 export const workspaceVerificationLabel = (status) => ({
   unverified: '尚未实际调试', pending: '等待调试', running: '正在真实调试',
@@ -293,6 +320,11 @@ export const buildGenerationTimeline = (generation) => {
 
 export const generationResolutionHint = (generation, { draftDirty = false } = {}) => {
   const status = generation?.status
+  if (generation?.lifecycle?.state === 'interrupted') {
+    return draftDirty
+      ? '探索已中断，草稿和轨迹已保留。请先保存本地草稿，再确认现场后继续探索；也可查看历史记录。'
+      : '探索已中断，草稿和轨迹已保留。可查看历史记录，或确认现场后继续探索；已完成操作不会自动重放。'
+  }
   if (status === 'needs_input') return '请补充明确的测试目标、操作步骤和至少一个可验证结果后重新分析。页面元素和平台默认清理策略不需要填写。'
   if (status === 'needs_confirmation') return '请确认本次测试目标范围。平台会在一个连续会话中自行探索页面元素；额外高风险操作仍需单独调整目标。'
   if (status === 'needs_review') {

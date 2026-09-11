@@ -1,6 +1,7 @@
 """Real MCPAgent/LangChain graph regressions for the project budget adapter."""
 
 import asyncio
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -16,6 +17,8 @@ from mcp_use import MCPClient
 from mcp_use.client.connectors.base import BaseConnector
 
 from ai_core.mcp_agent_budget import BudgetedMCPAgent, mcp_graph_recursion_limit
+from ai_core.mcp_exploration_runtime import ExplorationRuntimeMiddleware
+from web_testing.exploration_trace import _tool_failed
 from ai_core.webui_playwright_agent import MCPBrowserToolGuard
 from web_testing.generation_contracts import ScenarioPlan
 from web_testing.mcp_page_explorer import MCPPageExplorer, MCPPageExplorerError
@@ -153,7 +156,7 @@ def async_fixture_tool(tool_name, trace, *, error=None):
 
 
 class BudgetedMCPAgentGraphTests(SimpleTestCase):
-    def make_agent(self, model, tools, callbacks=None, *, retry_on_error=True):
+    def make_agent(self, model, tools, callbacks=None, *, retry_on_error=True, runtime_factory=None):
         agent = BudgetedMCPAgent(
             llm=model,
             client=MCPClient.from_dict({'mcpServers': {}}),
@@ -161,11 +164,35 @@ class BudgetedMCPAgentGraphTests(SimpleTestCase):
             callbacks=callbacks or [],
             memory_enabled=False,
             retry_on_error=retry_on_error,
+            runtime_factory=runtime_factory,
         )
         agent._tools = list(tools) if isinstance(tools, list) else [tools]
         agent._agent_executor = agent._create_agent()
         agent._initialized = True
         return agent
+
+    def test_runtime_survives_real_mcpagent_local_tool_rebuild(self):
+        stats = Counter()
+        trace = AsyncToolTrace()
+        guard = MCPBrowserToolGuard(max_tool_calls=5)
+        factory = lambda tools: ExplorationRuntimeMiddleware(
+            tools, checkpoint=lambda: {'revision': 1}, failed=_tool_failed, stats=stats,
+        )
+        agent = self.make_agent(
+            ScriptedToolBatchModel(tool_batches=[['playwright_navigate'], ['save_script_draft']]),
+            [async_fixture_tool(name, trace) for name in ['playwright_navigate', 'playwright_get_visible_text']],
+            callbacks=[guard], runtime_factory=factory,
+        )
+        async def run():
+            await agent.register_local_tools([async_fixture_tool('save_script_draft', trace)])
+            return await agent.run('offline runtime integration', manage_connector=False)
+        result = asyncio.run(run())
+        self.assertEqual(result, '{"complete": true}')
+        self.assertEqual(trace.started, ['playwright_navigate', 'playwright_get_visible_text', 'save_script_draft'])
+        self.assertEqual(trace.peak_active, 1)
+        self.assertEqual(guard.get_stats()['total_tool_calls'], 2)
+        self.assertEqual(stats['automatic_observations'], 1)
+        self.assertEqual(stats['context_requests'], 3)
 
     def test_31_browser_tools_finish_with_the_real_mcpagent_graph(self):
         model = ScriptedLoopModel(tool_rounds=31)

@@ -6,9 +6,12 @@ import {
   assertionStateTagType,
   buildGenerationTimeline,
   canRetryScriptFromTrace,
+  canResumeInterruptedExploration,
   canSaveGeneratedDraft,
+  formatGenerationLifecycleTime,
   generationDraftCompletion,
   generationFailureReason,
+  generationLifecycleStateLabel,
   generationUserMessage,
   generationActionRequired,
   generationApiErrorMessage,
@@ -57,6 +60,32 @@ test('generic generation status boundaries remain mapped', () => {
   assert.equal(isActiveGeneration('validating'), true)
   assert.equal(isPausedGeneration('needs_credentials'), false)
   assert.equal(isTerminalGeneration('needs_review'), true)
+})
+
+test('interrupted lifecycle is explicit and never inferred from missing heartbeats', () => {
+  const interrupted = { lifecycle: { state: 'interrupted', can_resume: true } }
+  assert.equal(generationLifecycleStateLabel('interrupted'), '探索已中断')
+  assert.equal(formatGenerationLifecycleTime(null), '—')
+  assert.equal(canResumeInterruptedExploration(interrupted), true)
+  assert.equal(canResumeInterruptedExploration(interrupted, { draftDirty: true }), false)
+  assert.equal(canResumeInterruptedExploration(interrupted, { busy: true }), false)
+  assert.equal(canResumeInterruptedExploration({ lifecycle: { state: 'running', can_resume: true } }), false)
+  assert.equal(canResumeInterruptedExploration({ status: 'needs_review', lifecycle: { state: 'idle', can_resume: true } }), true)
+  assert.equal(canResumeInterruptedExploration({ status: 'cancelled', lifecycle: { state: 'idle', can_resume: true } }), true)
+  assert.equal(canResumeInterruptedExploration({ status: 'failed', lifecycle: { state: 'idle', can_resume: false } }), false)
+  assert.match(generationResolutionHint(interrupted), /已完成操作不会自动重放/)
+})
+
+test('resume dialog requires notes and cancel stays local without an API action', () => {
+  const panel = readFileSync(new URL('../src/components/webui-generation/GenerationResultPanel.vue', import.meta.url), 'utf8')
+  assert.match(panel, /确认现场后继续探索/)
+  assert.match(panel, /本地草稿尚未保存，请先保存草稿后再确认现场继续探索/)
+  assert.match(panel, /请填写现场恢复说明/)
+  assert.match(panel, /已完成操作不会自动重放/)
+  assert.match(panel, /cancelButtonText: '取消恢复'/)
+  assert.match(panel, /生成记录已变更，请重新打开恢复窗口并确认现场/)
+  assert.match(panel, /if \(error !== 'cancel' && error !== 'close'\)/)
+  assert.match(panel, /emit\('resume-exploration', \{/)
 })
 
 test('field validation errors are shown instead of a generic transport error', () => {

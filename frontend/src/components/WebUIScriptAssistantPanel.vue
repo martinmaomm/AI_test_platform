@@ -93,7 +93,7 @@
         <el-input v-model="messageText" type="textarea" :rows="3" maxlength="2000" show-word-limit placeholder="说明你希望如何修改脚本…" :disabled="active || acting" />
         <div class="message-actions">
           <span class="assistant-action-with-help">
-            <el-button :disabled="!canContinue || !modelConfigId || acting" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
+            <el-button :disabled="!canContinue || !canSend" :loading="acting" @click="continueCandidate">继续调整候选</el-button>
             <el-tooltip :content="continueHelp" :trigger="['hover', 'focus']" placement="top" popper-class="assistant-action-help-popper">
               <button type="button" class="assistant-help" aria-label="继续调整候选说明"><el-icon><QuestionFilled /></el-icon></button>
             </el-tooltip>
@@ -126,7 +126,7 @@ const props = defineProps({
 })
 const emit = defineEmits(['apply-to-editor'])
 const sendHelp = '将输入框中的修改要求发送给 AI，以当前编辑器里的脚本为基础修改，包含你的手工改动。必须填写修改要求；只生成候选，不会自动运行或保存。'
-const continueHelp = '将同一输入框中的修改要求发送给 AI，以最新的候选脚本为基础继续修改，不包含候选生成后对编辑器的手工改动。需先有候选；未填写新要求时默认让 AI 继续调整，不会自动运行或保存。'
+const continueHelp = '将同一输入框中的修改要求发送给 AI，以最新的候选脚本为基础继续修改，不包含候选生成后对编辑器的手工改动。需先有候选，并填写具体修改要求；不会自动运行或保存。'
 const context = computed(() => assistantPanelContext(props.editContext, props.repairContext))
 const isEdit = computed(() => Boolean(props.editContext))
 const isRepair = computed(() => Boolean(props.repairContext))
@@ -278,6 +278,9 @@ const requestRepair = async () => {
   } catch (error) { if (error !== 'cancel' && error !== 'close' && error?.message !== '变量名不能为空') ElMessage.error(lastError.value || '启动 AI 修复失败'); else if (error?.message === '变量名不能为空') ElMessage.warning(error.message) }
 }
 const sendMessage = async useCandidate => {
+  if (!messageText.value.trim()) return ElMessage.warning('请先填写具体的修改要求。')
+  if (assistant.value ? !canSend.value : !canStartEdit.value) return
+  if (useCandidate && !canContinue.value) return
   try {
     if (!assistant.value) {
       await create({ mode: 'edit', model_config_id: modelConfigId.value, ...editPayload() })
@@ -288,13 +291,12 @@ const sendMessage = async useCandidate => {
   } catch { ElMessage.error(lastError.value || '发送消息失败') }
 }
 const continueCandidate = async () => {
-  if (!canContinue.value) return
+  if (!canContinue.value || !canSend.value) return
   if (assistant.value.source_script && props.editContext.scriptContent !== assistant.value.source_script) {
     try {
       await ElMessageBox.confirm('继续调整候选会以已有候选为基线，不会包含候选生成后对编辑器作出的手工修改。若要保留手工修改，请使用“发送”。', '确认继续调整候选', { type: 'warning', confirmButtonText: '继续调整候选', cancelButtonText: '返回编辑' })
     } catch { return }
   }
-  if (!messageText.value.trim()) messageText.value = '请在保留当前候选目标的前提下，继续调整候选脚本。'
   await sendMessage(true)
 }
 const applyToEditor = async () => {

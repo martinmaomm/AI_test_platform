@@ -433,6 +433,25 @@ def verify_ui(origin, fixture, output):
             ).to_be_disabled()
             expect(
                 actions.get_by_role("button", name="继续调整候选", exact=True)
+            ).to_be_disabled()
+            edit_message = panel.get_by_placeholder("说明你希望如何修改脚本…")
+            for blank in ("   ", "\n\t\u3000", ""):
+                edit_message.fill(blank)
+                for label in ("发送", "继续调整候选"):
+                    expect(
+                        actions.get_by_role("button", name=label, exact=True)
+                    ).to_be_disabled()
+            edit_message.fill("补充具体修改要求")
+            for label in ("发送", "继续调整候选"):
+                expect(
+                    actions.get_by_role("button", name=label, exact=True)
+                ).to_be_enabled()
+            edit_message.fill("")
+            expect(
+                actions.get_by_role("button", name="继续调整候选", exact=True)
+            ).to_be_disabled()
+            expect(
+                panel.get_by_role("button", name="采用到编辑器", exact=True)
             ).to_be_enabled()
             expect(
                 panel.locator(".candidate-actions").get_by_role(
@@ -486,6 +505,10 @@ def verify_ui(origin, fixture, output):
             assert continued.value.status == 202, continued.value.text()
             assert continued.value.request.post_data_json["use_candidate"] is True
             assert (
+                continued.value.request.post_data_json["message"]
+                == "继续保留业务断言，确认日志准确。"
+            )
+            assert (
                 continued.value.request.post_data_json["model_config_id"]
                 == fixture["next_model_id"]
             )
@@ -496,6 +519,10 @@ def verify_ui(origin, fixture, output):
                 panel.get_by_role("button", name="采用到编辑器", exact=True)
             ).to_be_enabled()
             assert MODEL_IDS[-1] == fixture["next_model_id"], MODEL_IDS
+            for label in ("发送", "继续调整候选"):
+                expect(
+                    actions.get_by_role("button", name=label, exact=True)
+                ).to_be_disabled()
             assert not RUNS, "Continuing a candidate must not execute it"
             panel.get_by_role("button", name="调试验证", exact=True).click()
             page.get_by_role("button", name="确认执行", exact=True).click()

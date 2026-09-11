@@ -48,8 +48,17 @@ test('conversation actions sit together with independent accessible help and unc
   assert.match(panel, /:trigger="\['hover', 'focus'\]"/)
   assert.match(panel, /以当前编辑器里的脚本为基础修改/)
   assert.match(panel, /以最新的候选脚本为基础继续修改/)
-  assert.match(panel, /未填写新要求时默认让 AI 继续调整/)
+  assert.match(panel, /需先有候选，并填写具体修改要求/)
   assert.match(panel, /await sendMessage\(true\)/)
   assert.doesNotMatch(panel, /查看调试验证详情/)
   assert.match(panel, /v-for="\(attempt, index\) in executionEntries"/)
+})
+
+test('continuing requires an explicit message without affecting candidate adoption', async () => {
+  const panel = await readFile(new URL('../src/components/WebUIScriptAssistantPanel.vue', import.meta.url), 'utf8')
+  assert.match(panel, /:disabled="!canContinue \|\| !canSend"[^>]*@click="continueCandidate"/)
+  assert.match(panel, /const sendMessage = async useCandidate => \{\s*if \(!messageText.value.trim\(\)\) return ElMessage.warning/)
+  assert.match(panel, /const continueCandidate = async \(\) => \{\s*if \(!canContinue.value \|\| !canSend.value\) return/)
+  assert.doesNotMatch(panel, /请在保留当前候选目标的前提下|未填写新要求时默认/)
+  assert.match(panel, /:disabled="!canContinue \|\| acting" @click="applyToEditor"/)
 })

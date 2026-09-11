@@ -932,6 +932,7 @@ export function useWebUIScriptGeneration({ projectId, userId }) {
   }
 
   const retryGeneration = async () => {
+    if (hasUnsavedDraft.value || draftConflict.value) return null
     if (!generation.value?.id || historySwitching.value || isDeletingGeneration.value || resolving.value || isActive.value || isWorkspaceBusy.value || hasRepairCandidate.value || repairing.value || repairApplying.value || repairDiscarding.value) return null
     const requestProjectId = currentProjectId.value
     const generationId = generation.value.id

@@ -46,7 +46,10 @@ def browser_observation(fingerprint='a' * 64, *, scope='page', text=None, elemen
         'settled': True, 'truncated': False, 'notes': [],
         'elements': elements if elements is not None else [{
             'tag': 'input', 'role': 'textbox', 'name': 'Display name', 'id': 'f17',
-            'type': 'text', 'placeholder': 'Name', 'visible': True, 'enabled': True,
+            'html_name': 'backend_display_name', 'type': 'text', 'placeholder': 'Name', 'visible': True, 'enabled': True,
+            'readonly': False,
+            'mcp_selector': 'input[name="backend_display_name"]:visible',
+            'mcp_selector_status': 'verified_current_page',
             'container': 'Create entry',
         }],
         'text': text if text is not None else ['Create entry'],
@@ -103,6 +106,99 @@ class ExplorationDiagnosticsTests(SimpleTestCase):
         self.assertEqual(context['observation_error'], 'invalid')
         self.assertIn('不可用', render_observation_unavailable(context))
 
+    def test_html_name_and_native_readonly_are_validated_and_rendered_distinctly(self):
+        observation = browser_observation(elements=[{
+            'tag': 'input', 'role': 'combobox', 'name': 'Visible field label',
+            'html_name': 'stored_field', 'id': 'field-1', 'type': 'text',
+            'placeholder': '', 'visible': True, 'enabled': True, 'readonly': True,
+            'container': 'Named dialog',
+        }, {
+            'tag': 'div', 'role': 'combobox', 'name': 'Custom control label',
+            'html_name': '', 'id': 'custom-1', 'type': '', 'placeholder': '',
+            'visible': True, 'enabled': True, 'readonly': None, 'container': 'Named dialog',
+        }])
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        controls = context['observation']['elements']
+        self.assertEqual(controls[0]['html_name'], 'stored_field')
+        self.assertIs(controls[0]['readonly'], True)
+        self.assertIsNone(controls[1]['readonly'])
+        rendered = render_observation(context)
+        self.assertIn('语义名称近似值 (not HTML name)=Visible field label', rendered)
+        self.assertIn('HTML name=stored_field', rendered)
+        self.assertIn('readonly=true', rendered)
+        self.assertIn('readonly=unknown', rendered)
+
+        observation['elements'][0]['readonly'] = 'true'
+        invalid_context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        self.assertEqual(invalid_context['observation']['elements'], [controls[1]])
+        self.assertTrue(invalid_context['observation']['truncated'])
+
+    def test_selector_hint_is_literal_optional_and_conflicting_verified_claim_is_removed(self):
+        without_hint = browser_observation(elements=[{
+            'tag': 'input', 'role': '', 'name': 'Optional hint', 'html_name': '',
+            'id': '', 'type': 'text', 'placeholder': '', 'visible': True,
+            'enabled': True, 'readonly': False, 'container': '',
+        }])
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=without_hint))
+        control = context['observation']['elements'][0]
+        self.assertFalse(context['observation']['truncated'])
+        self.assertEqual(control['mcp_selector'], '')
+        self.assertEqual(control['mcp_selector_status'], 'not_provided')
+
+        literal = 'input[name="two  spaces \\"quoted\\""]:visible'
+        with_hint = browser_observation(elements=[{
+            **without_hint['elements'][0], 'mcp_selector': literal,
+            'mcp_selector_status': 'verified_current_page',
+        }])
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=with_hint))
+        self.assertEqual(context['observation']['elements'][0]['mcp_selector'], literal)
+        self.assertIn(literal, render_observation(context))
+
+        conflicting = browser_observation(elements=[{
+            **without_hint['elements'][0], 'mcp_selector': '',
+            'mcp_selector_status': 'verified_current_page',
+        }])
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=conflicting))
+        self.assertTrue(context['observation']['truncated'])
+        self.assertEqual(context['observation']['elements'][0]['mcp_selector'], '')
+        self.assertEqual(context['observation']['elements'][0]['mcp_selector_status'], 'verification_error')
+
+    def test_native_select_options_keep_exact_values_and_are_bounded(self):
+        options = [
+            {'value': 'en', 'label': 'English', 'disabled': False, 'selected': False},
+            {'value': ' fr  "quoted" ', 'label': 'French Canada', 'disabled': False, 'selected': True},
+        ]
+        observation = browser_observation(elements=[{
+            'tag': 'select', 'role': '', 'name': 'Language', 'html_name': '',
+            'id': '', 'type': '', 'placeholder': '', 'visible': True,
+            'enabled': True, 'readonly': None, 'container': 'Preferences',
+            'mcp_selector': 'select[aria-label="Language"]:visible',
+            'mcp_selector_status': 'verified_current_page',
+            'select_value': ' fr  "quoted" ', 'options': options,
+            'options_truncated': False,
+        }])
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        control = context['observation']['elements'][0]
+        self.assertEqual(control['select_value'], ' fr  "quoted" ')
+        self.assertEqual(control['options'], options)
+        rendered = render_observation(context)
+        self.assertIn('当前 select value=" fr  \\"quoted\\" "', rendered)
+        self.assertIn('原生 select options=', rendered)
+
+        observation['elements'][0]['options'] = options * 21
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        self.assertTrue(context['observation']['truncated'])
+        self.assertTrue(context['observation']['elements'][0]['options_truncated'])
+        self.assertEqual(len(context['observation']['elements'][0]['options']), 40)
+
+    def test_malformed_tag_cannot_crash_optional_select_branch(self):
+        observation = browser_observation(elements=[{
+            'tag': 123, 'visible': True, 'enabled': True, 'readonly': None,
+        }])
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        self.assertEqual(context['observation']['elements'][0]['tag'], '')
+        self.assertEqual(context['observation']['elements'][0]['mcp_selector_status'], 'not_provided')
+
     def test_projection_reserves_a_complete_truncation_marker_at_near_exact_budget(self):
         context, _ = extract_page_context(trailer(
             tool_failed=False, observation=browser_observation(text=['late text ' * 30]),
@@ -112,9 +208,95 @@ class ExplorationDiagnosticsTests(SimpleTestCase):
         budget = len(render_observation(without_text)) + 3
         rendered = render_observation(context, limit=budget)
         self.assertLessEqual(len(rendered), budget)
-        self.assertIn('截断', rendered)
-        self.assertNotIn('late text', rendered)
+        self.assertTrue(rendered.endswith('[页面观察摘要已截断。]'))
+        complete_lines = render_observation(context).splitlines()
+        for line in rendered.splitlines()[:-1]:
+            self.assertIn(line, complete_lines)
         self.assertEqual(json.dumps(context, ensure_ascii=False, sort_keys=True), source)
+
+    def test_projection_reserves_visible_text_among_many_long_selectors(self):
+        template = browser_observation()['elements'][0]
+        elements = [{
+            **template, 'name': f'Control {index}', 'id': f'control-{index}',
+            'mcp_selector': f'input[data-key="{index}  ' + 'segment  ' * 55 + '"]:visible',
+        } for index in range(10)]
+        texts = [(f'Visible line {index}: ' + 'content ' * 20).rstrip() for index in range(16)]
+        context, _ = extract_page_context(trailer(
+            tool_failed=False, observation=browser_observation(elements=elements, text=texts),
+        ))
+        self.assertEqual(context['observation']['text'], texts)
+        original = json.dumps(context, ensure_ascii=False, sort_keys=True)
+        rendered = render_observation(context)
+        self.assertLessEqual(len(rendered), 8000)
+        self.assertIn('[页面观察摘要已截断。]', rendered)
+        self.assertIn(elements[0]['mcp_selector'], rendered)
+        self.assertGreaterEqual(sum(line.startswith('控件：') for line in rendered.splitlines()), 3)
+        for item in texts:
+            self.assertIn('可见文本：' + item, rendered)
+        self.assertEqual(json.dumps(context, ensure_ascii=False, sort_keys=True), original)
+
+        message = ToolMessage(
+            content=trailer(tool_failed=False, observation=context['observation']),
+            name='playwright_get_visible_html', tool_call_id='balanced-read',
+        )
+        projected, _ = project_messages([message])
+        self.assertIn('可见文本：' + texts[-1], projected[0].content)
+        self.assertIn(elements[0]['mcp_selector'], projected[0].content)
+        self.assertLessEqual(len(projected[0].content), 8000)
+
+    def test_projection_preserves_browser_control_order_and_exact_selector_lines(self):
+        template = browser_observation()['elements'][0]
+        elements = [{
+            **template, 'tag': tag, 'role': role, 'id': f'control-{index}',
+            'mcp_selector': f'  {tag}[data-key="{index}  two  spaces"]:visible  ',
+        } for index, (tag, role) in enumerate([
+            ('a', 'link'), ('input', 'textbox'), ('div', 'combobox'), ('button', 'button'),
+        ])]
+        context, _ = extract_page_context(trailer(
+            tool_failed=False, observation=browser_observation(elements=elements, text=['visible ' * 40] * 20),
+        ))
+        selector_label = '已核对当前页面的MCP selector，语义名称不等于HTML属性='
+        for limit in (0, 1, 3, 4, 13, 64, 128, 256, 511, 1024, 3000, 8000, 16000):
+            with self.subTest(limit=limit):
+                rendered = render_observation(context, limit=limit)
+                self.assertLessEqual(len(rendered), limit)
+                selectors = [
+                    line.split(selector_label, 1)[1]
+                    for line in rendered.splitlines() if line.startswith('控件：')
+                ]
+                expected = [item['mcp_selector'] for item in elements if item['mcp_selector'] in selectors]
+                self.assertEqual(selectors, expected)
+                if limit >= 3000:
+                    self.assertEqual(selectors, [item['mcp_selector'] for item in elements])
+                    self.assertIn('可见文本：', rendered)
+                if 4 <= limit <= 3000:
+                    self.assertIn('截断', rendered)
+
+    def test_projection_long_notes_cannot_consume_all_control_and_text_space(self):
+        observation = browser_observation(text=['Visible detail ' * 20] * 20)
+        observation['notes'] = ['note ' * 50] * 24
+        context, _ = extract_page_context(trailer(tool_failed=False, observation=observation))
+        rendered = render_observation(context, limit=2000)
+        self.assertLessEqual(len(rendered), 2000)
+        self.assertIn('控件：', rendered)
+        self.assertIn('可见文本：Visible detail', rendered)
+        self.assertIn('截断', rendered)
+
+    def test_projection_reclaims_budget_when_only_one_content_kind_exists(self):
+        template = browser_observation()['elements'][0]
+        for elements, texts, prefix in (
+            ([template] * 20, [], '控件：'),
+            ([], ['Visible detail ' * 20] * 20, '可见文本：'),
+        ):
+            with self.subTest(prefix=prefix):
+                context, _ = extract_page_context(trailer(
+                    tool_failed=False, observation=browser_observation(elements=elements, text=texts),
+                ))
+                rendered = render_observation(context, limit=2000)
+                self.assertLessEqual(len(rendered), 2000)
+                content = '\n'.join(line for line in rendered.splitlines() if line.startswith(prefix))
+                self.assertGreater(len(content), 1000)
+                self.assertIn('截断', rendered)
 
     def test_boolean_observation_version_is_invalid(self):
         context, _ = extract_page_context(trailer(

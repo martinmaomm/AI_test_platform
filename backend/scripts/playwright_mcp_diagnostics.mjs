@@ -128,7 +128,10 @@ async function probeTarget(page, args, spec, metadata, budget) {
   if (!labelRead.ok) {
     // A strict-mode error proves ambiguity but not an exact count. Labels remain blank
     // because no one matching element may be presented as the unique target.
-    return { hidden: false, disabled: false };
+    return {
+      hidden: false, disabled: false,
+      ambiguous: classifyTechnicalFailure(String(labelRead.error?.message || '')) === 'strict_mode',
+    };
   }
   metadata.matched_count = 1;
   if (labelRead.value && typeof labelRead.value === 'object') {
@@ -427,8 +430,10 @@ export function wrapToolForPageDiagnostics(Tool, spec, { screenshotDir }) {
     }
     metadata.diagnostic_reads += preBudget.reads;
 
-    if (spec.guardHiddenInput && (proof.hidden || proof.disabled)) {
-      metadata.reason_code = proof.hidden ? 'target_not_visible' : 'target_not_enabled';
+    const ambiguous = spec.guardAmbiguousTarget && proof.ambiguous;
+    if (ambiguous || (spec.guardHiddenInput && (proof.hidden || proof.disabled))) {
+      const reason = ambiguous ? 'strict_mode' : proof.hidden ? 'target_not_visible' : 'target_not_enabled';
+      metadata.reason_code = reason;
       const pageBudget = diagnosticBudget();
       try {
         await readPageContext(context?.page, metadata, pageBudget);
@@ -436,14 +441,16 @@ export function wrapToolForPageDiagnostics(Tool, spec, { screenshotDir }) {
         // The proven hidden/disabled state remains authoritative even if enrichment fails.
       }
       metadata.diagnostic_reads += pageBudget.reads;
-      metadata.reason_code = proof.hidden ? 'target_not_visible' : 'target_not_enabled';
+      metadata.reason_code = reason;
       try {
         await captureFailureScreenshot(context?.page, screenshotDir, metadata);
       } catch {
         metadata.screenshot_status = 'unavailable';
         metadata.screenshot_message = '失败现场截图不可用：DiagnosticsError';
       }
-      return blockedResponse(metadata, proof.hidden
+      return blockedResponse(metadata, ambiguous
+        ? 'Strict mode violation: locator matches multiple elements. No action was performed. Use the verified mcp_selector for the intended control.'
+        : proof.hidden
         ? 'Element is not visible. Please observe the page again before filling or selecting.'
         : 'Element is disabled. Please observe the page again before filling or selecting.');
     }
@@ -513,7 +520,9 @@ export async function installPlaywrightMcpPageDiagnostics(packageRoot, {
     [interaction.PressKeyTool, { selectorKey: 'selector' }],
   ];
   for (const [Tool, spec] of mappings) {
-    wrapToolForPageDiagnostics(Tool, spec, { screenshotDir: resolvedScreenshotDir });
+    wrapToolForPageDiagnostics(Tool, {
+      ...spec, guardAmbiguousTarget: Boolean(spec.selectorKey),
+    }, { screenshotDir: resolvedScreenshotDir });
   }
   replaceVisiblePageReaderTool(visiblePage.VisibleTextTool, { screenshotDir: resolvedScreenshotDir });
   replaceVisiblePageReaderTool(visiblePage.VisibleHtmlTool, { screenshotDir: resolvedScreenshotDir });

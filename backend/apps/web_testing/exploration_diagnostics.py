@@ -14,6 +14,19 @@ MAX_DIAGNOSTICS_ENCODED_CHARS = 100000
 MAX_DIAGNOSTICS_DECODED_BYTES = (MAX_DIAGNOSTICS_ENCODED_CHARS // 4) * 3
 MAX_OBSERVATION_JSON_CHARS = 16000
 _FINGERPRINT = re.compile(r'[a-f0-9]{64}\Z')
+_MCP_SELECTOR_STATUSES = {
+    'verified_current_page', 'verification_budget_exhausted', 'candidate_too_long',
+    'detached_or_page_changed', 'no_unique_visible_candidate', 'verification_error',
+    'not_provided',
+}
+_MCP_SELECTOR_STATUS_LABELS = {
+    'verification_budget_exhausted': '核验预算已用完',
+    'candidate_too_long': '候选 selector 超出长度限制',
+    'detached_or_page_changed': '控件已分离或页面已变化',
+    'no_unique_visible_candidate': '没有当前页面唯一可见候选',
+    'verification_error': '浏览器核验失败',
+    'not_provided': '观察器未提供 selector 核验证据',
+}
 _TEXT_FIELDS = {
     'page_title': 200, 'element_label': 200, 'container_label': 200,
     'selector': 1000, 'captured_at': 50, 'reason_code': 80,
@@ -31,6 +44,13 @@ def _text(value, limit):
 
 def _was_text_truncated(value, limit):
     return isinstance(value, str) and len(value.strip()) > limit
+
+
+def _literal(value, limit):
+    """Keep executable literal spacing; reject rather than truncate unsafe data."""
+    if not isinstance(value, str) or len(value) > limit or re.search(r'[\x00-\x1f\x7f]', value):
+        return ''
+    return value
 
 
 def normalize_observation(value):
@@ -78,7 +98,7 @@ def normalize_observation(value):
         return {}
     normalized_elements = []
     element_limits = {
-        'tag': 80, 'role': 100, 'name': 300, 'id': 200, 'type': 100,
+        'tag': 80, 'role': 100, 'name': 300, 'html_name': 200, 'id': 200, 'type': 100,
         'placeholder': 300, 'container': 500,
     }
     consumer_truncated = (
@@ -91,16 +111,85 @@ def normalize_observation(value):
         if not isinstance(item, dict) or item.get('visible') is not True:
             consumer_truncated = True
             continue
+        normalized_fields = {
+            key: _text(item.get(key), limit) for key, limit in element_limits.items()
+        }
+        element_tag = normalized_fields['tag'].lower()
         enabled = item.get('enabled')
         if enabled is not None and not isinstance(enabled, bool):
             consumer_truncated = True
             continue
+        readonly = item.get('readonly')
+        if readonly is not None and not isinstance(readonly, bool):
+            consumer_truncated = True
+            continue
+        raw_selector = item.get('mcp_selector', '')
+        selector = _literal(raw_selector, 1000)
+        selector_status = item.get('mcp_selector_status')
+        if 'mcp_selector' in item and not isinstance(raw_selector, str):
+            consumer_truncated = True
+        if not selector and selector_status is None:
+            selector_status = 'not_provided'
+        elif selector_status not in _MCP_SELECTOR_STATUSES:
+            selector_status = 'verification_error'
+            consumer_truncated = True
+        if bool(selector) != (selector_status == 'verified_current_page'):
+            selector = ''
+            selector_status = 'verification_error'
+            consumer_truncated = True
+        options = item.get('options', [])
+        normalized_options = []
+        options_truncated = item.get('options_truncated', False)
+        if not isinstance(options, list) or not isinstance(options_truncated, bool):
+            options = []
+            options_truncated = True
+            consumer_truncated = True
+        if len(options) > 40:
+            options_truncated = True
+            consumer_truncated = True
+        for option in options[:40]:
+            if not isinstance(option, dict):
+                options_truncated = True
+                consumer_truncated = True
+                continue
+            option_value = _literal(option.get('value'), 300)
+            option_label = _text(option.get('label'), 300)
+            if (
+                not isinstance(option.get('value'), str)
+                or (option.get('value') and not option_value)
+                or not isinstance(option.get('label'), str)
+                or not isinstance(option.get('disabled'), bool)
+                or not isinstance(option.get('selected'), bool)
+            ):
+                options_truncated = True
+                consumer_truncated = True
+                continue
+            normalized_options.append({
+                'value': option_value, 'label': option_label,
+                'disabled': option['disabled'], 'selected': option['selected'],
+            })
+        select_value = _literal(item.get('select_value', ''), 300)
+        if element_tag == 'select':
+            if not isinstance(item.get('select_value'), str):
+                consumer_truncated = True
+                options_truncated = True
+        elif options or item.get('select_value') or item.get('options_truncated'):
+            normalized_options = []
+            select_value = ''
+            options_truncated = False
+            consumer_truncated = True
         if any(_was_text_truncated(item.get(key), limit) for key, limit in element_limits.items()):
             consumer_truncated = True
         normalized_elements.append({
-            **{key: _text(item.get(key), limit) for key, limit in element_limits.items()},
+            **normalized_fields,
             'visible': True,
             'enabled': enabled,
+            'readonly': readonly,
+            'mcp_selector': selector,
+            'mcp_selector_status': selector_status,
+            'select_value': select_value,
+            'options': normalized_options,
+            'options_truncated': options_truncated,
         })
     result = {
         'version': 1,
@@ -118,14 +207,26 @@ def normalize_observation(value):
         result['truncated'] = True
     if any(_was_text_truncated(item, 500) for item in text[:80] if isinstance(item, str)):
         result['truncated'] = True
-    # Drop least useful text first, then controls/notes.  Core state fields
-    # remain available even when an oversized producer violates its contract.
+    # Validation adds explicit defaults, which can expand an otherwise bounded
+    # producer observation. Keep both active controls and visible result text;
+    # neither kind of evidence is expendable merely because the page is large.
     while _observation_json_size(result) > MAX_OBSERVATION_JSON_CHARS:
         result['truncated'] = True
-        if result['text']:
-            result['text'].pop()
-        elif result['elements']:
+        if result['elements'] and (
+            not result['text']
+            or _observation_json_size(result['elements']) > _observation_json_size(result['text']) * 2
+        ):
+            last = result['elements'][-1]
+            if len(last['options']) > 1 and _observation_json_size(last) > 2400:
+                removable = next((index for index in range(len(last['options']) - 1, -1, -1)
+                                  if not last['options'][index]['selected']), None)
+                if removable is not None:
+                    last['options'].pop(removable)
+                    last['options_truncated'] = True
+                    continue
             result['elements'].pop()
+        elif result['text']:
+            result['text'].pop()
         elif result['notes']:
             result['notes'].pop()
         else:
@@ -246,39 +347,78 @@ def _whole_lines(lines, limit):
 def render_observation(context, limit=8000):
     """Render a bounded semantic model projection, never raw trailer bytes."""
     observation = context.get('observation') if isinstance(context, dict) else None
-    if not isinstance(observation, dict):
+    if not isinstance(observation, dict) or limit <= 0:
         return ''
     mandatory = [
         '[平台页面观察]',
         f"范围：{observation['scope']}；地址：{observation['page_url']}；标题：{observation['page_title']}",
         f"页面稳定：{'是' if observation['settled'] else '否'}；观察截断：{'是' if observation['truncated'] else '否'}",
+        '说明：name 是由 ARIA、可见原生标签或提示文本推导的近似语义名称，不保证等于浏览器完整可访问名称，也不是 HTML name 属性。',
+        '说明：已核对当前页面的MCP selector，语义名称不等于HTML属性；selector 仅证明当前页面唯一可见匹配，不保证跨运行稳定。',
     ]
     if target := render_target_diagnostics(context):
         mandatory.append(target)
     mandatory.extend('说明：' + note for note in observation['notes'])
 
-    def priority(item):
-        tag = item.get('tag', '').lower()
-        role = item.get('role', '').lower()
-        if tag == 'dialog' or role in {'dialog', 'alertdialog'}:
-            return 0
-        if tag == 'form':
-            return 1
-        if tag in {'input', 'textarea', 'select', 'button'} or role in {'button', 'textbox', 'combobox', 'checkbox', 'radio'}:
-            return 2
-        return 3
-
-    records = []
-    for item in sorted(observation['elements'], key=priority):
+    # The producer already orders controls by active surface. A global tag sort
+    # would move controls from other surfaces ahead of the current one.
+    controls = []
+    for item in observation['elements']:
         details = [f"<{item['tag'] or 'element'}>"]
-        for key, label in (('role', 'role'), ('name', 'name'), ('id', 'id'), ('type', 'type'), ('placeholder', 'placeholder'), ('container', 'container')):
+        for key, label in (('role', 'role'), ('name', '语义名称近似值 (not HTML name)'), ('html_name', 'HTML name'), ('id', 'id'), ('type', 'type'), ('placeholder', 'placeholder'), ('container', 'container')):
             if item.get(key):
                 details.append(f'{label}={item[key]}')
         details.append('enabled=' + ('unknown' if item['enabled'] is None else str(item['enabled']).lower()))
-        records.append('控件：' + '；'.join(details))
-    for item in observation['text']:
-        records.append('可见文本：' + item)
-    return _whole_lines([*mandatory, *records], limit)
+        details.append('readonly=' + ('unknown' if item['readonly'] is None else str(item['readonly']).lower()))
+        if item['mcp_selector']:
+            details.append('已核对当前页面的MCP selector，语义名称不等于HTML属性=' + item['mcp_selector'])
+        else:
+            details.append('MCP selector未提供=' + _MCP_SELECTOR_STATUS_LABELS.get(
+                item['mcp_selector_status'], item['mcp_selector_status'],
+            ))
+        if item['tag'].lower() == 'select':
+            details.append('当前 select value=' + json.dumps(item['select_value'], ensure_ascii=False))
+            details.append('原生 select options=' + json.dumps(
+                item['options'], ensure_ascii=False, separators=(',', ':'),
+            ))
+            if item['options_truncated']:
+                details.append('select options 已截断')
+        controls.append('控件：' + '；'.join(details))
+    texts = ['可见文本：' + item for item in observation['text']]
+    lines = [*mandatory, *controls, *texts]
+    complete = '\n'.join(lines)
+    if len(complete) <= limit:
+        return complete
+
+    marker = '[页面观察摘要已截断。]'
+    if limit < len(marker) or not (controls or texts):
+        return _whole_lines(lines, limit)
+
+    def cost(records):
+        # Every retained record precedes another record or the final marker.
+        return sum(len(line) + 1 for line in records)
+
+    def take(records, budget):
+        selected = []
+        for line in records:
+            size = len(line) + 1
+            if size <= budget:
+                selected.append(line)
+                budget -= size
+        return selected
+
+    remaining = limit - len(marker)
+    # Large notes/metadata must not crowd out both kinds of page evidence.
+    header = take(mandatory, remaining // 4)
+    remaining -= cost(header)
+    # Reserve half the body for each kind, releasing unused capacity when one
+    # is small. Select only whole records, keeping selector literals untouched.
+    control_budget = min(cost(controls), remaining // 2)
+    text_budget = min(cost(texts), remaining - control_budget)
+    selected_controls = take(controls, remaining - text_budget)
+    selected_texts = take(texts, remaining - cost(selected_controls))
+    selected_controls = take(controls, remaining - cost(selected_texts))
+    return '\n'.join([*header, *selected_controls, *selected_texts, marker])
 
 
 def failure_context(events, error_code='', error_message=''):

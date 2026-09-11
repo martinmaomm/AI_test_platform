@@ -354,6 +354,12 @@ test('a schema-v5 trace can retry script organization without reopening a browse
   assert.equal(canRetryScriptFromTrace(generation), true)
   assert.equal(canRetryScriptFromTrace({ ...generation, status: 'cancelled' }), true)
   assert.equal(canRetryScriptFromTrace({ ...generation, status: 'ready' }), false)
+  for (const status of ['ready', 'ready_with_warnings']) {
+    assert.equal(canRetryScriptFromTrace({ ...generation, status, workspace: { verification: { status: 'failed' } } }), true)
+    for (const verification of ['passed', 'unverified', 'running']) {
+      assert.equal(canRetryScriptFromTrace({ ...generation, status, workspace: { verification: { status: verification } } }), false)
+    }
+  }
   assert.equal(canRetryScriptFromTrace({ status: 'failed', script_draft: 'partial script', exploration_snapshot: { schema_version: 5 } }), true)
   assert.equal(canRetryScriptFromTrace(generation, true), false)
 })

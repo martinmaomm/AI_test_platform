@@ -43,6 +43,8 @@ from common.parsers import extract_python_from_output
 from .exploration_policy import ExplorationPolicy
 from .exploration_timeout import exploration_total_timeout_seconds
 from .exploration_trace import ExplorationTraceRecorder, _tool_failed
+from .exploration_test_data import ExplorationTestData
+from .exploration_operation_history import compact_operation_history
 from .exploration_diagnostics import failure_context
 from .script_draft_edits import apply_script_edits
 from .generation_preflight import (
@@ -72,6 +74,10 @@ _SCREENSHOT_DATA_RE = re.compile(r'data:image/[^;,\s]+;base64,[a-z0-9+/=\s]+', r
 
 
 EXPLORATION_SCRIPT_CONSTRAINTS = f"""你在一个连续的 Playwright MCP 浏览器上下文中探索并增量编写 Python 草稿。
+浏览器观察中的 mcp_selector 是平台已核对唯一命中当前可见控件的可执行定位器，MCP 操作优先原样使用它，不从语义名称臆造 [name]、[role] 或 CSS class。mcp_selector_status 非 verified_current_page 或缺少定位器时，按需补读当前表单/区域；不要凭空编造属性。定位器仅证明本次页面命中，页面变化后用新观察核对；生成脚本可使用 page.locator 对应定位器，但涉及列表数据时应结合本轮唯一变量筛选目标，不能把本轮列表行号当成业务身份。原生 select 的 options 提供真实 label/value/disabled/selected；选择时使用对应 value，不猜测。没有选项信息的自定义组合框先点击展开并读取实际选项。
+页面观察中的 name 是近似语义名称，不保证等于完整可访问名称，更不是 CSS 的 [name=...]；HTML name 只有工具明确提供时才可使用。readonly=true 的输入不能 fill；按其实际 role 和当前值判断是只读信息还是需要点击/键盘选择的控件。没有业务要求且已有有效默认值的可选字段，不必为了探索而逐一改动。生成代码优先复用成功操作中已核验的完整定位器；只有真实证据支持时才换成 get_by_role、get_by_label 或 get_by_placeholder。同名字段在不同表单里不保证具有相同属性，不能把搜索区的属性移植给弹窗字段；不能只因本轮自动生成的 HTML id 可用就假定每次打开都相同。
+平台检查点中的 operation_history 保留成功工具操作的简明历史，早期对话被压缩后仍可用于编写代码。它不是当前页面，也不表示业务断言已通过，禁止把历史动作直接重放。整理代码时核对其中的原始定位器和操作顺序，包括实际出现的后续确认步骤；不得凭记忆省略或臆造。历史标明截断时不要把未列出当作没有发生，保留现有草稿中已确认的步骤。
+探索需要唯一数据时，必须先调用 generate_unique_test_value，由平台实际执行 time.time_ns()。不要自行编造时间戳，也不要把函数名字当作输入值。使用工具返回的 value 填写、搜索、核对；同一变量 name 重复调用返回本轮同一个值。生成 Python 时 import time，将返回的 python_assignment 放在 run 函数内，并在填写、查询、断言中复用该变量；不得把本轮探索样本固定写入可重复运行脚本。不同业务数据可用不同 name、prefix、suffix，不按网站字段名推断唯一性。
 所有工具操作按顺序串行执行，包括填写、点击、读取页面和保存草稿；前一个完成后再执行下一个。需要根据页面结果决定的后续操作，应等待本轮工具结果后再发出。
 生成的 Python 脚本也必须按业务步骤逐个 await 浏览器操作，不使用 asyncio.gather、create_task、线程池或进程池并发执行测试步骤。
 浏览器调用上限 {MCP_BROWSER_TOOL_CALL_LIMIT} 次，模型调用上限 {MCP_MAX_STEPS} 次；接近预算时停止浏览器操作，使用 save_script_draft 保存当前完整草稿和真实剩余步骤。
@@ -98,6 +104,13 @@ class ScriptExplorationResult:
     error_message: str = ''
     final_message: str = ''
     completion: str = 'unknown'
+
+
+class UniqueTestValueInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    name: str = Field(min_length=1, max_length=64)
+    prefix: str = Field(default='', max_length=120)
+    suffix: str = Field(default='', max_length=120)
 
 
 class ScriptSaveInput(BaseModel):
@@ -228,6 +241,7 @@ class ScriptExplorationAgent:
         self._trace_path = ''
         self._prior_attempts: list[dict[str, Any]] = []
         self._efficiency_stats = Counter()
+        self._test_data = ExplorationTestData()
         self._last_valid_script = ''
         self._latest_candidate = ''
         self._artifact = {
@@ -337,6 +351,7 @@ class ScriptExplorationAgent:
             await self._await_task(
                 asyncio.create_task(agent.register_local_tools([
                     self._save_tool(), self._patch_tool(), self._read_tool(),
+                    self._unique_value_tool(),
                 ])), deadline,
             )
             with suppress_mcp_raw_query_logs():
@@ -348,7 +363,7 @@ class ScriptExplorationAgent:
             await self._submit_final_text_candidate()
             if not await self._persist_checkpoint(force=True):
                 return self._result('CHECKPOINT_FAILED', self._checkpoint_failure)
-            return self._result(self._candidate_error_code, self._candidate_error_message)
+            return self._result()
         except Exception as exc:
             logger.exception('连续探索中断，保留已保存草稿: generation_id=%s', self.generation_id)
             error_code = exc.error_code if isinstance(exc, ScriptExplorationAgentError) else _classify_mcp_error(exc)
@@ -444,16 +459,42 @@ class ScriptExplorationAgent:
             args_schema=ScriptSaveInput,
         )
 
+    def _unique_value_tool(self):
+        async def generate_unique_test_value(name, prefix='', suffix=''):
+            try:
+                item = self._test_data.generate(name, prefix, suffix)
+            except ValueError as exc:
+                return {'status': 'rejected', 'message': str(exc)}
+            # Persist before exposing a value that may be written to the site.
+            if not await self._persist_checkpoint(force=True):
+                raise ScriptExplorationAgentError('CHECKPOINT_FAILED', self._checkpoint_failure)
+            return {'status': 'ready', **item,
+                    'usage': '探索时原样使用 value；脚本中 import time，在 run 内使用 python_assignment，后续操作复用该变量。'}
+        return StructuredTool.from_function(
+            coroutine=generate_unique_test_value, name='generate_unique_test_value',
+            description='生成真实 time.time_ns() 唯一数据和对应 Python 赋值代码。同一 name 本轮幂等；不同新数据使用不同变量名。',
+            args_schema=UniqueTestValueInput,
+        )
+
     def _runtime_factory(self, tools):
         try:
             context_chars = max(12000, min(200000, int(os.environ.get('WEBUI_EXPLORATION_CONTEXT_CHARS', 48000))))
         except (ValueError, TypeError):
             context_chars = 48000
         return ExplorationRuntimeMiddleware(
-            tools, checkpoint=lambda: dict(self._artifact), failed=_tool_failed,
+            tools, checkpoint=lambda: {
+                **self._artifact,
+                'generated_test_data': self._test_data.snapshot(),
+                'operation_history': self._operation_history(),
+            }, failed=_tool_failed,
             stats=self._efficiency_stats, context_chars=context_chars,
             auto_observe=os.environ.get('WEBUI_EXPLORATION_AUTO_OBSERVE', 'true').lower() not in {'0', 'false', 'no'},
         )
+
+    def _operation_history(self):
+        source = (self._trace_recorder.evidence_snapshot()
+                  if self._trace_recorder is not None else self._saved_trace_data)
+        return compact_operation_history(source.get('events') or [])
 
     def _read_tool(self):
         async def read_script(start_line=1, line_count=100):
@@ -503,6 +544,21 @@ class ScriptExplorationAgent:
             ),
         )
 
+    def _reject_candidate(self, *, source: str, error_code: str, message: str, **details) -> dict[str, Any]:
+        """Keep the authoritative artifact but surface the failed replacement."""
+        feedback = {
+            'status': 'rejected', 'source': source,
+            'error_code': error_code, 'message': message,
+            'retained_revision': self._artifact['revision'],
+            'retained_completion': self._artifact['completion'],
+            **details,
+        }
+        self._latest_candidate_feedback = feedback
+        self._candidate_error_code = error_code
+        self._candidate_error_message = message
+        self._warnings.append(message)
+        return feedback
+
     def _consider_candidate(
         self,
         code: str,
@@ -519,16 +575,26 @@ class ScriptExplorationAgent:
             # so enforce the same source-size contract before storing or
             # parsing an oversized candidate.  Do not retain a truncated copy
             # as though it were a usable draft.
-            feedback = {
-                'status': 'rejected', 'source': source,
-                'error_code': 'SCRIPT_TOO_LONG',
-                'message': f'候选 Python 草稿超过 {_MAX_SCRIPT_CHARS} 字符，已拒绝保存并保留原草稿。',
-                'retained_revision': self._artifact['revision'],
-                'retained_completion': self._artifact['completion'],
-            }
-            self._latest_candidate_feedback = feedback
-            return feedback
+            return self._reject_candidate(
+                source=source, error_code='SCRIPT_TOO_LONG',
+                message=f'候选 Python 草稿超过 {_MAX_SCRIPT_CHARS} 字符，已拒绝保存并保留原草稿。',
+            )
         self._latest_candidate = candidate
+        if not candidate:
+            return self._reject_candidate(
+                source=source,
+                error_code='SCRIPT_CANDIDATE_EMPTY' if self._last_valid_script else 'NO_SCRIPT_DRAFT',
+                message='未返回可提取的 Python 候选草稿；已保留原草稿，本次整理未成功。' if self._last_valid_script
+                else '未返回可提取的 Python 草稿，当前没有可用草稿。',
+            )
+        fixed_samples = self._test_data.fixed_sample_variables(candidate)
+        if fixed_samples:
+            return self._reject_candidate(
+                source=source, error_code='FIXED_EXPLORATION_SAMPLE',
+                message='脚本固定写入了本轮唯一数据样本。请在 run 内生成变量，并在后续操作和断言中复用变量。',
+                variables=fixed_samples,
+                assignments=[self._test_data.snapshot()[name]['python_assignment'] for name in fixed_samples],
+            )
         report = self._quality_report(candidate)
         blockers = list(report.get('blockers') or [])
         normalized_completion = completion if completion in {'partial', 'complete'} else 'partial'
@@ -576,14 +642,11 @@ class ScriptExplorationAgent:
             report = self._quality_report(candidate)
             blockers = list(report.get('blockers') or [])
         if blockers:
-            feedback = {
-                'status': 'rejected', 'source': source,
-                'retained_revision': self._artifact['revision'],
-                'retained_completion': self._artifact['completion'],
-                'static_feedback': self._bounded_report(report, blockers=blockers),
-            }
-            self._latest_candidate_feedback = feedback
-            return feedback
+            return self._reject_candidate(
+                source=source, error_code=str(blockers[0].get('code') or 'SCRIPT_CANDIDATE_INVALID'),
+                message='候选 Python 草稿未通过静态检查，已拒绝保存并保留原草稿。',
+                static_feedback=self._bounded_report(report, blockers=blockers),
+            )
         changed = candidate != self._last_valid_script
         self._last_valid_script = candidate
         if changed:
@@ -604,15 +667,21 @@ class ScriptExplorationAgent:
             'static_feedback': self._bounded_report(report),
         }
         self._latest_candidate_feedback = feedback
+        # A later accepted replacement resolves an earlier rejected proposal.
+        self._candidate_error_code = ''
+        self._candidate_error_message = ''
         return feedback
 
     async def _submit_final_text_candidate(self) -> None:
         # A locally saved draft is authoritative.  An extra final reply must
         # not downgrade or replace it merely because the reply is incomplete.
-        if (self._last_valid_script and not self._seed_is_current) or not self._model_output_for_extraction:
+        if self._last_valid_script and not self._seed_is_current:
             return
         candidate = extract_python_from_output(self._model_output_for_extraction)
-        if not candidate or candidate.strip() == self._last_valid_script:
+        # A plain final summary must not replace a more specific tool rejection.
+        if not candidate and self._candidate_error_code:
+            return
+        if candidate and candidate.strip() == self._last_valid_script:
             return
         feedback = self._consider_candidate(
             candidate,
@@ -626,18 +695,14 @@ class ScriptExplorationAgent:
         )
         if feedback['status'] == 'accepted':
             self._warnings.append('最终文本草稿仅作为增量保存失败时的 partial 回退，未声明已完成。')
-        elif feedback.get('error_code') == 'SCRIPT_TOO_LONG':
-            self._warnings.append(str(feedback['message']))
-            self._candidate_error_code = str(feedback['error_code'])
-            self._candidate_error_message = str(feedback['message'])
 
     async def _generate_code_only(self) -> ScriptExplorationResult:
         """Ask the configured model to repair only callback-owned saved evidence.
 
         No MCP client, browser tool, or MCPAgent is constructed in this path.
         A missing draft still gets one bounded model repair attempt from the
-        saved trace; it becomes ``NO_SCRIPT_DRAFT`` only if that cannot yield
-        a syntactically saveable, evidence-grounded script.
+        saved trace; an empty reply with no retained draft is ``NO_SCRIPT_DRAFT``.
+        Other rejected proposals retain their specific failure code.
         """
         diagnostics = self._quality_report(self._last_valid_script) if self._last_valid_script else {
             'status': 'needs_review', 'blockers': [], 'warnings': [],
@@ -648,11 +713,15 @@ class ScriptExplorationAgent:
             'brief': self._brief,
             'target_url': self._target_url,
             'saved_trace': compact_saved_evidence(self._saved_trace_data),
+            'operation_history': compact_operation_history(self._saved_trace_data.get('events') or []),
+            'generated_test_data': self._test_data.snapshot(),
             'existing_script_draft': self._last_valid_script,
             'diagnostics': diagnostics,
             'repair_diagnostics': self._saved_repair_diagnostics,
             'rules': [
-                '只能整理、修复已有草稿和 saved_trace 中实际观察到的操作。',
+                '只能整理、修复已有草稿、saved_trace 和 operation_history 中实际观察到的操作。operation_history 保留早期成功动作，供纠正被省略的定位器和后续确认步骤；不得重放浏览器或把工具成功当作断言通过。',
+                '优先复用成功操作的完整定位器，保留其表单范围；不得把别处同名控件的 placeholder、name 等属性移植到该字段。',
+                'generated_test_data 保存本轮探索的实际值及 Python 赋值方式；代码应在 run 内生成并复用变量，不固定写入探索样本。',
                 '不得创建 MCP/client/browser，不得补造未知定位器、按钮、断言或业务操作。',
                 '输出完整 Python 草稿；保留或补充顶部中文场景说明和步骤注释。',
                 'page.goto 必须使用完整 HTTP(S) 网址，首次打开 target_url，保留原路径、参数和 # 路由；不依赖 base_url 或测试环境。未知操作或断言必须保留 PENDING_STEP 或 PENDING_ASSERTION 注释。',
@@ -666,31 +735,24 @@ class ScriptExplorationAgent:
             )
             self._record_model_output(model_result)
             candidate = extract_python_from_output(self._model_output_for_extraction)
-            if candidate:
-                feedback = self._consider_candidate(
-                    candidate,
-                    completed_steps=self._artifact['completed_steps'],
-                    # Only pending markers still present in the current
-                    # candidate may carry into the repaired artifact.
-                    remaining_steps=[],
-                    variables=self._artifact['variables'],
-                    # Repair candidates may already be complete.  Static quality
-                    # never proves that claim; the independent runner does.
-                    completion='complete' if self._brief.get('repair_only') else 'partial',
-                    source='code_only_model',
-                )
-                if feedback['status'] == 'rejected':
-                    self._warnings.append(str(feedback.get(
-                        'message', 'code_only 模型候选未通过静态检查，已保留原草稿。',
-                    )))
-                    if feedback.get('error_code') == 'SCRIPT_TOO_LONG':
-                        self._candidate_error_code = str(feedback['error_code'])
-                        self._candidate_error_message = str(feedback['message'])
-            else:
-                self._warnings.append('code_only 模型未返回可提取的 Python 草稿，已保留原草稿。')
+            self._consider_candidate(
+                candidate,
+                completed_steps=self._artifact['completed_steps'],
+                # Only pending markers still present in the current
+                # candidate may carry into the repaired artifact.
+                remaining_steps=[],
+                variables=self._artifact['variables'],
+                # Repair candidates may already be complete.  Static quality
+                # never proves that claim; the independent runner does.
+                completion='complete' if (
+                    self._brief.get('repair_only')
+                    or (self._artifact['completion'] == 'complete' and not self._artifact['remaining_steps'])
+                ) else 'partial',
+                source='code_only_model',
+            )
             if not await self._persist_checkpoint(force=True):
                 return self._result('CHECKPOINT_FAILED', self._checkpoint_failure)
-            return self._result(self._candidate_error_code, self._candidate_error_message)
+            return self._result()
         except Exception as exc:
             logger.exception('基于证据整理脚本中断: generation_id=%s', self.generation_id)
             error_code = exc.error_code if isinstance(exc, ScriptExplorationAgentError) else _classify_mcp_error(exc)
@@ -810,6 +872,7 @@ class ScriptExplorationAgent:
         termination_reason = self._termination_reason or str(stats.get('termination_reason') or '')
         return {
             'schema_version': 5,
+            'generated_test_data': self._test_data.snapshot(),
             'trace_path': self._trace_path or self._saved_trace_data.get('trace_path', ''),
             'prior_attempts': self._prior_attempts,
             'target_url': self._target_url,
@@ -833,6 +896,8 @@ class ScriptExplorationAgent:
         }
 
     def _result(self, error_code: str = '', error_message: str = '') -> ScriptExplorationResult:
+        if not error_code:
+            error_code, error_message = self._candidate_error_code, self._candidate_error_message
         completion = self._artifact['completion']
         if self._artifact['remaining_steps']:
             completion = 'partial'
@@ -860,8 +925,10 @@ class ScriptExplorationAgent:
             'brief': self._brief,
             'target_url': self._target_url,
             'saved_snapshot': compact_saved_evidence(self._saved_trace_data),
+            'operation_history': compact_operation_history(self._saved_trace_data.get('events') or []),
             'existing_script_draft': self._last_valid_script if len(self._last_valid_script) <= 16000 else '草稿较长，使用 read_script_draft 分段读取当前代码。',
             'artifact': self._artifact,
+            'generated_test_data': self._test_data.snapshot(),
             'scope': {
                 'allow_test_data_writes': bool(self._brief.get('allow_test_data_writes')),
                 'explicit_read_only': bool(self._brief.get('explicit_read_only')),
@@ -872,6 +939,7 @@ class ScriptExplorationAgent:
     def _restore_snapshot(self, snapshot: dict | None) -> None:
         value = snapshot if isinstance(snapshot, dict) else {}
         self._saved_trace_data = dict(value)
+        self._test_data.restore(value.get('generated_test_data'))
         self._prior_attempts = [item for item in value.get('prior_attempts', []) if isinstance(item, dict)] if isinstance(value.get('prior_attempts'), list) else []
         for key, default in (
             ('events', []), ('page_states', []), ('locator_evidence', []), ('tool_stats', {}),

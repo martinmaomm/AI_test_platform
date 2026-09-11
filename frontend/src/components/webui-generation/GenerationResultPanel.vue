@@ -39,7 +39,7 @@ const statusLabel = computed(() => generationStatusLabel(props.generation?.statu
 const resolutionHint = computed(() => generationResolutionHint(props.generation, { draftDirty: Boolean(props.draft?.dirty) }))
 const hintType = computed(() => props.generation?.status === 'failed' ? 'error' : ['needs_review', 'needs_confirmation', 'needs_input'].includes(props.generation?.status) ? 'warning' : props.generation?.status === 'cancelled' ? 'info' : 'success')
 const canSave = computed(() => canSaveGeneratedDraft(props.generation, props.draft, props.busy))
-const canRetryGeneration = computed(() => canRetryScriptFromTrace(props.generation, props.busy))
+const canRetryGeneration = computed(() => canRetryScriptFromTrace(props.generation, props.busy || props.draft?.dirty || props.draftConflict))
 const draftCompletion = computed(() => generationDraftCompletion(props.generation))
 const failureReason = computed(() => generationFailureReason(props.generation))
 const showStopContext = computed(() => shouldShowGenerationStopContext(props.generation?.status))

@@ -82,6 +82,34 @@ function tempScreenshots() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-diagnostics-'));
 }
 
+test('proven ambiguous targets never run a first-match action in the controlled UI runtime', async () => {
+  const screenshotDir = tempScreenshots();
+  try {
+    let calls = 0;
+    class Tool {
+      async execute() {
+        calls += 1;
+        return { content: [{ type: 'text', text: 'first-match action' }], isError: false };
+      }
+    }
+    wrapToolForPageDiagnostics(Tool, { selectorKey: 'selector', guardAmbiguousTarget: true }, { screenshotDir });
+    const result = await new Tool().execute({ selector: 'input' }, { page: mockPage({ count: 3 }) });
+    assert.equal(calls, 0);
+    assert.equal(result.isError, true);
+    const metadata = metadataFrom(result);
+    assert.equal(metadata.reason_code, 'strict_mode');
+    assert.equal(metadata.matched_count, null);
+    assert.equal(metadata.screenshot_status, 'captured');
+    assert.match(result.content[0].text, /No action was performed/);
+
+    const accepted = await new Tool().execute({ selector: 'input.unique' }, { page: mockPage({ count: 1 }) });
+    assert.equal(calls, 1);
+    assert.equal(accepted.isError, false);
+  } finally {
+    fs.rmSync(screenshotDir, { recursive: true, force: true });
+  }
+});
+
 test('successful interaction preserves content and appends bounded page metadata last without a screenshot', async () => {
   const screenshotDir = tempScreenshots();
   try {

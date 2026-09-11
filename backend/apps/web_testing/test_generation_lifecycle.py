@@ -405,6 +405,20 @@ class GenerationLifecycleTests(TestCase):
                 self.assertEqual(generation.status, WebUIScriptGeneration.Status.FAILED)
                 self.assertEqual(generation.revision, 0)
 
+    def test_code_only_retry_accepts_ready_draft_only_after_failed_debug(self):
+        for status in (WebUIScriptGeneration.Status.READY, WebUIScriptGeneration.Status.READY_WITH_WARNINGS):
+            for verification in ('failed', 'passed', 'unverified'):
+                with self.subTest(status=status, verification=verification):
+                    generation = self.generation(status=status)
+                    generation.workspace = {'verification': {'status': verification}}
+                    generation.save(update_fields=['workspace'])
+                    if verification == 'failed':
+                        retried = prepare_trace_generation_retry(generation.pk, expected_revision=0)
+                        self.assertEqual(retried.status, WebUIScriptGeneration.Status.GENERATING)
+                    else:
+                        with self.assertRaises(GenerationResolutionConflict):
+                            prepare_trace_generation_retry(generation.pk, expected_revision=0)
+
     def test_ninth_code_only_invalidation_still_fences_first_obsolete_task(self):
         first_task = 'code-task-oldest'
         generation = self.generation(

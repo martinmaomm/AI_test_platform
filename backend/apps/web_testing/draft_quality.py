@@ -77,12 +77,14 @@ def _simple_statement_call(node: ast.stmt) -> ast.Call | None:
     return value if isinstance(value, ast.Call) else None
 
 
-def _static_entry_goto(tree: ast.Module) -> tuple[str, ast.Call | ast.stmt | None]:
+def _static_entry_goto(tree: ast.Module) -> tuple[str, ast.Call | ast.stmt | None, str | None]:
     """Find a statically ordered entry goto without interpreting Python flow.
 
     Direct sequential statements in ``run`` and directly-called local helpers
-    are reliable. Branches, loops, dynamic goto values, and recursive helpers
-    stay explicitly unconfirmed.
+    can supply a literal or a single-assignment local string (including a known
+    string alias). Each function has its own bindings; arguments and globals
+    are not propagated. Return the URL separately without changing the AST.
+    Branches, loops, reassignments and recursive helpers stay unconfirmed.
     """
     functions = {
         node.name: node
@@ -91,19 +93,51 @@ def _static_entry_goto(tree: ast.Module) -> tuple[str, ast.Call | ast.stmt | Non
     }
     run = functions.get('run')
     if run is None:
-        return 'missing', None
+        return 'missing', None, None
+
+    def string_value(node: ast.AST | None, constants: dict[str, str]) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return constants.get(node.id) if isinstance(node, ast.Name) else None
 
     def inspect(function: ast.FunctionDef | ast.AsyncFunctionDef, stack: frozenset[str]):
         if function.name in stack:
-            return 'unconfirmed', function
+            return 'unconfirmed', function, None
         stack = stack | {function.name}
+        constants: dict[str, str] = {}
+        bound_names = {node.arg for node in ast.walk(function.args) if isinstance(node, ast.arg)}
         for statement in function.body:
             if not isinstance(statement, (
                 ast.Expr, ast.Assign, ast.AnnAssign, ast.Return, ast.Pass,
                 ast.Import, ast.ImportFrom,
             )):
                 # Do not guess which branch/helper a compound statement runs.
-                return 'unconfirmed', statement
+                return 'unconfirmed', statement, None
+
+            # Only one direct Name binding may introduce a known string. All
+            # other writes (including walrus expressions and imports) discard
+            # prior knowledge before considering a navigation in this statement.
+            assigned = None
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                assigned = statement.targets[0]
+            elif isinstance(statement, ast.AnnAssign):
+                assigned = statement.target
+            known = string_value(statement.value, constants) if isinstance(assigned, ast.Name) else None
+            writes = {
+                node.id for node in ast.walk(statement)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+            }
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                writes.update(alias.asname or alias.name.split('.')[0] for alias in statement.names)
+            for name in writes:
+                constants.pop(name, None)
+            if (
+                isinstance(assigned, ast.Name) and known is not None
+                and assigned.id not in bound_names and writes == {assigned.id}
+            ):
+                constants[assigned.id] = known
+            bound_names.update(writes)
+
             call = _simple_statement_call(statement)
             if any(
                 isinstance(child, ast.Name) and child.id in functions
@@ -111,22 +145,25 @@ def _static_entry_goto(tree: ast.Module) -> tuple[str, ast.Call | ast.stmt | Non
                 for child in ast.walk(statement)
             ):
                 # Passing or aliasing a helper makes its execution order unknown.
-                return 'unconfirmed', statement
+                return 'unconfirmed', statement, None
             if call is not None:
                 awaited = isinstance(getattr(statement, 'value', None), ast.Await)
                 short = call.func.attr if isinstance(call.func, ast.Attribute) else ''
                 if short == 'goto':
                     if not awaited:
-                        return 'unconfirmed', call
+                        return 'unconfirmed', call, None
                     target = call.args[0] if call.args else next(
                         (kw.value for kw in call.keywords if kw.arg == 'url'), None,
                     )
-                    if isinstance(target, ast.Constant) and isinstance(target.value, str):
-                        return 'literal', call
-                    return 'unconfirmed', call
+                    resolved = string_value(target, constants)
+                    if resolved is not None:
+                        return 'literal' if isinstance(target, ast.Constant) else 'resolved', call, resolved
+                    return 'unconfirmed', call, None
                 if isinstance(call.func, ast.Name) and call.func.id in functions:
+                    if call.func.id in bound_names:
+                        return 'unconfirmed', call, None
                     if isinstance(functions[call.func.id], ast.AsyncFunctionDef) and not awaited:
-                        return 'unconfirmed', call
+                        return 'unconfirmed', call, None
                     result = inspect(functions[call.func.id], stack)
                     if result[0] != 'missing':
                         return result
@@ -137,10 +174,10 @@ def _static_entry_goto(tree: ast.Module) -> tuple[str, ast.Call | ast.stmt | Non
                 and child.func.attr == 'goto'
                 for child in ast.walk(statement)
             ):
-                return 'unconfirmed', statement
+                return 'unconfirmed', statement, None
             if isinstance(statement, ast.Return):
-                return 'missing', None
-        return 'missing', None
+                return 'missing', None, None
+        return 'missing', None, None
 
     return inspect(run, frozenset())
 
@@ -180,6 +217,7 @@ def evaluate_draft(script: str, *, target_url: str = '', snapshot: dict | None =
             for item in node.names:
                 aliases[item.asname or item.name] = f'{node.module}.{item.name}'
 
+    entry_status, entry, entry_url = _static_entry_goto(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr.startswith('__'):
             blockers.append(_issue('UNSAFE_ATTRIBUTE', '生成草稿不允许访问 Python 内部双下划线属性。', line=node.lineno))
@@ -197,10 +235,13 @@ def evaluate_draft(script: str, *, target_url: str = '', snapshot: dict | None =
             blockers.append(_issue('UNSAFE_OS_OPERATION', '生成草稿只能读取配置变量，不能调用操作系统命令或修改环境。', line=node.lineno))
         if short == 'goto':
             target = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == 'url'), None)
-            if isinstance(target, ast.Constant) and isinstance(target.value, str):
+            url = target.value if isinstance(target, ast.Constant) and isinstance(target.value, str) else None
+            if node is entry and entry_url is not None:
+                url = entry_url
+            if url is not None:
                 try:
-                    validate_target_url(target.value)
-                    if target_url and target_origin(target.value) != target_origin(target_url):
+                    validate_target_url(url)
+                    if target_url and target_origin(url) != target_origin(target_url):
                         blockers.append(_issue('NAVIGATION_OUTSIDE_TARGET', '脚本导航地址不属于描述中的目标站点，请确认测试范围。', line=node.lineno))
                 except ValueError:
                     blockers.append(_issue('ABSOLUTE_URL_REQUIRED', '脚本导航必须填写完整 HTTP(S) 网址，不能依赖相对路径或环境地址。', line=node.lineno))
@@ -229,7 +270,6 @@ def evaluate_draft(script: str, *, target_url: str = '', snapshot: dict | None =
                 pass
         blockers.append(_issue('TOP_LEVEL_EXECUTION', '请把动态数据生成和页面操作放在 run 函数内。', line=getattr(node, 'lineno', None)))
 
-    entry_status, entry = _static_entry_goto(tree)
     if entry_status == 'missing':
         blockers.append(_issue('ENTRY_NAVIGATION_MISSING', '脚本缺少打开目标页面的 page.goto 操作。'))
     elif entry_status == 'unconfirmed':
@@ -238,16 +278,13 @@ def evaluate_draft(script: str, *, target_url: str = '', snapshot: dict | None =
             '无法静态确认脚本首个 page.goto 的完整入口网址；草稿可继续编辑和调试，但不能标记为已验证。',
             level='warning', line=getattr(entry, 'lineno', None),
         ))
-    elif target_url and isinstance(entry, ast.Call):
-        entry_target = entry.args[0] if entry.args else next(
-            (kw.value for kw in entry.keywords if kw.arg == 'url'), None,
-        )
-        if (
-            isinstance(entry_target, ast.Constant)
-            and isinstance(entry_target.value, str)
-            and target_origin(entry_target.value) == target_origin(target_url)
-            and entry_target.value != target_url
-        ):
+    elif target_url and isinstance(entry, ast.Call) and entry_url is not None:
+        try:
+            same_origin = target_origin(entry_url) == target_origin(target_url)
+        except ValueError:
+            # Invalid resolved URLs were already reported by the navigation check.
+            same_origin = False
+        if same_origin and entry_url != target_url:
             blockers.append(_issue(
                 'TARGET_URL_CHANGED',
                 '脚本入口与描述中的完整目标网址不同，请保留路径、参数和 # 路由。',

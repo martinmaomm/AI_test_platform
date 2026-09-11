@@ -7,6 +7,8 @@ const MAX_SELECTOR_LENGTH = 1000;
 const READ_TIMEOUT_MS = 1200;
 const SAMPLE_COUNT = 3;
 const SAMPLE_DELAY_MS = 80;
+const MAX_SELECTOR_CHECKS = 240;
+const SELECTOR_CHECK_BUDGET_MS = 1800;
 
 function bounded(value, limit) {
   const text = String(value || '')
@@ -27,15 +29,40 @@ function fit(observation) {
   const output = {
     ...observation,
     notes: [...observation.notes],
-    elements: observation.elements.map((item) => ({ ...item })),
+    elements: observation.elements.map((item) => ({
+      ...item,
+      ...(item.options ? { options: [...item.options] } : {}),
+    })),
     text: [...observation.text],
   };
   const tooLarge = () => JSON.stringify(output).length > MAX_OBSERVATION_JSON_CHARS;
   if (!tooLarge()) return output;
   output.truncated = true;
   note(output, 'output_truncated');
-  while (output.text.length && tooLarge()) output.text.pop();
-  while (output.elements.length && tooLarge()) output.elements.pop();
+  // Both lists are already ordered by the active surface (dialog/form/main).
+  // Share the available payload roughly 2:1, lending unused space to either
+  // side. Removing all text first hides results and prompts on control-heavy
+  // pages; removing all controls first makes those results unactionable.
+  while ((output.elements.length || output.text.length) && tooLarge()) {
+    const controlsSize = JSON.stringify(output.elements).length;
+    const textSize = JSON.stringify(output.text).length;
+    if (output.elements.length && (!output.text.length || controlsSize > textSize * 2)) {
+      const last = output.elements.at(-1);
+      // One large native option inventory must not crowd out the select
+      // itself. Drop whole, unselected options, never alter executable values.
+      if (last.options?.length > 1 && JSON.stringify(last).length > 2400) {
+        const removable = last.options.findLastIndex((option) => !option.selected);
+        if (removable >= 0) {
+          last.options.splice(removable, 1);
+          last.options_truncated = true;
+          continue;
+        }
+      }
+      output.elements.pop();
+    } else {
+      output.text.pop();
+    }
+  }
   while (output.notes.length > 1 && tooLarge()) output.notes.pop();
   if (tooLarge()) {
     output.notes = ['output_truncated'];
@@ -73,6 +100,8 @@ function browserSnapshot(root) {
   const MAX_TEXT = 220;
   const MAX_VISITED = 6000;
   const MAX_SEMANTIC = 2400;
+  const MAX_SELECT_OPTIONS = 40;
+  const MAX_SELECT_VALUE_LENGTH = 300;
   const notes = [];
   const addNote = (value) => {
     if (!notes.includes(value)) notes.push(value);
@@ -143,24 +172,55 @@ function browserSnapshot(root) {
       .map(textInside)
       .filter(Boolean);
     return (
-      labels.join(' ') ||
-      clean(element.getAttribute('aria-label')) ||
       referencedText(element, 'aria-labelledby') ||
+      clean(element.getAttribute('aria-label')) ||
+      labels.join(' ') ||
       clean(element.getAttribute('placeholder')) ||
       clean(element.getAttribute('title')) ||
       textInside(element)
     );
   };
-  const containerFor = (element) => {
-    const container = element.closest('[role="dialog"], dialog, form, main, [role="main"], nav');
-    if (!container || !visibleElement(container)) return '';
-    const heading = container.querySelector('legend, [role="heading"], h1, h2, h3, h4, h5, h6');
+  const htmlNameFor = (element) =>
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLSelectElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLButtonElement
+      ? clean(element.getAttribute('name'))
+      : '';
+  // `readonly` has no interaction-preventing native meaning for every input
+  // type (for example, checkbox).  Do not turn an attribute or ARIA hint into
+  // a claim that a control cannot be filled; use null when it is inapplicable
+  // or a custom control does not expose the native state.
+  const nativeReadonlyInputTypes = new Set([
+    'date', 'datetime-local', 'email', 'month', 'number', 'password', 'search',
+    'tel', 'text', 'time', 'url', 'week',
+  ]);
+  const readonlyFor = (element) => {
+    if (element instanceof HTMLTextAreaElement) return element.readOnly;
+    if (element instanceof HTMLInputElement) {
+      const type = (element.getAttribute('type') || 'text').toLowerCase();
+      return nativeReadonlyInputTypes.has(type) ? element.readOnly : null;
+    }
+    return null;
+  };
+  const containerNameFor = (container) => {
+    const heading = container.querySelector(
+      'legend, [role="heading"], h1, h2, h3, h4, h5, h6'
+    );
     return (
       clean(container.getAttribute('aria-label')) ||
       referencedText(container, 'aria-labelledby') ||
-      textInside(heading || document.createElement('span')) ||
-      clean(container.id)
+      textInside(heading || document.createElement('span'))
     );
+  };
+  const containerFor = (element) => {
+    for (let container = element.parentElement; container; container = container.parentElement) {
+      if (!container.matches('[role="dialog"], dialog, form, main, [role="main"], nav')) continue;
+      if (!visibleElement(container)) continue;
+      const name = containerNameFor(container);
+      if (name) return name;
+    }
+    return '';
   };
   const surfaceFor = (element) => {
     const dialog = element.closest('[role="dialog"], dialog');
@@ -209,6 +269,111 @@ function browserSnapshot(root) {
       return `selected:${element.selectedIndex}:${stateDigest(element.value)}`;
     return element.isContentEditable ? `editable:${stateDigest(element.textContent)}` : '';
   };
+  const cssString = (value) => `"${String(value)
+    .replaceAll('\\', '\\\\')
+    .replaceAll('"', '\\"')
+    .replaceAll('\n', '\\a ')
+    .replaceAll('\r', '\\d ')
+    .replaceAll('\f', '\\c ')}"`;
+  const structuralSelectorFor = (element) => {
+    const segments = [];
+    for (let current = element; current?.nodeType === Node.ELEMENT_NODE; current = current.parentElement) {
+      const tag = current.tagName.toLowerCase();
+      const siblings = current.parentElement
+        ? Array.from(current.parentElement.children).filter((item) => item.tagName === current.tagName)
+        : [current];
+      segments.unshift(`${tag}:nth-of-type(${siblings.indexOf(current) + 1})`);
+    }
+    return segments.join(' > ');
+  };
+  const relativeStructuralSelector = (ancestor, element) => {
+    const segments = [];
+    for (let current = element; current && current !== ancestor; current = current.parentElement) {
+      const tag = current.tagName.toLowerCase();
+      const siblings = Array.from(current.parentElement.children)
+        .filter((item) => item.tagName === current.tagName);
+      segments.unshift(`${tag}:nth-of-type(${siblings.indexOf(current) + 1})`);
+    }
+    return segments.join(' > ');
+  };
+  const scopedStructuralCandidatesFor = (element) => {
+    const candidates = [];
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      const relative = relativeStructuralSelector(ancestor, element);
+      if (!relative) continue;
+      const tag = ancestor.tagName.toLowerCase();
+      const anchors = [];
+      for (const attribute of ['data-testid', 'name', 'aria-label']) {
+        const value = ancestor.getAttribute(attribute);
+        if (value !== null && value !== '')
+          anchors.push(`${tag}[${attribute}=${cssString(value)}]`);
+      }
+      const role = ancestor.getAttribute('role');
+      if (role) anchors.push(`${tag}[role=${cssString(role)}]`);
+      if (['dialog', 'form', 'main', 'nav'].includes(tag)) anchors.push(tag);
+      for (const anchor of anchors) candidates.push(`${anchor} > ${relative}:visible`);
+    }
+    return candidates;
+  };
+  const selectorCandidatesFor = (element, name) => {
+    const tag = element.tagName.toLowerCase();
+    const candidates = [];
+    for (const attribute of ['data-testid', 'name', 'placeholder', 'aria-label']) {
+      const value = element.getAttribute(attribute);
+      if (value !== null && value !== '')
+        candidates.push(`${tag}[${attribute}=${cssString(value)}]:visible`);
+    }
+    if ((tag === 'button' || tag === 'a') && name) {
+      candidates.push(`${tag}:text-is(${JSON.stringify(name)}):visible`);
+      candidates.push(`${tag}:has-text(${JSON.stringify(name)}):visible`);
+    }
+    candidates.push(...scopedStructuralCandidatesFor(element));
+    const structural = structuralSelectorFor(element);
+    if (structural) candidates.push(`${structural}:visible`);
+    return [...new Set(candidates)];
+  };
+  const identityFor = (element) => ({
+    path: structuralSelectorFor(element),
+    tag: element.tagName.toLowerCase(),
+    id: element.getAttribute('id'),
+    role: element.getAttribute('role'),
+    htmlName: element.getAttribute('name'),
+    placeholder: element.getAttribute('placeholder'),
+    ariaLabel: element.getAttribute('aria-label'),
+    ariaLabelledby: element.getAttribute('aria-labelledby'),
+    dataTestid: element.getAttribute('data-testid'),
+    textDigest: stateDigest(element.textContent),
+    labelsDigest: stateDigest(Array.from(element.labels || []).map((item) => item.textContent).join('\u0000')),
+  });
+  const selectEvidenceFor = (element) => {
+    if (!(element instanceof HTMLSelectElement)) return {};
+    const options = [];
+    let optionsTruncated = false;
+    for (const option of Array.from(element.options)) {
+      if (options.length >= MAX_SELECT_OPTIONS) {
+        optionsTruncated = true;
+        break;
+      }
+      const value = String(option.value);
+      if (value.length > MAX_SELECT_VALUE_LENGTH) {
+        optionsTruncated = true;
+        continue;
+      }
+      options.push({
+        value,
+        label: clean(option.label || option.textContent, MAX_SELECT_VALUE_LENGTH),
+        disabled: option.disabled || (option.parentElement instanceof HTMLOptGroupElement && option.parentElement.disabled),
+        selected: option.selected,
+      });
+    }
+    const selectedValue = String(element.value);
+    if (selectedValue.length > MAX_SELECT_VALUE_LENGTH) optionsTruncated = true;
+    return {
+      select_value: selectedValue.length <= MAX_SELECT_VALUE_LENGTH ? selectedValue : '',
+      options,
+      options_truncated: optionsTruncated,
+    };
+  };
 
   const roots = [];
   if (
@@ -255,18 +420,29 @@ function browserSnapshot(root) {
     if (element.shadowRoot) addNote('visible_shadow_root_not_traversed');
     const surface = surfaceFor(element);
     if (interactive(element)) {
-      const record = {
+      const semanticRecord = {
         tag: element.tagName.toLowerCase(),
         role: clean(element.getAttribute('role')),
         name: nameFor(element),
+        html_name: htmlNameFor(element),
         id: clean(element.id),
         type: clean(element.getAttribute('type')),
         placeholder: clean(element.getAttribute('placeholder')),
         visible: true,
         enabled: enabledFor(element),
+        readonly: readonlyFor(element),
         container: containerFor(element),
       };
-      pushSemantic(['control', surface, sequence, record, stateFor(element)]);
+      const record = {
+        ...semanticRecord,
+        ...selectEvidenceFor(element),
+        _identity: identityFor(element),
+        _selector_candidates: selectorCandidatesFor(element, semanticRecord.name),
+      };
+      // Selector hints and option inventories are presentation evidence. Keep
+      // them out of page-state fingerprints so formatting/locator choice does
+      // not look like a page transition to the repeat guard.
+      pushSemantic(['control', surface, sequence, semanticRecord, stateFor(element)]);
       if (elements.length < MAX_ELEMENTS)
         elements.push({ ...record, _surface: surface, _sequence: sequence });
       else addNote('controls_capped');
@@ -333,6 +509,96 @@ async function evaluateLocator(locator) {
   return locator.evaluate(browserSnapshot, undefined, { timeout: READ_TIMEOUT_MS });
 }
 
+function selectorStatusFrom(error) {
+  const text = String(error?.message || error || '');
+  if (/detached from|not attached|not connected to the dom/i.test(text))
+    return 'detached_or_page_changed';
+  return 'verification_error';
+}
+
+function selectorStatusLabel(status) {
+  return ({
+    verification_budget_exhausted: '核验预算已用完',
+    candidate_too_long: '候选 selector 超出长度限制',
+    detached_or_page_changed: '控件已分离或页面已变化',
+    no_unique_visible_candidate: '没有当前页面唯一可见候选',
+    verification_error: '浏览器核验失败',
+  })[status] || status || '未核对';
+}
+
+async function verifyMcpSelectors(page, elements) {
+  const verified = [];
+  const deadline = Date.now() + SELECTOR_CHECK_BUDGET_MS;
+  let checks = 0;
+  for (const source of elements) {
+    const { _identity: identity, _selector_candidates: candidates, ...element } = source;
+    let mcpSelector = '';
+    let status = 'no_unique_visible_candidate';
+    if (!identity?.path || !Array.isArray(candidates) || candidates.length === 0) {
+      verified.push({ ...element, mcp_selector: '', mcp_selector_status: status });
+      continue;
+    }
+    for (const candidate of candidates) {
+      if (Date.now() >= deadline || checks >= MAX_SELECTOR_CHECKS) {
+        status = 'verification_budget_exhausted';
+        break;
+      }
+      if (candidate.length > MAX_SELECTOR_LENGTH) {
+        status = 'candidate_too_long';
+        continue;
+      }
+      checks += 1;
+      try {
+        const locator = page.locator(candidate);
+        const count = await locator.count();
+        if (count !== 1) continue;
+        const sameIdentity = await locator.evaluate((current, expected) => {
+          const digest = (value) => {
+            const raw = String(value || '');
+            let state = 2166136261;
+            for (let index = 0; index < raw.length; index += 1) {
+              state ^= raw.charCodeAt(index);
+              state = Math.imul(state, 16777619);
+            }
+            return `${raw.length}:${(state >>> 0).toString(16)}`;
+          };
+          const segments = [];
+          for (let element = current; element; element = element.parentElement) {
+            const tag = element.tagName.toLowerCase();
+            const siblings = element.parentElement
+              ? Array.from(element.parentElement.children).filter((item) => item.tagName === element.tagName)
+              : [element];
+            segments.unshift(`${tag}:nth-of-type(${siblings.indexOf(element) + 1})`);
+          }
+          return segments.join(' > ') === expected.path
+            && current.tagName.toLowerCase() === expected.tag
+            && current.getAttribute('id') === expected.id
+            && current.getAttribute('role') === expected.role
+            && current.getAttribute('name') === expected.htmlName
+            && current.getAttribute('placeholder') === expected.placeholder
+            && current.getAttribute('aria-label') === expected.ariaLabel
+            && current.getAttribute('aria-labelledby') === expected.ariaLabelledby
+            && current.getAttribute('data-testid') === expected.dataTestid
+            && digest(current.textContent) === expected.textDigest
+            && digest(Array.from(current.labels || []).map((item) => item.textContent).join('\u0000')) === expected.labelsDigest;
+        }, identity, { timeout: READ_TIMEOUT_MS });
+        if (!sameIdentity) {
+          status = 'detached_or_page_changed';
+          continue;
+        }
+        mcpSelector = candidate;
+        status = 'verified_current_page';
+        break;
+      } catch (error) {
+        status = selectorStatusFrom(error);
+        if (status === 'detached_or_page_changed') break;
+      }
+    }
+    verified.push({ ...element, mcp_selector: mcpSelector, mcp_selector_status: status });
+  }
+  return verified;
+}
+
 function scopeError(error) {
   const text = String(error?.message || error || '');
   if (/strict mode violation|resolved to \d+ elements?/i.test(text)) return 'scope_ambiguous';
@@ -385,6 +651,9 @@ export async function collectPageObservation(page, { selector } = {}) {
       error = scopeError(scopeFailure);
     }
   }
+  const presentedElements = error
+    ? []
+    : await verifyMcpSelectors(page, presented?.elements || []);
   const observation = {
     version: OBSERVATION_VERSION,
     page_url: bounded(finalSample.snapshot.page_url, 4096),
@@ -394,7 +663,7 @@ export async function collectPageObservation(page, { selector } = {}) {
     settled: stable,
     truncated: Boolean(presented?.truncated),
     notes: [...(presented?.notes || [])],
-    elements: presented?.elements || [],
+    elements: presentedElements,
     text: presented?.text || [],
   };
   // A complete scoped read is not incomplete merely because the global page
@@ -422,12 +691,14 @@ export function renderPageObservation(
     `URL：${observation.page_url || '未知'}`,
     `范围：${observation.scope}`,
     `稳定性：${observation.settled ? '已稳定' : '未稳定（仅表示页面状态仍在变化）'}`,
+    '说明：name 是由 ARIA、可见原生标签或提示文本推导的近似语义名称，不保证等于浏览器完整可访问名称，也不是 HTML name 属性。',
+    '说明：已核对当前页面的MCP selector，语义名称不等于HTML属性；selector 仅证明当前页面唯一可见匹配，不保证跨运行稳定。',
   ];
   if (observation.elements.length) {
     lines.push('可见控件：');
     for (const element of observation.elements)
       lines.push(
-        `- ${[element.tag, element.role && `role=${element.role}`, element.name && `名称=${element.name}`, element.id && `id=${element.id}`, element.type && `type=${element.type}`, element.placeholder && `placeholder=${element.placeholder}`, element.enabled === false ? '已禁用' : element.enabled === true ? '可用' : '可用状态未知'].filter(Boolean).join('；')}${element.container ? `；容器=${element.container}` : ''}`
+        `- ${[element.tag, element.role && `role=${element.role}`, element.name && `语义名称近似值（非 HTML name）=${element.name}`, element.html_name && `HTML name=${element.html_name}`, element.id && `id=${element.id}`, element.type && `type=${element.type}`, element.placeholder && `placeholder=${element.placeholder}`, element.enabled === false ? '已禁用' : element.enabled === true ? '可用' : '可用状态未知', element.readonly === true ? '只读' : element.readonly === false ? '非只读' : '只读状态未知', element.mcp_selector ? `已核对当前页面的MCP selector，语义名称不等于HTML属性=${element.mcp_selector}` : `MCP selector未提供=${selectorStatusLabel(element.mcp_selector_status)}`, element.tag === 'select' && `当前 select value=${JSON.stringify(element.select_value || '')}`, element.tag === 'select' && `原生 select options=${JSON.stringify(element.options || [])}`, element.options_truncated && 'select options 已截断'].filter(Boolean).join('；')}${element.container ? `；容器=${element.container}` : ''}`
       );
   }
   if (observation.text.length) {

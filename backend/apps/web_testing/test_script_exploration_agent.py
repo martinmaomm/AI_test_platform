@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from django.test import SimpleTestCase, override_settings
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .exploration_policy import ExplorationPolicy
 from .exploration_trace import ExplorationTraceRecorder, _tool_failed
@@ -48,6 +52,56 @@ def brief(**overrides):
     }
     value.update(overrides)
     return value
+
+
+class OperationHistoryCheckpointTests(SimpleTestCase):
+    def test_old_operation_survives_message_pruning_in_real_middleware_checkpoint(self):
+        selector = '  form[data-name="two  spaces"] input  '
+        events = [{
+            'event_id': f'E{index}', 'tool_name': 'playwright_click',
+            'action': 'click', 'status': 'succeeded',
+            'locator_input': {'selector': selector},
+        } for index in range(3)]
+        agent = ScriptExplorationAgent(Mock(), {}, str(uuid4()), lambda: False, 10)
+        agent._saved_trace_data = {'events': events}
+        agent._trace_recorder = Mock()
+        agent._trace_recorder.evidence_snapshot.return_value = {'events': events}
+        runtime = agent._runtime_factory([])
+        runtime.context_chars = 12000
+        messages = [HumanMessage(content='Original goal')]
+        for index in range(3):
+            messages.extend([
+                AIMessage(content='', tool_calls=[{
+                    'id': str(index), 'type': 'tool_call', 'name': 'playwright_click',
+                    'args': {'selector': selector if index == 0 else '#current'},
+                }]),
+                ToolMessage(content='x' * (20000 if index == 0 else 100),
+                            name='playwright_click', tool_call_id=str(index)),
+            ])
+        request = Mock(messages=messages)
+        request.override.side_effect = lambda **values: SimpleNamespace(**values)
+
+        async def capture(value):
+            return value
+
+        projected = asyncio.run(runtime.awrap_model_call(request, capture)).messages
+        self.assertNotIn('0', [item.tool_call_id for item in projected if isinstance(item, ToolMessage)])
+        self.assertIn('operation_history', projected[-1].content)
+        self.assertIn(json.dumps(selector, ensure_ascii=False), projected[-1].content)
+        self.assertEqual([item['event_id'] for item in runtime.checkpoint()['operation_history']['actions']],
+                         ['E0', 'E1', 'E2'])
+        self.assertEqual(agent._saved_trace_data['events'], events)
+
+    def test_initial_evidence_preserves_actions_older_than_compact_trace_tail(self):
+        agent = ScriptExplorationAgent(Mock(), {}, str(uuid4()), lambda: False, 10)
+        agent._saved_trace_data = {'events': [{
+            'event_id': f'E{index}', 'tool_name': 'playwright_click',
+            'action': 'click', 'status': 'succeeded', 'locator_input': {'selector': f'#field-{index}'},
+        } for index in range(20)]}
+        prompt = json.loads(agent._prompt())
+        self.assertEqual(len(prompt['saved_snapshot']['events']), 12)
+        self.assertEqual(len(prompt['operation_history']['actions']), 20)
+        self.assertEqual(prompt['operation_history']['actions'][0]['locator_input']['selector'], '#field-0')
 
 
 class ScriptExplorationAgentTests(SimpleTestCase):
@@ -209,7 +263,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
 
         result, client = self.run_with(Agent, callback=checkpoints.append)
         self.assertEqual((client.opened, client.closed), (1, 1))
-        self.assertEqual(Agent.tool_names, ['save_script_draft', 'patch_script_draft', 'read_script_draft'])
+        self.assertEqual(Agent.tool_names, ['save_script_draft', 'patch_script_draft', 'read_script_draft', 'generate_unique_test_value'])
         self.assertIn('await page.goto', result.script_draft)
         self.assertEqual(result.completion, 'partial')
         self.assertEqual(result.snapshot['artifact']['remaining_steps'], ['确认详情页操作'])
@@ -254,7 +308,7 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             async def run(self, *_args, **_kwargs): return ''
 
         self.run_with(Agent)
-        self.assertEqual(Agent.tools, ['save_script_draft', 'patch_script_draft', 'read_script_draft'])
+        self.assertEqual(Agent.tools, ['save_script_draft', 'patch_script_draft', 'read_script_draft', 'generate_unique_test_value'])
         self.assertNotIn('finalize_exploration_path', Agent.instructions)
         self.assertNotIn('finalization_protocol', Agent.instructions)
 
@@ -337,7 +391,8 @@ class ScriptExplorationAgentTests(SimpleTestCase):
             async def run(self, *_args, **_kwargs): return '没有可以保存的代码。'
 
         result, _ = self.run_with(Agent)
-        self.assertEqual(result.error_code, '')
+        self.assertEqual(result.error_code, 'SCRIPT_CANDIDATE_EMPTY')
+        self.assertTrue(result.error_message)
         self.assertIn('场景：', result.script_draft)
         self.assertIn("await page.goto('https://example.test/catalog')", result.script_draft)
         self.assertIn('PENDING_STEP:', result.script_draft)
@@ -507,6 +562,33 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertEqual(result.snapshot['artifact']['remaining_steps'], [])
         self.assertNotIn('PENDING_STEP:', result.script_draft)
 
+    def test_code_only_preserves_existing_completion_without_promoting_partial_history(self):
+        class LLM:
+            async def ainvoke(self, prompt):
+                self.prompt = json.loads(prompt)
+                return f'```python\n{COMPLETE_SCRIPT}\n```'
+
+        for completion in ('complete', 'partial'):
+            with self.subTest(completion=completion):
+                model = LLM()
+                events = [{
+                    'event_id': f'E{index}', 'tool_name': 'playwright_click',
+                    'action': 'click', 'status': 'succeeded', 'locator_input': {'selector': f'#control-{index}'},
+                } for index in range(20)]
+                snapshot = {'schema_version': 5, 'events': events, 'artifact': {
+                    'completion': completion, 'remaining_steps': [],
+                }}
+                with patch('web_testing.script_exploration_agent.MCPClient.from_dict') as factory:
+                    result = asyncio.run(self.make_agent(llm_model=model).generate(
+                        brief=brief(), target_url='https://example.test/catalog',
+                        saved_snapshot=snapshot, script_draft=COMPLETE_SCRIPT, code_only=True,
+                    ))
+                factory.assert_not_called()
+                self.assertEqual(result.completion, completion)
+                self.assertEqual(len(model.prompt['operation_history']['actions']), 20)
+                self.assertEqual(len(model.prompt['saved_trace']['events']), 12)
+                self.assertNotIn('PENDING_STEP:', result.script_draft)
+
     def test_code_only_keeps_current_pending_marker_not_old_snapshot_pending_step(self):
         class LLM:
             async def ainvoke(self, _prompt):
@@ -608,6 +690,171 @@ class ScriptExplorationAgentTests(SimpleTestCase):
         self.assertEqual(feedback['error_code'], 'SCRIPT_TOO_LONG')
         self.assertIn('超过 200000 字符', feedback['message'])
         self.assertTrue(any('超过 200000 字符' in warning for warning in result.snapshot['warnings']))
+
+    def test_code_only_preserves_unfenced_complete_python_via_shared_parser(self):
+        from common.parsers import extract_python_from_output
+
+        class LLM:
+            async def ainvoke(self, _prompt):
+                return COMPLETE_SCRIPT
+
+        with patch(
+            'web_testing.script_exploration_agent.extract_python_from_output', wraps=extract_python_from_output,
+        ) as extract, patch('web_testing.script_exploration_agent.MCPClient.from_dict') as client:
+            result = asyncio.run(self.make_agent(llm_model=LLM()).generate(
+                brief=brief(repair_only=True), target_url='https://example.test/catalog',
+                saved_snapshot={'artifact': {'revision': 7, 'completion': 'complete', 'remaining_steps': []}},
+                script_draft=PARTIAL_SCRIPT, code_only=True,
+            ))
+        extract.assert_called_once_with(COMPLETE_SCRIPT)
+        client.assert_not_called()
+        self.assertEqual(result.script_draft, COMPLETE_SCRIPT.strip())
+        self.assertEqual(result.error_code, '')
+        self.assertEqual(result.completion, 'complete')
+        self.assertEqual(result.snapshot['draft_state']['latest_candidate_feedback']['status'], 'accepted')
+
+    def test_code_only_rejections_preserve_complete_draft_but_report_failure(self):
+        data_agent = self.make_agent()
+        item = data_agent._test_data.generate('entity', prefix='fixture_')
+        snapshot = {
+            'artifact': {
+                'revision': 7, 'completion': 'complete', 'completed_steps': ['打开目录'],
+                'remaining_steps': [], 'variables': [],
+            },
+            'generated_test_data': data_agent._test_data.snapshot(),
+        }
+        original_snapshot = deepcopy(snapshot)
+        cases = (
+            ('syntax', '```python\nasync def run(page, variables):\n    await page.goto(\n```', 'SCRIPT_CONTRACT_INVALID'),
+            ('static', f'```python\nimport subprocess\n{COMPLETE_SCRIPT}\n```', 'IMPORT_NOT_ALLOWED'),
+            ('fixed_sample', f'```python\n{COMPLETE_SCRIPT}\n    value = {item["value"]!r}\n```', 'FIXED_EXPLORATION_SAMPLE'),
+            ('empty', '', 'SCRIPT_CANDIDATE_EMPTY'),
+            ('no_code', '整理已完成。', 'SCRIPT_CANDIDATE_EMPTY'),
+            ('too_long', f'```python\n{COMPLETE_SCRIPT}\n    value = {"A" * 200001!r}\n```', 'SCRIPT_TOO_LONG'),
+        )
+        for name, reply, error_code in cases:
+            with self.subTest(name=name):
+                class LLM:
+                    async def ainvoke(self, _prompt):
+                        return reply
+
+                checkpoints = []
+                with patch('web_testing.script_exploration_agent.MCPClient.from_dict') as client:
+                    result = asyncio.run(self.make_agent(checkpoints.append, LLM()).generate(
+                        brief=brief(), target_url='https://example.test/catalog',
+                        saved_snapshot=snapshot, script_draft=COMPLETE_SCRIPT, code_only=True,
+                    ))
+                client.assert_not_called()
+                self.assertEqual(result.script_draft, COMPLETE_SCRIPT.strip())
+                self.assertEqual(result.completion, 'complete')  # Retained artifact, not repair success.
+                self.assertEqual(result.snapshot['artifact'], original_snapshot['artifact'])
+                self.assertEqual(result.error_code, error_code)
+                self.assertTrue(result.error_message)
+                feedback = result.snapshot['draft_state']['latest_candidate_feedback']
+                self.assertEqual(feedback['status'], 'rejected')
+                self.assertEqual(feedback['source'], 'code_only_model')
+                self.assertEqual(feedback['error_code'], error_code)
+                self.assertEqual(feedback['retained_revision'], 7)
+                self.assertEqual(feedback['retained_completion'], 'complete')
+                self.assertIn(result.error_message, result.snapshot['warnings'])
+                self.assertEqual(checkpoints[-1]['script_draft'], COMPLETE_SCRIPT.strip())
+                self.assertEqual(checkpoints[-1]['snapshot']['draft_state']['latest_candidate_feedback'], feedback)
+                self.assertEqual(snapshot, original_snapshot)
+
+    def test_final_text_rejections_preserve_seed_and_report_specific_failure(self):
+        for kind in ('syntax', 'empty', 'no_code', 'fixed_sample'):
+            with self.subTest(kind=kind):
+                agent = self.make_agent()
+                agent._target_url = 'https://example.test/catalog'
+                agent._install_entry_seed()
+                original_script = agent._last_valid_script
+                original_artifact = deepcopy(agent._artifact)
+                item = agent._test_data.generate('entity')
+                replies = {
+                    'syntax': ('```python\nasync def run(page, variables):\n    await page.goto(\n```', 'SCRIPT_CONTRACT_INVALID'),
+                    'empty': ('', 'SCRIPT_CANDIDATE_EMPTY'),
+                    'no_code': ('已经整理完成。', 'SCRIPT_CANDIDATE_EMPTY'),
+                    'fixed_sample': (f'```python\n{COMPLETE_SCRIPT}\n    value = {item["value"]!r}\n```', 'FIXED_EXPLORATION_SAMPLE'),
+                }
+                reply, code = replies[kind]
+                agent._record_model_output(reply)
+                asyncio.run(agent._submit_final_text_candidate())
+                result = agent._result()
+                self.assertEqual(result.script_draft, original_script)
+                self.assertEqual(result.snapshot['artifact'], original_artifact)
+                self.assertEqual(result.error_code, code)
+                self.assertTrue(result.error_message)
+                self.assertEqual(result.snapshot['draft_state']['latest_candidate_feedback']['source'], 'final_text_fallback')
+
+    def test_final_summary_does_not_replace_saved_complete_draft_or_hide_rejection(self):
+        for reject_later in (False, True):
+            with self.subTest(reject_later=reject_later):
+                agent = self.make_agent()
+                agent._target_url = 'https://example.test/catalog'
+                tool = agent._save_tool()
+                asyncio.run(tool.ainvoke({'code': COMPLETE_SCRIPT, 'completion': 'complete'}))
+                original_artifact = deepcopy(agent._artifact)
+                if reject_later:
+                    asyncio.run(tool.ainvoke({'code': 'async def run(page, variables):\n    await page.goto('}))
+                agent._record_model_output('全部完成。')
+                asyncio.run(agent._submit_final_text_candidate())
+                result = agent._result()
+                self.assertEqual(result.script_draft, COMPLETE_SCRIPT.strip())
+                self.assertEqual(result.snapshot['artifact'], original_artifact)
+                self.assertEqual(result.error_code, 'SCRIPT_CONTRACT_INVALID' if reject_later else '')
+
+    def test_empty_final_summary_does_not_mask_specific_seed_tool_rejection(self):
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        agent._install_entry_seed()
+        asyncio.run(agent._save_tool().ainvoke({'code': 'async def run(page, variables):\n    await page.goto('}))
+        agent._record_model_output('')
+        asyncio.run(agent._submit_final_text_candidate())
+        self.assertEqual(agent._result().error_code, 'SCRIPT_CONTRACT_INVALID')
+        self.assertEqual(agent._latest_candidate_feedback['source'], 'save_tool')
+
+    def test_accepted_replacement_clears_candidate_error_but_not_explicit_terminal_errors(self):
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        tool = agent._save_tool()
+        asyncio.run(tool.ainvoke({'code': COMPLETE_SCRIPT, 'completion': 'complete'}))
+        asyncio.run(tool.ainvoke({'code': 'async def run(page, variables):\n    await page.goto('}))
+        self.assertEqual(agent._result().error_code, 'SCRIPT_CONTRACT_INVALID')
+        self.assertEqual(agent._result('CHECKPOINT_FAILED', 'checkpoint failed').error_code, 'CHECKPOINT_FAILED')
+        feedback = asyncio.run(tool.ainvoke({'code': COMPLETE_SCRIPT, 'completion': 'complete'}))
+        self.assertEqual(feedback['status'], 'accepted')
+        self.assertEqual(agent._result().error_code, '')
+        self.assertEqual(agent._result().error_message, '')
+
+    def test_candidate_failure_maps_retained_complete_draft_to_needs_review(self):
+        from .generation_orchestrator import _persist_agent_result
+
+        agent = self.make_agent()
+        agent._target_url = 'https://example.test/catalog'
+        tool = agent._save_tool()
+        asyncio.run(tool.ainvoke({'code': COMPLETE_SCRIPT, 'completion': 'complete'}))
+        asyncio.run(tool.ainvoke({'code': 'async def run(page, variables):\n    await page.goto('}))
+        result = agent._result()
+        generation = SimpleNamespace(pk=uuid4(), revision=7, target_url=agent._target_url, current_stage='generating')
+        current = SimpleNamespace(script_draft=result.script_draft, exploration_snapshot=result.snapshot)
+        completed = SimpleNamespace(pk=generation.pk, status='needs_review', error_code=result.error_code)
+        with patch('web_testing.generation_orchestrator.WebUIScriptGeneration.objects.only') as query, patch(
+            'web_testing.generation_orchestrator.finalize_generation_artifact', return_value=completed,
+        ) as finalize, patch('web_testing.generation_orchestrator.publish_terminal'), patch(
+            'web_testing.generation_orchestrator._workspace_variables', return_value=[],
+        ), patch('web_testing.generation_orchestrator.evaluate_workspace_draft', return_value={
+            'status': 'ready', 'completion': 'complete', 'blockers': [], 'warnings': [],
+        }):
+            query.return_value.get.return_value = current
+            persisted = _persist_agent_result(
+                generation, task_id='offline', script_draft=result.script_draft,
+                snapshot=result.snapshot, completion=result.completion,
+                error_code=result.error_code, error_message=result.error_message, final_message=result.final_message,
+            )
+        self.assertEqual(persisted['status'], 'needs_review')
+        self.assertEqual(finalize.call_args.kwargs['target_status'], 'needs_review')
+        self.assertEqual(finalize.call_args.kwargs['error_code'], 'SCRIPT_CONTRACT_INVALID')
+        self.assertEqual(finalize.call_args.kwargs['script_draft'], COMPLETE_SCRIPT.strip())
 
     def test_final_text_fallback_extracts_full_fenced_code_while_snapshot_stays_bounded(self):
         encoded = 'A' * 21_000

@@ -68,12 +68,27 @@ class BrowserObservationBridgeTests(SimpleTestCase):
         self.assertEqual(observation['version'], 1)
         names = [item['name'] for item in observation['elements']]
         self.assertIn('LateFieldAlpha', names)
+        alpha = next(item for item in observation['elements'] if item['name'] == 'LateFieldAlpha')
+        self.assertEqual(alpha['html_name'], 'alpha_value')
+        self.assertIs(alpha['readonly'], False)
+        self.assertEqual(alpha['mcp_selector'], 'input[name="alpha_value"]:visible')
+        self.assertEqual(alpha['mcp_selector_status'], 'verified_current_page')
+        readonly_combo = next(item for item in observation['elements'] if item['name'] == 'ReadonlyCombo')
+        self.assertIs(readonly_combo['readonly'], True)
+        self.assertEqual(next(item for item in observation['elements'] if item['name'] == 'InnerField')['container'], 'NamedDialog')
         locked = next(item for item in observation['elements'] if item['name'] == 'LockedFieldBeta')
         self.assertIs(locked['enabled'], False)
         inherited = next(item for item in observation['elements'] if item['name'] == 'InheritedDisabledGamma')
         self.assertIs(inherited['enabled'], False)
         for name in ('InertField', 'AriaDisabledField'):
             self.assertIs(next(item for item in observation['elements'] if item['name'] == name)['enabled'], False)
+        language = next(item for item in observation['elements'] if item['name'] == 'LanguagePreference')
+        self.assertEqual(language['select_value'], 'fr')
+        self.assertEqual(language['options'], [
+            {'value': 'en', 'label': 'English', 'disabled': False, 'selected': False},
+            {'value': 'fr', 'label': 'French', 'disabled': False, 'selected': True},
+        ])
+        self.assertTrue(all(item['mcp_selector'] for item in observation['elements']))
         self.assertNotIn('HIDDEN_ANCESTOR_FIELD', json.dumps(observation))
         self.assertNotIn('HIDDEN_BUTTON_COPY', json.dumps(observation))
 
@@ -89,6 +104,11 @@ class BrowserObservationBridgeTests(SimpleTestCase):
         result = projected[-1].content
         self.assertIn('LateFieldAlpha', result)
         self.assertIn('LockedFieldBeta', result)
+        self.assertIn('HTML name=alpha_value', result)
+        self.assertIn('readonly=true', result)
+        self.assertIn('已核对当前页面的MCP selector，语义名称不等于HTML属性=', result)
+        self.assertIn('原生 select options=', result)
+        self.assertIn('可见文本：VISIBLE_CURRENT_RESULT', result)
         self.assertNotIn('HIDDEN_ANCESTOR_TITLE', result)
         self.assertNotIn('PLATFORM_BROWSER_DIAGNOSTICS_V1:', result)
         self.assertLess(len(result), 12000)
@@ -105,6 +125,20 @@ class BrowserObservationBridgeTests(SimpleTestCase):
         self.assertIs(field['truncated'], False)
         self.assertIn('global_state_partial', field['notes'])
         self.assertNotIn('Navigation', json.dumps(field))
+
+    def test_normalization_expansion_cannot_erase_small_result_text(self):
+        raw_observation = self.envelopes['budgeted']['content'][-1]['text']
+        self.assertIn('PLATFORM_BROWSER_DIAGNOSTICS_V1:', raw_observation)
+        context, _ = extract_page_context(self.outputs['budgeted'])
+        observation = context['observation']
+        self.assertIn('BUDGETED_VISIBLE_RESULT', observation['text'])
+        self.assertTrue(observation['elements'])
+        self.assertTrue(observation['truncated'])
+        message = ToolMessage(content=self.outputs['budgeted'], name='playwright_get_visible_html', tool_call_id='budgeted-read')
+        projected, _ = project_messages([message])
+        self.assertIn('可见文本：BUDGETED_VISIBLE_RESULT', projected[0].content)
+        self.assertIn(observation['elements'][0]['mcp_selector'], projected[0].content)
+        self.assertLessEqual(len(projected[0].content), 8000)
 
     def test_selector_literal_spacing_is_not_rewritten_by_display_formatting(self):
         self.assertFalse(self.envelopes['spaced']['isError'])
@@ -173,5 +207,6 @@ class BrowserObservationBridgeTests(SimpleTestCase):
         model_input = '\n'.join(str(message.content) for message in model.observed_messages[-1])
         self.assertIn('LateFieldAlpha', model_input)
         self.assertIn('LockedFieldBeta', model_input)
+        self.assertIn('可见文本：VISIBLE_CURRENT_RESULT', model_input)
         self.assertNotIn('HIDDEN_ANCESTOR_FIELD', model_input)
         self.assertNotIn('PLATFORM_BROWSER_DIAGNOSTICS_V1:', model_input)

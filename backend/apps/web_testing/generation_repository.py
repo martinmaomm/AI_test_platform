@@ -354,6 +354,14 @@ def prepare_trace_generation_retry(generation_id: Any, *, expected_revision: int
             WebUIScriptGeneration.Status.NEEDS_REVIEW,
             WebUIScriptGeneration.Status.CANCELLED,
         }
+        # Generation may be statically ready while its independent debug run
+        # failed. Existing trace evidence can correct that draft without paying
+        # for another browser exploration; passed/unverified drafts stay gated.
+        if workspace['verification'].get('status') == 'failed':
+            retryable_statuses.update({
+                WebUIScriptGeneration.Status.READY,
+                WebUIScriptGeneration.Status.READY_WITH_WARNINGS,
+            })
         has_trace_or_draft = bool(snapshot.get('events') or generation.script_draft.strip())
         if generation.status not in retryable_statuses or not has_trace_or_draft:
             raise GenerationResolutionConflict('当前记录没有可用于代码整理的真实轨迹或草稿，不能重试。', generation)

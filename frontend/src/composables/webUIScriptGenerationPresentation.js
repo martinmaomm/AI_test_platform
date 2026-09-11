@@ -286,10 +286,12 @@ export const canRetryScriptFromTrace = (generation, busy = false) => {
   const hasTrace = (Array.isArray(snapshot.events) && snapshot.events.length > 0)
     || (Array.isArray(snapshot.page_states) && snapshot.page_states.length > 0)
   const hasTraceOrDraft = hasTrace || Boolean(generation?.script_draft?.trim())
+  const debugFailed = ['ready', 'ready_with_warnings'].includes(generation?.status)
+    && generation?.workspace?.verification?.status === 'failed'
   return !busy
     && snapshot.schema_version === 5
     && hasTraceOrDraft
-    && ['failed', 'needs_review', 'cancelled'].includes(generation?.status)
+    && (['failed', 'needs_review', 'cancelled'].includes(generation?.status) || debugFailed)
 }
 
 const GENERATION_FIELD_LABELS = {

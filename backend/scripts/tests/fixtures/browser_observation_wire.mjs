@@ -37,13 +37,20 @@ try {
       <input id="hidden-input">
     </div></section>
     <main><div role="dialog" id="panel" aria-label="Current surface">
-      <form><label for="alpha">LateFieldAlpha</label><input id="alpha" placeholder="Field placeholder">
+      <p role="status">VISIBLE_CURRENT_RESULT</p>
+      <form><label for="alpha">LateFieldAlpha</label><input id="alpha" name="alpha_value" placeholder="Field placeholder">
+      <label for="readonly-combo">ReadonlyCombo</label><input id="readonly-combo" role="combobox" name="readonly_value" readonly>
       <label for="beta">LockedFieldBeta</label><input id="beta" disabled>
       <fieldset disabled><label for="gamma">InheritedDisabledGamma</label><input id="gamma"></fieldset>
       <label for="spaced">ExactSelectorSpacing</label><input id="spaced" name="two  spaces">
+      <label for="language">NativeLanguageLabel</label><span id="language-name">LanguagePreference</span>
+      <select id="language" aria-label="FallbackLanguage" aria-labelledby="language-name">
+        <option value="en">English</option><option value="fr" selected>French</option>
+      </select>
       <div inert><label for="inert-field">InertField</label><input id="inert-field"></div>
       <div aria-disabled="true"><label for="aria-field">AriaDisabledField</label><input id="aria-field"></div>
       <button type="button" id="commit">Proceed<span style="display:none">HIDDEN_BUTTON_COPY</span></button></form>
+      <div role="dialog" aria-label="NamedDialog"><form><label for="inner-field">InnerField</label><input id="inner-field"></form></div>
     </div></main>
   </body></html>`);
   const toolContext = { page, browser };
@@ -64,6 +71,11 @@ try {
     element.style.display = 'none';
   });
   envelopes.changed = await new VisibleTextTool().execute({}, toolContext);
+  const manyFields = Array.from({ length: 65 }, (_, index) =>
+    `<input name="field_${index}_${'x'.repeat(100)}">`
+  ).join('');
+  await page.setContent(`<main><p role="status">BUDGETED_VISIBLE_RESULT</p>${manyFields}</main>`);
+  envelopes.budgeted = await new VisibleHtmlTool().execute({}, toolContext);
   process.stdout.write(`BROWSER_WIRE_FIXTURE:${JSON.stringify(envelopes)}\n`);
 } finally {
   await browser?.close();

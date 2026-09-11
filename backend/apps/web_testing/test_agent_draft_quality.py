@@ -1,9 +1,11 @@
 """Offline checks for the script-first workflow, without a model or database."""
 
+import ast
+
 from django.test import SimpleTestCase
 
 from .assertion_state import analyze_assertion_state, evaluation_status
-from .draft_quality import evaluate_draft
+from .draft_quality import _static_entry_goto, evaluate_draft
 from .generation_brief import build_generation_brief
 
 
@@ -136,6 +138,152 @@ class AgentDraftQualityTests(SimpleTestCase):
         changed = script.replace(target, 'https://example.test/start?mode=other#/entry', 1)
         report = evaluate_draft(changed, target_url=target)
         self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+
+    def test_sequential_local_string_entry_and_alias_keep_exact_target(self):
+        target = 'https://example.test/start?mode=test#/entry'
+        for statements in (
+            f"target_url = {target!r}\n    await page.goto(target_url)",
+            f"target_url: str = {target!r}\n    await page.goto(url=target_url)",
+            f"entry = {target!r}\n    target_url = entry\n    await page.goto(target_url)",
+        ):
+            with self.subTest(statements=statements):
+                script = SCRIPT.replace("await page.goto('https://example.test/')", statements)
+                report = evaluate_draft(script, target_url=target)
+                self.assertEqual(report['blockers'], [])
+                self.assertEqual(report['warnings'], [])
+                tree = ast.parse(script)
+                original = ast.dump(tree, include_attributes=True)
+                status, call, resolved = _static_entry_goto(tree)
+                self.assertEqual(status, 'resolved')
+                self.assertEqual(resolved, target)
+                self.assertIsInstance(call.args[0] if call.args else call.keywords[0].value, ast.Name)
+                self.assertEqual(ast.dump(tree, include_attributes=True), original)
+
+    def test_local_string_entry_preserves_url_path_query_fragment_and_origin_checks(self):
+        target = 'https://example.test/start?mode=test#/entry'
+        for url, code in (
+            ('https://example.test/other?mode=test#/entry', 'TARGET_URL_CHANGED'),
+            ('https://example.test/start?mode=other#/entry', 'TARGET_URL_CHANGED'),
+            ('https://example.test/start?mode=test#/other', 'TARGET_URL_CHANGED'),
+            ('https://outside.test/start?mode=test#/entry', 'NAVIGATION_OUTSIDE_TARGET'),
+            ('http://example.test/start?mode=test#/entry', 'NAVIGATION_OUTSIDE_TARGET'),
+            ('https://example.test:8443/start?mode=test#/entry', 'NAVIGATION_OUTSIDE_TARGET'),
+            ('/start?mode=test#/entry', 'ABSOLUTE_URL_REQUIRED'),
+            ('', 'ABSOLUTE_URL_REQUIRED'),
+        ):
+            with self.subTest(url=url):
+                script = SCRIPT.replace(
+                    "await page.goto('https://example.test/')",
+                    f'target_url = {url!r}\n    await page.goto(target_url)',
+                )
+                report = evaluate_draft(script, target_url=target)
+                self.assertIn(code, [item['code'] for item in report['blockers']])
+
+    def test_unknown_or_reassigned_local_entry_is_still_unconfirmed(self):
+        for prefix in (
+            "target_url = variables['URL']",
+            "target_url = 'https://example.test/'\n    target_url = variables['URL']",
+            "target_url = 'https://example.test/'\n    target_url = 'https://example.test/'",
+            "entry = variables['URL']\n    target_url = entry",
+            "target_url = 'https://example.test/'\n    target_url += '/next'",
+            "target_url = 'https://example.test/'\n    other, target_url = ('x', variables['URL'])",
+            "target_url = 'https://example.test/'\n    print(target_url := variables['URL'])",
+        ):
+            with self.subTest(prefix=prefix):
+                script = SCRIPT.replace(
+                    "await page.goto('https://example.test/')",
+                    prefix + '\n    await page.goto(target_url)',
+                )
+                report = evaluate_draft(script, target_url='https://example.test/')
+                codes = [item['code'] for item in report['warnings']]
+                self.assertIn('ENTRY_NAVIGATION_UNCONFIRMED', codes)
+                self.assertIn('DYNAMIC_NAVIGATION_REVIEW', codes)
+
+    def test_branch_loop_and_import_shadow_cannot_certify_local_entry(self):
+        for prefix in (
+            "if True:\n        target_url = 'https://example.test/'",
+            "target_url = 'https://example.test/'\n    if variables:\n        target_url = variables['URL']",
+            "target_url = 'https://example.test/'\n    for target_url in variables.values():\n        pass",
+            "target_url = 'https://example.test/'\n    import time as target_url",
+            "target_url = 'https://example.test/'\n    from os import getenv as target_url",
+        ):
+            with self.subTest(prefix=prefix):
+                script = SCRIPT.replace(
+                    "await page.goto('https://example.test/')",
+                    prefix + '\n    await page.goto(target_url)',
+                )
+                report = evaluate_draft(script, target_url='https://example.test/')
+                self.assertIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+
+    def test_helper_local_constants_are_isolated_from_caller(self):
+        target = 'https://example.test/expected'
+        script = '''async def open_entry(page):
+    target_url = 'https://example.test/other'
+    await page.goto(target_url)
+
+async def run(page):
+    target_url = 'https://example.test/expected'
+    await open_entry(page)
+    assert True
+'''
+        report = evaluate_draft(script, target_url=target)
+        self.assertIn('TARGET_URL_CHANGED', [item['code'] for item in report['blockers']])
+
+        # A helper with no navigation must not overwrite its caller's binding.
+        script = script.replace('    await page.goto(target_url)', '    return target_url').replace(
+            '    assert True', '    await page.goto(target_url)\n    assert True',
+        )
+        report = evaluate_draft(script, target_url=target)
+        self.assertEqual(report['blockers'], [])
+        self.assertNotIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+
+    def test_helper_arguments_and_global_constants_are_not_inferred_from_caller(self):
+        for helper in (
+            'async def open_entry(page, target_url):',
+            'async def open_entry(page, ignored):',
+        ):
+            with self.subTest(helper=helper):
+                script = f'''target_url = 'https://example.test/global'
+{helper}
+    await page.goto(target_url)
+
+async def run(page):
+    target_url = 'https://example.test/expected'
+    await open_entry(page, target_url)
+    assert True
+'''
+                report = evaluate_draft(script, target_url='https://example.test/expected')
+                self.assertIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+
+    def test_shadowed_aliased_and_recursive_helpers_remain_unconfirmed(self):
+        helper = '''async def open_entry(page):
+    target_url = 'https://example.test/'
+    await page.goto(target_url)
+
+'''
+        for call in (
+            'import time as open_entry\n    await open_entry(page)',
+            'from time import time as open_entry\n    await open_entry(page)',
+            'navigate = open_entry\n    await navigate(page)',
+            'await run(page)',
+        ):
+            with self.subTest(call=call):
+                script = helper + 'async def run(page):\n    ' + call + '\n    assert True\n'
+                report = evaluate_draft(script, target_url='https://example.test/')
+                self.assertIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+
+    def test_constant_resolution_only_confirms_the_first_goto(self):
+        script = SCRIPT.replace(
+            "await page.goto('https://example.test/')",
+            "target_url = 'https://example.test/'\n    await page.goto(target_url)\n"
+            "    await page.goto(variables['NEXT_URL'])",
+        )
+        report = evaluate_draft(script, target_url='https://example.test/')
+        self.assertEqual(report['blockers'], [])
+        self.assertNotIn('ENTRY_NAVIGATION_UNCONFIRMED', [item['code'] for item in report['warnings']])
+        warnings = [item for item in report['warnings'] if item['code'] == 'DYNAMIC_NAVIGATION_REVIEW']
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("variables['NEXT_URL']", script.splitlines()[warnings[0]['line'] - 1])
 
     def test_source_earlier_unused_helper_goto_is_not_the_entry(self):
         target = 'https://example.test/start?mode=test#/entry'

@@ -31,6 +31,7 @@ import {
   listItems,
   normalizeDraft,
   normalizeCoverage,
+  normalizeLengthGtExpected,
   currentScenarioState,
   currentScenarioStatus,
   recoverableScenarioDraft,
@@ -93,7 +94,21 @@ test("empty editor recovery preserves generated steps and user config but never 
   assert.equal(recoverableScenarioDraft({ generation: { rounds: [{ draft: generated, runnable: false }] } }, draft), null);
 });
 
-test("visual editor keeps exact filters and exposes absence assertions", async () => {
+test("length_gt serializes only bare nonnegative integer thresholds as JSON numbers", () => {
+  assert.equal(normalizeLengthGtExpected("length_gt", "0"), 0);
+  assert.equal(normalizeLengthGtExpected("length_gt", "12"), 12);
+  assert.equal(normalizeLengthGtExpected("length_gt", "${minimum_count}"), "${minimum_count}");
+  for (const value of ["", " ", "-1", "1.5", "\"1\"", "01", "not-a-number"]) {
+    assert.equal(normalizeLengthGtExpected("length_gt", value), value);
+  }
+  assert.equal(normalizeLengthGtExpected("length", "0"), "0");
+  assert.equal(
+    normalizeLengthGtExpected("length_gt", "9007199254740992"),
+    "9007199254740992",
+  );
+});
+
+test("visual editor keeps exact filters and exposes length_gt assertions", async () => {
   const selector = 'body.data[?(@.name == ${unique_name})]';
   const draft = normalizeDraft({teststeps: [{
     request: {method: "GET", url: "/items"},
@@ -103,11 +118,17 @@ test("visual editor keeps exact filters and exposes absence assertions", async (
   assert.equal(draft.teststeps[0].extract.id, `${selector}[0].id`);
   assert.deepEqual(draft.teststeps[0].validate, [{length: [selector, 0]}]);
   const editor = await readFile(new URL("../src/components/api-workspace/VisualStepEditor.vue", import.meta.url), "utf8");
-  for (const value of ["eq", "ne", "contains", "not_contains", "gt", "ge", "lt", "le", "type", "length"]) {
+  for (const value of ["eq", "ne", "contains", "not_contains", "gt", "ge", "lt", "le", "type", "length", "length_gt"]) {
     assert.ok(editor.includes(`value="${value}"`), `missing comparator: ${value}`);
   }
   assert.ok(editor.includes("零条或多条会停止"));
   assert.ok(editor.includes("长度等于 0"));
+  assert.ok(editor.includes("阈值 0 表示非空"));
+  assert.ok(editor.includes("type</code> 为 <code>list"));
+  assert.match(editor, /aria-label="`断言 \$\{assertionIndex \+ 1\} 操作符`"/);
+  assert.match(editor, /aria-label="`断言 \$\{assertionIndex \+ 1\} 目标`"/);
+  assert.match(editor, /aria-label="`断言 \$\{assertionIndex \+ 1\} 期望值`"/);
+  assert.match(editor, /normalizeLengthGtExpected\(item\.operator, item\.expected\)/);
 });
 
 test("API workspace draft remains structured and preserves body kinds", () => {

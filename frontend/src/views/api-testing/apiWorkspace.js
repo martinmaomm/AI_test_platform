@@ -543,6 +543,17 @@ export const defaultStep = (index = 1) => ({
   validate: [],
 });
 
+export const normalizeLengthGtExpected = (operator, expected) => {
+  if (
+    operator !== "length_gt" ||
+    typeof expected !== "string" ||
+    !/^(?:0|[1-9]\d*)$/.test(expected)
+  )
+    return expected;
+  const value = Number(expected);
+  return Number.isSafeInteger(value) ? value : expected;
+};
+
 export const normalizeDraft = (value) => {
   const draft = clone(value);
   const fallback = defaultDraft();

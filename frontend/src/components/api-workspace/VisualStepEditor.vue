@@ -152,6 +152,7 @@
             按唯一名称提取示例：<code>{{ selectorExample }}</code>。
             unique_name 需先在变量中定义。提取必须恰好匹配一条；零条或多条会停止，不会默认选第一条。
             删除后可对筛选结果使用“长度等于 0”断言，无需再提取 ID。
+            “长度大于”可检查 <code>body.data</code>；阈值 0 表示非空，建议保留 <code>type</code> 为 <code>list</code> 的断言。
           </p>
           <div class="assertion-title">断言</div>
           <div
@@ -162,6 +163,7 @@
             <el-select
               :model-value="assertion.operator"
               :disabled="disabled"
+              :aria-label="`断言 ${assertionIndex + 1} 操作符`"
               @update:model-value="
                 updateAssertion(assertionIndex, { operator: $event })
               "
@@ -178,10 +180,12 @@
               <el-option label="小于等于" value="le" />
               <el-option label="类型为" value="type" />
               <el-option label="长度等于" value="length" />
+              <el-option label="长度大于" value="length_gt" />
             </el-select>
             <el-input
               :model-value="assertion.target"
               :disabled="disabled"
+              :aria-label="`断言 ${assertionIndex + 1} 目标`"
               placeholder="status_code / body.data.id"
               @update:model-value="
                 updateAssertion(assertionIndex, { target: $event })
@@ -190,6 +194,7 @@
             <el-input
               :model-value="assertion.expected"
               :disabled="disabled"
+              :aria-label="`断言 ${assertionIndex + 1} 期望值`"
               placeholder="期望值"
               @update:model-value="
                 updateAssertion(assertionIndex, { expected: $event })
@@ -199,6 +204,7 @@
               text
               type="danger"
               :disabled="disabled"
+              :aria-label="`删除断言 ${assertionIndex + 1}`"
               @click="removeAssertion(assertionIndex)"
               >删除</el-button
             >
@@ -207,6 +213,7 @@
             text
             type="primary"
             :disabled="disabled"
+            aria-label="添加断言"
             @click="addAssertion"
             >+ 添加断言</el-button
           >
@@ -221,7 +228,11 @@
 import { computed } from "vue";
 import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import KeyValueRows from "./KeyValueRows.vue";
-import { bodyKind, normalizeStep } from "@/views/api-testing/apiWorkspace";
+import {
+  bodyKind,
+  normalizeLengthGtExpected,
+  normalizeStep,
+} from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
   modelValue: { type: Object, required: true },
@@ -281,7 +292,10 @@ const updateAssertion = (index, value) => {
   );
   patch({
     validate: next.map((item) => ({
-      [item.operator]: [item.target, item.expected],
+      [item.operator]: [
+        item.target,
+        normalizeLengthGtExpected(item.operator, item.expected),
+      ],
     })),
   });
 };

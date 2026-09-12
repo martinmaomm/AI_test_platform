@@ -87,6 +87,72 @@ def test_validator_selector_uses_the_full_current_variable_scope():
         assert run_case("validator-filter", case)["status"] == "passed"
 
 
+def _length_gt_case(expected=0, selector="body.data", variables=None):
+    return {"config": {"base_url": "https://api.example.test", "variables": variables or {}}, "teststeps": [{
+        "request": {"url": "/items"}, "validate": [{"length_gt": [selector, expected]}],
+    }]}
+
+
+def test_length_gt_compares_length_strictly_and_preserves_actual_response_evidence():
+    for actual, expected, passes in [([], 0, False), ([1], 0, True), ([1, 2], 2, False),
+                                      ([1, 2, 3], 2, True), ("abc", 2, True), ({"id": 1}, 0, True)]:
+        session = FakeSession([FakeResponse(body={"data": actual})])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("length-gt", _length_gt_case(expected))
+        assert result["success"] is passes, result
+        record = result["step_datas"][0]["validators"]["validate_extractor"][0]
+        assert record["check_value"] == actual
+        assert record["expect_value"] == expected
+        assert f"实际长度为 {len(actual)}" in record["message"]
+
+
+def test_length_gt_rejects_invalid_literal_thresholds_before_any_request():
+    for expected in (True, False, -1, 0.5, 0.0, None, "", "0", '"0"', [], {}, "${limit} suffix"):
+        with patch("api_testing.requests_runtime.requests.Session") as session_factory:
+            result = run_case("invalid-length-threshold", _length_gt_case(expected))
+        assert result["status"] == "error", expected
+        assert "预期值必须是非负整数" in result["error"]
+        session_factory.assert_not_called()
+
+
+def test_length_gt_allows_variable_thresholds_but_validates_the_resolved_type():
+    for expected, passes in [(0, True), (1, False), ("0", False), (True, False), (-1, False), (None, False)]:
+        session = FakeSession([FakeResponse(body={"data": [1]})])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("variable-length", _length_gt_case("${limit}", variables={"limit": expected}))
+        assert result["success"] is passes, result
+        if type(expected) is not int or expected < 0:
+            assert "预期值必须是非负整数" in result["step_datas"][0]["validators"]["validate_extractor"][0]["message"]
+
+
+def test_length_gt_rejects_missing_or_unsized_values_instead_of_treating_them_as_nonempty():
+    for body in ({}, {"data": None}, {"data": 1}, {"data": True}):
+        session = FakeSession([FakeResponse(body=body)])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("invalid-length-value", _length_gt_case())
+        assert result["status"] == "failed"
+        record = result["step_datas"][0]["validators"]["validate_extractor"][0]
+        assert record["passed"] is False
+        assert "断言无法执行" in record["message"]
+
+
+def test_length_gt_export_and_filtered_list_use_the_same_runtime_contract():
+    selector = "body.data[?(@.name == ${name})]"
+    case = _length_gt_case(selector=selector, variables={"name": "current"})
+    # A separate exact-length assertion must remain unchanged.
+    case["teststeps"][0]["validate"].append({"length": [selector, 1]})
+    namespace = {"__name__": "exported_length_gt"}
+    exec(compile(export_python(case), "exported_length_gt.py", "exec"), namespace)
+    for body, status in [({"data": [{"name": "other"}, {"name": "current"}]}, "passed"),
+                         ({"data": []}, "failed")]:
+        with patch("api_testing.requests_runtime.requests.Session", return_value=FakeSession([FakeResponse(body=body)])):
+            original = run_case("length-export", case)
+        with patch.object(namespace["requests"], "Session", return_value=FakeSession([FakeResponse(body=body)])):
+            exported = namespace["run_case"]("length-export", namespace["CASE"])
+        assert original["status"] == exported["status"] == status
+        assert original["step_datas"] == exported["step_datas"]
+
+
 def test_selector_parser_rejects_complete_invalid_syntax_and_implicit_projection():
     for selector in (
         "body.data[?(@.name != 'x')]", "body.data[?(@.name == ${role})] trailing",

@@ -102,6 +102,9 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
         type_names = rules.split('type 的预期值只能是 ', 1)[1].split(' 这些类型名字符串', 1)[0]
         self.assertEqual(set(type_names.replace('、', '/').split('/')), set(_TYPE_NAMES))
         self.assertIn('length 为长度等于预期值', rules)
+        self.assertIn('length_gt 为长度大于预期值', rules)
+        self.assertIn('{"length_gt":["body.data",0]}', rules)
+        self.assertIn('不要用非空检查替代业务要求的精确匹配', rules)
 
     def test_prompt_example_is_canonical_and_comparator_first_array_is_rejected(self):
         rules = self.messages()[0].content

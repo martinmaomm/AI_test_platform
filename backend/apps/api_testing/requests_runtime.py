@@ -34,7 +34,7 @@ _VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FULL_VARIABLE = re.compile(r"^(?:\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}|\$([A-Za-z_][A-Za-z0-9_]*))$")
 _EMBEDDED_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}|\$(?![.{])([A-Za-z_][A-Za-z0-9_]*)")
 _SUPPORTED_COMPARATORS = {
-    "eq", "ne", "contains", "not_contains", "gt", "ge", "lt", "le", "type", "length",
+    "eq", "ne", "contains", "not_contains", "gt", "ge", "lt", "le", "type", "length", "length_gt",
 }
 _TYPE_NAMES = {
     "null": type(None), "none": type(None), "bool": bool, "boolean": bool,
@@ -71,6 +71,11 @@ def _case_value(value: Any) -> dict[str, Any]:
     return _as_mapping(value, "用例")
 
 
+def _validate_length_threshold(value: Any) -> None:
+    if type(value) is not int or value < 0:
+        raise CaseContractError("长度大于（length_gt）断言的预期值必须是非负整数，例如 0（不加引号）")
+
+
 def _canonical_validator(value: Any, field: str) -> dict[str, Any]:
     if isinstance(value, Mapping):
         raw = dict(value)
@@ -105,6 +110,8 @@ def _canonical_validator(value: Any, field: str) -> dict[str, Any]:
     if comparator == "type" and (not isinstance(args[1], str) or args[1].lower() not in _TYPE_NAMES):
         names = ", ".join(sorted(_TYPE_NAMES))
         raise CaseContractError(f"{field} 的 type 预期值必须是支持的类型名：{names}")
+    if comparator == "length_gt" and not (isinstance(args[1], str) and _FULL_VARIABLE.fullmatch(args[1])):
+        _validate_length_threshold(args[1])
     # Keep the editor's established {eq: [check, expect]} JSON as canonical.
     # The runner parses this controlled form below; UI callers never need to
     # understand the internal comparator/check/expect representation.
@@ -879,6 +886,12 @@ def _compare(comparator: str, actual: Any, expected: Any) -> bool:
             return len(actual) == expected
         except TypeError as exc:
             raise CaseContractError("length 断言的检查值没有长度") from exc
+    if comparator == "length_gt":
+        _validate_length_threshold(expected)
+        try:
+            return len(actual) > expected
+        except TypeError as exc:
+            raise CaseContractError("长度大于（length_gt）断言的检查值没有长度；请填写列表、字符串或对象的路径") from exc
     raise UnsupportedCaseFeature(f"不支持的比较器：{comparator}")
 
 
@@ -891,6 +904,8 @@ def _validator_record(validator: Mapping[str, Any], context: Mapping[str, Any], 
         actual = _select(check, context, variables=variables)
         passed = _compare(comparator, actual, expected)
         message = "断言通过" if passed else f"断言失败：{check} {comparator} {expected!r}，实际为 {actual!r}"
+        if comparator == "length_gt":
+            message = f"{'断言通过' if passed else '断言失败'}：{check} 的长度应大于 {expected}，实际长度为 {len(actual)}"
     except (CaseContractError, KeyError, TypeError, ValueError) as exc:
         actual, expected, passed, message = None, raw_expected, False, f"断言无法执行：{exc}"
     return {

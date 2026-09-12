@@ -283,7 +283,7 @@ def main():
             assert kwargs['url'] == 'https://example.test/health', 'Unexpected request in fake test service'
             assert kwargs['verify'] is False, 'API business requests must skip certificate validation'
             result.status_code = fixture.get('http_status', 200)
-            result._content = json.dumps({'state': 'ok' if result.status_code == 200 else 'error'}).encode()
+            result._content = json.dumps(fixture.get('http_body', {'state': 'ok' if result.status_code == 200 else 'error'})).encode()
             result.url, result.headers, result.elapsed = kwargs['url'], {'Content-Type': 'application/json'}, timedelta(milliseconds=5)
             result.request = Request(kwargs['method'], kwargs['url'], headers=kwargs.get('headers')).prepare()
             return result

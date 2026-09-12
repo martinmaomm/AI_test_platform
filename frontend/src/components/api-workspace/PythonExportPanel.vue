@@ -2,7 +2,7 @@
   <el-card shadow="never">
     <template #header
       ><div class="heading">
-        <strong>Python（只读导出）</strong>
+        <strong>Python（只读导出）<ActionHelpTooltip label="Python 导出操作" content="查看代码将当前已保存草稿转换为 Python；复制写入剪贴板；导出 .py 下载脚本。都不会运行接口或保存为测试用例，导出的代码不能反向更新可视化草稿。" /></strong>
         <div>
           <el-button
             size="small"
@@ -49,6 +49,7 @@
 </template>
 
 <script setup>
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 defineProps({
   code: String,
   dirty: Boolean,
@@ -61,6 +62,7 @@ defineEmits(["load", "copy", "download"]);
 <style scoped>
 .heading {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 8px;

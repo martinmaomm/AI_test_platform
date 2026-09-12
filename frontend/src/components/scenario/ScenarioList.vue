@@ -3,6 +3,7 @@
     <!-- 头部 -->
     <div class="list-header">
       <span class="list-title">场景用例</span>
+      <ActionHelpTooltip label="场景用例操作" content="右侧更多菜单可重命名、复制、加入套件或删除。复制为独立副本；加入套件仅建立引用而不复制场景；拖动排序会立即保存。删除会移除场景记录，无法从页面恢复。" placement="bottom" />
       <el-tooltip content="刷新列表">
         <el-button :icon="Refresh" circle size="small" :loading="loading" @click="loadScenarios" />
       </el-tooltip>
@@ -18,10 +19,12 @@
           <el-icon><FolderAdd /></el-icon>
           批量加入套件
         </el-button>
+        <ActionHelpTooltip label="批量加入套件" content="将选中的场景用例关联到套件，不复制场景内容；套件执行时按其中的场景用例运行。" />
         <el-button type="danger" size="small" @click="handleBatchDelete">
           <el-icon><Delete /></el-icon>
           批量删除
         </el-button>
+        <ActionHelpTooltip label="批量删除场景" content="确认后删除当前项目中选中的场景用例记录；删除后无法从页面恢复。" />
         <el-button size="small" @click="clearSelection">
           <el-icon><Close /></el-icon>
           取消选择
@@ -177,6 +180,7 @@ import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { Refresh, Search, DataAnalysis, List, MoreFilled, Edit, Delete, DocumentCopy, FolderAdd, Rank, Close } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, ElLoading } from 'element-plus'
 import { getAPITestCases, getAPITestCase, createAPITestCase, patchAPITestCase, deleteAPITestCase, batchDeleteAPITestCases, updateScenarioTestCasesOrder } from '@/api/apiTesting'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import SuiteSelectionDialog from '@/components/SuiteSelectionDialog.vue'
 import Draggable from 'vuedraggable'
 

@@ -21,6 +21,7 @@
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <ActionHelpTooltip label="添加步骤" content="主按钮新增空白步骤并打开编辑器；下拉可从端点用例导入。导入时会把每个选中用例的第一步复制为独立副本到当前场景草稿，不会关联或修改源用例。" />
         <el-button
           type="warning"
           :icon="VideoPlay"
@@ -31,6 +32,7 @@
         >
           {{ executing ? '执行中...' : '执行场景' }}
         </el-button>
+        <ActionHelpTooltip label="执行场景" content="选择环境后会创建执行快照并异步运行当前已保存的场景，运行会向目标系统发起真实请求，可能新增、修改或删除测试数据。" />
         <el-button
           type="primary"
           :icon="Check"
@@ -41,6 +43,7 @@
         >
           保存
         </el-button>
+        <ActionHelpTooltip label="保存场景" content="将当前场景配置和步骤写回场景用例；添加、编辑、删除或拖动步骤后的修改均需保存才会持久化。" />
       </div>
     </div>
 
@@ -61,6 +64,7 @@
               {{ localJSON.config._variablesList.length }} 个
             </el-tag>
             <div class="card-header-tip">可在步骤中通过 <code>${变量名}</code> 引用</div>
+            <ActionHelpTooltip label="场景变量操作" content="可添加、删除变量或插入动态值函数；变量修改属于当前草稿，保存后才可供场景步骤引用。" />
             <el-button
               style="margin-left: auto;"
               size="small"
@@ -159,6 +163,7 @@
             <el-tag type="info" size="small" effect="plain" style="margin-left: 8px;">
               {{ localJSON.teststeps.length }} 个步骤
             </el-tag>
+            <ActionHelpTooltip label="步骤操作" content="拖动手柄调整当前草稿中的步骤顺序；编辑会打开步骤编辑器，删除只从当前草稿移除。以上修改均需保存才会写回场景。" />
           </div>
         </template>
 
@@ -333,6 +338,7 @@
         >
           开始执行
         </el-button>
+        <ActionHelpTooltip label="开始执行场景" content="将按所选环境异步执行当前已保存的场景，并向目标系统发起真实请求，可能新增、修改或删除测试数据；Base URL 可临时覆盖环境配置，但不会保存到场景。" />
       </template>
     </el-dialog>
 
@@ -508,6 +514,7 @@
             >
               确认导入 ({{ importSelected.length }})
             </el-button>
+            <ActionHelpTooltip label="确认导入步骤" content="逐个读取选中的端点用例，并把可解析的第一步复制为独立副本到当前场景草稿；不会修改源用例，导入后请保存场景。" />
           </div>
         </div>
       </template>
@@ -522,6 +529,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Close, Check, Edit, Delete, List, DCaret, SetUp, VideoPlay, Document, CopyDocument, Loading, Management, MagicStick, Search } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import { updateAPITestCase, executeAPITestCase, getTaskStatus, getAPITestCaseExecutionDetail, getAPIEndpoints, getAPISpecifications, getAPITestCases, getAPITestCase } from '@/api/apiTesting'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import { getProjectEnvironments } from '@/api/projects'
 import StepEditorDrawer from '@/components/scenario/StepEditorDrawer.vue'
 

@@ -5,6 +5,7 @@
         <strong>场景计划与覆盖</strong>
         <span class="heading-actions">
           <el-button text size="small" :disabled="promptDisabled" @click="$emit('edit-root-context')">工作区设置</el-button>
+          <ActionHelpTooltip label="工作区设置" content="定位到根工作区的模型、文档和接口范围设置；这里只用于调整配置，不会立即生成或运行。" />
           <el-tag :type="currentStatus.type">{{ currentStatus.label }}</el-tag>
         </span>
       </div>
@@ -58,11 +59,14 @@
         :disabled="promptDisabled"
         @update:model-value="$emit('update:rootPrompt', $event)"
       />
-      <el-button
-        type="primary"
-        :disabled="promptDisabled || generationDisabled || !rootPrompt.trim()"
-        @click="$emit('generate')"
-      >生成并验证全流程</el-button>
+      <div class="heading-actions">
+        <el-button
+          type="primary"
+          :disabled="promptDisabled || generationDisabled || !rootPrompt.trim()"
+          @click="$emit('generate')"
+        >生成并验证全流程</el-button>
+        <ActionHelpTooltip label="生成并验证全流程" content="按测试目标规划多个独立场景，调用 AI 生成候选并顺序验证。确认后会发送真实请求，可能增删改测试数据；这不是只重跑当前场景，生成结果仍需逐个检查、采用和保存。" />
+      </div>
     </div>
     <el-alert
       v-if="!scenarios.length"
@@ -72,6 +76,7 @@
       show-icon
     />
     <div v-else class="scenario-list" aria-label="场景列表" data-testid="api-workspace-scenarios">
+      <p class="coverage-hint">点击场景查看其候选、草稿和验证结果；切换场景不会发起执行。</p>
       <button
         v-for="scenario in scenarios"
         :key="scenario.id"
@@ -96,6 +101,7 @@
 
 <script setup>
 import { computed } from "vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import {
   normalizeCoverage,
   currentScenarioState,
@@ -183,6 +189,7 @@ const endpointText = (scenario) => {
 }
 .heading-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }

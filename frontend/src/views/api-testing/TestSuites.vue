@@ -18,6 +18,10 @@
           <el-button type="primary" icon="Plus" @click="openCreateDialog" :disabled="!selectedProject" class="create-btn">
             新建套件
           </el-button>
+          <ActionHelpTooltip
+            label="新建套件"
+            content="创建一个 API 测试套件，可先选择已有用例并在保存时一并关联；创建本身不会执行测试。"
+          />
         </div>
       </div>
     </div>
@@ -36,6 +40,10 @@
             </el-icon>
             批量删除
           </el-button>
+          <ActionHelpTooltip
+            label="批量删除套件"
+            content="删除所选套件及其与测试用例的关联，无法从页面恢复；测试用例本身不会被删除。"
+          />
           <el-button @click="clearSelection">
             <el-icon>
               <Close />
@@ -314,6 +322,15 @@
           </el-table-column>
 
           <el-table-column label="操作" width="340" fixed="right">
+            <template #header>
+              <span class="table-action-header">
+                操作
+                <ActionHelpTooltip
+                  label="套件操作"
+                  content="编辑可更新套件信息；执行会先要求选择环境再异步运行；定时任务会打开创建任务窗口并预选该套件；删除只移除套件及其用例关联，不删除测试用例。"
+                />
+              </span>
+            </template>
             <template #default="scope">
               <div style="display:flex;flex-wrap:nowrap;gap:6px;align-items:center;">
                 <el-button type="" size="small" @click="editTestSuite(scope.row)">
@@ -469,7 +486,13 @@
           <div class="test-case-management">
             <div class="management-header">
               <div class="header-left">
-                <h4>当前测试用例 ({{ editingSuite ? (editingSuite.test_cases?.length || 0) : pendingCaseIds.length }})</h4>
+                <h4>
+                  当前测试用例 ({{ editingSuite ? (editingSuite.test_cases?.length || 0) : pendingCaseIds.length }})
+                  <ActionHelpTooltip
+                    label="套件用例关联"
+                    content="可添加已有测试用例、调整执行顺序或移除关联。新建套件时选择结果会暂存到保存；编辑已有套件时移除或清空会立即解除关联，均不会删除测试用例本身。"
+                  />
+                </h4>
                 <p class="header-desc">{{ editingSuite ? '管理套件中的测试用例' : '预先选择用例，保存时一并加入套件' }}</p>
               </div>
               <div class="header-right">
@@ -599,9 +622,15 @@
       <template #footer>
         <div class="dialog-footer">
           <el-button @click="showCreateDialog = false">取消</el-button>
-          <el-button type="primary" @click="saveTestSuite" :loading="saving">
-            {{ editingSuite ? '更新' : '创建' }}
-          </el-button>
+          <span class="dialog-primary-action">
+            <el-button type="primary" @click="saveTestSuite" :loading="saving">
+              {{ editingSuite ? '更新' : '创建' }}
+            </el-button>
+            <ActionHelpTooltip
+              :label="editingSuite ? '更新套件' : '创建套件'"
+              :content="editingSuite ? '保存套件的基本信息；不会执行测试。' : '先创建套件，再关联本次已选择的用例；不会执行测试。'"
+            />
+          </span>
         </div>
       </template>
     </el-dialog>
@@ -693,6 +722,10 @@
           <el-button type="primary" @click="confirmExecuteSuite" :loading="executing" :disabled="!selectedEnvironment">
             {{ executing ? '执行中...' : '确认执行' }}
           </el-button>
+          <ActionHelpTooltip
+            label="确认执行套件"
+            content="会向所选环境发起真实测试请求，可能增删改测试数据。同名变量优先级：套件变量高于用例变量，用例变量高于环境变量。"
+          />
         </div>
       </template>
     </el-dialog>
@@ -768,7 +801,13 @@
       <template #footer>
         <div class="drawer-footer">
           <el-button @click="showEditDrawer = false">取消</el-button>
-          <el-button type="primary" @click="saveDrawerSuite" :loading="saving">更新</el-button>
+          <span class="dialog-primary-action">
+            <el-button type="primary" @click="saveDrawerSuite" :loading="saving">更新</el-button>
+            <ActionHelpTooltip
+              label="更新套件"
+              content="保存当前抽屉中的套件基本信息和变量配置，不会执行测试或改动已关联用例。"
+            />
+          </span>
         </div>
       </template>
     </el-drawer>
@@ -800,6 +839,7 @@ import Draggable from 'vuedraggable'
 import TaskEditDialog from '@/components/scheduledTasks/TaskEditDialog.vue'
 import CaseSelector from '@/components/api-testing/CaseSelector.vue'
 import KeyValueRows from '@/components/api-workspace/KeyValueRows.vue'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 
 // 路由实例
 const router = useRouter()
@@ -2842,6 +2882,13 @@ onUnmounted(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.dialog-primary-action,
+.table-action-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* 表格行样式 */

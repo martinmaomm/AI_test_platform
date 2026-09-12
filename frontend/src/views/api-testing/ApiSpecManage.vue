@@ -4,6 +4,10 @@
     <div class="card-header">
       <div class="card-header-left">
         <span>API规范列表</span>
+        <ActionHelpTooltip
+          label="规范操作"
+          content="待处理的规范可进入 API 工作区继续设计测试；其他状态可查看已解析的端点与关联用例。删除会移除该规范、其端点及这些端点的测试用例，且无法从页面恢复。"
+        />
       </div>
       <div class="card-header-right">
         <el-input v-model="searchQuery" placeholder="搜索API规范..." style="width: 300px" clearable>
@@ -140,6 +144,11 @@
           </div>
           <h3 class="upload-title">
             {{ selectedProject ? '上传Swagger API文档' : '请先选择项目' }}
+            <ActionHelpTooltip
+              v-if="selectedProject"
+              label="上传并解析规范"
+              content="选择 JSON 或 YAML 文件后上传，系统会创建规范并立即解析端点。上传不会自动生成或执行测试。"
+            />
           </h3>
           <p class="upload-hint">
             {{ selectedProject ? '支持 .json, .yaml, .yml 格式' : '点击前往项目管理页面选择项目' }}
@@ -243,6 +252,7 @@ import {
   MagicStick
 } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import { getAPISpecifications, uploadParseAPISpecification, deleteAPISpecification, getTaskStatus}
   from '@/api/apiTesting'
 import { useProjectStore } from '@/stores/project'

@@ -2,7 +2,9 @@
   <el-card shadow="never" class="execution-history" data-testid="api-workspace-execution-history">
     <template #header>
       <div class="heading">
-        <strong>{{ historyLabel || "本工作区运行历史" }}</strong>
+        <span><strong>{{ historyLabel || "本工作区运行历史" }}</strong>
+        <ActionHelpTooltip label="运行历史操作" content="切换工作区或场景历史只改变展示范围；打开执行详情查看该次请求、响应和断言，不会重新执行。停止整批任务会停止根工作区及子场景未完成的生成和调试，保留已完成结果；已发生的测试数据操作不会回滚。" />
+        </span>
         <el-button
           v-if="canCancelRoot"
           type="danger"
@@ -50,6 +52,7 @@
         <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
       </el-table-column>
       <el-table-column label="操作" width="142" fixed="right">
+        <template #header>操作 <ActionHelpTooltip label="打开执行详情" content="查看这一次运行的请求、响应、断言和日志，不会重新执行；历史结果不代表当前编辑版本已通过。" /></template>
         <template #default="{ row }">
           <el-button link type="primary" @click="openReport(row)">打开执行详情</el-button>
         </template>
@@ -60,6 +63,7 @@
 
 <script setup>
 import { computed } from "vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import { useRouter } from "vue-router";
 import { reportPath } from "@/utils/reportLinks";
 import { workspaceExecutionHistory } from "@/views/api-testing/apiWorkspace";

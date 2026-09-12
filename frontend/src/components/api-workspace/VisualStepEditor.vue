@@ -2,7 +2,7 @@
   <el-card shadow="never" class="step-editor">
     <template #header>
       <div class="step-heading">
-        <strong>步骤 {{ index + 1 }}</strong>
+        <strong>步骤 {{ index + 1 }}<ActionHelpTooltip label="步骤编辑操作" content="删除步骤只从当前草稿移除请求，不会调用被测网站的删除接口。请求体类型切换会清空原类型的内容，请先核对；所有修改需保存草稿并重新验证。" /></strong>
         <el-button
           text
           type="danger"
@@ -210,6 +210,7 @@
             @click="addAssertion"
             >+ 添加断言</el-button
           >
+          <ActionHelpTooltip label="断言操作" content="添加断言会新增一条默认 HTTP 状态码等于 200 的检查，请按接口实际预期修改。删除只移除当前检查项；不要为了让结果通过而删除必要断言。修改后需保存并重新验证。" />
         </el-collapse-item>
       </el-collapse>
     </el-form>
@@ -218,6 +219,7 @@
 
 <script setup>
 import { computed } from "vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import KeyValueRows from "./KeyValueRows.vue";
 import { bodyKind, normalizeStep } from "@/views/api-testing/apiWorkspace";
 

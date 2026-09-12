@@ -120,12 +120,20 @@
               >
                 查看端点详情
               </el-button>
+              <ActionHelpTooltip
+                label="查看端点详情"
+                content="打开当前端点的请求方法、路径、参数和响应定义，仅查看信息，不会修改规范或测试用例。"
+              />
               <el-button
                 type="primary"
                 @click="openAIGenerationDialogForEndpoint(selectedEndpoint)"
               >
                 在工作区生成测试
               </el-button>
+              <ActionHelpTooltip
+                label="在工作区生成测试"
+                content="带入当前端点进入 API 工作区，在工作区确认候选草稿后才会保存为测试用例；此处不会直接生成或执行测试。"
+              />
             </div>
           </div>
 
@@ -273,7 +281,13 @@
             <!-- 测试用例展示区域 -->
             <div v-else-if="selectedEndpoint" class="test-cases-workspace">
               <div class="workspace-header">
-                <h4>测试用例 ({{ endpointTests.length }})</h4>
+                <h4>
+                  测试用例 ({{ endpointTests.length }})
+                  <ActionHelpTooltip
+                    label="端点测试用例操作"
+                    content="点击用例可查看详情；复制图标会创建一份新的用例副本。刷新只重新读取当前端点已保存的用例，不会执行测试。"
+                  />
+                </h4>
                 <div class="workspace-header-actions">
                   <el-button
                     plain
@@ -284,6 +298,10 @@
                   >
                     <el-icon><Refresh /></el-icon> 刷新
                   </el-button>
+                  <ActionHelpTooltip
+                    label="刷新端点测试用例"
+                    content="重新读取当前端点已保存的测试用例列表，不会生成、保存或执行测试。"
+                  />
                 </div>
               </div>
 
@@ -1219,6 +1237,7 @@ import {
 } from "@element-plus/icons-vue";
 import Draggable from "vuedraggable";
 import APICaseEditDetail from "@/components/APICaseEditDetail.vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import dayjs from "dayjs";
 import {
   getAPIEndpoints,

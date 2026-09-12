@@ -33,11 +33,13 @@
           <el-form-item label="探索总时限（秒）" required><el-input-number :key="`browser-discovery-timeout-${disabled || creating}`" v-model="form.exploration_timeout_seconds" aria-label="探索总时限（秒）" :min="BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS" :max="timeoutMaximum" :step="30" :disabled="disabled || creating" /></el-form-item>
           <el-form-item><el-checkbox v-model="form.allow_test_data_writes" aria-label="允许测试数据写入" :disabled="disabled || creating">我确认允许在上述授权测试范围内修改测试数据</el-checkbox></el-form-item>
           <el-button type="primary" :loading="creating" :disabled="disabled" @click="submit">开始探索</el-button>
+          <ActionHelpTooltip label="开始探索" content="调用所选 AI，通过浏览器执行描述中的页面操作并记录真实接口。可能新增、修改或删除测试数据；完成后还需选择样本进入工作区生成用例，不会直接保存测试用例。" />
         </el-form>
       </el-card>
       <div class="discovery-toolbar">
         <strong>网页探索任务</strong>
         <el-button text :loading="tasksLoading" @click="$emit('refresh')">刷新</el-button>
+        <ActionHelpTooltip label="刷新探索任务" content="重新读取探索任务列表和状态，不会再次探索网页，也不会重复生成任务。" />
       </div>
       <el-empty v-if="!tasksLoading && !tasks.length" description="尚无网页探索任务" :image-size="56" />
       <el-table v-else :data="tasks" size="small" row-key="id" @row-click="$emit('select', $event.id)">
@@ -53,6 +55,7 @@
         <el-table-column label="耗时" width="100"><template #default="{ row }">{{ duration(row) }}</template></el-table-column>
         <el-table-column label="请求" width="72"><template #default="{ row }">{{ row.request_count ?? "—" }}</template></el-table-column>
         <el-table-column label="操作" width="144">
+          <template #header>操作 <ActionHelpTooltip label="探索任务操作" content="查看展示该次探索的状态和样本。删除只移除允许删除的任务及数据库采样记录，磁盘日志和截图保留；已交接或被来源引用的任务可能不能删除。不会删除已保存用例。" /></template>
           <template #default="{ row }">
             <el-button text type="primary" @click.stop="$emit('select', row.id)">查看</el-button>
             <el-tooltip :disabled="!deleteState(row).reason" :content="deleteState(row).reason" placement="top">
@@ -80,6 +83,7 @@
         <p v-if="task.error_code" class="diagnostic-code">{{ task.error_code }}：{{ errorCodeLabel(task.error_code) }}</p>
         <p v-if="task.description" class="description">{{ task.description }}</p>
         <el-alert v-if="originResolution.state === 'awaiting_confirmation'" title="发现跨主机接口的当前直接请求，需确认后才会发送该请求；未确认不会保存正文或认证信息。" type="warning" :closable="false" show-icon />
+        <ActionHelpTooltip v-if="originResolution.state === 'awaiting_confirmation'" label="允许或拒绝接口来源" content="请核对接口地址是否属于本次测试范围。允许后可能向该地址发送请求和认证信息并采集样本；拒绝会阻止未授权来源的请求，不会撤回已经发生的页面操作。" />
         <div v-if="originResolution.state === 'awaiting_confirmation'" class="origin-candidates">
           <div v-for="candidate in originResolution.pending" :key="`${candidate.origin}:${candidate.method}:${candidate.path}`" class="origin-candidate">
             <strong>{{ candidate.method }} {{ candidate.path }}</strong><span>{{ candidate.origin }}</span>
@@ -89,6 +93,7 @@
           <p v-if="!canConfirmOrigin" class="records-hint">当前任务已结束或不允许确认，请刷新任务详情查看最终状态。</p>
         </div>
         <el-alert v-if="originResolution.state === 'awaiting_selection'" title="已采集多个接口来源，请选择本次交接的主来源；不同来源的同路径接口不会混合。" type="info" :closable="false" show-icon />
+        <ActionHelpTooltip v-if="originResolution.state === 'awaiting_selection'" label="选择此来源" content="从已采集的接口地址中指定本次生成所用的主来源；不同来源不会混为一套接口，这一步不会重新探索。" />
         <div v-if="originResolution.state === 'awaiting_selection'" class="origin-candidates">
           <div v-for="origin in originResolution.origins" :key="origin" class="origin-candidate">
             <span>{{ origin }}</span>
@@ -103,6 +108,7 @@
             <span><el-button type="danger" plain :loading="deleting && String(deletingTaskId) === String(task.id)" :disabled="disabled || !deleteState(task).canDelete" @click="$emit('delete', task.id)">删除</el-button></span>
           </el-tooltip>
           <el-button :loading="recordsLoading" @click="$emit('load-records', task.id)">查看已授权样本</el-button>
+          <ActionHelpTooltip label="探索详情操作" content="取消探索会请求停止并等待检查点结束，已发生的数据操作不会回滚。删除仅处理此任务及数据库采样记录，日志和截图保留。查看已授权样本读取已有采集摘要，不会重新请求被测接口。" />
         </div>
         <template v-if="recordGroups.length">
           <p class="records-hint">仅显示后端提供的公开脱敏摘要。公开内容相同的样本合并展示，原始采集记录及依赖保留。已观察：请求/响应样本；未知：必填性、完整 Schema、枚举和其他响应分支，不能将样本视为完整接口规范。</p>
@@ -130,6 +136,7 @@
             <el-button type="success" :disabled="!canHandoff || !selectedRecordIds.length || selectedGroupCount > 50" :loading="handoffLoading" @click="handoff">创建来源并进入工作区</el-button>
             <span v-if="!canHandoff && originResolution.state === 'awaiting_selection'" class="records-hint">请先选择一个已采集来源后再交接。</span>
             <el-button v-if="recordsHasMore" :loading="recordsLoading" @click="$emit('load-more-records')">加载更多样本</el-button>
+            <ActionHelpTooltip label="样本交接操作" content="加载更多样本读取本次任务尚未显示的采集记录。创建来源并进入工作区会将勾选样本整理为接口来源并打开工作区，不会自动运行或保存用例；缺少依赖时需补选相关样本。" />
           </div>
         </template>
         <el-empty v-else-if="recordsLoaded" description="没有可交接的已授权样本" :image-size="56" />
@@ -140,6 +147,7 @@
 
 <script setup>
 import { computed, ref, watch } from "vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import {
   BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH,
   BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS,

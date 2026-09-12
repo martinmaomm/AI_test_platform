@@ -15,6 +15,7 @@
         >
           AI 编辑选中用例
         </el-button>
+        <ActionHelpTooltip label="AI 编辑选中用例" content="仅可选择一个端点用例进入 AI 工作区；先保存右侧未保存的编辑，再继续生成或查看 Python。" />
         <el-button
           type="success"
           plain
@@ -24,12 +25,15 @@
         >
           加入测试套件
         </el-button>
+        <ActionHelpTooltip label="加入测试套件" content="把选中的用例关联到测试套件，不会复制用例。套件中的端点用例彼此独立运行，不能传递上下文变量。" />
         <el-button type="success" plain size="small" @click="handleBatchDuplicate" :loading="isBatchDuplicating">
           <el-icon><CopyDocument /></el-icon>批量复制
         </el-button>
+        <ActionHelpTooltip label="批量复制" content="为每个选中用例创建带新名称的独立副本；后续编辑副本不会修改原用例。" />
         <el-button type="danger" size="small" @click="batchDelete">
           <el-icon><Delete /></el-icon>批量删除
         </el-button>
+        <ActionHelpTooltip label="批量删除" content="确认后删除当前项目中选中的用例记录；删除后无法从页面恢复。" />
         <el-button size="small" @click="clearSelection">
           <el-icon><Close /></el-icon>取消
         </el-button>
@@ -64,6 +68,7 @@
 
         <span class="toolbar-spacer" />
 
+        <ActionHelpTooltip label="端点用例操作" content="树中可拖动同层节点调整顺序并立即保存；用例行的图标可重命名、复制或打开执行配置。复制会创建独立副本，执行确认后会向所选环境发起真实请求。" />
         <span class="case-count">{{ filteredTestCases.length }} 个用例</span>
         <el-button size="small" :loading="loading" @click="loadData">
           <el-icon><Refresh /></el-icon>
@@ -287,6 +292,7 @@
         >
           确认执行
         </el-button>
+        <ActionHelpTooltip label="确认执行" content="将按所选环境创建执行快照并异步执行该用例；执行会向目标系统发起真实请求，可能新增、修改或删除测试数据。" />
       </template>
     </el-dialog>
 
@@ -347,6 +353,7 @@ import {
 } from '@/api/apiTesting'
 import { getProjectEnvironments } from '@/api/projects'
 import APITestCaseExecutionDetail from '@/components/APITestCaseExecutionDetail.vue'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import EndpointTester from './EndpointTester.vue'
 import SuiteSelectionDialog from '@/components/SuiteSelectionDialog.vue'
 import { useProjectStore } from '@/stores/project'

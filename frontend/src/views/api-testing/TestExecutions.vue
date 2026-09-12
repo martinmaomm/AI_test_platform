@@ -65,6 +65,10 @@
             </el-icon>
             批量删除
           </el-button>
+          <ActionHelpTooltip
+            label="批量删除执行记录"
+            content="删除所选执行记录及其执行明细；套件执行的子用例执行明细也会删除。测试用例和测试套件不会被删除，且记录无法从页面恢复。"
+          />
           <el-button @click="clearSelection">
             <el-icon>
               <Close />
@@ -77,7 +81,13 @@
       <!-- 原始card-header - 当没有选中项时显示 -->
       <div v-if="selectedRuns.length === 0" class="card-header">
         <div class="card-header-left">
-          <h3>执行记录列表</h3>
+          <h3>
+            执行记录列表
+            <ActionHelpTooltip
+              label="执行记录列表"
+              content="可按执行类型、状态、触发方式和日期筛选；刷新会按当前条件重新读取列表。勾选记录后可批量删除，删除记录及其明细后无法从页面恢复。"
+            />
+          </h3>
         </div>
         <div class="card-header-right">
           <!-- 筛选器 -->
@@ -178,6 +188,15 @@
         </el-table-column>
 
         <el-table-column label="操作" width="250" fixed="right" align="center">
+          <template #header>
+            <span class="table-action-header">
+              操作
+              <ActionHelpTooltip
+                label="执行记录操作"
+                content="查看详情会读取该次执行的明细；查看完整报告会进入该记录的报告页；复制链接只复制报告地址。"
+              />
+            </span>
+          </template>
           <template #default="{ row }">
             <div class="action-buttons">
               <el-button size="small" @click.stop="viewDetails(row)" class="view-btn">
@@ -237,6 +256,7 @@ import APITestCaseExecutionDetail from '@/components/APITestCaseExecutionDetail.
 import dayjs from 'dayjs'
 import { useProjectStore } from '@/stores/project'
 import { copyText, reportPath, reportUrl } from '@/utils/reportLinks'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 
 const loading = ref(false)
 const currentPage = ref(1)
@@ -980,6 +1000,12 @@ onMounted(async () => {
 .batch-buttons {
   display: flex;
   gap: 10px;
+}
+
+.table-action-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* 详情对话框样式 */

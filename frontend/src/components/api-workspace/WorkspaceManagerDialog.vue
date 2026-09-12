@@ -27,6 +27,7 @@
         </template>
       </el-table-column>
       <el-table-column label="操作" width="190" fixed="right">
+        <template #header>操作 <ActionHelpTooltip label="管理工作区操作" content="查看会切换到该工作区；重命名只改工作区名称。删除会移除工作区及其子场景、草稿和对话，不会删除已保存测试用例或执行记录；运行中的工作区不能删除。" /></template>
         <template #default="{ row }">
           <el-button link type="primary" :disabled="mutating" @click="$emit('select', row.id)">
             查看
@@ -48,6 +49,7 @@
 </template>
 
 <script setup>
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import { rootWorkspaceBusy, rootWorkspaceStatusMeta } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({

@@ -493,6 +493,7 @@
                 <el-icon v-if="!isDebugging"><VideoPlay /></el-icon>
                 {{ isDebugging ? '执行中…' : `调试到此步骤（前 ${stepIndex + 1} 步）` }}
               </el-button>
+              <ActionHelpTooltip label="调试到此步骤" content="会按所选环境依次执行前序步骤和当前草稿步骤，以获取当前步骤响应；会发起真实请求，可能新增、修改或删除测试数据，但不会保存步骤。" />
             </div>
 
             <!-- 调试结果 -->
@@ -734,6 +735,7 @@
       <div class="drawer-footer">
         <el-button @click="$emit('update:visible', false)">取消</el-button>
         <el-button type="primary" :icon="Check" @click="handleSave">保存步骤</el-button>
+        <ActionHelpTooltip label="保存步骤" content="仅把当前步骤回传到场景草稿；还需在场景编排页点击“保存”，才会写回场景用例。" />
       </div>
     </template>
   </el-drawer>
@@ -793,6 +795,7 @@ import { ref, watch, computed, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Close, Edit, Check, ArrowDown, Document, QuestionFilled, MagicStick, VideoPlay, CopyDocument, InfoFilled, Aim } from '@element-plus/icons-vue'
 import MonacoEditor from '@/components/MonacoEditor.vue'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import { debugScenarioSteps } from '@/api/apiTesting'
 import { getProjectEnvironments } from '@/api/projects'
 

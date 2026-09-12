@@ -19,6 +19,7 @@
     <div class="right-panel" v-loading="loadingDetail">
       <div v-if="currentScenario" class="workspace-action">
         <el-button type="primary" plain size="small" :disabled="loadingDetail" @click="openAIWorkspace">在 AI 工作区编辑 / 查看 Python</el-button>
+        <ActionHelpTooltip label="AI 工作区" content="打开当前场景的 AI 工作区以编辑或查看 Python；存在未保存的编排修改时需先保存，避免带着旧内容进入。" />
       </div>
       <ScenarioOrchestrator
         v-if="currentScenario && !loadingDetail"
@@ -46,6 +47,7 @@ import { Connection } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
 import { getAPITestCase } from '@/api/apiTesting'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import ScenarioList from '@/components/scenario/ScenarioList.vue'
 import ScenarioOrchestrator from '@/components/scenario/ScenarioOrchestrator.vue'
 

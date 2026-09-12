@@ -55,7 +55,9 @@
       class="failure-actions"
       data-testid="api-scenario-failure-actions"
     >
-      <strong>当前场景需要人工处理</strong>
+      <div class="heading"><strong>当前场景需要人工处理</strong>
+      <ActionHelpTooltip label="失败处理操作" content="查看失败原因展开已有请求、响应和断言；AI 修复只定位到对话输入框，需再点修复并验证才会提交；手动编辑定位到可视化步骤，候选尚未采用时需先确认采用。这里不会直接自动修复或覆盖用例。" />
+      </div>
       <div class="failure-action-buttons">
         <el-button
           :disabled="failureActions.view.disabled"
@@ -151,6 +153,7 @@
 
 <script setup>
 import { computed, ref } from "vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import DebugResultPanel from "./DebugResultPanel.vue";
 import {
   generationPhaseLabel,

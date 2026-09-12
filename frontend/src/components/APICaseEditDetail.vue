@@ -32,6 +32,7 @@
               <el-icon><Check /></el-icon>
               保存更改
             </el-button>
+            <ActionHelpTooltip label="用例编辑操作" content="“保存更改”会写回当前用例的基本信息和脚本内容；从接口用例导入的步骤只进入当前编辑草稿，保存前不会持久化，也不修改源用例。" />
             <el-button size="default" @click="handleClose" class="close-btn">
               <el-icon><Close /></el-icon>
               关闭
@@ -410,6 +411,7 @@
         :closable="false"
         style="margin-bottom: 16px;"
       />
+      <ActionHelpTooltip label="选择响应字段" content="仅从规范的响应结构回填字段路径；不发送请求，也不代表断言已经验证通过。请结合断言方式、期望值并保存用例。" />
 
       <!-- 响应结构树 -->
       <div class="response-structure">
@@ -569,6 +571,7 @@ import {
 import { updateAPITestCase, getAPITestCases, getAPITestCase } from '@/api/apiTesting'
 import { useProjectStore } from '@/stores/project'
 import MonacoEditor from '@/components/MonacoEditor.vue'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 
 // Props
 const props = defineProps({

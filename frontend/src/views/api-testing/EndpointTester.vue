@@ -130,6 +130,7 @@
         <el-icon style="margin-right:4px"><CaretRight /></el-icon>
         发送 (调试)
       </el-button>
+      <ActionHelpTooltip label="发送调试请求" content="使用当前草稿和所选环境同步发起一次真实 HTTP 请求，仅用于调试且不会自动保存用例；请求可能新增、修改或删除测试数据。" />
       <el-button
         size="large"
         :loading="saving"
@@ -141,6 +142,7 @@
         <el-icon v-if="!saving" style="margin-right:4px"><Check /></el-icon>
         {{ isDirty ? '保存 *' : '已保存' }}
       </el-button>
+      <ActionHelpTooltip label="保存用例" content="将当前请求配置、提取规则和断言写回该端点用例；运行环境的 Base URL 不会随此保存。" />
       <el-button
         size="large"
         plain
@@ -151,6 +153,8 @@
         <el-icon style="margin-right:4px"><Document /></el-icon>
         API 规范
       </el-button>
+      <ActionHelpTooltip label="API 规范" content="打开当前用例关联端点的只读规范详情，不会修改用例或发送请求。" />
+      <ActionHelpTooltip label="请求编辑操作" content="参数、请求头、Body、Hooks、变量提取和断言里的添加或删除先改本地草稿；只有点击保存才会写回用例。" />
     </div>
 
     <!-- ===== 响应状态条 ===== -->
@@ -855,6 +859,7 @@
                   <el-icon><CopyDocument /></el-icon>
                   复制 JSON
                 </el-button>
+                <ActionHelpTooltip label="脚本预览操作" content="复制 JSON 只写入本机剪贴板；“保存到用例”才会持久化当前预览对应的配置。" />
                 <el-button
                   size="small"
                   text
@@ -923,6 +928,7 @@
                   <el-icon><CopyDocument /></el-icon>
                   复制
                 </el-button>
+                <ActionHelpTooltip label="响应结果操作" content="“重新发送”会再次发起真实请求；本区域的复制按钮只写入本机剪贴板，不会修改用例、响应或目标系统。" />
               </div>
               <pre class="resp-pre">{{ respBodyView === 'pretty' ? prettyResponseBody : response.body }}</pre>
             </div>
@@ -1287,6 +1293,7 @@ import {
   Document, Check, Cpu, Refresh, ArrowDown, Aim, Edit,
 } from '@element-plus/icons-vue'
 import { updateAPITestCase, patchAPITestCase, getAPITestCase, getEndpointDetail } from '@/api/apiTesting'
+import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import { saveExecutionCache, loadExecutionCache } from '@/store/endpointCache'
 import { getProjectEnvironments } from '@/api/projects'
 import api from '@/api/index.js'

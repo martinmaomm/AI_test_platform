@@ -29,6 +29,7 @@
               :class="{ 'source-tab--active': isBrowserSource }"
               @click="switchSource('browser_capture')"
             >从网页探索生成</button>
+            <ActionHelpTooltip label="切换生成来源" content="接口文档入口使用已上传的 Swagger/OpenAPI；网页探索入口先记录页面真实接口。切换不会删除已有工作区，有未保存修改时会提示确认。" />
           </div>
         </div>
         <div class="header-actions">
@@ -62,12 +63,15 @@
           <el-button data-testid="api-workspace-manager" :disabled="interactionLocked" @click="managerDialog = true"
             >管理工作区</el-button
           >
-          <el-button
-            :loading="loading"
-            :disabled="interactionLocked"
-            @click="reloadWorkspace"
-            >重新加载</el-button
-          >
+          <span class="header-action-with-help">
+            <el-button
+              :loading="loading"
+              :disabled="interactionLocked"
+              @click="reloadWorkspace"
+              >重新加载</el-button
+            >
+            <ActionHelpTooltip label="工作区操作" :content="isDocumentSource ? '新建工作区会创建独立的需求与草稿；管理工作区可查看、重命名或删除历史。重新加载读取服务器最新状态，不会重新生成或运行；有未保存修改时会先提示确认。' : '新建探索会重置探索表单，不会立即运行或删除旧任务；管理工作区管理已交接的工作区。重新加载读取当前工作区的最新状态，不会重新探索。'" />
+          </span>
         </div>
       </header>
       <BrowserDiscoveryPanel
@@ -275,6 +279,7 @@
                 @click="saveRootContext"
                 >保存工作区设置</el-button
               >
+              <ActionHelpTooltip label="保存工作区设置" content="保存根工作区选择的模型、文档和接口范围，供后续规划使用；不会立即生成或验证，也不会改动已生成子场景的冻结范围。" />
             </el-form>
           </el-card>
         </aside>
@@ -319,6 +324,7 @@
               :disabled="interactionLocked || draftDirty || !scenarioModelDirty"
               @click="saveScenarioModel"
             >保存子场景模型</el-button>
+            <ActionHelpTooltip label="保存子场景模型" content="保存此场景后续重新生成或修复所用的模型；不影响其他场景，也不会立即调用模型。" />
           </el-card>
           <el-alert
             v-if="editingScenario && scenarioModelDirty"
@@ -391,6 +397,7 @@
           />
           <div ref="visualStepsRef" class="steps-heading">
             <h3>可视化步骤</h3>
+            <div class="action-with-help">
             <el-button
               type="primary"
               plain
@@ -399,6 +406,8 @@
               @click="addStep"
               >添加步骤</el-button
             >
+            <ActionHelpTooltip label="添加步骤" content="在当前可视化草稿末尾添加一个请求步骤，需自行填写参数、提取和断言；不会立即执行。编辑完成后保存草稿，再验证当前场景。" />
+            </div>
           </div>
           <p v-if="scenarioEndpointScopeHint" class="hint">
             {{ scenarioEndpointScopeHint }}
@@ -671,6 +680,7 @@ import {
   resolveBrowserDiscoveryOrigin,
 } from "@/api/apiBrowserDiscovery";
 import WorkspaceConversation from "@/components/api-workspace/WorkspaceConversation.vue";
+import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
 import WorkspaceConfigEditor from "@/components/api-workspace/WorkspaceConfigEditor.vue";
 import VisualStepEditor from "@/components/api-workspace/VisualStepEditor.vue";
 import DebugResultPanel from "@/components/api-workspace/DebugResultPanel.vue";
@@ -3172,6 +3182,11 @@ onBeforeUnmount(() => {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+}
+.header-action-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .workspace-select-label {
   color: var(--el-text-color-secondary);

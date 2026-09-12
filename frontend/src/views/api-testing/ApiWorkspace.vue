@@ -296,7 +296,7 @@
           />
           <el-card v-if="editingScenario" shadow="never" class="scenario-model-settings">
             <template #header><strong>子场景模型</strong></template>
-            <p class="hint">模型仅用于当前子场景后续修复；不会影响根工作区或其他场景。</p>
+            <p class="hint">模型用于当前子场景后续重新生成或修复；不会影响根工作区或其他场景。</p>
             <el-select
               v-model="scenarioModelId"
               clearable
@@ -366,13 +366,20 @@
           <section class="scenario-validation" data-testid="api-scenario-validation">
             <div class="debug-actions">
               <el-tag :type="currentValidationStatus.type">{{ currentValidationStatus.label }}</el-tag>
-              <el-button
-                type="warning"
-                data-testid="api-verify-current-scenario"
-                :disabled="Boolean(verificationDisabledReason)"
-                :title="verificationDisabledReason || verificationHint"
-                @click="openDebug"
-              >{{ verificationButtonLabel }}</el-button>
+              <div class="action-with-help">
+                <el-button
+                  type="warning"
+                  data-testid="api-verify-current-scenario"
+                  :disabled="Boolean(verificationDisabledReason)"
+                  :title="verificationDisabledReason || verificationHint"
+                  @click="openDebug"
+                >{{ verificationButtonLabel }}</el-button>
+                <el-tooltip placement="top" :trigger="['hover', 'focus', 'click']" :popper-style="actionHelpStyle" :content="`${verificationHint} 确认执行后会发送真实接口请求，可能修改测试数据；不会调用 AI 或自动保存为测试用例。`">
+                  <button type="button" class="action-help" :aria-label="`${verificationButtonLabel}说明`">
+                    <el-icon aria-hidden="true"><QuestionFilled /></el-icon>
+                  </button>
+                </el-tooltip>
+              </div>
             </div>
             <p class="hint">{{ verificationDisabledReason || verificationHint }}</p>
           </section>
@@ -407,13 +414,21 @@
             @update:model-value="updateStep(index, $event)"
             @remove="removeStep(index)"
           />
-          <el-button
-            type="primary"
-            :loading="savingDraft"
-            :disabled="interactionLocked || conflict || !dirty"
-            @click="saveDraft"
-            >保存草稿</el-button
-          >
+          <div class="action-with-help">
+            <el-button
+              type="primary"
+              :loading="savingDraft"
+              :disabled="interactionLocked || conflict || !dirty"
+              @click="saveDraft"
+              >保存草稿</el-button
+            >
+            <el-tooltip placement="top" :trigger="['hover', 'focus', 'click']" :popper-style="actionHelpStyle" content="仅保存当前工作区的编辑内容，方便继续调试；不调用 AI、不执行接口，也不会更新已保存的测试用例。">
+              <button type="button" class="action-help" aria-label="保存草稿说明">
+                <el-icon aria-hidden="true"><QuestionFilled /></el-icon>
+              </button>
+            </el-tooltip>
+            <span class="hint">保存编辑进度，不代表验证通过或已保存为测试用例。</span>
+          </div>
           <DebugResultPanel
             ref="currentDebugRef"
             data-testid="api-current-debug-result"
@@ -431,7 +446,7 @@
             @cancel-root="cancelRootWorkspace"
             @select-history="selectHistoryWorkspace"
           />
-          <div class="debug-actions">
+          <div class="action-with-help">
             <el-button
               type="success"
               :disabled="
@@ -443,6 +458,12 @@
               @click="openSave"
               >保存为测试用例</el-button
             >
+            <el-tooltip placement="top" :trigger="['hover', 'focus', 'click']" :popper-style="actionHelpStyle" content="将当前草稿保存到测试用例列表；首次创建，后续更新本工作区绑定的用例。不会自动运行，也不代表验证通过；建议先确认本次验证结果。">
+              <button type="button" class="action-help" aria-label="保存为测试用例说明">
+                <el-icon aria-hidden="true"><QuestionFilled /></el-icon>
+              </button>
+            </el-tooltip>
+            <span class="hint">供以后重复执行；再次保存会更新本工作区绑定的测试用例。</span>
           </div>
           <PythonExportPanel
             :code="pythonCurrent ? python.code : ''"
@@ -620,6 +641,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { QuestionFilled } from "@element-plus/icons-vue";
 import { copyText } from "@/utils/reportLinks";
 import { useProjectStore } from "@/stores/project";
 import { getAPISpecifications, getAPIEndpoints } from "@/api/apiTesting";
@@ -725,6 +747,7 @@ const props = defineProps({
 });
 const route = useRoute();
 const router = useRouter();
+const actionHelpStyle = { maxWidth: "min(360px, calc(100vw - 32px))", lineHeight: "1.6" };
 const projectStore = useProjectStore();
 const projectId = computed(() => projectStore.currentProjectId);
 const workspace = ref(null);
@@ -3197,6 +3220,35 @@ onBeforeUnmount(() => {
 }
 .steps-heading h3 {
   margin: 0;
+}
+.action-with-help {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.action-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  cursor: help;
+  flex-shrink: 0;
+}
+.action-help:hover,
+.action-help:focus-visible {
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+}
+.action-help:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 2px;
 }
 .dialog-form {
   margin-top: 18px;

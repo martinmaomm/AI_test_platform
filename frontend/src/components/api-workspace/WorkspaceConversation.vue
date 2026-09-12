@@ -60,12 +60,26 @@
           </li>
         </ul>
       </details>
-      <el-button
-        type="primary"
-        :disabled="disabled || busy || submitting || generationPending"
-        @click="$emit('adopt')"
-        >采用候选并替换草稿</el-button
-      >
+      <div class="action-option candidate-action">
+        <el-button
+          type="primary"
+          :disabled="disabled || busy || submitting || generationPending"
+          @click="$emit('adopt')"
+          >采用候选并替换草稿</el-button
+        >
+        <el-tooltip
+          content="仅替换当前可视化草稿；不会自动保存为测试用例或执行。"
+          placement="top"
+          :trigger="['hover', 'focus', 'click']"
+          :popper-style="{ maxWidth: 'min(360px, calc(100vw - 32px))', lineHeight: '1.6' }"
+        >
+          <button
+            type="button"
+            class="action-help"
+            aria-label="采用候选并替换草稿说明"
+          ><el-icon aria-hidden="true"><QuestionFilled /></el-icon></button>
+        </el-tooltip>
+      </div>
     </div>
     <el-input
       ref="messageInput"
@@ -79,60 +93,102 @@
       :placeholder="inputPlaceholder"
       @keydown.ctrl.enter.prevent="send(allowGenerate ? 'generate' : 'repair')"
     />
-    <div class="actions">
-      <el-button
-        v-if="allowGenerate"
-        type="primary"
-        :loading="busy && mode === 'generate'"
-        :disabled="
-          disabled ||
-          busy ||
-          submitting ||
-          generationPending ||
-          generationDisabled ||
-          !allowGenerate ||
-          !message.trim()
-        "
-        @click="send('generate')"
-        >生成并验证</el-button
-      >
-      <el-button
-        v-else-if="allowScenarioRegenerate"
-        type="primary"
-        :loading="busy && mode === 'generate'"
-        :disabled="
-          disabled ||
-          busy ||
-          submitting ||
-          generationPending ||
-          generationDisabled ||
-          !message.trim()
-        "
-        @click="send('generate')"
-        >重新生成本场景</el-button
-      >
-      <el-button
-        :loading="busy && mode === 'repair'"
-        :disabled="
-          disabled ||
-          busy ||
-          submitting ||
-          generationPending ||
-          generationDisabled ||
-          !canRepair
-        "
-        @click="send('repair')"
-        >修复并验证</el-button
-      >
+    <div class="action-choice" data-testid="api-workspace-action-choice">
+      <template v-if="allowGenerate">
+        <span class="choice-line">从测试目标开始设计：填写需求，选「生成并验证」。</span>
+        <span class="choice-line">流程基本正确但运行报错：选「修复并验证」，AI 会参考失败证据；修复建议可不填。</span>
+      </template>
+      <template v-else-if="allowScenarioRegenerate">
+        <span class="choice-line">流程整体不对或想调整思路：填写补充要求，选「重新生成本场景」（保留原目标，只处理当前场景）。</span>
+        <span class="choice-line">流程基本正确但运行报错：选「修复并验证」，AI 会参考失败证据；修复建议可不填。</span>
+      </template>
+      <template v-else>
+        <span class="choice-line">流程基本正确但运行报错：选「修复并验证」，AI 会参考失败证据；修复建议可不填。</span>
+      </template>
     </div>
-    <p class="hint">
-      {{ allowGenerate ? "生成、修复和验证都不会自动采用候选或保存用例；确认后才会发起真实验证请求。" : allowScenarioRegenerate ? "重新生成仅处理当前子场景：原目标会保留，请补充当前场景的要求；不会重新规划或生成其他场景。" : "仅补充当前子场景的修复说明；不会重新规划或生成其他场景。" }}
+    <div class="actions">
+      <div v-if="allowGenerate" class="action-option">
+        <el-button
+          type="primary"
+          :loading="busy && mode === 'generate'"
+          :disabled="
+            disabled ||
+            busy ||
+            submitting ||
+            generationPending ||
+            generationDisabled ||
+            !allowGenerate ||
+            !message.trim()
+          "
+          @click="send('generate')"
+          >生成并验证</el-button
+        >
+        <el-tooltip
+          content="生成候选草稿。确认后会进行真实验证，可能影响测试数据；候选不会自动采用或保存。"
+          placement="top"
+          :trigger="['hover', 'focus', 'click']"
+          :popper-style="{ maxWidth: 'min(360px, calc(100vw - 32px))', lineHeight: '1.6' }"
+        >
+          <button type="button" class="action-help" aria-label="生成并验证说明"><el-icon aria-hidden="true"><QuestionFilled /></el-icon></button>
+        </el-tooltip>
+      </div>
+      <div v-else-if="allowScenarioRegenerate" class="action-option">
+        <el-button
+          type="primary"
+          :loading="busy && mode === 'generate'"
+          :disabled="
+            disabled ||
+            busy ||
+            submitting ||
+            generationPending ||
+            generationDisabled ||
+            !message.trim()
+          "
+          @click="send('generate')"
+          >重新生成本场景</el-button
+        >
+        <el-tooltip
+          content="保留原目标，只重新生成当前场景。确认后会进行真实验证，可能影响测试数据。"
+          placement="top"
+          :trigger="['hover', 'focus', 'click']"
+          :popper-style="{ maxWidth: 'min(360px, calc(100vw - 32px))', lineHeight: '1.6' }"
+        >
+          <button type="button" class="action-help" aria-label="重新生成本场景说明"><el-icon aria-hidden="true"><QuestionFilled /></el-icon></button>
+        </el-tooltip>
+      </div>
+      <div class="action-option">
+        <el-button
+          :loading="busy && mode === 'repair'"
+          :disabled="
+            disabled ||
+            busy ||
+            submitting ||
+            generationPending ||
+            generationDisabled ||
+            !canRepair
+          "
+          @click="send('repair')"
+          >修复并验证</el-button
+        >
+        <el-tooltip
+          content="参考失败证据修补候选/草稿。修复建议可不填；确认后会进行真实验证，可能影响测试数据。"
+          placement="top"
+          :trigger="['hover', 'focus', 'click']"
+          :popper-style="{ maxWidth: 'min(360px, calc(100vw - 32px))', lineHeight: '1.6' }"
+        >
+          <button type="button" class="action-help" aria-label="修复并验证说明"><el-icon aria-hidden="true"><QuestionFilled /></el-icon></button>
+        </el-tooltip>
+      </div>
+    </div>
+    <p class="action-boundary">
+      确认后可能实际增删改测试数据；候选不会自动采用或保存为测试用例。
     </p>
   </section>
 </template>
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { QuestionFilled } from "@element-plus/icons-vue";
 import { candidateAssertionReview, shouldClearSubmittedMessage } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
@@ -228,6 +284,40 @@ defineExpose({ clearSubmittedMessage, focusInput });
   align-items: center;
   gap: 8px;
 }
+.actions,
+.action-option {
+  flex-wrap: wrap;
+}
+.action-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+.action-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  cursor: help;
+  font: inherit;
+}
+.action-help:hover,
+.action-help:focus-visible {
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+}
+.action-help:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 2px;
+}
 .panel-title {
   justify-content: space-between;
 }
@@ -264,11 +354,26 @@ defineExpose({ clearSubmittedMessage, focusInput });
   padding-left: 20px;
 }
 .candidate p,
-.hint {
+.action-choice,
+.action-boundary {
   margin: 0;
 }
-.hint {
+.action-boundary {
   color: var(--el-text-color-secondary);
   font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.action-choice {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.choice-line {
+  display: block;
 }
 </style>

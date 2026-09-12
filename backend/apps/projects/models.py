@@ -137,7 +137,6 @@ class Environment(models.Model):
             'headers': self.config.get('headers', {}),
             'variables': self.config.get('variables', {}),
             'timeout': self.config.get('timeout', 30),
-            'verify_ssl': self.config.get('verify_ssl', True)
         }
 
     def get_web_config(self):
@@ -200,7 +199,6 @@ class Environment(models.Model):
                 "headers": {"Authorization": "Bearer xxx"},
                 "variables": {"env": "test"},
                 "timeout": 30,
-                "verify_ssl": True
             }
         elif self.category == self.EnvironmentCategory.WEB:
             return {

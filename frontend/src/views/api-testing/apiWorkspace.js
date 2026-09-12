@@ -123,9 +123,25 @@ export const scenarioStatusMeta = (status) =>
     stale: { label: "已修改待重验", type: "warning" },
     failed: { label: "失败", type: "danger" },
     needs_review: { label: "需人工处理", type: "warning" },
+    cancelled: { label: "已停止", type: "info" },
   })[status] || { label: status || "待规划", type: "info" };
 
 export const rootGenerationStatusMeta = rootWorkspaceStatusMeta;
+
+export const currentScenarioStatus = (scenario) => {
+  if (scenario?.status === "debugging") return "running";
+  if (scenario?.status === "generating") return "generating";
+  const result = scenario?.debug_result;
+  if (scenario?.debug_revision === scenario?.revision && result) {
+    if (["queued", "running", "partial"].includes(result.status)) return "running";
+    if (result.error_type === "Cancelled" || result.status === "cancelled") return "cancelled";
+    if (result.success === true) return "passed";
+    if (result.success === false || ["failed", "error"].includes(result.status)) return "failed";
+  }
+  if (scenario?.status === "stale" || isGenerationStale(scenario?.generation, scenario?.revision))
+    return "stale";
+  return scenario?.generation?.status || scenario?.status;
+};
 
 export const normalizeCoverage = (value) => {
   const coverage = value && typeof value === "object" ? value : {};
@@ -151,14 +167,17 @@ export const currentScenarioState = (root) => {
   const current = scenarioIds
     ? scenarios.filter((scenario) => scenarioIds.has(String(scenario.id)))
     : scenarios;
-  const statusOf = (scenario) =>
-    scenario?.status === "stale"
-      ? "stale"
-      : scenario?.generation?.status || scenario?.status;
+  const statusOf = currentScenarioStatus;
   if (current.some((scenario) => statusOf(scenario) === "stale"))
     return { label: "有场景已修改待重验", type: "warning", stale: true };
   if (current.some((scenario) => ["running", "queued", "generating"].includes(statusOf(scenario))))
     return { label: "场景仍在执行", type: "warning", stale: false };
+  if (current.some((scenario) => scenario.debug_revision === scenario.revision && scenario.debug_result?.success != null)) {
+    if (current.every((scenario) => statusOf(scenario) === "passed"))
+      return { label: "全部场景已验证", type: "success", stale: false };
+    if (current.some((scenario) => statusOf(scenario) === "failed"))
+      return { label: "有场景验证失败", type: "danger", stale: false };
+  }
   return null;
 };
 
@@ -352,6 +371,30 @@ export const isGenerationStale = (generation, workspaceRevision, dirty) =>
 const hasGeneratedSteps = (draft) =>
   Array.isArray(draft?.teststeps) && draft.teststeps.length > 0;
 
+// Recovery is explicit editing, never a transfer of a historical pass result.
+export const recoverableScenarioDraft = (workspace, currentDraft) => {
+  if (hasGeneratedSteps(currentDraft)) return null;
+  const rounds = Array.isArray(workspace?.generation?.rounds)
+    ? workspace.generation.rounds : [];
+  const round = [...rounds].reverse().find((item) =>
+    item?.runnable !== false && hasGeneratedSteps(item?.draft) &&
+    (item?.status === "passed" || item?.runnable === true || item?.result?.step_datas?.length) &&
+    generationDraftSummary(item.draft).errors.length === 0,
+  );
+  if (!round) return null;
+  const restored = normalizeDraft(round.draft);
+  const config = normalizeDraft(currentDraft).config;
+  const overrides = { ...config };
+  if (!overrides.base_url?.trim()) delete overrides.base_url;
+  if (!overrides.name?.trim() || overrides.name === defaultDraft().config.name) delete overrides.name;
+  restored.config = {
+    ...restored.config, ...overrides,
+    variables: { ...restored.config.variables, ...config.variables },
+    headers: { ...restored.config.headers, ...config.headers },
+  };
+  return { draft: restored, attempt: round.attempt };
+};
+
 export const generationDraftSummary = (draft) => {
   const errors = [];
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
@@ -489,7 +532,6 @@ export const defaultDraft = () => ({
     name: "未命名 API 用例",
     base_url: "",
     variables: {},
-    verify: true,
   },
   teststeps: [],
 });
@@ -505,6 +547,8 @@ export const normalizeDraft = (value) => {
   const draft = clone(value);
   const fallback = defaultDraft();
   const config = { ...fallback.config, ...(draft.config || {}) };
+  delete config.verify;
+  delete config.verify_ssl;
   if (
     !config.variables ||
     typeof config.variables !== "object" ||
@@ -524,6 +568,8 @@ export const normalizeDraft = (value) => {
 export const normalizeStep = (value, index) => {
   const step = clone(value);
   const request = { method: "GET", url: "/", ...(step.request || {}) };
+  delete request.verify;
+  delete request.verify_ssl;
   request.method = String(request.method || "GET").toUpperCase();
   request.url = String(request.url || "/");
   for (const key of ["headers", "params"]) {
@@ -546,11 +592,11 @@ export const normalizeStep = (value, index) => {
         : {},
     validate: Array.isArray(step.validate) ? step.validate : [],
     phase: step.phase === "cleanup" ? "cleanup" : undefined,
-    requires: Array.isArray(step.requires)
-      ? step.requires.filter(
-          (item) => typeof item === "string" && item.trim(),
-        )
-      : [],
+    requires: step.phase === "cleanup"
+      ? (Array.isArray(step.requires)
+        ? step.requires.filter((item) => typeof item === "string" && item.trim())
+        : [])
+      : undefined,
   };
 };
 
@@ -641,7 +687,6 @@ export const candidateDiff = (draft, candidate) => {
     current.config.variables,
     proposed.config.variables,
   );
-  changed(changes, "TLS 校验", current.config.verify, proposed.config.verify);
   if (current.teststeps.length !== proposed.teststeps.length)
     changes.push(
       `步骤数量：${current.teststeps.length} → ${proposed.teststeps.length}`,

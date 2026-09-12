@@ -58,7 +58,7 @@ class UploadedFileCreateSerializer(serializers.ModelSerializer):
 # 环境序列化器
 ENVIRONMENT_CONFIG_KEYS = {
     Environment.EnvironmentCategory.API: {
-        'base_url', 'headers', 'variables', 'timeout', 'verify_ssl',
+        'base_url', 'headers', 'variables', 'timeout',
     },
     Environment.EnvironmentCategory.WEB: {
         'base_url', 'variables',

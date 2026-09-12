@@ -86,7 +86,7 @@ def confirm_generation(page, base_url='https://example.test'):
 
 def execute_debug(page):
     from playwright.sync_api import expect
-    launch = page.get_by_role('button', name='显式调试执行', exact=True)
+    launch = page.get_by_test_id('api-verify-current-scenario')
     expect(launch).to_be_enabled(timeout=15000)
     launch.click()
     with page.expect_response(lambda item: item.url.endswith('/debug/') and item.request.method == 'POST'):
@@ -281,6 +281,7 @@ def main():
         def fake_http(**kwargs):
             result = Response()
             assert kwargs['url'] == 'https://example.test/health', 'Unexpected request in fake test service'
+            assert kwargs['verify'] is False, 'API business requests must skip certificate validation'
             result.status_code = fixture.get('http_status', 200)
             result._content = json.dumps({'state': 'ok' if result.status_code == 200 else 'error'}).encode()
             result.url, result.headers, result.elapsed = kwargs['url'], {'Content-Type': 'application/json'}, timedelta(milliseconds=5)

@@ -20,15 +20,6 @@
           />
         </el-form-item>
       </div>
-      <el-form-item label="TLS 证书校验">
-        <el-switch
-          :model-value="config.verify"
-          :disabled="disabled"
-          active-text="校验"
-          inactive-text="跳过"
-          @update:model-value="patch({ verify: $event })"
-        />
-      </el-form-item>
       <el-form-item label="用例变量">
         <p class="hint">
           变量可在 URL、请求头、参数和请求体中以 <code>${name}</code>、<code

@@ -91,6 +91,30 @@ class APIWorkspaceTests(TestCase):
         values.update(kwargs)
         return APIWorkspace.objects.create(**values)
 
+    def test_default_draft_has_no_tls_override(self):
+        draft = default_api_workspace_draft()
+        self.assertNotIn('verify', draft['config'])
+        self.assertNotIn('verify_ssl', draft['config'])
+
+    def test_api_environment_has_no_tls_switch(self):
+        from projects.models import Environment
+        from projects.serializers import normalize_environment_config
+        environment = Environment(category='api', config={'base_url': 'https://example.test', 'verify_ssl': True})
+        self.assertNotIn('verify_ssl', environment.get_api_config())
+        self.assertNotIn('verify_ssl', environment.get_config_example())
+        self.assertNotIn('verify_ssl', normalize_environment_config('api', environment.config))
+
+    def test_normalize_draft_removes_legacy_tls_overrides(self):
+        draft = normalize_draft({
+            'version': 1,
+            'config': {'name': '旧草稿', 'base_url': '', 'variables': {}, 'verify': True, 'verify_ssl': True},
+            'teststeps': [{'request': {'method': 'GET', 'url': '/health', 'verify': True, 'verify_ssl': True}}],
+        })
+        self.assertNotIn('verify', draft['config'])
+        self.assertNotIn('verify_ssl', draft['config'])
+        self.assertNotIn('verify', draft['teststeps'][0]['request'])
+        self.assertNotIn('verify_ssl', draft['teststeps'][0]['request'])
+
     def endpoint(self, project=None):
         project = project or self.project
         spec = APISpecification.objects.create(

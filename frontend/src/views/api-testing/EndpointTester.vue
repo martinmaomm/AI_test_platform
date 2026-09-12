@@ -1561,7 +1561,7 @@ const handleSaveTitle = async () => {
  * 保存原始 config 段，保存时写回，防止 base_url / variables 等字段丢失。
  * Single Source of Truth：数据库 script_content.config
  */
-const scriptConfig = ref({ name: '', base_url: '', variables: {}, verify: true })
+const scriptConfig = ref({ name: '', base_url: '', variables: {} })
 
 // HttpRunner validate 内置比较器集合
 const KNOWN_COMPARATORS = new Set([
@@ -1771,7 +1771,6 @@ const populateFromTestCase = (tc) => {
     name:      parsedConfig.name      ?? tc.title ?? '',
     base_url:  parsedConfig.base_url  ?? '',
     variables: parsedConfig.variables ?? {},
-    verify:    parsedConfig.verify    ?? true,
   }
 
   const req = step?.request ?? {}
@@ -2559,7 +2558,6 @@ const previewScript = computed(() => {
     name:   cfg.name || stepName,
     ...(cfg.base_url                              && { base_url:  cfg.base_url }),
     ...(Object.keys(cfg.variables ?? {}).length   && { variables: cfg.variables }),
-    ...(cfg.verify === false                       && { verify:    false }),
   }
 
   const testcase = {

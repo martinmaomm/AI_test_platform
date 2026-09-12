@@ -362,13 +362,6 @@
               />
             </el-form-item>
 
-            <el-form-item label="Verify SSL">
-              <el-switch
-                v-model="localRequest.verify_ssl"
-                @change="handleChange"
-              />
-            </el-form-item>
-
             <el-form-item label="Timeout (ms)">
               <el-input-number
                 v-model="localRequest.timeout"
@@ -436,7 +429,6 @@ const localRequest = ref({
   data: [],
   raw: '',
   assertions: [],
-  verify_ssl: false,
   timeout: 5000
 })
 
@@ -521,7 +513,6 @@ const scriptContent = computed(() => {
   const config = {
     name: props.testCase?.title || 'API Test',
     base_url: localRequest.value.base_url,
-    verify: localRequest.value.verify_ssl,
     timeout: localRequest.value.timeout
   }
 
@@ -653,9 +644,6 @@ const syncScriptToUI = (scriptData, showMessage = false) => {
     if (scriptData.config) {
       if (scriptData.config.base_url) {
         localRequest.value.base_url = scriptData.config.base_url
-      }
-      if (scriptData.config.verify !== undefined) {
-        localRequest.value.verify_ssl = scriptData.config.verify
       }
       if (scriptData.config.timeout) {
         localRequest.value.timeout = scriptData.config.timeout
@@ -822,7 +810,6 @@ const initializeRequest = async () => {
       })),
       raw: JSON.stringify(bodyData, null, 2),
       assertions: [],
-      verify_ssl: false,
       timeout: 5000
     }
     
@@ -892,7 +879,6 @@ const initializeRequest = async () => {
           valueType: 'string'
         }
       }),
-      verify_ssl: config.verify === undefined ? false : config.verify,
       timeout: config.timeout || 5000
     }
 
@@ -978,7 +964,6 @@ const handleChange = (source = 'unknown') => {
   const config = {
     name: props.testCase.title,
     base_url: localRequest.value.base_url,
-    verify: localRequest.value.verify_ssl,
     timeout: localRequest.value.timeout
   }
 

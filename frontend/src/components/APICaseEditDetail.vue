@@ -174,9 +174,6 @@
                       <el-form-item label="基础URL">
                         <el-input v-model="visualForm.config.base_url" placeholder="例如: http://api.example.com" />
                       </el-form-item>
-                      <el-form-item label="SSL验证">
-                        <el-switch v-model="visualForm.config.verify" />
-                      </el-form-item>
                     </el-form>
                   </el-card>
 
@@ -623,7 +620,6 @@ const visualForm = ref({
   config: {
     name: '',
     base_url: '',
-    verify: false,
     variables: {}
   },
   teststeps: []
@@ -1030,7 +1026,6 @@ const parseScriptToVisual = () => {
         config: {
           name: editForm.value.title || '测试用例',
           base_url: '',
-          verify: false,
           variables: {}
         },
         teststeps: []
@@ -1045,7 +1040,6 @@ const parseScriptToVisual = () => {
     visualForm.value.config = {
       name: parsed.config?.name || editForm.value.title || '测试用例',
       base_url: parsed.config?.base_url || '',
-      verify: parsed.config?.verify !== undefined ? parsed.config.verify : false,
       variables: parsed.config?.variables || {}
     }
     
@@ -1142,7 +1136,6 @@ const syncAllVisualToScript = () => {
       config: {
         name: visualForm.value.config.name,
         base_url: visualForm.value.config.base_url,
-        verify: visualForm.value.config.verify,
         variables: visualForm.value.config.variables
       },
       teststeps: visualForm.value.teststeps.map(step => {

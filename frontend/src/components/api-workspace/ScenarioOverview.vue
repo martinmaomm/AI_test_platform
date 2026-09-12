@@ -99,6 +99,7 @@ import { computed } from "vue";
 import {
   normalizeCoverage,
   currentScenarioState,
+  currentScenarioStatus,
   rootGenerationStatusMeta,
   scenarioStatusMeta,
 } from "@/views/api-testing/apiWorkspace";
@@ -141,9 +142,7 @@ const progressLabel = computed(() => {
 });
 const scenarioStatus = (scenario) =>
   scenarioStatusMeta(
-    scenario?.status === "stale"
-      ? "stale"
-      : scenario?.generation?.status || scenario?.status,
+    currentScenarioStatus(scenario),
   );
 const endpointText = (scenario) => {
   const endpoints = new Map(

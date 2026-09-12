@@ -274,12 +274,6 @@
             <el-form-item label="超时（秒）">
               <el-input-number v-model="executionOptions.timeout" :min="10" :max="300" :step="10" style="width:160px" />
             </el-form-item>
-            <el-form-item label="SSL 验证">
-              <el-radio-group v-model="executionOptions.verify_ssl">
-                <el-radio :value="true">验证</el-radio>
-                <el-radio :value="false">跳过</el-radio>
-              </el-radio-group>
-            </el-form-item>
           </el-form>
         </div>
       </div>
@@ -904,7 +898,7 @@ const pendingRunTestCase = ref(null)
 const environments = ref([])
 const selectedEnvironment = ref(null)
 const loadingEnvironments = ref(false)
-const executionOptions = ref({ timeout: 30, verify_ssl: true })
+const executionOptions = ref({ timeout: 30 })
 const executingTestCases = ref(new Set())
 const showResultDialog = ref(false)
 const selectedTestResult = ref(null)

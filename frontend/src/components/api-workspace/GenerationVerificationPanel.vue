@@ -13,7 +13,7 @@
     </template>
     <el-alert
       v-if="stale"
-      title="当前草稿或上下文已变化；以下验证证据仅对应旧版本，不能据此判定当前草稿通过。"
+      :title="currentDebugPassed ? '当前版本已重新验证通过；下面保留的是生成阶段的历史记录。' : '以下是生成阶段的历史证据。当前草稿可使用下方验证按钮重新运行，无需重新生成。'"
       type="warning"
       :closable="false"
       show-icon
@@ -170,6 +170,7 @@ const props = defineProps({
   dirty: Boolean,
   endpointScope: String,
   currentDebugResult: { type: Object, default: null },
+  currentDebugRevision: { type: Number, default: null },
   failureActions: {
     type: Object,
     default: () => ({
@@ -188,6 +189,10 @@ const rounds = computed(() =>
 );
 const stale = computed(() =>
   isGenerationStale(props.generation, props.workspaceRevision, props.dirty),
+);
+const currentDebugPassed = computed(() =>
+  !props.dirty && props.currentDebugRevision === props.workspaceRevision &&
+  props.currentDebugResult?.success === true,
 );
 const status = computed(() =>
   stale.value
@@ -269,7 +274,9 @@ const displayValue = (value) => {
 const timeLabel = (value, label) =>
   value ? `${label}：${new Date(value).toLocaleString()} ` : "";
 const finalMessage = computed(() => {
-  if (stale.value) return "验证结果已过期，当前版本需要重新生成并验证。";
+  if (stale.value) return currentDebugPassed.value
+    ? "当前草稿已重新验证通过。最新执行日志请查看调试结果或运行历史。"
+    : "生成历史对应旧版本；请使用下方验证按钮运行当前草稿，或恢复保留的生成步骤。";
   const messages = {
     passed: hasCandidateDraft.value
       ? "候选已验证通过，但尚未采用；当前可视化草稿和测试用例都未被自动覆盖。"

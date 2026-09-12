@@ -223,9 +223,6 @@
             <el-input v-model="environmentForm.config.headers" type="textarea" :rows="3"
               placeholder="JSON格式的请求头，如：{'Authorization': 'Bearer token'}" />
           </el-form-item>
-          <el-form-item label="SSL验证" prop="config.verify_ssl">
-            <el-switch v-model="environmentForm.config.verify_ssl" active-text="验证" inactive-text="不验证" />
-          </el-form-item>
         </div>
 
         <!-- WebUI 配置 -->
@@ -386,8 +383,7 @@ const getDefaultEnvironmentConfig = (category = environmentCategory.value || 'we
       base_url: '',
       headers: '{}',
       variables: '{}',
-      timeout: 30,
-      verify_ssl: true
+      timeout: 30
     }
   } else if (category === 'app') {
     base.config = {
@@ -639,8 +635,7 @@ const getEnvironmentConfigPayload = (category, config = {}) => {
       base_url: String(config.base_url || '').trim(),
       headers: parseJsonField(config.headers, {}),
       variables,
-      timeout: Number(config.timeout) || 30,
-      verify_ssl: config.verify_ssl !== false
+      timeout: Number(config.timeout) || 30
     }
   }
 
@@ -668,8 +663,7 @@ const getEnvironmentFormConfig = (category, config = {}) => {
       base_url: config.base_url || '',
       headers: stringifyJsonField(config.headers),
       variables: stringifyJsonField(config.variables),
-      timeout: config.timeout || 30,
-      verify_ssl: config.verify_ssl !== false
+      timeout: config.timeout || 30
     }
   }
 

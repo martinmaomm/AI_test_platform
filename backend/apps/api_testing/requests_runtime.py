@@ -137,6 +137,10 @@ def normalize_case(value: Any) -> dict[str, Any]:
     for key in unsupported:
         if key in config:
             raise UnsupportedCaseFeature(f"requests 运行器不支持 config.{key}")
+    # API business requests always skip server certificate validation.  Remove
+    # legacy per-case switches rather than persisting a misleading override.
+    config.pop("verify", None)
+    config.pop("verify_ssl", None)
     variables = config.get("variables", {})
     if not isinstance(variables, Mapping):
         raise CaseContractError("config.variables 必须是 JSON 对象")
@@ -146,8 +150,6 @@ def normalize_case(value: Any) -> dict[str, Any]:
     headers = config.get("headers", {})
     if not isinstance(headers, Mapping):
         raise CaseContractError("config.headers 必须是 JSON 对象")
-    if "verify" in config and not isinstance(config["verify"], bool):
-        raise CaseContractError("config.verify 必须是布尔值")
     if "base_url" in config and config["base_url"] is not None and not isinstance(config["base_url"], str):
         raise CaseContractError("config.base_url 必须是字符串")
 
@@ -184,7 +186,7 @@ def normalize_case(value: Any) -> dict[str, Any]:
             raise CaseContractError(f"{field}.requires 仅允许 cleanup 步骤使用")
         supported_request_fields = {
             "method", "url", "headers", "params", "json", "data", "raw",
-            "timeout", "allow_redirects", "cookies", "verify",
+            "timeout", "allow_redirects", "cookies", "verify", "verify_ssl",
         }
         unknown_request_fields = sorted(set(request).difference(supported_request_fields))
         if unknown_request_fields:
@@ -205,9 +207,10 @@ def normalize_case(value: Any) -> dict[str, Any]:
                 raise CaseContractError(f"{field}.request.{mapping_key} 必须是 JSON 对象")
         if "cookies" in request and request["cookies"] is not None and not isinstance(request["cookies"], Mapping):
             raise CaseContractError(f"{field}.request.cookies 必须是 JSON 对象")
-        for boolean_key in ("allow_redirects", "verify"):
-            if boolean_key in request and not isinstance(request[boolean_key], bool):
-                raise CaseContractError(f"{field}.request.{boolean_key} 必须是布尔值")
+        if "allow_redirects" in request and not isinstance(request["allow_redirects"], bool):
+            raise CaseContractError(f"{field}.request.allow_redirects 必须是布尔值")
+        request.pop("verify", None)
+        request.pop("verify_ssl", None)
         if "timeout" in request and request["timeout"] is not None:
             _positive_timeout(request["timeout"], f"{field}.request.timeout", MAX_REQUEST_TIMEOUT_SECONDS)
         body_keys = [key for key in ("json", "data", "raw") if key in request and request[key] is not None]
@@ -267,7 +270,6 @@ def normalize_case(value: Any) -> dict[str, Any]:
     result["config"]["variables"] = deepcopy(dict(variables))
     result["config"]["headers"] = deepcopy(dict(headers))
     result["config"].setdefault("name", "")
-    result["config"].setdefault("verify", True)
     result["teststeps"] = normalised_steps
     return result
 
@@ -477,11 +479,6 @@ def _runtime_options(case: Mapping[str, Any], options: Mapping[str, Any] | None)
     connect = _positive_timeout(options.get("connect_timeout", default_timeout), "connect_timeout", MAX_REQUEST_TIMEOUT_SECONDS)
     total_default = min(MAX_TOTAL_TIMEOUT_SECONDS, max(read, read * max(1, len(case["teststeps"]))))
     total = _positive_timeout(options.get("total_timeout", config.get("total_timeout", total_default)), "total_timeout", MAX_TOTAL_TIMEOUT_SECONDS)
-    # Environment.get_api_config() exposes verify_ssl; explicit platform
-    # ``verify`` remains the newer, higher-priority spelling.
-    verify = options.get("verify", options.get("verify_ssl", config.get("verify", True)))
-    if not isinstance(verify, bool):
-        raise CaseContractError("verify 必须是布尔值")
     headers = config.get("headers", {})
     option_headers = options.get("headers", {})
     if not isinstance(option_headers, Mapping):
@@ -495,7 +492,6 @@ def _runtime_options(case: Mapping[str, Any], options: Mapping[str, Any] | None)
         "connect_timeout": connect,
         "read_timeout": read,
         "total_timeout": total,
-        "verify": verify,
         "headers": _merge_headers(headers, option_headers),
         "allowed_origin": allowed_origin,
     }
@@ -1196,17 +1192,16 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None,
                     raw_request_timeout, f"步骤 {index}.request.timeout", MAX_REQUEST_TIMEOUT_SECONDS,
                 )
                 connect_timeout = read_timeout = request_timeout
-            request_verify = request.pop("verify", runtime["verify"])
             request_redirects = request.pop("allow_redirects", True)
             request_cookies = request.pop("cookies", None)
-            if not isinstance(request_verify, bool) or not isinstance(request_redirects, bool):
-                raise CaseContractError(f"步骤 {index} 的 verify/allow_redirects 必须是布尔值")
+            if not isinstance(request_redirects, bool):
+                raise CaseContractError(f"步骤 {index} 的 allow_redirects 必须是布尔值")
             if request_cookies is not None and not isinstance(request_cookies, Mapping):
                 raise CaseContractError(f"步骤 {index} 的 cookies 必须是 JSON 对象")
             body_keys = [key for key in ("json", "data", "raw") if key in request and request[key] is not None]
             request_kwargs: dict[str, Any] = {
                 "method": request.pop("method"), "url": url, "headers": headers,
-                "params": params, "verify": request_verify, "allow_redirects": request_redirects,
+                "params": params, "verify": False, "allow_redirects": request_redirects,
                 "timeout": (min(connect_timeout, remaining / 2), min(read_timeout, remaining / 2)),
             }
             if request_cookies is not None:

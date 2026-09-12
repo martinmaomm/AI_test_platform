@@ -335,6 +335,28 @@ class WorkspaceReliabilityTests(TestCase):
         self.assertEqual(accepted.status_code, 200, accepted.data)
         self.assertIsNone(accepted.data['data']['candidate'])
 
+    def test_removing_tls_fields_does_not_bypass_assertion_confirmation(self):
+        endpoint = self.endpoint('GET', '/review-tls')
+        candidate = self.draft(endpoint, status=201)
+        candidate['config']['verify'] = True
+        candidate_hash = draft_hash(candidate)
+        workspace = self.workspace(candidate={
+            'draft': candidate, 'draft_hash': candidate_hash, 'source_revision': 0,
+            'review': {'requires_confirmation': True, 'changes': ['status_code 200 -> 201']},
+        })
+        payload = {'revision': 0, 'draft': normalize_draft(candidate)}
+        missing = APIWorkspaceDetailView.as_view()(
+            self.request('patch', payload), project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(missing.status_code, 409, missing.data)
+        accepted = APIWorkspaceDetailView.as_view()(
+            self.request('patch', {**payload, 'assertion_review_ack': candidate_hash}),
+            project_id=self.project.id, workspace_id=workspace.id,
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.data)
+        self.assertNotIn('verify', accepted.data['data']['draft']['config'])
+        self.assertIsNone(accepted.data['data']['debug_revision'])
+
     def test_unsafe_replay_stops_automatic_repair(self):
         status, summary, disposition = classify_result({
             'success': False, 'error_type': 'ExtractionFailure',

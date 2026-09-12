@@ -357,12 +357,27 @@
             :dirty="dirty"
             :endpoint-scope="endpointScope"
             :current-debug-result="workspace.debug_result"
+            :current-debug-revision="workspace.debug_revision"
             :failure-actions="failureActions"
             @view-failure="viewFailureEvidence"
             @repair="focusRepairConversation"
             @manual-edit="openManualEditor"
           />
+          <section class="scenario-validation" data-testid="api-scenario-validation">
+            <div class="debug-actions">
+              <el-tag :type="currentValidationStatus.type">{{ currentValidationStatus.label }}</el-tag>
+              <el-button
+                type="warning"
+                data-testid="api-verify-current-scenario"
+                :disabled="Boolean(verificationDisabledReason)"
+                :title="verificationDisabledReason || verificationHint"
+                @click="openDebug"
+              >{{ verificationButtonLabel }}</el-button>
+            </div>
+            <p class="hint">{{ verificationDisabledReason || verificationHint }}</p>
+          </section>
           <WorkspaceConfigEditor
+            v-if="draft.teststeps.length"
             :model-value="draft.config"
             :disabled="interactionLocked || conflict"
             @update:model-value="updateConfig"
@@ -418,13 +433,6 @@
           />
           <div class="debug-actions">
             <el-button
-              type="warning"
-              :disabled="
-                interactionLocked || conflict || !draft.teststeps.length
-              "
-              @click="openDebug"
-              >显式调试执行</el-button
-            ><el-button
               type="success"
               :disabled="
                 interactionLocked ||
@@ -674,6 +682,9 @@ import {
   clone,
   cleanupVariablesBeforeStep,
   completedDocumentApiSpecs,
+  currentScenarioStatus,
+  scenarioStatusMeta,
+  recoverableScenarioDraft,
   defaultStep,
   errorMessage,
   failureActionState,
@@ -936,6 +947,35 @@ const generationStale = computed(() =>
     dirty.value,
   ),
 );
+const currentValidationStatus = computed(() =>
+  scenarioStatusMeta(dirty.value ? "stale" : currentScenarioStatus(workspace.value)),
+);
+const recoverableDraft = computed(() => recoverableScenarioDraft(workspace.value, draft.value));
+const canAdoptForValidation = computed(() =>
+  Boolean(workspace.value?.candidate?.draft?.teststeps?.length) &&
+  !generationStale.value && workspace.value.candidate.source_revision === workspace.value.revision,
+);
+const verificationButtonLabel = computed(() =>
+  draft.value.teststeps.length ? "验证当前场景" :
+  canAdoptForValidation.value ? "采用候选并验证" : "恢复草稿并验证",
+);
+const verificationHint = computed(() =>
+  draft.value.teststeps.length
+    ? "运行当前草稿，不调用 AI；未保存的修改会先保存，再由你确认执行。"
+    : canAdoptForValidation.value
+      ? "已生成的步骤仍是候选，尚未进入当前草稿。确认采用后即可验证和编辑。"
+      : recoverableDraft.value
+        ? "当前草稿没有步骤，但生成历史仍保留可执行脚本。可确认恢复后重新验证，不需要重新生成。"
+        : "当前草稿没有步骤，请先生成候选或添加测试步骤。",
+);
+const verificationDisabledReason = computed(() => {
+  if (conflict.value) return "版本冲突，请先重新加载服务器版本并处理本地修改。";
+  if (rootBusy.value) return "当前批次仍在运行，请等待结束或先停止整批任务，再验证本场景。";
+  if (interactionLocked.value) return "当前正在处理操作，请稍后再验证。";
+  if (!draft.value.teststeps.length && !canAdoptForValidation.value && !recoverableDraft.value)
+    return verificationHint.value;
+  return "";
+});
 const canRepair = computed(
   () =>
     canRepairWorkspace({
@@ -2756,9 +2796,34 @@ const loadEndpointsForSpec = async ({
   }
 };
 const openDebug = async () => {
-  if (!draft.value.teststeps.length) {
-    ElMessage.warning("请先添加至少一个步骤后再调试。");
+  if (verificationDisabledReason.value) {
+    ElMessage.warning(verificationDisabledReason.value);
     return;
+  }
+  if (!draft.value.teststeps.length) {
+    if (canAdoptForValidation.value) {
+      if (!(await adoptCandidate())) return;
+    } else if (recoverableDraft.value) {
+      const target = workspace.value;
+      const recovered = recoverableDraft.value;
+      const original = JSON.stringify(draft.value);
+      const project = projectId.value;
+      const revision = target.revision;
+      try {
+        await ElMessageBox.confirm(
+          `将从生成记录第 ${recovered.attempt || "—"} 轮恢复 ${recovered.draft.teststeps.length} 个步骤，并保留当前已填写的配置。旧通过状态不会沿用；下一步还需确认真实请求。此操作不会保存为测试用例。`,
+          "确认恢复生成步骤",
+          { confirmButtonText: "恢复草稿", cancelButtonText: "取消", type: "warning" },
+        );
+      } catch {
+        return;
+      }
+      if (project !== projectId.value || !sameWorkspaceId(target.id, workspace.value?.id) ||
+          revision !== workspace.value?.revision || original !== JSON.stringify(draft.value) ||
+          interactionLocked.value || conflict.value) return;
+      draft.value = recovered.draft;
+      markDirty();
+    }
   }
   if (dirty.value && !(await saveDraft())) return;
   debugForm.value = { environment_id: null, variables: {} };

@@ -32,6 +32,8 @@ import {
   normalizeDraft,
   normalizeCoverage,
   currentScenarioState,
+  currentScenarioStatus,
+  recoverableScenarioDraft,
   activeScenario,
   mergeRootWorkspaceMetadata,
   rootWorkspaceBusy,
@@ -49,6 +51,47 @@ import {
   workspaceSourceType,
   workspaceExecutionHistory,
 } from "../src/views/api-testing/apiWorkspace.js";
+
+test("current-revision debug evidence takes precedence over stale generation history", () => {
+  const scenario = { id: 2, revision: 3, status: "ready", generation: { status: "stale", source_revision: 0 } };
+  assert.equal(currentScenarioStatus(scenario), "stale");
+  const passed = { ...scenario, debug_revision: 3, debug_result: { success: true } };
+  assert.equal(currentScenarioStatus(passed), "passed");
+  assert.equal(currentScenarioState({ scenarios: [passed] }).type, "success");
+  const failed = { ...passed, debug_result: { success: false, status: "failed" } };
+  assert.equal(currentScenarioStatus(failed), "failed");
+  assert.equal(currentScenarioState({ scenarios: [failed] }).type, "danger");
+  assert.equal(currentScenarioStatus({ ...passed, debug_revision: 2 }), "stale");
+  assert.equal(currentScenarioStatus({ ...passed, status: "debugging", debug_result: { success: false, status: "partial" } }), "running");
+  assert.equal(currentScenarioStatus({ ...passed, debug_result: { success: false, error_type: "Cancelled" } }), "cancelled");
+});
+
+test("empty editor recovery preserves generated steps and user config but never transfers verification", () => {
+  const generated = {
+    config: { name: "登录", base_url: "https://example.test", variables: { from_ai: 1, shared: "old" }, headers: { "X-Test": "kept" }, verify: true },
+    teststeps: [{ request: { method: "GET", url: "/health", verify_ssl: true }, validate: [{ eq: ["status_code", 200] }] }],
+  };
+  const workspace = { generation: { rounds: [
+    { attempt: 1, status: "passed", draft: generated, result: { success: true } },
+    { attempt: 2, status: "needs_review", runnable: false, draft: { ...generated, teststeps: [{ request: { url: "/bad" } }] } },
+  ] } };
+  const draft = normalizeDraft({ config: { variables: { shared: "new" }, verify: false } });
+  const recovery = recoverableScenarioDraft(workspace, draft);
+  assert.equal(recovery.attempt, 1);
+  assert.equal(recovery.draft.config.base_url, "https://example.test");
+  assert.equal(recovery.draft.config.name, "登录");
+  assert.deepEqual(recovery.draft.config.variables, { from_ai: 1, shared: "new" });
+  assert.deepEqual(recovery.draft.config.headers, { "X-Test": "kept" });
+  assert.equal(recovery.draft.teststeps[0].request.url, "/health");
+  assert.ok(!("requires" in JSON.parse(JSON.stringify(recovery.draft)).teststeps[0]), "ordinary steps must not carry cleanup-only fields");
+  assert.ok(!("verify" in recovery.draft.config));
+  assert.ok(!("verify_ssl" in recovery.draft.teststeps[0].request));
+  assert.ok(!("result" in recovery));
+  assert.equal(draft.teststeps.length, 0);
+  assert.equal(generated.config.verify, true, "reading recovery must not mutate historical evidence");
+  assert.equal(recoverableScenarioDraft(workspace, normalizeDraft(generated)), null);
+  assert.equal(recoverableScenarioDraft({ generation: { rounds: [{ draft: generated, runnable: false }] } }, draft), null);
+});
 
 test("visual editor keeps exact filters and exposes absence assertions", async () => {
   const selector = 'body.data[?(@.name == ${unique_name})]';

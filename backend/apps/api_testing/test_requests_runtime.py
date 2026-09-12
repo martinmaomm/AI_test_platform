@@ -310,22 +310,27 @@ def test_runner_keeps_json_form_and_raw_distinct():
     assert session.requests[2]["timeout"] == (1.0, 2.0)
 
 
-def test_runtime_supports_editor_timeout_redirect_cookies_and_verify_fields():
+def test_runtime_removes_legacy_tls_fields_and_keeps_editor_request_fields():
     session = FakeSession([FakeResponse()])
-    case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [{
-        "request": {"url": "/health", "timeout": 5, "allow_redirects": False, "cookies": {"sid": "test"}, "verify": False},
+    case = {"config": {"base_url": "https://api.example.test", "verify": True, "verify_ssl": True}, "teststeps": [{
+        "request": {"url": "/health", "timeout": 5, "allow_redirects": False, "cookies": {"sid": "test"}, "verify": True, "verify_ssl": True},
     }]}
     with patch("api_testing.requests_runtime.requests.Session", return_value=session):
-        result = run_case("editor-fields", json.dumps(case), options={"total_timeout": 20})
+        result = run_case("editor-fields", json.dumps(case), options={"total_timeout": 20, "verify": True, "verify_ssl": True})
     assert result["status"] == "passed"
     request = session.requests[0]
     assert request["timeout"] == (5.0, 5.0)
     assert request["allow_redirects"] is False
     assert request["cookies"] == {"sid": "test"}
     assert request["verify"] is False
+    normalized = normalize_case(case)
+    assert "verify" not in normalized["config"]
+    assert "verify_ssl" not in normalized["config"]
+    assert "verify" not in normalized["teststeps"][0]["request"]
+    assert "verify_ssl" not in normalized["teststeps"][0]["request"]
 
 
-def test_environment_verify_ssl_and_base_url_api_prefix_are_honoured():
+def test_legacy_environment_tls_options_cannot_reenable_certificate_validation():
     session = FakeSession([FakeResponse(), FakeResponse()])
     case = {"config": {"base_url": "https://api.example.test/api"}, "teststeps": [
         {"request": {"url": "/users"}},
@@ -337,7 +342,7 @@ def test_environment_verify_ssl_and_base_url_api_prefix_are_honoured():
     assert session.requests[0]["url"] == "https://api.example.test/api/users"
     assert session.requests[0]["verify"] is False
     assert session.requests[1]["url"] == "https://override.example.test/health"
-    assert session.requests[1]["verify"] is True
+    assert session.requests[1]["verify"] is False
 
 
 def test_normalize_rejects_unknown_request_fields_before_execution():
@@ -574,6 +579,22 @@ def test_export_is_standalone_python_source_with_the_same_runtime_core():
     assert exported_result["stat"] == original_result["stat"]
     assert exported_result["step_datas"] == original_result["step_datas"]
     assert exported_session.requests[0]["json"] == {"id": 7, "note": "O'Reilly\nquoted"}
+
+
+def test_export_uses_the_same_fixed_tls_policy_without_case_tls_fields():
+    case = {"config": {"base_url": "https://api.example.test", "verify": True}, "teststeps": [{
+        "request": {"url": "/health", "verify_ssl": True},
+    }]}
+    source = export_python(case)
+    namespace = {"__name__": "exported_tls_policy"}
+    exec(compile(source, "exported_tls_policy.py", "exec"), namespace)
+    assert "verify" not in namespace["CASE"]["config"]
+    assert "verify_ssl" not in namespace["CASE"]["teststeps"][0]["request"]
+    session = FakeSession([FakeResponse()])
+    with patch.object(namespace["requests"], "Session", return_value=session):
+        result = namespace["run_case"]("exported-tls", namespace["CASE"], options={"verify": True, "verify_ssl": True})
+    assert result["success"] is True
+    assert session.requests[0]["verify"] is False
 
 
 def test_platform_runner_uses_controlled_json_worker_with_hard_deadline():

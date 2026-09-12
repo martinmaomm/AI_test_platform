@@ -231,12 +231,6 @@
                 style="width: 200px" />
             </el-form-item>
 
-            <el-form-item label="SSL验证">
-              <el-radio-group v-model="executionOptions.verify_ssl">
-                <el-radio :label="true">验证SSL</el-radio>
-                <el-radio :label="false">跳过SSL验证</el-radio>
-              </el-radio-group>
-            </el-form-item>
           </el-form>
         </div>
       </div>
@@ -305,7 +299,6 @@ const selectedEnvironment = ref(null)
 const loadingEnvironments = ref(false)
 const executionOptions = ref({
   timeout: 30,
-  verify_ssl: true,
   generate_report: true
 })
 

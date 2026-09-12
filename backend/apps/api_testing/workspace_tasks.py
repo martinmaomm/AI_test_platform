@@ -876,7 +876,7 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
                          scope_catalog: list[dict[str, Any]] | None = None) -> list[Any]:
     rules = [
         '你是 API 测试草稿助手。只输出一个完整 JSON 对象；不要 Markdown、解释或 Python。',
-        '必须完整输出 {"version":1,"config":{"name":"","base_url":"","variables":{},"verify":true},"teststeps":[]}，不可省略字段。',
+        '必须完整输出 {"version":1,"config":{"name":"","base_url":"","variables":{}},"teststeps":[]}，不可省略字段。',
         '每步格式为 {"name":"","endpoint_id":1,"request":{"method":"GET","url":"/users/${id}","headers":{},"params":{},"json":{}},"extract":{"token":"body.data.token"},"validate":[{"eq":["status_code",200]}]}。',
         'validate 唯一输出格式是单键字典组成的数组：每项为 {"比较器":["响应选择器",预期值]}，例如 [{"eq":["status_code",200]}]。禁止输出 ["eq","status_code",200] 这类位置数组、check/assert/expect 对象或 validators 别名；示例仅说明格式，不是接口的预期值依据。',
         '仅支持这些比较器：eq, ne, contains, not_contains, gt, ge, lt, le, type, length。eq/ne 为相等/不等；gt/ge/lt/le 为大小比较；length 为长度等于预期值，不是搜索或筛选。type 的预期值只能是 null/none、bool/boolean、int/integer、float、number、str/string、list/array、dict/object 这些类型名字符串。',

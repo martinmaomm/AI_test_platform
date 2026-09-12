@@ -429,7 +429,7 @@ def default_api_workspace_draft():
     """Return a fresh, editor-compatible API case contract."""
     return {
         'version': 1,
-        'config': {'name': '', 'base_url': '', 'variables': {}, 'verify': True},
+        'config': {'name': '', 'base_url': '', 'variables': {}},
         'teststeps': [],
     }
 

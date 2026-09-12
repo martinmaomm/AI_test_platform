@@ -507,7 +507,7 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
     review_adoption = bool(
         draft is not _UNSET and candidate_draft is not None
         and review.get('requires_confirmation') is True
-        and proposed_draft == candidate_draft
+        and proposed_draft == normalize_draft(candidate_draft)
     )
     if review_adoption and assertion_review_ack != candidate.get('draft_hash'):
         raise WorkspaceConflict('候选修改了受保护断言，assertion_review_ack 缺失或已过期。')

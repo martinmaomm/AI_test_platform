@@ -128,6 +128,12 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
             with self.subTest(path=path):
                 self.assertIn(path, rules)
                 self.assertEqual(_select(path, context), 17)
+        for requirement in (
+            '显式数字索引', '即使之后用于 POST 等写请求也不要求索引所在列表只有一条',
+            '索引越界或字段缺失仍失败', '列表顺序可能变化',
+            '针对指定业务对象优先使用唯一条件筛选',
+        ):
+            self.assertIn(requirement, rules)
         self.assertIn('支持有界等值筛选', rules)
         self.assertIn('body.data.items[?(@.name == ${unique_name})][0].id', rules)
         self.assertEqual(_select(
@@ -146,6 +152,8 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
         rules = self.messages()[0].content
         for requirement in (
             '零条或多条均失败', '不会退回取第一条',
+            '不能用筛选后 [0] 掩盖多匹配',
+            '直接提取未指定索引的整个列表用于后续写请求仍必须只有一条记录',
             '删除后的同一筛选用 length=0', '不要在不存在验证步骤继续提取已删除的 ID',
             '不能因当前页没有匹配就宣称不存在', '无需在 config.variables 中声明',
             '禁止把这两个系统变量声明为空值、占位符或自引用',
@@ -184,8 +192,8 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
                     '用本轮创建时使用的唯一标识定位记录',
                     '查询参数和响应路径也必须有证据',
                     '在查询步骤用 eq 断言核对所取记录的唯一标识',
-                    '使用 [0] 前还应断言结果唯一',
-                    '不能直接取未限定列表首行操作旧数据',
+                    '不能直接把未指定索引的整个列表用于操作旧数据',
+                    '显式索引是按位置取值，不要求额外断言列表唯一',
                     '不能用 contains 对象数组代替唯一标识核对',
                     '普通 HTTP 状态或业务状态断言不能证明操作对象属于本轮记录',
                     'summary 中说明缺少的查询或精确选择能力',

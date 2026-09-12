@@ -220,9 +220,9 @@ def test_filter_extraction_requires_one_match_then_allows_update_and_delete_with
     assert session.requests[1]["params"] == {"name": role_name}
 
 
-def test_unfiltered_or_duplicate_list_extractions_stop_before_a_later_write_and_preserve_response_evidence():
+def test_unselected_or_duplicate_list_extractions_stop_before_a_later_write_and_preserve_response_evidence():
     base_case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
-        {"name": "lookup", "request": {"url": "/roles"}, "extract": {"role_id": "body.data.list[0].id"}},
+        {"name": "lookup", "request": {"url": "/roles"}, "extract": {"role_id": "body.data.list"}},
         {"name": "must-not-write", "request": {"method": "POST", "url": "/roles/${role_id}"}},
     ]}
     duplicate_case = {"config": {"base_url": "https://api.example.test", "variables": {"role_name": "same"}}, "teststeps": [
@@ -245,6 +245,75 @@ def test_unfiltered_or_duplicate_list_extractions_stop_before_a_later_write_and_
         assert "唯一匹配" in first["error"]
 
 
+def _indexed_allocation_case():
+    return {"config": {"base_url": "https://api.example.test"}, "teststeps": [
+        {"name": "查询资源", "request": {"url": "/resources"},
+         "extract": {"first_id": "body.data[0].id", "second_id": "body.data[1].id"},
+         "validate": [{"type": ["body.data", "list"]}, {"length_gt": ["body.data", 0]}]},
+        {"name": "关联选中的资源", "request": {"method": "POST", "url": "/roles/99/resources",
+         "params": {"resourceIds": ["${first_id}", "${second_id}"]},
+         "headers": {"X-Selected-ID": "${second_id}"}}, "validate": [{"eq": ["status_code", 200]}]},
+    ]}
+
+
+def test_explicit_indexes_feed_later_post_and_export_without_requiring_the_full_list_to_be_unique():
+    case = _indexed_allocation_case()
+    body = {"data": [{"id": index} for index in range(1, 37)]}
+    namespace = {"__name__": "exported_indexed_allocation"}
+    exec(compile(export_python(case), "exported_indexed_allocation.py", "exec"), namespace)
+    results = []
+    for execute in (run_case, namespace["run_case"]):
+        session = FakeSession([FakeResponse(body=body), FakeResponse(body={"code": 200})])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = execute("indexed-allocation", case)
+        assert result["status"] == "passed", result
+        assert len(session.requests) == 2
+        assert session.requests[1]["params"] == {"resourceIds": [1, 2]}
+        assert session.requests[1]["headers"]["X-Selected-ID"] == "2"
+        assert result["step_datas"][0]["export_vars"] == {"first_id": 1, "second_id": 2}
+        results.append(result)
+    assert results[0]["step_datas"] == results[1]["step_datas"]
+
+
+def test_explicit_index_errors_keep_response_and_skip_the_later_write():
+    for body, message in [({"data": []}, "索引 [0] 越界"), ({"data": [{"id": 1}]}, "索引 [1] 越界"),
+                          ({"data": [{}, {"id": 2}]}, "id"), ({"data": None}, "失败"), ({}, "data")]:
+        session = FakeSession([FakeResponse(body=body)])
+        with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+            result = run_case("bad-index", _indexed_allocation_case())
+        assert result["status"] == "failed", result
+        assert result["error_type"] == "ExtractionFailure"
+        assert len(session.requests) == 1
+        first, later = result["step_datas"]
+        assert message in first["error"]
+        assert first["data"]["req_resps"][0]["response"]["body"] == body
+        # Partial successes may remain in report evidence, but no later write runs.
+        assert any(item["passed"] is False for item in first["extraction_results"])
+        assert later["status"] == "skipped"
+
+
+def test_explicit_dot_and_nested_indexes_do_not_change_filter_uniqueness():
+    context = {"body": {"data": [{"id": 1}, {"id": 2}], "groups": [[], [{"id": 3}, {"id": 4}]]}}
+    assert _select("body.data.1.id", context, require_unique=True) == 2
+    assert _select("body.groups[1][1].id", context, require_unique=True) == 4
+    for selector in ("body.data[-1].id", "body.data[1.5].id"):
+        try:
+            validate_selector(selector)
+        except CaseContractError:
+            pass
+        else:
+            raise AssertionError(f"invalid index must still fail: {selector}")
+    for items in ([], [{"id": 3, "name": "same"}, {"id": 4, "name": "same"}]):
+        filtered = {"body": {"groups": [[], items]}}
+        selector = "body.groups[1][?(@.name == 'same')][0].id"
+        try:
+            _select(selector, filtered, require_unique=True)
+        except ExtractionFailure as exc:
+            assert "筛选结果必须唯一匹配" in str(exc)
+        else:
+            raise AssertionError("an explicit index must not bypass filter uniqueness")
+
+
 def test_source_use_tracks_current_extract_version_including_headers_and_cookies():
     replacement = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
         {"request": {"url": "/old"}, "extract": {"id": "body.list[0].id"}},
@@ -255,8 +324,8 @@ def test_source_use_tracks_current_extract_version_including_headers_and_cookies
     with patch("api_testing.requests_runtime.requests.Session", return_value=safe_session):
         assert run_case("overridden", replacement)["status"] == "passed"
     for extract, transfer_selector, write_variable in (
-        ({"id": "body.list[0].id"}, None, "write_id"),
-        ({"old_id": "body.list[0].id"}, "extract.old_id", "new_id"),
+        ({"id": "body.list[?(@.name == 'same')][0].id"}, None, "write_id"),
+        ({"old_id": "body.list[?(@.name == 'same')][0].id"}, "extract.old_id", "new_id"),
         ({"old_object": "body.list"}, "extract.old_object[0].id", "new_id"),
     ):
         config_variables = {"id": "", "write_id": "${id}"} if write_variable == "write_id" else {}
@@ -264,17 +333,17 @@ def test_source_use_tracks_current_extract_version_including_headers_and_cookies
         if transfer_selector is not None:
             steps.append({"request": {"url": "/copy"}, "extract": {"new_id": transfer_selector}})
         steps.append({"request": {"method": "POST", "url": f"/roles/${{{write_variable}}}"}})
-        session = FakeSession([FakeResponse(body={"list": [{"id": 1}, {"id": 2}]})])
+        session = FakeSession([FakeResponse(body={"list": [{"id": 1, "name": "same"}, {"id": 2, "name": "same"}]})])
         with patch("api_testing.requests_runtime.requests.Session", return_value=session):
             result = run_case("alias-source", {"config": {"base_url": "https://api.example.test", "variables": config_variables}, "teststeps": steps})
         assert result["error_type"] == "ExtractionFailure"
         assert len(session.requests) == 1
     for request_part in ({"headers": {"X-ID": "${id}"}}, {"cookies": {"id": "${id}"}}):
         case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
-            {"request": {"url": "/roles"}, "extract": {"id": "body.list[0].id"}},
+            {"request": {"url": "/roles"}, "extract": {"id": "body.list[?(@.name == 'same')][0].id"}},
             {"request": {"method": "POST", "url": "/roles", **request_part}},
         ]}
-        session = FakeSession([FakeResponse(body={"list": [{"id": 1}, {"id": 2}]})])
+        session = FakeSession([FakeResponse(body={"list": [{"id": 1, "name": "same"}, {"id": 2, "name": "same"}]})])
         with patch("api_testing.requests_runtime.requests.Session", return_value=session):
             result = run_case("header-cookie-source", case)
         assert result["error_type"] == "ExtractionFailure"
@@ -298,18 +367,18 @@ def test_exported_runtime_embeds_filter_selector_without_new_dependencies():
     assert session.requests[1]["url"] == "https://api.example.test/roles/7"
 
 
-def test_object_transfer_cannot_hide_a_new_unfiltered_array_index_before_write():
+def test_object_transfer_allows_explicit_array_index_before_write():
     case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [
         {"request": {"url": "/list"}, "extract": {"payload": "body"}},
-        {"request": {"url": "/copy"}, "extract": {"id": "extract.payload.data[0].id"}},
+        {"request": {"url": "/copy"}, "extract": {"id": "extract.payload.data[1].id"}},
         {"request": {"method": "POST", "url": "/items/${id}"}},
     ]}
-    session = FakeSession([FakeResponse(body={"data": [{"id": 1}, {"id": 2}]}), FakeResponse()])
+    session = FakeSession([FakeResponse(body={"data": [{"id": 1}, {"id": 2}]}), FakeResponse(), FakeResponse()])
     with patch("api_testing.requests_runtime.requests.Session", return_value=session):
         result = run_case("transfer-index", case)
-    assert result["error_type"] == "ExtractionFailure"
-    assert len(session.requests) == 2
-    assert result["step_datas"][2]["status"] == "skipped"
+    assert result["status"] == "passed"
+    assert len(session.requests) == 3
+    assert session.requests[2]["url"] == "https://api.example.test/items/2"
 
 
 def test_normalize_case_is_json_only_copied_and_rejects_hooks():

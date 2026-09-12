@@ -108,7 +108,7 @@ test("length_gt serializes only bare nonnegative integer thresholds as JSON numb
   );
 });
 
-test("visual editor keeps exact filters and exposes length_gt assertions", async () => {
+test("visual editor explains filter uniqueness, explicit indexes, and length_gt assertions", async () => {
   const selector = 'body.data[?(@.name == ${unique_name})]';
   const draft = normalizeDraft({teststeps: [{
     request: {method: "GET", url: "/items"},
@@ -121,7 +121,14 @@ test("visual editor keeps exact filters and exposes length_gt assertions", async
   for (const value of ["eq", "ne", "contains", "not_contains", "gt", "ge", "lt", "le", "type", "length", "length_gt"]) {
     assert.ok(editor.includes(`value="${value}"`), `missing comparator: ${value}`);
   }
+  assert.ok(editor.includes("条件筛选提取必须恰好匹配一条"));
   assert.ok(editor.includes("零条或多条会停止"));
+  assert.ok(editor.includes("body.data[0].id"));
+  assert.ok(editor.includes("body.data.0.id"));
+  assert.ok(editor.includes("即使后续用于 POST 等写请求也不要求列表只有一条"));
+  assert.ok(editor.includes("列表顺序可能变化"));
+  assert.ok(editor.includes("针对指定业务对象优先使用唯一条件筛选"));
+  assert.ok(editor.includes("不要直接提取未指定索引的整个列表用于后续写请求"));
   assert.ok(editor.includes("长度等于 0"));
   assert.ok(editor.includes("阈值 0 表示非空"));
   assert.ok(editor.includes("type</code> 为 <code>list"));

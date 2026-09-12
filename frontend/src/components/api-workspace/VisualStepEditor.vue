@@ -150,7 +150,8 @@
           /></el-form-item>
           <p class="selector-hint">
             按唯一名称提取示例：<code>{{ selectorExample }}</code>。
-            unique_name 需先在变量中定义。提取必须恰好匹配一条；零条或多条会停止，不会默认选第一条。
+            unique_name 需先在变量中定义；条件筛选提取必须恰好匹配一条，零条或多条会停止，不会默认选第一条。
+            显式数字索引如 <code>body.data[0].id</code> 或 <code>body.data.0.id</code> 会按指定位置取值，即使后续用于 POST 等写请求也不要求列表只有一条；索引越界或字段缺失仍会失败。列表顺序可能变化，针对指定业务对象优先使用唯一条件筛选；不要直接提取未指定索引的整个列表用于后续写请求。
             删除后可对筛选结果使用“长度等于 0”断言，无需再提取 ID。
             “长度大于”可检查 <code>body.data</code>；阈值 0 表示非空，建议保留 <code>type</code> 为 <code>list</code> 的断言。
           </p>

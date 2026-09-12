@@ -312,8 +312,8 @@ def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, A
         sources = extraction_sources.get(definition)
         if sources is None:
             return {definition}
-        # The transfer itself may introduce an array index even if its source
-        # was a plain object. Both ends of the chain must remain guarded.
+        # Track both ends so a transfer cannot hide a filtered or unselected
+        # list source. Explicit indexes are handled by the selector itself.
         return {definition}.union(*(definition_sources(source, seen) for source in sources))
 
     def source_definitions(name: str, seen: set[str] | None = None) -> set[tuple[int, str]]:
@@ -772,7 +772,8 @@ def _select(selector: str, context: Mapping[str, Any], *, variables: Mapping[str
 
     A filter returns its list unchanged for validators (so ``length=0`` can
     assert absence). Extraction callers opt into ``require_unique`` whenever a
-    filter exists or a value later drives a write request.
+    filter exists or a value later drives a write request. It guards filter
+    matches and unselected terminal lists, not explicitly indexed positions.
     """
     root, operations = _parse_selector(selector)
     if root not in context:
@@ -787,12 +788,10 @@ def _select(selector: str, context: Mapping[str, Any], *, variables: Mapping[str
                 if isinstance(current, list):
                     if not payload.isdecimal():
                         raise CaseContractError("数组不支持隐式字段投影；请明确使用 [0].字段")
-                    if require_unique and len(current) != 1:
-                        raise ExtractionFailure(f"选择器数组必须唯一匹配，实际为 {len(current)} 条")
                     try:
                         current = current[int(payload)]
                     except IndexError as exc:
-                        raise KeyError(payload) from exc
+                        raise ExtractionFailure(f"选择器索引 [{payload}] 越界，当前列表长度为 {len(current)}") from exc
                     continue
                 raise KeyError(payload)
             if root == "headers" and position == 0:
@@ -804,12 +803,10 @@ def _select(selector: str, context: Mapping[str, Any], *, variables: Mapping[str
         elif kind == "index":
             if not isinstance(current, list):
                 raise KeyError(payload)
-            if require_unique and len(current) != 1:
-                raise ExtractionFailure(f"选择器数组必须唯一匹配，实际为 {len(current)} 条")
             try:
                 current = current[payload]
             except IndexError as exc:
-                raise KeyError(payload) from exc
+                raise ExtractionFailure(f"选择器索引 [{payload}] 越界，当前列表长度为 {len(current)}") from exc
         else:
             if not isinstance(current, list):
                 raise KeyError("filter")

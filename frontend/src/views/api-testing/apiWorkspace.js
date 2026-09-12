@@ -108,6 +108,8 @@ export const rootWorkspaceStatusMeta = (status) =>
     partial: { label: "部分完成", type: "warning" },
     needs_review: { label: "需要人工处理", type: "warning" },
     failed: { label: "生成失败", type: "danger" },
+    cancelled: { label: "已停止", type: "info" },
+    canceled: { label: "已停止", type: "info" },
   })[status] || statusMeta(status);
 
 export const scenarioStatusMeta = (status) =>
@@ -322,6 +324,8 @@ export const generationStatusMeta = (status) =>
     needs_review: { label: "需要人工处理", type: "warning" },
     failed: { label: "验证失败", type: "danger" },
     stale: { label: "结果已过期", type: "info" },
+    cancelled: { label: "已停止", type: "info" },
+    canceled: { label: "已停止", type: "info" },
   })[status] || { label: "尚未验证", type: "info" };
 
 export const generationPhaseLabel = (phase) =>
@@ -332,6 +336,8 @@ export const generationPhaseLabel = (phase) =>
     running: "正在验证请求与断言",
     repairing: "正在修复并复验",
     finished: "流程已结束",
+    cancelled: "已停止",
+    canceled: "已停止",
   })[phase] || "等待状态更新";
 
 export const isGenerationStale = (generation, workspaceRevision, dirty) =>
@@ -388,6 +394,7 @@ export const generationDraftSummary = (draft) => {
           : `步骤 ${index + 1}`,
       method: String(request.method || "GET").toUpperCase(),
       url: typeof request.url === "string" ? request.url : "/",
+      ...(step.phase === "cleanup" ? { phase: "cleanup" } : {}),
     });
   });
   return {
@@ -538,8 +545,54 @@ export const normalizeStep = (value, index) => {
         ? step.extract
         : {},
     validate: Array.isArray(step.validate) ? step.validate : [],
+    phase: step.phase === "cleanup" ? "cleanup" : undefined,
+    requires: Array.isArray(step.requires)
+      ? step.requires.filter(
+          (item) => typeof item === "string" && item.trim(),
+        )
+      : [],
   };
 };
+
+export const cleanupVariablesBeforeStep = (steps, currentIndex) => {
+  if (!Array.isArray(steps) || !Number.isInteger(currentIndex)) return [];
+  const variables = new Set();
+  steps.slice(0, Math.max(0, currentIndex)).forEach((item, index) => {
+    Object.keys(normalizeStep(item, index + 1).extract).forEach((key) =>
+      variables.add(key),
+    );
+  });
+  return [...variables];
+};
+
+export const candidateAssertionReview = (candidate) => {
+  const review = candidate?.review;
+  const strings = (value) =>
+    Array.isArray(value)
+      ? value.filter((item) => typeof item === "string" && item.trim())
+      : [];
+  return {
+    requiresConfirmation: review?.requires_confirmation === true,
+    changes: strings(review?.changes),
+    warnings: strings(review?.warnings),
+    draftHash:
+      typeof candidate?.draft_hash === "string" && candidate.draft_hash.trim()
+        ? candidate.draft_hash
+        : null,
+  };
+};
+
+export const workspaceExecutionHistory = (workspace) =>
+  (Array.isArray(workspace?.execution_history)
+    ? workspace.execution_history
+    : []
+  ).filter(
+    (item) =>
+      item &&
+      typeof item === "object" &&
+      Number.isSafeInteger(Number(item.id)) &&
+      Number(item.id) > 0,
+  );
 
 export const bodyKind = (request = {}) => {
   if (Object.hasOwn(request, "json")) return "json";

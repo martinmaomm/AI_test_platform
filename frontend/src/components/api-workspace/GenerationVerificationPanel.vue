@@ -23,6 +23,8 @@
       <el-descriptions-item label="验证轮次"
         >第 {{ generationState.attempt || 0 }} / {{ generationState.max_attempts || 3 }} 轮</el-descriptions-item
       >
+      <el-descriptions-item label="排队状态" :span="2">{{ queueTiming }}</el-descriptions-item>
+      <el-descriptions-item label="执行状态" :span="2">{{ executionTiming }}</el-descriptions-item>
       <el-descriptions-item label="验证目标" :span="2"
         >{{ generationState.target_url || "尚未开始请求验证" }}</el-descriptions-item
       >
@@ -43,7 +45,7 @@
       />
       <ol v-if="scenario.steps.length">
         <li v-for="(step, index) in scenario.steps" :key="`${step.name}-${index}`">
-          {{ step.name }}：{{ step.method }} {{ step.url }}
+          {{ step.name }}：{{ step.method }} {{ step.url }}<span v-if="step.phase === 'cleanup'">（清理）</span>
         </li>
       </ol>
       <p v-else>候选尚未产出可展示的步骤。</p>
@@ -193,6 +195,23 @@ const status = computed(() =>
     : generationStatusMeta(props.generation?.status),
 );
 const phase = computed(() => generationPhaseLabel(props.generation?.phase));
+const displayTime = (value) => (value ? new Date(value).toLocaleString() : "未记录");
+const queueTiming = computed(() => {
+  const generation = generationState.value;
+  if (!generation.queued_at) return "尚未进入队列。";
+  if (!generation.claimed_at)
+    return `已于 ${displayTime(generation.queued_at)} 排队；队列截止：${displayTime(generation.deadlines?.queue_at)}。`;
+  return `已于 ${displayTime(generation.queued_at)} 排队，并于 ${displayTime(generation.claimed_at)} 被执行器领取。`;
+});
+const executionTiming = computed(() => {
+  const generation = generationState.value;
+  if (!generation.claimed_at) return "尚未开始执行；不会把排队时间计为执行耗时。";
+  if (!generation.started_at)
+    return `已被执行器领取，尚未记录开始时间；执行截止：${displayTime(generation.deadlines?.execution_at)}。`;
+  if (!generation.finished_at)
+    return `已于 ${displayTime(generation.started_at)} 开始执行；执行截止：${displayTime(generation.deadlines?.execution_at)}。`;
+  return `执行于 ${displayTime(generation.started_at)} 开始，并于 ${displayTime(generation.finished_at)} 结束。`;
+});
 const latestDraft = computed(() =>
   latestGenerationDraft(props.generation, props.candidate),
 );

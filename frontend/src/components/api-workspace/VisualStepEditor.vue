@@ -19,6 +19,32 @@
           :disabled="disabled"
           @update:model-value="patch({ name: $event })"
       /></el-form-item>
+      <el-form-item label="步骤阶段">
+        <el-select
+          :model-value="step.phase || ''"
+          :disabled="disabled"
+          placeholder="普通执行步骤"
+          @update:model-value="setPhase"
+        >
+          <el-option label="普通执行" value="" />
+          <el-option label="清理测试数据" value="cleanup" />
+        </el-select>
+        <p class="phase-hint">清理步骤只可依赖本轮前序步骤已经提取的变量。</p>
+      </el-form-item>
+      <el-form-item v-if="step.phase === 'cleanup'" label="清理依赖变量">
+        <el-checkbox-group
+          :model-value="step.requires"
+          :disabled="disabled"
+          @update:model-value="patch({ requires: $event })"
+        >
+          <el-checkbox
+            v-for="variable in availableExtractVariables"
+            :key="variable"
+            :label="variable"
+          >{{ variable }}</el-checkbox>
+        </el-checkbox-group>
+        <p v-if="!availableExtractVariables.length" class="phase-hint">前序步骤尚未提取变量；清理步骤不能填写额外依赖。</p>
+      </el-form-item>
       <el-form-item label="关联 API 端点">
         <el-select
           :model-value="step.endpoint_id || null"
@@ -199,6 +225,7 @@ const props = defineProps({
   modelValue: { type: Object, required: true },
   index: { type: Number, required: true },
   endpoints: { type: Array, default: () => [] },
+  availableExtractVariables: { type: Array, default: () => [] },
   disabled: Boolean,
 });
 const emit = defineEmits(["update:modelValue", "remove"]);
@@ -214,6 +241,12 @@ const endpointLabel = (endpoint) =>
 const patch = (value) => emit("update:modelValue", { ...step.value, ...value });
 const patchRequest = (value) =>
   patch({ request: { ...step.value.request, ...value } });
+const setPhase = (phase) =>
+  patch(
+    phase === "cleanup"
+      ? { phase: "cleanup" }
+      : { phase: undefined, requires: [] },
+  );
 const setBodyKind = (kind) => {
   const request = { ...step.value.request };
   delete request.json;
@@ -283,6 +316,11 @@ const removeAssertion = (index) =>
 .selector-hint code {
   color: var(--el-text-color-regular);
   white-space: normal;
+}
+.phase-hint {
+  margin: 6px 0 0;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 .assertion-row {
   display: grid;

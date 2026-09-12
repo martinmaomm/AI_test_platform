@@ -387,6 +387,7 @@
             :model-value="step"
             :index="index"
             :endpoints="editorEndpointOptions"
+            :available-extract-variables="cleanupVariablesBeforeStep(draft.teststeps, index)"
             :disabled="interactionLocked || conflict"
             @update:model-value="updateStep(index, $event)"
             @remove="removeStep(index)"
@@ -403,6 +404,17 @@
             data-testid="api-current-debug-result"
             :result="workspace.debug_result"
             :stale="debugStale"
+          />
+          <WorkspaceExecutionHistory
+            :workspace="historyWorkspace"
+            :project-id="projectId"
+            :history-targets="historyTargets"
+            :selected-workspace-id="historyWorkspaceId"
+            :history-label="historyLabel"
+            :can-cancel-root="rootBusy"
+            :cancelling="cancellingWorkspace"
+            @cancel-root="cancelRootWorkspace"
+            @select-history="selectHistoryWorkspace"
           />
           <div class="debug-actions">
             <el-button
@@ -446,7 +458,7 @@
       :close-on-click-modal="false"
     >
       <el-alert
-        title="将向所选测试环境发起真实请求。仅使用测试账号和测试数据。"
+        title="将向所选测试环境发起真实请求，可能再次修改测试数据。仅使用测试账号和测试数据。"
         type="warning"
         :closable="false"
         show-icon
@@ -579,7 +591,7 @@
         </el-form-item>
       </el-form>
       <p class="generation-warning">
-        将向该目标发送真实请求，可能增删改测试数据；建议使用动态唯一测试数据，最多执行 3 轮。请仅使用测试环境。
+        将向该目标发送真实请求，可能增删改测试数据；修复并验证也可能再次修改测试数据。建议使用动态唯一测试数据，最多执行 3 轮。请仅使用测试环境。
       </p>
       <template #footer>
         <el-button :disabled="sendingMessage" @click="generationDialog = false"
@@ -606,6 +618,7 @@ import { getAPISpecifications, getAPIEndpoints } from "@/api/apiTesting";
 import { getProjectEnvironments } from "@/api/projects";
 import { getLLMConfigurations } from "@/api/aiConfig";
 import {
+  cancelApiWorkspace,
   createApiWorkspace,
   deleteApiWorkspace,
   debugApiWorkspace,
@@ -636,6 +649,7 @@ import ScenarioOverview from "@/components/api-workspace/ScenarioOverview.vue";
 import WorkspaceManagerDialog from "@/components/api-workspace/WorkspaceManagerDialog.vue";
 import PythonExportPanel from "@/components/api-workspace/PythonExportPanel.vue";
 import KeyValueRows from "@/components/api-workspace/KeyValueRows.vue";
+import WorkspaceExecutionHistory from "@/components/api-workspace/WorkspaceExecutionHistory.vue";
 import BrowserDiscoveryPanel from "@/components/api-testing/BrowserDiscoveryPanel.vue";
 import {
   browserDiscoveryConfig as normalizeBrowserDiscoveryConfig,
@@ -654,9 +668,11 @@ import {
   activeScenario,
   canGenerateWithModel,
   canRepairWorkspace,
+  candidateAssertionReview,
   candidateDiff,
   childEditorEndpointIds,
   clone,
+  cleanupVariablesBeforeStep,
   completedDocumentApiSpecs,
   defaultStep,
   errorMessage,
@@ -704,6 +720,7 @@ const workspace = ref(null);
 const rootWorkspace = ref(null);
 const workspaceId = ref(null);
 const activeScenarioId = ref(null);
+const historyWorkspaceId = ref(null);
 const workspaces = ref([]);
 const draft = ref(normalizeDraft());
 const modelId = ref(null);
@@ -735,6 +752,7 @@ const python = ref({
 const loading = ref(false);
 const savingDraft = ref(false);
 const savingCase = ref(false);
+const cancellingWorkspace = ref(false);
 const adoptingCandidate = ref(false);
 const sendingMessage = ref(false);
 const modelsLoading = ref(false);
@@ -832,6 +850,35 @@ const navigationDirty = computed(
 );
 const rootBusy = computed(() => rootWorkspaceBusy(rootWorkspace.value));
 const editingScenario = computed(() => Boolean(workspace.value?.parent_id));
+const historyWorkspace = computed(() => {
+  const root = rootWorkspace.value || workspace.value;
+  if (!root?.id) return null;
+  if (sameWorkspaceId(historyWorkspaceId.value, root.id)) return root;
+  const current = (root.scenarios || []).find((item) =>
+    sameWorkspaceId(item?.id, historyWorkspaceId.value),
+  );
+  return current || workspace.value || root;
+});
+const historyTargets = computed(() => {
+  const root = rootWorkspace.value || workspace.value;
+  if (!root?.id) return [];
+  const targets = [{ id: root.id, kind: "root", label: "工作区历史" }];
+  const current = workspace.value?.parent_id ? workspace.value : null;
+  if (current?.id)
+    targets.push({
+      id: current.id,
+      kind: "scenario",
+      label: `当前场景历史：${current.title || `场景 #${current.id}`}`,
+    });
+  return targets;
+});
+const historyLabel = computed(() => {
+  const current = historyWorkspace.value;
+  if (!current?.id) return "本工作区运行历史";
+  return current.parent_id
+    ? `当前场景运行历史：${current.title || `场景 #${current.id}`}`
+    : "工作区运行历史";
+});
 const hasSavedRootCase = computed(
   () => !editingScenario.value && Boolean(rootWorkspace.value?.saved_case_id),
 );
@@ -847,6 +894,7 @@ const interactionLocked = computed(
     busy.value ||
     savingDraft.value ||
     savingCase.value ||
+    cancellingWorkspace.value ||
     adoptingCandidate.value ||
     sendingMessage.value ||
     generationDialog.value ||
@@ -1789,6 +1837,9 @@ const applyRootWorkspace = (value) => {
   }
   const scenario = activeScenario(next, activeScenarioId.value);
   activeScenarioId.value = scenario?.id ?? null;
+  const historyIds = [next.id, ...(next.scenarios || []).map((item) => item?.id)];
+  if (!historyIds.some((id) => sameWorkspaceId(id, historyWorkspaceId.value)))
+    historyWorkspaceId.value = scenario?.id ?? next.id;
   applyEditorWorkspace(scenario || next);
   resetNavigationWorkspaceBaseline();
   if (rootBusy.value) startPolling();
@@ -1806,6 +1857,7 @@ const applyWorkspace = (value) => {
     workspaces.value = updateWorkspaceListItem(workspaces.value, rootWorkspace.value);
   }
   activeScenarioId.value = next.id;
+  historyWorkspaceId.value = next.id;
   applyEditorWorkspace(next);
 };
 const loadWorkspaces = async (requestProjectId = projectId.value) => {
@@ -1962,7 +2014,12 @@ const selectScenario = async (scenarioId) => {
   if (!next || sameWorkspaceId(next.id, workspace.value?.id)) return;
   if (!(await confirmDiscardDraft("切换场景"))) return;
   activeScenarioId.value = next.id;
+  historyWorkspaceId.value = next.id;
   applyEditorWorkspace(next);
+};
+const selectHistoryWorkspace = (id) => {
+  if (!historyTargets.value.some((target) => sameWorkspaceId(target.id, id))) return;
+  historyWorkspaceId.value = id;
 };
 const openRenameWorkspace = (item) => {
   if (!item || rootWorkspaceBusy(item)) return;
@@ -2025,6 +2082,7 @@ const confirmDeleteWorkspace = async (item) => {
       workspace.value = null;
       workspaceId.value = null;
       activeScenarioId.value = null;
+      historyWorkspaceId.value = null;
       clearPython();
       if (next) {
         await router.replace({ path: route.path, query: { workspace_id: String(next.id) } });
@@ -2461,6 +2519,65 @@ const sendMessage = async ({ mode, message, base_url, variables, workspaceId: ta
     if (requestSequence === messageSendSequence) sendingMessage.value = false;
   }
 };
+const cancelRootWorkspace = async () => {
+  const target = rootWorkspace.value;
+  if (!target?.id || !rootBusy.value || cancellingWorkspace.value) return;
+  const request = {
+    projectId: projectId.value,
+    workspaceId: target.id,
+    revision: target.revision,
+  };
+  try {
+    await ElMessageBox.confirm(
+      "将停止整个根工作区及其子场景中仍在排队或执行的生成、调试任务；已完成候选和部分报告会保留。",
+      "确认停止根工作区批次",
+      { confirmButtonText: "停止批次", cancelButtonText: "继续运行", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  if (
+    request.projectId !== projectId.value ||
+    !sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id) ||
+    request.revision !== rootWorkspace.value?.revision
+  )
+    return;
+  cancellingWorkspace.value = true;
+  stopPolling();
+  reloadSequence += 1;
+  messageSendSequence += 1;
+  try {
+    const response = await cancelApiWorkspace(
+      request.projectId,
+      request.workspaceId,
+      request.revision,
+    );
+    if (
+      request.projectId !== projectId.value ||
+      !sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id)
+    )
+      return;
+    const next = asWorkspace(response);
+    if (!next?.id) throw new Error("取消响应未返回工作区状态");
+    applyWorkspace(next);
+    await loadWorkspaces();
+    ElMessage.success("已停止根工作区批次；已完成的候选和报告仍可查看。");
+  } catch (error) {
+    if (
+      request.projectId === projectId.value &&
+      sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id)
+    ) {
+      ElMessage.error(errorMessage(error, "停止工作区批次失败"));
+      if (rootBusy.value) startPolling();
+    }
+  } finally {
+    if (
+      request.projectId === projectId.value &&
+      sameWorkspaceId(request.workspaceId, rootWorkspace.value?.id)
+    )
+      cancellingWorkspace.value = false;
+  }
+};
 const adoptCandidate = async () => {
   if (busy.value || adoptingCandidate.value) return false;
   const candidate = workspace.value?.candidate;
@@ -2474,18 +2591,31 @@ const adoptCandidate = async () => {
     );
   if (candidate.source_revision !== workspace.value.revision)
     return (ElMessage.warning("候选对应旧版本草稿，请重新生成。"), false);
+  const review = candidateAssertionReview(candidate);
+  if (review.requiresConfirmation && !review.draftHash)
+    return (
+      ElMessage.error("受保护断言候选缺少确认凭据，请重新生成后再采用。"),
+      false
+    );
   const request = {
     projectId: projectId.value,
     workspaceId: workspace.value.id,
     revision: workspace.value.revision,
     rootId: rootWorkspace.value?.id,
     candidate,
+    assertionReviewAck: review.requiresConfirmation ? review.draftHash : null,
   };
   try {
     await ElMessageBox.confirm(
-      "采用后将替换当前可视化草稿；此操作不会保存为测试用例。",
+      review.requiresConfirmation
+        ? `以下受保护断言调整将替换当前草稿：${review.changes.join("；") || "请核对候选断言变更"}。确认后才会采用；此操作不会保存为测试用例。`
+        : "采用后将替换当前可视化草稿；此操作不会保存为测试用例。",
       "确认采用候选",
-      { confirmButtonText: "采用", cancelButtonText: "取消", type: "warning" },
+      {
+        confirmButtonText: review.requiresConfirmation ? "确认断言调整并采用" : "采用",
+        cancelButtonText: "取消",
+        type: "warning",
+      },
     );
     if (
       request.projectId !== projectId.value ||
@@ -2502,7 +2632,13 @@ const adoptCandidate = async () => {
       const response = await updateApiWorkspace(
         request.projectId,
         request.workspaceId,
-        { draft: clone(request.candidate.draft), revision: request.revision },
+        {
+          draft: clone(request.candidate.draft),
+          revision: request.revision,
+          ...(request.assertionReviewAck
+            ? { assertion_review_ack: request.assertionReviewAck }
+            : {}),
+        },
       );
       if (
         request.projectId !== projectId.value ||
@@ -2784,6 +2920,7 @@ const initialize = async () => {
   rootWorkspace.value = null;
   workspaceId.value = null;
   activeScenarioId.value = null;
+  historyWorkspaceId.value = null;
   workspaces.value = [];
   scenarioEndpointOptions.value = [];
   rootPrompt.value = "";
@@ -2797,6 +2934,7 @@ const initialize = async () => {
   conflict.value = false;
   savingDraft.value = false;
   savingCase.value = false;
+  cancellingWorkspace.value = false;
   sendingMessage.value = false;
   unavailableModel.value = false;
   clearPython();

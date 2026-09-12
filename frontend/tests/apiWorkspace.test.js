@@ -10,8 +10,10 @@ import {
   bodyKind,
   canGenerateWithModel,
   canRepairWorkspace,
+  candidateAssertionReview,
   candidateDiff,
   childEditorEndpointIds,
+  cleanupVariablesBeforeStep,
   completedApiSpecs,
   completedDocumentApiSpecs,
   debugHasFailure,
@@ -45,6 +47,7 @@ import {
   workspaceInitializationPlan,
   workspaceRouteForSource,
   workspaceSourceType,
+  workspaceExecutionHistory,
 } from "../src/views/api-testing/apiWorkspace.js";
 
 test("visual editor keeps exact filters and exposes absence assertions", async () => {
@@ -120,6 +123,54 @@ test("candidate display names structural changes without applying a draft", () =
   );
   assert.doesNotMatch(changes.join("\n"), /Authorization/);
   assert.equal(current.config.base_url, "");
+});
+
+test("protected assertion candidates require their exact draft hash acknowledgement", () => {
+  assert.deepEqual(
+    candidateAssertionReview({
+      draft_hash: "candidate-v2",
+      review: {
+        requires_confirmation: true,
+        changes: ["步骤 1 将状态码断言从 200 调整为 201"],
+        warnings: ["该调整仅适用于新建资源响应"],
+      },
+    }),
+    {
+      requiresConfirmation: true,
+      changes: ["步骤 1 将状态码断言从 200 调整为 201"],
+      warnings: ["该调整仅适用于新建资源响应"],
+      draftHash: "candidate-v2",
+    },
+  );
+  assert.equal(candidateAssertionReview({ review: { requires_confirmation: true } }).draftHash, null);
+  assert.equal(candidateAssertionReview({ review: { requires_confirmation: false } }).requiresConfirmation, false);
+});
+
+test("cleanup steps only expose variables extracted by earlier steps", () => {
+  const steps = [
+    { extract: { token: "body.token", record_id: "body.id" } },
+    { extract: { cleanup_key: "body.cleanup_key" } },
+    { phase: "cleanup", requires: ["token"] },
+  ];
+  assert.deepEqual(cleanupVariablesBeforeStep(steps, 0), []);
+  assert.deepEqual(cleanupVariablesBeforeStep(steps, 1), ["token", "record_id"]);
+  assert.deepEqual(cleanupVariablesBeforeStep(steps, 2), ["token", "record_id", "cleanup_key"]);
+  assert.equal(normalizeDraft({ teststeps: [steps[2]] }).teststeps[0].phase, "cleanup");
+});
+
+test("workspace execution history accepts only standard positive execution ids", () => {
+  assert.deepEqual(
+    workspaceExecutionHistory({
+      execution_history: [
+        { id: 9, status: "passed", source: "workspace_generation" },
+        { id: "10", status: "failed", source: "workspace_debug" },
+        { id: 0, status: "passed" },
+        null,
+      ],
+    }).map((item) => item.id),
+    [9, "10"],
+  );
+  assert.deepEqual(workspaceExecutionHistory({ execution_history: {} }), []);
 });
 
 test("repair is enabled only for actual failed debug evidence", () => {
@@ -930,4 +981,33 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.doesNotMatch(legacyApi, /generateScenario/);
   assert.doesNotMatch(specDetail, /generateEndpointTestCases\(/);
   assert.doesNotMatch(specDetail, /generateSpecTestCases\(/);
+});
+
+test("workspace reliability UI uses cancellation, standard report history, and explicit assertion acknowledgement", async () => {
+  const [api, workspace, history, conversation, verification, editor, debug] = await Promise.all([
+    readFile(new URL("../src/api/apiWorkspace.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/views/api-testing/ApiWorkspace.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/api-workspace/WorkspaceExecutionHistory.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/api-workspace/WorkspaceConversation.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/api-workspace/GenerationVerificationPanel.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/api-workspace/VisualStepEditor.vue", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/api-workspace/DebugResultPanel.vue", import.meta.url), "utf8"),
+  ]);
+  assert.match(api, /\$\{basePath\(projectId\)\}\$\{workspaceId\}\/cancel\//);
+  assert.match(workspace, /cancelRootWorkspace/);
+  assert.match(workspace, /const historyWorkspaceId = ref\(null\)/);
+  assert.match(workspace, /const selectHistoryWorkspace = \(id\)/);
+  assert.match(workspace, /:workspace="historyWorkspace"/);
+  assert.match(workspace, /reloadSequence \+= 1/);
+  assert.match(workspace, /assertion_review_ack/);
+  assert.match(history, /reportPath\("api", props\.projectId, row\.id\)/);
+  assert.match(history, /api-workspace-history-scope-\$\{target\.kind\}/);
+  assert.match(history, /select-history/);
+  assert.match(conversation, /candidate\.assertion_provenance/);
+  assert.match(conversation, /确认前不会采用、调试或保存该候选/);
+  assert.match(verification, /不会把排队时间计为执行耗时/);
+  assert.match(editor, /清理测试数据/);
+  assert.match(editor, /availableExtractVariables/);
+  assert.match(debug, /不建议自动重试/);
+  assert.match(debug, /normalized \? "结果未知" : "未执行"/);
 });

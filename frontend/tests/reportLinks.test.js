@@ -16,6 +16,14 @@ test('native report links keep project and execution ids encoded', () => {
   assert.equal(reportUrl('web', 12, 34, 'https://automation.example'), 'https://automation.example/reports/web/12/34')
 })
 
+test('API native reports distinguish unknown outcomes from assertion failures and warn before replay', async () => {
+  const source = await readFile(new URL('../src/components/APITestCaseExecutionDetail.vue', import.meta.url), 'utf8')
+  assert.match(source, /unknown: '结果未知，请核对测试数据'/)
+  assert.match(source, /replay_safety\?\.safe_to_retry === false/)
+  assert.match(source, /本轮可能已产生测试数据，请先核对结果再重新运行/)
+  assert.match(source, /'stopped': '已停止'/)
+})
+
 test('report routes are authenticated and old static-report proxy is absent', async () => {
   const [router, vite, api, login] = await Promise.all([
     readFile(new URL('../src/router/index.js', import.meta.url), 'utf8'),

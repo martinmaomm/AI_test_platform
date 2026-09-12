@@ -17,6 +17,13 @@
     />
     <template v-else>
       <el-alert
+        v-if="replaySafety"
+        :title="replaySafetyTitle"
+        :type="replaySafety.safe_to_retry === false ? 'warning' : 'info'"
+        :closable="false"
+        show-icon
+      />
+      <el-alert
         v-if="stale"
         title="当前存在未保存或更高版本的草稿；该结果只对应旧草稿，不能据此判定当前草稿通过。"
         type="warning"
@@ -110,9 +117,25 @@ const failureItems = computed(() => failureEvidence(props.result));
 const extractionResults = computed(
   () => props.result?.extraction_results || props.result?.result?.extraction_results,
 );
+const replaySafety = computed(() => {
+  const value = props.result?.replay_safety || props.result?.result?.replay_safety;
+  return value && typeof value === "object" ? value : null;
+});
+const replaySafetyTitle = computed(() => {
+  const safety = replaySafety.value;
+  if (!safety) return "";
+  const cleanup = safety.cleanup_status ? `清理状态：${safety.cleanup_status}。` : "";
+  const effects = Array.isArray(safety.side_effects) && safety.side_effects.length
+    ? `可能副作用：${safety.side_effects.join("；")}。`
+    : "";
+  if (safety.safe_to_retry === false)
+    return `不建议自动重试：${safety.reason || "本轮可能修改了测试数据"}。${cleanup}${effects}请人工确认后再运行。`;
+  return `重试安全性：${safety.reason || "服务端未报告风险"}。${cleanup}${effects}`;
+});
 const pretty = (value) => JSON.stringify(value, null, 2);
 const normalizedStatus = (status) => String(status || "").toLowerCase();
 const statusLabel = (status) => {
+  const normalized = normalizedStatus(status);
   const labels = {
     skipped: "已跳过",
     passed: "通过",
@@ -120,7 +143,7 @@ const statusLabel = (status) => {
     failure: "失败",
     error: "错误",
   };
-  return labels[normalizedStatus(status)] || "未执行";
+  return labels[normalized] || (normalized ? "结果未知" : "未执行");
 };
 const isSkipped = (step) => normalizedStatus(step?.status) === "skipped";
 const failed = (value) =>

@@ -145,7 +145,9 @@ python manage.py createsuperuser
 | 数据与队列 | `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`、`REDIS_URL` | 当前已确认的数据库键仅为这五个；Django、Celery、Channels 共用相关连接配置。变更后重启 ASGI、worker、Beat。先验证网络与权限，再迁移。 |
 | 遥测 | `ANONYMIZED_TELEMETRY`、`MCP_USE_ANONYMIZED_TELEMETRY` | 关闭 Chroma/mcp-use 匿名遥测；重启 ASGI 与 worker 后生效。 |
 | 单次模型请求 | `LLM_TIMEOUT_SECONDS`，或 LLM 页面配置的 `extra_config.timeout` | 代码未设置时默认 600 秒；`env.example` 显式写 300 秒。传给模型客户端的请求等待配置，不等于整个任务时限；流式请求还受客户端连接 / 读取超时语义影响。 |
-| API 生成验证总时限 | `API_GENERATION_TIMEOUT_SECONDS` | 默认 1800 秒，代码最低 60 秒；覆盖生成、修复和试运行的整个 pipeline。超时不撤销已经发到远端的写请求。 |
+| API 单场景执行时限 | `API_GENERATION_TIMEOUT_SECONDS` | 默认 1800 秒，代码最低 60 秒；从 worker 开始处理计时，覆盖该场景的生成、修复和试运行，不含排队。超时不撤销已经发到远端的写请求。 |
+| API 整批执行时限 | `API_GENERATION_BATCH_TIMEOUT_SECONDS` | 默认 7200 秒；覆盖整批规划及串行子场景，与单场景时限同时生效。 |
+| API 排队时限 | `API_GENERATION_QUEUE_TIMEOUT_SECONDS` | 默认 1800 秒；尚未被 worker 领取时单独计时，不消耗执行预算。修改这三项后重启后端和 Celery。 |
 | WebUI 探索总时限 | `WEBUI_EXPLORATION_TOTAL_TIMEOUT_SECONDS` | 默认 600 秒，代码限制在 60–1800 秒；只覆盖探索阶段。 |
 | 项目知识库任务总时限 | `KNOWLEDGE_TOTAL_TIMEOUT_SECONDS` | 默认 1200 秒，代码限制在 30–1500 秒；从 worker 开始处理计时，不含排队。`PROJECT_KNOWLEDGE_ENABLED=false` 会关闭新任务提交。 |
 | Celery 任务限制配置 | `CELERY_TASK_TIME_LIMIT`（源码，30 分钟） | 与业务总时限独立；当前 solo 池在主进程内执行，不能依赖此配置保证强制中断。仍需各流程的业务超时和执行器中止机制。 |

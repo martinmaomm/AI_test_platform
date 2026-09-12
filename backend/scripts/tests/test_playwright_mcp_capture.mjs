@@ -154,6 +154,94 @@ test('capture is disabled unless the task switch is exactly enabled', () => {
   assert.deepEqual(readNetworkCaptureConfig({}), { enabled: false });
 });
 
+test('document navigation requires exact origin approval, including popup and redirect destinations', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-navigation-'));
+  let capture;
+  try {
+    capture = new NetworkCapture({ directory: root, allowedOrigins: new Set(), autoOrigin: true,
+      targetOrigin: 'http://entry.test:8080', targetHostname: 'entry.test',
+      limits: { maxRequests: 100, maxBodyBytes: 1024, maxTotalBodyBytes: 65536, bodyTimeoutMs: 100 } });
+    const context = new FakeContext();
+    await capture.attachContext(context);
+    const page = fakePage('http://entry.test:8080/');
+    context.emit('page', page);
+    const destination = 'http://entry.test:9090';
+    capture.resolvedOrigins.add(destination); // Automatic API discovery is not navigation consent.
+    const request = fakeRequest({ url: `${destination}/popup?password=not-in-evidence`, page, resourceType: 'document' });
+    const route = new FakeRoute(context, request);
+    let fetches = 0;
+    route.fetch = async () => { fetches++; throw new Error('must not send request before approval'); };
+    const pending = context.routeHandler(route);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(fetches, 0);
+    fs.writeFileSync(path.join(root, 'origin-control.json'), JSON.stringify({
+      version: 1, approved_origins: [], rejected_origins: [destination], cancelled: false,
+    }));
+    await pending;
+    assert.equal(route.aborted, 1);
+    assert.equal(fetches, 0);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'network.jsonl'), 'utf8'), /not-in-evidence/);
+
+    // Redirect responses use the same policy, without sending a second request.
+    const initial = fakeRequest({ url: 'http://entry.test:8080/redirect', page, resourceType: 'document' });
+    const redirect = new FakeRoute(context, initial);
+    assert.equal(await capture.navigationAllowed(redirect, initial, new URL(`${destination}/sso`)), false);
+
+    // Approval releases the same held route without resending an operation.
+    fs.writeFileSync(path.join(root, 'origin-control.json'), JSON.stringify({
+      version: 1, approved_origins: [destination], rejected_origins: [], cancelled: false,
+    }));
+    await context.routeHandler(route);
+    assert.equal(fetches, 0);
+    assert.equal(route.continued, 1);
+  } finally {
+    await capture?.releasePendingRoutes('origin_cancelled');
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real Chrome blocks direct cross-origin document navigation and popups before transmission', { timeout: 60000 }, async (t) => {
+  if (!fs.existsSync(chromePath)) { t.skip('Google Chrome is unavailable'); return; }
+  let packageRoot;
+  try { packageRoot = resolvePlaywrightMcpPackageRoot(); }
+  catch { t.skip('Playwright MCP package is unavailable'); return; }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-navigation-live-'));
+  const received = [];
+  const foreign = http.createServer((req, res) => { received.push(req.url); response(res, 200, 'text/html', 'foreign'); });
+  await new Promise((resolve) => foreign.listen(0, '127.0.0.1', resolve));
+  const foreignOrigin = `http://127.0.0.1:${foreign.address().port}`;
+  const entry = http.createServer((req, res) => {
+    if (req.url === '/redirect') return response(res, 307, 'text/plain', '', { location: `${foreignOrigin}/redirected` });
+    response(res, 200, 'text/html', `<a id="popup" target="_blank" href="${foreignOrigin}/popup">open</a>`);
+  });
+  await new Promise((resolve) => entry.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${entry.address().port}`;
+  let browser;
+  try {
+    const requireFromPackage = createRequire(path.join(packageRoot, 'package.json'));
+    browser = await requireFromPackage('playwright').chromium.launch({ executablePath: chromePath, headless: true });
+    const capture = new NetworkCapture({ directory: root, allowedOrigins: new Set(), targetOrigin: origin,
+      limits: { maxRequests: 100, maxBodyBytes: 1024, maxTotalBodyBytes: 65536, bodyTimeoutMs: 100 } });
+    capture.attachBrowser(browser);
+    const context = await browser.newContext();
+    const foreignPage = await context.newPage();
+    await assert.rejects(foreignPage.goto(`${foreignOrigin}/direct`), /ERR_BLOCKED_BY_CLIENT|ERR_FAILED/);
+    await foreignPage.close();
+    const page = await context.newPage();
+    await page.goto(origin);
+    const popupPromise = context.waitForEvent('page');
+    await page.locator('#popup').click();
+    const popup = await popupPromise;
+    await popup.waitForLoadState('domcontentloaded').catch(() => {});
+    assert.deepEqual(received, []);
+    assert.equal(readJsonLines(path.join(root, 'network.jsonl')).filter((x) => x.event === 'navigation_blocked').length, 2);
+  } finally {
+    await browser?.close();
+    await Promise.all([new Promise((resolve) => entry.close(resolve)), new Promise((resolve) => foreign.close(resolve))]);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('automatic origin mode requires an HTTP entry URL', () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-auto-config-'));
   try {

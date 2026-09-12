@@ -733,10 +733,15 @@ class APITestCaseExecutionDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'execution']
     
     def get_environment_base_url(self, obj):
-        """获取环境base_url"""
-        if obj.execution.environment:
-            web_config = obj.execution.environment.get_api_config()
-            return web_config.get('base_url', '') if web_config else ''
+        """Show the executed target, not a mutable environment's current URL."""
+        snapshot = obj.execution.input_snapshot or {}
+        for item in snapshot.get('cases', []):
+            if not isinstance(item, dict) or item.get('detail_id') != obj.pk:
+                continue
+            options = item.get('options') or {}
+            script = item.get('script') or {}
+            config = script.get('config', {}) if isinstance(script, dict) else {}
+            return options.get('base_url') or config.get('base_url') or ''
         return ''
 
     def get_test_case_description(self, obj):

@@ -14,6 +14,13 @@
 
       <!-- 主内容区域 -->
       <div class="main-content">
+        <el-alert
+          v-if="getHttpRunnerRawResult()?.replay_safety?.safe_to_retry === false"
+          type="warning" :closable="false" show-icon
+          title="本轮可能已产生测试数据，请先核对结果再重新运行"
+          :description="getHttpRunnerRawResult().replay_safety.reason"
+          style="margin-bottom: 12px"
+        />
         <!-- 概览标签页 -->
         <div v-show="activeTab === 'overview'" class="tab-content">
           <div class="overview-section">
@@ -421,8 +428,8 @@
                       <span class="step-error-number">{{ index + 1 }}</span>
                       <span>{{ step.name || `Step ${index + 1}` }}</span>
                     </div>
-                    <span class="status-badge" :class="step.status === 'skipped' ? 'skipped' : 'failed'">
-                      <i :class="step.status === 'skipped' ? 'el-icon-minus' : 'el-icon-close'"></i>
+                    <span class="status-badge" :class="['skipped', 'unknown'].includes(step.status) ? step.status : 'failed'">
+                      <i :class="['skipped', 'unknown'].includes(step.status) ? 'el-icon-minus' : 'el-icon-close'"></i>
                       {{ apiStepLabel(step) }}
                     </span>
                   </div>
@@ -533,7 +540,11 @@ const getStatusText = (status) => {
     'failed': '失败',
     'error': '错误',
     'running': '执行中',
-    'pending': '等待中'
+    'pending': '等待中',
+    'skipped': '已跳过',
+    'unknown': '结果未知',
+    'stopped': '已停止',
+    'cancelled': '已取消'
   }
   return statusMap[status] || '未知'
 }
@@ -878,6 +889,7 @@ const getHttpRunnerStepDatas = () => {
 
 const apiStepLabel = (step) => ({
   passed: '通过', failed: '断言失败', error: '执行错误', skipped: '已跳过',
+  unknown: '结果未知，请核对测试数据', running: '执行中',
 }[step.status] || (step.success ? '通过' : '失败'))
 
 const getHttpRunnerConfigVars = () => {

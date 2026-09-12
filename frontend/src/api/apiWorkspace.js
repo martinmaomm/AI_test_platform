@@ -53,6 +53,14 @@ export const debugApiWorkspace = async (projectId, workspaceId, payload) => {
   return response.data;
 };
 
+export const cancelApiWorkspace = async (projectId, workspaceId, revision) => {
+  const response = await api.post(
+    `${basePath(projectId)}${workspaceId}/cancel/`,
+    { revision },
+  );
+  return response.data;
+};
+
 export const saveApiWorkspace = async (projectId, workspaceId, payload) => {
   const response = await api.post(
     `${basePath(projectId)}${workspaceId}/save/`,

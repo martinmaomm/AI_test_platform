@@ -8,8 +8,6 @@ import ast
 import builtins
 import json
 from datetime import timedelta
-import subprocess
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
@@ -580,14 +578,11 @@ def test_export_is_standalone_python_source_with_the_same_runtime_core():
 
 def test_platform_runner_uses_controlled_json_worker_with_hard_deadline():
     case = {"config": {"base_url": "https://api.example.test"}, "teststeps": [{"request": {"url": "/health"}}]}
-    worker_result = {"success": True, "status": "passed", "step_datas": []}
-    with patch("api_testing.requests_runner.subprocess.run", return_value=SimpleNamespace(stdout=json.dumps(worker_result), stderr="", returncode=0)) as run:
-        result = requests_runner("platform", json.dumps(case), options={"total_timeout": 1})
-    assert result == worker_result
-    payload = json.loads(run.call_args.kwargs["input"])
-    assert payload["case"]["teststeps"][0]["request"]["method"] == "GET"
-    assert run.call_args.kwargs["timeout"] == 3.0
-    assert run.call_args.kwargs["check"] is False
+    with patch("api_testing.requests_runner.subprocess.Popen") as popen:
+        result = requests_runner("platform", json.dumps(case), should_cancel=lambda: True)
+    popen.assert_not_called()
+    assert result["error_type"] == "Cancelled"
+    assert result["step_datas"][0]["status"] == "skipped"
 
 
 def test_platform_runner_hard_timeout_preserves_unknown_step_boundary():
@@ -595,9 +590,10 @@ def test_platform_runner_hard_timeout_preserves_unknown_step_boundary():
         {"name": "in-flight", "request": {"url": "/first"}},
         {"name": "not-run", "request": {"url": "/second"}},
     ]}
-    with patch("api_testing.requests_runner.subprocess.run", side_effect=subprocess.TimeoutExpired("requests_worker", 3)):
-        result = requests_runner("hard-timeout", json.dumps(case), options={"total_timeout": 1})
+    with patch("api_testing.requests_runner.subprocess.Popen") as popen:
+        result = requests_runner("hard-timeout", json.dumps(case), hard_timeout_seconds=0)
+    popen.assert_not_called()
     assert result["status"] == "error"
-    assert result["step_datas"] == []
+    assert [step["status"] for step in result["step_datas"]] == ["skipped", "skipped"]
     assert "硬总超时" in result["error"]
-    assert "是否生效未知" in result["error"]
+    assert "副作用状态未知" in result["error"]

@@ -38,6 +38,28 @@
         :closable="false"
         show-icon
       />
+      <el-alert
+        v-if="assertionReview.requiresConfirmation"
+        data-testid="api-candidate-assertion-review"
+        title="候选调整了既有断言。请核对差异与原因，并在采用时明确确认；确认前不会采用、调试或保存该候选。"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
+      <ul v-if="assertionReview.changes.length" class="review-list">
+        <li v-for="change in assertionReview.changes" :key="change">断言变更：{{ change }}</li>
+      </ul>
+      <ul v-if="assertionReview.warnings.length" class="review-list">
+        <li v-for="warning in assertionReview.warnings" :key="warning">提示：{{ warning }}</li>
+      </ul>
+      <details v-if="assertionProvenance.length" class="assertion-provenance">
+        <summary>查看断言来源</summary>
+        <ul>
+          <li v-for="entry in assertionProvenance" :key="`${entry.step_index}-${entry.endpoint_id}`">
+            步骤 {{ Number(entry.step_index) + 1 }}：{{ provenanceText(entry) }}
+          </li>
+        </ul>
+      </details>
       <el-button
         type="primary"
         :disabled="disabled || busy || submitting || generationPending"
@@ -110,8 +132,8 @@
 </template>
 
 <script setup>
-import { nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { shouldClearSubmittedMessage } from "@/views/api-testing/apiWorkspace";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { candidateAssertionReview, shouldClearSubmittedMessage } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -138,6 +160,19 @@ const message = ref("");
 const messageInput = ref(null);
 const mode = ref("generate");
 const submitting = ref(false);
+const assertionReview = computed(() => candidateAssertionReview(props.candidate));
+const assertionProvenance = computed(() =>
+  Array.isArray(props.candidate?.assertion_provenance)
+    ? props.candidate.assertion_provenance.filter(
+        (entry) => entry && Number.isInteger(entry.step_index) && Array.isArray(entry.assertions),
+      )
+    : [],
+);
+const provenanceText = (entry) =>
+  entry.assertions
+    .filter((item) => item && typeof item === "object")
+    .map((item) => `${item.selector || "未记录选择器"}（${item.source || "未记录来源"}）`)
+    .join("；") || "未记录断言";
 const send = async (nextMode) => {
   if (
     props.generationDisabled ||
@@ -222,6 +257,11 @@ defineExpose({ clearSubmittedMessage, focusInput });
   padding: 12px;
   display: grid;
   gap: 8px;
+}
+.review-list,
+.assertion-provenance ul {
+  margin: 8px 0;
+  padding-left: 20px;
 }
 .candidate p,
 .hint {

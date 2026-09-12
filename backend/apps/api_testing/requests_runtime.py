@@ -165,6 +165,23 @@ def normalize_case(value: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             raise CaseContractError(f"{field}.request 必须是 JSON 对象")
         request = deepcopy(dict(request))
+        phase = step.get("phase", "main")
+        if phase not in {"main", "cleanup"}:
+            raise CaseContractError(f"{field}.phase 只能是 main 或 cleanup")
+        if phase == "cleanup":
+            requires = step.get("requires")
+            if not isinstance(requires, list) or not requires:
+                raise CaseContractError(f"{field}.requires 必须是非空变量名数组")
+            invalid_requires = [
+                name for name in requires
+                if not isinstance(name, str) or not _VARIABLE_NAME.fullmatch(name)
+            ]
+            if invalid_requires:
+                raise CaseContractError(f"{field}.requires 包含无效变量名：{invalid_requires[0]!r}")
+            if len(set(requires)) != len(requires):
+                raise CaseContractError(f"{field}.requires 不允许重复变量名")
+        elif "requires" in step:
+            raise CaseContractError(f"{field}.requires 仅允许 cleanup 步骤使用")
         supported_request_fields = {
             "method", "url", "headers", "params", "json", "data", "raw",
             "timeout", "allow_redirects", "cookies", "verify",
@@ -220,6 +237,28 @@ def normalize_case(value: Any) -> dict[str, Any]:
         for position, validator in enumerate(step["validate"]):
             validate_selector(_parse_validator(validator, f"{field}.validate[{position}]")["check"])
         step.pop("validators", None)
+        if phase == "cleanup":
+            step["phase"] = "cleanup"
+            step["requires"] = list(requires)
+            cleanup_location_variables = set().union(*(
+                _variable_names(request.get(key))
+                for key in ("url", "params", "json", "data", "raw")
+                if key in request
+            ))
+            undeclared = cleanup_location_variables.difference(requires)
+            if undeclared:
+                raise CaseContractError(
+                    f"{field} 清理定位载荷引用了未在 requires 声明的变量：{', '.join(sorted(undeclared))}"
+                )
+            if not cleanup_location_variables.intersection(requires):
+                raise CaseContractError(
+                    f"{field}.requires 至少一个变量必须实际用于 url/params/json/data/raw 清理定位载荷"
+                )
+        else:
+            if "phase" in raw_step:
+                step["phase"] = "main"
+            else:
+                step.pop("phase", None)
         normalised_steps.append(step)
 
     result = deepcopy(raw)
@@ -292,7 +331,10 @@ def _validate_known_variables(case: Mapping[str, Any], variables: Mapping[str, A
         missing = _variable_names(value).difference(available)
         if missing:
             raise CaseContractError(f"未知变量：{', '.join(sorted(missing))}")
-    for index, step in enumerate(case["teststeps"], start=1):
+    indexed_steps = list(enumerate(case["teststeps"], start=1))
+    execution_steps = [item for item in indexed_steps if item[1].get("phase", "main") == "main"]
+    execution_steps.extend(item for item in indexed_steps if item[1].get("phase", "main") == "cleanup")
+    for index, step in execution_steps:
         request = step["request"]
         for key in ("url", "params", "json", "data", "raw"):
             if key in request:
@@ -870,6 +912,7 @@ def _validator_record(validator: Mapping[str, Any], context: Mapping[str, Any], 
 def _empty_step(
     name: str, *, status: str, error: str = "", log: str = "",
     request_view: Mapping[str, Any] | None = None, elapsed_ms: float = 0,
+    phase: str = "main",
 ) -> dict[str, Any]:
     validators = {"validate_extractor": []}
     req_resps: list[dict[str, Any]] = []
@@ -881,7 +924,7 @@ def _empty_step(
                 "url": request_view.get("url", ""), "elapsed_ms": elapsed_ms, "error": error,
             },
         })
-    return {
+    result = {
         "name": name,
         "success": False,
         "status": status,
@@ -892,9 +935,45 @@ def _empty_step(
         "error": error,
         "log": log,
     }
+    if phase == "cleanup":
+        result["phase"] = "cleanup"
+    return result
 
 
-def _report(*, script_id: str, name: str, started_wall: datetime, started_monotonic: float, steps: list[dict[str, Any]], error: str = "", error_type: str = "") -> dict[str, Any]:
+def _cleanup_status(steps: list[dict[str, Any]], cleanup_declared: bool) -> str:
+    cleanup_steps = [step for step in steps if step.get("phase") == "cleanup"]
+    if not cleanup_declared:
+        return "not_required"
+    if not cleanup_steps or all(step.get("status") == "skipped" for step in cleanup_steps):
+        return "not_run"
+    if any(step.get("status") in {"failed", "error", "unknown"} for step in cleanup_steps):
+        return "failed"
+    if any(step.get("status") == "skipped" for step in cleanup_steps):
+        return "incomplete"
+    return "completed"
+
+
+def _replay_safety(*, success: bool, side_effects: bool, cleanup_status: str) -> dict[str, Any]:
+    if success:
+        safe_to_retry = True
+        reason = "执行成功，无需失败重跑"
+    elif side_effects:
+        safe_to_retry = False
+        reason = "已派发可能产生副作用的请求，无法严格证明回滚完整，禁止自动重跑"
+    else:
+        safe_to_retry = True
+        reason = "未派发可能产生副作用的请求，可安全重跑"
+    return {
+        "safe_to_retry": safe_to_retry,
+        "reason": reason,
+        "side_effects": side_effects,
+        "cleanup_status": cleanup_status,
+    }
+
+
+def _report(*, script_id: str, name: str, started_wall: datetime, started_monotonic: float,
+            steps: list[dict[str, Any]], error: str = "", error_type: str = "",
+            side_effects: bool = False, cleanup_declared: bool = False) -> dict[str, Any]:
     duration = round(time.monotonic() - started_monotonic, 6)
     succeeded = sum(1 for step in steps if step["status"] == "passed")
     failed = sum(1 for step in steps if step["status"] == "failed")
@@ -903,6 +982,7 @@ def _report(*, script_id: str, name: str, started_wall: datetime, started_monoto
     success = not error and failed == 0 and errored == 0 and skipped == 0
     status = "passed" if success else ("failed" if error_type in {"ValidationFailure", "ExtractionFailure"} else "error")
     log = "\n".join(step["log"] for step in steps if step.get("log"))
+    cleanup_status = _cleanup_status(steps, cleanup_declared)
     return {
         "success": success,
         "status": status,
@@ -917,6 +997,9 @@ def _report(*, script_id: str, name: str, started_wall: datetime, started_monoto
         "error": error,
         "error_type": error_type,
         "log": log,
+        "replay_safety": _replay_safety(
+            success=success, side_effects=side_effects, cleanup_status=cleanup_status,
+        ),
     }
 
 
@@ -930,25 +1013,53 @@ def build_error_report(script_id: str, error: str, error_type: str = "CaseContra
     )
 
 
-def hard_timeout_report(script_id: str, case: Mapping[str, Any], total_timeout: float) -> dict[str, Any]:
-    """Report a killed worker without inventing any per-step execution state.
-
-    The current worker protocol has no checkpoint stream. A process kill cannot
-    establish which requests reached a remote service, so callers receive no
-    fabricated ``step_datas``. A future protocol may append verified completed
-    checkpoints, one in-flight error and then skipped steps, but only after it
-    actually transports that evidence to the parent process.
-    """
+def interrupted_report(script_id: str, case: Mapping[str, Any], error_type: str, message: str,
+                       *, partial_report: Mapping[str, Any] | None = None,
+                       side_effects: bool = False) -> dict[str, Any]:
+    """Build a terminal report from worker evidence without guessing outcomes."""
     started_wall = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
+    cleanup_declared = any(step.get("phase", "main") == "cleanup" for step in case["teststeps"])
+    if isinstance(partial_report, Mapping):
+        raw_steps = partial_report.get("step_datas", [])
+        steps = deepcopy(raw_steps) if isinstance(raw_steps, list) else []
+        previous_safety = partial_report.get("replay_safety", {})
+        side_effects = side_effects or bool(
+            previous_safety.get("side_effects") if isinstance(previous_safety, Mapping) else False
+        )
+    else:
+        steps = [
+            _empty_step(
+                step["name"], status="skipped", error="执行被中止，未发送请求",
+                log=f"步骤 {index} skipped：执行被中止",
+                phase=step.get("phase", "main"),
+            )
+            for index, step in enumerate(case["teststeps"], start=1)
+        ]
+    report = _report(
+        script_id=script_id, name=str(case["config"].get("name") or script_id),
+        started_wall=started_wall, started_monotonic=started_monotonic, steps=steps,
+        error=message, error_type=error_type, side_effects=side_effects,
+        cleanup_declared=cleanup_declared,
+    )
+    if isinstance(partial_report, Mapping):
+        if isinstance(partial_report.get("time"), Mapping):
+            report["time"]["start_at"] = partial_report["time"].get("start_at", report["time"]["start_at"])
+        report["log"] = "\n".join(filter(None, [report.get("log", ""), message]))
+    return report
+
+
+def hard_timeout_report(script_id: str, case: Mapping[str, Any], total_timeout: float,
+                        *, partial_report: Mapping[str, Any] | None = None,
+                        side_effects: bool = False) -> dict[str, Any]:
+    """Report a killed worker while preserving completed and in-flight checkpoints."""
     message = (
         f"平台硬总超时（{total_timeout:g} 秒）；已终止并回收本地 worker。"
-        "逐步结果未完整返回，远端请求是否生效未知；如用例包含写操作，请检查测试数据。"
+        "当前请求结果及副作用状态未知；未执行步骤已标记 skipped，请检查测试数据与清理状态。"
     )
-    return _report(
-        script_id=script_id, name=str(case["config"].get("name") or script_id),
-        started_wall=started_wall, started_monotonic=started_monotonic, steps=[],
-        error=message, error_type="HardTimeout",
+    return interrupted_report(
+        script_id, case, "HardTimeout", message,
+        partial_report=partial_report, side_effects=side_effects,
     )
 
 
@@ -959,7 +1070,8 @@ def resolve_total_timeout(case: Mapping[str, Any], options: Mapping[str, Any] | 
     return _runtime_options(case, options)["total_timeout"]
 
 
-def run_case(script_id: str, script_content: Any, base_url: str | None = None, options: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def run_case(script_id: str, script_content: Any, base_url: str | None = None,
+             options: Mapping[str, Any] | None = None, on_checkpoint: Any = None) -> dict[str, Any]:
     """Execute one normalised case with one isolated ``requests.Session``.
 
     A failure never raises into callers: it becomes a stable report. The
@@ -969,7 +1081,7 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
     """
     started_wall = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
-    steps: list[dict[str, Any]] = []
+    completed_steps: dict[int, dict[str, Any]] = {}
     try:
         if options is not None and not isinstance(options, Mapping):
             raise CaseContractError("options 必须是 JSON 对象")
@@ -992,140 +1104,246 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None, o
         unique_extracts = _validate_known_variables(case, variables, headers=runtime["headers"])
         resolved_base_url = _substitute(base_url if base_url is not None else config.get("base_url"), variables)
     except (CaseContractError, UnsupportedCaseFeature) as exc:
-        return _report(script_id=script_id, name="", started_wall=started_wall, started_monotonic=started_monotonic, steps=steps, error=str(exc), error_type=type(exc).__name__)
+        return _report(script_id=script_id, name="", started_wall=started_wall,
+                       started_monotonic=started_monotonic, steps=[], error=str(exc),
+                       error_type=type(exc).__name__)
 
     session = requests.Session()
     deadline = started_monotonic + runtime["total_timeout"]
-    terminal_error = ""
-    terminal_error_type = ""
-    try:
-        for index, step in enumerate(case["teststeps"], start=1):
-            if terminal_error:
-                steps.append(_empty_step(step["name"], status="skipped", error="前序步骤失败，未发送请求", log=f"步骤 {index} skipped：前序步骤失败"))
-                continue
-            attempted_request: dict[str, Any] | None = None
-            request_started: float | None = None
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("用例总超时，未发送请求")
-                raw_request = deepcopy(step["request"])
-                raw_headers = _merge_headers(runtime["headers"], raw_request.pop("headers", {}))
-                request = _substitute(raw_request, variables)
-                url = _absolute_http_url(request.pop("url"), resolved_base_url)
-                _assert_allowed_origin(url, runtime["allowed_origin"])
-                # Config headers are global but substitutions must still use
-                # the variables currently in scope.  This keeps runtime,
-                # static validation and Python export semantics aligned.
-                headers = _http_headers(_substitute(raw_headers, variables))
-                params = request.pop("params", None)
-                raw_request_timeout = request.pop("timeout", None)
-                if raw_request_timeout is None:
-                    connect_timeout, read_timeout = runtime["connect_timeout"], runtime["read_timeout"]
-                else:
-                    request_timeout = _positive_timeout(
-                        raw_request_timeout, f"步骤 {index}.request.timeout", MAX_REQUEST_TIMEOUT_SECONDS,
-                    )
-                    connect_timeout = read_timeout = request_timeout
-                request_verify = request.pop("verify", runtime["verify"])
-                request_redirects = request.pop("allow_redirects", True)
-                request_cookies = request.pop("cookies", None)
-                if not isinstance(request_verify, bool) or not isinstance(request_redirects, bool):
-                    raise CaseContractError(f"步骤 {index} 的 verify/allow_redirects 必须是布尔值")
-                if request_cookies is not None and not isinstance(request_cookies, Mapping):
-                    raise CaseContractError(f"步骤 {index} 的 cookies 必须是 JSON 对象")
-                body_keys = [key for key in ("json", "data", "raw") if key in request and request[key] is not None]
-                request_kwargs: dict[str, Any] = {
-                    "method": request.pop("method"), "url": url, "headers": headers,
-                    "params": params, "verify": request_verify, "allow_redirects": request_redirects,
-                    "timeout": (min(connect_timeout, remaining / 2), min(read_timeout, remaining / 2)),
-                }
-                if request_cookies is not None:
-                    request_kwargs["cookies"] = dict(request_cookies)
-                if body_keys:
-                    key = body_keys[0]
-                    request_kwargs["data" if key == "raw" else key] = request.pop(key)
-                if request:
-                    raise UnsupportedCaseFeature(f"步骤 {index} request 含不支持字段：{', '.join(sorted(request))}")
-                request_body = request_kwargs.get("json", request_kwargs.get("data"))
-                attempted_request = {
-                    "method": request_kwargs["method"], "url": url, "headers": headers,
-                    "params": params, "body": request_body,
-                }
-                request_started = time.monotonic()
-                response = session.request(**request_kwargs)
-                body = _response_body(response)
-                response_headers = dict(getattr(response, "headers", {}) or {})
-                status_code = getattr(response, "status_code", None)
-                response_context = {
-                    "body": body, "status_code": status_code, "headers": response_headers,
-                    "extract": variables,
-                }
-                exported: dict[str, Any] = {}
-                extraction_results: list[dict[str, Any]] = []
-                extraction_errors: list[str] = []
-                for name, selector in step["extract"].items():
-                    try:
-                        exported[name] = deepcopy(_select(
-                            selector, response_context, variables=variables,
-                            require_unique=((index, name) in unique_extracts or selector_has_filter(selector)),
-                        ))
-                        extraction_results.append({"name": name, "selector": selector, "passed": True})
-                    except (CaseContractError, KeyError, TypeError, ValueError) as exc:
-                        message = f"步骤 {index} 提取变量 {name} 失败：{exc}"
-                        extraction_errors.append(message)
-                        extraction_results.append({"name": name, "selector": selector, "passed": False, "error": str(exc)})
-                # A partially extracted response is useful evidence, but never a
-                # source of variables for later requests after extraction failed.
-                if not extraction_errors:
-                    variables.update(exported)
-                    response_context["extract"] = variables
-                records = [
-                    _validator_record(
-                        _parse_validator(raw_validator, f"步骤 {index} 断言"), response_context, variables,
-                    )
-                    for raw_validator in step["validate"]
-                ]
-                passed = all(record["passed"] for record in records)
-                elapsed = _elapsed_ms(response, request_started)
-                response_view = {
-                    "status_code": status_code, "headers": response_headers, "body": body,
-                    "content": getattr(response, "text", None), "url": getattr(response, "url", url), "elapsed_ms": elapsed,
-                }
-                validators = {"validate_extractor": records}
-                passed = passed and not extraction_errors
-                step_error = (extraction_errors[0] if extraction_errors else "") or (
-                    "" if passed else next(record["message"] for record in records if not record["passed"])
+    primary_error = ""
+    primary_error_type = ""
+    cleanup_error = ""
+    cleanup_error_type = ""
+    side_effects = False
+    successful_main_extracts: set[str] = set()
+    indexed_steps = list(enumerate(case["teststeps"], start=1))
+    main_steps = [item for item in indexed_steps if item[1].get("phase", "main") == "main"]
+    cleanup_steps = [item for item in indexed_steps if item[1].get("phase", "main") == "cleanup"]
+    execution_steps = main_steps + cleanup_steps
+    cleanup_declared = bool(cleanup_steps)
+
+    def current_report(current_index: int | None = None) -> dict[str, Any]:
+        report_steps: list[dict[str, Any]] = []
+        for index, step in execution_steps:
+            if index in completed_steps:
+                report_steps.append(deepcopy(completed_steps[index]))
+            elif index == current_index:
+                report_steps.append(_empty_step(
+                    step["name"], status="unknown",
+                    error="请求执行中，最终结果及副作用状态未知",
+                    log=f"步骤 {index} unknown：等待 worker 完成 checkpoint",
+                    phase=step.get("phase", "main"),
+                ))
+            else:
+                report_steps.append(_empty_step(
+                    step["name"], status="skipped", error="尚未执行",
+                    log=f"步骤 {index} skipped：尚未执行",
+                    phase=step.get("phase", "main"),
+                ))
+        error = primary_error or cleanup_error or ("执行尚未完成" if current_index is not None else "")
+        error_type = primary_error_type or cleanup_error_type
+        report = _report(
+            script_id=script_id, name=str(config.get("name") or script_id),
+            started_wall=started_wall, started_monotonic=started_monotonic,
+            steps=report_steps, error=error, error_type=error_type,
+            side_effects=side_effects, cleanup_declared=cleanup_declared,
+        )
+        report["checkpoint"] = {
+            "completed_steps": len(completed_steps),
+            "total_steps": len(execution_steps),
+            "current_step": current_index,
+        }
+        return report
+
+    def emit(event: str, index: int, *, current: bool = False) -> None:
+        if on_checkpoint is None:
+            return
+        on_checkpoint({
+            "event": event,
+            "step_index": index,
+            "report": current_report(index if current else None),
+        })
+
+    def complete_skipped(index: int, step: Mapping[str, Any], message: str) -> None:
+        completed_steps[index] = _empty_step(
+            step["name"], status="skipped", error=message,
+            log=f"步骤 {index} skipped：{message}", phase=step.get("phase", "main"),
+        )
+        emit("step_completed", index)
+
+    def execute_step(index: int, step: Mapping[str, Any]) -> tuple[str, str]:
+        nonlocal side_effects
+        phase = step.get("phase", "main")
+        emit("step_started", index, current=True)
+        attempted_request: dict[str, Any] | None = None
+        request_started: float | None = None
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("用例总超时，未发送请求")
+            raw_request = deepcopy(step["request"])
+            raw_headers = _merge_headers(runtime["headers"], raw_request.pop("headers", {}))
+            request = _substitute(raw_request, variables)
+            url = _absolute_http_url(request.pop("url"), resolved_base_url)
+            _assert_allowed_origin(url, runtime["allowed_origin"])
+            headers = _http_headers(_substitute(raw_headers, variables))
+            params = request.pop("params", None)
+            raw_request_timeout = request.pop("timeout", None)
+            if raw_request_timeout is None:
+                connect_timeout, read_timeout = runtime["connect_timeout"], runtime["read_timeout"]
+            else:
+                request_timeout = _positive_timeout(
+                    raw_request_timeout, f"步骤 {index}.request.timeout", MAX_REQUEST_TIMEOUT_SECONDS,
                 )
-                steps.append({
-                    "name": step["name"], "success": passed, "status": "passed" if passed else "failed",
-                    "data": {"req_resps": [{"request": attempted_request, "response": response_view}], "validators": validators, "stat": {"elapsed_ms": elapsed, "response_time_ms": elapsed}},
-                    "validators": validators, "export_vars": exported, "extraction_results": extraction_results,
-                    "attachment": {}, "error": step_error,
-                    "log": f"步骤 {index} {'成功' if passed else '失败'}：{request_kwargs['method']} {url}",
-                })
-                if not passed:
-                    terminal_error = step_error
-                    terminal_error_type = "ExtractionFailure" if extraction_errors else "ValidationFailure"
-            except TimeoutError as exc:
-                terminal_error, terminal_error_type = str(exc), "Timeout"
-                elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0
-                steps.append(_empty_step(step["name"], status="error", error=terminal_error, log=f"步骤 {index} 超时：{terminal_error}", request_view=attempted_request, elapsed_ms=elapsed))
-            except (CaseContractError, UnsupportedCaseFeature) as exc:
-                terminal_error, terminal_error_type = str(exc), type(exc).__name__
-                elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0
-                steps.append(_empty_step(step["name"], status="error", error=terminal_error, log=f"步骤 {index} 执行错误：{terminal_error}", request_view=attempted_request, elapsed_ms=elapsed))
-            except requests.RequestException as exc:
-                terminal_error, terminal_error_type = str(exc), type(exc).__name__
-                elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0
-                steps.append(_empty_step(step["name"], status="error", error=terminal_error, log=f"步骤 {index} 请求错误：{terminal_error}", request_view=attempted_request, elapsed_ms=elapsed))
-            except Exception as exc:  # requests adapters may raise implementation-specific errors.
-                terminal_error, terminal_error_type = str(exc), type(exc).__name__
-                elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0
-                steps.append(_empty_step(step["name"], status="error", error=terminal_error, log=f"步骤 {index} 执行错误：{terminal_error}", request_view=attempted_request, elapsed_ms=elapsed))
+                connect_timeout = read_timeout = request_timeout
+            request_verify = request.pop("verify", runtime["verify"])
+            request_redirects = request.pop("allow_redirects", True)
+            request_cookies = request.pop("cookies", None)
+            if not isinstance(request_verify, bool) or not isinstance(request_redirects, bool):
+                raise CaseContractError(f"步骤 {index} 的 verify/allow_redirects 必须是布尔值")
+            if request_cookies is not None and not isinstance(request_cookies, Mapping):
+                raise CaseContractError(f"步骤 {index} 的 cookies 必须是 JSON 对象")
+            body_keys = [key for key in ("json", "data", "raw") if key in request and request[key] is not None]
+            request_kwargs: dict[str, Any] = {
+                "method": request.pop("method"), "url": url, "headers": headers,
+                "params": params, "verify": request_verify, "allow_redirects": request_redirects,
+                "timeout": (min(connect_timeout, remaining / 2), min(read_timeout, remaining / 2)),
+            }
+            if request_cookies is not None:
+                request_kwargs["cookies"] = dict(request_cookies)
+            if body_keys:
+                key = body_keys[0]
+                request_kwargs["data" if key == "raw" else key] = request.pop(key)
+            if request:
+                raise UnsupportedCaseFeature(f"步骤 {index} request 含不支持字段：{', '.join(sorted(request))}")
+            request_body = request_kwargs.get("json", request_kwargs.get("data"))
+            attempted_request = {
+                "method": request_kwargs["method"], "url": url, "headers": headers,
+                "params": params, "body": request_body,
+            }
+            if request_kwargs["method"] not in {"GET", "HEAD", "OPTIONS"}:
+                side_effects = True
+            emit("request_dispatched", index, current=True)
+            request_started = time.monotonic()
+            response = session.request(**request_kwargs)
+            body = _response_body(response)
+            response_headers = dict(getattr(response, "headers", {}) or {})
+            status_code = getattr(response, "status_code", None)
+            response_context = {
+                "body": body, "status_code": status_code, "headers": response_headers,
+                "extract": variables,
+            }
+            exported: dict[str, Any] = {}
+            extraction_results: list[dict[str, Any]] = []
+            extraction_errors: list[str] = []
+            for name, selector in step["extract"].items():
+                try:
+                    exported[name] = deepcopy(_select(
+                        selector, response_context, variables=variables,
+                        require_unique=((index, name) in unique_extracts or selector_has_filter(selector)),
+                    ))
+                    extraction_results.append({"name": name, "selector": selector, "passed": True})
+                except (CaseContractError, KeyError, TypeError, ValueError) as exc:
+                    message = f"步骤 {index} 提取变量 {name} 失败：{exc}"
+                    extraction_errors.append(message)
+                    extraction_results.append({"name": name, "selector": selector, "passed": False, "error": str(exc)})
+            if not extraction_errors:
+                variables.update(exported)
+                response_context["extract"] = variables
+                if phase == "main":
+                    successful_main_extracts.update(exported)
+            records = [
+                _validator_record(
+                    _parse_validator(raw_validator, f"步骤 {index} 断言"), response_context, variables,
+                )
+                for raw_validator in step["validate"]
+            ]
+            passed = all(record["passed"] for record in records) and not extraction_errors
+            elapsed = _elapsed_ms(response, request_started)
+            response_view = {
+                "status_code": status_code, "headers": response_headers, "body": body,
+                "content": getattr(response, "text", None), "url": getattr(response, "url", url),
+                "elapsed_ms": elapsed,
+            }
+            validators = {"validate_extractor": records}
+            step_error = (extraction_errors[0] if extraction_errors else "") or (
+                "" if passed else next(record["message"] for record in records if not record["passed"])
+            )
+            result_step = {
+                "name": step["name"], "success": passed, "status": "passed" if passed else "failed",
+                "data": {"req_resps": [{"request": attempted_request, "response": response_view}],
+                         "validators": validators,
+                         "stat": {"elapsed_ms": elapsed, "response_time_ms": elapsed}},
+                "validators": validators, "export_vars": exported,
+                "extraction_results": extraction_results, "attachment": {}, "error": step_error,
+                "log": f"步骤 {index} {'成功' if passed else '失败'}：{request_kwargs['method']} {url}",
+            }
+            if phase == "cleanup":
+                result_step["phase"] = "cleanup"
+            completed_steps[index] = result_step
+            if passed:
+                return "", ""
+            return step_error, "ExtractionFailure" if extraction_errors else "ValidationFailure"
+        except TimeoutError as exc:
+            step_error, step_error_type = str(exc), "Timeout"
+            log_kind = "超时"
+        except (CaseContractError, UnsupportedCaseFeature) as exc:
+            step_error, step_error_type = str(exc), type(exc).__name__
+            log_kind = "执行错误"
+        except requests.RequestException as exc:
+            step_error, step_error_type = str(exc), type(exc).__name__
+            log_kind = "请求错误"
+        except Exception as exc:  # requests adapters may raise implementation-specific errors.
+            step_error, step_error_type = str(exc), type(exc).__name__
+            log_kind = "执行错误"
+        elapsed = round((time.monotonic() - request_started) * 1000, 3) if request_started is not None else 0
+        completed_steps[index] = _empty_step(
+            step["name"], status="error", error=step_error,
+            log=f"步骤 {index} {log_kind}：{step_error}", request_view=attempted_request,
+            elapsed_ms=elapsed, phase=phase,
+        )
+        return step_error, step_error_type
+
+    try:
+        for index, step in main_steps:
+            if primary_error:
+                complete_skipped(index, step, "前序 main 步骤失败，未发送请求")
+                continue
+            primary_error, primary_error_type = execute_step(index, step)
+            emit("step_completed", index)
+
+        for index, step in cleanup_steps:
+            if deadline - time.monotonic() <= 0:
+                message = "cleanup 未执行：用例总期限已耗尽，未发送请求"
+                complete_skipped(index, step, message)
+                if not primary_error and not cleanup_error:
+                    cleanup_error, cleanup_error_type = message, "CleanupUnavailable"
+                continue
+            missing_requires = sorted(set(step["requires"]).difference(successful_main_extracts))
+            if missing_requires:
+                message = (
+                    "cleanup 未执行：requires 变量必须来自本轮成功 main extract，缺少 "
+                    + ", ".join(missing_requires)
+                )
+                complete_skipped(index, step, message)
+                if not primary_error and not cleanup_error:
+                    cleanup_error, cleanup_error_type = message, "CleanupUnavailable"
+                continue
+            step_error, step_error_type = execute_step(index, step)
+            emit("step_completed", index)
+            if step_error and not cleanup_error:
+                cleanup_error, cleanup_error_type = step_error, step_error_type
     finally:
         session.close()
-    return _report(script_id=script_id, name=str(config.get("name") or script_id), started_wall=started_wall, started_monotonic=started_monotonic, steps=steps, error=terminal_error, error_type=terminal_error_type)
+    ordered_results = [completed_steps[index] for index, _step in execution_steps]
+    terminal_error = primary_error or cleanup_error
+    terminal_error_type = primary_error_type or cleanup_error_type
+    return _report(
+        script_id=script_id, name=str(config.get("name") or script_id),
+        started_wall=started_wall, started_monotonic=started_monotonic, steps=ordered_results,
+        error=terminal_error, error_type=terminal_error_type, side_effects=side_effects,
+        cleanup_declared=cleanup_declared,
+    )
 
 
 def export_python(value: Any) -> str:
@@ -1177,5 +1395,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "CaseContractError", "UnsupportedCaseFeature", "normalize_case", "run_case", "export_python",
-    "build_error_report", "hard_timeout_report", "resolve_total_timeout", "validate_selector", "selector_has_filter",
+    "build_error_report", "hard_timeout_report", "interrupted_report", "resolve_total_timeout",
+    "validate_selector", "selector_has_filter",
 ]

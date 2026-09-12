@@ -350,6 +350,98 @@ def draft_changes(previous: dict[str, Any], current: dict[str, Any]) -> list[str
     return changes or ['未变更请求结构；保留上一轮候选进行复测']
 
 
+def assertion_provenance(candidate: dict[str, Any], *, endpoints: list[dict[str, Any]],
+                         user_draft: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Build a conservative server-owned sidecar; model provenance is ignored."""
+    selected = {item.get('id'): item for item in endpoints if isinstance(item, dict)}
+    user_assertions = step_assertions(user_draft or {})
+    occurrences: dict[str, int] = {}
+    result: list[dict[str, Any]] = []
+    for step_index, step in enumerate(candidate.get('teststeps') or []):
+        request = step.get('request') if isinstance(step, dict) else {}
+        request = request if isinstance(request, dict) else {}
+        endpoint_id = step.get('endpoint_id') if isinstance(step, dict) else None
+        method = str(request.get('method') or '').upper()
+        identity_base = (
+            f'endpoint:{endpoint_id}:method:{method}' if isinstance(endpoint_id, int)
+            else f"request:{method}:url:{request.get('url', '')}"
+        )
+        occurrence = occurrences.get(identity_base, 0)
+        occurrences[identity_base] = occurrence + 1
+        identity = f'{identity_base}:occurrence:{occurrence}'
+        entries: list[dict[str, Any]] = []
+        for assertion_index, assertion in enumerate(step.get('validate') or []):
+            comparator, selector, expected = '', '', None
+            if isinstance(assertion, dict) and len(assertion) == 1:
+                comparator, operands = next(iter(assertion.items()))
+                if isinstance(operands, list) and len(operands) == 2:
+                    selector, expected = operands
+            canonical = _canonical(assertion)
+            if canonical in user_assertions.get(identity, set()):
+                source = 'user'
+            elif _assertion_is_grounded(
+                comparator=str(comparator), selector=str(selector), expected=expected,
+                endpoint=selected.get(endpoint_id) or {},
+            ):
+                source = 'grounded'
+            else:
+                source = 'ai_proposed'
+            entries.append({
+                'index': assertion_index,
+                'comparator': comparator,
+                'selector': selector,
+                'expected': deepcopy(expected),
+                'source': source,
+            })
+        result.append({'step_index': step_index, 'endpoint_id': endpoint_id, 'assertions': entries})
+    return result
+
+
+def _assertion_is_grounded(*, comparator: str, selector: str, expected: Any,
+                           endpoint: dict[str, Any]) -> bool:
+    """Only mark facts that match explicit response metadata or captured evidence."""
+    if comparator != 'eq' or selector != 'status_code' or isinstance(expected, bool):
+        return False
+    try:
+        expected_code = int(expected)
+    except (TypeError, ValueError):
+        return False
+    responses = endpoint.get('responses') if isinstance(endpoint.get('responses'), dict) else {}
+    if str(expected_code) in responses:
+        return True
+    context = endpoint.get('document_context') if isinstance(endpoint.get('document_context'), dict) else {}
+    capture = context.get('browser_capture') if isinstance(context.get('browser_capture'), dict) else {}
+    samples = capture.get('observed_samples') if isinstance(capture.get('observed_samples'), list) else []
+    return any(
+        isinstance(sample, dict)
+        and isinstance(sample.get('observed_response'), dict)
+        and sample['observed_response'].get('status_code') == expected_code
+        for sample in samples
+    )
+
+
+def assertion_review(candidate: dict[str, Any], *, previous: dict[str, Any],
+                     protected_changed: bool) -> dict[str, Any] | None:
+    """Describe review gates and quality warnings without inventing assertions."""
+    selectors = []
+    for step in candidate.get('teststeps') or []:
+        for assertion in step.get('validate') or [] if isinstance(step, dict) else []:
+            if isinstance(assertion, dict) and len(assertion) == 1:
+                operands = next(iter(assertion.values()))
+                if isinstance(operands, list) and operands:
+                    selectors.append(str(operands[0]))
+    warnings: list[str] = []
+    if selectors and all(item == 'status_code' or item.startswith('headers.') for item in selectors):
+        warnings.append('候选仅包含传输层断言，尚未验证业务响应字段。')
+    if not protected_changed and not warnings:
+        return None
+    return {
+        'requires_confirmation': protected_changed,
+        'changes': draft_changes(previous, candidate) if protected_changed else [],
+        'warnings': warnings,
+    }
+
+
 def _require_variables(value: Any, variables: dict[str, Any], *, allowed: set[str], label: str) -> None:
     for name in _variable_names(value):
         if name not in allowed:
@@ -572,8 +664,13 @@ def classify_result(result: dict[str, Any], draft: dict[str, Any]) -> tuple[str,
     if result.get('success') and complete:
         return 'passed', '所有步骤已运行且断言通过。', 'stop'
     error_type = result.get('error_type') if isinstance(result, dict) else ''
+    if error_type == 'Cancelled':
+        return 'cancelled', '任务已取消；已保留取消前完成或状态未知的证据。', 'stop'
     if error_type in {'HardTimeout', 'Timeout'}:
         return 'needs_review', '请求超时，远端是否生效未知，未自动重试。', 'stop'
+    replay_safety = result.get('replay_safety') if isinstance(result.get('replay_safety'), dict) else {}
+    if replay_safety.get('safe_to_retry') is False:
+        return 'needs_review', '本轮存在不可安全重放或状态未知的请求，未自动重试。', 'stop'
     for step in steps or []:
         if step.get('status') == 'passed':
             continue

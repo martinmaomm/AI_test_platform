@@ -22,18 +22,34 @@ from projects.models import Environment, Project
 from .models import APITestCase, APIWorkspace, APISpecification, default_api_workspace_draft
 from .workspace_service import (
     WorkspaceConflict, WorkspaceValidationError, _UNSET, append_message,
-    can_edit_project, can_execute_project, create_or_update_case, endpoint_specs, expire_stalled_workspace,
-    generation_endpoint_specs, infer_spec_id, validate_spec_id,
+    can_edit_project, can_execute_project, create_or_update_case, debug_timeout_seconds,
+    endpoint_specs, expire_stalled_workspace,
+    generation_budget, generation_endpoint_specs, infer_spec_id, validate_spec_id,
     normalize_draft, require_executable_draft, require_generation_model_id, validate_model_id,
     owned_workspace, require_revision, serialize_workspace, update_workspace_draft,
     workspace_is_busy, scenario_authenticated_endpoint_ids,
 )
+from .workspace_evidence import attach_execution_histories, stop_workspace_executions
 from .workspace_tasks import debug_api_workspace, generate_and_verify_api_workspace
 from .workspace_verification import require_target_url
 
 
 def _problem(exc: Exception, status_code: int = 400):
     return response(kind='error', message=str(exc), status_code=status_code)
+
+
+def _workspace_payload(workspace: APIWorkspace) -> dict[str, Any]:
+    family = [workspace]
+    if workspace.parent_id is None:
+        prefetched = getattr(workspace, '_prefetched_objects_cache', {})
+        if 'scenarios' in prefetched:
+            family.extend(list(workspace.scenarios.all()))
+        else:
+            children = list(workspace.scenarios.select_related('saved_case').order_by('scenario_order', 'id'))
+            workspace._prefetched_objects_cache = {**prefetched, 'scenarios': children}
+            family.extend(children)
+    attach_execution_histories(family)
+    return serialize_workspace(workspace)
 
 
 def _draft_endpoint_ids(draft: dict[str, Any]) -> list[int]:
@@ -56,14 +72,22 @@ def _project_or_denied(project_id: int, user) -> Project:
 
 def _queue_debug(workspace: APIWorkspace, *, revision: int, environment: dict[str, Any], variables: dict[str, Any]):
     task_id = str(uuid.uuid4())
+    budget = generation_budget(model_id=workspace.model_id, owner=workspace.owner)
+    budget['timeouts']['execution_seconds'] = debug_timeout_seconds()
+    budget['timeouts']['batch_seconds'] = None
+    budget['timeouts']['llm_seconds'] = None
     workspace.status = APIWorkspace.Status.DEBUGGING
     workspace.error = ''
     workspace.task_id = task_id
     workspace.debug_revision = revision
-    workspace.debug_result = {'status': 'queued'}
+    workspace.debug_result = {
+        'status': 'queued',
+        **{key: deepcopy(budget[key]) for key in ('queued_at', 'claimed_at', 'started_at', 'finished_at', 'timeouts', 'deadlines')},
+    }
     workspace.debug_snapshot = {
         'revision': revision, 'draft': deepcopy(workspace.draft),
         'environment': deepcopy(environment), 'variables': deepcopy(variables),
+        'task_id': task_id, 'budget': deepcopy(budget),
     }
     workspace.save()
 
@@ -85,6 +109,7 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
                     prompt_draft: dict[str, Any] | None = None, failure_evidence: dict[str, Any] | None = None,
                     scenario_workflow: bool = False):
     task_id = str(uuid.uuid4())
+    budget = generation_budget(model_id=workspace.model_id, owner=workspace.owner)
     workspace.status = APIWorkspace.Status.GENERATING
     workspace.error = ''
     workspace.candidate = None
@@ -92,10 +117,12 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
     snapshot = {
         'revision': revision, 'task_id': task_id, 'mode': mode,
         'draft': deepcopy(prompt_draft if prompt_draft is not None else workspace.draft),
+        'user_draft': deepcopy(workspace.draft),
         'model_id': workspace.model_id, 'spec_id': workspace.spec_id, 'endpoints': deepcopy(endpoints),
         'target_url': target_url, 'variables': deepcopy(variables), 'messages': deepcopy(workspace.messages),
-        'failure_evidence': deepcopy(failure_evidence), 'queued_at': timezone.now().isoformat(),
+        'failure_evidence': deepcopy(failure_evidence),
     }
+    snapshot.update(deepcopy(budget))
     if scenario_workflow:
         snapshot.update({'workflow': 'scenarios', 'scope_endpoint_ids': [item['id'] for item in endpoints]})
     elif workspace.parent_id:
@@ -111,13 +138,24 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
         if {item['id'] for item in endpoints} != set(frozen_scope):
             raise WorkspaceValidationError('子场景依赖范围与冻结快照不一致，不能继续执行。')
         authenticated_ids = scenario_authenticated_endpoint_ids(previous_scenario, target_endpoint_ids=target_ids)
+        dependency_ids = previous_scenario.get('dependency_endpoint_ids') or []
+        detailed_ids = set(target_ids) | set(dependency_ids)
+        scope_catalog = [
+            {'id': item['id'], 'method': item['method'], 'path': item['path'], 'name': item.get('summary') or ''}
+            for item in endpoints
+        ]
+        frozen_scope_specs = deepcopy(endpoints)
+        endpoints = [item for item in endpoints if item['id'] in detailed_ids]
         snapshot.update({
             'scope_endpoint_ids': deepcopy(frozen_scope),
+            'scope_catalog': scope_catalog,
+            'frozen_scope_specs': frozen_scope_specs,
+            'endpoints': deepcopy(endpoints),
             'scenario': {
                 'title': workspace.title, 'description': workspace.scenario_description,
                 'endpoint_ids': deepcopy(target_ids), 'target_endpoint_ids': deepcopy(target_ids),
                 'available_endpoint_ids': deepcopy(frozen_scope),
-                'dependency_endpoint_ids': deepcopy(previous_scenario.get('dependency_endpoint_ids') or []),
+                'dependency_endpoint_ids': deepcopy(dependency_ids),
                 'dependency_evidence': str(previous_scenario.get('dependency_evidence') or ''),
                 'authenticated_endpoint_ids': authenticated_ids,
                 'requires_authenticated_context': bool(authenticated_ids),
@@ -128,6 +166,7 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
         'source_revision': revision, 'target_url': target_url, 'summary': '', 'rounds': [],
         'adopted_revision': None,
         '_snapshot': snapshot,
+        **{key: deepcopy(budget[key]) for key in ('queued_at', 'claimed_at', 'started_at', 'finished_at', 'timeouts', 'deadlines')},
     }
     if workspace.parent_id:
         workspace.generation['scenario_context'] = deepcopy(snapshot['scenario'])
@@ -198,6 +237,8 @@ class APIWorkspaceCollectionView(APIView):
                 ),
             )
         ]
+        family = [item for root in workspaces for item in [root, *list(root.scenarios.all())]]
+        attach_execution_histories(family)
         return response(kind='success', data=[serialize_workspace(item) for item in workspaces], message='获取工作区成功')
 
     def post(self, request, project_id):
@@ -237,7 +278,7 @@ class APIWorkspaceCollectionView(APIView):
                 title=str(request.data.get('title') or (case.title if case else ''))[:200],
                 model_id=model_id, spec=spec, endpoint_ids=endpoint_ids, draft=draft,
             )
-            return response(kind='success', data=serialize_workspace(workspace), message='创建工作区成功', status_code=201)
+            return response(kind='success', data=_workspace_payload(workspace), message='创建工作区成功', status_code=201)
         except APITestCase.DoesNotExist:
             return _problem(WorkspaceValidationError('关联用例不存在或不属于当前项目。'), 404)
         except PermissionError as exc:
@@ -253,7 +294,7 @@ class APIWorkspaceDetailView(APIView):
         try:
             _project_or_denied(project_id, request.user)
             workspace = owned_workspace(project_id=project_id, workspace_id=workspace_id, user=request.user)
-            return response(kind='success', data=serialize_workspace(expire_stalled_workspace(workspace)), message='获取工作区详情成功')
+            return response(kind='success', data=_workspace_payload(expire_stalled_workspace(workspace)), message='获取工作区详情成功')
         except PermissionError as exc:
             return _problem(exc, 403)
         except LookupError as exc:
@@ -273,8 +314,9 @@ class APIWorkspaceDetailView(APIView):
                     endpoint_ids=request.data['endpoint_ids'] if 'endpoint_ids' in request.data else _UNSET,
                     spec_id=request.data['spec_id'] if 'spec_id' in request.data else _UNSET,
                     title=request.data['title'] if 'title' in request.data else _UNSET,
+                    assertion_review_ack=request.data['assertion_review_ack'] if 'assertion_review_ack' in request.data else _UNSET,
                 )
-            return response(kind='success', data=serialize_workspace(workspace), message='工作区草稿已更新')
+            return response(kind='success', data=_workspace_payload(workspace), message='工作区草稿已更新')
         except PermissionError as exc:
             return _problem(exc, 403)
         except LookupError as exc:
@@ -352,7 +394,89 @@ class APIWorkspaceMessagesView(APIView):
                     endpoints=endpoints, prompt_draft=prompt_draft, failure_evidence=failure_evidence,
                     scenario_workflow=scenario_workflow,
                 )
-            return response(kind='success', data=serialize_workspace(workspace), message='生成并试运行已排队', status_code=202)
+            return response(kind='success', data=_workspace_payload(workspace), message='生成并试运行已排队', status_code=202)
+        except PermissionError as exc:
+            return _problem(exc, 403)
+        except LookupError as exc:
+            return _problem(exc, 404)
+        except WorkspaceConflict as exc:
+            return _problem(exc, 409)
+        except (WorkspaceValidationError, ValueError) as exc:
+            return _problem(exc)
+
+
+class APIWorkspaceCancelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id, workspace_id):
+        try:
+            _project_or_denied(project_id, request.user)
+            requested_revision = request.data.get('revision')
+            if not isinstance(requested_revision, int) or isinstance(requested_revision, bool):
+                raise WorkspaceValidationError('cancel 必须携带整数 revision。')
+            cancelled_ids: list[int] = []
+            cancelled_leases: dict[int, str] = {}
+            now = timezone.now()
+            with transaction.atomic():
+                workspace = owned_workspace(
+                    project_id=project_id, workspace_id=workspace_id, user=request.user, lock=True,
+                )
+                generation = deepcopy(workspace.generation) if isinstance(workspace.generation, dict) else {}
+                already_cancelled = (
+                    generation.get('status') == 'cancelled'
+                    and generation.get('cancelled_source_revision') == requested_revision
+                )
+                if not already_cancelled:
+                    require_revision(workspace, requested_revision)
+                if workspace.parent_id is None:
+                    family = list(APIWorkspace.objects.select_for_update().filter(
+                        Q(pk=workspace.id) | Q(parent_id=workspace.id), owner=request.user,
+                    ).order_by('parent_id', 'scenario_order', 'id'))
+                else:
+                    family = [workspace]
+                if not already_cancelled:
+                    for item in family:
+                        if item.id != workspace.id and item.status not in {
+                            APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING,
+                        }:
+                            continue
+                        item_generation = deepcopy(item.generation) if isinstance(item.generation, dict) else {}
+                        old_revision = item.revision
+                        old_task_id = item.task_id
+                        item_generation.update({
+                            'status': 'cancelled', 'phase': 'finished',
+                            'summary': '用户已取消工作区任务。', 'finished_at': now.isoformat(),
+                            'cancelled_source_revision': old_revision,
+                        })
+                        item.generation = item_generation
+                        candidate = deepcopy(item.candidate) if isinstance(item.candidate, dict) else None
+                        if candidate and candidate.get('source_revision') == old_revision:
+                            candidate['source_revision'] = old_revision + 1
+                            item_generation['source_revision'] = old_revision + 1
+                            item.candidate = candidate
+                        if item.status == APIWorkspace.Status.DEBUGGING:
+                            debug_result = deepcopy(item.debug_result) if isinstance(item.debug_result, dict) else {}
+                            debug_result.update({
+                                'status': 'cancelled', 'error_type': 'Cancelled',
+                                'error': '用户已取消工作区任务。', 'finished_at': now.isoformat(),
+                            })
+                            item.debug_result = debug_result
+                            item.debug_snapshot = {}
+                        item.status = APIWorkspace.Status.READY
+                        item.error = ''
+                        item.task_id = ''
+                        item.revision += 1
+                        item.save()
+                        cancelled_ids.append(item.id)
+                        if old_task_id:
+                            cancelled_leases[item.id] = old_task_id
+                    stop_workspace_executions(cancelled_leases, message='用户已取消工作区任务。')
+                else:
+                    cancelled_ids = [item.id for item in family]
+            workspace = owned_workspace(
+                project_id=project_id, workspace_id=workspace_id, user=request.user,
+            )
+            return response(kind='success', data=_workspace_payload(workspace), message='工作区任务已取消')
         except PermissionError as exc:
             return _problem(exc, 403)
         except LookupError as exc:
@@ -394,7 +518,7 @@ class APIWorkspaceDebugView(APIView):
                 # Environment defaults < persisted draft variables < this debug invocation.
                 frozen_variables = {**environment_variables, **draft_variables, **variables}
                 _queue_debug(workspace, revision=revision, environment=environment, variables=frozen_variables)
-            return response(kind='success', data=serialize_workspace(workspace), message='调试已排队', status_code=202)
+            return response(kind='success', data=_workspace_payload(workspace), message='调试已排队', status_code=202)
         except Environment.DoesNotExist:
             return _problem(WorkspaceValidationError('API 环境不存在或不属于当前项目。'), 404)
         except PermissionError as exc:
@@ -420,7 +544,7 @@ class APIWorkspaceSaveView(APIView):
                 workspace, revision=request.data['revision'], title=request.data.get('title'),
                 description=request.data['description'] if 'description' in request.data else _UNSET,
             )
-            return response(kind='success', data=serialize_workspace(workspace), message='工作区已保存为 API 用例')
+            return response(kind='success', data=_workspace_payload(workspace), message='工作区已保存为 API 用例')
         except PermissionError as exc:
             return _problem(exc, 403)
         except LookupError as exc:

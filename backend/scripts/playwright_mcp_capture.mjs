@@ -228,10 +228,12 @@ function bodyFromBuffer(buffer, contentTypeValue) {
 export function readNetworkCaptureConfig(env = process.env) {
   if (env[NETWORK_CAPTURE_ENV] !== '1') return { enabled: false };
   const autoOrigin = env[NETWORK_CAPTURE_AUTO_ORIGIN_ENV] === '1';
+  const targetUrl = safeUrl(env[NETWORK_CAPTURE_TARGET_URL_ENV]);
   const config = {
     enabled: true,
     directory: requiredAbsoluteDirectory(env[NETWORK_CAPTURE_DIR_ENV], NETWORK_CAPTURE_DIR_ENV),
     allowedOrigins: parseAllowedOrigins(env[NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV]),
+    ...(targetUrl ? { targetOrigin: targetUrl.origin, targetHostname: targetUrl.hostname } : {}),
     limits: {
       maxRequests: positiveInteger(env[NETWORK_CAPTURE_MAX_REQUESTS_ENV], DEFAULT_LIMITS.maxRequests),
       maxBodyBytes: positiveInteger(env[NETWORK_CAPTURE_MAX_BODY_BYTES_ENV], DEFAULT_LIMITS.maxBodyBytes),
@@ -241,7 +243,6 @@ export function readNetworkCaptureConfig(env = process.env) {
   };
   if (!autoOrigin) return config;
 
-  const targetUrl = safeUrl(env[NETWORK_CAPTURE_TARGET_URL_ENV]);
   if (!targetUrl) {
     throw new Error(`${NETWORK_CAPTURE_TARGET_URL_ENV} must be an HTTP(S) URL when ${NETWORK_CAPTURE_AUTO_ORIGIN_ENV}=1.`);
   }
@@ -530,7 +531,7 @@ export class NetworkCapture {
     context.on('request', (request) => this.onRequest(request));
     context.on('requestfinished', (request) => this.trackRequestFinished(request));
     context.on('requestfailed', (request) => this.onRequestFailed(request));
-    if (this.config.autoOrigin) {
+    if (this.config.autoOrigin || this.config.targetOrigin) {
       // This completes before newContext resolves, which is before navigation.
       await context.route('**/*', (route) => this.onRoute(route));
     }
@@ -784,6 +785,14 @@ export class NetworkCapture {
 
   async onRoute(route) {
     const request = route.request();
+    if (request.resourceType() === 'document' && this.config.targetOrigin) {
+      await this.routeNavigation(route, request);
+      return;
+    }
+    if (!this.config.autoOrigin) {
+      await route.continue();
+      return;
+    }
     const candidate = this.autoCandidate(request);
     if (!candidate) {
       await route.continue();
@@ -840,6 +849,42 @@ export class NetworkCapture {
       return;
     }
     await this.rejectAutoRequest(route, request, candidate, decision.reason, { persist: decision.kind !== 'cancelled' });
+  }
+
+  async navigationAllowed(route, request, url) {
+    const control = this.config.autoOrigin ? this.readOriginControl() : { approved: new Set() };
+    if (control.cancelled) return false;
+    if (url.origin === this.config.targetOrigin || this.config.allowedOrigins.has(url.origin)
+      || control.approved.has(url.origin)) return true;
+    const candidate = { origin: url.origin, method: request.method(), path: url.pathname };
+    // API calls to another port may be auto-discovered, but that does not grant
+    // authority to navigate a tab or submit a document form to that origin.
+    if (!this.config.autoOrigin || control.rejected?.has(url.origin)
+      || this.pendingRoutes.size >= MAX_PENDING_ORIGIN_ROUTES || !this.markOriginPending(candidate)) return false;
+    const decision = await this.waitForOriginDecision(route, request, candidate);
+    if (decision.released) return null;
+    if (decision.kind !== 'approved') return false;
+    this.markOriginResolved(candidate);
+    return true;
+  }
+
+  async routeNavigation(route, request) {
+    const url = safeUrl(request.url());
+    if (!url) {
+      await route.abort('blockedbyclient');
+      return;
+    }
+    const allowed = await this.navigationAllowed(route, request, url);
+    if (allowed === null) return; // Task cancellation has already released it.
+    if (!allowed) {
+      this.writeNetwork({ event: 'navigation_blocked', origin: url.origin, path: url.pathname,
+        capture_status: 'metadata_only', reason: 'navigation_origin_not_authorized' });
+      await route.abort('blockedbyclient');
+      return;
+    }
+    // Keep native response semantics and private-network access. This checks
+    // routed navigations, not every hop in Chromium's server redirect chain.
+    await route.continue();
   }
 
   waitForOriginDecision(route, request, candidate) {

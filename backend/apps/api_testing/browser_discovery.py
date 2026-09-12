@@ -253,8 +253,11 @@ def sync_auto_origin(task: BrowserDiscoveryTask, *, save: bool = True) -> dict[s
     return state
 
 
-def _refresh_selected_record_eligibility(task: BrowserDiscoveryTask) -> None:
-    """A terminal source choice changes only this task's redacted eligibility view."""
+def _refresh_selected_record_eligibility(
+    task: BrowserDiscoveryTask, *, force_dependencies: bool = False,
+) -> bool:
+    """Refresh eligibility and rebuild candidates only when its input changed."""
+    changed = False
     records = BrowserDiscoveryRecord.objects.filter(task=task)
     for record in records:
         summary = record.public_summary if isinstance(record.public_summary, dict) else {}
@@ -269,10 +272,20 @@ def _refresh_selected_record_eligibility(task: BrowserDiscoveryTask) -> None:
             exclusion = ''
         elif summary.get('source_authorized') is True and record.origin != task.api_origin:
             exclusion = 'origin_not_selected'
-        if record.is_eligible != eligible or record.exclusion_reason != exclusion:
+        eligibility_changed = record.is_eligible != eligible
+        if eligibility_changed or record.exclusion_reason != exclusion:
             record.is_eligible = eligible
             record.exclusion_reason = exclusion
             record.save(update_fields=['is_eligible', 'exclusion_reason'])
+        if eligibility_changed:
+            changed = True
+    # Candidate computation compares every eligible record with earlier
+    # values. Avoid repeating that bounded but quadratic work on heartbeat
+    # polls with no new records or eligibility transition. Callers force a
+    # rebuild when they add rows or perform the first terminal source choice.
+    if changed or force_dependencies:
+        _refresh_dependency_candidates(task)
+    return changed
 
 
 def selectable_origins(task: BrowserDiscoveryTask, *, state: dict[str, Any] | None = None) -> list[str]:
@@ -744,8 +757,7 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
             pending.pop(request_id, None)
     if rows:
         BrowserDiscoveryRecord.objects.bulk_create(rows, ignore_conflicts=True)
-        _refresh_dependency_candidates(task)
-    _refresh_selected_record_eligibility(task)
+    _refresh_selected_record_eligibility(task, force_dependencies=bool(rows))
     count = BrowserDiscoveryRecord.objects.filter(task=task).count()
     BrowserDiscoveryTask.objects.filter(pk=task.pk).update(request_count=count)
     return {

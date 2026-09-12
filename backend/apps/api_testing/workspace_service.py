@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from datetime import timedelta
 from typing import Any
 
 from django.db import models, transaction
@@ -320,6 +321,7 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'messages': workspace.messages if isinstance(workspace.messages, list) else [],
         'candidate': workspace.candidate,
         'generation': public_generation(workspace.generation),
+        'execution_history': deepcopy(getattr(workspace, '_execution_history', [])),
         'debug_result': workspace.debug_result if isinstance(workspace.debug_result, dict) else {},
         'debug_revision': workspace.debug_revision,
         'saved_case_id': workspace.saved_case_id,
@@ -454,7 +456,8 @@ _UNSET = object()
 
 def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any = _UNSET,
                            model_id: Any = _UNSET, endpoint_ids: Any = _UNSET,
-                           spec_id: Any = _UNSET, title: Any = _UNSET) -> APIWorkspace:
+                           spec_id: Any = _UNSET, title: Any = _UNSET,
+                           assertion_review_ack: Any = _UNSET) -> APIWorkspace:
     require_revision(workspace, revision)
     if workspace_is_busy(workspace):
         raise WorkspaceConflict('当前工作区任务尚未结束，不能修改草稿。')
@@ -500,6 +503,14 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
         and generation.get('adopted_revision') in {None, previous_revision}
     )
     candidate_draft = candidate.get('draft') if isinstance(candidate.get('draft'), dict) else None
+    review = candidate.get('review') if isinstance(candidate.get('review'), dict) else {}
+    review_adoption = bool(
+        draft is not _UNSET and candidate_draft is not None
+        and review.get('requires_confirmation') is True
+        and proposed_draft == candidate_draft
+    )
+    if review_adoption and assertion_review_ack != candidate.get('draft_hash'):
+        raise WorkspaceConflict('候选修改了受保护断言，assertion_review_ack 缺失或已过期。')
     exact_adoption = False
     if draft is not _UNSET and candidate_draft is not None:
         from .workspace_verification import draft_hash
@@ -549,6 +560,12 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
             workspace.debug_revision = workspace.revision
             workspace.generation = {**generation, 'adopted_revision': workspace.revision}
             workspace.candidate = None
+        elif review_adoption:
+            workspace.candidate = None
+            workspace.debug_result = {}
+            workspace.debug_snapshot = {}
+            workspace.debug_revision = None
+            workspace.generation = {**generation, 'adopted_revision': workspace.revision}
         elif preserve_child_evidence:
             rebound_generation = deepcopy(generation)
             if rebound_generation.get('source_revision') == previous_revision:
@@ -581,30 +598,54 @@ def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspa
     if workspace.status not in {APIWorkspace.Status.GENERATING, APIWorkspace.Status.DEBUGGING}:
         return workspace
     now = now or timezone.now()
-    limit_seconds = debug_timeout_seconds() if workspace.status == APIWorkspace.Status.DEBUGGING else generation_timeout_seconds()
+    def deadline(value: APIWorkspace):
+        if value.status == APIWorkspace.Status.DEBUGGING:
+            snapshot = value.debug_snapshot if isinstance(value.debug_snapshot, dict) else {}
+            budget = snapshot.get('budget') if isinstance(snapshot.get('budget'), dict) else {}
+            deadlines = budget.get('deadlines') if isinstance(budget.get('deadlines'), dict) else {}
+            key = 'execution_at' if budget.get('claimed_at') else 'queue_at'
+            parsed = parse_datetime(str(deadlines.get(key) or ''))
+            if parsed is not None and timezone.is_aware(parsed):
+                return parsed, key
+            return None, 'invalid'
+        generation = value.generation if isinstance(value.generation, dict) else {}
+        snapshot = generation.get('_snapshot') if isinstance(generation.get('_snapshot'), dict) else {}
+        deadlines = snapshot.get('deadlines') if isinstance(snapshot.get('deadlines'), dict) else {}
+        if not snapshot.get('claimed_at'):
+            waiting_key = 'batch_at' if snapshot.get('queue_managed_by_parent') is True else 'queue_at'
+            parsed = parse_datetime(str(deadlines.get(waiting_key) or ''))
+            if parsed is not None and timezone.is_aware(parsed):
+                return parsed, waiting_key
+            return None, 'invalid'
+        active = [
+            parse_datetime(str(deadlines.get(key) or ''))
+            for key in ('execution_at', 'batch_at')
+        ]
+        active = [item for item in active if item is not None and timezone.is_aware(item)]
+        if active:
+            return min(active), 'active'
+        return None, 'invalid'
 
-    def elapsed(value: APIWorkspace) -> float:
-        anchor = value.updated_at
-        if value.status == APIWorkspace.Status.GENERATING:
-            generation = value.generation if isinstance(value.generation, dict) else {}
-            snapshot = generation.get('_snapshot') or {}
-            queued_at = parse_datetime(str(snapshot.get('queued_at') or ''))
-            if queued_at is not None and timezone.is_aware(queued_at):
-                anchor = queued_at
-        return (now - anchor).total_seconds()
-
-    # A streaming heartbeat must not extend the complete task's deadline.
-    if elapsed(workspace) <= limit_seconds:
+    current_deadline, deadline_kind = deadline(workspace)
+    if current_deadline is not None and now <= current_deadline:
         return workspace
     with transaction.atomic():
         current = APIWorkspace.objects.select_for_update().get(pk=workspace.pk)
         if current.status != workspace.status or current.task_id != workspace.task_id:
             return current
-        if elapsed(current) <= limit_seconds:
+        locked_deadline, locked_kind = deadline(current)
+        if locked_deadline is not None and now <= locked_deadline:
             return current
         was_debugging = current.status == APIWorkspace.Status.DEBUGGING
         current.status = APIWorkspace.Status.FAILED
-        current.error = '异步任务未在限定时间内完成，已标记失败；未自动重试。'
+        current.error = (
+            '异步任务缺少合法冻结预算，已标记失败；请重新发起。'
+            if locked_kind == 'invalid'
+            else
+            '异步任务排队超过独立等待时限，已标记失败；未消耗执行预算且未自动重试。'
+            if locked_kind == 'queue_at'
+            else '异步任务未在限定执行时间内完成，已标记失败；未自动重试。'
+        )
         if was_debugging:
             current.debug_snapshot = {}
             current.debug_result = {'status': 'error', 'error': current.error}
@@ -635,12 +676,60 @@ def expire_stalled_workspace(workspace: APIWorkspace, *, now=None) -> APIWorkspa
 
 
 def generation_timeout_seconds() -> int:
-    """Bound the complete queued generate-and-verify pipeline."""
-    configured = os.environ.get('API_GENERATION_TIMEOUT_SECONDS', '1800')
+    """Bound active work for one generated scenario, including its retries."""
+    return _configured_timeout('API_GENERATION_TIMEOUT_SECONDS', 1800)
+
+
+def generation_batch_timeout_seconds() -> int:
+    """Bound active root planning plus its ordered scenario batch."""
+    return _configured_timeout('API_GENERATION_BATCH_TIMEOUT_SECONDS', 7200)
+
+
+def generation_queue_timeout_seconds() -> int:
+    """Bound queue waiting independently from active execution budgets."""
+    return _configured_timeout('API_GENERATION_QUEUE_TIMEOUT_SECONDS', 1800)
+
+
+def _configured_timeout(name: str, default: int) -> int:
+    configured = os.environ.get(name, str(default))
     try:
         return max(60, int(configured))
-    except ValueError:
-        return 1800
+    except (TypeError, ValueError):
+        return default
+
+
+def generation_budget(*, model_id: int | None, owner, queued_at=None) -> dict[str, Any]:
+    """Freeze queue/active/batch/LLM budgets when the request is accepted."""
+    queued_at = queued_at or timezone.now()
+    from ai_core.model_manager import DEFAULT_LLM_TIMEOUT
+    from ai_core.models import LLMConfiguration
+    llm_seconds = DEFAULT_LLM_TIMEOUT
+    model = LLMConfiguration.objects.filter(pk=model_id, created_by=owner).only('provider', 'extra_config').first()
+    if model:
+        default_llm = 30 if model.provider == 'ollama' else DEFAULT_LLM_TIMEOUT
+        configured = model.extra_config.get('timeout', default_llm) if isinstance(model.extra_config, dict) else default_llm
+        try:
+            llm_seconds = max(1, int(configured))
+        except (TypeError, ValueError):
+            llm_seconds = default_llm
+    queue_seconds = generation_queue_timeout_seconds()
+    return {
+        'queued_at': queued_at.isoformat(),
+        'claimed_at': None,
+        'started_at': None,
+        'finished_at': None,
+        'timeouts': {
+            'queue_seconds': queue_seconds,
+            'execution_seconds': generation_timeout_seconds(),
+            'batch_seconds': generation_batch_timeout_seconds(),
+            'llm_seconds': llm_seconds,
+        },
+        'deadlines': {
+            'queue_at': (queued_at + timedelta(seconds=queue_seconds)).isoformat(),
+            'execution_at': None,
+            'batch_at': None,
+        },
+    }
 
 
 def debug_timeout_seconds() -> int:

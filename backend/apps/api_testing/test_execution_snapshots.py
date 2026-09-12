@@ -72,6 +72,40 @@ class APIExecutionSnapshotTests(TestCase):
             run_execution(self.execution.pk)
         self.assertEqual(runner.call_count, 1)
 
+    def test_completed_checkpoint_survives_cancellation_without_overwriting_stopped(self):
+        capture_case_snapshot(self.execution, self.case, self.environment)
+
+        def run(**kwargs):
+            self.assertFalse(kwargs['should_cancel']())
+            partial = {**self.passed, 'success': False, 'status': 'running'}
+            kwargs['on_progress'](partial)
+            self.execution.refresh_from_db()
+            stored = json.loads(self.execution.case_execution_detail.httprunner_result)
+            self.assertEqual(stored['step_datas'][0]['status'], 'passed')
+            self.assertEqual(self.execution.success_steps, 1)
+            APITestExecution.objects.filter(pk=self.execution.pk).update(status='stopped')
+            self.assertTrue(kwargs['should_cancel']())
+            return {**partial, 'status': 'stopped', 'error_type': 'Cancelled', 'error': '用户停止执行'}
+
+        with patch('api_testing.execution_service.requests_runner', side_effect=run):
+            result = run_execution(self.execution.pk)
+        self.assertEqual(result['execution_status'], 'stopped')
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.success_steps, 1)
+        self.assertEqual(self.execution.failure_steps, 0)
+        self.assertEqual(self.execution.case_execution_detail.status, 'skipped')
+
+    def test_report_target_uses_frozen_options_after_environment_changes(self):
+        from .serializers import APITestCaseExecutionDetailSerializer
+        capture_case_snapshot(self.execution, self.case, self.environment)
+        self.environment.config = {'base_url': 'https://changed.invalid'}
+        self.environment.save()
+        detail = self.execution.case_execution_detail
+        self.assertEqual(APITestCaseExecutionDetailSerializer(detail).data['environment_base_url'], 'https://example.test')
+        self.environment.delete()
+        detail.refresh_from_db()
+        self.assertEqual(APITestCaseExecutionDetailSerializer(detail).data['environment_base_url'], 'https://example.test')
+
     def test_missing_snapshot_is_error_not_live_fallback(self):
         from .models import APITestCaseExecutionDetail
         APITestCaseExecutionDetail.objects.create(execution=self.execution, test_case=self.case, name='Case')

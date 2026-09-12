@@ -185,8 +185,7 @@ def verify(origin, fixture, output):
             confirm_generation(page)
             expect(adopt).to_be_visible(timeout=15000)
             expect(verification).to_contain_text('已验证通过')
-            assert fixture['model_prompts'][-1]['failure_evidence']['success'] is False
-            assert fixture['model_prompts'][-1]['failure_evidence']['step_datas'][0]['data']['req_resps'][0]['response']['status_code'] == 503
+            assert fixture['model_prompts'][-1]['failure_evidence']['failed_steps'][0]['response']['status_code'] == 503
             page.screenshot(path=str(output / 'manual-repair-verified.png'), full_page=True)
             adopt.click()
             page.get_by_role('button', name='采用', exact=True).click()
@@ -290,11 +289,30 @@ def main():
 
         def local_runner(**kwargs):
             remaining = kwargs.pop('hard_timeout_seconds', None)
+            on_progress = kwargs.pop('on_progress', None)
+            should_cancel = kwargs.pop('should_cancel', None)
+            latest = {}
+
+            class FixtureCancelled(Exception):
+                pass
+
+            def checkpoint(event):
+                latest.update(deepcopy(event['report']))
+                if on_progress:
+                    on_progress(deepcopy(latest))
+                if should_cancel and should_cancel():
+                    raise FixtureCancelled()
+
             if remaining is not None:
                 kwargs['options'] = {**(kwargs.get('options') or {}), 'total_timeout': min(600, remaining)}
             fake_session = SimpleNamespace(request=fake_http, close=lambda: None)
             with patch('api_testing.requests_runtime.requests.Session', return_value=fake_session):
-                return run_case(**kwargs)
+                try:
+                    return run_case(**kwargs, on_checkpoint=checkpoint)
+                except FixtureCancelled:
+                    from api_testing.requests_runtime import interrupted_report, normalize_case
+                    return interrupted_report(kwargs['script_id'], normalize_case(kwargs['script_content']),
+                                              'Cancelled', '隔离浏览器测试取消', partial_report=latest)
 
         def eager(task):
             def dispatch(args, task_id, **kwargs):

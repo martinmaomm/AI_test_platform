@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 
 def _persist_detail(detail, result):
     detail.status = result.get('status') or ('passed' if result.get('success') else 'failed')
-    if detail.status not in {'passed', 'failed', 'error'}:
+    if result.get('error_type') == 'Cancelled':
+        detail.status = 'skipped'
+    elif detail.status not in {'passed', 'failed', 'error'}:
         detail.status = 'error'
     detail.end_time = timezone.now()
     detail.duration = max(0, (detail.end_time - detail.start_time).total_seconds())
@@ -62,9 +64,36 @@ def run_execution(execution_id, *, suite=False, scheduled_log_id=None, progress=
                 progress(10 + int(index / len(cases) * 80), f"正在执行 {index + 1}/{len(cases)}：{item['name']}")
             try:
                 options = item.get('options') or {}
+
+                def checkpoint(partial):
+                    # Persist evidence before the next request. A cancel or hard
+                    # deadline must not erase a previously completed operation.
+                    steps = partial.get('step_datas') or []
+                    detail.httprunner_result = json.dumps(partial, ensure_ascii=False)
+                    detail.log = partial.get('log') or ''
+                    detail.save(update_fields=['httprunner_result', 'log'])
+                    if not suite:
+                        checkpoint_data = partial.get('checkpoint') or {}
+                        completed = checkpoint_data.get('completed_steps')
+                        total = checkpoint_data.get('total_steps')
+                        progress_fields = {}
+                        if isinstance(completed, int) and isinstance(total, int) and total > 0:
+                            progress_fields['progress'] = min(99, int(completed / total * 100))
+                        APITestExecution.objects.filter(pk=execution.pk, status='running').update(
+                            execution_log=detail.log, total_steps=len(steps),
+                            success_steps=sum(step.get('status') == 'passed' for step in steps),
+                            failure_steps=sum(step.get('status') == 'failed' for step in steps),
+                            error_steps=sum(step.get('status') == 'error' for step in steps),
+                            **progress_fields,
+                        )
+
                 result = requests_runner(
                     script_id=str(item['case_id']), script_content=item['script'],
                     base_url=options.get('base_url') or None, options=options,
+                    on_progress=checkpoint,
+                    should_cancel=lambda: not APITestExecution.objects.filter(
+                        pk=execution.pk, status='running',
+                    ).exists(),
                 )
             except Exception as exc:
                 result = {'success': False, 'error': str(exc), 'error_type': type(exc).__name__,

@@ -289,22 +289,33 @@ class BrowserDiscoveryOriginsView(APIView):
                 else:
                     if task.status not in {BrowserDiscoveryTask.Status.COMPLETED, BrowserDiscoveryTask.Status.PARTIAL}:
                         raise WorkspaceValidationError('仅已结束的探索任务可以选择交接来源。')
-                    if origin not in selectable_origins(task, state=state):
-                        raise WorkspaceValidationError('只能选择已解析且已采集的来源作为工作区主接口来源。')
-                    task.api_origin = origin
-                    task.current_action = '已结束，已选择交接来源'
-                    task.limits = {**(task.limits or {}), 'selected_origin': origin}
-                    _refresh_selected_record_eligibility(task)
-                    # The terminal collector metrics belong to the completed
-                    # run, while usable/excluded depend on the source selected
-                    # now.  Recompute the latter without erasing final trace
-                    # diagnostics that are no longer available from JSONL.
-                    prior_evidence = task.evidence_summary if isinstance(task.evidence_summary, dict) else {}
-                    evidence = evidence_statistics(task)
-                    for key in ('pending', 'invalid_lines', 'over_limit', 'truncated'):
-                        evidence[key] = int(prior_evidence.get(key, evidence[key]) or 0)
-                    task.evidence_summary = evidence
-                    task.save(update_fields=['api_origin', 'limits', 'current_action', 'evidence_summary', 'updated_at'])
+                    # The task version protects trace mutations, but terminal
+                    # source selection is a separate one-way decision.  Do
+                    # not let an older page holding the same task version
+                    # replace the source already used to derive the handoff.
+                    selected_origin = normalize_http_url(
+                        (task.limits or {}).get('selected_origin') or task.api_origin,
+                        label='selected_origin', origin_only=True,
+                    ) if ((task.limits or {}).get('selected_origin') or task.api_origin) else ''
+                    if selected_origin and selected_origin != origin:
+                        raise WorkspaceConflict('交接来源已选择为其他 origin，不能使用旧页面改选；请刷新任务状态。')
+                    if not selected_origin:
+                        if origin not in selectable_origins(task, state=state):
+                            raise WorkspaceValidationError('只能选择已解析且已采集的来源作为工作区主接口来源。')
+                        task.api_origin = origin
+                        task.current_action = '已结束，已选择交接来源'
+                        task.limits = {**(task.limits or {}), 'selected_origin': origin}
+                        _refresh_selected_record_eligibility(task, force_dependencies=True)
+                        # The terminal collector metrics belong to the completed
+                        # run, while usable/excluded depend on the source selected
+                        # now.  Recompute the latter without erasing final trace
+                        # diagnostics that are no longer available from JSONL.
+                        prior_evidence = task.evidence_summary if isinstance(task.evidence_summary, dict) else {}
+                        evidence = evidence_statistics(task)
+                        for key in ('pending', 'invalid_lines', 'over_limit', 'truncated'):
+                            evidence[key] = int(prior_evidence.get(key, evidence[key]) or 0)
+                        task.evidence_summary = evidence
+                        task.save(update_fields=['api_origin', 'limits', 'current_action', 'evidence_summary', 'updated_at'])
             return response(kind='success', data=serialize_task(task), message='浏览器探索来源状态已更新')
         except PermissionError as exc:
             return _problem(exc, 403)

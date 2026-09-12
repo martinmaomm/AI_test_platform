@@ -17,7 +17,9 @@ from .models import (
     APIEndpoint, APISpecification, APITestCase, APIWorkspace,
     BrowserDiscoveryTask, default_api_workspace_draft,
 )
-from .workspace_service import debug_timeout_seconds, endpoint_specs, normalize_draft, serialize_workspace
+from .workspace_service import (
+    endpoint_specs, generation_budget, normalize_draft, serialize_workspace,
+)
 from .workspace_tasks import _path_matches, _step_assertions, debug_api_workspace, generate_and_verify_api_workspace
 from .workspace_verification import draft_hash, prepare_candidate, protected_expected_values
 from .workspace_views import (
@@ -103,15 +105,17 @@ class APIWorkspaceTests(TestCase):
             draft=draft or default_api_workspace_draft(), model_id=self.model.id if model_id is ... else model_id,
             spec=endpoint.spec, endpoint_ids=[endpoint.id], status='generating', task_id=task_id,
         )
+        budget = generation_budget(model_id=workspace.model_id, owner=workspace.owner)
         workspace.generation = {
             'status': 'queued', 'phase': 'queued', 'attempt': 0, 'max_attempts': 3,
             'source_revision': 0, 'target_url': 'https://example.test', 'rounds': [], 'adopted_revision': None,
+            **deepcopy(budget),
             '_snapshot': {
                 'revision': 0, 'task_id': task_id, 'mode': 'generate', 'draft': workspace.draft,
                 'model_id': workspace.model_id, 'spec_id': endpoint.spec_id,
                 'endpoints': endpoint_specs(self.project.id, [endpoint.id], spec_id=endpoint.spec_id),
                 'target_url': 'https://example.test', 'variables': {}, 'messages': [],
-                'queued_at': timezone.now().isoformat(),
+                'user_draft': workspace.draft, **deepcopy(budget),
             },
         }
         workspace.save(update_fields=['generation', 'updated_at'])
@@ -395,12 +399,14 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(workspace.draft, draft)
 
     def test_debug_uses_frozen_snapshot_and_returns_matching_revision(self):
+        budget = generation_budget(model_id=self.model.id, owner=self.user)
         workspace = self.workspace(
             status='debugging', task_id='debug-task', debug_revision=0,
             debug_snapshot={'revision': 0, 'draft': {
                 **default_api_workspace_draft(),
                 'teststeps': [{'name': 'health', 'request': {'method': 'GET', 'url': '/health'}}],
-            }, 'environment': {'base_url': 'https://example.test'}, 'variables': {'token': 'frozen'}},
+            }, 'environment': {'base_url': 'https://example.test'}, 'variables': {'token': 'frozen'},
+                'budget': budget},
         )
         module = ModuleType('api_testing.requests_runner')
         called = {}
@@ -535,7 +541,8 @@ class APIWorkspaceTests(TestCase):
         from .workspace_tasks import _claim_debug
         workspace = self.workspace(
             status='debugging', task_id='claimed-task', debug_revision=0,
-            debug_snapshot={'revision': 0, 'draft': default_api_workspace_draft(), 'environment': {}, 'variables': {}},
+            debug_snapshot={'revision': 0, 'draft': default_api_workspace_draft(), 'environment': {}, 'variables': {},
+                            'budget': generation_budget(model_id=self.model.id, owner=self.user)},
         )
         self.assertIsNotNone(_claim_debug(workspace_id=workspace.id, revision=0, task_id='claimed-task'))
         module = ModuleType('api_testing.requests_runner')
@@ -545,12 +552,12 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(result.result['status'], 'stale')
 
     def test_polling_expires_lost_debug_without_allowing_old_worker_writeback(self):
+        budget = generation_budget(model_id=self.model.id, owner=self.user)
+        budget['deadlines']['queue_at'] = (timezone.now() - timedelta(seconds=1)).isoformat()
         workspace = self.workspace(
             status='debugging', task_id='lost-task', debug_revision=0,
-            debug_snapshot={'revision': 0, 'draft': default_api_workspace_draft(), 'environment': {}, 'variables': {}},
-        )
-        APIWorkspace.objects.filter(pk=workspace.pk).update(
-            updated_at=timezone.now() - timedelta(seconds=debug_timeout_seconds() + 1),
+            debug_snapshot={'revision': 0, 'draft': default_api_workspace_draft(), 'environment': {}, 'variables': {},
+                            'budget': budget},
         )
         detail = APIWorkspaceDetailView.as_view()(
             self.request(self.user, 'get', '/'), project_id=self.project.id, workspace_id=workspace.id,
@@ -777,9 +784,17 @@ class APIWorkspaceTests(TestCase):
             'title': 'Credential lifecycle', 'endpoint_ids': ids,
             'authenticated_endpoint_ids': ids[1:], 'requires_authenticated_context': True,
         }]}, endpoint_ids=set(ids))
+        budget = generation_budget(model_id=root.model_id, owner=root.owner)
+        budget['claimed_at'] = timezone.now().isoformat()
+        budget['started_at'] = budget['claimed_at']
+        budget['deadlines']['execution_at'] = None
+        budget['deadlines']['batch_at'] = (
+            timezone.now() + timedelta(seconds=budget['timeouts']['batch_seconds'])
+        ).isoformat()
         _scenario_children(root_id=root.id, revision=0, task_id=root.task_id, plan=plan, snapshot={
             'target_url': 'https://example.test', 'variables': {}, 'queued_at': timezone.now().isoformat(),
             'scope_endpoint_ids': ids, 'endpoints': endpoint_specs(self.project.id, ids, spec_id=spec.id),
+            **budget,
         })
         draft = {'version': 1, 'config': {'name': 'Credential lifecycle', 'variables': {}}, 'teststeps': [
             {'endpoint_id': endpoint.id, 'request': {'method': endpoint.method, 'url': endpoint.path},
@@ -904,14 +919,15 @@ class APIWorkspaceTests(TestCase):
         workspace.refresh_from_db()
         snapshot = workspace.generation['_snapshot']
         self.assertEqual(snapshot['draft'], candidate)
+        self.assertEqual(snapshot['user_draft'], workspace.draft)
+        self.assertNotEqual(snapshot['user_draft'], snapshot['draft'])
         self.assertEqual(snapshot['failure_evidence'], result)
 
     def test_expired_pipeline_does_not_contact_model_or_target(self):
         workspace, _ = self.pipeline_workspace(task_id='expired-pipeline')
-        workspace.generation['_snapshot']['queued_at'] = (timezone.now() - timedelta(seconds=2)).isoformat()
+        workspace.generation['_snapshot']['deadlines']['queue_at'] = (timezone.now() - timedelta(seconds=1)).isoformat()
         workspace.save(update_fields=['generation', 'updated_at'])
-        with patch('api_testing.workspace_tasks.generation_timeout_seconds', return_value=1), \
-             patch('api_testing.workspace_tasks.get_llm_manager') as manager:
+        with patch('api_testing.workspace_tasks.get_llm_manager') as manager:
             result = generate_and_verify_api_workspace.apply(args=(workspace.id, 0, 'expired-pipeline'))
         self.assertEqual(result.result['status'], 'failed')
         manager.assert_not_called()
@@ -931,10 +947,9 @@ class APIWorkspaceTests(TestCase):
         from .workspace_service import expire_stalled_workspace
         from .workspace_tasks import _finish_pipeline
         workspace, _ = self.pipeline_workspace(task_id='heartbeat-expired')
-        workspace.generation['_snapshot']['queued_at'] = (timezone.now() - timedelta(seconds=10)).isoformat()
+        workspace.generation['_snapshot']['deadlines']['queue_at'] = (timezone.now() - timedelta(seconds=1)).isoformat()
         workspace.save(update_fields=['generation', 'updated_at'])
-        with patch('api_testing.workspace_service.generation_timeout_seconds', return_value=5):
-            expired = expire_stalled_workspace(workspace)
+        expired = expire_stalled_workspace(workspace)
         self.assertEqual(expired.status, 'failed')
         self.assertEqual(expired.generation['status'], 'failed')
         _finish_pipeline(workspace.id, 0, 'heartbeat-expired', 'passed', 'late worker result')
@@ -1115,13 +1130,17 @@ class APIWorkspaceTests(TestCase):
             status='generating', task_id='expired-child',
             generation={'status': 'running', 'phase': 'generating', '_snapshot': {
                 'revision': 0, 'task_id': 'expired-child', 'parent_task_id': 'expired-root',
-                'parent_revision': 0, 'queued_at': (timezone.now() - timedelta(seconds=10)).isoformat(),
+                'parent_revision': 0, 'queue_managed_by_parent': True,
+                'timeouts': deepcopy(root.generation['_snapshot']['timeouts']),
+                'deadlines': {
+                    'queue_at': None, 'execution_at': None,
+                    'batch_at': (timezone.now() - timedelta(seconds=1)).isoformat(),
+                },
             }},
         )
-        root.generation['_snapshot']['queued_at'] = (timezone.now() - timedelta(seconds=10)).isoformat()
+        root.generation['_snapshot']['deadlines']['queue_at'] = (timezone.now() - timedelta(seconds=1)).isoformat()
         root.save(update_fields=['generation', 'updated_at'])
-        with patch('api_testing.workspace_service.generation_timeout_seconds', return_value=5):
-            expire_stalled_workspace(root)
+        expire_stalled_workspace(root)
         child.refresh_from_db()
         self.assertEqual(child.status, 'failed')
         self.assertEqual(child.generation['status'], 'failed')

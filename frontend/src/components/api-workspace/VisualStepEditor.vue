@@ -156,6 +156,11 @@
             “长度大于”可检查 <code>body.data</code>；阈值 0 表示非空，建议保留 <code>type</code> 为 <code>list</code> 的断言。
           </p>
           <div class="assertion-title">断言</div>
+          <p class="selector-hint">
+            期望值输入 <code>401</code> 表示数字，<code>"401"</code> 表示字符串（使用英文双引号）；
+            普通文本可直接输入，也支持 <code>true</code> / <code>false</code>、<code>null</code>、JSON 数组和对象。
+            变量如 <code>${expected_code}</code> 在运行时取值。下方类型提示对应实际保存的值；修改后需保存并重新验证。
+          </p>
           <div
             v-for="(assertion, assertionIndex) in assertions"
             :key="assertionIndex"
@@ -192,11 +197,10 @@
                 updateAssertion(assertionIndex, { target: $event })
               "
             />
-            <el-input
+            <AssertionExpectedInput
               :model-value="assertion.expected"
               :disabled="disabled"
-              :aria-label="`断言 ${assertionIndex + 1} 期望值`"
-              placeholder="期望值"
+              :label="`断言 ${assertionIndex + 1} 期望值`"
               @update:model-value="
                 updateAssertion(assertionIndex, { expected: $event })
               "
@@ -228,12 +232,9 @@
 <script setup>
 import { computed } from "vue";
 import ActionHelpTooltip from "@/components/ActionHelpTooltip.vue";
+import AssertionExpectedInput from "./AssertionExpectedInput.vue";
 import KeyValueRows from "./KeyValueRows.vue";
-import {
-  bodyKind,
-  normalizeLengthGtExpected,
-  normalizeStep,
-} from "@/views/api-testing/apiWorkspace";
+import { bodyKind, normalizeStep } from "@/views/api-testing/apiWorkspace";
 
 const props = defineProps({
   modelValue: { type: Object, required: true },
@@ -284,7 +285,11 @@ const assertions = computed(() =>
       "eq",
       ["", ""],
     ];
-    return { operator, target: values?.[0] ?? "", expected: values?.[1] ?? "" };
+    return {
+      operator,
+      target: values?.[0] ?? "",
+      expected: values?.[1] === undefined ? "" : values[1],
+    };
   }),
 );
 const updateAssertion = (index, value) => {
@@ -293,10 +298,7 @@ const updateAssertion = (index, value) => {
   );
   patch({
     validate: next.map((item) => ({
-      [item.operator]: [
-        item.target,
-        normalizeLengthGtExpected(item.operator, item.expected),
-      ],
+      [item.operator]: [item.target, item.expected],
     })),
   });
 };
@@ -344,6 +346,7 @@ const removeAssertion = (index) =>
   grid-template-columns: 100px minmax(120px, 1fr) minmax(120px, 1fr) auto;
   gap: 8px;
   margin-bottom: 8px;
+  align-items: start;
 }
 @media (max-width: 680px) {
   .request-line,

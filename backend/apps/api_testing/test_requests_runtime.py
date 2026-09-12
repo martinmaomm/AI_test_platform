@@ -93,6 +93,40 @@ def _length_gt_case(expected=0, selector="body.data", variables=None):
     }]}
 
 
+def test_assertion_value_types_survive_runtime_and_python_export_without_coercion():
+    body = {"code": 401, "string_code": "401", "empty": None, "items": [1, "2"],
+            "data": {"enabled": True}, "ratio": 1.25}
+    for expected, variable, resolved, passes in [
+        (401, None, 401, True), ("401", None, "401", False),
+        ("${expected_code}", 401, 401, True),
+        ("${expected_code}", "401", "401", False),
+    ]:
+        case = {"config": {"base_url": "https://api.example.test", "variables": {"expected_code": variable}},
+                "teststeps": [{"request": {"url": "/health"}, "validate": [
+                    {"eq": ["status_code", 200]}, {"eq": ["body.code", expected]},
+                    {"eq": ["body.string_code", "401"]}, {"eq": ["body.empty", None]},
+                    {"eq": ["body.items", [1, "2"]]}, {"eq": ["body.data", {"enabled": True}]},
+                    {"eq": ["body.ratio", 1.25]},
+                ]}]}
+        namespace = {"__name__": "exported_assertion_types"}
+        exec(compile(export_python(case), "exported_assertion_types.py", "exec"), namespace)
+        results = []
+        for execute, script in [(run_case, case), (namespace["run_case"], namespace["CASE"])]:
+            session = FakeSession([FakeResponse(body=body)])
+            with patch("api_testing.requests_runtime.requests.Session", return_value=session):
+                result = execute("typed-assertions", script)
+            assert result["success"] is passes, result
+            records = result["step_datas"][0]["validators"]["validate_extractor"]
+            assert records[1]["check_value"] == 401
+            assert type(records[1]["check_value"]) is int
+            assert records[1]["expect_value"] == resolved
+            assert type(records[1]["expect_value"]) is type(resolved)
+            assert records[1]["passed"] is passes
+            assert all(record["passed"] for index, record in enumerate(records) if index != 1)
+            results.append(result)
+        assert results[0]["step_datas"] == results[1]["step_datas"]
+
+
 def test_length_gt_compares_length_strictly_and_preserves_actual_response_evidence():
     for actual, expected, passes in [([], 0, False), ([1], 0, True), ([1, 2], 2, False),
                                       ([1, 2, 3], 2, True), ("abc", 2, True), ({"id": 1}, 0, True)]:

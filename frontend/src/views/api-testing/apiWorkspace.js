@@ -135,6 +135,7 @@ export const currentScenarioStatus = (scenario) => {
   if (scenario?.debug_revision === scenario?.revision && result) {
     if (["queued", "running", "partial"].includes(result.status)) return "running";
     if (result.error_type === "Cancelled" || result.status === "cancelled") return "cancelled";
+    if (["AccountSafetyBlocked", "AccountSafetyReview"].includes(result.error_type)) return "needs_review";
     if (result.success === true) return "passed";
     if (result.success === false || ["failed", "error"].includes(result.status)) return "failed";
   }

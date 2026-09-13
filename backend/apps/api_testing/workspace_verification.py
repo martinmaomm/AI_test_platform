@@ -652,6 +652,58 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
     return draft
 
 
+def account_safety_regressions(previous: dict[str, Any], candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    """Repairs may fix identity bindings, but cannot silently drop known policy.
+
+    Endpoint identity comes from the document, not a URL keyword blacklist.
+    Legacy/ordinary drafts with no declarations acquire no new requirements.
+    """
+    def key(step):
+        request = step.get('request') or {}
+        endpoint_id = step.get('endpoint_id')
+        return (request.get('method'), endpoint_id if type(endpoint_id) is int else request.get('url'))
+
+    protected_endpoints = {
+        key(step) for step in previous.get('teststeps', [])
+        if isinstance(step, dict) and step.get('account_safety')
+    }
+    candidates = {}
+    for index, step in enumerate(candidate.get('teststeps', []), 1):
+        if isinstance(step, dict):
+            candidates.setdefault(key(step), []).append((index, step))
+    issues = [{
+        'step': matching[0][0], 'code': 'AccountSafetyReview', 'repairable': True,
+        'reason': '候选移除了该端点已有的账号保护声明。请保留保护并改用本轮临时对象，不要删除声明绕过检查。',
+    } for endpoint_key, matching in candidates.items()
+        if endpoint_key in protected_endpoints and not any(item.get('account_safety') for _, item in matching)]
+    # A semantic mutation cannot become a purported create/read merely to
+    # satisfy the guard. Match document endpoints as a group: RPC endpoints
+    # may legitimately carry several different operations in the same case.
+    def guarded_operations(step):
+        rules = step.get('account_safety')
+        if not isinstance(rules, list):
+            return set()
+        return {(rule.get('entity'), rule.get('operation')) for rule in rules
+                if isinstance(rule, dict) and isinstance(rule.get('entity'), str)
+                and rule.get('operation') in ('mutate', 'capture_protected')}
+
+    for old_index, step in enumerate(previous.get('teststeps', []), 1):
+        if not isinstance(step, dict):
+            continue
+        required = guarded_operations(step)
+        if not required:
+            continue
+        matching = candidates.get(key(step), [])
+        available = set().union(*(guarded_operations(item) for _, item in matching))
+        if not required.issubset(available):
+            issues.append({
+                'step': matching[0][0] if matching else old_index, 'code': 'AccountSafetyReview',
+                'repairable': True,
+                'reason': '候选移除或弱化了已声明的账号操作/身份保护。请保留操作语义并改用临时对象，不能伪装成创建或查询。',
+            })
+    return issues
+
+
 def classify_result(result: dict[str, Any], draft: dict[str, Any]) -> tuple[str, str, str]:
     """Return public status, explanation, and one of repair/stop/review."""
     steps = result.get('step_datas') if isinstance(result, dict) else None
@@ -664,6 +716,9 @@ def classify_result(result: dict[str, Any], draft: dict[str, Any]) -> tuple[str,
     if result.get('success') and complete:
         return 'passed', '所有步骤已运行且断言通过。', 'stop'
     error_type = result.get('error_type') if isinstance(result, dict) else ''
+    if error_type in {'AccountSafetyBlocked', 'AccountSafetyReview'}:
+        detail = str(result.get('error') or '账号或角色的操作目标需要核对。')
+        return 'needs_review', detail + ' 草稿和运行证据已保留；请调整临时账号步骤后继续，未自动重放。', 'review'
     if error_type == 'Cancelled':
         return 'cancelled', '任务已取消；已保留取消前完成或状态未知的证据。', 'stop'
     if error_type in {'HardTimeout', 'Timeout'}:

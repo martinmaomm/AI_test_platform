@@ -20,7 +20,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 
@@ -54,6 +54,299 @@ class UnsupportedCaseFeature(CaseContractError):
 
 class ExtractionFailure(ValueError):
     """A response extraction assertion failure, distinct from case syntax."""
+
+
+class AccountSafetyReview(ValueError):
+    """A declared account/role operation lacks enough runtime evidence to run safely."""
+
+
+class AccountSafetyBlocked(ValueError):
+    """A declared mutation targets a protected account or role."""
+
+
+_ACCOUNT_SAFETY_OPERATIONS = {"capture_protected", "create", "bind_created", "mutate"}
+_ACCOUNT_SAFETY_ENTITIES = {"account", "role"}
+_ACCOUNT_SAFETY_REQUEST_SOURCES = {"path", "params", "json", "form"}
+_ACCOUNT_SAFETY_IDENTITY_SOURCES = {"response", "extract"} | _ACCOUNT_SAFETY_REQUEST_SOURCES
+
+
+def _account_safety_issue(step: int, code: str, reason: str) -> dict[str, Any]:
+    return {"step": step, "code": code, "reason": reason, "repairable": True}
+
+
+def _account_safety_path_valid(value: Any, *, path_source: bool = False) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    if path_source and len(value) != 1:
+        return False
+    for item in value:
+        if type(item) is int:
+            if item < 0:
+                return False
+        elif not isinstance(item, str) or not item or (path_source and item == "*"):
+            return False
+    return True
+
+
+def _account_safety_rules(step: Mapping[str, Any]) -> list[Any]:
+    value = step.get("account_safety")
+    return list(value) if isinstance(value, list) else []
+
+
+def validate_account_safety(step: Any, *, index: int | None = None) -> list[dict[str, Any]]:
+    """Statically validate one step's optional ``account_safety`` declarations.
+
+    This helper is deliberately non-throwing. It validates only explicit safety
+    metadata and does not infer account operations from URLs, HTTP methods,
+    field names, role IDs, or usernames. Missing metadata therefore returns an
+    empty list and remains compatible with ordinary and legacy drafts.
+    """
+    step_number = index if type(index) is int and index > 0 else 1
+    if not isinstance(step, Mapping) or "account_safety" not in step:
+        return []
+    value = step.get("account_safety")
+    if not isinstance(value, list) or not value:
+        return [_account_safety_issue(
+            step_number, "ACCOUNT_SAFETY_SCHEMA", "account_safety 必须是非空声明数组",
+        )]
+
+    issues: list[dict[str, Any]] = []
+    extracts = step.get("extract") if isinstance(step.get("extract"), Mapping) else {}
+    for position, rule in enumerate(value, start=1):
+        prefix = f"account_safety[{position - 1}]"
+        if not isinstance(rule, Mapping):
+            issues.append(_account_safety_issue(
+                step_number, "ACCOUNT_SAFETY_SCHEMA", f"{prefix} 必须是 JSON 对象",
+            ))
+            continue
+        raw_operation = rule.get("operation")
+        operation = raw_operation if isinstance(raw_operation, str) else None
+        if operation not in _ACCOUNT_SAFETY_OPERATIONS:
+            issues.append(_account_safety_issue(
+                step_number, "ACCOUNT_SAFETY_OPERATION_REQUIRED",
+                f"{prefix}.operation 必须是 capture_protected/create/bind_created/mutate",
+            ))
+        raw_entity = rule.get("entity")
+        entity = raw_entity if isinstance(raw_entity, str) else None
+        if entity not in _ACCOUNT_SAFETY_ENTITIES:
+            issues.append(_account_safety_issue(
+                step_number, "ACCOUNT_SAFETY_ENTITY_REQUIRED",
+                f"{prefix}.entity 必须是 account 或 role",
+            ))
+        if "target_value" in rule:
+            issues.append(_account_safety_issue(
+                step_number, "ACCOUNT_SAFETY_SCHEMA",
+                f"{prefix} 不支持 target_value；目标值必须从实际请求 target 位置解析",
+            ))
+
+        if operation in {"capture_protected", "bind_created"}:
+            source, path = rule.get("identity_source"), rule.get("identity_path")
+            invalid = not isinstance(source, str) or source not in _ACCOUNT_SAFETY_IDENTITY_SOURCES or not _account_safety_path_valid(
+                path, path_source=source == "path",
+            )
+            if operation == "bind_created" and source != "response":
+                invalid = True
+            if source == "extract" and (
+                not isinstance(path, list) or not path or not isinstance(path[0], str) or path[0] not in extracts
+            ):
+                invalid = True
+            if invalid:
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_IDENTITY_REQUIRED",
+                    f"{prefix} 必须用 identity_source + identity_path 显式定位本步成功证据；bind_created 仅接受 response",
+                ))
+            elif "*" in path and rule.get("many") is not True:
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_SCHEMA",
+                    f"{prefix}.identity_path 使用 * 时必须显式 many=true",
+                ))
+
+        if operation == "create":
+            has_identity = "identity_source" in rule or "identity_path" in rule
+            if has_identity:
+                source, path = rule.get("identity_source"), rule.get("identity_path")
+                invalid = not isinstance(source, str) or source not in _ACCOUNT_SAFETY_IDENTITY_SOURCES or not _account_safety_path_valid(
+                    path, path_source=source == "path",
+                )
+                if source == "extract" and (
+                    not isinstance(path, list) or not path or not isinstance(path[0], str) or path[0] not in extracts
+                ):
+                    invalid = True
+                if invalid:
+                    issues.append(_account_safety_issue(
+                        step_number, "ACCOUNT_SAFETY_IDENTITY_REQUIRED",
+                        f"{prefix} 的创建身份必须绑定本步成功响应、extract 或实际请求位置",
+                    ))
+                elif "*" in path and rule.get("many") is not True:
+                    issues.append(_account_safety_issue(
+                        step_number, "ACCOUNT_SAFETY_SCHEMA",
+                        f"{prefix}.identity_path 使用 * 时必须显式 many=true",
+                    ))
+            if not has_identity and "unique_key" not in rule:
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_IDENTITY_REQUIRED",
+                    f"{prefix} 必须声明 identity_source/identity_path，或声明 unique_key 供后续精确查询绑定",
+                ))
+            request = step.get("request") if isinstance(step.get("request"), Mapping) else {}
+            method = request.get("method", "GET")
+            if isinstance(method, str) and method.upper() in {"GET", "HEAD", "OPTIONS"}:
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_OPERATION_REQUIRED",
+                    f"{prefix}.create 不能使用 GET/HEAD/OPTIONS 建立本轮创建证据",
+                ))
+
+        if operation == "mutate":
+            target = rule.get("target")
+            valid_target = isinstance(target, Mapping)
+            if valid_target:
+                source, path = target.get("source"), target.get("path")
+                valid_target = isinstance(source, str) and source in _ACCOUNT_SAFETY_REQUEST_SOURCES and _account_safety_path_valid(
+                    path, path_source=source == "path",
+                )
+                if valid_target and "*" in path and target.get("many") is not True:
+                    valid_target = False
+            if not valid_target:
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_TARGET_REQUIRED",
+                    f"{prefix}.target 必须显式绑定实际请求的 path/params/json/form；数组路径 * 必须 many=true",
+                ))
+            if not isinstance(rule.get("effect"), str) or not rule.get("effect", "").strip():
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_SCHEMA", f"{prefix}.effect 必须是非空操作说明",
+                ))
+
+        if operation in {"create", "bind_created"} and "unique_key" in rule:
+            unique_key = rule.get("unique_key")
+            valid_key = isinstance(unique_key, Mapping)
+            response_path: Any = None
+            if valid_key:
+                source, path = unique_key.get("source"), unique_key.get("path")
+                valid_key = (
+                    isinstance(unique_key.get("name"), str)
+                    and bool(unique_key.get("name", "").strip())
+                    and isinstance(source, str)
+                    and source in _ACCOUNT_SAFETY_REQUEST_SOURCES
+                    and _account_safety_path_valid(path, path_source=source == "path")
+                    and "*" not in path
+                )
+                if operation == "bind_created":
+                    response_path = unique_key.get("response_path")
+                    identity_path = rule.get("identity_path")
+                    valid_key = (
+                        valid_key
+                        and _account_safety_path_valid(response_path)
+                        and isinstance(identity_path, list)
+                        and len(identity_path) == len(response_path)
+                        and identity_path[:-1] == response_path[:-1]
+                    )
+            if not valid_key:
+                issues.append(_account_safety_issue(
+                    step_number, "ACCOUNT_SAFETY_UNIQUE_KEY_REQUIRED",
+                    f"{prefix}.unique_key 必须以 name/source/path 绑定实际请求单一唯一键；bind_created 还需 response_path 与 identity_path 定位同一响应记录",
+                ))
+        elif operation == "bind_created":
+            issues.append(_account_safety_issue(
+                step_number, "ACCOUNT_SAFETY_UNIQUE_KEY_REQUIRED",
+                f"{prefix}.bind_created 必须声明 unique_key",
+            ))
+    return issues
+
+
+def _account_safety_static_target_variables(request: Any, target: Mapping[str, Any]) -> set[str]:
+    """Return only exact variable references at an explicitly declared target."""
+    if not isinstance(request, Mapping):
+        return set()
+    source, path = target.get("source"), target.get("path")
+    if not isinstance(path, list) or not path:
+        return set()
+    values: list[Any]
+    if source == "path":
+        locator = path[0]
+        if isinstance(locator, str):
+            if not isinstance(request.get("url"), str):
+                return set()
+            matches = []
+            for segment in (item for item in urlsplit(request["url"]).path.split("/") if item):
+                match = _FULL_VARIABLE.fullmatch(segment)
+                if match and next(name for name in match.groups() if name is not None) == locator:
+                    matches.append(segment)
+            return {locator} if len(matches) == 1 else set()
+        if type(locator) is not int or not isinstance(request.get("url"), str):
+            return set()
+        segments = [item for item in urlsplit(request["url"]).path.split("/") if item]
+        if locator >= len(segments):
+            return set()
+        values = [segments[locator]]
+    else:
+        request_key = "data" if source == "form" else source
+        root = request.get(request_key)
+        try:
+            values = _account_safety_values_at(root, path, "static account_safety target")
+        except AccountSafetyReview:
+            return set()
+    names: set[str] = set()
+    for value in values:
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                match = _FULL_VARIABLE.fullmatch(candidate)
+                if match:
+                    names.add(next(name for name in match.groups() if name is not None))
+    return names
+
+
+def account_safety_issues(draft: Any) -> list[dict[str, Any]]:
+    """Return non-throwing, 1-based static safety issues for a draft."""
+    if isinstance(draft, str):
+        try:
+            draft = json.loads(draft)
+        except (TypeError, json.JSONDecodeError):
+            return []
+    if not isinstance(draft, Mapping) or not isinstance(draft.get("teststeps"), list):
+        return []
+    issues = [
+        issue
+        for index, step in enumerate(draft["teststeps"], start=1)
+        for issue in validate_account_safety(step, index=index)
+    ]
+    protected_extracts = {entity: set() for entity in _ACCOUNT_SAFETY_ENTITIES}
+    for index, step in enumerate(draft["teststeps"], start=1):
+        if not isinstance(step, Mapping):
+            continue
+        extracts = step.get("extract") if isinstance(step.get("extract"), Mapping) else {}
+        for names in protected_extracts.values():
+            names.difference_update(name for name in extracts if isinstance(name, str))
+        rules = _account_safety_rules(step)
+        if validate_account_safety(step, index=index):
+            continue
+        for rule in rules:
+            if rule["operation"] == "mutate":
+                target = rule["target"]
+                referenced = _account_safety_static_target_variables(step.get("request"), target)
+                overlap = protected_extracts[rule["entity"]].intersection(referenced)
+                if overlap:
+                    variable = sorted(overlap)[0]
+                    issues.append(_account_safety_issue(
+                        index, "ACCOUNT_SAFETY_PROTECTED_FLOW",
+                        f"危险目标直接复用了受保护身份 extract 变量 {variable!r}；请改为本轮创建的临时 {rule['entity']} 身份",
+                    ))
+            elif rule["operation"] == "capture_protected" and rule["identity_source"] == "extract":
+                protected_extracts[rule["entity"]].add(rule["identity_path"][0])
+    return issues
+
+
+def account_safety_prompt_rules() -> list[str]:
+    """Return the canonical generation rules and compact JSON examples."""
+    return [
+        "account_safety 仅用于显式账号/角色操作，必须是声明数组；不得根据 URL、HTTP 方法、字段名、用户名、role ID 或 admin 路径猜测，普通登录/登出/查询及无声明业务步骤保持不变。",
+        "当接口文档或测试目标已确认包含账号、角色的修改/删除或密码、状态、权限变更时，必须声明 mutate 并先建立本轮成功 create 证据；提供的登录账号只作为执行身份，不能作为默认测试对象。普通 login/logout/read 和其他资源无需声明，不因同值 ID 误拦。仅在文档或真实响应给出可验证身份路径时 capture 登录账号及关联共享角色，不能为不存在或没有文档的资料接口杜撰路径。",
+        "已有 account_safety 声明不得通过删除绕过；应创建并操作本轮临时对象。危险 mutate 必须绑定最终实际请求位置，不能另写 target_value。",
+        '保护账号与共享角色示例：{"account_safety":[{"operation":"capture_protected","entity":"account","identity_source":"response","identity_path":["data","user","id"]},{"operation":"capture_protected","entity":"role","identity_source":"response","identity_path":["data","roles","*","id"],"many":true}]}。',
+        '本轮创建示例：{"extract":{"temp_user_id":"body.data.id"},"account_safety":[{"operation":"create","entity":"account","identity_source":"extract","identity_path":["temp_user_id"]}]}。',
+        '危险目标示例：{"request":{"method":"DELETE","url":"/users/${temp_user_id}"},"account_safety":[{"operation":"mutate","entity":"account","effect":"delete","target":{"source":"path","path":["temp_user_id"]}}]}。target.source 仅为 path/params/json/form；path 可用独占 URL segment 的变量名或 0-based segment index，嵌套数组必须显式 * 且 many=true。',
+        '创建无返回 ID 时声明 {"operation":"create","entity":"account","unique_key":{"name":"username","source":"json","path":["username"]}}；后续绑定完整示例：{"operation":"bind_created","entity":"account","identity_source":"response","identity_path":["data","items","*","id"],"many":true,"unique_key":{"name":"username","source":"params","path":["username"],"response_path":["data","items","*","username"]}}。两条 response path 必须定位同一记录；无关查询可插入，查询参数或断言本身不能证明创建归属。',
+        "capture_protected/create/bind_created 只在该步请求、extract 和断言全部成功后产生证据；GET/HEAD/OPTIONS 的 create 声明不能建立创建证据。读取旧对象不是 create，失败步骤不能授权后续 mutate 或 cleanup；fresh-created 是隔离操作的充分证据，但 protected 一旦命中始终优先。此机制防模型和人工误操作，不是抵御恶意脚本的语义沙箱。",
+    ]
 
 
 def _as_mapping(value: Any, field: str) -> dict[str, Any]:
@@ -538,6 +831,264 @@ def _absolute_http_url(value: Any, base_url: Any) -> str:
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise CaseContractError("请求 URL 必须是完整的 HTTP(S) URL，或提供合法 base_url 的相对路径")
     return value
+
+
+def _account_safety_identity(value: Any, label: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise AccountSafetyReview(f"{label} 必须解析为非空字符串或整数 ID")
+    text = str(value).strip()
+    if not text:
+        raise AccountSafetyReview(f"{label} 不能是空身份")
+    if re.fullmatch(r"[+-]?\d+", text):
+        return str(int(text))
+    return text
+
+
+def _account_safety_unique_value(value: Any, label: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise AccountSafetyReview(f"{label} 必须解析为非空字符串或整数唯一键")
+    if isinstance(value, str):
+        if not value:
+            raise AccountSafetyReview(f"{label} 不能是空唯一键")
+        return "string:" + value
+    return "integer:" + str(value)
+
+
+def _account_safety_values_at(root: Any, path: list[Any], label: str) -> list[Any]:
+    values = [root]
+    for segment in path:
+        selected: list[Any] = []
+        for value in values:
+            if segment == "*":
+                if not isinstance(value, list):
+                    raise AccountSafetyReview(f"{label} 的 * 只能展开数组")
+                selected.extend(value)
+            elif isinstance(value, Mapping) and segment in value:
+                selected.append(value[segment])
+            elif isinstance(value, list) and type(segment) is int and 0 <= segment < len(value):
+                selected.append(value[segment])
+            else:
+                raise AccountSafetyReview(f"{label} 在实际数据中缺少路径段 {segment!r}")
+        values = selected
+    return values
+
+
+def _account_safety_path_values(binding: Mapping[str, Any], request: Mapping[str, Any], label: str) -> list[Any]:
+    locator = binding["path"][0]
+    resolved_segments = [unquote(item) for item in urlsplit(str(request["resolved_url"])).path.split("/") if item]
+    if type(locator) is int:
+        if locator >= len(resolved_segments):
+            raise AccountSafetyReview(f"{label} 指向的 URL path segment {locator} 不存在")
+        return [resolved_segments[locator]]
+
+    template_segments = [item for item in urlsplit(str(request["url_template"])).path.split("/") if item]
+    matches: list[int] = []
+    for position, segment in enumerate(template_segments):
+        match = _FULL_VARIABLE.fullmatch(segment)
+        if match and next(name for name in match.groups() if name is not None) == locator:
+            matches.append(position)
+    if len(matches) != 1 or len(template_segments) != len(resolved_segments):
+        raise AccountSafetyReview(
+            f"{label} 的 path 变量 {locator!r} 必须在请求 URL 中独占且只出现于一个 segment"
+        )
+    return [resolved_segments[matches[0]]]
+
+
+def _account_safety_request_values(binding: Mapping[str, Any], request: Mapping[str, Any], label: str) -> list[Any]:
+    source = binding["source"]
+    if source == "path":
+        values = _account_safety_path_values(binding, request, label)
+    else:
+        root = request.get(source)
+        if root is None:
+            raise AccountSafetyReview(f"{label} 声明的实际请求 {source} 不存在")
+        values = _account_safety_values_at(root, binding["path"], label)
+
+    many = binding.get("many") is True
+    flattened: list[Any] = []
+    for value in values:
+        if isinstance(value, list):
+            if not many:
+                raise AccountSafetyReview(f"{label} 解析为数组时必须显式 many=true")
+            flattened.extend(value)
+        else:
+            flattened.append(value)
+    if not flattened:
+        raise AccountSafetyReview(f"{label} 未从实际请求解析出目标")
+    if not many and len(flattened) != 1:
+        raise AccountSafetyReview(f"{label} 必须只解析出一个目标；数组目标需显式 many=true")
+    return flattened
+
+
+def _account_safety_identity_values(
+    rule: Mapping[str, Any], request: Mapping[str, Any], *, response: Mapping[str, Any] | None = None,
+    current_extract: Mapping[str, Any] | None = None, label: str, allow_empty: bool = False,
+) -> list[str]:
+    source = rule["identity_source"]
+    binding = {"source": source, "path": rule["identity_path"], "many": rule.get("many", False)}
+    if source in _ACCOUNT_SAFETY_REQUEST_SOURCES:
+        raw_values = _account_safety_request_values(binding, request, label)
+    else:
+        if response is None:
+            raise AccountSafetyReview(f"{label} 只能在成功响应后解析")
+        root = response.get("body") if source == "response" else current_extract
+        raw_values = _account_safety_values_at(root, rule["identity_path"], label)
+        many = rule.get("many") is True
+        flattened: list[Any] = []
+        for value in raw_values:
+            if isinstance(value, list):
+                if not many:
+                    raise AccountSafetyReview(f"{label} 解析为数组时必须显式 many=true")
+                flattened.extend(value)
+            else:
+                flattened.append(value)
+        raw_values = flattened
+        if not raw_values and allow_empty:
+            return []
+        if not raw_values:
+            raise AccountSafetyReview(f"{label} 未从本步成功证据解析出身份")
+        if not many and len(raw_values) != 1:
+            raise AccountSafetyReview(f"{label} 必须只解析出一个身份；身份数组需显式 many=true")
+    return [_account_safety_identity(value, label) for value in raw_values]
+
+
+def _account_safety_request_key(rule: Mapping[str, Any], request: Mapping[str, Any], label: str) -> str:
+    values = _account_safety_request_values(rule["unique_key"], request, label)
+    if len(values) != 1:
+        raise AccountSafetyReview(f"{label} 必须从实际请求解析出一个唯一键")
+    return _account_safety_unique_value(values[0], label)
+
+
+def _account_safety_bound_response_identity(
+    rule: Mapping[str, Any], response: Mapping[str, Any], expected_key: str, label: str,
+) -> str:
+    """Bind identity and unique key from the same, uniquely matching response record."""
+    identity_path = rule["identity_path"]
+    response_path = rule["unique_key"]["response_path"]
+    parent_path = identity_path[:-1]
+    parents = _account_safety_values_at(response.get("body"), parent_path, f"{label}.record")
+    matches: list[str] = []
+    for parent in parents:
+        try:
+            identity_values = _account_safety_values_at(parent, [identity_path[-1]], f"{label}.identity_path")
+            key_values = _account_safety_values_at(parent, [response_path[-1]], f"{label}.response_path")
+            if len(identity_values) != 1 or len(key_values) != 1:
+                continue
+            actual_key = _account_safety_unique_value(key_values[0], f"{label}.response_path")
+            if actual_key == expected_key:
+                matches.append(_account_safety_identity(identity_values[0], f"{label}.identity_path"))
+        except AccountSafetyReview:
+            continue
+    if len(matches) != 1:
+        raise AccountSafetyReview(
+            f"{label} 的成功响应必须恰有一条同记录 unique key 匹配本轮 create；实际匹配 {len(matches)} 条"
+        )
+    return matches[0]
+
+
+def _prepare_account_safety(
+    index: int, step: Mapping[str, Any], request: Mapping[str, Any], state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    issues = validate_account_safety(step, index=index)
+    if issues:
+        raise AccountSafetyReview(issues[0]["reason"])
+    rules = _account_safety_rules(step)
+    bind_rules = [rule for rule in rules if rule["operation"] == "bind_created"]
+    pending = list(state["pending"])
+    if bind_rules and not pending:
+        raise AccountSafetyReview(f"步骤 {index} bind_created 前没有本轮成功 create 唯一键证据")
+
+    prepared: list[dict[str, Any]] = []
+    matched_pending: set[int] = set()
+    try:
+        for position, rule in enumerate(rules, start=1):
+            operation, entity = rule["operation"], rule["entity"]
+            label = f"步骤 {index} account_safety[{position - 1}]"
+            item: dict[str, Any] = {"rule": rule}
+            if operation == "mutate":
+                raw_targets = _account_safety_request_values(rule["target"], request, f"{label}.target")
+                targets = [_account_safety_identity(value, f"{label}.target") for value in raw_targets]
+                protected = state["protected"][entity]
+                blocked = [target for target in targets if target in protected]
+                if blocked:
+                    raise AccountSafetyBlocked(
+                        f"步骤 {index} 已阻止 {rule['effect']}：目标 {entity} {blocked[0]!r} 属于受保护身份"
+                    )
+                unproven = [target for target in targets if target not in state["created"][entity]]
+                if unproven:
+                    raise AccountSafetyReview(
+                        f"步骤 {index} 未发送 {rule['effect']}：目标 {entity} {unproven[0]!r} 没有本轮成功 create 证据"
+                    )
+                item["identities"] = targets
+            elif operation in {"capture_protected", "create"} and rule.get("identity_source") in _ACCOUNT_SAFETY_REQUEST_SOURCES:
+                item["identities"] = _account_safety_identity_values(rule, request, label=label)
+            if operation == "create" and "unique_key" in rule:
+                item["unique_value"] = _account_safety_request_key(rule, request, f"{label}.unique_key")
+            if operation == "bind_created":
+                unique_value = _account_safety_request_key(rule, request, f"{label}.unique_key")
+                matches = [
+                    pending_index for pending_index, evidence in enumerate(pending)
+                    if pending_index not in matched_pending
+                    and evidence["entity"] == entity
+                    and evidence["name"] == rule["unique_key"]["name"].strip()
+                    and evidence["value"] == unique_value
+                ]
+                if len(matches) != 1:
+                    raise AccountSafetyReview(
+                        f"步骤 {index} bind_created 的 entity、unique_key.name 与实际请求值未唯一匹配本轮 create ledger"
+                    )
+                matched_pending.add(matches[0])
+                item["unique_value"] = unique_value
+                item["pending_evidence"] = pending[matches[0]]
+            prepared.append(item)
+    except (AccountSafetyReview, AccountSafetyBlocked):
+        raise
+    return prepared
+
+
+def _apply_successful_account_safety(
+    index: int, prepared: list[dict[str, Any]], request: Mapping[str, Any], state: dict[str, Any],
+    *, response: Mapping[str, Any], current_extract: Mapping[str, Any],
+) -> None:
+    deferred: list[dict[str, str]] = []
+    for position, item in enumerate(prepared, start=1):
+        rule = item["rule"]
+        operation, entity = rule["operation"], rule["entity"]
+        label = f"步骤 {index} account_safety[{position - 1}]"
+        if operation == "capture_protected":
+            identities = item.get("identities") or _account_safety_identity_values(
+                rule, request, response=response, current_extract=current_extract, label=label,
+                allow_empty=entity == "role" and rule.get("many") is True,
+            )
+            state["protected"][entity].update(identities)
+        elif operation == "create":
+            identities = item.get("identities")
+            if identities is None and "identity_source" in rule:
+                try:
+                    identities = _account_safety_identity_values(
+                        rule, request, response=response, current_extract=current_extract, label=label,
+                    )
+                except AccountSafetyReview:
+                    if "unique_value" not in item:
+                        raise
+            if identities:
+                state["created"][entity].update(identities)
+            elif "unique_value" in item:
+                deferred.append({
+                    "entity": entity,
+                    "name": rule["unique_key"]["name"].strip(),
+                    "value": item["unique_value"],
+                })
+            else:
+                raise AccountSafetyReview(f"{label} 未从本步成功 create 获得身份或唯一键证据")
+        elif operation == "bind_created":
+            identity = _account_safety_bound_response_identity(
+                rule, response, item["unique_value"], label,
+            )
+            state["created"][entity].add(identity)
+            state["pending"].remove(item["pending_evidence"])
+    if deferred:
+        state["pending"].extend(deferred)
 
 
 def _header_value(headers: Mapping[str, Any], name: str) -> Any:
@@ -1124,6 +1675,11 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None,
     cleanup_error_type = ""
     side_effects = False
     successful_main_extracts: set[str] = set()
+    account_safety_state = {
+        "protected": {entity: set() for entity in _ACCOUNT_SAFETY_ENTITIES},
+        "created": {entity: set() for entity in _ACCOUNT_SAFETY_ENTITIES},
+        "pending": [],
+    }
     indexed_steps = list(enumerate(case["teststeps"], start=1))
     main_steps = [item for item in indexed_steps if item[1].get("phase", "main") == "main"]
     cleanup_steps = [item for item in indexed_steps if item[1].get("phase", "main") == "cleanup"]
@@ -1190,9 +1746,11 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None,
             if remaining <= 0:
                 raise TimeoutError("用例总超时，未发送请求")
             raw_request = deepcopy(step["request"])
+            request_url_template = raw_request.get("url")
             raw_headers = _merge_headers(runtime["headers"], raw_request.pop("headers", {}))
             request = _substitute(raw_request, variables)
-            url = _absolute_http_url(request.pop("url"), resolved_base_url)
+            resolved_request_url = request.pop("url")
+            url = _absolute_http_url(resolved_request_url, resolved_base_url)
             _assert_allowed_origin(url, runtime["allowed_origin"])
             headers = _http_headers(_substitute(raw_headers, variables))
             params = request.pop("params", None)
@@ -1228,6 +1786,17 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None,
                 "method": request_kwargs["method"], "url": url, "headers": headers,
                 "params": params, "body": request_body,
             }
+            safety_request = {
+                "url_template": request_url_template,
+                "resolved_url": resolved_request_url,
+                "path": resolved_request_url,
+                "params": params,
+                "json": request_kwargs.get("json"),
+                "form": request_kwargs.get("data") if body_keys and body_keys[0] == "data" else None,
+            }
+            prepared_safety = _prepare_account_safety(
+                index, step, safety_request, account_safety_state,
+            )
             if request_kwargs["method"] not in {"GET", "HEAD", "OPTIONS"}:
                 side_effects = True
             emit("request_dispatched", index, current=True)
@@ -1266,6 +1835,21 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None,
                 for raw_validator in step["validate"]
             ]
             passed = all(record["passed"] for record in records) and not extraction_errors
+            safety_error = ""
+            safety_error_type = ""
+            if passed:
+                try:
+                    # Several declarations can describe one response. Publish
+                    # ownership evidence only when the whole step is valid.
+                    next_safety_state = deepcopy(account_safety_state)
+                    _apply_successful_account_safety(
+                        index, prepared_safety, safety_request, next_safety_state,
+                        response=response_context, current_extract=exported,
+                    )
+                    account_safety_state.update(next_safety_state)
+                except (AccountSafetyReview, AccountSafetyBlocked) as exc:
+                    passed = False
+                    safety_error, safety_error_type = str(exc), type(exc).__name__
             elapsed = _elapsed_ms(response, request_started)
             response_view = {
                 "status_code": status_code, "headers": response_headers, "body": body,
@@ -1273,27 +1857,34 @@ def run_case(script_id: str, script_content: Any, base_url: str | None = None,
                 "elapsed_ms": elapsed,
             }
             validators = {"validate_extractor": records}
-            step_error = (extraction_errors[0] if extraction_errors else "") or (
+            step_error = safety_error or (extraction_errors[0] if extraction_errors else "") or (
                 "" if passed else next(record["message"] for record in records if not record["passed"])
             )
+            step_status = "error" if safety_error_type else ("passed" if passed else "failed")
             result_step = {
-                "name": step["name"], "success": passed, "status": "passed" if passed else "failed",
+                "name": step["name"], "success": passed, "status": step_status,
                 "data": {"req_resps": [{"request": attempted_request, "response": response_view}],
                          "validators": validators,
                          "stat": {"elapsed_ms": elapsed, "response_time_ms": elapsed}},
                 "validators": validators, "export_vars": exported,
                 "extraction_results": extraction_results, "attachment": {}, "error": step_error,
-                "log": f"步骤 {index} {'成功' if passed else '失败'}：{request_kwargs['method']} {url}",
+                "log": f"步骤 {index} {'成功' if passed else ('安全复核' if safety_error_type else '失败')}：{request_kwargs['method']} {url}",
             }
             if phase == "cleanup":
                 result_step["phase"] = "cleanup"
             completed_steps[index] = result_step
             if passed:
                 return "", ""
-            return step_error, "ExtractionFailure" if extraction_errors else "ValidationFailure"
+            return step_error, safety_error_type or ("ExtractionFailure" if extraction_errors else "ValidationFailure")
         except TimeoutError as exc:
             step_error, step_error_type = str(exc), "Timeout"
             log_kind = "超时"
+        except AccountSafetyBlocked as exc:
+            step_error, step_error_type = str(exc), type(exc).__name__
+            log_kind = "安全阻止"
+        except AccountSafetyReview as exc:
+            step_error, step_error_type = str(exc), type(exc).__name__
+            log_kind = "安全复核"
         except (CaseContractError, UnsupportedCaseFeature) as exc:
             step_error, step_error_type = str(exc), type(exc).__name__
             log_kind = "执行错误"
@@ -1401,7 +1992,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "CaseContractError", "UnsupportedCaseFeature", "normalize_case", "run_case", "export_python",
+    "CaseContractError", "UnsupportedCaseFeature", "AccountSafetyReview", "AccountSafetyBlocked",
+    "normalize_case", "run_case", "export_python", "validate_account_safety",
+    "account_safety_issues", "account_safety_prompt_rules",
     "build_error_report", "hard_timeout_report", "interrupted_report", "resolve_total_timeout",
     "validate_selector", "selector_has_filter",
 ]

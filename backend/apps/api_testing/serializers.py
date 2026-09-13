@@ -692,6 +692,13 @@ class APITestSuiteAddTestCaseSerializer(serializers.Serializer):
 
 # ============ API测试执行记录序列化器 ============
 
+EXECUTION_SOURCE_LABELS = {
+    'workspace_generation': 'AI自动验证',
+    'workspace_debug': '工作区调试',
+    'formal': '正式执行',
+}
+
+
 class APITestExecutionListSerializer(serializers.ModelSerializer):
     """API测试执行记录列表序列化器"""
     executor_name = serializers.CharField(source='executor.username', read_only=True)
@@ -699,14 +706,27 @@ class APITestExecutionListSerializer(serializers.ModelSerializer):
     exec_type_display = serializers.CharField(source='get_exec_type_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     trigger_type_display = serializers.CharField(source='get_trigger_type_display', read_only=True)
+    execution_source = serializers.SerializerMethodField()
+    execution_source_display = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
     project_id = serializers.IntegerField(read_only=True)
+
+    def get_execution_source(self, obj):
+        snapshot = obj.input_snapshot if isinstance(obj.input_snapshot, dict) else {}
+        source = snapshot.get('source')
+        if source in ('workspace_generation', 'workspace_debug'):
+            return source
+        return 'formal'
+
+    def get_execution_source_display(self, obj):
+        return EXECUTION_SOURCE_LABELS[self.get_execution_source(obj)]
     
     class Meta:
         model = APITestExecution
         fields = [
             'id', 'exec_type', 'exec_type_display', 'name', 'description', 'status', 'status_display',
             'trigger_type', 'trigger_type_display', 'executor', 'executor_name', 'project_id',
+            'execution_source', 'execution_source_display',
             'environment', 'environment_name', 'task_id',
             'start_time', 'end_time', 'duration', 'pass_rate',
             'log_path', 'report_path', 'created_at', 'updated_at'

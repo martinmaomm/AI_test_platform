@@ -85,7 +85,7 @@
             执行记录列表
             <ActionHelpTooltip
               label="执行记录列表"
-              content="可按执行类型、状态、触发方式和日期筛选；刷新会按当前条件重新读取列表。勾选记录后可批量删除，删除记录及其明细后无法从页面恢复。"
+              content="可按执行来源、执行类型、状态、触发方式和日期筛选；顶部统计是本项目全部可见记录的汇总。刷新会按当前条件重新读取列表。勾选记录后可批量删除，删除记录及其明细后无法从页面恢复。"
             />
           </h3>
         </div>
@@ -116,6 +116,12 @@
               <el-option label="Jenkins" value="jenkins" />
               <el-option label="CI/CD" value="ci_cd" />
             </el-select>
+            <el-select v-model="filters.execution_source" placeholder="执行来源" clearable style="width: 130px;" @change="handleExecutionSourceChange">
+              <el-option label="全部" value="" />
+              <el-option label="AI自动验证" value="workspace_generation" />
+              <el-option label="工作区调试" value="workspace_debug" />
+              <el-option label="正式执行" value="formal" />
+            </el-select>
             <el-date-picker v-model="filters.dateRange" type="daterange" range-separator="至" start-placeholder="开始日期"
               end-placeholder="结束日期" style="width: 280px;" />
           </div>
@@ -139,6 +145,12 @@
             <el-tag :type="getExecutionTypeTag(row.exec_type)" size="small">
               {{ getExecutionTypeText(row.exec_type) }}
             </el-tag>
+          </template>
+        </el-table-column>
+
+        <el-table-column prop="execution_source" label="执行来源" width="120" align="center">
+          <template #default="{ row }">
+            <span class="execution-source">{{ getExecutionSourceText(row.execution_source, row.execution_source_display) }}</span>
           </template>
         </el-table-column>
 
@@ -289,11 +301,13 @@ const filters = reactive({
   exec_type: '',
   status: '',
   trigger_type: '',
+  execution_source: '',
   dateRange: null
 })
 
 // 测试执行记录数据
 const testRuns = ref([])
+let testRunsRequestSequence = 0
 
 // 计算属性
 const filteredTestRuns = computed(() => {
@@ -351,6 +365,12 @@ const executionTypeMap = {
   suite: { text: '套件', tag: 'success' }
 }
 
+const executionSourceMap = {
+  workspace_generation: 'AI自动验证',
+  workspace_debug: '工作区调试',
+  formal: '正式执行'
+}
+
 // 获取测试名称
 const getTestName = (item) => {
   return item.name || item.test_case_name || '未命名测试'
@@ -382,6 +402,10 @@ const getExecutionTypeText = (execType) => {
 
 const getExecutionTypeTag = (execType) => {
   return executionTypeMap[execType]?.tag || 'info'
+}
+
+const getExecutionSourceText = (source, display) => {
+  return display || executionSourceMap[source] || '正式执行'
 }
 
 // 格式化执行时长
@@ -451,6 +475,7 @@ const loadStatistics = async () => {
 
 // 加载测试执行记录
 const loadTestRuns = async () => {
+  const requestSequence = ++testRunsRequestSequence
   try {
     loading.value = true
     
@@ -464,8 +489,11 @@ const loadTestRuns = async () => {
     if (filters.exec_type) params.exec_type = filters.exec_type
     if (filters.status) params.status = filters.status
     if (filters.trigger_type) params.trigger_type = filters.trigger_type
+    if (filters.execution_source) params.execution_source = filters.execution_source
     
     const response = await getAPITestExecutions(projectStore.currentProjectId, params)
+
+    if (requestSequence !== testRunsRequestSequence) return
 
     if (response.success) {
       // 处理新的分页数据结构
@@ -479,6 +507,8 @@ const loadTestRuns = async () => {
           description: item.description,
           status: item.status,
           trigger_type: item.trigger_type,
+          execution_source: item.execution_source,
+          execution_source_display: item.execution_source_display,
           executor_name: item.executor_name,
           environment_name: item.environment_name,
           start_time: item.start_time,
@@ -498,11 +528,19 @@ const loadTestRuns = async () => {
       handleError(response.message, '加载数据失败')
     }
   } catch (error) {
+    if (requestSequence !== testRunsRequestSequence) return
     console.error('加载测试执行记录失败:', error)
     handleError('加载数据失败')
   } finally {
-    loading.value = false
+    if (requestSequence === testRunsRequestSequence) {
+      loading.value = false
+    }
   }
+}
+
+const handleExecutionSourceChange = async () => {
+  currentPage.value = 1
+  await loadTestRuns()
 }
 
 // 计算执行时长

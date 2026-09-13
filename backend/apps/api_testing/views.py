@@ -6,7 +6,7 @@ from django.http import Http404
 from django.utils import timezone
 from datetime import timedelta
 
-from django.db.models import Q
+from django.db.models import Q, Count
 import logging
 import json
 import time
@@ -23,7 +23,7 @@ from projects.models import Environment
 from .serializers import (
     APISpecificationSerializer, APISpecificationCreateSerializer,
     APITestCaseSerializer, APITestCaseDetailSerializer, APITestCaseCreateSerializer,
-    APITestExecutionListSerializer,
+    APITestExecutionListSerializer, EXECUTION_SOURCE_LABELS,
     EndpointTestGenerationSerializer,
     APITestSuiteSerializer, APITestSuiteCreateSerializer, APITestSuiteUpdateSerializer,
     APITestSuiteAddTestCaseSerializer, APITestCaseExecutionDetailSerializer,
@@ -744,67 +744,27 @@ class TestStatisticsView(APIView):
         """获取项目测试统计信息"""
         # 检查项目权限
         project = get_object_or_404(Project, id=project_id)
-        if not (project.created_by == request.user or
+        if not (request.user.is_superuser or project.owner_id == request.user.id or
+                project.created_by == request.user or
                 project.members.filter(user=request.user, can_view_reports=True).exists()):
             return response(
                 kind="permission_denied",
                 message="没有权限查看此项目的测试报告"
             )
 
-        # 统计测试用例
-        total_cases = APITestCase.objects.filter(project=project).count()
-
-        # 统计测试执行记录（参考Web UI执行统计信息格式）
-        total_executions = APITestExecution.objects.filter(
-            environment__project=project
-        ).count()
-        
-        pending_executions = APITestExecution.objects.filter(
-            environment__project=project,
-            status='pending'
-        ).count()
-        
-        running_executions = APITestExecution.objects.filter(
-            environment__project=project,
-            status='running'
-        ).count()
-        
-        passed_executions = APITestExecution.objects.filter(
-            environment__project=project,
-            status='passed'
-        ).count()
-        
-        failed_executions = APITestExecution.objects.filter(
-            environment__project=project,
-            status='failed'
-        ).count()
-        
-        error_executions = APITestExecution.objects.filter(
-            environment__project=project,
-            status='error'
-        ).count()
-        
-        stopped_executions = APITestExecution.objects.filter(
-            environment__project=project,
-            status='stopped'
-        ).count()
-
-        # 计算成功率
-        success_rate = (passed_executions / total_executions * 100) if total_executions > 0 else 0
+        # Use the same project/report scope as the execution list. Workspace
+        # debug and AI verification deliberately have no Environment.
+        stats = _report_execution_queryset(request.user, project_id).aggregate(
+            total=Count('id', distinct=True),
+            **{state: Count('id', filter=Q(status=state), distinct=True)
+               for state in ('pending', 'running', 'passed', 'failed', 'error', 'stopped')},
+        )
+        stats['success_rate'] = round(stats['passed'] / stats['total'] * 100, 1) if stats['total'] else 0
 
         # 使用统一响应格式（参考Web UI执行统计信息格式）
         return response(
             kind="success",
-            data={
-                'total': total_executions,
-                'pending': pending_executions,
-                'running': running_executions,
-                'passed': passed_executions,
-                'failed': failed_executions,
-                'error': error_executions,
-                'stopped': stopped_executions,
-                'success_rate': round(success_rate, 1)
-            },
+            data=stats,
             message="API测试执行统计信息获取成功"
         )
 
@@ -1360,11 +1320,8 @@ class APITestExecutionListView(generics.ListAPIView):
         user = self.request.user
         project_id = self.kwargs.get('project_id')
         
-        queryset = APITestExecution.objects.filter(
-            executor=user,
-            environment__project_id=project_id
-        ).select_related(
-            'executor', 'environment'
+        queryset = _report_execution_queryset(user, project_id).select_related(
+            'executor', 'environment', 'project'
         ).prefetch_related(
             'case_execution_detail__test_case',
             'suite_execution_detail__test_suite'
@@ -1384,6 +1341,18 @@ class APITestExecutionListView(generics.ListAPIView):
         trigger_type = self.request.GET.get('trigger_type')
         if trigger_type in ['manual', 'schedule', 'api', 'llm', 'jenkins', 'ci_cd']:
             queryset = queryset.filter(trigger_type=trigger_type)
+
+        # Workspace runs have no Environment by design. Their source is derived
+        # from the durable snapshot without returning that snapshot to clients.
+        execution_source = self.request.GET.get('execution_source')
+        if execution_source in EXECUTION_SOURCE_LABELS:
+            if execution_source == 'formal':
+                queryset = queryset.filter(
+                    Q(input_snapshot__source__isnull=True)
+                    | ~Q(input_snapshot__source__in=['workspace_generation', 'workspace_debug'])
+                )
+            else:
+                queryset = queryset.filter(input_snapshot__source=execution_source)
 
         return queryset
 

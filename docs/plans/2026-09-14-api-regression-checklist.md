@@ -4,7 +4,7 @@
 
 业务代码基线：`4ff5a4c`（端点用例生成入口与多步骤保留）
 
-状态：**第一批隔离回归、第二批小样本真实联调及 D-01/D-02 定向修复已执行，整体仍暂不放行。** 分层结果见 [第一批验收报告](../verification/2026-09-14-api-regression-batch1.md)、[第二批真实联调报告](../verification/2026-09-14-api-regression-batch2.md)、[缺陷修复与复测](../verification/2026-09-14-api-regression-fixes.md)。多场景目标混入和计划报告排序已修复；复测新增 D-03（同值更新并未验证真实改名），完整 CRUD、邮件和第三批剩余项尚未完成。
+状态：**第一批隔离回归、第二批小样本真实联调及 D-01/D-02/D-03 定向修复已执行，整体仍暂不放行。** 分层结果见 [第一批验收报告](../verification/2026-09-14-api-regression-batch1.md)、[第二批真实联调报告](../verification/2026-09-14-api-regression-batch2.md)、[缺陷修复与复测](../verification/2026-09-14-api-regression-fixes.md)及 [D-03 状态变化验收](../verification/2026-09-14-api-state-change-fix.md)。多场景目标混入、计划报告排序及同值更新问题已定向修复；完整 CRUD 实际改名与独立三连跑已通过，邮件和第三批剩余项尚未完成。
 
 ## 1. 目标与范围
 
@@ -318,4 +318,4 @@ backend/.venv/bin/python backend/scripts/test_api_workspace_reliability_browser.
 
 ---
 
-下一步：优先处理复测发现的 D-03，并完成 CRUD 独立三连跑；补齐实际邮件和第三批未覆盖项。真实登录与首次 Beat 到点链路已有第二批证据，不将模拟结果计为真实模型通过。
+下一步：补齐实际邮件和第三批未覆盖项。D-03 已完成实际状态变化验证与 CRUD 独立三连跑；真实登录与首次 Beat 到点链路已有第二批证据，不将模拟结果计为真实模型通过。

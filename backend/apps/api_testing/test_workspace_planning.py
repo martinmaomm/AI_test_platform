@@ -181,6 +181,23 @@ class WorkspaceGenerationPromptTests(SimpleTestCase):
                 self.assertEqual(_compare('contains', actual, expected), contains)
                 self.assertEqual(_compare('not_contains', actual, expected), not contains)
 
+    def test_generation_and_repair_require_evidence_of_real_state_change(self):
+        for mode in ('generate', 'repair'):
+            with self.subTest(mode=mode):
+                rules = self.messages(mode=mode)[0].content
+                for requirement in (
+                    '每次执行只生成一次', '下一次独立执行才重新生成',
+                    '即使变量名不同，值也相同',
+                    '"before_value":"before_${uuid4}"',
+                    '"after_value":"after_${uuid4}"',
+                    '不靠接口路径、字段名或操作名称的固定词表判断',
+                    '变化前后输入必须不同', '变化前的实际字段值',
+                    '后续不得覆盖它', 'eq 预期新值和 ne ${observed_before}',
+                    '这些场景按用户预期验证未变化',
+                    '缺少可靠的前后查询能力', '不能声称已证明业务变化',
+                ):
+                    self.assertIn(requirement, rules)
+
     def test_prompt_requires_verified_current_run_identity_before_using_queried_id(self):
         for mode in ('generate', 'repair'):
             with self.subTest(mode=mode):

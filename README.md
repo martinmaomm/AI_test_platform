@@ -213,5 +213,6 @@ automation-platform/
 | [API 第一批隔离验收](docs/verification/2026-09-14-api-regression-batch1.md) | 2026-09-14 的测试维护、隔离回归、本机 MCP 证据及真实联调准备缺口 |
 | [API 第二批真实联调](docs/verification/2026-09-14-api-regression-batch2.md) | 真实模型、网页采集、独立重跑、导出及调度结果；多场景混入和计划报告排序两项待修问题 |
 | [API 缺陷修复与定向复测](docs/verification/2026-09-14-api-regression-fixes.md) | 多场景混入和报告排序已修复；记录新发现的同值更新问题及尚未完成的验收 |
+| [API 状态变化验收](docs/verification/2026-09-14-api-state-change-fix.md) | 同值更新问题的后续修复、真实改名和三次独立运行；保留原断言审核与整体验收边界 |
 
 设计讨论和历史实施方案保存在 `docs/plans/`、`docs/superpowers/`。安装与使用以当前指南和代码为准，不要直接照搬历史方案里的迁移或清理命令。

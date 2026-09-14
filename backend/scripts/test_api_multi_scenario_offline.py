@@ -125,10 +125,31 @@ def main():
 
         def runner(**kwargs):
             remaining = kwargs.pop('hard_timeout_seconds', None)
+            on_progress = kwargs.pop('on_progress', None)
+            should_cancel = kwargs.pop('should_cancel', None)
             assert remaining and remaining <= 1800
             kwargs['options'] = {**(kwargs.get('options') or {}), 'total_timeout': min(600, remaining)}
             queue_ids.append(kwargs['script_id'])
-            return run_case(**kwargs)
+            latest = {}
+
+            class FixtureCancelled(Exception):
+                pass
+
+            def checkpoint(event):
+                latest.update(deepcopy(event['report']))
+                if on_progress:
+                    on_progress(deepcopy(latest))
+                if should_cancel and should_cancel():
+                    raise FixtureCancelled()
+
+            try:
+                return run_case(**kwargs, on_checkpoint=checkpoint)
+            except FixtureCancelled:
+                from api_testing.requests_runtime import interrupted_report, normalize_case
+                return interrupted_report(
+                    kwargs['script_id'], normalize_case(kwargs['script_content']),
+                    'Cancelled', '隔离多场景测试取消', partial_report=latest,
+                )
 
         with patch.object(generate_and_verify_api_workspace, 'apply_async') as queue:
             reply = call(APIWorkspaceMessagesView, 'post', {
@@ -152,7 +173,16 @@ def main():
         assert [item.generation['status'] for item in children] == ['passed', 'needs_review', 'passed']
         assert prompts[1]['current_scenario']['title'] == '读取账号'
         assert prompts[-1]['current_scenario']['title'] == '独立新增'
-        assert all(item.generation['_snapshot']['queued_at'] == root.generation['_snapshot']['queued_at'] for item in children)
+        # Children are created after planning.  They must retain their own
+        # queue timestamp while sharing the root's batch budget;
+        # equality with the root request timestamp would hide that distinction.
+        root_snapshot = root.generation['_snapshot']
+        root_batch_deadline = root_snapshot['deadlines']['batch_at']
+        assert all(item.generation['_snapshot']['queue_managed_by_parent'] is True for item in children)
+        assert all(item.generation['_snapshot']['queued_at'] == item.generation['queued_at'] for item in children)
+        assert all(item.generation['_snapshot']['queued_at'] >= root_snapshot['claimed_at'] for item in children)
+        assert all(item.generation['_snapshot']['deadlines']['queue_at'] is None for item in children)
+        assert all(item.generation['_snapshot']['deadlines']['batch_at'] == root_batch_deadline for item in children)
         assert len(sent) == 5 and len(sessions) == 3, (sent, sessions)
         assert [entry['url'].split('/')[-1] for _, entry in sent] == ['login', 'profile', 'maintenance', 'login', 'items']
         assert prompts[2]['current_draft']['teststeps'][0]['validate'] == []

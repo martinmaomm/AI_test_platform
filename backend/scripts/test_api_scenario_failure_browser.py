@@ -115,7 +115,14 @@ def verify(origin, fixture, output):
             expect(page.get_by_role('textbox', name='步骤名称', exact=True)).to_have_value('获取当前用户')
             # The business target stays unchanged, while manual editing can
             # associate a selected authentication dependency from this root.
-            page.locator('.step-editor').first.get_by_role('combobox').first.click()
+            # The first combobox is the execution phase.  Select the endpoint
+            # field explicitly so the available-dependency assertion covers
+            # the intended editor control rather than a coincidental dropdown.
+            endpoint_picker = page.locator('.step-editor').first.locator('.el-form-item').filter(
+                has_text='关联 API 端点',
+            ).get_by_role('combobox')
+            expect(endpoint_picker).to_have_count(1)
+            endpoint_picker.click()
             expect(page.get_by_role('option').filter(has_text='/session-ticket')).to_be_visible()
             expect(page.get_by_role('option').filter(has_text='/not-selected')).to_have_count(0)
             page.keyboard.press('Escape')

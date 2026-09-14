@@ -104,9 +104,30 @@ def main():
 
         def runner(**kwargs):
             remaining = kwargs.pop('hard_timeout_seconds', None)
+            on_progress = kwargs.pop('on_progress', None)
+            should_cancel = kwargs.pop('should_cancel', None)
             assert remaining and remaining <= 1800
             kwargs['options'] = {**(kwargs.get('options') or {}), 'total_timeout': min(600, remaining)}
-            return run_case(**kwargs)
+            latest = {}
+
+            class FixtureCancelled(Exception):
+                pass
+
+            def checkpoint(event):
+                latest.update(deepcopy(event['report']))
+                if on_progress:
+                    on_progress(deepcopy(latest))
+                if should_cancel and should_cancel():
+                    raise FixtureCancelled()
+
+            try:
+                return run_case(**kwargs, on_checkpoint=checkpoint)
+            except FixtureCancelled:
+                from api_testing.requests_runtime import interrupted_report, normalize_case
+                return interrupted_report(
+                    kwargs['script_id'], normalize_case(kwargs['script_content']),
+                    'Cancelled', '隔离依赖测试取消', partial_report=latest,
+                )
 
         def queue(workspace, mode='generate'):
             request = APIRequestFactory().post('/', {'revision': workspace.revision, 'mode': mode,
@@ -149,16 +170,20 @@ def main():
             previous_calls = len(requests)
             generate_and_verify_api_workspace.apply(**queue(first, 'repair'))
             first.refresh_from_db()
-            assert first.generation['status'] == 'passed', first.generation
-            assert len(first.generation['rounds']) == 2, first.generation
+            # Changing the protected body-code expectation to the observed 401
+            # is review-only.  It must not be retried against the target or
+            # silently repaired by consuming the next model response.
+            assert first.generation['status'] == 'needs_review', first.generation
+            assert len(first.generation['rounds']) == 1, first.generation
             assert first.generation['rounds'][0]['runnable'] is False
             assert first.generation['rounds'][0]['result'] == {}, 'Weakened assertions reached the target'
-            assert len(requests) == previous_calls + 2 and len(sessions) == 3, (requests, sessions)
-            assert first.candidate['draft']['teststeps'][1]['validate'] == good['teststeps'][1]['validate']
+            assert len(requests) == previous_calls and len(sessions) == 2, (requests, sessions)
+            assert first.candidate['verification_status'] == 'needs_review'
+            assert first.candidate['draft']['teststeps'][1]['validate'] == weakened['teststeps'][1]['validate']
+            assert outputs == [good], 'Review-only rejection unexpectedly requested another model reply'
             assert APIWorkspace.objects.filter(pk=sibling.pk).values().get() == before_sibling
             assert APITestCase.objects.count() == 0
-            assert not outputs
-    print('PASS: target-only scenario uses selected dependencies; manual repair prepends auth, preserves assertions and other scenes')
+    print('PASS: target-only scenario uses selected dependencies; weakened repair is review-only with no target replay')
 
 
 if __name__ == '__main__':

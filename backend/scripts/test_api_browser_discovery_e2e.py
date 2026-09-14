@@ -3,6 +3,10 @@
 Uses a disposable database, a synthetic loopback website and deterministic model
 answers. It proves integration, not real-model reasoning. No NAS, Redis or
 provider calls are made. The installed pinned MCP and Chrome are required.
+
+For a preinstalled package without cached npm registry metadata, set
+TEST_MCP_NPM_PREFIX to its npm project and prepend that project's
+node_modules/.bin to PATH. All npm execution still uses --offline.
 """
 from __future__ import annotations
 
@@ -134,7 +138,11 @@ def main():
 
         owner = get_user_model().objects.get(pk=fixture['user_id'])
         MCPConfiguration.objects.create(created_by=owner, name='playwright', raw_config=json.dumps({'mcpServers': {'playwright': {
-            'command': 'npx', 'args': ['--offline', '-y', '@executeautomation/playwright-mcp-server@1.0.12'],
+            'command': 'npx', 'args': ['--offline', '-y',
+                # Keep the pinned package usable without registry metadata
+                # when a preinstalled local npm prefix is supplied.
+                *(['--prefix', os.environ['TEST_MCP_NPM_PREFIX']] if os.environ.get('TEST_MCP_NPM_PREFIX') else []),
+                '@executeautomation/playwright-mcp-server@1.0.12'],
             'env': {'CHROME_EXECUTABLE_PATH': str(CHROME)}, 'timeout': 45,
         }}}))
         task = BrowserDiscoveryTask.objects.create(

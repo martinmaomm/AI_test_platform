@@ -3,6 +3,11 @@
 Only disposable SQLite and loopback fixtures are used. The deterministic model
 drives real Chrome, not a simulated collector; no NAS/provider/Redis is called.
 Run after building the frontend, with the backend virtual environment.
+
+If npm registry metadata is not cached, TEST_MCP_NPM_PREFIX may point to an
+existing npm project containing the pinned package. Also prepend that project's
+node_modules/.bin to PATH so the platform output wrapper can resolve the binary.
+This remains offline; it does not install or change the package version.
 """
 from __future__ import annotations
 
@@ -129,7 +134,11 @@ def main():
 
         settings.API_BROWSER_DISCOVERY_ENABLED = True
         MCPConfiguration.objects.create(created_by_id=fixture["user_id"], name="playwright", raw_config=json.dumps({"mcpServers": {"playwright": {
-            "command": "npx", "args": ["--offline", "-y", "@executeautomation/playwright-mcp-server@1.0.12"],
+            "command": "npx", "args": ["--offline", "-y",
+                # An installed local prefix also works when npm's registry
+                # metadata cache is absent; never download a replacement.
+                *(["--prefix", os.environ["TEST_MCP_NPM_PREFIX"]] if os.environ.get("TEST_MCP_NPM_PREFIX") else []),
+                "@executeautomation/playwright-mcp-server@1.0.12"],
             "env": {"CHROME_EXECUTABLE_PATH": str(CHROME)}, "timeout": 45,
         }}}))
 

@@ -98,10 +98,31 @@ def main():
 
             def runner(**kwargs):
                 remaining = kwargs.pop('hard_timeout_seconds', None)
+                on_progress = kwargs.pop('on_progress', None)
+                should_cancel = kwargs.pop('should_cancel', None)
                 if remaining is not None:
                     kwargs['options'] = {**(kwargs.get('options') or {}), 'total_timeout': min(600, remaining)}
+                latest = {}
+
+                class FixtureCancelled(Exception):
+                    pass
+
+                def checkpoint(event):
+                    latest.update(deepcopy(event['report']))
+                    if on_progress:
+                        on_progress(deepcopy(latest))
+                    if should_cancel and should_cancel():
+                        raise FixtureCancelled()
+
                 with patch('api_testing.requests_runtime.requests.Session', return_value=SimpleNamespace(request=fake_request, close=lambda: None)):
-                    return run_case(**kwargs)
+                    try:
+                        return run_case(**kwargs, on_checkpoint=checkpoint)
+                    except FixtureCancelled:
+                        from api_testing.requests_runtime import interrupted_report, normalize_case
+                        return interrupted_report(
+                            kwargs['script_id'], normalize_case(kwargs['script_content']),
+                            'Cancelled', '隔离验证测试取消', partial_report=latest,
+                        )
 
             with patch('api_testing.workspace_tasks.get_llm_manager', return_value=SimpleNamespace(stream_invoke=answer)), patch(
                 'api_testing.requests_runner.requests_runner', side_effect=runner,

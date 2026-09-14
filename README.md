@@ -210,5 +210,6 @@ automation-platform/
 | [网页探索 API 验收](docs/api-browser-discovery-acceptance-2026-09-09.md) | 本地回归、真实模型/NAS、两次独立重跑与 Python 导出证据 |
 | [API 工作区全量复测记录](docs/api-workspace-live-retest-2026-09-08.md) | 2026-09-08 的实际测试证据与人工修正记录；不是所有环境和场景的质量保证 |
 | [API 系统回归清单与验收标准](docs/plans/2026-09-14-api-regression-checklist.md) | 三批执行顺序、59 项检查、真实联调样本与模块收尾标准；计划不代表已通过 |
+| [API 第一批隔离验收](docs/verification/2026-09-14-api-regression-batch1.md) | 2026-09-14 的测试维护、隔离回归、本机 MCP 证据及真实联调准备缺口 |
 
 设计讨论和历史实施方案保存在 `docs/plans/`、`docs/superpowers/`。安装与使用以当前指南和代码为准，不要直接照搬历史方案里的迁移或清理命令。

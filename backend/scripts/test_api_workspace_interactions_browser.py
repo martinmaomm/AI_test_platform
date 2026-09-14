@@ -119,7 +119,7 @@ def verify(origin, fixture, output):
                 generate.click()
             harness.confirm_generation(page)
             expect(message).to_have_value('')
-            expect(page.get_by_role('button', name='采用候选并替换草稿')).to_be_visible(timeout=15000)
+            expect(page.get_by_role('button', name='采用候选并替换草稿', exact=True)).to_be_visible(timeout=15000)
 
             # Failed reload keeps edits; a confirmed successful reload replaces them.
             name.fill('本地尚未保存的编辑')

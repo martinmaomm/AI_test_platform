@@ -18,6 +18,10 @@ _BROWSER_CREDENTIAL_KEYS = frozenset({
 })
 
 
+class ScenarioScopeViolation(WorkspaceValidationError):
+    """A candidate step conflicts with the server-frozen current scenario."""
+
+
 def _browser_credential_key(name: Any, *, header=False) -> bool:
     normalized = re.sub(r'[-_\s]', '', str(name)).lower()
     if header and normalized.startswith('x'):
@@ -565,7 +569,8 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
                       protected: dict[str, dict[str, str]] | None = None,
                       required_endpoint_ids: set[int] | None = None,
                       authenticated_target_ids: set[int] | None = None,
-                      cookie_session_dependency_ids: set[int] | None = None) -> dict[str, Any]:
+                      cookie_session_dependency_ids: set[int] | None = None,
+                      scenario: dict[str, Any] | None = None) -> dict[str, Any]:
     draft = normalize_draft(value)
     selected = {item['id']: item for item in endpoints}
     if not draft['teststeps']:
@@ -615,10 +620,20 @@ def prepare_candidate(value: Any, *, endpoints: list[dict[str, Any]], target_url
         # document forgot a security override).  Enforce it only for business
         # targets the scenario plan explicitly marked as authenticated.
         if step.get('endpoint_id') in (authenticated_target_ids or set()):
-            _require_endpoint_security(
-                effective_step['request'], endpoint, index=index,
-                session_cookie_available=bool(completed_dependency_ids.intersection(cookie_session_dependency_ids or set())),
-            )
+            try:
+                _require_endpoint_security(
+                    effective_step['request'], endpoint, index=index,
+                    session_cookie_available=bool(completed_dependency_ids.intersection(cookie_session_dependency_ids or set())),
+                )
+            except WorkspaceValidationError as exc:
+                if not scenario:
+                    raise
+                raise ScenarioScopeViolation(
+                    f'候选步骤 {index + 1} 与 current_scenario 冻结认证契约冲突：端点 '
+                    f'{step.get("endpoint_id")} 属于 authenticated_endpoint_ids，但当前调用缺少 '
+                    'OpenAPI security 要求的鉴权参数。若该步属于当前场景目标，请使用本场景凭证；'
+                    '若它表达其他未认证或负向场景，请删除整个越界步骤及其断言，不能改写当前场景目标或断言。'
+                ) from exc
         # Conditions in extract selectors are evaluated against values from
         # earlier steps, never another partially extracted value in this step.
         _require_variables(step['extract'], scoped_values, allowed=available, label=f'候选步骤 {index + 1} 提取条件')

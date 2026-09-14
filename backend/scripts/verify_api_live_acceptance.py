@@ -13,6 +13,7 @@ import time
 import subprocess
 import traceback
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from dotenv import load_dotenv
@@ -334,6 +335,27 @@ def launch_c(args):
         browser.close()
 
 
+def status_b(args):
+    """Read the existing task; never dispatch another generation on timeout."""
+    record = json.loads((args.output / 'live-b.json').read_text())
+    session = platform_session(args)
+    base = 'http://127.0.0.1:8000/api/v1/projects/2/api-testing/'
+    response = session.get(base + f'workspaces/{record["root_id"]}/', timeout=15)
+    response.raise_for_status()
+    root = response.json()['data']
+    write_json(args.output / 'live-b-workspace.private.json', root, private=True)
+    summary = {'root_id': root['id'], 'status': root['status'],
+               'generation_status': root['generation'].get('status'),
+               'phase': root['generation'].get('phase'),
+               'scenarios': [{
+                   'id': c['id'], 'endpoint_ids': c['endpoint_ids'],
+                   'status': c['status'], 'attempt': c['generation'].get('attempt'),
+                   'verification_status': (c.get('candidate') or {}).get('verification_status'),
+               } for c in root['scenarios']]}
+    write_json(args.output / 'live-b-status.json', summary)
+    print(json.dumps(summary, ensure_ascii=False), flush=True)
+
+
 def run_formal_case(session, base, case_id, output, label):
     """Dispatch once, persist identity immediately, and stop on the first failure."""
     ledger_path = output / f'{label}-executions.json'
@@ -391,6 +413,64 @@ def finish_b_negative(args):
     record.update({'negative_child_id': c['id'], 'negative_case_id': c['saved_case_id'], 'crud_status': root['scenarios'][0]['status']})
     write_json(ledger_path, record)
     run_formal_case(session, base, c['saved_case_id'], args.output, 'live-b-negative')
+
+
+def require_distinct_crud_names(result):
+    """This fixture requires a real rename, not just a successful update HTTP."""
+    created, updated = [], []
+    for step in result.get('step_datas', []):
+        for exchange in step.get('data', {}).get('req_resps', []):
+            request = exchange.get('request', {})
+            path = urlsplit(request.get('url', '')).path
+            body = request.get('body')
+            if request.get('method') != 'POST' or not isinstance(body, dict):
+                continue
+            if path == '/resourceCategory/create':
+                created.append(body.get('name'))
+            elif path.startswith('/resourceCategory/update/'):
+                updated.append(body.get('name'))
+    assert len(created) == len(updated) == 1, '缺少本轮唯一创建/修改请求证据'
+    assert all(isinstance(value, str) and value for value in [*created, *updated]), '缺少实际名称'
+    assert created[0] != updated[0], '新增名和修改名相同，不能将无效改名计为 CRUD 通过'
+
+
+def finish_b_crud(args):
+    """Save and replay the reviewed CRUD candidate without editing its steps."""
+    session = platform_session(args)
+    base = 'http://127.0.0.1:8000/api/v1/projects/2/api-testing/'
+    ledger_path = args.output / 'live-b.json'
+    record = json.loads(ledger_path.read_text())
+    root = session.get(base + f'workspaces/{record["root_id"]}/', timeout=15).json()['data']
+    assert root['status'] not in ('generating', 'debugging')
+    # Login may be a lifecycle target or an explicit dependency; both are valid
+    # so long as the same approved CRUD operations remain in the scene.
+    children = [c for c in root['scenarios']
+                if {27, 28, 29, 30} <= set(c['endpoint_ids']) <= {4, 27, 28, 29, 30}]
+    assert len(children) == 1, '必须找到且仅找到本次资源分类 CRUD 场景'
+    c = children[0]
+    candidate = c['candidate']
+    assert candidate['verification_status'] == 'passed' and not candidate['risks']
+    draft = candidate['draft']
+    assert {s['endpoint_id'] for s in draft['teststeps']} == {4, 27, 28, 29, 30}
+    assert draft['teststeps'][0]['endpoint_id'] == 4, 'CRUD 必须自行登录'
+    assert not any({'eq': ['body.code', 401]} in s['validate'] for s in draft['teststeps']), '不能混入独立负向断言'
+    require_distinct_crud_names(c['generation']['rounds'][-1]['result'])
+    if not c['saved_case_id']:
+        r = session.patch(base + f'workspaces/{c["id"]}/', json={'revision': c['revision'], 'draft': draft}, timeout=20)
+        assert r.status_code == 200
+        c = r.json()['data']
+        r = session.post(base + f'workspaces/{c["id"]}/save/', json={
+            'revision': c['revision'], 'title': '验收LIVE-B-资源分类完整生命周期',
+        }, timeout=20)
+        assert r.status_code == 200
+        c = r.json()['data']
+    record.update({'crud_child_id': c['id'], 'crud_case_id': c['saved_case_id'],
+                   'crud_attempts': c['generation']['attempt']})
+    write_json(ledger_path, record)
+    case = session.get(base + f'test-cases/{c["saved_case_id"]}/', timeout=15).json()['data']
+    assert case['test_case_type'] == 'scenario'
+    assert json.loads(case['script_content'])['teststeps'] == draft['teststeps']
+    run_formal_case(session, base, c['saved_case_id'], args.output, 'live-b-crud')
 
 
 def export_a(args):
@@ -533,8 +613,9 @@ def main():
     parser.add_argument('--run-live', action='store_true', required=True)
     parser.add_argument('--output', type=Path, required=True)
     stages = {'preflight': preflight, 'launch-a': launch_a, 'finish-a': finish_a,
-              'replay-a': replay_a, 'launch-b': launch_b, 'launch-c': launch_c,
-              'finish-b-negative': finish_b_negative, 'export-a': export_a, 'handoff-c': handoff_c, 'generate-c': generate_c,
+              'replay-a': replay_a, 'launch-b': launch_b, 'status-b': status_b, 'launch-c': launch_c,
+              'finish-b-negative': finish_b_negative, 'finish-b-crud': finish_b_crud,
+              'export-a': export_a, 'handoff-c': handoff_c, 'generate-c': generate_c,
               'finish-c': finish_c}
     parser.add_argument('--stage', choices=tuple(stages), default='preflight')
     parser.add_argument('--frontend', default='http://127.0.0.1:5173')

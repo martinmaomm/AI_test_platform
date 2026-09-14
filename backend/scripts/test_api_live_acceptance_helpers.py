@@ -4,7 +4,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import verify_api_live_delivery as delivery
 import verify_api_live_acceptance as acceptance
@@ -64,6 +65,38 @@ class LiveHelperTests(unittest.TestCase):
         report = {'case_executions': [{'test_case': 11, 'status': 'passed'}, {'test_case': 10, 'status': 'passed'}]}
         with self.assertRaises(RuntimeError):
             delivery.assert_two_case_report(report, 10, 11)
+
+    def test_crud_finish_refuses_unverified_or_mixed_candidate_before_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(output=Path(tmp))
+            acceptance.write_json(args.output / 'live-b.json', {'root_id': 10})
+            for passed, mixed in ((False, False), (True, True)):
+                with self.subTest(passed=passed, mixed=mixed):
+                    steps = [{'endpoint_id': i, 'validate': [{'eq': ['status_code', 200]}]}
+                             for i in (4, 27, 29, 30, 28)]
+                    if mixed:
+                        steps.append({'endpoint_id': 29, 'validate': [{'eq': ['body.code', 401]}]})
+                    child = {'endpoint_ids': [27, 28, 29, 30], 'candidate': {
+                        'verification_status': 'passed' if passed else 'failed', 'risks': [],
+                        'draft': {'teststeps': steps},
+                    }}
+                    session = Mock()
+                    session.get.return_value.json.return_value = {'data': {'status': 'ready', 'scenarios': [child]}}
+                    with patch.object(acceptance, 'platform_session', return_value=session), \
+                         patch.object(acceptance, 'run_formal_case') as run, self.assertRaises(AssertionError):
+                        acceptance.finish_b_crud(args)
+                    session.patch.assert_not_called()
+                    session.post.assert_not_called()
+                    run.assert_not_called()
+
+    def test_crud_acceptance_rejects_noop_rename_even_if_runtime_passed(self):
+        def report(updated):
+            return {'success': True, 'step_datas': [{'data': {'req_resps': [{'request': {
+                'method': 'POST', 'url': f'https://fixture.test/resourceCategory/{path}', 'body': {'name': name},
+            }}]}} for path, name in [('create', 'unique-first'), ('update/13', updated)]]}
+        with self.assertRaisesRegex(AssertionError, '新增名和修改名相同'):
+            acceptance.require_distinct_crud_names(report('unique-first'))
+        acceptance.require_distinct_crud_names(report('unique-second'))
 
 
 if __name__ == '__main__':

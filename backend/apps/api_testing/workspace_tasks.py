@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 MAX_SCENARIO_COUNT = 20
+MAX_SHARED_CONSTRAINT_COUNT = 50
 
 
 class PipelineDeadlineExceeded(RuntimeError):
@@ -312,7 +313,9 @@ def _planner_messages(*, conversation: list[dict[str, Any]], endpoints: list[dic
     )
     rules = [
         '你是 API 测试场景规划助手。只输出一个 JSON 对象，不要 Markdown 或解释。',
-        f'输出严格为 {{"scenarios":[{scenario_shape}],"summary":""}}。',
+        f'输出严格为 {{"shared_constraints":[],"scenarios":[{scenario_shape}],"summary":""}}。',
+        f'shared_constraints 必须是最多 {MAX_SHARED_CONSTRAINT_COUNT} 项的字符串数组，只放适用于每个场景的用户约束，例如本轮唯一数据、变量来源、清理边界和禁止触碰既有数据；不得放任何单一场景的业务目标或待执行步骤。没有共享约束时输出空数组。',
+        '将用户要求完整分配到 shared_constraints 或对应场景 description：每个场景 description 必须完整保留该场景自己的目标、局部数据要求、断言和清理要求，不得把其他场景目标复制进来，也不得仅依赖根 conversation 补全当前场景。',
         f'scenarios 必须为 1 到 {MAX_SCENARIO_COUNT} 项；每项 title 非空，description 为字符串，endpoint_ids 为非空整数数组。',
         'endpoint_ids 是该场景必须保留并断言的业务目标，只能来自 selected_endpoints；不要编造端点或把未选择端点纳入计划。',
         '按独立业务生命周期组织场景：可将同一业务对象的新增、查询、更新、删除等紧密关联操作合并到一个场景，以合理数量覆盖所选范围。规划阶段不是每个接口一个场景；selected_endpoints 仅限定可用范围，不要求全范围内每个端点都必须执行。',
@@ -353,6 +356,15 @@ def _planner_messages(*, conversation: list[dict[str, Any]], endpoints: list[dic
 def _parse_plan(value: Any, *, endpoint_ids: set[int], target_endpoint_id: int | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise WorkspaceValidationError('场景规划必须是 JSON 对象。')
+    shared_constraints = value.get('shared_constraints', [])
+    if (not isinstance(shared_constraints, list)
+            or len(shared_constraints) > MAX_SHARED_CONSTRAINT_COUNT
+            or any(not isinstance(item, str) or not item.strip() or len(item.strip()) > 2000
+                   for item in shared_constraints)):
+        raise WorkspaceValidationError(
+            f'场景规划 shared_constraints 必须是最多 {MAX_SHARED_CONSTRAINT_COUNT} 项的非空字符串数组。'
+        )
+    shared_constraints = list(dict.fromkeys(item.strip() for item in shared_constraints))
     scenarios = value.get('scenarios')
     if not isinstance(scenarios, list):
         raise WorkspaceValidationError(f'场景规划 scenarios 必须为 1 到 {MAX_SCENARIO_COUNT} 项。')
@@ -413,7 +425,7 @@ def _parse_plan(value: Any, *, endpoint_ids: set[int], target_endpoint_id: int |
     summary = value.get('summary', '')
     if not isinstance(summary, str):
         raise WorkspaceValidationError('场景规划 summary 必须是字符串。')
-    return {'scenarios': normalized, 'summary': summary}
+    return {'shared_constraints': shared_constraints, 'scenarios': normalized, 'summary': summary}
 
 
 def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: dict[str, Any], plan: dict[str, Any]) -> list[tuple[int, int, str]] | None:
@@ -428,7 +440,7 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
             {'id': item['id'], 'method': item['method'], 'path': item['path'], 'name': item.get('summary') or ''}
             for item in snapshot.get('endpoints') or []
         ]
-        endpoint_by_id = {item['id']: item for item in snapshot.get('endpoints') or []}
+        shared_constraints = deepcopy(plan.get('shared_constraints') or [])
         for order, scenario in enumerate(plan['scenarios']):
             child_task_id = str(uuid.uuid4())
             queued_at = timezone.now()
@@ -460,7 +472,11 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
                 'scope_catalog': deepcopy(scope_catalog),
                 'frozen_scope_specs': deepcopy(snapshot.get('endpoints') or []),
                 'target_url': snapshot['target_url'], 'variables': deepcopy(snapshot['variables']),
-                'messages': deepcopy(snapshot.get('messages') or []), 'failure_evidence': None,
+                # Root messages contain all planned scenario goals.  Children
+                # receive only the planner's scoped contract and subsequent
+                # messages written directly in that child.
+                'messages': [],
+                'shared_constraints': deepcopy(shared_constraints), 'failure_evidence': None,
                 'scenario': {
                     **deepcopy(scenario), 'target_endpoint_ids': deepcopy(scenario['endpoint_ids']),
                     'available_endpoint_ids': deepcopy(snapshot.get('scope_endpoint_ids') or []),
@@ -475,7 +491,7 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
                 title=scenario['title'], scenario_order=order, scenario_description=scenario['description'],
                 model_id=root.model_id, target_endpoint_id=root.target_endpoint_id,
                 endpoint_ids=scenario['endpoint_ids'], draft=default_api_workspace_draft(),
-                messages=deepcopy(snapshot.get('messages') or []),
+                messages=[],
                 status=APIWorkspace.Status.GENERATING, task_id=child_task_id,
                 generation={
                     'status': 'queued', 'phase': 'queued', 'attempt': 0, 'max_attempts': 3,
@@ -489,6 +505,7 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
                         **deepcopy(scenario), 'target_endpoint_ids': deepcopy(scenario['endpoint_ids']),
                         'available_endpoint_ids': deepcopy(snapshot.get('scope_endpoint_ids') or []),
                     },
+                    'shared_constraints': deepcopy(shared_constraints),
                 },
             )
             children.append((child.id, child.revision, child_task_id))
@@ -663,8 +680,6 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
             return {'status': 'stale'}
         user_draft = normalize_draft(snapshot.get('user_draft', snapshot['draft']))
         protection_draft = normalize_draft(snapshot['draft'])
-        baseline = _step_assertions(protection_draft)
-        protected = protected_expected_values(protection_draft, snapshot.get('variables'))
         prompt_draft = snapshot['draft']
         rounds: list[dict[str, Any]] = []
         failure_evidence = snapshot.get('failure_evidence') if isinstance(snapshot.get('failure_evidence'), dict) else None
@@ -684,6 +699,8 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
         cookie_session_dependency_ids = scenario.get('dependency_endpoint_ids', [])
         cookie_session_dependency_ids = set(cookie_session_dependency_ids) if isinstance(cookie_session_dependency_ids, list) else set()
         active_endpoints = deepcopy(snapshot.get('endpoints') or [])
+        baseline = _step_assertions(protection_draft)
+        protected = protected_expected_values(protection_draft, snapshot.get('variables'))
         from api_testing.requests_runner import requests_runner
         for attempt in range(1, 4):
             workspace = _pipeline_guard(workspace_id, revision, task_id, frozen_model_id=snapshot.get('model_id'))
@@ -720,6 +737,7 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
                     mode=mode, failure_evidence=_prompt_failure_evidence(failure_evidence), scenario=scenario or None,
                     scope_catalog=snapshot.get('scope_catalog') or [],
                     target_endpoint_id=snapshot.get('target_endpoint_id'),
+                    shared_constraints=snapshot.get('shared_constraints') or [],
                 ), callback=on_chunk, **_llm_stream_timeout_kwargs(manager, call_timeout))
             except Exception as exc:
                 cause = exc if isinstance(exc, (PipelineDeadlineExceeded, PipelineStale)) else exc.__cause__
@@ -749,7 +767,8 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
                     target_url=snapshot['target_url'], variables=snapshot['variables'],
                     required_endpoint_ids=required_endpoint_ids,
                     authenticated_target_ids=authenticated_target_ids,
-                    cookie_session_dependency_ids=cookie_session_dependency_ids)
+                    cookie_session_dependency_ids=cookie_session_dependency_ids,
+                    scenario=scenario or None)
             except Exception as exc:
                 # A parseable but statically invalid draft is valuable repair
                 # context.  It is deliberately not stored as ``candidate`` and
@@ -961,7 +980,8 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
                          failure_evidence: dict[str, Any] | None,
                          scenario: dict[str, Any] | None = None,
                          scope_catalog: list[dict[str, Any]] | None = None,
-                         target_endpoint_id: int | None = None) -> list[Any]:
+                         target_endpoint_id: int | None = None,
+                         shared_constraints: list[str] | None = None) -> list[Any]:
     rules = [
         '你是 API 测试草稿助手。只输出一个完整 JSON 对象；不要 Markdown、解释或 Python。',
         '必须完整输出 {"version":1,"config":{"name":"","base_url":"","variables":{}},"teststeps":[]}，不可省略字段。',
@@ -1006,8 +1026,15 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
             '只能依据提供的本次失败证据修改。修正 validate 格式时保留原检查项、比较器语义与预期值；修正提取时遵守上述路径与本轮记录定位边界。实际响应只用于定位问题，不得将原预期值或其引用变量改为实际值来制造通过。',
             '不得删除、放宽、跳过或伪造已有断言；无法安全修复时保留原断言。',
         ])
+        if isinstance(failure_evidence, dict) and failure_evidence.get('error_type') == 'ScenarioScopeViolation':
+            rules.append(
+                '本轮失败是 current_scenario 冻结契约冲突。若冲突步骤实际属于其他独立场景，必须删除该完整越界步骤及其断言；'
+                '此例外不允许删除、改写或弱化当前场景仍需保留的业务目标步骤、断言、账号保护或认证要求。'
+                '若冲突步骤就是当前场景目标，则保留其原断言并补齐本场景自己的认证上下文。'
+            )
     payload = {
         'conversation': conversation,
+        'shared_constraints': shared_constraints or [],
         'current_draft': draft,
         'selected_endpoints': endpoints,
         'failure_evidence': failure_evidence if mode == 'repair' else None,
@@ -1016,7 +1043,7 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
         'target_endpoint_id': target_endpoint_id,
     }
     if scenario:
-        rules.append('current_scenario.target_endpoint_ids 是必须保留的业务目标和断言；selected_endpoints/available_endpoint_ids 是同一根工作区冻结的可选依赖范围。只可增加有 OpenAPI security、参数、请求体或响应字段证据支持的前置登录/数据准备步骤，且不得执行所有可选端点。current_scenario.authenticated_endpoint_ids 是冻结的需认证业务目标子集，这些端点必须使用该场景自己提取或用户提供的凭证；requires_authenticated_context 仅为该子集是否非空的摘要，不表示全部目标都需认证。未在子集中的认证入口可先获取凭证，明确的未登录/无权限负向目标按原计划生成。每个场景不能借用其他场景的 token 或步骤。修复可插入前置步骤，但必须保留目标请求及其原业务断言，不得缩小或重写冻结的 authenticated_endpoint_ids 来绕过认证要求。')
+        rules.append('payload.shared_constraints 是适用于每个场景的冻结共享约束；current_scenario.description 是当前场景完整目标；conversation 只包含直接写入当前子场景的后续局部指令。不得把根工作区或其他场景的目标补成当前待办。current_scenario.target_endpoint_ids 是必须保留的业务目标和断言；selected_endpoints/available_endpoint_ids 是同一根工作区冻结的可选依赖范围。只可增加有 OpenAPI security、参数、请求体或响应字段证据支持的前置登录/数据准备步骤，且不得执行所有可选端点。current_scenario.authenticated_endpoint_ids 是冻结的需认证业务目标子集，这些端点必须使用该场景自己提取或用户提供的凭证；requires_authenticated_context 仅为该子集是否非空的摘要，不表示全部目标都需认证。未在子集中的认证入口可先获取凭证，明确的未登录/无权限负向目标只在其自己的场景生成。每个场景不能借用其他场景的 token 或步骤。修复可插入前置步骤，但必须保留目标请求及其原业务断言，不得缩小或重写冻结的 authenticated_endpoint_ids 来绕过认证要求。')
     elif target_endpoint_id is not None:
         rules.append(
             f'平台已冻结本工作区唯一业务目标 target_endpoint_id={target_endpoint_id}。生成和修复都必须实际调用并断言该端点；'

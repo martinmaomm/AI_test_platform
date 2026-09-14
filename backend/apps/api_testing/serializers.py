@@ -804,8 +804,37 @@ class APITestSuiteExecutionDetailSerializer(serializers.ModelSerializer):
         return ''
 
     def get_case_executions(self, obj):
+        """Render historical rows in the order frozen for this execution.
+
+        Old records may predate snapshots, and manual intervention can leave
+        rows not represented in one.  Keep every persisted row visible after
+        the ordered snapshot rows instead of dropping it from the report.
+        """
+        case_executions = list(obj.case_executions.all().order_by('id'))
+        snapshot = obj.execution.input_snapshot
+        frozen_cases = snapshot.get('cases') if isinstance(snapshot, dict) else None
+        if not isinstance(frozen_cases, list):
+            return APITestSuiteCaseExecutionSerializer(case_executions, many=True).data
+
+        by_id = {case_execution.pk: case_execution for case_execution in case_executions}
+        ordered = []
+        seen = set()
+        for frozen_case in frozen_cases:
+            if not isinstance(frozen_case, dict):
+                continue
+            detail_id = frozen_case.get('detail_id')
+            if type(detail_id) is not int or detail_id in seen:
+                continue
+            case_execution = by_id.get(detail_id)
+            if case_execution is not None:
+                ordered.append(case_execution)
+                seen.add(detail_id)
+        ordered.extend(
+            case_execution for case_execution in case_executions
+            if case_execution.pk not in seen
+        )
         return APITestSuiteCaseExecutionSerializer(
-            obj.case_executions.all().order_by('id'), many=True,
+            ordered, many=True,
         ).data
 
 class APITestSuiteCaseExecutionSerializer(serializers.ModelSerializer):

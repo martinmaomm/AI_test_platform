@@ -1043,6 +1043,7 @@ class APIWorkspaceTests(TestCase):
         self.assertEqual(root.generation['planning_attempts'][0]['raw'], invalid_plan)
         self.assertEqual(root.generation['plan'], {
             **valid_plan,
+            'shared_constraints': [],
             'scenarios': [{
                 **valid_plan['scenarios'][0], 'dependency_endpoint_ids': [],
                 'dependency_evidence': '', 'requires_authenticated_context': False, 'authenticated_endpoint_ids': [],

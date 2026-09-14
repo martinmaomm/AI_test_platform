@@ -83,6 +83,36 @@ class ScheduledRunReliabilityTests(TestCase):
         self.assertEqual(APITestExecution.objects.filter(trigger_type='schedule').count(), 2)
         enqueue.assert_called_once_with(log.id, log.linked_executions[0]['execution_id'])
 
+    def test_scheduled_api_report_uses_frozen_suite_order_after_suite_changes(self):
+        """Scheduled snapshots must create their report rows in frozen order."""
+        from api_testing.serializers import APITestSuiteExecutionDetailSerializer
+
+        later_case = APITestCase.objects.create(
+            project=self.project, endpoint=self.case.endpoint, title='Later case',
+            created_by=self.user,
+            script_content='{"config":{"name":"later"},"teststeps":[]}',
+        )
+        suite = APITestSuite.objects.create(
+            name='Ordered report', user=self.user, project=self.project,
+            # ``APITestCase`` defaults to newest first, so this deliberately
+            # reverses the source query order used by the old scheduler.
+            test_case_order=[self.case.pk, later_case.pk],
+        )
+        suite.test_cases.add(self.case, later_case)
+        ScheduledTask.objects.filter(pk=self.task.pk).update(suite_ids=[suite.pk])
+
+        log, _ = self.reserve()
+        execution = APITestExecution.objects.get(pk=log.linked_executions[0]['execution_id'])
+        suite.test_case_order = [later_case.pk, self.case.pk]
+        suite.test_cases.remove(later_case)
+        suite.save(update_fields=['test_case_order', 'updated_at'])
+
+        report = APITestSuiteExecutionDetailSerializer(execution.suite_execution_detail).data
+        self.assertEqual(
+            [case['test_case_title'] for case in report['case_executions']],
+            ['Health case', 'Later case'],
+        )
+
     def test_failed_first_suite_is_reported_then_advances_to_second(self):
         log, _ = self.reserve()
         first, second = log.linked_executions

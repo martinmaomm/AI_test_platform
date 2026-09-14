@@ -65,6 +65,75 @@ class APIExecutionSnapshotTests(TestCase):
         self.assertEqual(seen, [(str(second.pk), 'suite'), (str(self.case.pk), 'suite')])
         self.assertEqual(result['passed_cases'], 2)
 
+    def test_manual_suite_report_uses_frozen_case_order_after_suite_changes(self):
+        """The report must not consult the mutable suite ordering."""
+        from .serializers import APITestSuiteExecutionDetailSerializer
+
+        second = APITestCase.objects.create(
+            project=self.project, test_case_type='scenario', title='Second',
+            created_by=self.user, script_content=json.dumps(self.doc),
+        )
+        suite = APITestSuite.objects.create(
+            project=self.project, user=self.user, name='Suite',
+            test_case_order=[second.pk, self.case.pk],
+        )
+        suite.test_cases.add(self.case, second)
+        self.execution.exec_type = 'suite'
+        self.execution.save(update_fields=['exec_type'])
+
+        capture_suite_snapshot(self.execution, suite, self.environment)
+        suite.test_case_order = [self.case.pk, second.pk]
+        suite.test_cases.remove(second)
+        suite.save(update_fields=['test_case_order', 'updated_at'])
+
+        report = APITestSuiteExecutionDetailSerializer(self.execution.suite_execution_detail).data
+        self.assertEqual(
+            [case['test_case_title'] for case in report['case_executions']],
+            ['Second', 'Case'],
+        )
+
+    def test_suite_report_preserves_orphan_detail_after_frozen_rows(self):
+        """A stale snapshot must not hide a persisted report detail."""
+        from .models import APITestSuiteCaseExecution
+        from .serializers import APITestSuiteExecutionDetailSerializer
+
+        second = APITestCase.objects.create(
+            project=self.project, test_case_type='scenario', title='Second',
+            created_by=self.user, script_content=json.dumps(self.doc),
+        )
+        suite = APITestSuite.objects.create(
+            project=self.project, user=self.user, name='Suite',
+            test_case_order=[second.pk, self.case.pk],
+        )
+        suite.test_cases.add(self.case, second)
+        self.execution.exec_type = 'suite'
+        self.execution.save(update_fields=['exec_type'])
+        capture_suite_snapshot(self.execution, suite, self.environment)
+
+        detail = self.execution.suite_execution_detail
+        by_case = {row.test_case_id: row for row in detail.case_executions.all()}
+        APITestSuiteCaseExecution.objects.create(
+            suite_execution=detail, test_case=None, name='Orphan detail', status='error',
+        )
+        self.execution.input_snapshot = {
+            'version': 1,
+            'kind': 'suite',
+            'cases': [
+                {'detail_id': True},
+                {'detail_id': by_case[self.case.pk].pk},
+                {'detail_id': by_case[self.case.pk].pk},
+                {'detail_id': 999999},
+                {'detail_id': by_case[second.pk].pk},
+            ],
+        }
+        self.execution.save(update_fields=['input_snapshot'])
+
+        report = APITestSuiteExecutionDetailSerializer(detail).data
+        self.assertEqual(
+            [case['test_case_title'] for case in report['case_executions']],
+            ['Case', 'Second', 'Orphan detail'],
+        )
+
     def test_duplicate_delivery_does_not_resend_http(self):
         capture_case_snapshot(self.execution, self.case, self.environment)
         with patch('api_testing.execution_service.requests_runner', return_value=self.passed) as runner:

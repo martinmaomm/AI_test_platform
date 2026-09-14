@@ -256,23 +256,13 @@ def _create_web_snapshot(task: ScheduledTask, suite):
 
 
 def _create_api_snapshot(task: ScheduledTask, suite):
-    from api_testing.models import APITestExecution, APITestSuiteCaseExecution, APITestSuiteExecutionDetail
+    from api_testing.models import APITestExecution
 
     execution = APITestExecution.objects.create(
         exec_type='suite', name=f'{suite.name} - 定时任务', description=f'定时任务执行: {task.name}',
         status='pending', trigger_type='schedule', executor=task.user,
         environment=task.environment, project=task.project,
     )
-    test_cases = list(suite.test_cases.all())
-    suite_detail = APITestSuiteExecutionDetail.objects.create(
-        execution=execution, test_suite=suite, test_suite_name=suite.name, total_cases=len(test_cases),
-    )
-    APITestSuiteCaseExecution.objects.bulk_create([
-        APITestSuiteCaseExecution(
-            suite_execution=suite_detail, test_case=test_case, name=test_case.title, status='pending',
-        )
-        for test_case in test_cases
-    ])
     from api_testing.execution_snapshots import capture_suite_snapshot
     capture_suite_snapshot(execution, suite, task.environment)
     return execution

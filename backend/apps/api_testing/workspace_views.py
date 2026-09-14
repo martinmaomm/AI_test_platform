@@ -131,6 +131,10 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
         previous_generation = workspace.generation if isinstance(workspace.generation, dict) else {}
         previous_snapshot = previous_generation.get('_snapshot') if isinstance(previous_generation.get('_snapshot'), dict) else {}
         previous_scenario = previous_snapshot.get('scenario') if isinstance(previous_snapshot.get('scenario'), dict) else {}
+        shared_constraints = previous_snapshot.get('shared_constraints')
+        if not isinstance(shared_constraints, list) or any(not isinstance(item, str) for item in shared_constraints):
+            shared_constraints = []
+        local_messages = list(workspace.messages) if isinstance(workspace.messages, list) else []
         frozen_scope = previous_snapshot.get('scope_endpoint_ids')
         if not isinstance(frozen_scope, list) or not frozen_scope:
             raise WorkspaceValidationError('子场景没有冻结根依赖范围，不能生成或修复。')
@@ -153,6 +157,8 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
             'scope_catalog': scope_catalog,
             'frozen_scope_specs': frozen_scope_specs,
             'endpoints': deepcopy(endpoints),
+            'messages': deepcopy(local_messages),
+            'shared_constraints': deepcopy(shared_constraints),
             'scenario': {
                 'title': workspace.title, 'description': workspace.scenario_description,
                 'endpoint_ids': deepcopy(target_ids), 'target_endpoint_ids': deepcopy(target_ids),
@@ -173,6 +179,7 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
     }
     if workspace.parent_id:
         workspace.generation['scenario_context'] = deepcopy(snapshot['scenario'])
+        workspace.generation['shared_constraints'] = deepcopy(snapshot.get('shared_constraints') or [])
     if scenario_workflow:
         workspace.generation.update({
             'phase': 'planning', 'plan': {}, 'scenario_ids': [], 'active_scenario_id': None,

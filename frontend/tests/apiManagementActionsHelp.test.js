@@ -21,7 +21,7 @@ test('API management views describe available actions with shared accessible hel
     '上传并解析规范',
     '规范操作',
     '查看端点详情',
-    '在工作区生成测试',
+    '生成端点用例',
     '端点测试用例操作',
   ]) {
     assert.ok(`${specs}${detail}`.includes(text), `missing specification action help: ${text}`)

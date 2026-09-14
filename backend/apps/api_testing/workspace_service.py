@@ -163,6 +163,58 @@ def endpoint_specs(project_id: int, endpoint_ids: list[int], *, spec_id: int | N
     } for endpoint in (by_id[item] for item in ids)]
 
 
+def validate_target_endpoint_id(project_id: int, target_endpoint_id: Any, *,
+                                spec_id: int | None = None,
+                                endpoint_ids: list[int] | None = None,
+                                owner=None) -> APIEndpoint | None:
+    """Resolve an explicit endpoint target without creating a deletion FK.
+
+    API specifications own their endpoints through CASCADE.  The workspace keeps
+    only the numeric id so a later specification deletion leaves an auditable,
+    invalid target instead of changing workspace mode.
+    """
+    if target_endpoint_id is None:
+        return None
+    if (not isinstance(target_endpoint_id, int) or isinstance(target_endpoint_id, bool)
+            or target_endpoint_id <= 0):
+        raise WorkspaceValidationError('target_endpoint_id 必须是正整数或 null。')
+    try:
+        endpoint = APIEndpoint.objects.select_related('spec', 'spec__source_task').get(
+            pk=target_endpoint_id, spec__project_id=project_id,
+        )
+    except APIEndpoint.DoesNotExist as exc:
+        raise WorkspaceValidationError('目标端点不存在或不属于当前项目。') from exc
+    if spec_id is not None and endpoint.spec_id != spec_id:
+        raise WorkspaceValidationError('目标端点与工作区 API 规范不一致。')
+    _require_browser_capture_source_owner(endpoint.spec, owner=owner)
+    if endpoint_ids is not None and target_endpoint_id not in endpoint_ids:
+        raise WorkspaceValidationError('endpoint_ids 不能移除显式目标端点。')
+    return endpoint
+
+
+def validate_target_draft(draft: dict[str, Any], *, project_id: int, spec_id: int,
+                          endpoint_ids: list[int], target_endpoint_id: int,
+                          owner=None, require_target: bool = True) -> list[int]:
+    """Keep every explicit-target draft reference inside its frozen scope."""
+    referenced_ids: list[int] = []
+    for index, step in enumerate(draft.get('teststeps', [])):
+        endpoint_id = step.get('endpoint_id') if isinstance(step, dict) else None
+        if endpoint_id is None:
+            continue
+        if not isinstance(endpoint_id, int) or isinstance(endpoint_id, bool) or endpoint_id <= 0:
+            raise WorkspaceValidationError(f'teststeps[{index}].endpoint_id 必须是当前项目的正整数。')
+        if endpoint_id not in referenced_ids:
+            referenced_ids.append(endpoint_id)
+    if referenced_ids:
+        endpoint_specs(project_id, referenced_ids, spec_id=spec_id, owner=owner)
+    outside_scope = [endpoint_id for endpoint_id in referenced_ids if endpoint_id not in endpoint_ids]
+    if outside_scope:
+        raise WorkspaceValidationError(f'草稿引用了工作区可用范围之外的端点：{outside_scope}。')
+    if require_target and target_endpoint_id not in referenced_ids:
+        raise WorkspaceValidationError('显式端点用例草稿必须实际引用目标端点。')
+    return referenced_ids
+
+
 _MAX_LOCAL_REF_DEPTH = 24
 
 
@@ -224,6 +276,13 @@ def generation_endpoint_specs(workspace: APIWorkspace) -> list[dict[str, Any]]:
             raise WorkspaceValidationError('子场景的根工作区归属不一致，不能读取依赖端点。')
         if root.spec_id != workspace.spec_id:
             raise WorkspaceValidationError('根工作区 API 规范已变化，子场景的依赖范围已失效。')
+        if workspace.target_endpoint_id is not None:
+            if root.target_endpoint_id != workspace.target_endpoint_id:
+                raise WorkspaceValidationError('子场景与根工作区的显式目标端点不一致。')
+            validate_target_endpoint_id(
+                workspace.project_id, workspace.target_endpoint_id, spec_id=workspace.spec_id,
+                endpoint_ids=workspace.endpoint_ids, owner=workspace.owner,
+            )
         child_generation = workspace.generation if isinstance(workspace.generation, dict) else {}
         child_snapshot = child_generation.get('_snapshot') if isinstance(child_generation.get('_snapshot'), dict) else {}
         frozen_ids = child_snapshot.get('scope_endpoint_ids')
@@ -242,6 +301,11 @@ def generation_endpoint_specs(workspace: APIWorkspace) -> list[dict[str, Any]]:
         raise WorkspaceValidationError('请先选择可用 API 规范后再生成。')
     validate_spec_id(workspace.project_id, workspace.spec_id, owner=workspace.owner)
     endpoint_ids = workspace.endpoint_ids if isinstance(workspace.endpoint_ids, list) else []
+    if workspace.target_endpoint_id is not None:
+        validate_target_endpoint_id(
+            workspace.project_id, workspace.target_endpoint_id, spec_id=workspace.spec_id,
+            endpoint_ids=endpoint_ids, owner=workspace.owner,
+        )
     if not endpoint_ids:
         endpoint_ids = list(APIEndpoint.objects.filter(spec_id=workspace.spec_id).values_list('id', flat=True)[:51])
         if len(endpoint_ids) > 50:
@@ -300,6 +364,16 @@ def workspace_source(workspace: APIWorkspace) -> tuple[str, str, str | None]:
 def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = True,
                         source: tuple[str, str, str | None] | None = None) -> dict[str, Any]:
     saved_case = workspace.saved_case if workspace.saved_case_id else None
+    generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+    scenario_context = generation.get('scenario_context') if isinstance(generation.get('scenario_context'), dict) else {}
+    suggested_test_type = scenario_context.get('test_type')
+    valid_test_types = {value for value, _label in APITestCase.TEST_TYPE_CHOICES}
+    if suggested_test_type not in valid_test_types:
+        suggested_test_type = (
+            saved_case.test_type
+            if saved_case and saved_case.test_case_type == 'endpoint' and saved_case.test_type in valid_test_types
+            else None
+        )
     resolved_source = source or workspace_source(workspace)
     source_type, source_name, source_task_id = resolved_source
     data = {
@@ -309,6 +383,7 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'scenario_order': workspace.scenario_order,
         'scenario_description': workspace.scenario_description,
         'model_id': workspace.model_id,
+        'target_endpoint_id': workspace.target_endpoint_id,
         'spec_id': workspace.spec_id,
         'source_type': source_type,
         'source_name': source_name,
@@ -327,6 +402,7 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'saved_case_id': workspace.saved_case_id,
         'saved_case_title': str(saved_case.title or '') if saved_case else '',
         'saved_case_description': str(saved_case.description or '') if saved_case else '',
+        'suggested_test_type': suggested_test_type,
         'task_id': workspace.task_id or None,
         'updated_at': workspace.updated_at.isoformat() if workspace.updated_at else None,
     }
@@ -349,20 +425,26 @@ def workspace_coverage(root: APIWorkspace, children: list[APIWorkspace] | None =
     generation = root.generation if isinstance(root.generation, dict) else {}
     snapshot = generation.get('_snapshot') if isinstance(generation.get('_snapshot'), dict) else {}
     frozen_scope = snapshot.get('scope_endpoint_ids')
-    total = {
-        endpoint_id for endpoint_id in (
-            frozen_scope if isinstance(frozen_scope, list) else root.endpoint_ids or []
-        ) if isinstance(endpoint_id, int)
-    }
+    if root.target_endpoint_id is not None:
+        # Explicit endpoint mode separates its single business coverage target
+        # from the wider frozen scope used for login/setup/query/cleanup steps.
+        total = {root.target_endpoint_id}
+    else:
+        total = {
+            endpoint_id for endpoint_id in (
+                frozen_scope if isinstance(frozen_scope, list) else root.endpoint_ids or []
+            ) if isinstance(endpoint_id, int)
+        }
     # A real root scope/model/spec edit marks prior evidence stale.  It remains
     # visible in child history but must not be reported as coverage for the new
     # scope.  Title-only updates deliberately do not set this state.
     if generation.get('status') == 'stale':
-        current_ids = root.endpoint_ids if isinstance(root.endpoint_ids, list) else []
-        if current_ids:
-            total = {item for item in current_ids if isinstance(item, int)}
-        elif root.spec_id:
-            total = set(APIEndpoint.objects.filter(spec_id=root.spec_id).values_list('id', flat=True))
+        if root.target_endpoint_id is None:
+            current_ids = root.endpoint_ids if isinstance(root.endpoint_ids, list) else []
+            if current_ids:
+                total = {item for item in current_ids if isinstance(item, int)}
+            elif root.spec_id:
+                total = set(APIEndpoint.objects.filter(spec_id=root.spec_id).values_list('id', flat=True))
         return {
             'total': len(total), 'planned': 0, 'generated': 0, 'verified': 0,
             'uncovered_endpoint_ids': sorted(total), 'planned_endpoint_ids': [],
@@ -480,6 +562,23 @@ def update_workspace_draft(workspace: APIWorkspace, *, revision: int, draft: Any
     if next_endpoint_ids:
         endpoint_specs(workspace.project_id, next_endpoint_ids, spec_id=next_spec_id, owner=workspace.owner)
     proposed_draft = normalize_draft(draft) if draft is not _UNSET else workspace.draft
+    if workspace.target_endpoint_id is not None:
+        if next_spec_id is None:
+            raise WorkspaceValidationError('显式目标工作区必须保留 API 规范。')
+        if workspace.parent_id and endpoint_ids is not _UNSET and next_endpoint_ids != [workspace.target_endpoint_id]:
+            raise WorkspaceValidationError('显式端点子场景的业务目标范围必须保持为唯一目标端点。')
+        validate_target_endpoint_id(
+            workspace.project_id, workspace.target_endpoint_id, spec_id=next_spec_id,
+            endpoint_ids=next_endpoint_ids, owner=workspace.owner,
+        )
+        available_endpoint_ids = next_endpoint_ids
+        if workspace.parent_id:
+            available_endpoint_ids = [item['id'] for item in generation_endpoint_specs(workspace)]
+        validate_target_draft(
+            proposed_draft, project_id=workspace.project_id, spec_id=next_spec_id,
+            endpoint_ids=available_endpoint_ids, target_endpoint_id=workspace.target_endpoint_id,
+            owner=workspace.owner, require_target=bool(proposed_draft.get('teststeps')),
+        )
     candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
     generation = workspace.generation if isinstance(workspace.generation, dict) else {}
     previous_revision = workspace.revision
@@ -770,21 +869,53 @@ def classify_case_draft(draft: dict[str, Any], *, project_id: int) -> tuple[str,
 
 
 def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str | None,
-                          description: Any = _UNSET) -> APIWorkspace:
+                          description: Any = _UNSET, test_type: Any = _UNSET) -> APIWorkspace:
     with transaction.atomic():
         workspace = APIWorkspace.objects.select_for_update().get(pk=workspace.pk)
         require_revision(workspace, revision)
         if workspace_is_busy(workspace):
             raise WorkspaceConflict('当前工作区任务尚未结束，不能保存。')
         draft = require_executable_draft(workspace.draft)
-        test_case_type, endpoint = classify_case_draft(draft, project_id=workspace.project_id)
+        if workspace.target_endpoint_id is not None:
+            if workspace.spec_id is None:
+                raise WorkspaceValidationError('显式目标工作区缺少 API 规范，不能保存。')
+            endpoint = validate_target_endpoint_id(
+                workspace.project_id, workspace.target_endpoint_id, spec_id=workspace.spec_id,
+                endpoint_ids=workspace.endpoint_ids, owner=workspace.owner,
+            )
+            available_endpoint_ids = workspace.endpoint_ids
+            if workspace.parent_id:
+                available_endpoint_ids = [item['id'] for item in generation_endpoint_specs(workspace)]
+            validate_target_draft(
+                draft, project_id=workspace.project_id, spec_id=workspace.spec_id,
+                endpoint_ids=available_endpoint_ids, target_endpoint_id=workspace.target_endpoint_id,
+                owner=workspace.owner,
+            )
+            test_case_type = 'endpoint'
+        else:
+            test_case_type, endpoint = classify_case_draft(draft, project_id=workspace.project_id)
         case = None
         if workspace.saved_case_id:
             case = APITestCase.objects.select_for_update().get(
                 pk=workspace.saved_case_id, project_id=workspace.project_id,
             )
+            if workspace.target_endpoint_id is not None and (
+                    case.test_case_type != 'endpoint' or case.endpoint_id != workspace.target_endpoint_id):
+                raise WorkspaceValidationError('关联用例与工作区显式目标端点不一致。')
             if workspace.saved_case_updated_at and case.updated_at != workspace.saved_case_updated_at:
                 raise WorkspaceConflict('关联用例已被其他人修改，请先处理冲突。')
+        if test_case_type == 'endpoint':
+            if test_type is _UNSET:
+                case_test_type = case.test_type if case else 'positive'
+            else:
+                valid_test_types = {value for value, _label in APITestCase.TEST_TYPE_CHOICES}
+                if not isinstance(test_type, str) or test_type not in valid_test_types:
+                    raise WorkspaceValidationError('test_type 仅支持 positive、negative、boundary 或 security。')
+                case_test_type = test_type
+        else:
+            if test_type is not _UNSET:
+                raise WorkspaceValidationError('场景用例不接受 test_type。')
+            case_test_type = case.test_type if case else 'positive'
         case_title = (
             title if isinstance(title, str) and title.strip()
             else (case.title if case else (draft['config']['name'] or workspace.title or '未命名 API 用例'))
@@ -799,7 +930,7 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
             case = APITestCase.objects.create(
                 project_id=workspace.project_id, created_by=workspace.owner,
                 title=case_title[:200], description=case_description,
-                test_case_type=test_case_type, endpoint=endpoint,
+                test_case_type=test_case_type, endpoint=endpoint, test_type=case_test_type,
                 script_content=__import__('json').dumps(draft, ensure_ascii=False),
             )
             workspace.saved_case = case
@@ -809,7 +940,10 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
             case.script_content = __import__('json').dumps(draft, ensure_ascii=False)
             case.test_case_type = test_case_type
             case.endpoint = endpoint
-            case.save(update_fields=['title', 'description', 'script_content', 'test_case_type', 'endpoint', 'updated_at'])
+            case.test_type = case_test_type
+            case.save(update_fields=[
+                'title', 'description', 'script_content', 'test_case_type', 'endpoint', 'test_type', 'updated_at',
+            ])
             workspace.saved_case = case
         workspace.saved_case_updated_at = case.updated_at
         workspace.save(update_fields=['saved_case', 'saved_case_updated_at', 'updated_at'])

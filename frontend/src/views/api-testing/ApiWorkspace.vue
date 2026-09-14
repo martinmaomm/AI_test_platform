@@ -204,10 +204,11 @@
               <el-form-item v-if="isDocumentSource" label="API 规范"
                 ><el-select
                   v-model="selectedSpecId"
+                  data-testid="endpoint-generation-spec"
                   clearable
                   filterable
                   :loading="specsLoading"
-                  :disabled="interactionLocked"
+                  :disabled="interactionLocked || Boolean(targetEndpointId)"
                   placeholder="选择 API 规范"
                   style="width: 100%"
                   @change="selectSpec"
@@ -239,7 +240,17 @@
                 </el-descriptions>
                 <p class="hint">此来源及其接口范围由已确认的网页探索样本决定，不能在这里切换为 Swagger 文档。</p>
               </el-form-item>
-              <el-form-item label="供 AI 参考的端点" class="endpoint-field"
+              <el-alert
+                v-if="targetEndpointId"
+                :title="`端点用例模式：被测目标接口为 ${targetEndpointLabel}。该接口固定包含在范围内；请按需勾选登录等辅助接口。`"
+                type="info"
+                :closable="false"
+                show-icon
+              />
+              <el-descriptions v-if="targetEndpointId" :column="1" size="small" border class="target-endpoint-summary">
+                <el-descriptions-item label="被测目标接口" data-testid="endpoint-generation-target">{{ targetEndpointLabel }}</el-descriptions-item>
+              </el-descriptions>
+              <el-form-item :label="targetEndpointId ? '可用辅助接口 / 依赖范围' : '供 AI 参考的端点'" class="endpoint-field"
                 ><el-checkbox-group
                   v-model="endpointIds"
                   :disabled="interactionLocked"
@@ -248,11 +259,12 @@
                     v-for="endpoint in endpointOptions"
                     :key="endpoint.id"
                     :label="endpoint.id"
+                    :disabled="interactionLocked || String(endpoint.id) === String(targetEndpointId)"
                     >{{ endpointLabel(endpoint) }}</el-checkbox
                   ></el-checkbox-group
                 >
                 <p v-if="isDocumentSource" class="hint">
-                  选定规范后会加载并勾选其接口；一次最多 50 个，您可缩小范围。端点仅提供上下文和步骤关联。
+                  {{ targetEndpointId ? '被测目标接口不可移除；可勾选同一规范内的登录等辅助接口。目标及辅助接口合计最多 50 个，保存设置后再生成。' : '选定规范后会加载并勾选其接口；一次最多 50 个，您可缩小范围。端点仅提供上下文和步骤关联。' }}
                 </p>
                 <p v-else class="hint">
                   已加载此网页探索来源确认的接口；一次最多保留 50 个，您可缩小范围，但不能切换为其他规范。
@@ -465,7 +477,7 @@
                 !draft.teststeps.length
               "
               @click="openSave"
-              >保存为测试用例</el-button
+              >{{ targetEndpointId ? '保存为端点用例' : '保存为测试用例' }}</el-button
             >
             <el-tooltip placement="top" :trigger="['hover', 'focus', 'click']" :popper-style="actionHelpStyle" content="将当前草稿保存到测试用例列表；首次创建，后续更新本工作区绑定的用例。不会自动运行，也不代表验证通过；建议先确认本次验证结果。">
               <button type="button" class="action-help" aria-label="保存为测试用例说明">
@@ -552,12 +564,12 @@
     </el-dialog>
     <el-dialog
       v-model="saveDialog"
-      title="保存为 API 测试用例"
+      :title="targetEndpointId ? '保存为端点用例' : '保存为 API 测试用例'"
       width="520px"
       :close-on-click-modal="false"
     >
       <el-alert
-        title="保存是显式操作：首次创建用例，后续仅更新本工作区绑定的用例。"
+        :title="targetEndpointId ? '保存为端点用例：将保留登录准备、清理等完整步骤，后续仅更新本工作区绑定的用例。' : '保存是显式操作：首次创建用例，后续仅更新本工作区绑定的用例。'"
         type="info"
         :closable="false"
         show-icon
@@ -571,6 +583,14 @@
             type="textarea"
             :rows="3"
             maxlength="500" /></el-form-item
+        ><el-form-item v-if="targetEndpointId" label="测试类型">
+          <el-radio-group v-model="saveForm.test_type">
+            <el-radio label="positive">正向</el-radio>
+            <el-radio label="negative">反向</el-radio>
+            <el-radio label="boundary">边界</el-radio>
+            <el-radio label="security">安全</el-radio>
+          </el-radio-group>
+        </el-form-item
       ></el-form>
       <template #footer
         ><el-button @click="saveDialog = false">取消</el-button
@@ -715,6 +735,7 @@ import {
   cleanupVariablesBeforeStep,
   completedDocumentApiSpecs,
   currentScenarioStatus,
+  endpointCaseScope,
   scenarioStatusMeta,
   recoverableScenarioDraft,
   defaultStep,
@@ -838,7 +859,7 @@ const currentDebugRef = ref(null);
 const browserDiscoveryPanelRef = ref(null);
 const browserDiscoveryFormDirty = ref(false);
 const debugForm = ref({ environment_id: null, variables: {} });
-const saveForm = ref({ title: "", description: "" });
+const saveForm = ref({ title: "", description: "", test_type: "positive" });
 const generationForm = ref({
   mode: "generate",
   message: "",
@@ -1042,6 +1063,23 @@ const failureActions = computed(() =>
 const selectedSpec = computed(() =>
   specs.value.find((spec) => String(spec.id) === String(selectedSpecId.value)),
 );
+const targetEndpointId = computed(() =>
+  rootWorkspace.value?.target_endpoint_id ?? null,
+);
+const targetEndpoint = computed(() =>
+  endpointOptions.value.find(
+    (endpoint) => String(endpoint.id) === String(targetEndpointId.value),
+  ) || null,
+);
+const targetEndpointLabel = computed(() =>
+  targetEndpoint.value
+    ? endpointLabel(targetEndpoint.value)
+    : `目标接口 #${targetEndpointId.value}`,
+);
+const endpointCaseTestType = (value) =>
+  ["positive", "negative", "boundary", "security"].includes(value)
+    ? value
+    : "positive";
 const selectedSpecName = computed(
   () =>
     (isBrowserSource.value && sourceName.value) ||
@@ -2026,9 +2064,18 @@ const createWorkspace = async ({ fromInitialize = false } = {}) => {
   if (!(await confirmDiscardDraft("新建工作区", { includePrompt: true }))) return;
   const caseRaw = route.query.case_id;
   const endpointRaw = route.query.endpoint_id;
+  const targetRaw = route.query.target_endpoint_id;
+  const specRaw = route.query.spec_id;
   const caseId = routeInteger("case_id");
   const endpointId = routeInteger("endpoint_id");
-  if ((caseRaw != null && !caseId) || (endpointRaw != null && !endpointId)) {
+  const targetEndpointIdFromQuery = routeInteger("target_endpoint_id");
+  const specId = routeInteger("spec_id");
+  if (
+    (caseRaw != null && !caseId) ||
+    (endpointRaw != null && !endpointId) ||
+    (targetRaw != null && !targetEndpointIdFromQuery) ||
+    (specRaw != null && !specId)
+  ) {
     ElMessage.error("工作区入口参数必须是正整数。");
     return;
   }
@@ -2038,7 +2085,11 @@ const createWorkspace = async ({ fromInitialize = false } = {}) => {
   try {
     const payload = {};
     if (caseId) payload.case_id = caseId;
-    if (endpointId) payload.endpoint_ids = [endpointId];
+    if (specId) payload.spec_id = specId;
+    if (targetEndpointIdFromQuery) {
+      payload.target_endpoint_id = targetEndpointIdFromQuery;
+      payload.endpoint_ids = [targetEndpointIdFromQuery];
+    } else if (endpointId) payload.endpoint_ids = [endpointId];
     const response = await createApiWorkspace(requestProjectId, payload);
     if (requestProjectId !== projectId.value) return;
     const created = asWorkspace(response);
@@ -2737,6 +2788,11 @@ const adoptCandidate = async () => {
   }
 };
 const selectSpec = async (specId) => {
+  if (targetEndpointId.value && String(specId) !== String(rootWorkspace.value?.spec_id)) {
+    ElMessage.warning("端点用例的目标接口已固定，不能切换到其他 API 规范。");
+    selectedSpecId.value = rootWorkspace.value?.spec_id ?? null;
+    return;
+  }
   endpointIds.value = [];
   selectedSpecId.value = specId ?? null;
   endpointOptions.value = [];
@@ -2749,9 +2805,13 @@ const selectSpec = async (specId) => {
 };
 const selectEndpoints = (ids) => {
   endpointSelectionEditSequence += 1;
-  if (ids.length > 50) {
-    endpointIds.value = ids.slice(0, 50);
+  const normalized = endpointCaseScope(ids, targetEndpointId.value);
+  if (normalized.length !== ids.length) {
+    endpointIds.value = normalized;
     ElMessage.warning("一次最多选择 50 个 API 接口，已保留前 50 个。");
+  } else if (JSON.stringify(normalized) !== JSON.stringify(ids)) {
+    endpointIds.value = normalized;
+    ElMessage.warning("被测目标接口必须保留在可用范围内。");
   }
   markContextDirty();
 };
@@ -2802,7 +2862,10 @@ const loadEndpointsForSpec = async ({
       }
     } else {
       const knownIds = new Set(loaded.map((endpoint) => String(endpoint.id)));
-      endpointIds.value = endpointIds.value.filter((id) => knownIds.has(String(id)));
+      endpointIds.value = endpointCaseScope(
+        endpointIds.value.filter((id) => knownIds.has(String(id))),
+        targetEndpointId.value,
+      );
     }
     return true;
   } catch (error) {
@@ -2891,6 +2954,7 @@ const openSave = async () => {
   saveForm.value = {
     title: workspace.value?.saved_case_title || draft.value.config.name,
     description: savedCaseDescription(workspace.value),
+    test_type: endpointCaseTestType(workspace.value?.saved_case_test_type || workspace.value?.suggested_test_type),
   };
   saveDialog.value = true;
 };
@@ -2903,14 +2967,16 @@ const saveCase = async () => {
   };
   savingCase.value = true;
   try {
+    const payload = {
+      revision: request.revision,
+      title: saveForm.value.title,
+      description: saveForm.value.description,
+    };
+    if (targetEndpointId.value) payload.test_type = saveForm.value.test_type;
     const response = await saveApiWorkspace(
       request.projectId,
       request.workspaceId,
-      {
-        revision: request.revision,
-        title: saveForm.value.title,
-        description: saveForm.value.description,
-      },
+      payload,
     );
     if (
       request.projectId !== projectId.value ||

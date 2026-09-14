@@ -27,7 +27,8 @@ from .workspace_service import (
     generation_budget, generation_endpoint_specs, infer_spec_id, validate_spec_id,
     normalize_draft, require_executable_draft, require_generation_model_id, validate_model_id,
     owned_workspace, require_revision, serialize_workspace, update_workspace_draft,
-    workspace_is_busy, scenario_authenticated_endpoint_ids,
+    workspace_is_busy, scenario_authenticated_endpoint_ids, validate_target_draft,
+    validate_target_endpoint_id,
 )
 from .workspace_evidence import attach_execution_histories, stop_workspace_executions
 from .workspace_tasks import debug_api_workspace, generate_and_verify_api_workspace
@@ -118,7 +119,8 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
         'revision': revision, 'task_id': task_id, 'mode': mode,
         'draft': deepcopy(prompt_draft if prompt_draft is not None else workspace.draft),
         'user_draft': deepcopy(workspace.draft),
-        'model_id': workspace.model_id, 'spec_id': workspace.spec_id, 'endpoints': deepcopy(endpoints),
+        'model_id': workspace.model_id, 'spec_id': workspace.spec_id,
+        'target_endpoint_id': workspace.target_endpoint_id, 'endpoints': deepcopy(endpoints),
         'target_url': target_url, 'variables': deepcopy(variables), 'messages': deepcopy(workspace.messages),
         'failure_evidence': deepcopy(failure_evidence),
     }
@@ -159,6 +161,7 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
                 'dependency_evidence': str(previous_scenario.get('dependency_evidence') or ''),
                 'authenticated_endpoint_ids': authenticated_ids,
                 'requires_authenticated_context': bool(authenticated_ids),
+                **({'test_type': previous_scenario['test_type']} if previous_scenario.get('test_type') else {}),
             },
         })
     workspace.generation = {
@@ -247,9 +250,11 @@ class APIWorkspaceCollectionView(APIView):
             case = None
             case_id = request.data.get('case_id')
             if case_id is not None:
-                if not isinstance(case_id, int):
-                    raise WorkspaceValidationError('case_id 必须是整数。')
-                case = APITestCase.objects.get(pk=case_id, project=project)
+                if not isinstance(case_id, int) or isinstance(case_id, bool) or case_id <= 0:
+                    raise WorkspaceValidationError('case_id 必须是正整数。')
+                case = APITestCase.objects.select_related('endpoint__spec').get(pk=case_id, project=project)
+                if case.endpoint_id and case.endpoint.spec.project_id != project.id:
+                    raise WorkspaceValidationError('关联用例的端点不属于当前项目。')
             if case and case.script_content:
                 try:
                     draft = normalize_draft(json.loads(case.script_content))
@@ -257,6 +262,19 @@ class APIWorkspaceCollectionView(APIView):
                     raise WorkspaceValidationError('关联用例的现有脚本无法解析为 requests 用例契约，请重新生成草稿。')
             else:
                 draft = default_api_workspace_draft()
+
+            target_endpoint_id = request.data.get('target_endpoint_id')
+            if case and case.test_case_type == 'endpoint':
+                if not case.endpoint_id:
+                    raise WorkspaceValidationError('关联端点用例缺少有效目标端点。')
+                if target_endpoint_id is not None and target_endpoint_id != case.endpoint_id:
+                    raise WorkspaceValidationError('target_endpoint_id 必须与关联端点用例一致。')
+                target_endpoint_id = case.endpoint_id
+            elif case and target_endpoint_id is not None:
+                raise WorkspaceValidationError('场景用例不能作为显式端点工作区打开。')
+            target_endpoint = validate_target_endpoint_id(
+                project.id, target_endpoint_id, owner=request.user,
+            )
 
             endpoint_ids_provided = 'endpoint_ids' in request.data
             endpoint_ids = request.data.get('endpoint_ids', [])
@@ -266,17 +284,34 @@ class APIWorkspaceCollectionView(APIView):
                 endpoint_ids = _draft_endpoint_ids(draft)
                 if not endpoint_ids and case.endpoint_id:
                     endpoint_ids = [case.endpoint_id]
+            if target_endpoint_id is not None and not endpoint_ids_provided and target_endpoint_id not in endpoint_ids:
+                endpoint_ids.append(target_endpoint_id)
             inferred_spec_id = request.data.get('spec_id')
             if inferred_spec_id is None:
                 inferred_spec_id = infer_spec_id(project.id, endpoint_ids)
+                if inferred_spec_id is None and target_endpoint is not None:
+                    inferred_spec_id = target_endpoint.spec_id
+            if endpoint_ids and inferred_spec_id is None:
+                raise WorkspaceValidationError('所选端点必须来自同一可用 API 规范，请明确选择 spec_id。')
             spec = validate_spec_id(project.id, inferred_spec_id, owner=request.user)
             endpoint_specs(project.id, endpoint_ids, spec_id=spec.id if spec else None, owner=request.user)
+            if target_endpoint_id is not None:
+                validate_target_endpoint_id(
+                    project.id, target_endpoint_id, spec_id=spec.id if spec else None,
+                    endpoint_ids=endpoint_ids, owner=request.user,
+                )
+                validate_target_draft(
+                    draft, project_id=project.id, spec_id=spec.id,
+                    endpoint_ids=endpoint_ids, target_endpoint_id=target_endpoint_id,
+                    owner=request.user, require_target=bool(draft.get('teststeps')),
+                )
             model_id = validate_model_id(request.data.get('model_id'), owner=request.user)
             workspace = APIWorkspace.objects.create(
                 project=project, owner=request.user, saved_case=case,
                 saved_case_updated_at=case.updated_at if case else None,
                 title=str(request.data.get('title') or (case.title if case else ''))[:200],
-                model_id=model_id, spec=spec, endpoint_ids=endpoint_ids, draft=draft,
+                model_id=model_id, spec=spec, target_endpoint_id=target_endpoint_id,
+                endpoint_ids=endpoint_ids, draft=draft,
             )
             return response(kind='success', data=_workspace_payload(workspace), message='创建工作区成功', status_code=201)
         except APITestCase.DoesNotExist:
@@ -305,6 +340,8 @@ class APIWorkspaceDetailView(APIView):
             _project_or_denied(project_id, request.user)
             if 'revision' not in request.data:
                 raise WorkspaceValidationError('PATCH 必须携带 revision。')
+            if 'target_endpoint_id' in request.data:
+                raise WorkspaceValidationError('target_endpoint_id 创建后不可通过 PATCH 修改。')
             with transaction.atomic():
                 workspace = owned_workspace(project_id=project_id, workspace_id=workspace_id, user=request.user, lock=True)
                 workspace = update_workspace_draft(
@@ -543,6 +580,7 @@ class APIWorkspaceSaveView(APIView):
             workspace = create_or_update_case(
                 workspace, revision=request.data['revision'], title=request.data.get('title'),
                 description=request.data['description'] if 'description' in request.data else _UNSET,
+                test_type=request.data['test_type'] if 'test_type' in request.data else _UNSET,
             )
             return response(kind='success', data=_workspace_payload(workspace), message='工作区已保存为 API 用例')
         except PermissionError as exc:

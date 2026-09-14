@@ -139,7 +139,7 @@ def verify(origin, fixture, output):
                 assert database(APITestCase.objects.count) == 0
                 page.screenshot(path=str(output / 'generation-running.png'), full_page=True)
                 fixture['generation_gate'].set()
-            adopt = page.get_by_role('button', name='采用候选并替换草稿')
+            adopt = page.get_by_role('button', name='采用候选并替换草稿', exact=True)
             expect(adopt).to_be_visible(timeout=15000)
             verification = page.get_by_test_id('api-generation-verification')
             expect(verification).to_contain_text('已验证通过')
@@ -256,6 +256,11 @@ def main():
                 raise RuntimeError('Browser test did not release the isolated model gate')
             payload = next(json.loads(item.content) for item in messages if item.content.lstrip().startswith('{'))
             fixture.setdefault('model_prompts', []).append(payload)
+            if callable(fixture.get('model_answer')):
+                answer = fixture['model_answer'](payload)
+                if callback:
+                    callback(answer)
+                return answer
             if payload.get('stage') == 'plan':
                 answer = json.dumps({'summary': '独立健康检查场景', 'scenarios': fixture.get('planned_scenarios') or [
                     {'title': '健康检查', 'description': '验证 HTTP 状态码 200 和响应状态',
@@ -279,6 +284,8 @@ def main():
             return answer
 
         def fake_http(**kwargs):
+            if callable(fixture.get('fake_http')):
+                return fixture['fake_http'](**kwargs)
             result = Response()
             assert kwargs['url'] == 'https://example.test/health', 'Unexpected request in fake test service'
             assert kwargs['verify'] is False, 'API business requests must skip certificate validation'

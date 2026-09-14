@@ -460,6 +460,11 @@ class APIWorkspace(models.Model):
     )
     title = models.CharField(max_length=200, blank=True)
     model_id = models.PositiveBigIntegerField(null=True, blank=True)
+    # Keep the explicit endpoint-generation target as an immutable numeric
+    # binding.  APIEndpoint is cascade-deleted with its specification; storing
+    # the id lets the workspace report and reject a missing target instead of
+    # silently degrading into an ordinary scenario workspace.
+    target_endpoint_id = models.PositiveBigIntegerField(null=True, blank=True)
     endpoint_ids = models.JSONField(default=list, blank=True)
     draft = models.JSONField(default=default_api_workspace_draft, blank=True)
     revision = models.PositiveIntegerField(default=0)

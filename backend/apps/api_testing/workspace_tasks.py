@@ -24,7 +24,7 @@ from .models import APIWorkspace, default_api_workspace_draft
 from .workspace_service import (
     can_edit_project, can_execute_project, normalize_draft,
     require_executable_draft, require_generation_model_id, WorkspaceValidationError,
-    scenario_authenticated_endpoint_ids,
+    scenario_authenticated_endpoint_ids, validate_target_endpoint_id,
 )
 from .workspace_evidence import (
     WORKSPACE_DEBUG, WORKSPACE_GENERATION, finish_workspace_execution,
@@ -208,6 +208,14 @@ def _pipeline_guard(workspace_id: int, revision: int, task_id: str, *, frozen_mo
             return None
         if workspace.model_id != frozen_model_id:
             raise ValueError('工作区模型绑定已变化，已拒绝继续使用过期任务。')
+        frozen_target_endpoint_id = snapshot.get('target_endpoint_id')
+        if workspace.target_endpoint_id != frozen_target_endpoint_id:
+            raise ValueError('工作区显式目标端点绑定已变化，已拒绝继续使用过期任务。')
+        if frozen_target_endpoint_id is not None:
+            validate_target_endpoint_id(
+                workspace.project_id, frozen_target_endpoint_id, spec_id=workspace.spec_id,
+                endpoint_ids=workspace.endpoint_ids, owner=workspace.owner,
+            )
         if not can_edit_project(workspace.project, workspace.owner) or not can_execute_project(workspace.project, workspace.owner):
             raise ValueError('工作区所有者已失去 API 编辑或执行权限。')
         # Check the current binding, rather than trusting the frozen numeric ID.
@@ -292,10 +300,19 @@ def _has_browser_capture(endpoints: list[dict[str, Any]]) -> bool:
 
 
 def _planner_messages(*, conversation: list[dict[str, Any]], endpoints: list[dict[str, Any]],
-                     failure_evidence: dict[str, Any] | None = None) -> list[Any]:
+                     failure_evidence: dict[str, Any] | None = None,
+                     target_endpoint_id: int | None = None) -> list[Any]:
+    scenario_shape = (
+        '{"title":"","description":"","endpoint_ids":[1],"test_type":"positive",'
+        '"authenticated_endpoint_ids":[],"dependency_endpoint_ids":[],"dependency_evidence":"",'
+        '"requires_authenticated_context":false}'
+        if target_endpoint_id is not None else
+        '{"title":"","description":"","endpoint_ids":[1],"authenticated_endpoint_ids":[],'
+        '"dependency_endpoint_ids":[],"dependency_evidence":"","requires_authenticated_context":false}'
+    )
     rules = [
         '你是 API 测试场景规划助手。只输出一个 JSON 对象，不要 Markdown 或解释。',
-        '输出严格为 {"scenarios":[{"title":"","description":"","endpoint_ids":[1],"authenticated_endpoint_ids":[],"dependency_endpoint_ids":[],"dependency_evidence":"","requires_authenticated_context":false}],"summary":""}。',
+        f'输出严格为 {{"scenarios":[{scenario_shape}],"summary":""}}。',
         f'scenarios 必须为 1 到 {MAX_SCENARIO_COUNT} 项；每项 title 非空，description 为字符串，endpoint_ids 为非空整数数组。',
         'endpoint_ids 是该场景必须保留并断言的业务目标，只能来自 selected_endpoints；不要编造端点或把未选择端点纳入计划。',
         '按独立业务生命周期组织场景：可将同一业务对象的新增、查询、更新、删除等紧密关联操作合并到一个场景，以合理数量覆盖所选范围。规划阶段不是每个接口一个场景；selected_endpoints 仅限定可用范围，不要求全范围内每个端点都必须执行。',
@@ -313,6 +330,12 @@ def _planner_messages(*, conversation: list[dict[str, Any]], endpoints: list[dic
             'observed_request.auth_hints 只证明该次请求携带了认证信息，不证明接口所有情况都必须认证。结合前序响应字段、用户成功流程与实际样本识别登录依赖；不能把登录入口也标记为预先需要自己尚未取得的凭据。',
             'dependency_candidates/path_template 是值关联证据，不是完整业务契约。每个场景均需重新登录、准备唯一数据和提取动态 ID；不能借用浏览器缓存、其他场景或探索期的 Token/ID。观察不到的接口或业务规则不可补造，未覆盖处在 summary 明确说明。',
         ])
+    if target_endpoint_id is not None:
+        rules.extend([
+            f'本次是显式端点用例生成，平台冻结的唯一业务目标是 target_endpoint_id={target_endpoint_id}。每个场景的 endpoint_ids 必须严格等于 [{target_endpoint_id}]，模型不能更换、删除或增加业务目标端点。',
+            '围绕该唯一目标规划相互独立的正向、反向和边界用例；可按文档与用户目标补充 security 用例。每个场景可输出 test_type，且只能是 positive、negative、boundary、security 之一。',
+            '登录、数据准备、精确查询和清理只能列为 dependency_endpoint_ids，不能替代目标请求；每个最终草稿仍必须实际调用并断言冻结目标端点。',
+        ])
     previous_plan = failure_evidence.get('raw_plan') if isinstance(failure_evidence, dict) else None
     previous_scenarios = previous_plan.get('scenarios') if isinstance(previous_plan, dict) else None
     if isinstance(previous_scenarios, list) and len(previous_scenarios) > MAX_SCENARIO_COUNT:
@@ -322,12 +345,12 @@ def _planner_messages(*, conversation: list[dict[str, Any]], endpoints: list[dic
         )
     payload = {
         'stage': 'plan', 'conversation': conversation, 'selected_endpoints': endpoints,
-        'failure_evidence': failure_evidence,
+        'failure_evidence': failure_evidence, 'target_endpoint_id': target_endpoint_id,
     }
     return [SystemMessage(content='\n'.join(rules)), HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
 
 
-def _parse_plan(value: Any, *, endpoint_ids: set[int]) -> dict[str, Any]:
+def _parse_plan(value: Any, *, endpoint_ids: set[int], target_endpoint_id: int | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise WorkspaceValidationError('场景规划必须是 JSON 对象。')
     scenarios = value.get('scenarios')
@@ -352,6 +375,17 @@ def _parse_plan(value: Any, *, endpoint_ids: set[int]) -> dict[str, Any]:
             raise WorkspaceValidationError(f'场景规划第 {index} 项 endpoint_ids 必须是非空整数数组。')
         if not set(ids).issubset(endpoint_ids):
             raise WorkspaceValidationError(f'场景规划第 {index} 项引用了选定范围之外的端点。')
+        if target_endpoint_id is not None and ids != [target_endpoint_id]:
+            raise WorkspaceValidationError(
+                f'场景规划第 {index} 项 endpoint_ids 必须严格等于显式目标 [{target_endpoint_id}]。'
+            )
+        test_type = scenario.get('test_type')
+        if test_type is not None and (
+                not isinstance(test_type, str)
+                or test_type not in {'positive', 'negative', 'boundary', 'security'}):
+            raise WorkspaceValidationError(
+                f'场景规划第 {index} 项 test_type 仅支持 positive、negative、boundary 或 security。'
+            )
         dependency_ids = scenario.get('dependency_endpoint_ids', [])
         evidence = scenario.get('dependency_evidence', '')
         if not isinstance(dependency_ids, list) or any(not isinstance(item, int) or isinstance(item, bool) for item in dependency_ids):
@@ -367,12 +401,15 @@ def _parse_plan(value: Any, *, endpoint_ids: set[int]) -> dict[str, Any]:
             authenticated_ids = scenario_authenticated_endpoint_ids(scenario, target_endpoint_ids=ids)
         except WorkspaceValidationError as exc:
             raise WorkspaceValidationError(f'场景规划第 {index} 项 {exc}') from exc
-        normalized.append({
+        normalized_scenario = {
             'title': title.strip(), 'description': description, 'endpoint_ids': list(dict.fromkeys(ids)),
             'dependency_endpoint_ids': list(dict.fromkeys(dependency_ids)), 'dependency_evidence': evidence,
             'authenticated_endpoint_ids': authenticated_ids,
             'requires_authenticated_context': bool(authenticated_ids),
-        })
+        }
+        if test_type is not None:
+            normalized_scenario['test_type'] = test_type
+        normalized.append(normalized_scenario)
     summary = value.get('summary', '')
     if not isinstance(summary, str):
         raise WorkspaceValidationError('场景规划 summary 必须是字符串。')
@@ -417,7 +454,8 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
                 'revision': 0, 'task_id': child_task_id, 'mode': 'generate',
                 'draft': default_api_workspace_draft(), 'user_draft': default_api_workspace_draft(),
                 'model_id': root.model_id,
-                'spec_id': root.spec_id, 'endpoints': detailed_endpoints,
+                'spec_id': root.spec_id, 'target_endpoint_id': root.target_endpoint_id,
+                'endpoints': detailed_endpoints,
                 'scope_endpoint_ids': deepcopy(snapshot.get('scope_endpoint_ids') or []),
                 'scope_catalog': deepcopy(scope_catalog),
                 'frozen_scope_specs': deepcopy(snapshot.get('endpoints') or []),
@@ -435,7 +473,8 @@ def _scenario_children(*, root_id: int, revision: int, task_id: str, snapshot: d
             child = APIWorkspace.objects.create(
                 project=root.project, owner=root.owner, parent=root, spec=root.spec,
                 title=scenario['title'], scenario_order=order, scenario_description=scenario['description'],
-                model_id=root.model_id, endpoint_ids=scenario['endpoint_ids'], draft=default_api_workspace_draft(),
+                model_id=root.model_id, target_endpoint_id=root.target_endpoint_id,
+                endpoint_ids=scenario['endpoint_ids'], draft=default_api_workspace_draft(),
                 messages=deepcopy(snapshot.get('messages') or []),
                 status=APIWorkspace.Status.GENERATING, task_id=child_task_id,
                 generation={
@@ -514,6 +553,7 @@ def _generate_scenarios(root_id: int, revision: int, task_id: str, snapshot: dic
             output = manager.stream_invoke(_planner_messages(
                 conversation=snapshot.get('messages') or [], endpoints=snapshot['endpoints'],
                 failure_evidence=failure_evidence,
+                target_endpoint_id=snapshot.get('target_endpoint_id'),
             ), callback=on_chunk, **_llm_stream_timeout_kwargs(manager, call_timeout))
             if time.monotonic() >= call_deadline:
                 raise PipelineDeadlineExceeded('单次模型调用返回时已超过冻结时限，未发送目标请求。')
@@ -521,7 +561,10 @@ def _generate_scenarios(root_id: int, revision: int, task_id: str, snapshot: dic
             try:
                 raw_plan = None
                 raw_plan = _parse_candidate(output)
-                plan = _parse_plan(raw_plan, endpoint_ids=set(snapshot.get('scope_endpoint_ids') or []))
+                plan = _parse_plan(
+                    raw_plan, endpoint_ids=set(snapshot.get('scope_endpoint_ids') or []),
+                    target_endpoint_id=snapshot.get('target_endpoint_id'),
+                )
                 break
             except Exception as exc:
                 failure_evidence = {
@@ -629,7 +672,12 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
         scenario = deepcopy(snapshot['scenario']) if isinstance(snapshot.get('scenario'), dict) else {}
         required_endpoint_ids = scenario.get('target_endpoint_ids', scenario.get('endpoint_ids', []))
         required_endpoint_ids = set(required_endpoint_ids) if isinstance(required_endpoint_ids, list) else set()
-        authenticated_ids = scenario_authenticated_endpoint_ids(scenario, target_endpoint_ids=required_endpoint_ids)
+        if snapshot.get('target_endpoint_id') is not None:
+            required_endpoint_ids = {snapshot['target_endpoint_id']}
+        authenticated_ids = (
+            scenario_authenticated_endpoint_ids(scenario, target_endpoint_ids=required_endpoint_ids)
+            if scenario else []
+        )
         authenticated_target_ids = set(authenticated_ids)
         if scenario:
             scenario.update(authenticated_endpoint_ids=authenticated_ids, requires_authenticated_context=bool(authenticated_ids))
@@ -671,6 +719,7 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
                     conversation=snapshot.get('messages') or [], draft=prompt_draft, endpoints=active_endpoints,
                     mode=mode, failure_evidence=_prompt_failure_evidence(failure_evidence), scenario=scenario or None,
                     scope_catalog=snapshot.get('scope_catalog') or [],
+                    target_endpoint_id=snapshot.get('target_endpoint_id'),
                 ), callback=on_chunk, **_llm_stream_timeout_kwargs(manager, call_timeout))
             except Exception as exc:
                 cause = exc if isinstance(exc, (PipelineDeadlineExceeded, PipelineStale)) else exc.__cause__
@@ -911,7 +960,8 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
                          endpoints: list[dict[str, Any]], mode: str,
                          failure_evidence: dict[str, Any] | None,
                          scenario: dict[str, Any] | None = None,
-                         scope_catalog: list[dict[str, Any]] | None = None) -> list[Any]:
+                         scope_catalog: list[dict[str, Any]] | None = None,
+                         target_endpoint_id: int | None = None) -> list[Any]:
     rules = [
         '你是 API 测试草稿助手。只输出一个完整 JSON 对象；不要 Markdown、解释或 Python。',
         '必须完整输出 {"version":1,"config":{"name":"","base_url":"","variables":{}},"teststeps":[]}，不可省略字段。',
@@ -963,9 +1013,15 @@ def _generation_messages(*, conversation: list[dict[str, Any]], draft: dict[str,
         'failure_evidence': failure_evidence if mode == 'repair' else None,
         'current_scenario': scenario,
         'scope_catalog': scope_catalog or [],
+        'target_endpoint_id': target_endpoint_id,
     }
     if scenario:
         rules.append('current_scenario.target_endpoint_ids 是必须保留的业务目标和断言；selected_endpoints/available_endpoint_ids 是同一根工作区冻结的可选依赖范围。只可增加有 OpenAPI security、参数、请求体或响应字段证据支持的前置登录/数据准备步骤，且不得执行所有可选端点。current_scenario.authenticated_endpoint_ids 是冻结的需认证业务目标子集，这些端点必须使用该场景自己提取或用户提供的凭证；requires_authenticated_context 仅为该子集是否非空的摘要，不表示全部目标都需认证。未在子集中的认证入口可先获取凭证，明确的未登录/无权限负向目标按原计划生成。每个场景不能借用其他场景的 token 或步骤。修复可插入前置步骤，但必须保留目标请求及其原业务断言，不得缩小或重写冻结的 authenticated_endpoint_ids 来绕过认证要求。')
+    elif target_endpoint_id is not None:
+        rules.append(
+            f'平台已冻结本工作区唯一业务目标 target_endpoint_id={target_endpoint_id}。生成和修复都必须实际调用并断言该端点；'
+            '登录、数据准备、精确查询和清理可以使用 selected_endpoints 中的其他端点，但不能替代、删除或重写平台目标。'
+        )
     return [SystemMessage(content='\n'.join(rules)), HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
 
 

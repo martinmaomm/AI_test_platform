@@ -55,17 +55,26 @@ export const workspaceInitializationPlan = (
       : { action: "invalid", message: "workspace_id 必须是正整数。" };
   }
 
+  const hasTargetEndpointId = query.target_endpoint_id != null;
+  const hasSpecId = query.spec_id != null;
   const hasCaseId = query.case_id != null;
   const hasEndpointId = query.endpoint_id != null;
-  if (hasCaseId || hasEndpointId) {
+  if (hasTargetEndpointId || hasCaseId || hasEndpointId || hasSpecId) {
+    const targetEndpointId = positiveQueryInteger(query.target_endpoint_id);
     const caseId = positiveQueryInteger(query.case_id);
     const endpointId = positiveQueryInteger(query.endpoint_id);
-    if ((hasCaseId && !caseId) || (hasEndpointId && !endpointId)) {
+    const specId = positiveQueryInteger(query.spec_id);
+    if (
+      (hasTargetEndpointId && !targetEndpointId) ||
+      (hasCaseId && !caseId) ||
+      (hasEndpointId && !endpointId) ||
+      (hasSpecId && !specId)
+    ) {
       return { action: "invalid", message: "工作区入口参数必须是正整数。" };
     }
     return sourceType === "browser_capture"
       ? { action: "documents", caseId, endpointId, explicit: true }
-      : { action: "create", caseId, endpointId, explicit: true };
+      : { action: "create", caseId, endpointId, targetEndpointId, specId, explicit: true };
   }
 
   const workspaceId = workspaces[0]?.id;
@@ -73,6 +82,15 @@ export const workspaceInitializationPlan = (
   return sourceType === "browser_capture"
     ? { action: "none", explicit: false }
     : { action: "create", caseId: null, endpointId: null, explicit: false };
+};
+
+export const endpointCaseScope = (ids, targetEndpointId, max = 50) => {
+  const target = positiveQueryInteger(targetEndpointId);
+  const unique = [...new Set((Array.isArray(ids) ? ids : [])
+    .map((id) => positiveQueryInteger(id))
+    .filter(Boolean))];
+  const withoutTarget = unique.filter((id) => id !== target);
+  return target ? [target, ...withoutTarget].slice(0, max) : unique.slice(0, max);
 };
 
 export const savedCaseDescription = (workspace) =>

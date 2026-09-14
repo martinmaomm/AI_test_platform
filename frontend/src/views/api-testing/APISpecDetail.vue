@@ -128,11 +128,11 @@
                 type="primary"
                 @click="openAIGenerationDialogForEndpoint(selectedEndpoint)"
               >
-                在工作区生成测试
+                生成端点用例
               </el-button>
               <ActionHelpTooltip
-                label="在工作区生成测试"
-                content="带入当前端点进入 API 工作区，在工作区确认候选草稿后才会保存为测试用例；此处不会直接生成或执行测试。"
+                label="生成端点用例"
+                content="带入当前端点作为被测目标进入 API 工作区；可在工作区选择登录等辅助接口，确认候选草稿后才会保存为端点用例；此处不会直接生成或执行测试。"
               />
             </div>
           </div>
@@ -1813,7 +1813,11 @@ const getFieldTypeTag = (type) => {
 const openAIGenerationDialogForEndpoint = (endpoint) => {
   router.push({
     path: "/api-testing/workspace",
-    query: { endpoint_id: endpoint.id },
+    query: {
+      spec_id: endpoint.spec_id || route.params.id,
+      endpoint_id: endpoint.id,
+      target_endpoint_id: endpoint.id,
+    },
   });
 };
 

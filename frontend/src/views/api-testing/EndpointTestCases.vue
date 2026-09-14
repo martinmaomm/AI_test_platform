@@ -68,6 +68,9 @@
 
         <span class="toolbar-spacer" />
 
+        <el-button type="primary" size="small" data-testid="endpoint-generate-entry" @click="openEndpointGeneration">
+          生成端点用例
+        </el-button>
         <ActionHelpTooltip label="端点用例操作" content="树中可拖动同层节点调整顺序并立即保存；用例行的图标可重命名、复制或打开执行配置。复制会创建独立副本，执行确认后会向所选环境发起真实请求。" />
         <span class="case-count">{{ filteredTestCases.length }} 个用例</span>
         <el-button size="small" :loading="loading" @click="loadData">
@@ -94,6 +97,7 @@
 
         <div v-else-if="treeData.length === 0" class="tree-empty-wrap">
           <el-empty description="暂无用例数据" :image-size="56" />
+          <el-button type="primary" data-testid="endpoint-generate-entry" @click="openEndpointGeneration">生成端点用例</el-button>
         </div>
 
         <el-scrollbar v-else class="tree-scrollbar">
@@ -210,8 +214,16 @@
 
       <!-- ========== 右侧测试面板 ========== -->
       <div class="right-panel">
+        <div v-if="isMultiStepCase" class="endpoint-multistep-preview" data-testid="endpoint-multistep-preview">
+          <h3>{{ activeTestCase.title }} · 完整流程（{{ activeCaseSteps.length }} 步）</h3>
+          <p class="multistep-note">本用例包含多个步骤。请进入完整工作区编辑和调试，登录准备与清理步骤会一并保留。</p>
+          <ol>
+            <li v-for="(step, index) in activeCaseSteps" :key="index">{{ step.name || `步骤 ${index + 1}` }}：{{ step.request?.method || '—' }} {{ step.request?.url || '—' }}</li>
+          </ol>
+          <el-button type="primary" data-testid="endpoint-open-workspace" @click="openFullCaseWorkspace">编辑并调试完整用例</el-button>
+        </div>
         <EndpointTester
-          v-if="activeTestCase"
+          v-else-if="activeTestCase"
           ref="testerRef"
           :key="activeTestCase.id"
           :test-case="activeTestCase"
@@ -227,6 +239,25 @@
       </div>
 
     </div><!-- /split-body -->
+
+    <el-dialog v-model="endpointGenerationVisible" title="生成端点用例" width="520px" data-testid="endpoint-generation-dialog" @closed="invalidateEndpointGeneration">
+      <el-form label-position="top">
+        <el-form-item label="Swagger / OpenAPI 规范">
+          <el-select v-model="generationSpecId" data-testid="endpoint-generation-spec" :loading="generationSpecsLoading" placeholder="选择已处理的 API 规范" style="width:100%" @change="loadGenerationEndpoints">
+            <el-option v-for="spec in generationSpecs" :key="spec.id" :value="spec.id" :label="spec.spec_name || spec.name || spec.title || `规范 ${spec.id}`" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="被测目标接口">
+          <el-select v-model="generationTargetId" data-testid="endpoint-generation-target" :loading="generationEndpointsLoading" :disabled="!generationSpecId" placeholder="选择一个目标接口" style="width:100%">
+            <el-option v-for="endpoint in generationEndpoints" :key="endpoint.id" :value="endpoint.id" :label="endpointLabelForGeneration(endpoint)" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="endpointGenerationVisible = false">取消</el-button>
+        <el-button type="primary" data-testid="endpoint-generation-open" :disabled="!generationSpecId || !generationTargetId" @click="goToEndpointWorkspace">进入工作区</el-button>
+      </template>
+    </el-dialog>
 
     <!-- ===== 执行配置弹框 ===== -->
     <el-dialog
@@ -329,7 +360,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, onActivated, onUnmounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -350,11 +381,14 @@ import {
   updateEndpointTestCasesOrder,
   updateModuleOrder,
   updateEndpointOrder,
+  getAPISpecifications,
+  getAPIEndpoints,
 } from '@/api/apiTesting'
 import { getProjectEnvironments } from '@/api/projects'
 import APITestCaseExecutionDetail from '@/components/APITestCaseExecutionDetail.vue'
 import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
 import EndpointTester from './EndpointTester.vue'
+import { completedDocumentApiSpecs } from './apiWorkspace'
 import SuiteSelectionDialog from '@/components/SuiteSelectionDialog.vue'
 import { useProjectStore } from '@/stores/project'
 
@@ -387,9 +421,22 @@ const startResize = (e) => {
 
 // ===== 当前选中用例 =====
 const activeTestCase = ref(null)
+let activeCaseDetailEpoch = 0
+const activeCaseSteps = computed(() => {
+  const source = activeTestCase.value?.script_content
+  try {
+    const script = typeof source === 'string' ? JSON.parse(source) : source
+    return script?.teststeps ?? script?.steps ?? []
+  } catch { return [] }
+})
+const isMultiStepCase = computed(() => activeCaseSteps.value.length > 1)
 const selectTestCase = (tc) => {
   activeTestCase.value = tc
   nextTick(() => treeRef.value?.setCurrentKey(`tc-${tc.id}`))
+}
+const openFullCaseWorkspace = () => {
+  if (!activeTestCase.value?.id) return
+  router.push({ path: '/api-testing/workspace', query: { case_id: activeTestCase.value.id } })
 }
 
 // ===== el-tree 节点点击（含未保存拦截）=====
@@ -423,7 +470,95 @@ const handleNodeClick = async (data, node) => {
     }
   }
 
-  selectTestCase(data.testCase)
+  // 多步骤判断必须基于详情，列表摘要不保证包含 script_content。
+  // 等待期间不挂载摘要版单步编辑器，避免失败或旧响应导致截断风险。
+  const requestProjectId = currentProjectId.value
+  const requestCaseId = data.testCase.id
+  const requestEpoch = ++activeCaseDetailEpoch
+  activeTestCase.value = null
+  try {
+    const response = await getAPITestCase(requestProjectId, requestCaseId)
+    const fullCase = response?.data
+    if (
+      requestEpoch !== activeCaseDetailEpoch ||
+      requestProjectId !== currentProjectId.value ||
+      String(fullCase?.id) !== String(requestCaseId)
+    ) return
+    selectTestCase(fullCase)
+  } catch {
+    if (requestEpoch === activeCaseDetailEpoch && requestProjectId === currentProjectId.value) {
+      ElMessage.error('加载用例详情失败，未打开快捷编辑器以避免丢失多步骤配置')
+    }
+  }
+}
+
+const endpointGenerationVisible = ref(false)
+const generationSpecs = ref([])
+const generationEndpoints = ref([])
+const generationSpecId = ref(null)
+const generationTargetId = ref(null)
+const generationSpecsLoading = ref(false)
+const generationEndpointsLoading = ref(false)
+let generationSpecsEpoch = 0
+let generationEndpointsEpoch = 0
+const endpointLabelForGeneration = (endpoint) => `${endpoint.method || '—'} ${endpoint.path || endpoint.url || `接口 #${endpoint.id}`}`
+const listResponseItems = (response) => response?.data?.items || response?.data?.results || response?.data?.data || response?.data || response?.items || response?.results || []
+const invalidateEndpointGeneration = () => {
+  generationSpecsEpoch += 1
+  generationEndpointsEpoch += 1
+  generationSpecsLoading.value = false
+  generationEndpointsLoading.value = false
+}
+const openEndpointGeneration = async () => {
+  const projectId = currentProjectId.value
+  if (!projectId) return
+  invalidateEndpointGeneration()
+  endpointGenerationVisible.value = true
+  generationSpecId.value = null
+  generationTargetId.value = null
+  generationSpecs.value = []
+  generationEndpoints.value = []
+  const epoch = ++generationSpecsEpoch
+  generationSpecsLoading.value = true
+  try {
+    const response = await getAPISpecifications(projectId)
+    if (epoch !== generationSpecsEpoch || !endpointGenerationVisible.value || projectId !== currentProjectId.value) return
+    generationSpecs.value = completedDocumentApiSpecs(response)
+    if (generationSpecs.value.length === 1) {
+      generationSpecId.value = generationSpecs.value[0].id
+      await loadGenerationEndpoints(generationSpecId.value)
+    }
+  } catch {
+    if (epoch === generationSpecsEpoch && endpointGenerationVisible.value && projectId === currentProjectId.value) ElMessage.error('加载 API 规范失败')
+  } finally {
+    if (epoch === generationSpecsEpoch && endpointGenerationVisible.value && projectId === currentProjectId.value) generationSpecsLoading.value = false
+  }
+}
+const loadGenerationEndpoints = async (specId) => {
+  generationTargetId.value = null
+  generationEndpoints.value = []
+  if (!specId) return
+  const projectId = currentProjectId.value
+  const epoch = ++generationEndpointsEpoch
+  generationEndpointsLoading.value = true
+  try {
+    const response = await getAPIEndpoints(projectId, specId)
+    if (epoch !== generationEndpointsEpoch || !endpointGenerationVisible.value || projectId !== currentProjectId.value || String(specId) !== String(generationSpecId.value)) return
+    generationEndpoints.value = listResponseItems(response)
+  } catch {
+    if (epoch === generationEndpointsEpoch && endpointGenerationVisible.value && projectId === currentProjectId.value) ElMessage.error('加载规范接口失败')
+  } finally {
+    if (epoch === generationEndpointsEpoch && endpointGenerationVisible.value && projectId === currentProjectId.value) generationEndpointsLoading.value = false
+  }
+}
+const goToEndpointWorkspace = () => {
+  if (!generationSpecId.value || !generationTargetId.value) return
+  endpointGenerationVisible.value = false
+  router.push({ path: '/api-testing/workspace', query: {
+    spec_id: generationSpecId.value,
+    endpoint_id: generationTargetId.value,
+    target_endpoint_id: generationTargetId.value,
+  } })
 }
 
 // ===== 展开 / 折叠全部 =====
@@ -447,28 +582,33 @@ const testCases = ref([])
 const total = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(200)   // 树形视图一次多加载
+let listLoadEpoch = 0
 
 const loadData = async () => {
-  if (!projectStore.currentProject) return
+  const requestProjectId = currentProjectId.value
+  const requestEpoch = ++listLoadEpoch
+  if (!requestProjectId) return
   try {
     loading.value = true
     const [res, modRes] = await Promise.all([
-      getAPITestCases(projectStore.currentProjectId, {
+      getAPITestCases(requestProjectId, {
         page: currentPage.value,
         page_size: pageSize.value,
+        test_case_type: 'endpoint',
         test_type: testCaseTypeFilter.value,
         search: searchQuery.value,
       }),
-      getAPIModules(projectStore.currentProjectId).catch(() => ({ success: true, data: [] })),
+      getAPIModules(requestProjectId).catch(() => ({ success: true, data: [] })),
     ])
+    if (requestEpoch !== listLoadEpoch || requestProjectId !== currentProjectId.value) return
     const { items, total: t } = extractDataFromResponse(res)
     testCases.value = sortByCreatedAtDesc(ensureArray(items))
     total.value = t
     moduleOrder.value = Array.isArray(modRes?.data) ? modRes.data : []
   } catch {
-    ElMessage.error('加载测试用例失败')
+    if (requestEpoch === listLoadEpoch && requestProjectId === currentProjectId.value) ElMessage.error('加载测试用例失败')
   } finally {
-    loading.value = false
+    if (requestEpoch === listLoadEpoch && requestProjectId === currentProjectId.value) loading.value = false
   }
 }
 
@@ -1012,8 +1152,29 @@ const cleanupPolling = () => {
 }
 
 // ===== 生命周期 =====
-onMounted(loadData)
-onUnmounted(cleanupPolling)
+let endpointListActivated = false
+watch(currentProjectId, (projectId) => {
+  listLoadEpoch += 1
+  activeCaseDetailEpoch += 1
+  activeTestCase.value = null
+  invalidateEndpointGeneration()
+  selectedTestCases.value = []
+  treeRef.value?.setCheckedKeys([])
+  currentPage.value = 1
+  testCases.value = []
+  total.value = 0
+  if (projectId) void loadData()
+}, { immediate: true })
+onActivated(() => {
+  if (endpointListActivated && currentProjectId.value) void loadData()
+  endpointListActivated = true
+})
+onUnmounted(() => {
+  listLoadEpoch += 1
+  activeCaseDetailEpoch += 1
+  invalidateEndpointGeneration()
+  cleanupPolling()
+})
 
 // ===== 导航 =====
 const goToProjects = () => router.push('/project/project-list')
@@ -1463,6 +1624,42 @@ const typeLabelMap = {
   flex: 1;
   min-width: 0;
   overflow: hidden;
+}
+
+.endpoint-multistep-preview {
+  box-sizing: border-box;
+  height: calc(100% - 32px);
+  margin: 16px;
+  padding: 20px;
+  overflow: auto;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px;
+  background: var(--el-bg-color);
+  color: var(--el-text-color-primary);
+}
+.endpoint-multistep-preview h3 {
+  margin: 0 0 16px;
+  font-size: 16px;
+}
+.multistep-note {
+  margin: 0;
+  padding: 12px;
+  border-radius: 4px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.endpoint-multistep-preview ol {
+  margin: 20px 0;
+  padding-left: 24px;
+  list-style: decimal;
+}
+.endpoint-multistep-preview li {
+  margin: 12px 0;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 .right-empty {

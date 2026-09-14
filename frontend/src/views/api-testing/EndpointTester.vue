@@ -1538,6 +1538,8 @@ const caseInfo      = ref(null)
 const isEditingTitle = ref(false)
 const editingTitleValue = ref('')
 const rawTestCase   = ref(null)   // 原始 API 响应，用于 PUT 保存时全量继承
+const originalStep = ref({})
+const caseHasMultipleSteps = ref(false)
 
 const titleInputRef = ref(null)
 const startEditTitle = () => {
@@ -1759,6 +1761,7 @@ const populateFromTestCase = (tc) => {
   // ── 解析 script_content ───────────────────────────────────────────
   let parsedConfig = {}
   let step = null
+  let allSteps = []
 
   if (tc.script_content) {
     try {
@@ -1767,18 +1770,17 @@ const populateFromTestCase = (tc) => {
         : JSON.stringify(tc.script_content)
       const script = JSON.parse(raw)
       parsedConfig = script.config || {}
-      step = script.teststeps?.[0] ?? script.steps?.[0] ?? null
+      allSteps = script.teststeps ?? script.steps ?? []
+      step = allSteps[0] ?? null
     } catch (e) {
       console.warn('[EndpointTester] script_content 解析失败:', e.message)
     }
   }
 
   // 缓存 config（保存时原样写回，不丢失 base_url / variables 等字段）
-  scriptConfig.value = {
-    name:      parsedConfig.name      ?? tc.title ?? '',
-    base_url:  parsedConfig.base_url  ?? '',
-    variables: parsedConfig.variables ?? {},
-  }
+  scriptConfig.value = { ...parsedConfig, name: parsedConfig.name ?? tc.title ?? '' }
+  originalStep.value = step ? JSON.parse(JSON.stringify(step)) : {}
+  caseHasMultipleSteps.value = allSteps.length > 1
 
   const req = step?.request ?? {}
 
@@ -2291,6 +2293,10 @@ const specResponseJson = computed(() => {
 // ===== 发送（调试）操作 =====
 
 const handleSend = async () => {
+  if (caseHasMultipleSteps.value) {
+    ElMessage.warning('多步骤用例请在 API 工作区编辑和调试完整流程，快捷编辑器不会执行部分步骤。')
+    return
+  }
   if (!requestData.url.trim()) {
     ElMessage.warning('请输入请求 URL')
     return
@@ -2534,20 +2540,23 @@ const buildHttpRunnerStep = (stepName = '测试步骤') => {
     if (requestData.rawBody) bodyField = { data: requestData.rawBody }
   }
 
-  return {
+  const original = JSON.parse(JSON.stringify(originalStep.value || {}))
+  const request = { ...(original.request || {}), method: requestData.method, url: requestData.url }
+  for (const key of ['headers', 'params', 'json', 'data']) delete request[key]
+  if (Object.keys(headers).length) request.headers = headers
+  if (Object.keys(params).length) request.params = params
+  Object.assign(request, bodyField)
+  const step = {
+    ...original,
     name: stepName,
-    request: {
-      method: requestData.method,
-      url:    requestData.url,
-      ...(Object.keys(headers).length && { headers }),
-      ...(Object.keys(params).length  && { params  }),
-      ...bodyField,
-    },
-    ...(setupHooks.length    && { setup_hooks:    setupHooks }),
-    ...(teardownHooks.length && { teardown_hooks: teardownHooks }),
-    ...(Object.keys(extractMap).length && { extract:  extractMap }),
-    ...(validators.length              && { validate: validators }),
+    request,
   }
+  for (const key of ['setup_hooks', 'teardown_hooks', 'extract', 'validate']) delete step[key]
+  if (setupHooks.length) step.setup_hooks = setupHooks
+  if (teardownHooks.length) step.teardown_hooks = teardownHooks
+  if (Object.keys(extractMap).length) step.extract = extractMap
+  if (validators.length) step.validate = validators
+  return step
 }
 
 // ===== previewScript：完整 HttpRunner 测试用例 JSON（UI → script_content）=====
@@ -2561,11 +2570,7 @@ const previewScript = computed(() => {
 
   // 重建 config：始终保留从 script_content 中解析出来的原始字段
   const cfg = scriptConfig.value
-  const config = {
-    name:   cfg.name || stepName,
-    ...(cfg.base_url                              && { base_url:  cfg.base_url }),
-    ...(Object.keys(cfg.variables ?? {}).length   && { variables: cfg.variables }),
-  }
+  const config = { ...cfg, name: cfg.name || stepName }
 
   const testcase = {
     config,
@@ -2584,6 +2589,10 @@ const httprunnerPreview = computed(() =>
 // ===== 保存：将 previewScript 写入 script_content 字段 =====
 
 const handleSave = async () => {
+  if (caseHasMultipleSteps.value) {
+    ElMessage.warning('多步骤用例请在 API 工作区编辑完整流程，快捷编辑器不会保存部分步骤。')
+    return
+  }
   if (!caseInfo.value?.id) {
     ElMessage.warning('当前无选中用例，无法保存')
     return
@@ -2600,11 +2609,6 @@ const handleSave = async () => {
   } catch {
     ElMessage.error('脚本内容无法解析为合法 JSON，请检查后重试')
     return
-  }
-
-  // 剥离 base_url（由运行时环境注入，不持久化）
-  if (pureScript.config) {
-    delete pureScript.config.base_url
   }
 
   // 净化 Headers：直接用 UI 绑定的用户自定义行重建，防止环境全局头混入

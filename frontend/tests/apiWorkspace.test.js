@@ -47,6 +47,7 @@ import {
   workspaceNavigationSnapshot,
   workspaceMatchesSource,
   workspaceInitializationPlan,
+  endpointCaseScope,
   workspaceRouteForSource,
   workspaceSourceType,
   workspaceExecutionHistory,
@@ -465,7 +466,11 @@ test("workspace initialization honors explicit targets before history", () => {
   );
   assert.deepEqual(
     workspaceInitializationPlan({ case_id: "4", endpoint_id: "5" }, history),
-    { action: "create", caseId: 4, endpointId: 5, explicit: true },
+    { action: "create", caseId: 4, endpointId: 5, targetEndpointId: null, specId: null, explicit: true },
+  );
+  assert.deepEqual(
+    workspaceInitializationPlan({ target_endpoint_id: "5", endpoint_id: "5", spec_id: "2" }, history),
+    { action: "create", caseId: null, endpointId: 5, targetEndpointId: 5, specId: 2, explicit: true },
   );
   assert.deepEqual(workspaceInitializationPlan({}, history), {
     action: "load",
@@ -480,6 +485,8 @@ test("workspace initialization honors explicit targets before history", () => {
     workspaceInitializationPlan({ endpoint_id: ["5"] }, history).action,
     "invalid",
   );
+  assert.deepEqual(endpointCaseScope([2, 3, 2], 1), [1, 2, 3]);
+  assert.deepEqual(endpointCaseScope(Array.from({ length: 52 }, (_, index) => index + 1), 52), [52, ...Array.from({ length: 49 }, (_, index) => index + 1)]);
 });
 
 test("workspace source routes isolate document and browser history", () => {
@@ -957,7 +964,29 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(suites, /v-model="suiteForm\.variables"/);
   assert.match(suites, /套件变量会覆盖用例变量/);
   assert.match(endpointCases, /query: \{ case_id: selectedList\[0\]\.id \}/);
-  assert.match(specDetail, /query: \{ endpoint_id: endpoint\.id \}/);
+  assert.match(specDetail, /target_endpoint_id: endpoint\.id/);
+  assert.match(endpointCases, /endpoint-generation-dialog/);
+  assert.match(endpointCases, /completedDocumentApiSpecs\(response\)/);
+  assert.match(endpointCases, /test_case_type: 'endpoint'/);
+  assert.match(endpointCases, /generationSpecsEpoch/);
+  assert.match(endpointCases, /generationEndpointsEpoch/);
+  assert.match(endpointCases, /activeCaseDetailEpoch/);
+  assert.match(endpointCases, /let listLoadEpoch = 0/);
+  assert.match(endpointCases, /requestProjectId !== currentProjectId\.value/);
+  assert.match(endpointCases, /watch\(currentProjectId,[\s\S]*\{ immediate: true \}\)/);
+  assert.match(endpointCases, /onActivated\(\(\) =>/);
+  assert.match(endpointCases, /未打开快捷编辑器以避免丢失多步骤配置/);
+  assert.doesNotMatch(endpointCases, /selectTestCase\(data\.testCase\)/);
+  assert.match(endpointCases, /endpoint-multistep-preview/);
+  assert.match(endpointCases, /endpoint-open-workspace/);
+  assert.match(workspace, /endpoint-generation-spec/);
+  assert.match(workspace, /endpoint-generation-target/);
+  assert.match(workspace, /payload\.target_endpoint_id/);
+  assert.match(workspace, /:disabled="interactionLocked \|\| Boolean\(targetEndpointId\)"/);
+  assert.match(workspace, /rootWorkspace\.value\?\.spec_id/);
+  assert.match(workspace, /saved_case_test_type/);
+  assert.match(workspace, /suggested_test_type/);
+  assert.match(workspace, /payload\.test_type = saveForm\.value\.test_type/);
   assert.match(workspace, /<main v-if="workspaceReady"/);
   assert.doesNotMatch(workspace, /label="工作区标题"/);
   assert.doesNotMatch(workspace, /:model-value="workspace\.title" disabled/);
@@ -1041,6 +1070,22 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.doesNotMatch(legacyApi, /generateScenario/);
   assert.doesNotMatch(specDetail, /generateEndpointTestCases\(/);
   assert.doesNotMatch(specDetail, /generateSpecTestCases\(/);
+});
+
+test("endpoint quick editor preserves single-step metadata and rejects multi-step truncation", async () => {
+  const tester = await readFile(
+    new URL("../src/views/api-testing/EndpointTester.vue", import.meta.url),
+    "utf8",
+  );
+  const cases = await readFile(
+    new URL("../src/views/api-testing/EndpointTestCases.vue", import.meta.url),
+    "utf8",
+  );
+  assert.match(tester, /const step = \{\s*\.\.\.original,/);
+  assert.match(tester, /caseHasMultipleSteps\.value/);
+  assert.doesNotMatch(tester, /delete pureScript\.config\.base_url/);
+  assert.match(cases, /v-else-if="activeTestCase"/);
+  assert.match(cases, /endpoint-multistep-preview/);
 });
 
 test("workspace reliability UI uses cancellation, standard report history, and explicit assertion acknowledgement", async () => {

@@ -2,12 +2,25 @@
 项目 Dashboard 统计 API：企业级研发效能核心指标
 按 project_type 动态路由到对应模型（api/web/app），统一返回结构。
 """
+import logging
+
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from projects.access import REPORT, get_project_for_user
 from .services import get_dashboard_summary, get_dashboard_trend, get_dashboard_top_failures
+
+logger = logging.getLogger(__name__)
+
+
+def _statistics_response(service, project, wrapped=False):
+    try:
+        data = service(project)
+    except Exception:
+        logger.exception('首页统计失败 project=%s service=%s', project.pk, getattr(service, '__name__', 'statistics'))
+        return Response({'message': '首页统计暂时无法加载，请稍后重试。'}, status=503)
+    return Response({'data': data} if wrapped else data)
 
 
 def _get_project_or_404(project_id, user):
@@ -22,8 +35,7 @@ class DashboardSummaryView(APIView):
 
     def get(self, request, project_id):
         project = _get_project_or_404(project_id, request.user)
-        data = get_dashboard_summary(project)
-        return Response(data)
+        return _statistics_response(get_dashboard_summary, project)
 
 
 class DashboardTrendView(APIView):
@@ -33,8 +45,7 @@ class DashboardTrendView(APIView):
 
     def get(self, request, project_id):
         project = _get_project_or_404(project_id, request.user)
-        data = get_dashboard_trend(project)
-        return Response({'data': data})
+        return _statistics_response(get_dashboard_trend, project, wrapped=True)
 
 
 class DashboardTopFailuresView(APIView):
@@ -44,5 +55,4 @@ class DashboardTopFailuresView(APIView):
 
     def get(self, request, project_id):
         project = _get_project_or_404(project_id, request.user)
-        data = get_dashboard_top_failures(project)
-        return Response({'data': data})
+        return _statistics_response(get_dashboard_top_failures, project, wrapped=True)

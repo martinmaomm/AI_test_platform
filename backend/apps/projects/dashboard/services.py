@@ -1,413 +1,169 @@
-"""
-Dashboard 统计服务层：按项目类型动态路由到对应模型
-统一返回结构，前端无需修改。
-"""
-from datetime import timedelta
-from django.db.models import Count, Q, Sum
-from django.db.models.functions import TruncDate
+"""首页统计：按项目隔离，统计已结束执行中的实际用例结果。"""
+from datetime import datetime, time, timedelta
+
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 
+FINISHED = ('passed', 'failed', 'error', 'incomplete', 'stopped')
+VERDICTS = ('passed', 'failed', 'error')
+
+
 def _empty_summary():
-    return {
-        'today_pass_rate': 0.0,
-        'today_executions': 0,
-        'ai_contribution_rate': 0.0,
-        'total_cases': 0,
-    }
+    return dict(today_pass_rate=0.0, today_executions=0,
+                ai_contribution_rate=0.0, total_cases=0)
 
 
-def _empty_trend(start_date, end_date):
-    result = []
-    dt = start_date
-    while dt <= end_date:
-        result.append({
-            'date': dt.isoformat(),
-            'executions': 0,
-            'passed': 0,
-            'failed': 0,
-            'pass_rate': 0.0,
-        })
-        dt += timedelta(days=1)
-    return result
+def _empty_trend(start, end):
+    return [dict(date=(start + timedelta(days=n)).isoformat(), executions=0,
+                 passed=0, failed=0, pass_rate=0.0)
+            for n in range((end - start).days + 1)]
 
 
-def _empty_top_failures():
-    return []
-
-
-# ==================== API 测试 ====================
-
-def _api_summary(project_id):
-    from api_testing.models import APITestExecution, APITestCase, APITestCaseExecutionDetail
-    from api_testing.models import APITestSuiteExecutionDetail
-
-    today = timezone.now().date()
-    today_execs = APITestExecution.objects.filter(
-        project_id=project_id,
-        created_at__date=today
-    ).exclude(status__in=('pending', 'running'))
-
-    today_executions = today_execs.count()
-    total_steps = 0
-    passed_steps = 0
-    for exec in today_execs.select_related('case_execution_detail', 'suite_execution_detail'):
-        if exec.exec_type in ('case', 'scenario'):
-            try:
-                detail = exec.case_execution_detail
-                total_steps += 1
-                if detail.status == 'passed':
-                    passed_steps += 1
-            except APITestCaseExecutionDetail.DoesNotExist:
-                pass
-        elif exec.exec_type == 'suite':
-            try:
-                detail = exec.suite_execution_detail
-                total_steps += detail.total_cases
-                passed_steps += detail.passed_cases
-            except APITestSuiteExecutionDetail.DoesNotExist:
-                pass
-
-    today_pass_rate = round((passed_steps / total_steps * 100), 2) if total_steps > 0 else 0.0
-    total_cases = APITestCase.objects.filter(project_id=project_id).count()
-    ai_cases = APITestCase.objects.filter(
-        project_id=project_id,
-        test_case_type='scenario'
-    ).count()
-    ai_contribution_rate = round((ai_cases / total_cases * 100), 2) if total_cases > 0 else 0.0
-
-    return {
-        'today_pass_rate': today_pass_rate,
-        'today_executions': today_executions,
-        'ai_contribution_rate': ai_contribution_rate,
-        'total_cases': total_cases,
-    }
-
-
-def _api_trend(project_id, start_date, end_date):
-    from api_testing.models import APITestExecution, APITestCaseExecutionDetail
-    from api_testing.models import APITestSuiteExecutionDetail
-
-    exec_counts = (
-        APITestExecution.objects.filter(
-            project_id=project_id,
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date
+def _models(project):
+    if project.project_type == 'api':
+        from api_testing.models import (
+            APITestExecution, APITestCase, APITestCaseExecutionDetail, APITestSuiteCaseExecution,
         )
-        .exclude(status__in=('pending', 'running'))
-        .annotate(date=TruncDate('created_at'))
-        .values('date')
-        .annotate(executions=Count('id'))
-        .order_by('date')
-    )
-    case_stats = (
-        APITestCaseExecutionDetail.objects.filter(
-            execution__project_id=project_id,
-            execution__created_at__date__gte=start_date,
-            execution__created_at__date__lte=end_date
+        return APITestExecution, APITestCase, APITestCaseExecutionDetail, APITestSuiteCaseExecution
+    if project.project_type == 'web':
+        from web_testing.models import (
+            WebUITestExecution, WebUITestCase, WebUITestCaseExecutionDetail, WebUITestSuiteCaseExecution,
         )
-        .exclude(execution__status__in=('pending', 'running'))
-        .annotate(date=TruncDate('execution__created_at'))
-        .values('date')
-        .annotate(
-            passed=Count('id', filter=Q(status='passed')),
-            failed=Count('id', filter=Q(status__in=('failed', 'error')))
-        )
-        .order_by('date')
-    )
-    suite_stats = (
-        APITestSuiteExecutionDetail.objects.filter(
-            execution__project_id=project_id,
-            execution__created_at__date__gte=start_date,
-            execution__created_at__date__lte=end_date
-        )
-        .exclude(execution__status__in=('pending', 'running'))
-        .annotate(date=TruncDate('execution__created_at'))
-        .values('date')
-        .annotate(passed=Sum('passed_cases'), failed=Sum('failed_cases'))
-        .order_by('date')
-    )
-    return _merge_trend_results(exec_counts, case_stats, suite_stats, start_date, end_date)
+        return WebUITestExecution, WebUITestCase, WebUITestCaseExecutionDetail, WebUITestSuiteCaseExecution
+    return None
 
 
-def _api_top_failures(project_id, start_date, end_date):
-    from api_testing.models import APITestCaseExecutionDetail, APITestSuiteCaseExecution, APITestCase
-
-    case_failures = (
-        APITestCaseExecutionDetail.objects.filter(
-            execution__project_id=project_id,
-            execution__created_at__date__gte=start_date,
-            execution__created_at__date__lte=end_date,
-            status__in=('failed', 'error')
-        )
-        .values('test_case_id')
-        .annotate(fail_count=Count('id'))
-    )
-    suite_failures = (
-        APITestSuiteCaseExecution.objects.filter(
-            suite_execution__execution__project_id=project_id,
-            suite_execution__execution__created_at__date__gte=start_date,
-            suite_execution__execution__created_at__date__lte=end_date,
-            status__in=('failed', 'error')
-        )
-        .values('test_case_id')
-        .annotate(fail_count=Count('id'))
-    )
-    case_id_to_count = {}
-    for row in case_failures:
-        case_id_to_count[row['test_case_id']] = case_id_to_count.get(row['test_case_id'], 0) + row['fail_count']
-    for row in suite_failures:
-        case_id_to_count[row['test_case_id']] = case_id_to_count.get(row['test_case_id'], 0) + row['fail_count']
-
-    sorted_cases = sorted(case_id_to_count.items(), key=lambda x: x[1], reverse=True)[:5]
-    case_ids = [c[0] for c in sorted_cases]
-    cases_by_id = {c.id: c for c in APITestCase.objects.filter(id__in=case_ids).only('id', 'title')}
-
-    return [
-        {
-            'test_case_id': cid,
-            'test_case_name': getattr(cases_by_id.get(cid), 'title', None) or f'用例#{cid}',
-            'fail_count': cnt,
-        }
-        for cid, cnt in sorted_cases
-    ]
+def _executions(project, start, end):
+    # 用应用时区划分日期，半开区间也避免依赖 MySQL 的时区表。
+    tz = timezone.get_current_timezone()
+    lower = timezone.make_aware(datetime.combine(start, time.min), tz)
+    upper = timezone.make_aware(datetime.combine(end + timedelta(days=1), time.min), tz)
+    return _models(project)[0].objects.filter(
+        project_id=project.pk, created_at__gte=lower, created_at__lt=upper,
+        status__in=FINISHED,
+    ).order_by()
 
 
-# ==================== Web 测试 ====================
-# WebUITestExecution 无 project FK，通过 case_execution_detail__test_case__project 或
-# suite_execution_detail__test_suite__project 过滤
-
-def _web_summary(project_id):
-    from web_testing.models import (
-        WebUITestExecution, WebUITestCase,
-        WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail
+def _details(project, executions):
+    _, _, single, child = _models(project)
+    return (
+        (single.objects.filter(execution__in=executions.exclude(exec_type='suite')).order_by(), 'execution'),
+        (child.objects.filter(suite_execution__execution__in=executions.filter(exec_type='suite')).order_by(),
+         'suite_execution__execution'),
     )
 
-    today = timezone.now().date()
-    base_q = Q(
-        case_execution_detail__test_case__project_id=project_id
-    ) | Q(
-        suite_execution_detail__test_suite__project_id=project_id
-    )
-    today_execs = WebUITestExecution.objects.filter(base_q).filter(
-        created_at__date=today
-    ).exclude(status__in=('pending', 'running')).distinct()
 
-    today_executions = today_execs.count()
-    total_steps = 0
-    passed_steps = 0
-    for exec in today_execs.select_related('case_execution_detail', 'suite_execution_detail'):
-        if exec.exec_type == 'case':
-            try:
-                detail = exec.case_execution_detail
-                total_steps += 1
-                if detail.status == 'passed':
-                    passed_steps += 1
-            except WebUITestCaseExecutionDetail.DoesNotExist:
-                pass
-        elif exec.exec_type == 'suite':
-            try:
-                detail = exec.suite_execution_detail
-                total_steps += detail.total_cases
-                passed_steps += detail.passed_cases
-            except WebUITestSuiteExecutionDetail.DoesNotExist:
-                pass
+def _rate(passed, failed):
+    return round(100 * passed / (passed + failed), 2) if passed + failed else 0.0
 
-    today_pass_rate = round((passed_steps / total_steps * 100), 2) if total_steps > 0 else 0.0
-    total_cases = WebUITestCase.objects.filter(project_id=project_id).count()
-    return {
-        'today_pass_rate': today_pass_rate,
-        'today_executions': today_executions,
-        'ai_contribution_rate': 0.0,
-        'total_cases': total_cases,
-    }
-
-
-def _web_trend(project_id, start_date, end_date):
-    from web_testing.models import (
-        WebUITestExecution, WebUITestCaseExecutionDetail,
-        WebUITestSuiteExecutionDetail
-    )
-
-    base_q = Q(
-        case_execution_detail__test_case__project_id=project_id
-    ) | Q(
-        suite_execution_detail__test_suite__project_id=project_id
-    )
-    exec_qs = WebUITestExecution.objects.filter(base_q).filter(
-        created_at__date__gte=start_date,
-        created_at__date__lte=end_date
-    ).exclude(status__in=('pending', 'running')).distinct()
-
-    exec_counts = (
-        exec_qs.annotate(date=TruncDate('created_at'))
-        .values('date')
-        .annotate(executions=Count('id'))
-        .order_by('date')
-    )
-    case_stats = (
-        WebUITestCaseExecutionDetail.objects.filter(
-            test_case__project_id=project_id,
-            execution__created_at__date__gte=start_date,
-            execution__created_at__date__lte=end_date
-        )
-        .exclude(execution__status__in=('pending', 'running'))
-        .annotate(date=TruncDate('execution__created_at'))
-        .values('date')
-        .annotate(
-            passed=Count('id', filter=Q(status='passed')),
-            failed=Count('id', filter=Q(status__in=('failed', 'error')))
-        )
-        .order_by('date')
-    )
-    suite_stats = (
-        WebUITestSuiteExecutionDetail.objects.filter(
-            test_suite__project_id=project_id,
-            execution__created_at__date__gte=start_date,
-            execution__created_at__date__lte=end_date
-        )
-        .exclude(execution__status__in=('pending', 'running'))
-        .annotate(date=TruncDate('execution__created_at'))
-        .values('date')
-        .annotate(passed=Sum('passed_cases'), failed=Sum('failed_cases'))
-        .order_by('date')
-    )
-    return _merge_trend_results(exec_counts, case_stats, suite_stats, start_date, end_date)
-
-
-def _web_top_failures(project_id, start_date, end_date):
-    from web_testing.models import WebUITestCaseExecutionDetail, WebUITestSuiteCaseExecution, WebUITestCase
-
-    case_failures = (
-        WebUITestCaseExecutionDetail.objects.filter(
-            test_case__project_id=project_id,
-            execution__created_at__date__gte=start_date,
-            execution__created_at__date__lte=end_date,
-            status__in=('failed', 'error')
-        )
-        .values('test_case_id')
-        .annotate(fail_count=Count('id'))
-    )
-    suite_failures = (
-        WebUITestSuiteCaseExecution.objects.filter(
-            test_case__project_id=project_id,
-            suite_execution__execution__created_at__date__gte=start_date,
-            suite_execution__execution__created_at__date__lte=end_date,
-            status__in=('failed', 'error')
-        )
-        .values('test_case_id')
-        .annotate(fail_count=Count('id'))
-    )
-    case_id_to_count = {}
-    for row in case_failures:
-        case_id_to_count[row['test_case_id']] = case_id_to_count.get(row['test_case_id'], 0) + row['fail_count']
-    for row in suite_failures:
-        case_id_to_count[row['test_case_id']] = case_id_to_count.get(row['test_case_id'], 0) + row['fail_count']
-
-    sorted_cases = sorted(case_id_to_count.items(), key=lambda x: x[1], reverse=True)[:5]
-    case_ids = [c[0] for c in sorted_cases]
-    cases_by_id = {c.id: c for c in WebUITestCase.objects.filter(id__in=case_ids).only('id', 'title')}
-
-    return [
-        {
-            'test_case_id': cid,
-            'test_case_name': getattr(cases_by_id.get(cid), 'title', None) or f'用例#{cid}',
-            'fail_count': cnt,
-        }
-        for cid, cnt in sorted_cases
-    ]
-
-
-# ==================== 通用合并逻辑 ====================
-
-def _merge_trend_results(exec_counts, case_stats, suite_stats, start_date, end_date):
-    by_date = {}
-    dt = start_date
-    while dt <= end_date:
-        by_date[dt] = {
-            'date': dt.isoformat(),
-            'executions': 0,
-            'passed': 0,
-            'failed': 0,
-            'pass_rate': 0.0,
-        }
-        dt += timedelta(days=1)
-
-    for row in exec_counts:
-        d = row['date']
-        if d in by_date:
-            by_date[d]['executions'] = row['executions']
-
-    for row in case_stats:
-        d = row['date']
-        if d in by_date:
-            by_date[d]['passed'] += row['passed'] or 0
-            by_date[d]['failed'] += row['failed'] or 0
-
-    for row in suite_stats:
-        d = row['date']
-        if d in by_date:
-            by_date[d]['passed'] += row['passed'] or 0
-            by_date[d]['failed'] += row['failed'] or 0
-
-    result = []
-    for d in sorted(by_date.keys()):
-        row = by_date[d]
-        total = row['passed'] + row['failed']
-        row['pass_rate'] = round((row['passed'] / total * 100), 2) if total > 0 else 0.0
-        result.append(row)
-    return result
-
-
-# ==================== 工厂入口 ====================
 
 def get_dashboard_summary(project):
-    """根据项目类型返回 summary 统计"""
-    project_type = (project.project_type or 'api').lower()
-    project_id = project.id
-    try:
-        if project_type == 'api':
-            return _api_summary(project_id)
-        if project_type == 'web':
-            return _web_summary(project_id)
-        if project_type in ('app', 'perf'):
-            return _empty_summary()
-        return _api_summary(project_id)
-    except Exception:
+    models = _models(project)
+    if not models:
         return _empty_summary()
+    today = timezone.localdate()
+    executions = _executions(project, today, today)
+    passed = failed = 0
+    for details, _ in _details(project, executions):
+        result = details.aggregate(
+            passed=Count('pk', filter=Q(status='passed')),
+            failed=Count('pk', filter=Q(status__in=('failed', 'error'))),
+        )
+        passed += result['passed']
+        failed += result['failed']
+    cases = models[1].objects.filter(project_id=project.pk)
+    total = cases.count()
+    if project.project_type == 'web':
+        ai_count = cases.filter(script_source='mcp_exploration').count()
+    else:
+        from api_testing.models import APIWorkspace
+        # API 用例没有来源字段，以仍保留的 AI 候选采纳记录为依据，不能将场景类型视为 AI 来源。
+        adopted = APIWorkspace.objects.filter(
+            project_id=project.pk, generation__adopted_revision__isnull=False,
+        ).exclude(generation__adopted_revision=None).values('saved_case_id')
+        ai_count = cases.filter(pk__in=adopted).count()
+    return dict(today_pass_rate=_rate(passed, failed), today_executions=executions.count(),
+                ai_contribution_rate=round(100 * ai_count / total, 2) if total else 0.0,
+                total_cases=total)
 
 
 def get_dashboard_trend(project):
-    """根据项目类型返回 trend 趋势数据"""
-    project_type = (project.project_type or 'api').lower()
-    project_id = project.id
-    end_date = timezone.now().date()
-    start_date = end_date - timedelta(days=6)
+    end = timezone.localdate()
+    start = end - timedelta(days=6)
+    rows = _empty_trend(start, end)
+    if not _models(project):
+        return rows
+    by_date = {row['date']: row for row in rows}
+    executions = _executions(project, start, end)
+    for timestamp in executions.values_list('created_at', flat=True).iterator():
+        by_date[timezone.localdate(timestamp).isoformat()]['executions'] += 1
+    for details, path in _details(project, executions):
+        for status, timestamp in details.filter(status__in=VERDICTS).values_list(
+            'status', f'{path}__created_at',
+        ).iterator():
+            row = by_date[timezone.localdate(timestamp).isoformat()]
+            row['passed' if status == 'passed' else 'failed'] += 1
+    for row in rows:
+        row['pass_rate'] = _rate(row['passed'], row['failed'])
+    return rows
+
+
+def _usable_name(value):
+    return value.strip() if isinstance(value, str) and value.strip().lower() not in ('', 'none', 'null') else ''
+
+
+def _identifier(value):
+    # 快照缺少或损坏 ID 时仅使用名称兜底，不让一条记录拖垮整页统计。
+    if isinstance(value, bool):
+        return None
     try:
-        if project_type == 'api':
-            return _api_trend(project_id, start_date, end_date)
-        if project_type == 'web':
-            return _web_trend(project_id, start_date, end_date)
-        if project_type in ('app', 'perf'):
-            return _empty_trend(start_date, end_date)
-        return _api_trend(project_id, start_date, end_date)
-    except Exception:
-        return _empty_trend(start_date, end_date)
+        return int(value) if str(value).isdigit() and int(value) > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def get_dashboard_top_failures(project):
-    """根据项目类型返回 top-failures 数据"""
-    project_type = (project.project_type or 'api').lower()
-    project_id = project.id
-    end_date = timezone.now().date()
-    start_date = end_date - timedelta(days=6)
-    try:
-        if project_type == 'api':
-            return _api_top_failures(project_id, start_date, end_date)
-        if project_type == 'web':
-            return _web_top_failures(project_id, start_date, end_date)
-        if project_type in ('app', 'perf'):
-            return _empty_top_failures()
-        return _api_top_failures(project_id, start_date, end_date)
-    except Exception:
-        return _empty_top_failures()
+    models = _models(project)
+    if not models:
+        return []
+    end = timezone.localdate()
+    executions = _executions(project, end - timedelta(days=6), end)
+    cases = dict(models[1].objects.filter(project_id=project.pk).values_list('pk', 'title'))
+    workspace_cases = {}
+    if project.project_type == 'api':
+        from api_testing.models import APIWorkspace
+        workspace_cases = dict(APIWorkspace.objects.filter(
+            project_id=project.pk, saved_case_id__in=cases,
+        ).values_list('pk', 'saved_case_id'))
+    grouped = {}
+    for details, path in _details(project, executions):
+        fields = ['pk', 'test_case_id', 'execution_name', 'parent_execution_id']
+        annotations = {'execution_name': F(f'{path}__name'), 'parent_execution_id': F(f'{path}__pk')}
+        if project.project_type == 'api' or path != 'execution':
+            fields.append('name')
+        if project.project_type == 'api' and path == 'execution':
+            annotations.update(workspace_id=F('execution__input_snapshot__workspace_id'),
+                               frozen_case_id=F('execution__input_snapshot__cases__0__case_id'))
+            fields += ['workspace_id', 'frozen_case_id']
+        for detail in details.filter(status__in=('failed', 'error')).annotate(**annotations).values(*fields).iterator():
+            workspace_id = _identifier(detail.get('workspace_id'))
+            case_id = detail['test_case_id'] or _identifier(detail.get('frozen_case_id')) or workspace_cases.get(workspace_id)
+            snapshot_name = _usable_name(detail.get('name')) or _usable_name(detail['execution_name'])
+            if case_id:
+                key = ('case', case_id)
+                name = _usable_name(cases.get(case_id)) or snapshot_name or f'用例#{case_id}'
+            elif workspace_id:
+                key = ('workspace', workspace_id)
+                name = snapshot_name or f'未保存场景（工作区 {workspace_id}）'
+            elif project.project_type == 'web' and path == 'execution':
+                # UI 草稿没有稳定用例关联，执行名称又可能完全相同，不能臆测它们是同一用例。
+                key = ('execution', detail['parent_execution_id'])
+                name = f'{snapshot_name or "未保存用例"}（执行 #{detail["parent_execution_id"]}）'
+            else:
+                key = ('name', snapshot_name) if snapshot_name else (path, detail['pk'])
+                name = snapshot_name or f'未命名用例（执行明细 {detail["pk"]}）'
+            row = grouped.setdefault(key, dict(test_case_id=case_id if case_id in cases else None,
+                                               test_case_name=name, fail_count=0))
+            row['fail_count'] += 1
+    return sorted(grouped.values(), key=lambda row: (-row['fail_count'], row['test_case_name']))[:5]

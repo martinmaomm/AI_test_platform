@@ -4,7 +4,7 @@
       <template #header>
         <div class="card-header">
           <span>个人资料</span>
-          <el-button type="primary" @click="editMode = !editMode">
+          <el-button type="primary" :disabled="saving" @click="editMode ? cancelEdit() : editMode = true">
             {{ editMode ? '取消编辑' : '编辑资料' }}
           </el-button>
         </div>
@@ -18,106 +18,23 @@
         :disabled="!editMode"
       >
         <el-row :gutter="20">
-          <el-col :span="12">
+          <el-col :xs="24" :sm="12">
             <el-form-item label="用户名" prop="username">
               <el-input v-model="profileForm.username" disabled />
             </el-form-item>
           </el-col>
-          <el-col :span="12">
+          <el-col :xs="24" :sm="12">
             <el-form-item label="邮箱" prop="email">
               <el-input v-model="profileForm.email" />
             </el-form-item>
           </el-col>
         </el-row>
         
-        <el-row :gutter="20">
-          <el-col :span="12">
-            <el-form-item label="姓" prop="first_name">
-              <el-input v-model="profileForm.first_name" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="名" prop="last_name">
-              <el-input v-model="profileForm.last_name" />
-            </el-form-item>
-          </el-col>
-        </el-row>
-        
-        <el-row :gutter="20">
-          <el-col :span="12">
-            <el-form-item label="手机号" prop="phone">
-              <el-input v-model="profileForm.phone" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="头像">
-              <el-upload
-                class="avatar-uploader"
-                action="#"
-                :show-file-list="false"
-                :before-upload="beforeAvatarUpload"
-                :disabled="!editMode"
-              >
-                <img v-if="profileForm.avatar" :src="profileForm.avatar" class="avatar" />
-                <el-icon v-else class="avatar-uploader-icon"><Plus /></el-icon>
-              </el-upload>
-            </el-form-item>
-          </el-col>
-        </el-row>
-        
-        <el-form-item label="个人简介" prop="bio">
-          <el-input
-            v-model="profileForm.bio"
-            type="textarea"
-            :rows="3"
-            placeholder="请输入个人简介..."
-          />
-        </el-form-item>
-        
-        <el-row :gutter="20">
-          <el-col :span="12">
-            <el-form-item label="职位" prop="title">
-              <el-input v-model="profileForm.title" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="部门" prop="department">
-              <el-input v-model="profileForm.department" />
-            </el-form-item>
-          </el-col>
-        </el-row>
-        
-        <el-form-item label="公司" prop="company">
-          <el-input v-model="profileForm.company" />
-        </el-form-item>
-        
-        <el-form-item label="技能标签">
-          <el-tag
-            v-for="(skill, index) in profileForm.skills"
-            :key="index"
-            closable
-            :disable-transitions="false"
-            @close="handleSkillClose(index)"
-            :disabled="!editMode"
-          >
-            {{ skill }}
-          </el-tag>
-          <el-input
-            v-if="editMode"
-            v-model="newSkill"
-            class="input-new-skill"
-            size="small"
-            @keyup.enter="handleSkillInputConfirm"
-            @blur="handleSkillInputConfirm"
-            placeholder="输入技能标签"
-          />
-        </el-form-item>
-        
         <el-form-item v-if="editMode">
           <el-button type="primary" @click="saveProfile" :loading="saving">
             保存修改
           </el-button>
-          <el-button @click="cancelEdit">取消</el-button>
+          <el-button :disabled="saving" @click="cancelEdit">取消</el-button>
         </el-form-item>
       </el-form>
     </el-card>
@@ -173,8 +90,7 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { usersApi } from '@/api/users'
 
@@ -184,21 +100,11 @@ const authStore = useAuthStore()
 const editMode = ref(false)
 const saving = ref(false)
 const changingPassword = ref(false)
-const newSkill = ref('')
 
 // 个人资料表单
 const profileForm = reactive({
   username: '',
-  email: '',
-  first_name: '',
-  last_name: '',
-  phone: '',
-  avatar: '',
-  bio: '',
-  title: '',
-  department: '',
-  company: '',
-  skills: []
+  email: ''
 })
 
 // 密码表单
@@ -256,16 +162,7 @@ const loadProfile = async () => {
       const user = response.data.data
       Object.assign(profileForm, {
         username: user.username || '',
-        email: user.email || '',
-        first_name: user.first_name || '',
-        last_name: user.last_name || '',
-        phone: user.phone || '',
-        avatar: user.avatar || '',
-        bio: user.bio || '',
-        title: user.profile?.title || '',
-        department: user.profile?.department || '',
-        company: user.profile?.company || '',
-        skills: user.profile?.skills || []
+        email: user.email || ''
       })
     }
   } catch (error) {
@@ -280,23 +177,14 @@ const saveProfile = async () => {
     saving.value = true
     
     const updateData = {
-      email: profileForm.email,
-      first_name: profileForm.first_name,
-      last_name: profileForm.last_name,
-      phone: profileForm.phone,
-      bio: profileForm.bio,
-      profile: {
-        title: profileForm.title,
-        department: profileForm.department,
-        company: profileForm.company,
-        skills: profileForm.skills
-      }
+      email: profileForm.email
     }
     
     const response = await usersApi.updateProfile(updateData)
     if (response.data?.success) {
       ElMessage.success(response.data.message || '个人资料保存成功')
       editMode.value = false
+      profileFormRef.value?.clearValidate()
       // 更新 auth store 中的用户信息
       authStore.user = { ...authStore.user, ...response.data.data }
     } else {
@@ -311,9 +199,10 @@ const saveProfile = async () => {
 }
 
 // 取消编辑
-const cancelEdit = () => {
+const cancelEdit = async () => {
   editMode.value = false
-  loadProfile() // 重新加载数据，丢弃未保存的修改
+  await loadProfile() // 重新加载数据，丢弃未保存的修改
+  profileFormRef.value?.clearValidate()
 }
 
 // 修改密码
@@ -347,38 +236,13 @@ const changePassword = async () => {
   }
 }
 
-// 头像上传
-const beforeAvatarUpload = (file) => {
-  const isJPG = file.type === 'image/jpeg' || file.type === 'image/png'
-  const isLt2M = file.size / 1024 / 1024 < 2
-
-  if (!isJPG) {
-    ElMessage.error('头像只能是 JPG 或 PNG 格式!')
-  }
-  if (!isLt2M) {
-    ElMessage.error('头像大小不能超过 2MB!')
-  }
-  return isJPG && isLt2M
-}
-
-// 技能标签相关
-const handleSkillClose = (index) => {
-  profileForm.skills.splice(index, 1)
-}
-
-const handleSkillInputConfirm = () => {
-  if (newSkill.value) {
-    if (profileForm.skills.indexOf(newSkill.value) === -1) {
-      profileForm.skills.push(newSkill.value)
-    }
-    newSkill.value = ''
-  }
-}
 </script>
 
 <style scoped>
 .profile-page {
   padding: 20px;
+  max-width: 960px;
+  margin: 0 auto;
 }
 
 .profile-card,
@@ -392,47 +256,4 @@ const handleSkillInputConfirm = () => {
   align-items: center;
 }
 
-.avatar-uploader {
-  text-align: center;
-}
-
-.avatar-uploader .avatar {
-  width: 100px;
-  height: 100px;
-  border-radius: 50%;
-  object-fit: cover;
-}
-
-.avatar-uploader .el-upload {
-  border: 1px dashed #d9d9d9;
-  border-radius: 6px;
-  cursor: pointer;
-  position: relative;
-  overflow: hidden;
-  transition: border-color 0.3s;
-}
-
-.avatar-uploader .el-upload:hover {
-  border-color: #409eff;
-}
-
-.avatar-uploader-icon {
-  font-size: 28px;
-  color: #8c939d;
-  width: 100px;
-  height: 100px;
-  line-height: 100px;
-  text-align: center;
-}
-
-.input-new-skill {
-  width: 90px;
-  margin-left: 10px;
-  vertical-align: bottom;
-}
-
-.el-tag {
-  margin-right: 10px;
-  margin-bottom: 10px;
-}
 </style>

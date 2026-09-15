@@ -226,6 +226,7 @@ def verify(origin, fixture, output):
             assert inaccessible.value.status == 404, inaccessible.value.text()
             expect(page.get_by_text('加载项目详情失败', exact=True)).to_be_visible(timeout=15000)
             page.screenshot(path=str(output / 'member-gates.png'), full_page=True)
+            verify_profile(page, origin, fixture['member'], output)
             assert not errors, errors
         except Exception:
             page.screenshot(path=str(output / 'failure.png'), full_page=True)
@@ -233,6 +234,67 @@ def verify(origin, fixture, output):
         finally:
             context.close()
             browser.close()
+
+
+def verify_profile(page, origin, member, output):
+    """The compact profile sends only email; hidden historical data is untouched."""
+    from playwright.sync_api import expect
+    from users.models import User, UserProfile
+
+    def seed_history():
+        User.objects.filter(pk=member.pk).update(phone='old-phone', bio='old-bio', first_name='Old')
+        UserProfile.objects.update_or_create(user=member, defaults={'title': 'Old title', 'skills': ['old-skill']})
+    database(seed_history)
+
+    page.goto(origin + '/profile')
+    form = page.locator('.profile-page')
+    username, email = form.get_by_label('用户名', exact=True), form.get_by_label('邮箱', exact=True)
+    expect(username).to_have_value(member.username)
+    expect(username).to_be_disabled()
+    expect(email).to_have_value(member.email)
+    expect(form.locator('.el-form-item__label')).to_have_text(['用户名', '邮箱', '当前密码', '新密码', '确认新密码'])
+    expect(form.locator('.el-upload')).to_have_count(0)
+
+    # Both cancel buttons discard changes rather than just disabling the form.
+    for button in ('取消编辑', '取消'):
+        form.get_by_role('button', name='编辑资料', exact=True).click()
+        email.fill('discarded@example.test')
+        form.get_by_role('button', name=button, exact=True).click()
+        expect(email).to_have_value(member.email)
+        expect(email).to_be_disabled()
+        expect(form.locator('.el-form-item__error')).to_have_count(0)
+
+    form.get_by_role('button', name='编辑资料', exact=True).click()
+    email.fill('invalid-email')
+    form.get_by_role('button', name='保存修改', exact=True).click()
+    expect(form.get_by_text('请输入正确的邮箱地址', exact=True)).to_be_visible()
+    email.fill('updated-profile@example.test')
+    with page.expect_response(lambda item: item.request.method == 'PUT' and item.url.endswith('/users/manage/profile/')) as saved:
+        form.get_by_role('button', name='保存修改', exact=True).click()
+    assert saved.value.ok, saved.value.text()
+    assert saved.value.request.post_data_json == {'email': 'updated-profile@example.test'}
+    expect(email).to_be_disabled()
+    expect(form.locator('.el-form-item__error')).to_have_count(0)
+
+    def check_history():
+        current = User.objects.get(pk=member.pk)
+        assert current.email == 'updated-profile@example.test'
+        assert (current.phone, current.bio, current.first_name) == ('old-phone', 'old-bio', 'Old')
+        assert current.profile.title == 'Old title' and current.profile.skills == ['old-skill']
+        assert not current.is_staff and not current.is_superuser
+    database(check_history)
+
+    # Password changing remains usable; writes affect the isolated fixture only.
+    form.get_by_label('当前密码', exact=True).fill('fixture-only')
+    form.get_by_label('新密码', exact=True).fill('fixture-new-password')
+    form.get_by_label('确认新密码', exact=True).fill('fixture-new-password')
+    with page.expect_response(lambda item: item.request.method == 'POST' and item.url.endswith('/users/change-password/')) as changed:
+        form.get_by_role('button', name='修改密码', exact=True).click()
+    assert changed.value.ok, changed.value.text()
+    expect(form.get_by_label('当前密码', exact=True)).to_have_value('')
+    assert database(lambda: User.objects.get(pk=member.pk).check_password('fixture-new-password'))
+    expect(page.locator('.el-message:visible')).to_have_count(0, timeout=6000)
+    page.screenshot(path=str(output / 'profile.png'), full_page=True)
 
 
 def main():

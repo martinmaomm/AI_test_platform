@@ -127,9 +127,10 @@ class APITestCaseSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'description', 'test_case_type',
             'test_type', 'priority', 'endpoint_info', 'last_result_info',
-            'steps_count', 'sort_order', 'created_by_username', 'created_at', 'updated_at'
+            'steps_count', 'sort_order', 'creation_source',
+            'created_by_username', 'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'creation_source', 'created_at', 'updated_at']
 
     def get_steps_count(self, obj):
         """从 script_content 中读取实际步骤数量（兼容 JSON 和 YAML 两种格式）"""
@@ -211,9 +212,9 @@ class APITestCaseDetailSerializer(serializers.ModelSerializer):
             'id', 'title', 'description', 'test_case_type', 'test_case_type_display',
             'test_type', 'timeout', 'retry_count',
             'priority', 'endpoint_info', 'scenario_info', 'last_result_info',
-            'script_content', 'created_by_username', 'created_at', 'updated_at'
+            'script_content', 'creation_source', 'created_by_username', 'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'creation_source', 'created_at', 'updated_at']
     
     def get_endpoint_info(self, obj):
         """获取端点信息（仅端点测试用例）"""
@@ -274,8 +275,9 @@ class APITestCaseCreateSerializer(serializers.ModelSerializer):
         model = APITestCase
         fields = [
             'title', 'description', 'test_case_type', 'endpoint', 'test_type',
-            'timeout', 'retry_count', 'priority', 'script_content',
+            'timeout', 'retry_count', 'priority', 'script_content', 'creation_source',
         ]
+        read_only_fields = ['creation_source']
     
     def validate(self, data):
         """验证数据"""

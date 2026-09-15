@@ -549,7 +549,9 @@ class APITestCaseListCreateView(generics.ListCreateAPIView):
                     )
                 
                 # 保存测试用例
-                test_case = serializer.save(created_by=request.user, project=project)
+                test_case = serializer.save(
+                    created_by=request.user, project=project, creation_source='manual',
+                )
                 
                 logger.info(f"API测试用例创建成功: ID={test_case.id}, 标题={test_case.title}, 用户={request.user.id}")
                 

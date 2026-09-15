@@ -23,6 +23,9 @@ def seed(fixture):
     owner = fixture['root']
     first, second, _ = fixture['projects']
     APITestCase.objects.create(project=second, created_by=owner, title='手工场景', test_case_type='scenario')
+    for source in ('ai', 'manual', 'unknown'):
+        APITestCase.objects.create(project=first, created_by=owner, title=f'{source} 来源用例',
+                                   test_case_type='scenario', creation_source=source)
     for project, name, status, workspace in (
         (first, '注册调试', 'failed', 101), (first, '注册调试', 'failed', 101),
         (first, '退出调试', 'passed', 102), (second, '第二项目成功', 'passed', 103),
@@ -74,6 +77,11 @@ def verify(origin, fixture, output):
             sign_in('root', first)
             expect(page.locator('.metric-pass-rate strong')).to_have_text('33.33%')
             expect(page.locator('.metric-executions strong')).to_have_text('3')
+            expect(page.locator('.metric-ai-rate strong')).to_have_text('33.33%')
+            expect(page.locator('.metric-ai-rate .metric-label')).to_have_text('AI 生成用例占比')
+            page.locator('.metric-ai-rate .metric-label').hover()
+            expect(page.get_by_role('tooltip')).to_contain_text('后续编辑、AI 修复或删除工作区不改变来源')
+            page.locator('.cockpit-toolbar h1').hover()
             expect(page.locator('.top-failures')).to_contain_text('注册调试')
             expect(page.locator('.top-failures')).not_to_contain_text('None')
             assert page.locator('.vue-grid-layout, .vue-resizable-handle, .drag-handle').count() == 0

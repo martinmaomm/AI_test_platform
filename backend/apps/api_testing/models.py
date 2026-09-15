@@ -296,6 +296,12 @@ class APIEndpoint(models.Model):
 
 class APITestCase(models.Model):
     """API测试用例模型 - 支持端点和场景两种类型"""
+
+    CREATION_SOURCE_CHOICES = [
+        ('manual', _('Manual')),
+        ('ai', _('AI generated')),
+        ('unknown', _('Unknown')),
+    ]
     
     # 测试用例类型
     TEST_CASE_TYPE_CHOICES = [
@@ -326,6 +332,10 @@ class APITestCase(models.Model):
     # 测试用例信息
     title = models.CharField(_('test case title'), max_length=200)
     description = models.TextField(_('description'), blank=True)
+    creation_source = models.CharField(
+        _('creation source'), max_length=16, choices=CREATION_SOURCE_CHOICES,
+        default='manual', editable=False,
+    )
     
     # 测试类型（仅端点测试用例需要）
     TEST_TYPE_CHOICES = [

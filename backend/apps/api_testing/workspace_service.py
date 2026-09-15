@@ -1065,6 +1065,17 @@ def classify_case_draft(draft: dict[str, Any], *, project_id: int) -> tuple[str,
     return 'scenario', None
 
 
+def workspace_has_ai_creation_evidence(workspace: APIWorkspace) -> bool:
+    """Return whether this unsaved workspace has adopted a server-recorded AI candidate."""
+    generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+    adopted_revision = generation.get('adopted_revision')
+    return (
+        isinstance(adopted_revision, int)
+        and not isinstance(adopted_revision, bool)
+        and 0 < adopted_revision <= workspace.revision
+    )
+
+
 def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str | None,
                           description: Any = _UNSET, test_type: Any = _UNSET) -> APIWorkspace:
     with transaction.atomic():
@@ -1129,6 +1140,9 @@ def create_or_update_case(workspace: APIWorkspace, *, revision: int, title: str 
                 title=case_title[:200], description=case_description,
                 test_case_type=test_case_type, endpoint=endpoint, test_type=case_test_type,
                 script_content=__import__('json').dumps(draft, ensure_ascii=False),
+                creation_source=(
+                    'ai' if workspace_has_ai_creation_evidence(workspace) else 'manual'
+                ),
             )
             workspace.saved_case = case
         else:

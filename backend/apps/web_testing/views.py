@@ -897,6 +897,7 @@ class WebUIScriptGenerationSaveView(APIView):
                         variables=[],
                         user=generation.user,
                         project=project,
+                        creation_source='ai',
                     )
                     generation.test_case = test_case
                     generation.save(update_fields=['test_case', 'updated_at'])

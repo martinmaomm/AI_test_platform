@@ -136,20 +136,54 @@ class DashboardTests(TestCase):
         self.assertEqual(trend[-1]['passed'], 1)
         self.assertEqual([r['test_case_name'] for r in get_dashboard_top_failures(self.api)], ['第七天'])
 
-    def test_ai_ratio_uses_provenance_not_case_type(self):
+    def test_ai_ratio_uses_fixed_creation_source_not_case_type_or_current_script_source(self):
         manual = APITestCase.objects.create(project=self.api, title='手写场景', test_case_type='scenario', created_by=self.user)
         spec = APISpecification.objects.create(project=self.api, spec_name='测试规范', created_by=self.user)
         endpoint = APIEndpoint.objects.create(spec=spec, path='/health', method='GET')
         generated = APITestCase.objects.create(project=self.api, title='AI 端点', test_case_type='endpoint',
-                                               endpoint=endpoint, created_by=self.user)
+                                               endpoint=endpoint, created_by=self.user, creation_source='ai')
         APIWorkspace.objects.create(project=self.api, owner=self.user, saved_case=manual, model_id=1,
                                     generation={'status': 'passed', 'adopted_revision': None})
         for generation in ({'adopted_revision': 2}, {'adopted_revision': 3}, {}, {'adopted_revision': None}):
             APIWorkspace.objects.create(project=self.api, owner=self.user, saved_case=generated, generation=generation)
         self.assertEqual(get_dashboard_summary(self.api)['ai_contribution_rate'], 50)
-        for source in ('manual', 'mcp_exploration', 'mcp_exploration', 'mcp_exploration'):
-            WebUITestCase.objects.create(project=self.web, title=source, script_source=source, user=self.user)
+        # Current script source can change without affecting the initial source.
+        for initial, current in (('manual', 'mcp_exploration'), ('ai', 'manual'),
+                                 ('ai', 'manual'), ('ai', 'mcp_exploration')):
+            WebUITestCase.objects.create(project=self.web, title=initial, script_source=current,
+                                         creation_source=initial, user=self.user)
         self.assertEqual(get_dashboard_summary(self.web)['ai_contribution_rate'], 75)
+
+    def test_api_ratio_survives_workspace_regeneration_and_deletion(self):
+        case = APITestCase.objects.create(project=self.api, title='AI 场景', test_case_type='scenario',
+                                          created_by=self.user, creation_source='ai')
+        workspace = APIWorkspace.objects.create(project=self.api, owner=self.user, saved_case=case,
+                                                generation={'adopted_revision': 1})
+        self.assertEqual(get_dashboard_summary(self.api)['ai_contribution_rate'], 100)
+        workspace.generation = {}
+        workspace.save(update_fields=['generation'])
+        self.assertEqual(get_dashboard_summary(self.api)['ai_contribution_rate'], 100)
+        workspace.delete()
+        self.assertEqual(get_dashboard_summary(self.api)['ai_contribution_rate'], 100)
+
+    def test_unknown_source_is_in_denominator_but_not_assumed_ai(self):
+        for project, model, owner_kwargs in (
+            (self.api, APITestCase, {'created_by': self.user, 'test_case_type': 'scenario'}),
+            (self.web, WebUITestCase, {'user': self.user}),
+        ):
+            with self.subTest(project=project.project_type):
+                for source in ('ai', 'manual', 'unknown'):
+                    model.objects.create(project=project, title=source, creation_source=source, **owner_kwargs)
+                summary = get_dashboard_summary(project)
+                self.assertEqual(summary['total_cases'], 3)
+                self.assertEqual(summary['ai_contribution_rate'], 33.33)
+
+    def test_unadopted_or_manual_workspace_does_not_reclassify_saved_case(self):
+        case = APITestCase.objects.create(project=self.api, title='手工场景', test_case_type='scenario',
+                                          created_by=self.user, creation_source='manual')
+        APIWorkspace.objects.create(project=self.api, owner=self.user, saved_case=case,
+                                    generation={'adopted_revision': 1})
+        self.assertEqual(get_dashboard_summary(self.api)['ai_contribution_rate'], 0)
 
     def test_endpoints_keep_permissions_and_return_503_on_statistics_error(self):
         client = APIClient()

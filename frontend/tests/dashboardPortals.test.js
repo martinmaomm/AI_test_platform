@@ -48,6 +48,14 @@ test("dashboard removes the infrastructure heading and its grid row while retain
   assert.match(source, /\{ i: "portal-settings" \}/);
 });
 
+test("AI case ratio describes immutable first-save origin instead of current script or workspace state", () => {
+  assert.match(source, /AI 生成用例占比/);
+  assert.match(source, /首次保存为 AI 生成的用例数 ÷ 已保存用例总数/);
+  assert.match(source, /后续编辑、AI 修复或删除工作区不改变来源/);
+  assert.match(source, /历史来源未知的用例计入总数但不计为 AI/);
+  assert.doesNotMatch(source, /按仍保留的 AI 候选采纳记录统计/);
+});
+
 test("dashboard does not let project preference initialization block project loading forever", () => {
   assert.match(
     source,

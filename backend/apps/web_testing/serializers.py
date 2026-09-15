@@ -437,6 +437,7 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'description', 'created_by_username',
             'module_id', 'module_name', 'has_script', 'variables',
+            'creation_source',
             'script_source', 'script_status', 'script_framework', 'script_version',
             'script_validation_error', 'generation_metadata', 'assertion_state',
             'created_at', 'updated_at',
@@ -445,6 +446,7 @@ class WebUITestCaseSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'id', 'created_by_username', 'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
+            'creation_source',
             'script_source', 'script_status', 'script_framework', 'script_version',
             'script_validation_error', 'generation_metadata',
         ]
@@ -483,6 +485,7 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'description', 'created_by_username',
             'module_id', 'module_name', 'has_script', 'variables',
+            'creation_source',
             'test_script_content', 'script_source', 'script_status', 'script_framework',
             'script_version', 'script_validation_error', 'generation_metadata', 'assertion_state',
             'edit_version',
@@ -492,6 +495,7 @@ class WebUITestCaseDetailSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'id', 'created_by_username', 'created_at', 'updated_at',
             'last_execute_status', 'last_execute_time', 'last_error_message',
+            'creation_source',
             'script_source', 'script_status', 'script_framework', 'script_version',
             'script_validation_error', 'generation_metadata',
         ]
@@ -533,6 +537,7 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
         model = WebUITestCase
         fields = [
             'title', 'description', 'project', 'module', 'variables',
+            'creation_source',
             'test_script_content', 'script_source', 'script_status', 'script_framework',
             'script_version', 'script_validation_error', 'generation_metadata'
         ]
@@ -545,19 +550,20 @@ class WebUITestCaseCreateSerializer(serializers.ModelSerializer):
             'test_script_content': {'required': True, 'allow_blank': False},
         }
         read_only_fields = [
+            'creation_source', 'script_source',
             'script_status', 'script_framework', 'script_version',
             'script_validation_error', 'generation_metadata',
         ]
     
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
+        validated_data['creation_source'] = 'manual'
         script_content = validated_data.pop('test_script_content', None)
-        script_source = validated_data.pop('script_source', 'manual')
         if validated_data.get('module') is None:
             validated_data['module'] = WebUITestModule.ensure_default(validated_data['project'].id)
         test_case = super().create(validated_data)
         try:
-            return store_script_content(test_case, script_content, source=script_source)
+            return store_script_content(test_case, script_content, source='manual')
         except ScriptContractError as exc:
             test_case.delete()
             raise serializers.ValidationError({'test_script_content': str(exc)})

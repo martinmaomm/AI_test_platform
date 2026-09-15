@@ -68,6 +68,11 @@ class WebUITestModule(models.Model):
 class WebUITestCase(models.Model):
     """One independently executable Python Playwright script."""
 
+    CREATION_SOURCE_CHOICES = [
+        ('manual', '手工创建'),
+        ('ai', 'AI 生成'),
+        ('unknown', '未知'),
+    ]
     SCRIPT_SOURCE_CHOICES = [
         ('manual', '手工编写'),
         ('mcp_exploration', 'MCP 探索'),
@@ -85,6 +90,10 @@ class WebUITestCase(models.Model):
     title = models.CharField(max_length=200, verbose_name="测试用例标题")
     description = models.TextField(verbose_name="测试用例描述")
     variables = models.JSONField(default=list, blank=True, verbose_name='用例变量')
+    creation_source = models.CharField(
+        max_length=16, choices=CREATION_SOURCE_CHOICES, default='manual',
+        editable=False, verbose_name='初始创建来源',
+    )
     
     # 测试脚本内容
     test_script_content = models.TextField(blank=True, null=True, verbose_name="测试脚本内容")

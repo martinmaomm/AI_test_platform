@@ -74,15 +74,9 @@ def get_dashboard_summary(project):
         failed += result['failed']
     cases = models[1].objects.filter(project_id=project.pk)
     total = cases.count()
-    if project.project_type == 'web':
-        ai_count = cases.filter(script_source='mcp_exploration').count()
-    else:
-        from api_testing.models import APIWorkspace
-        # API 用例没有来源字段，以仍保留的 AI 候选采纳记录为依据，不能将场景类型视为 AI 来源。
-        adopted = APIWorkspace.objects.filter(
-            project_id=project.pk, generation__adopted_revision__isnull=False,
-        ).exclude(generation__adopted_revision=None).values('saved_case_id')
-        ai_count = cases.filter(pk__in=adopted).count()
+    # 来源在首次保存用例时固化，不随脚本编辑、AI 修复或工作区删除而变化。
+    # 历史来源未知的用例属于总数，但不臆测为 AI 生成。
+    ai_count = cases.filter(creation_source='ai').count()
     return dict(today_pass_rate=_rate(passed, failed), today_executions=executions.count(),
                 ai_contribution_rate=round(100 * ai_count / total, 2) if total else 0.0,
                 total_cases=total)

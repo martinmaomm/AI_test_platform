@@ -405,7 +405,7 @@ const metricLabel = (i) =>
   ({
     "metric-pass-rate": "今日通过率",
     "metric-executions": "今日执行数",
-    "metric-ai-rate": "AI 用例占比",
+    "metric-ai-rate": "AI 生成用例占比",
     "metric-total-cases": "总用例数",
   })[i];
 const metricHint = (i) =>
@@ -414,7 +414,7 @@ const metricHint = (i) =>
       "今日已结束用例执行中，通过占通过与失败；进行中、跳过和未完成不计入。",
     "metric-executions": "今日已结束的顶层执行记录；套件按一次计。",
     "metric-ai-rate":
-      "UI 按脚本来源统计；API 按仍保留的 AI 候选采纳记录统计。来源无记录不推断为 AI。",
+      "当前项目首次保存为 AI 生成的用例数 ÷ 已保存用例总数。后续编辑、AI 修复或删除工作区不改变来源；仅经 AI 修复的手工用例仍算手工。未保存草稿不计入，历史来源未知的用例计入总数但不计为 AI。",
     "metric-total-cases": "当前项目的用例总数。",
   })[i];
 const metricValue = (i) => {

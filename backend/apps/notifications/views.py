@@ -115,8 +115,8 @@ class NotificationReceiverViewSet(viewsets.ModelViewSet):
         try:
             recipients = parse_recipients(receiver.target_address or "")
             send_email(
-                subject="【自动化测试平台】邮件接收组测试",
-                body="这是一封自动化测试平台测试邮件。SMTP 服务器已接受后，仍请在收件箱确认实际送达。",
+                subject="【AI测试平台】邮件接收组测试",
+                body="这是一封AI测试平台测试邮件。SMTP 服务器已接受后，仍请在收件箱确认实际送达。",
                 recipients=recipients,
             )
             return Response(

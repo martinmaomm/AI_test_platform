@@ -1,6 +1,6 @@
 # 安装、配置与运行指南
 
-本文是自动化测试平台（Automation Platform）的安装与运行手册；项目能力与 UI / API 业务流程见 [README](../README.md)。命令以 macOS/zsh 为主，也可作为 Linux 部署的参考。示例仅使用本机地址和占位符，不包含实际部署凭据。
+本文是AI测试平台（AI Testing Platform）的安装与运行手册；项目能力与 UI / API 业务流程见 [README](../README.md)。命令以 macOS/zsh 为主，也可作为 Linux 部署的参考。示例仅使用本机地址和占位符，不包含实际部署凭据。
 
 > 核对日期：2026-09-08。现有开发环境为 macOS 26.6.2、Python 3.13.11、Node.js 26.7.0、npm 11.19.0；Python 包元数据记录 Django 4.2.25、PyMySQL 1.2.0。这是当前环境记录，不是跨平台兼容性承诺或最低版本声明。本次仅整理文档并核对代码，没有重做全新环境安装或真实服务联调。
 

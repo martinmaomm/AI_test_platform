@@ -1,6 +1,6 @@
 <template>
   <div class="platform-brand" :class="[`platform-brand--${size}`]">
-    <h1 class="brand-title">自动化测试平台</h1>
+    <h1 class="brand-title">AI测试平台</h1>
     <div class="brand-accent">
       <span class="brand-accent-glow" />
     </div>
@@ -21,8 +21,8 @@ const props = defineProps({
   }
 })
 
-const enSubtitle = 'Automation Platform'
-const zhSubtitle = '自动化测试平台'
+const enSubtitle = 'AI Testing Platform'
+const zhSubtitle = 'AI测试平台'
 </script>
 
 <style scoped>

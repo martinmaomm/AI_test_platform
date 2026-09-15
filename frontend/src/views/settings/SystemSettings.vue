@@ -3,7 +3,7 @@
     <div class="config-header">
       <BackButton to="/dashboard" text="返回首页" />
       <h1 class="config-title">全局系统配置</h1>
-      <p class="config-desc">邮件通知服务、用户管理与通用系统参数</p>
+      <p class="config-desc">邮件通知服务与用户管理</p>
     </div>
 
     <div class="card-grid">
@@ -30,7 +30,7 @@
 </template>
 
 <script setup>
-import { Message, Operation, User } from '@element-plus/icons-vue'
+import { Message, User } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
 import { computed } from 'vue'
 import { useAuthStore } from '@/stores/auth'
@@ -44,13 +44,6 @@ const cards = computed(() => [
     title: '邮件服务配置',
     desc: '配置 SMTP 服务器、端口、发件人，供执行报告邮件推送',
     icon: Message
-  },
-  {
-    id: 'general',
-    path: '/settings/general-params',
-    title: '通用系统参数',
-    desc: '环境标识、系统备份、基础参数配置',
-    icon: Operation
   },
   {
     id: 'users',
@@ -135,10 +128,6 @@ const cards = computed(() => [
   background: linear-gradient(180deg, #409eff, #66b1ff);
 }
 
-.config-card.card-general .card-glow-bar {
-  background: linear-gradient(180deg, #64748b, #94a3b8);
-}
-
 .config-card.card-users .card-glow-bar { background: linear-gradient(180deg, #8b5cf6, #a78bfa); }
 
 .card-inner {
@@ -163,11 +152,6 @@ const cards = computed(() => [
 .card-icon.email {
   background: rgba(64, 158, 255, 0.15);
   color: #409eff;
-}
-
-.card-icon.general {
-  background: rgba(100, 116, 139, 0.15);
-  color: #64748b;
 }
 
 .card-icon.users { background: rgba(139, 92, 246, 0.15); color: #8b5cf6; }

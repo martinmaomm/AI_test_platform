@@ -161,6 +161,8 @@ class NotificationApiContractTests(TestCase):
         self.assertIn("SMTP 服务器已接受", accepted.data["message"])
         self.assertIn("收件箱", accepted.data["message"])
         send_email.assert_called_once()
+        self.assertEqual(send_email.call_args.kwargs["subject"], "【AI测试平台】邮件接收组测试")
+        self.assertIn("AI测试平台测试邮件", send_email.call_args.kwargs["body"])
 
     def test_no_active_smtp_config_returns_safe_receiver_test_failure(self):
         receiver = NotificationReceiver.objects.create(

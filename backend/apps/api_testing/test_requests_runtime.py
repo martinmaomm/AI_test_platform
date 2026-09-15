@@ -392,6 +392,8 @@ def test_exported_runtime_embeds_filter_selector_without_new_dependencies():
     ]}
     source = export_python(case)
     assert "class _SelectorParser:" in source
+    assert "AI测试平台编辑器" in source
+    assert "自动化测试平台" not in source
     namespace = {"__name__": "exported_filter_runtime"}
     exec(compile(source, "exported_filter_runtime.py", "exec"), namespace)
     session = FakeSession([FakeResponse(body={"data": [{"id": 7, "name": "current"}]}), FakeResponse()])

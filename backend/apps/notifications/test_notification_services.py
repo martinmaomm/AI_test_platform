@@ -60,8 +60,8 @@ class NotificationServiceTests(TestCase):
         self.assertTrue(trigger_notification(self.task.id, self.execution_log))
 
         subject, body, recipients = send_email.call_args.args
-        self.assertIn("自动化测试平台", subject)
-        self.assertIn("## 自动化测试平台定时任务执行结果", body)
+        self.assertIn("AI测试平台", subject)
+        self.assertIn("## AI测试平台定时任务执行结果", body)
         self.assertEqual(recipients, ["one@example.test"])
         self.assertIn("reports/detail", send_email.call_args.kwargs["html_body"])
 
@@ -136,7 +136,7 @@ class NotificationServiceTests(TestCase):
         self.assertTrue(trigger_notification(self.task.id, self.execution_log))
 
         subject, body, recipients = send_email.call_args.args
-        self.assertIn("自动化测试平台", subject)
+        self.assertIn("AI测试平台", subject)
         self.assertIn("验证未完成", body)
         self.assertEqual(recipients, ["one@example.test"])
         self.assertIn("https://ui.example.test/reports/detail/", send_email.call_args.kwargs["html_body"])

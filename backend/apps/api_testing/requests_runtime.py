@@ -1961,7 +1961,7 @@ def export_python(value: Any) -> str:
     preamble = runtime_source[:marker_index + len(future_marker)]
     runtime_body = runtime_source[marker_index + len(future_marker):].lstrip(chr(10))
     scenario = json.dumps(str(case["config"].get("name") or "未命名场景"), ensure_ascii=False)
-    summary_lines = [f"# 场景：{scenario}", "# 步骤摘要（只读；请在自动化测试平台编辑器修改后重新导出）："]
+    summary_lines = [f"# 场景：{scenario}", "# 步骤摘要（只读；请在AI测试平台编辑器修改后重新导出）："]
     for index, step in enumerate(case["teststeps"], start=1):
         request = step["request"]
         name = json.dumps(str(step["name"]), ensure_ascii=False)
@@ -1972,7 +1972,7 @@ def export_python(value: Any) -> str:
     return f'''{preamble}
 
 {chr(10).join(summary_lines)}
-# 下方 CASE 是排版后的只读导出；不支持从 Python 反向同步到自动化测试平台。
+# 下方 CASE 是排版后的只读导出；不支持从 Python 反向同步到AI测试平台。
 CASE = {case_literal}
 
 

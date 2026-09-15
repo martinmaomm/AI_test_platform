@@ -100,6 +100,7 @@
         :handoff-loading="browserDiscoveryHandoffLoading"
         @refresh="refreshBrowserDiscoveries"
         @create="submitBrowserDiscovery"
+        @retry="retryBrowserDiscovery"
         @select="selectBrowserDiscovery"
         @cancel="cancelSelectedBrowserDiscovery"
         @delete="deleteBrowserDiscoveryTask"
@@ -148,6 +149,13 @@
           @generate="prepareRootGeneration"
           @edit-root-context="focusRootContext"
           @select="selectScenario"
+        />
+        <ModelFailureNotice
+          :workspace="workspace"
+          :disabled="interactionLocked || conflict"
+          :disabled-reason="providerRetryDisabledReason"
+          :pending="providerRetryPending"
+          @retry="retryProviderGeneration"
         />
         <div class="workspace-grid">
           <aside ref="contextPanel" class="context-panel">
@@ -691,6 +699,7 @@ import {
   listApiWorkspaces,
   saveApiWorkspace,
   sendApiWorkspaceMessage,
+  retryApiWorkspaceGeneration,
   updateApiWorkspace,
 } from "@/api/apiWorkspace";
 import {
@@ -711,6 +720,8 @@ import VisualStepEditor from "@/components/api-workspace/VisualStepEditor.vue";
 import DebugResultPanel from "@/components/api-workspace/DebugResultPanel.vue";
 import GenerationVerificationPanel from "@/components/api-workspace/GenerationVerificationPanel.vue";
 import ScenarioOverview from "@/components/api-workspace/ScenarioOverview.vue";
+import ModelFailureNotice from "@/components/api-workspace/ModelFailureNotice.vue";
+import { canRetryBrowserModelFailure, browserModelRetryForm, workspaceModelRetryState } from "@/utils/modelFailure";
 import WorkspaceManagerDialog from "@/components/api-workspace/WorkspaceManagerDialog.vue";
 import PythonExportPanel from "@/components/api-workspace/PythonExportPanel.vue";
 import KeyValueRows from "@/components/api-workspace/KeyValueRows.vue";
@@ -847,6 +858,7 @@ const conflict = ref(false);
 const debugDialog = ref(false);
 const saveDialog = ref(false);
 const generationDialog = ref(false);
+const providerRetryPending = ref(false);
 const managerDialog = ref(false);
 const renameDialog = ref(false);
 const workspaceMutation = ref(false);
@@ -975,6 +987,7 @@ const interactionLocked = computed(
     cancellingWorkspace.value ||
     adoptingCandidate.value ||
     sendingMessage.value ||
+    providerRetryPending.value ||
     generationDialog.value ||
     browserDiscoveryDeleting.value ||
     browserDiscoveryOriginActionLoading.value ||
@@ -988,6 +1001,11 @@ const workspaceReady = computed(
     !loading.value &&
     !initializing.value &&
     !routeTransitioning.value,
+);
+const providerRetryDisabledReason = computed(() =>
+  draftDirty.value || contextDirty.value || scenarioModelDirty.value || conversationDirty.value || rootPromptDirty.value
+    ? "有未提交的修改。重试只使用原冻结参数；请先处理修改，或通过原生成/修复入口提交新要求。"
+    : "",
 );
 const pythonCurrent = computed(
   () =>
@@ -1462,6 +1480,31 @@ const submitBrowserDiscovery = async (form) => {
   } finally {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
       browserDiscoveryCreating.value = false;
+  }
+};
+const retryBrowserDiscovery = async (taskId) => {
+  const task = browserDiscoveryTask.value;
+  if (interactionLocked.value || browserDiscoveryCreating.value ||
+      !sameWorkspaceId(taskId, task?.id) || !canRetryBrowserModelFailure(task)) return;
+  const epoch = viewEpoch;
+  const requestProjectId = projectId.value;
+  providerRetryPending.value = true;
+  try {
+    await ElMessageBox.confirm(
+      "将使用原探索目标、描述、模型和预算，创建一个新的探索任务。旧任务及证据保留。这不是断点继续，确认后可能重复登录、新增、修改或删除测试数据；请确认原测试范围仍允许这些操作。",
+      "确认重试网页探索", { type: "warning", confirmButtonText: "确认重新探索", cancelButtonText: "取消" },
+    );
+    if (epoch !== viewEpoch || requestProjectId !== projectId.value ||
+        !sameWorkspaceId(taskId, browserDiscoveryTask.value?.id) ||
+        !canRetryBrowserModelFailure(browserDiscoveryTask.value)) return;
+    // submitBrowserDiscovery takes over the in-flight lock synchronously.
+    providerRetryPending.value = false;
+    await submitBrowserDiscovery(browserModelRetryForm(task));
+  } catch (error) {
+    if (!["cancel", "close"].includes(error) && epoch === viewEpoch)
+      ElMessage.error(errorMessage(error, "重试探索失败"));
+  } finally {
+    if (epoch === viewEpoch) providerRetryPending.value = false;
   }
 };
 const cancelSelectedBrowserDiscovery = async (taskId) => {
@@ -2468,6 +2511,34 @@ const ensureGenerationContext = () => {
     return false;
   }
   return true;
+};
+const retryProviderGeneration = async () => {
+  const target = workspace.value;
+  const retry = workspaceModelRetryState(target);
+  if (interactionLocked.value || conflict.value || providerRetryDisabledReason.value || !retry.available) return;
+  const request = { projectId: projectId.value, id: target.id, revision: target.revision, epoch: viewEpoch };
+  providerRetryPending.value = true;
+  try {
+    await ElMessageBox.confirm(retry.confirmation, "确认重试模型生成", {
+      type: "warning", confirmButtonText: "确认重试并验证", cancelButtonText: "取消",
+    });
+    if (request.epoch !== viewEpoch || request.projectId !== projectId.value ||
+        !sameWorkspaceId(request.id, workspace.value?.id) || request.revision !== workspace.value?.revision ||
+        providerRetryDisabledReason.value || !workspaceModelRetryState(workspace.value).available) return;
+    const response = await retryApiWorkspaceGeneration(request.projectId, request.id, request.revision);
+    if (request.epoch !== viewEpoch || request.projectId !== projectId.value ||
+        !sameWorkspaceId(request.id, workspace.value?.id) || request.revision !== workspace.value?.revision) return;
+    applyWorkspace(response);
+    startPolling();
+    ElMessage.success("失败阶段已重新排队；未重新探索网页，也未重跑其他已通过场景。");
+  } catch (error) {
+    if (!["cancel", "close"].includes(error) && request.epoch === viewEpoch) {
+      if (error?.response?.status === 409) conflict.value = true;
+      ElMessage.error(errorMessage(error, "重试模型生成失败"));
+    }
+  } finally {
+    if (request.epoch === viewEpoch) providerRetryPending.value = false;
+  }
 };
 const prepareRootGeneration = () => {
   if (

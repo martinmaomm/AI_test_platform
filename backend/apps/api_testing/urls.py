@@ -17,6 +17,7 @@ from .browser_discovery_views import (
     BrowserDiscoveryOriginsView,
     BrowserDiscoveryRecordsView,
 )
+from .workspace_views import APIWorkspaceRetryGenerationView
 
 app_name = 'api_testing'
 
@@ -82,3 +83,10 @@ urlpatterns = [
 
 # Kept in a dedicated module so the durable workspace does not alter legacy views.
 urlpatterns += workspace_urlpatterns
+urlpatterns += [
+    path(
+        'workspaces/<int:workspace_id>/retry-generation/',
+        APIWorkspaceRetryGenerationView.as_view(),
+        name='api-workspace-retry-generation',
+    ),
+]

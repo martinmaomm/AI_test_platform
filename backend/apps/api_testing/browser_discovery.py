@@ -870,8 +870,15 @@ def _refresh_dependency_candidates(task: BrowserDiscoveryTask) -> None:
 
 
 def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
+    from ai_core.provider_errors import public_model_failure
+
     counts = task.records.aggregate(records_count=Count('id'), eligible_records_count=Count('id', filter=Q(is_eligible=True)))
     deletion = browser_discovery_delete_state(task)
+    evidence_summary = deepcopy(task.evidence_summary) if isinstance(task.evidence_summary, dict) else {}
+    model_failure = public_model_failure(
+        evidence_summary.get('diagnostic'),
+        stage='initial_model' if task.tool_calls == 0 else 'exploring',
+    )
     return {
         'id': str(task.id), 'task_id': task.task_id, 'project_id': task.project_id, 'model_id': task.model_id,
         'target_url': task.target_url, 'description': task.description, 'api_origin': task.api_origin or None,
@@ -880,7 +887,8 @@ def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
         'cancellation_requested': task.cancellation_requested, 'current_action': task.current_action,
         'tool_calls': task.tool_calls, 'model_calls': task.model_calls, 'request_count': task.request_count,
         'summary': task.summary, 'error_code': task.error_code, 'error_message': task.error_message,
-        'evidence_summary': deepcopy(task.evidence_summary) if isinstance(task.evidence_summary, dict) else {},
+        'evidence_summary': evidence_summary,
+        'model_failure': model_failure,
         'origin_resolution': origin_resolution(task),
         'source_version': task.source_version, 'records_count': counts['records_count'],
         'eligible_records_count': counts['eligible_records_count'],

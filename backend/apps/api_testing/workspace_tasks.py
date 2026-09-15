@@ -90,6 +90,28 @@ def _llm_stream_timeout_kwargs(manager: Any, call_timeout: float) -> dict[str, f
     return {}
 
 
+def _pipeline_control_exception(error: BaseException) -> BaseException | None:
+    """Find local cancellation/deadline signals hidden by provider wrappers."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (PipelineDeadlineExceeded, PipelineStale)):
+            return current
+        cause = current.__cause__ if isinstance(current.__cause__, BaseException) else current.__context__
+        current = cause if isinstance(cause, BaseException) else None
+    return None
+
+
+def _classify_stream_failure(error: BaseException, *, stage: str) -> dict[str, Any] | None:
+    """Classify only exceptions raised by the real model stream boundary."""
+    from ai_core.provider_errors import classify_provider_error
+    classified = classify_provider_error(error, model_context=True)
+    if not isinstance(classified, dict):
+        return None
+    return {**classified, 'stage': stage}
+
+
 def _pipeline_update(workspace_id: int, revision: int, task_id: str, **changes) -> bool:
     with transaction.atomic():
         workspace = APIWorkspace.objects.select_for_update().filter(pk=workspace_id).first()
@@ -174,7 +196,8 @@ def _claim_pipeline(workspace_id: int, revision: int, task_id: str) -> dict[str,
         return snapshot
 
 
-def _finish_pipeline(workspace_id: int, revision: int, task_id: str, status: str, summary: str) -> None:
+def _finish_pipeline(workspace_id: int, revision: int, task_id: str, status: str, summary: str,
+                     *, model_failure: dict[str, Any] | None = None) -> None:
     with transaction.atomic():
         workspace = APIWorkspace.objects.select_for_update().filter(pk=workspace_id).first()
         if (not workspace or workspace.revision != revision or workspace.task_id != task_id
@@ -188,6 +211,8 @@ def _finish_pipeline(workspace_id: int, revision: int, task_id: str, status: str
         ).exists():
             return
         generation.update({'status': status, 'phase': 'finished', 'summary': summary, 'finished_at': timezone.now().isoformat()})
+        if model_failure is not None:
+            generation['model_failure'] = deepcopy(model_failure)
         workspace.generation = generation
         workspace.status = APIWorkspace.Status.FAILED if status == 'failed' else APIWorkspace.Status.READY
         workspace.error = summary if status == 'failed' else ''
@@ -567,11 +592,27 @@ def _generate_scenarios(root_id: int, revision: int, task_id: str, snapshot: dic
                     if not _pipeline_update(root_id, revision, task_id, phase='planning', planning_attempt=planning_attempt):
                         raise PipelineStale('根工作区在规划期间已变更。')
 
-            output = manager.stream_invoke(_planner_messages(
-                conversation=snapshot.get('messages') or [], endpoints=snapshot['endpoints'],
-                failure_evidence=failure_evidence,
-                target_endpoint_id=snapshot.get('target_endpoint_id'),
-            ), callback=on_chunk, **_llm_stream_timeout_kwargs(manager, call_timeout))
+            try:
+                output = manager.stream_invoke(_planner_messages(
+                    conversation=snapshot.get('messages') or [], endpoints=snapshot['endpoints'],
+                    failure_evidence=failure_evidence,
+                    target_endpoint_id=snapshot.get('target_endpoint_id'),
+                ), callback=on_chunk, **_llm_stream_timeout_kwargs(manager, call_timeout))
+            except Exception as exc:
+                control = _pipeline_control_exception(exc)
+                if isinstance(control, PipelineStale):
+                    return {'status': 'stale'}
+                if isinstance(control, PipelineDeadlineExceeded):
+                    _finish_pipeline(root_id, revision, task_id, 'failed', str(control))
+                    return {'status': 'failed', 'workspace_id': root_id}
+                model_failure = _classify_stream_failure(exc, stage='planning')
+                if model_failure:
+                    _finish_pipeline(
+                        root_id, revision, task_id, 'failed', model_failure['message'],
+                        model_failure=model_failure,
+                    )
+                    return {'status': 'failed', 'workspace_id': root_id}
+                raise
             if time.monotonic() >= call_deadline:
                 raise PipelineDeadlineExceeded('单次模型调用返回时已超过冻结时限，未发送目标请求。')
             _require_pipeline_time(snapshot)
@@ -740,11 +781,20 @@ def generate_and_verify_api_workspace(self, workspace_id: int, revision: int, ta
                     shared_constraints=snapshot.get('shared_constraints') or [],
                 ), callback=on_chunk, **_llm_stream_timeout_kwargs(manager, call_timeout))
             except Exception as exc:
-                cause = exc if isinstance(exc, (PipelineDeadlineExceeded, PipelineStale)) else exc.__cause__
-                if isinstance(cause, PipelineStale):
+                control = _pipeline_control_exception(exc)
+                if isinstance(control, PipelineStale):
                     return {'status': 'stale'}
-                if isinstance(cause, PipelineDeadlineExceeded):
-                    _finish_pipeline(workspace_id, revision, task_id, 'failed', str(cause))
+                if isinstance(control, PipelineDeadlineExceeded):
+                    _finish_pipeline(workspace_id, revision, task_id, 'failed', str(control))
+                    return {'status': 'failed', 'workspace_id': workspace_id}
+                model_failure = _classify_stream_failure(
+                    exc, stage='repairing' if mode == 'repair' else 'generating',
+                )
+                if model_failure:
+                    _finish_pipeline(
+                        workspace_id, revision, task_id, 'failed', model_failure['message'],
+                        model_failure=model_failure,
+                    )
                     return {'status': 'failed', 'workspace_id': workspace_id}
                 raise
             if time.monotonic() >= call_deadline:

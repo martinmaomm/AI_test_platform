@@ -290,6 +290,7 @@ export const browserDiscoveryErrorCategory = (task) => {
   if (resolution.state === "awaiting_selection") return "多来源待选";
   const code = String(task?.error_code || "").trim();
   if (!code) return "无";
+  if (code.startsWith("MODEL_")) return browserDiscoveryErrorCodeLabel(code);
   if (["no_records", "no_usable_records"].includes(code)) return "未采集到有效接口证据";
   if (code === "capture_incomplete") return "证据采集不完整";
   if (["TOTAL_TIMEOUT", "timeout"].includes(code)) return "探索超时";
@@ -337,6 +338,14 @@ export const browserDiscoveryStatusMeta = (status) =>
 export const browserDiscoveryErrorCodeLabel = (code) => {
   const value = String(code || "").trim();
   const labels = {
+    MODEL_OVERLOADED: "模型服务过载，请稍后重试或切换模型。",
+    MODEL_RATE_LIMITED: "模型服务限流，请稍后重试。",
+    MODEL_TIMEOUT: "模型请求超时，请稍后重试。",
+    MODEL_UNAVAILABLE: "模型服务暂时不可用，请稍后重试。",
+    MODEL_AUTH_ERROR: "模型认证或访问权限异常，请检查模型配置。",
+    MODEL_CONFIG_ERROR: "模型名称或接口配置异常，请检查模型配置。",
+    MODEL_QUOTA_EXHAUSTED: "模型服务额度不足，请检查账户额度后再试。",
+    MCP_OTHER: "探索发生未分类异常，请向管理员提供任务 ID 核查后台日志。",
     CANCELLED: "用户已取消探索；已完成的网站操作不会撤销。",
     TOTAL_TIMEOUT: "网页探索达到本轮总时限，已停止后续操作。",
     STALE_TASK: "任务已取消或过期，已停止后续操作。",

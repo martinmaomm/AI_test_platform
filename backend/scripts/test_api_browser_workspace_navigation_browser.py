@@ -239,7 +239,7 @@ def verify(origin, fixture, output, dispatch):
 def main():
     output = BACKEND/'logs/api-browser-workspace-navigation'
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='api-browser-navigation-') as tmp, patch.object(socket.socket,'connect',loopback_only):
+    with tempfile.TemporaryDirectory(prefix='api-browser-navigation-') as tmp, patch.object(socket.socket,'connect',loopback_only(socket.socket.connect)):
         fixture = bootstrap(Path(tmp))
         from django.conf import settings
         settings.API_BROWSER_DISCOVERY_ENABLED = True

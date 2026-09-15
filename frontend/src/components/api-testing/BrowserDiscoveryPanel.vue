@@ -90,6 +90,13 @@
           <el-descriptions-item label="任务诊断">{{ task.error_message || task.error || terminalReason(task) || "无" }}</el-descriptions-item>
         </el-descriptions>
         <p v-if="task.error_code" class="diagnostic-code">{{ task.error_code }}：{{ errorCodeLabel(task.error_code) }}</p>
+        <el-alert v-if="modelFailure(task)" :title="modelFailure(task).message" type="error" :closable="false" show-icon>
+          <p>失败阶段：{{ modelStage(modelFailure(task).stage) }}。浏览器操作 {{ task.tool_calls || 0 }} 次，采集请求 {{ task.request_count || 0 }} 条。</p>
+          <div v-if="canRetryBrowserModelFailure(task)" class="task-actions">
+            <el-button type="primary" data-testid="api-retry-browser-model" :disabled="disabled || creating" :loading="creating" @click="$emit('retry', task.id)">重试探索</el-button>
+            <ActionHelpTooltip label="重试探索" content="用原目标、描述、模型和预算新建一次探索，不是从浏览器断点继续。已有任务和证据保留；确认后可能再次进行登录、增删改等网页操作，请核对已发生的数据变化。" />
+          </div>
+        </el-alert>
         <p v-if="task.description" class="description">{{ task.description }}</p>
         <el-alert v-if="originResolution.state === 'awaiting_confirmation'" title="发现跨主机接口的当前直接请求，需确认后才会发送该请求；未确认不会保存正文或认证信息。" type="warning" :closable="false" show-icon />
         <ActionHelpTooltip v-if="originResolution.state === 'awaiting_confirmation'" label="允许或拒绝接口来源" content="请核对接口地址是否属于本次测试范围。允许后可能向该地址发送请求和认证信息并采集样本；拒绝会阻止未授权来源的请求，不会撤回已经发生的页面操作。" />
@@ -186,11 +193,12 @@ import {
   formatBrowserDiscoveryDuration,
   isBrowserDiscoveryActive,
 } from "@/utils/apiBrowserDiscovery";
+import { modelFailure, modelFailureStageLabel as modelStage, canRetryBrowserModelFailure } from "@/utils/modelFailure";
 
 const props = defineProps({
   view: { type: String, default: "list", validator: (value) => ["list", "create", "detail"].includes(value) }, config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, deleting: Boolean, deletingTaskId: { type: [String, Number], default: null }, originActionLoading: Boolean, handoffLoading: Boolean,
 });
-const emit = defineEmits(["refresh", "create", "select", "cancel", "delete", "resolve-origin", "load-records", "load-more-records", "handoff", "open-workspace", "form-dirty-change"]);
+const emit = defineEmits(["refresh", "create", "select", "cancel", "delete", "retry", "resolve-origin", "load-records", "load-more-records", "handoff", "open-workspace", "form-dirty-change"]);
 const createFormCard = ref(null);
 const selectedRecordIds = ref([]);
 const enabled = computed(() => props.config?.enabled === true);

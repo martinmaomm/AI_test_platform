@@ -19,6 +19,7 @@ from .browser_discovery import (
     _response_scalar_values, expire_stale_discovery, handoff_to_workspace,
     ingest_trace, origin_control_file, origin_resolution, origin_state_file,
     read_origin_state, selectable_origins, sync_auto_origin, task_trace_file,
+    serialize_task,
 )
 from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryDetailView, BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView
 from .models import APIEndpoint, APISpecification, APIWorkspace, BrowserDiscoveryHandoff, BrowserDiscoveryRecord, BrowserDiscoveryTask, default_api_workspace_draft
@@ -315,6 +316,32 @@ class BrowserDiscoveryContractsTests(TestCase):
         self.assertIn('RuntimeError', task.error_message)
         self.assertNotIn('SECRET', task.error_message)
         self.assertNotIn('先前', task.error_message)
+
+    def test_model_failure_is_public_safe_metadata_at_initial_and_exploring_stages(self):
+        for tool_calls, stage in ((0, 'initial_model'), (2, 'exploring')):
+            with self.subTest(tool_calls=tool_calls):
+                task = self.task(status=BrowserDiscoveryTask.Status.RUNNING)
+                with patch('api_testing.browser_discovery.ingest_trace', return_value={}):
+                    _finish_browser_discovery(str(task.id), task.version, task.task_id, {
+                        'completed': False,
+                        'error_code': 'MODEL_OVERLOADED',
+                        'summary': '模型服务当前负载较高，请稍后重试。',
+                        'tool_calls': tool_calls,
+                        'diagnostic': {
+                            'code': 'MODEL_OVERLOADED', 'message': 'raw SECRET provider body',
+                            'retryable': True, 'status_code': 200,
+                        },
+                    })
+                task.refresh_from_db()
+                self.assertEqual(task.evidence_summary['diagnostic'], {
+                    'code': 'MODEL_OVERLOADED',
+                    'message': '模型服务当前负载较高，请稍后重试。',
+                    'retryable': True,
+                    'stage': stage,
+                })
+                data = serialize_task(task)
+                self.assertEqual(data['model_failure'], task.evidence_summary['diagnostic'])
+                self.assertNotIn('SECRET', str(data['model_failure']))
 
     def test_browser_capture_workspace_source_is_owner_scoped_at_create_patch_and_messages(self):
         task = self.task()

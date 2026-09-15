@@ -25,6 +25,7 @@ from .workspace_service import (
     can_edit_project, can_execute_project, create_or_update_case, debug_timeout_seconds,
     endpoint_specs, expire_stalled_workspace,
     generation_budget, generation_endpoint_specs, infer_spec_id, validate_spec_id,
+    generation_repair_seed, generation_retry_metadata,
     normalize_draft, require_executable_draft, require_generation_model_id, validate_model_id,
     owned_workspace, require_revision, serialize_workspace, update_workspace_draft,
     workspace_is_busy, scenario_authenticated_endpoint_ids, validate_target_draft,
@@ -108,26 +109,45 @@ def _queue_debug(workspace: APIWorkspace, *, revision: int, environment: dict[st
 def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target_url: str,
                     variables: dict[str, Any], endpoints: list[dict[str, Any]],
                     prompt_draft: dict[str, Any] | None = None, failure_evidence: dict[str, Any] | None = None,
-                    scenario_workflow: bool = False):
+                    scenario_workflow: bool = False,
+                    retry_snapshot: dict[str, Any] | None = None,
+                    retry_previous: dict[str, Any] | None = None,
+                    preserve_candidate: bool = False):
     task_id = str(uuid.uuid4())
     budget = generation_budget(model_id=workspace.model_id, owner=workspace.owner)
     workspace.status = APIWorkspace.Status.GENERATING
     workspace.error = ''
-    workspace.candidate = None
+    if not preserve_candidate:
+        workspace.candidate = None
     workspace.task_id = task_id
-    snapshot = {
-        'revision': revision, 'task_id': task_id, 'mode': mode,
-        'draft': deepcopy(prompt_draft if prompt_draft is not None else workspace.draft),
-        'user_draft': deepcopy(workspace.draft),
-        'model_id': workspace.model_id, 'spec_id': workspace.spec_id,
-        'target_endpoint_id': workspace.target_endpoint_id, 'endpoints': deepcopy(endpoints),
-        'target_url': target_url, 'variables': deepcopy(variables), 'messages': deepcopy(workspace.messages),
-        'failure_evidence': deepcopy(failure_evidence),
-    }
+    if retry_snapshot is not None:
+        snapshot = deepcopy(retry_snapshot)
+        for key in ('claimed_at', 'started_at', 'finished_at', 'parent_task_id', 'parent_revision',
+                    'queue_managed_by_parent'):
+            snapshot.pop(key, None)
+        snapshot.update({
+            'revision': revision, 'task_id': task_id, 'mode': mode,
+            'draft': deepcopy(prompt_draft if prompt_draft is not None else workspace.draft),
+            'model_id': workspace.model_id, 'spec_id': workspace.spec_id,
+            'target_endpoint_id': workspace.target_endpoint_id,
+            'target_url': target_url, 'variables': deepcopy(variables),
+            'failure_evidence': deepcopy(failure_evidence),
+        })
+        scenario_workflow = snapshot.get('workflow') == 'scenarios'
+    else:
+        snapshot = {
+            'revision': revision, 'task_id': task_id, 'mode': mode,
+            'draft': deepcopy(prompt_draft if prompt_draft is not None else workspace.draft),
+            'user_draft': deepcopy(workspace.draft),
+            'model_id': workspace.model_id, 'spec_id': workspace.spec_id,
+            'target_endpoint_id': workspace.target_endpoint_id, 'endpoints': deepcopy(endpoints),
+            'target_url': target_url, 'variables': deepcopy(variables), 'messages': deepcopy(workspace.messages),
+            'failure_evidence': deepcopy(failure_evidence),
+        }
     snapshot.update(deepcopy(budget))
-    if scenario_workflow:
+    if scenario_workflow and retry_snapshot is None:
         snapshot.update({'workflow': 'scenarios', 'scope_endpoint_ids': [item['id'] for item in endpoints]})
-    elif workspace.parent_id:
+    elif workspace.parent_id and retry_snapshot is None:
         previous_generation = workspace.generation if isinstance(workspace.generation, dict) else {}
         previous_snapshot = previous_generation.get('_snapshot') if isinstance(previous_generation.get('_snapshot'), dict) else {}
         previous_scenario = previous_snapshot.get('scenario') if isinstance(previous_snapshot.get('scenario'), dict) else {}
@@ -170,6 +190,18 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
                 **({'test_type': previous_scenario['test_type']} if previous_scenario.get('test_type') else {}),
             },
         })
+    archived: dict[str, Any] | None = None
+    if isinstance(retry_previous, dict):
+        prior_archive = retry_previous.get('_retry_previous') if isinstance(retry_previous.get('_retry_previous'), dict) else {}
+        prior_rounds = retry_previous.get('rounds')
+        if not isinstance(prior_rounds, list) or not prior_rounds:
+            prior_rounds = prior_archive.get('rounds') if isinstance(prior_archive.get('rounds'), list) else []
+        archived = {
+            'status': retry_previous.get('status'), 'phase': retry_previous.get('phase'),
+            'summary': retry_previous.get('summary'), 'source_revision': retry_previous.get('source_revision'),
+            'model_failure': deepcopy(retry_previous.get('model_failure')),
+            'rounds': deepcopy(prior_rounds),
+        }
     workspace.generation = {
         'status': 'queued', 'phase': 'queued', 'attempt': 0, 'max_attempts': 3,
         'source_revision': revision, 'target_url': target_url, 'summary': '', 'rounds': [],
@@ -177,6 +209,8 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
         '_snapshot': snapshot,
         **{key: deepcopy(budget[key]) for key in ('queued_at', 'claimed_at', 'started_at', 'finished_at', 'timeouts', 'deadlines')},
     }
+    if archived is not None:
+        workspace.generation['_retry_previous'] = archived
     if workspace.parent_id:
         workspace.generation['scenario_context'] = deepcopy(snapshot['scenario'])
         workspace.generation['shared_constraints'] = deepcopy(snapshot.get('shared_constraints') or [])
@@ -199,21 +233,26 @@ def _queue_pipeline(workspace: APIWorkspace, *, revision: int, mode: str, target
 
 def _repair_seed(workspace: APIWorkspace, revision: int) -> tuple[dict[str, Any], dict[str, Any]]:
     """Freeze only server-held, current-revision failed evidence for a repair run."""
-    candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
-    generation = workspace.generation if isinstance(workspace.generation, dict) else {}
-    rounds = generation.get('rounds') if isinstance(generation.get('rounds'), list) else []
-    if candidate.get('source_revision') == revision and isinstance(candidate.get('draft'), dict):
-        candidate_hash = candidate.get('draft_hash')
-        for item in reversed(rounds):
-            if not isinstance(item, dict) or item.get('draft_hash') != candidate_hash:
-                continue
-            result = item.get('result')
-            if isinstance(result, dict) and result.get('success') is not True:
-                return candidate['draft'], result
-    if workspace.debug_revision == revision and isinstance(workspace.debug_result, dict) and workspace.debug_result:
-        if workspace.debug_result.get('success') is not True:
-            return workspace.draft, workspace.debug_result
-    raise WorkspaceValidationError('修复需要当前 revision 的失败调试或候选运行证据。')
+    require_revision(workspace, revision)
+    return generation_repair_seed(workspace)
+
+
+def _validate_retry_snapshot(workspace: APIWorkspace, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Revalidate current authority/scope while retaining old frozen content."""
+    if not isinstance(snapshot.get('target_url'), str) or not isinstance(snapshot.get('variables'), dict):
+        raise WorkspaceValidationError('失败任务缺少合法的服务器冻结执行参数。')
+    require_target_url(snapshot['target_url'])
+    frozen_endpoints = snapshot.get('endpoints')
+    if not isinstance(frozen_endpoints, list) or not frozen_endpoints:
+        raise WorkspaceValidationError('失败任务缺少冻结接口范围，不能安全重试。')
+    current = generation_endpoint_specs(workspace)
+    frozen_scope = snapshot.get('scope_endpoint_ids')
+    expected_ids = frozen_scope if isinstance(frozen_scope, list) and frozen_scope else [
+        item.get('id') for item in frozen_endpoints if isinstance(item, dict)
+    ]
+    if len(current) != len(expected_ids) or {item['id'] for item in current} != set(expected_ids):
+        raise WorkspaceValidationError('当前接口范围与失败任务的冻结范围不一致，不能安全重试。')
+    return frozen_endpoints
 
 
 class APIWorkspaceCollectionView(APIView):
@@ -439,6 +478,80 @@ class APIWorkspaceMessagesView(APIView):
                     scenario_workflow=scenario_workflow,
                 )
             return response(kind='success', data=_workspace_payload(workspace), message='生成并试运行已排队', status_code=202)
+        except PermissionError as exc:
+            return _problem(exc, 403)
+        except LookupError as exc:
+            return _problem(exc, 404)
+        except WorkspaceConflict as exc:
+            return _problem(exc, 409)
+        except (WorkspaceValidationError, ValueError) as exc:
+            return _problem(exc)
+
+
+class APIWorkspaceRetryGenerationView(APIView):
+    """Explicitly retry one failed provider call from server-frozen input."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id, workspace_id):
+        try:
+            project = _project_or_denied(project_id, request.user)
+            if not can_execute_project(project, request.user):
+                raise PermissionError('没有权限执行此项目的 API 试运行。')
+            unexpected = set(request.data) - {'revision', 'execution_confirmed'}
+            if unexpected:
+                raise WorkspaceValidationError('retry-generation 仅接受 revision 与 execution_confirmed。')
+            if 'revision' not in request.data:
+                raise WorkspaceValidationError('retry-generation 必须携带 revision。')
+            if request.data.get('execution_confirmed') is not True:
+                raise WorkspaceValidationError('重试生成并试运行必须明确传递 execution_confirmed:true。')
+            with transaction.atomic():
+                workspace = owned_workspace(
+                    project_id=project_id, workspace_id=workspace_id, user=request.user, lock=True,
+                )
+                previous_revision = require_revision(workspace, request.data['revision'])
+                if workspace_is_busy(workspace):
+                    raise WorkspaceConflict('当前工作区任务尚未结束。')
+                _model_failure, retry = generation_retry_metadata(workspace)
+                if retry.get('available') is not True or retry.get('mode') not in {'generate', 'repair'}:
+                    raise WorkspaceValidationError(str(retry.get('reason') or '当前失败不能安全重试。'))
+                require_generation_model_id(workspace.model_id, owner=workspace.owner)
+                previous_generation = deepcopy(workspace.generation)
+                previous_snapshot = previous_generation.get('_snapshot')
+                if not isinstance(previous_snapshot, dict):
+                    raise WorkspaceValidationError('失败任务缺少服务器冻结参数，不能安全重试。')
+                _validate_retry_snapshot(workspace, previous_snapshot)
+                mode = retry['mode']
+                if mode == 'repair':
+                    prompt_draft, failure_evidence = _repair_seed(workspace, previous_revision)
+                else:
+                    prompt_draft = normalize_draft(
+                        previous_snapshot.get('user_draft', previous_snapshot.get('draft')),
+                    )
+                    failure_evidence = None
+
+                # A retry is a new asynchronous lease even though it does not
+                # edit the draft. Advancing the revision makes the accepted
+                # request idempotent against a second same-revision POST even
+                # when the first task finishes before that request acquires the lock.
+                workspace.revision += 1
+                if isinstance(workspace.candidate, dict) and workspace.candidate.get('source_revision') == previous_revision:
+                    workspace.candidate = {**deepcopy(workspace.candidate), 'source_revision': workspace.revision}
+                if workspace.debug_revision == previous_revision:
+                    workspace.debug_revision = workspace.revision
+                workspace.save(update_fields=['revision', 'candidate', 'debug_revision', 'updated_at'])
+                _queue_pipeline(
+                    workspace, revision=workspace.revision, mode=mode,
+                    target_url=previous_snapshot['target_url'], variables=previous_snapshot['variables'],
+                    endpoints=previous_snapshot['endpoints'], prompt_draft=prompt_draft,
+                    failure_evidence=failure_evidence,
+                    retry_snapshot=previous_snapshot, retry_previous=previous_generation,
+                    preserve_candidate=True,
+                )
+            return response(
+                kind='success', data=_workspace_payload(workspace),
+                message='当前失败范围的生成并试运行已重新排队', status_code=202,
+            )
         except PermissionError as exc:
             return _problem(exc, 403)
         except LookupError as exc:

@@ -131,6 +131,7 @@ def _browser_discovery_origin_pending(discovery_id: str, version: int, task_id: 
 def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, result: dict, *, exception: Exception | None = None):
     from .browser_discovery import evidence_statistics, ingest_trace, sync_auto_origin
     from .models import BrowserDiscoveryTask
+    from ai_core.provider_errors import public_model_failure
 
     with transaction.atomic():
         task = BrowserDiscoveryTask.objects.select_for_update().filter(pk=discovery_id).first()
@@ -160,6 +161,18 @@ def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, res
         completed = bool(result.get('completed')) if isinstance(result, dict) else False
         error_code = str(result.get('error_code') or '')[:80] if isinstance(result, dict) else ''
         summary = str(result.get('summary') or '')[:4000] if isinstance(result, dict) else ''
+        tool_calls = min(
+            int(result.get('tool_calls') or task.tool_calls) if isinstance(result, dict) else task.tool_calls,
+            int(task.limits.get('max_tool_calls', 100)),
+        )
+        model_failure = public_model_failure(
+            result.get('diagnostic') if isinstance(result, dict) else None,
+            stage='initial_model' if tool_calls == 0 else 'exploring',
+        )
+        if model_failure:
+            # Evidence remains the durable completion summary.  The diagnostic
+            # is a fixed public projection, never a provider exception/body.
+            evidence['diagnostic'] = model_failure
         if exception is not None:
             error_code = 'runner_failed'
             task.error_message = f'浏览器探索执行异常（{type(exception).__name__}），请检查模型和 MCP 配置。'
@@ -185,7 +198,7 @@ def _finish_browser_discovery(discovery_id: str, version: int, task_id: str, res
             error_code = error_code or ('no_usable_records' if records_count else 'no_records')
         task.status = status
         task.current_action = '已结束'
-        task.tool_calls = min(int(result.get('tool_calls') or task.tool_calls) if isinstance(result, dict) else task.tool_calls, int(task.limits.get('max_tool_calls', 100)))
+        task.tool_calls = tool_calls
         task.model_calls = min(int(result.get('model_calls') or task.model_calls) if isinstance(result, dict) else task.model_calls, int(task.limits.get('max_model_steps', 100)))
         task.summary = summary
         task.error_code = error_code

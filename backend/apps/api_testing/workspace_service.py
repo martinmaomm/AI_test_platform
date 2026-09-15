@@ -376,6 +376,14 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         )
     resolved_source = source or workspace_source(workspace)
     source_type, source_name, source_task_id = resolved_source
+    children: list[APIWorkspace] | None = None
+    if workspace.parent_id is None and include_scenarios:
+        prefetched = getattr(workspace, '_prefetched_objects_cache', {})
+        if 'scenarios' in prefetched:
+            children = list(workspace.scenarios.all())
+        else:
+            children = list(workspace.scenarios.all().select_related('saved_case').order_by('scenario_order', 'id'))
+    model_failure, retry = generation_retry_metadata(workspace, known_children=children)
     data = {
         'id': workspace.id,
         'title': workspace.title,
@@ -396,6 +404,8 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'messages': workspace.messages if isinstance(workspace.messages, list) else [],
         'candidate': workspace.candidate,
         'generation': public_generation(workspace.generation),
+        'model_failure': model_failure,
+        'retry': retry,
         'execution_history': deepcopy(getattr(workspace, '_execution_history', [])),
         'debug_result': workspace.debug_result if isinstance(workspace.debug_result, dict) else {},
         'debug_revision': workspace.debug_revision,
@@ -407,11 +417,7 @@ def serialize_workspace(workspace: APIWorkspace, *, include_scenarios: bool = Tr
         'updated_at': workspace.updated_at.isoformat() if workspace.updated_at else None,
     }
     if workspace.parent_id is None and include_scenarios:
-        prefetched = getattr(workspace, '_prefetched_objects_cache', {})
-        if 'scenarios' in prefetched:
-            children = list(workspace.scenarios.all())
-        else:
-            children = list(workspace.scenarios.all().select_related('saved_case').order_by('scenario_order', 'id'))
+        children = children or []
         data['scenarios'] = [
             serialize_workspace(child, include_scenarios=False, source=resolved_source)
             for child in children
@@ -499,9 +505,200 @@ def workspace_coverage(root: APIWorkspace, children: list[APIWorkspace] | None =
 
 def public_generation(value: Any) -> dict[str, Any]:
     generation = deepcopy(value) if isinstance(value, dict) else {}
-    for internal_key in ('_snapshot', '_claimed', 'task_id'):
-        generation.pop(internal_key, None)
+    for internal_key in list(generation):
+        if internal_key.startswith('_') or internal_key == 'task_id':
+            generation.pop(internal_key, None)
     return generation
+
+
+def _retry_stage(workspace: APIWorkspace, generation: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    stored = generation.get('model_failure') if isinstance(generation.get('model_failure'), dict) else {}
+    stage = stored.get('stage')
+    if stage in {'planning', 'generating', 'repairing'}:
+        return stage
+    if snapshot.get('workflow') == 'scenarios' and workspace.parent_id is None:
+        return 'planning'
+    if snapshot.get('mode') == 'repair' or generation.get('attempt', 0) > 1:
+        return 'repairing'
+    return 'generating'
+
+
+def _public_model_failure(workspace: APIWorkspace, generation: dict[str, Any],
+                          snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    if workspace.status != APIWorkspace.Status.FAILED or generation.get('status') != 'failed':
+        return None
+    stage = _retry_stage(workspace, generation, snapshot)
+    from ai_core.provider_errors import classify_provider_error, public_model_failure
+    stored = generation.get('model_failure') if isinstance(generation.get('model_failure'), dict) else None
+    public = public_model_failure(stored, stage=stage)
+    if public:
+        return public
+
+    # A small number of pre-contract failures are already persisted.  Only an
+    # explicit stream wrapper is eligible for this read-only compatibility
+    # classification; arbitrary workspace/HTTP/validation errors stay outside
+    # the provider namespace.
+    summary = generation.get('summary') or workspace.error
+    if not isinstance(summary, str) or '流式LLM调用失败' not in summary:
+        return None
+    try:
+        classified = classify_provider_error(RuntimeError(summary), model_context=False)
+    except (ImportError, TypeError, ValueError):
+        classified = None
+    return public_model_failure(classified, stage=stage)
+
+
+def _generation_rounds(generation: dict[str, Any]) -> list[dict[str, Any]]:
+    rounds = generation.get('rounds')
+    if isinstance(rounds, list) and rounds:
+        return [item for item in rounds if isinstance(item, dict)]
+    previous = generation.get('_retry_previous') if isinstance(generation.get('_retry_previous'), dict) else {}
+    rounds = previous.get('rounds')
+    return [item for item in rounds if isinstance(item, dict)] if isinstance(rounds, list) else []
+
+
+def result_has_http_evidence(value: Any) -> bool:
+    """Recognize persisted requests-runner responses, not generic failures."""
+    if not isinstance(value, dict):
+        return False
+    step_datas = value.get('step_datas')
+    if not isinstance(step_datas, list):
+        return False
+    for step in step_datas:
+        data = step.get('data') if isinstance(step, dict) else None
+        req_resps = data.get('req_resps') if isinstance(data, dict) else None
+        if not isinstance(req_resps, list):
+            continue
+        for exchange in req_resps:
+            response = exchange.get('response') if isinstance(exchange, dict) else None
+            status_code = response.get('status_code') if isinstance(response, dict) else None
+            if isinstance(status_code, int) and not isinstance(status_code, bool):
+                return True
+    return False
+
+
+def generation_repair_seed(workspace: APIWorkspace) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a current, server-held candidate/debug failure safe to replay."""
+    candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
+    generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+    if candidate.get('source_revision') == workspace.revision and isinstance(candidate.get('draft'), dict):
+        candidate_hash = candidate.get('draft_hash')
+        for item in reversed(_generation_rounds(generation)):
+            if item.get('draft_hash') != candidate_hash:
+                continue
+            result = item.get('result')
+            if isinstance(result, dict) and result.get('success') is not True:
+                return candidate['draft'], result
+    if workspace.debug_revision == workspace.revision and isinstance(workspace.debug_result, dict):
+        if workspace.debug_result and workspace.debug_result.get('success') is not True:
+            return workspace.draft, workspace.debug_result
+    raise WorkspaceValidationError('现有失败证据不足以安全修复；请使用常规生成入口重新确认参数。')
+
+
+def generation_retry_metadata(workspace: APIWorkspace, *, known_children: list[APIWorkspace] | None = None,
+                              ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Build the public, side-effect-free retry contract for one workspace."""
+    generation = workspace.generation if isinstance(workspace.generation, dict) else {}
+    snapshot = generation.get('_snapshot') if isinstance(generation.get('_snapshot'), dict) else {}
+    model_failure = _public_model_failure(workspace, generation, snapshot)
+    if workspace.parent_id:
+        scope = 'scenario'
+    elif snapshot.get('workflow') == 'scenarios':
+        scope = 'planning'
+    else:
+        scope = 'case'
+    retry = {
+        'available': False, 'reason': '当前记录没有可重试的模型服务失败。',
+        'mode': None, 'scope': scope, 'requires_execution_confirmation': True,
+    }
+
+    prefetched = getattr(workspace, '_prefetched_objects_cache', {})
+    if not model_failure:
+        prefetched_children = known_children
+        if prefetched_children is None:
+            prefetched_children = (
+                list(workspace.scenarios.all())
+                if workspace.parent_id is None and 'scenarios' in prefetched else []
+            )
+        if prefetched_children:
+            retry['scope'] = 'scenario'
+            retry['reason'] = '根工作区已包含子场景，请选择具体失败子场景重试；不会重跑已通过的子场景。'
+        return None, retry
+    children_exist = bool(known_children) if known_children is not None else (
+        bool(list(workspace.scenarios.all())) if workspace.parent_id is None and 'scenarios' in prefetched
+        else workspace.parent_id is None and workspace.scenarios.exists()
+    )
+    if children_exist:
+        retry['scope'] = 'scenario'
+        retry['reason'] = '根工作区已包含子场景，请选择具体失败子场景重试；不会重跑已通过的子场景。'
+        return model_failure, retry
+    if workspace_is_busy(workspace):
+        retry['reason'] = '当前工作区族仍有任务运行，不能重复提交重试。'
+        return model_failure, retry
+    if generation.get('status') == 'stale' or generation.get('source_revision') != workspace.revision:
+        retry['reason'] = '失败证据已过期，请使用常规生成入口重新确认当前配置。'
+        return model_failure, retry
+    if snapshot.get('task_id') != workspace.task_id:
+        retry['reason'] = '失败任务租约已被后续操作替换，不能重放旧模型失败。'
+        return model_failure, retry
+    if not model_failure['retryable']:
+        retry['reason'] = model_failure['message']
+        return model_failure, retry
+    if not snapshot:
+        retry['reason'] = '失败任务缺少服务器冻结参数，不能安全重试。'
+        return model_failure, retry
+    if snapshot.get('model_id') != workspace.model_id:
+        retry['reason'] = '所选模型已变化，不能用旧失败快照重试；请使用常规生成入口。'
+        return model_failure, retry
+    if snapshot.get('spec_id') != workspace.spec_id or snapshot.get('target_endpoint_id') != workspace.target_endpoint_id:
+        retry['reason'] = 'API 规范或目标范围已变化，不能用旧失败快照重试。'
+        return model_failure, retry
+    try:
+        require_generation_model_id(workspace.model_id, owner=workspace.owner)
+    except WorkspaceValidationError as exc:
+        retry['reason'] = str(exc)
+        return model_failure, retry
+
+    rounds = _generation_rounds(generation)
+    has_http = any(result_has_http_evidence(item.get('result')) for item in rounds)
+    if (workspace.debug_revision == workspace.revision
+            and result_has_http_evidence(workspace.debug_result)):
+        has_http = True
+    candidate = workspace.candidate if isinstance(workspace.candidate, dict) else {}
+    has_current_candidate = (
+        candidate.get('source_revision') == workspace.revision
+        and isinstance(candidate.get('draft'), dict)
+    )
+    if model_failure['stage'] == 'planning':
+        retry.update({
+            'available': True, 'mode': 'generate',
+            'reason': '将复用服务器冻结的规划描述、模型、接口范围、目标地址和变量，仅重试规划。',
+        })
+        return model_failure, retry
+    if has_http or has_current_candidate or model_failure['stage'] == 'repairing':
+        try:
+            repair_draft, repair_result = generation_repair_seed(workspace)
+        except WorkspaceValidationError as exc:
+            retry['reason'] = str(exc)
+            return model_failure, retry
+        from .workspace_verification import classify_result
+        _status, safety_reason, disposition = classify_result(repair_result, repair_draft)
+        if disposition != 'repair':
+            retry['reason'] = f'现有运行证据不可安全重放：{safety_reason}'
+            return model_failure, retry
+        retry.update({
+            'available': True, 'mode': 'repair',
+            'reason': (
+                '已有目标接口运行证据；将复用服务器冻结参数和现有候选，仅修复并重新试运行当前失败范围，'
+                '可能再次向冻结目标发送请求；不会重跑已通过的同级场景。'
+            ),
+        })
+        return model_failure, retry
+    retry.update({
+        'available': True, 'mode': 'generate',
+        'reason': '失败前未发送目标 HTTP；将复用服务器冻结参数，仅重新生成并试运行当前失败范围。',
+    })
+    return model_failure, retry
 
 
 def owned_workspace(*, project_id: int, workspace_id: int, user, lock: bool = False) -> APIWorkspace:

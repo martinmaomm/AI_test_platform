@@ -6,11 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from django.test import SimpleTestCase
+import httpx
 from langchain_core.callbacks import AsyncCallbackManager
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from mcp.types import Prompt, Resource, Tool
+from openai import APIError
 
 from .browser_discovery_agent import (
     ALLOWED_BROWSER_TOOLS, BrowserDiscoveryMCPAgent, DiscoveryStopped, DiscoveryToolGuard, PendingOriginGate,
@@ -341,6 +343,33 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertFalse(result['completed'])
         self.assertNotIn('SECRET', str(result))
         self.assertNotIn('API_KEY', str(result))
+
+    def test_streaming_openai_overload_is_model_failure_not_mcp_other(self):
+        client, _ = self.clients()
+        request = httpx.Request('POST', 'https://models.example.test/v1/chat/completions')
+        agent = SimpleNamespace(
+            initialize=AsyncMock(),
+            run=AsyncMock(side_effect=APIError(
+                'Our servers are currently overloaded. Please try again later.', request=request, body=None,
+            )),
+        )
+        with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client), patch(
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', return_value=agent,
+        ):
+            result = asyncio.run(run_browser_discovery(**self.options))
+        self.assertEqual(result['error_code'], 'MODEL_OVERLOADED')
+        self.assertEqual(result['diagnostic']['code'], 'MODEL_OVERLOADED')
+        self.assertNotIn('Our servers', str(result))
+
+    def test_unknown_mcp_error_remains_mcp_other(self):
+        client, _ = self.clients()
+        agent = SimpleNamespace(initialize=AsyncMock(), run=AsyncMock(side_effect=RuntimeError('unrecognized MCP fixture')))
+        with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client), patch(
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', return_value=agent,
+        ):
+            result = asyncio.run(run_browser_discovery(**self.options))
+        self.assertEqual(result['error_code'], 'MCP_OTHER')
+        self.assertNotIn('diagnostic', result)
 
     def test_true_tool_count_includes_each_call_and_blocks_limit_plus_one(self):
         guard = DiscoveryToolGuard('https://web.example.test', '', 2)

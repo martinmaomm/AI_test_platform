@@ -25,6 +25,7 @@ from mcp_use import MCPClient
 from pydantic import BaseModel, PrivateAttr, ValidationError, create_model
 
 from ai_core.mcp_agent_budget import BudgetedMCPAgent
+from ai_core.provider_errors import classify_provider_error
 from ai_core.webui_playwright_agent import _classify_mcp_error
 from web_testing.generation_preflight import prepare_playwright_mcp_output_config
 from web_testing.mcp_page_explorer import suppress_mcp_raw_query_logs
@@ -426,14 +427,22 @@ async def run_browser_discovery(
     except DiscoveryStopped as exc:
         result.update(error_code=exc.code, summary=str(exc))
     except Exception as exc:
-        kind = _classify_mcp_error(exc)
-        messages = {
-            'graph_recursion': '模型达到本轮步骤上限，已保留探索证据。',
-            'browser': 'MCP 浏览器启动或运行失败，请检查固定版本浏览器安装。',
-            'rate_limit': '模型服务暂时限流，已保留探索证据；稍后可以新建一次探索。',
-            'transient': '模型或页面探索服务连接中断，已保留探索证据，未自动重放网站操作。',
-        }
-        result.update(error_code=f'MCP_{kind.upper()}', summary=messages.get(kind, '网页探索服务执行异常，已保留已采集证据；请检查任务诊断。'))
+        provider_failure = classify_provider_error(exc)
+        if provider_failure:
+            result.update(
+                error_code=provider_failure['code'], summary=provider_failure['message'],
+                diagnostic=provider_failure,
+            )
+            kind = 'provider'
+        else:
+            kind = _classify_mcp_error(exc)
+            messages = {
+                'graph_recursion': '模型达到本轮步骤上限，已保留探索证据。',
+                'browser': 'MCP 浏览器启动或运行失败，请检查固定版本浏览器安装。',
+                'rate_limit': '模型服务暂时限流，已保留探索证据；稍后可以新建一次探索。',
+                'transient': '模型或页面探索服务连接中断，已保留探索证据，未自动重放网站操作。',
+            }
+            result.update(error_code=f'MCP_{kind.upper()}', summary=messages.get(kind, '网页探索服务执行异常，已保留已采集证据；请检查任务诊断。'))
         # Do not interpolate the exception: HTTP errors can include credentials,
         # model prompts or response bodies. Raw traffic has a separate ACL.
         logger.warning('API 网页探索中止 task=%s kind=%s exception_type=%s', task_id, kind, type(exc).__name__)

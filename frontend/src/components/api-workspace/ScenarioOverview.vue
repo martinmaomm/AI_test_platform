@@ -90,6 +90,7 @@
           <strong>{{ scenario.title || `场景 #${scenario.id}` }}</strong>
           <small>{{ scenario.scenario_description || "未提供场景说明" }}</small>
           <small>端点：{{ endpointText(scenario) }}</small>
+          <small v-if="scenario.model_failure?.message">{{ scenario.model_failure.message }} 点击此场景查看处理入口。</small>
         </span>
         <el-tag size="small" :type="scenarioStatus(scenario).type">
           {{ scenarioStatus(scenario).label }}

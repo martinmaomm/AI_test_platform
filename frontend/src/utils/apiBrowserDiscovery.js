@@ -232,6 +232,58 @@ export const browserDiscoveryEvidenceCounts = (task) => {
   };
 };
 
+const browserDiscoveryDisplayId = (value) => {
+  const id = String(value ?? "").trim();
+  if (!id) return "未知";
+  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+};
+
+const browserDiscoveryWorkspaceId = (value) => {
+  if (typeof value === "number")
+    return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) return null;
+  const numeric = Number(trimmed);
+  return Number.isSafeInteger(numeric) ? String(numeric) : null;
+};
+
+export const browserDiscoveryTaskLabel = (task) => {
+  const suffix = `任务 #${browserDiscoveryDisplayId(task?.id)}`;
+  try {
+    const url = new URL(String(task?.target_url || "").trim());
+    if (!["http:", "https:"].includes(url.protocol) || !url.host) return suffix;
+    return `${url.origin}${url.pathname || "/"} · #${browserDiscoveryDisplayId(task?.id)}`;
+  } catch {
+    return suffix;
+  }
+};
+
+export const formatBrowserDiscoveryTimestamp = (value) => {
+  if (value == null || String(value).trim() === "") return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  const pad = (number) => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+
+export const browserDiscoveryHandoffs = (task) => {
+  const handoffs = Array.isArray(task?.handoffs) ? task.handoffs : [];
+  const seenWorkspaceIds = new Set();
+  return handoffs.reduce((items, handoff) => {
+    const workspaceId = browserDiscoveryWorkspaceId(handoff?.workspace_id);
+    if (!workspaceId || seenWorkspaceIds.has(workspaceId)) return items;
+    seenWorkspaceIds.add(workspaceId);
+    items.push({
+      workspaceId,
+      workspaceTitle: String(handoff?.workspace_title ?? "").trim() || `生成结果 #${browserDiscoveryDisplayId(workspaceId)}`,
+      createdAt: handoff?.created_at ?? null,
+      sourceVersion: handoff?.source_version ?? null,
+    });
+    return items;
+  }, []);
+};
+
 export const browserDiscoveryErrorCategory = (task) => {
   const resolution = browserDiscoveryOriginResolution(task);
   if (resolution.state === "awaiting_confirmation") return "等待来源确认";

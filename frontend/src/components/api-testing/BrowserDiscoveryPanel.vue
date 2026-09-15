@@ -16,7 +16,7 @@
       show-icon
     />
     <template v-else>
-      <el-card ref="createFormCard" shadow="never" class="create-card" data-testid="api-browser-discovery-create-form">
+      <el-card v-if="view === 'create'" ref="createFormCard" shadow="never" class="create-card" data-testid="api-browser-discovery-create-form">
         <template #header><strong>网页探索</strong></template>
         <el-alert title="网页探索可能按您授权的测试范围执行真实页面操作。仅在测试站点和测试数据范围内使用。" type="warning" :closable="false" show-icon />
         <el-form label-position="top" class="create-form">
@@ -36,35 +36,41 @@
           <ActionHelpTooltip label="开始探索" content="调用所选 AI，通过浏览器执行描述中的页面操作并记录真实接口。可能新增、修改或删除测试数据；完成后还需选择样本进入工作区生成用例，不会直接保存测试用例。" />
         </el-form>
       </el-card>
-      <div class="discovery-toolbar">
-        <strong>网页探索任务</strong>
-        <el-button text :loading="tasksLoading" @click="$emit('refresh')">刷新</el-button>
-        <ActionHelpTooltip label="刷新探索任务" content="重新读取探索任务列表和状态，不会再次探索网页，也不会重复生成任务。" />
-      </div>
-      <el-empty v-if="!tasksLoading && !tasks.length" description="尚无网页探索任务" :image-size="56" />
-      <el-table v-else :data="tasks" size="small" row-key="id" @row-click="$emit('select', $event.id)">
-        <el-table-column label="目标" min-width="180">
-          <template #default="{ row }"><span class="task-url">{{ row.target_url || `任务 #${row.id}` }}</span></template>
-        </el-table-column>
-        <el-table-column label="状态" width="108">
-          <template #default="{ row }"><el-tag size="small" :type="statusMeta(row.status).type">{{ statusMeta(row.status).label }}</el-tag></template>
-        </el-table-column>
-        <el-table-column label="接口来源" min-width="170"><template #default="{ row }">{{ originSummary(row) }}</template></el-table-column>
-        <el-table-column label="证据" width="110"><template #default="{ row }">{{ evidenceCounts(row).collected }} / {{ evidenceCounts(row).usable }}</template></el-table-column>
-        <el-table-column label="当前动作" min-width="120"><template #default="{ row }">{{ row.current_action || row.phase || "—" }}</template></el-table-column>
-        <el-table-column label="耗时" width="100"><template #default="{ row }">{{ duration(row) }}</template></el-table-column>
-        <el-table-column label="请求" width="72"><template #default="{ row }">{{ row.request_count ?? "—" }}</template></el-table-column>
-        <el-table-column label="操作" width="144">
-          <template #header>操作 <ActionHelpTooltip label="探索任务操作" content="查看展示该次探索的状态和样本。删除只移除允许删除的任务及数据库采样记录，磁盘日志和截图保留；已交接或被来源引用的任务可能不能删除。不会删除已保存用例。" /></template>
-          <template #default="{ row }">
-            <el-button text type="primary" @click.stop="$emit('select', row.id)">查看</el-button>
-            <el-tooltip :disabled="!deleteState(row).reason" :content="deleteState(row).reason" placement="top">
-              <span><el-button text type="danger" :loading="deleting && String(deletingTaskId) === String(row.id)" :disabled="disabled || !deleteState(row).canDelete" @click.stop="$emit('delete', row.id)">删除</el-button></span>
-            </el-tooltip>
-          </template>
-        </el-table-column>
-      </el-table>
-      <el-card v-if="task" v-loading="detailLoading" shadow="never" class="task-detail">
+      <template v-if="view === 'list'">
+        <div class="discovery-toolbar">
+          <strong>网页探索任务</strong>
+          <el-button text :loading="tasksLoading" @click="$emit('refresh')">刷新</el-button>
+          <ActionHelpTooltip label="刷新探索任务" content="重新读取探索任务列表和状态，不会再次探索网页，也不会重复生成任务。" />
+        </div>
+        <el-empty v-if="!tasksLoading && !tasks.length" description="尚无网页探索任务" :image-size="56" />
+        <el-table v-else :data="tasks" size="small" row-key="id" @row-click="$emit('select', $event.id)">
+          <el-table-column label="目标 URL" min-width="220">
+            <template #default="{ row }"><span class="task-url">{{ taskLabel(row) }}</span></template>
+          </el-table-column>
+          <el-table-column label="创建时间" width="172"><template #default="{ row }">{{ timestamp(row.created_at) }}</template></el-table-column>
+          <el-table-column label="状态" width="108">
+            <template #default="{ row }"><el-tag size="small" :type="statusMeta(row.status).type">{{ statusMeta(row.status).label }}</el-tag></template>
+          </el-table-column>
+          <el-table-column label="有效样本" width="96"><template #default="{ row }">{{ evidenceCounts(row).usable }}</template></el-table-column>
+          <el-table-column label="耗时" width="100"><template #default="{ row }">{{ duration(row) }}</template></el-table-column>
+          <el-table-column label="关联生成结果" min-width="150">
+            <template #default="{ row }">
+              <el-button v-for="handoff in handoffs(row)" :key="handoff.workspaceId" text type="primary" @click.stop="openWorkspace(handoff.workspaceId)">{{ handoff.workspaceTitle }}</el-button>
+              <span v-if="!handoffs(row).length">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="144">
+            <template #header>操作 <ActionHelpTooltip label="探索任务操作" content="查看展示该次探索的状态和样本。删除只移除允许删除的任务及数据库采样记录，磁盘日志和截图保留；已交接或被来源引用的任务可能不能删除。不会删除已保存用例。" /></template>
+            <template #default="{ row }">
+              <el-button text type="primary" @click.stop="$emit('select', row.id)">查看</el-button>
+              <el-tooltip :disabled="!deleteState(row).reason" :content="deleteState(row).reason" placement="top">
+                <span><el-button text type="danger" :loading="deleting && String(deletingTaskId) === String(row.id)" :disabled="disabled || !deleteState(row).canDelete" @click.stop="$emit('delete', row.id)">删除</el-button></span>
+              </el-tooltip>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <el-card v-if="view === 'detail' && task" v-loading="detailLoading" shadow="never" class="task-detail">
         <template #header><div class="task-detail-header"><strong>任务 #{{ task.id }} 详情</strong><el-tag size="small" :type="statusMeta(task.status).type">{{ statusMeta(task.status).label }}</el-tag></div></template>
         <el-descriptions :column="2" size="small" border>
           <el-descriptions-item label="目标页面" :span="2">{{ task.target_url || "—" }}</el-descriptions-item>
@@ -76,6 +82,9 @@
           <el-descriptions-item label="MCP 调用">{{ task.tool_calls ?? "—" }}</el-descriptions-item>
           <el-descriptions-item label="模型调用">{{ task.model_calls ?? "—" }}</el-descriptions-item>
           <el-descriptions-item label="请求数">{{ task.request_count ?? "—" }}</el-descriptions-item>
+          <el-descriptions-item label="创建时间">{{ timestamp(task.created_at) }}</el-descriptions-item>
+          <el-descriptions-item label="开始时间">{{ timestamp(task.started_at) }}</el-descriptions-item>
+          <el-descriptions-item label="结束时间">{{ timestamp(task.finished_at) }}</el-descriptions-item>
           <el-descriptions-item label="任务结论" :span="2">{{ task.summary || terminalReason(task) || "尚未返回任务结论" }}</el-descriptions-item>
           <el-descriptions-item label="错误分类">{{ errorCategory(task) }}</el-descriptions-item>
           <el-descriptions-item label="任务诊断">{{ task.error_message || task.error || terminalReason(task) || "无" }}</el-descriptions-item>
@@ -110,6 +119,10 @@
           <el-button :loading="recordsLoading" @click="$emit('load-records', task.id)">查看已授权样本</el-button>
           <ActionHelpTooltip label="探索详情操作" content="取消探索会请求停止并等待检查点结束，已发生的数据操作不会回滚。删除仅处理此任务及数据库采样记录，日志和截图保留。查看已授权样本读取已有采集摘要，不会重新请求被测接口。" />
         </div>
+        <div v-if="handoffs(task).length" class="task-actions">
+          <span class="records-hint">已交接生成结果：</span>
+          <el-button v-for="handoff in handoffs(task)" :key="handoff.workspaceId" text type="primary" @click="openWorkspace(handoff.workspaceId)">{{ handoff.workspaceTitle }}</el-button>
+        </div>
         <template v-if="recordGroups.length">
           <p class="records-hint">仅显示后端提供的公开脱敏摘要。公开内容相同的样本合并展示，原始采集记录及依赖保留。已观察：请求/响应样本；未知：必填性、完整 Schema、枚举和其他响应分支，不能将样本视为完整接口规范。</p>
           <div v-for="group in recordGroups" :key="group.key" class="record-row">
@@ -133,10 +146,10 @@
           </div>
           <el-alert v-if="selectedGroupCount > 50" title="最多可选择 50 组接口；依赖项会由服务端再次校验。" type="warning" :closable="false" show-icon />
           <div class="task-actions">
-            <el-button type="success" :disabled="!canHandoff || !selectedRecordIds.length || selectedGroupCount > 50" :loading="handoffLoading" @click="handoff">创建来源并进入工作区</el-button>
+            <el-button type="success" :disabled="!canHandoff || !selectedRecordIds.length || selectedGroupCount > 50" :loading="handoffLoading" @click="handoff">确认接口并生成场景</el-button>
             <span v-if="!canHandoff && originResolution.state === 'awaiting_selection'" class="records-hint">请先选择一个已采集来源后再交接。</span>
             <el-button v-if="recordsHasMore" :loading="recordsLoading" @click="$emit('load-more-records')">加载更多样本</el-button>
-            <ActionHelpTooltip label="样本交接操作" content="加载更多样本读取本次任务尚未显示的采集记录。创建来源并进入工作区会将勾选样本整理为接口来源并打开工作区，不会自动运行或保存用例；缺少依赖时需补选相关样本。" />
+            <ActionHelpTooltip label="确认接口并生成场景" content="会先交接勾选样本并打开生成前确认框。请确认生成范围和实际请求后，才会开始生成与验证；此处不会立即执行或保存。缺少依赖时需补选相关样本。" />
           </div>
         </template>
         <el-empty v-else-if="recordsLoaded" description="没有可交接的已授权样本" :image-size="56" />
@@ -158,23 +171,26 @@ import {
   browserDiscoveryEvidenceCounts,
   browserDiscoveryExpandSelectedRecordIds,
   browserDiscoveryFormSnapshot,
+  browserDiscoveryHandoffs,
   browserDiscoveryOriginResolution,
   browserDiscoveryOriginStateLabel,
   browserDiscoveryOriginSummary,
   browserDiscoveryRecordGroups,
   browserDiscoveryStatusMeta,
+  browserDiscoveryTaskLabel,
   browserDiscoveryTimeoutDefault,
   canConfirmBrowserDiscoveryOrigin,
   canHandoffBrowserDiscovery,
   canSelectBrowserDiscoveryOrigin,
+  formatBrowserDiscoveryTimestamp,
   formatBrowserDiscoveryDuration,
   isBrowserDiscoveryActive,
 } from "@/utils/apiBrowserDiscovery";
 
 const props = defineProps({
-  config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, deleting: Boolean, deletingTaskId: { type: [String, Number], default: null }, originActionLoading: Boolean, handoffLoading: Boolean,
+  view: { type: String, default: "list", validator: (value) => ["list", "create", "detail"].includes(value) }, config: { type: Object, default: () => ({}) }, tasks: { type: Array, default: () => [] }, task: { type: Object, default: null }, records: { type: Array, default: () => [] }, disabled: Boolean, configLoading: Boolean, configLoadError: Boolean, tasksLoading: Boolean, detailLoading: Boolean, recordsLoading: Boolean, recordsLoaded: Boolean, recordsHasMore: Boolean, creating: Boolean, cancelling: Boolean, deleting: Boolean, deletingTaskId: { type: [String, Number], default: null }, originActionLoading: Boolean, handoffLoading: Boolean,
 });
-const emit = defineEmits(["refresh", "create", "select", "cancel", "delete", "resolve-origin", "load-records", "load-more-records", "handoff", "form-dirty-change"]);
+const emit = defineEmits(["refresh", "create", "select", "cancel", "delete", "resolve-origin", "load-records", "load-more-records", "handoff", "open-workspace", "form-dirty-change"]);
 const createFormCard = ref(null);
 const selectedRecordIds = ref([]);
 const enabled = computed(() => props.config?.enabled === true);
@@ -202,6 +218,9 @@ const timeoutMaximum = computed(() => {
 });
 const modelLabel = (model) => [model?.provider_name || model?.provider, model?.model_name].filter(Boolean).join(" · ") || `模型 ${model?.id}`;
 const errorCodeLabel = browserDiscoveryErrorCodeLabel;
+const taskLabel = browserDiscoveryTaskLabel;
+const timestamp = formatBrowserDiscoveryTimestamp;
+const handoffs = browserDiscoveryHandoffs;
 const terminalReason = (task) => task?.error_code ? errorCodeLabel(task.error_code) : "";
 const submit = () => emit("create", { ...form.value });
 const resetCreateForm = () => {
@@ -238,6 +257,7 @@ const handoff = () => emit("handoff", {
   recordIds: browserDiscoveryExpandSelectedRecordIds(selectedRecordIds.value, recordGroups.value),
 });
 const resolveOrigin = (origin, decision) => emit("resolve-origin", { taskId: props.task?.id, version: props.task?.version, origin, decision });
+const openWorkspace = (workspaceId) => emit("open-workspace", workspaceId);
 watch(() => props.task?.id, () => { selectedRecordIds.value = []; });
 watch(recordGroups, (groups) => {
   const eligibleIds = new Set(

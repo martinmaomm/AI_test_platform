@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -884,6 +884,7 @@ def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
         'origin_resolution': origin_resolution(task),
         'source_version': task.source_version, 'records_count': counts['records_count'],
         'eligible_records_count': counts['eligible_records_count'],
+        'handoffs': serialize_task_handoffs(task),
         'can_delete': deletion['can_delete'], 'delete_block_reason': deletion['reason'],
         'started_at': task.started_at.isoformat() if task.started_at else None,
         'heartbeat_at': task.heartbeat_at.isoformat() if task.heartbeat_at else None,
@@ -891,6 +892,46 @@ def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
         'created_at': task.created_at.isoformat() if task.created_at else None,
         'updated_at': task.updated_at.isoformat() if task.updated_at else None,
     }
+
+
+def task_handoff_prefetch() -> Prefetch:
+    """Load the read-only workspace navigation sidecar without per-task queries."""
+    return Prefetch(
+        'handoffs',
+        queryset=BrowserDiscoveryHandoff.objects.select_related('spec', 'workspace').order_by('-created_at', '-id'),
+    )
+
+
+def serialize_task_handoffs(task: BrowserDiscoveryTask) -> list[dict[str, Any]]:
+    """Return only intact, task-owned browser-capture workspace handoffs.
+
+    The handoff relation itself is authoritative.  The extra checks keep this
+    navigation sidecar from exposing a workspace if historical/corrupt data no
+    longer agrees on its browser-capture task, project, owner, or specification.
+    """
+    items = []
+    for handoff in task.handoffs.all():
+        workspace = handoff.workspace
+        spec = handoff.spec
+        if not workspace or not spec:
+            continue
+        if (
+            spec.spec_type != APISpecification.SpecType.BROWSER_CAPTURE
+            or spec.source_task_id != task.id
+            or spec.project_id != task.project_id
+            or workspace.project_id != task.project_id
+            or workspace.owner_id != task.owner_id
+            or workspace.spec_id != spec.id
+            or workspace.parent_id is not None
+        ):
+            continue
+        items.append({
+            'workspace_id': workspace.id,
+            'workspace_title': workspace.title,
+            'created_at': handoff.created_at.isoformat() if handoff.created_at else None,
+            'source_version': handoff.source_version,
+        })
+    return items
 
 
 def browser_discovery_delete_state(task: BrowserDiscoveryTask) -> dict[str, Any]:

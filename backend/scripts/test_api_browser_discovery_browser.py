@@ -181,12 +181,25 @@ def verify(origin, fixture, output):
                 expect(page.get_by_test_id("api-workspace-select")).to_contain_text("文档来源工作区")
                 expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(1)
             elif fixture["config"].API_BROWSER_DISCOVERY_ENABLED:
-                expect(page.get_by_test_id("api-browser-discovery-create-form")).to_be_visible()
+                expect(page.locator(".discovery-toolbar")).to_be_visible()
+                expect(page.get_by_test_id("api-browser-discovery-create-form")).to_have_count(0)
 
         def task_row(slug):
             return page.locator(".browser-discovery-panel .el-table__row").filter(has_text=slug)
 
+        def show_task_list():
+            page.get_by_test_id("api-browser-discovery-list").click()
+            expect(page).to_have_url(re.compile(r"/workspace/browser$"))
+            expect(page.locator(".discovery-toolbar")).to_be_visible(timeout=15000)
+
+        def open_task(slug):
+            show_task_list()
+            task_row(slug).get_by_role("button", name="查看", exact=True).click()
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?discovery_id=[0-9a-f-]{36}$"))
+
         def create_task(slug, description):
+            page.get_by_test_id("api-browser-discovery-new").click()
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?view=new$"))
             d = page.get_by_test_id("api-browser-discovery-create-form")
             d.get_by_role("textbox", name="完整页面 URL", exact=True).fill(f"https://web.example.test/{slug}?source=browser#fixture")
             origin_input = d.get_by_role("textbox", name="手动 API origin（可选）", exact=True)
@@ -205,12 +218,13 @@ def verify(origin, fixture, output):
             with page.expect_response(lambda item: item.request.method == "POST" and item.url.endswith(api_base)) as created:
                 d.get_by_role("button", name="开始探索", exact=True).click()
             assert created.value.status == 202, created.value.text()
-            expect(d.get_by_role("button", name="开始探索", exact=True)).to_be_enabled()
-            expect(page).to_have_url(re.compile(r"/workspace/browser(?:\?|$)"))
+            task = created.value.json()["data"]
+            expect(page).to_have_url(re.compile(rf"/workspace/browser\?discovery_id={re.escape(str(task['id']))}$"))
+            return task
 
         try:
             page.goto(origin + "/api-testing/workspace")
-            expect(page.get_by_role("heading", name="API 对话工作区")).to_be_visible(timeout=20000)
+            expect(page.get_by_role("tab", name="从接口文档生成", exact=True)).to_be_visible(timeout=20000)
             expect(page).to_have_url(re.compile(r"/workspace/documents\?workspace_id="))
             expect(tab("documents")).to_have_attribute("aria-selected", "true")
             expect(page.locator(".header-actions")).to_contain_text("文档来源工作区")
@@ -221,6 +235,7 @@ def verify(origin, fixture, output):
             page.screenshot(path=str(output / "default-document-page.png"), full_page=True)
             switch_to("browser")
             expect(page.get_by_test_id("api-browser-discovery-create-form")).to_have_count(0)
+            expect(page.locator(".discovery-toolbar")).to_have_count(0)
             page.screenshot(path=str(output / "disabled-feature.png"), full_page=True)
 
             fixture["config"].API_BROWSER_DISCOVERY_ENABLED = True
@@ -228,12 +243,17 @@ def verify(origin, fixture, output):
             settings.API_BROWSER_DISCOVERY_ENABLED = True
             requests.clear()
             page.reload()
-            d = page.get_by_test_id("api-browser-discovery-create-form")
-            expect(d).to_be_visible(timeout=15000)
+            expect(page).to_have_url(re.compile(r"/workspace/browser$"))
+            expect(page.locator(".discovery-toolbar")).to_be_visible(timeout=15000)
+            expect(page.get_by_test_id("api-browser-discovery-create-form")).to_have_count(0)
             expect(page.locator(".context-panel")).to_have_count(0)
             expect(page.get_by_role("button", name="新建工作区", exact=True)).to_have_count(0)
             assert not any(re.search(r"/api-specs/(?:\?|$)", url) for _, url in requests), requests
             assert database(lambda: APIWorkspace.objects.count()) == 1, "browser entry created an empty workspace"
+            page.get_by_test_id("api-browser-discovery-new").click()
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?view=new$"))
+            d = page.get_by_test_id("api-browser-discovery-create-form")
+            expect(d).to_be_visible(timeout=15000)
             d.locator(".el-form-item").filter(has_text="LLM 模型").locator(".el-select").click()
             expect(page.get_by_role("option", name="本地模拟 · browser-fixture-model", exact=True)).to_be_visible()
             expect(page.get_by_role("option", name="browser-disabled-model", exact=True)).to_have_count(0)
@@ -248,10 +268,10 @@ def verify(origin, fixture, output):
             expect(url_input).to_have_value("https://web.example.test/unsent")
             url_input.fill("")
 
-            create_task("cancel", "取消任务，观察运行进度")
+            cancel_task = create_task("cancel", "取消任务，观察运行进度")
             assert fixture["cancel_started"].wait(timeout=15), "simulated runner did not start"
             expect(page.get_by_text("正在模拟网页操作", exact=True).first).to_be_visible(timeout=15000)
-            expect(task_row("/cancel").get_by_role("button", name="删除", exact=True)).to_be_disabled()
+            expect(page.get_by_role("button", name="删除", exact=True)).to_be_disabled()
             page.screenshot(path=str(output / "running-progress.png"), full_page=True)
             # Leaving the browser page must not send task cancellation or create a document workspace.
             switch_to("documents")
@@ -263,20 +283,19 @@ def verify(origin, fixture, output):
             page.wait_for_timeout(1800)
             assert not any("browser-discoveries" in url for _, url in requests), requests
             switch_to("browser")
-            task_row("/cancel").get_by_role("button", name="查看", exact=True).click()
+            open_task("/cancel")
             page.get_by_role("button", name="取消探索", exact=True).click()
             fixture["cancel_release"].set()
             expect(page.get_by_text("已取消", exact=True).first).to_be_visible(timeout=15000)
             expect(page.get_by_text("取消前未保留证据", exact=True)).to_be_visible()
             expect(page.get_by_text("已请求取消，正在等待当前检查点安全收敛。", exact=True)).to_have_count(0)
             page.reload()
-            expect(task_row("/cancel")).to_be_visible(timeout=15000)
+            expect(page).to_have_url(re.compile(rf"/workspace/browser\?discovery_id={re.escape(str(cancel_task['id']))}$"))
 
-            create_task("partial", "部分失败后仍可交接")
-            expect(task_row("/partial")).to_be_visible(timeout=15000)
-            task_row("/partial").get_by_role("button", name="查看", exact=True).click()
+            partial_task = create_task("partial", "部分失败后仍可交接")
+            expect(page).to_have_url(re.compile(rf"/workspace/browser\?discovery_id={re.escape(str(partial_task['id']))}$"))
             expect(page.get_by_text("部分完成", exact=True).first).to_be_visible(timeout=15000)
-            page.get_by_role("button", name="查看已授权样本", exact=True).click()
+            # Terminal task details automatically load their saved samples.
             expect(page.get_by_text("GET /items/1", exact=True)).to_be_visible(timeout=15000)
             expect(page.get_by_text("已观察：请求/响应样本", exact=False)).to_be_visible()
             # Three captured requests contain only two publicly distinct samples.
@@ -290,8 +309,6 @@ def verify(origin, fixture, output):
             page.screenshot(path=str(output / "partial-records.png"), full_page=True)
 
             create_task("multiple", "同组多个样本，核对后续响应")
-            task_row("/multiple").get_by_role("button", name="查看", exact=True).click()
-            page.get_by_role("button", name="查看已授权样本", exact=True).click()
             sample_headers = page.locator(".record-sample .el-collapse-item__header")
             expect(sample_headers).to_have_count(2, timeout=15000)
             expect(sample_headers.nth(0)).to_contain_text("样本 #1")
@@ -307,17 +324,13 @@ def verify(origin, fixture, output):
             page.screenshot(path=str(output / "multiple-samples.png"), full_page=True)
 
             create_task("no-eligible", "无有效证据")
-            task_row("/no-eligible").get_by_role("button", name="查看", exact=True).click()
             expect(page.get_by_text("部分完成", exact=True).first).to_be_visible(timeout=15000)
-            page.get_by_role("button", name="查看已授权样本", exact=True).click()
             expect(page.get_by_text("样本 #1（不可交接）", exact=True).first).to_be_visible(timeout=15000)
-            expect(page.get_by_role("button", name="创建来源并进入工作区", exact=True)).to_be_disabled()
+            expect(page.get_by_role("button", name="确认接口并生成场景", exact=True)).to_be_disabled()
             page.screenshot(path=str(output / "no-eligible-evidence.png"), full_page=True)
 
             create_task("page", "分页与五十接口组限制")
-            task_row("/page").get_by_role("button", name="查看", exact=True).click()
             expect(page.get_by_text("已完成", exact=True).first).to_be_visible(timeout=15000)
-            page.get_by_role("button", name="查看已授权样本", exact=True).click()
             samples = page.locator(".sample-select .el-checkbox:not(.is-disabled)")
             expect(samples).to_have_count(50, timeout=15000)
             for index in range(50):
@@ -335,17 +348,16 @@ def verify(origin, fixture, output):
             expect(page.locator(".sample-select .el-checkbox").filter(has_text="样本 #52")).to_have_count(0)
             sample_51.click()
             expect(page.get_by_text("最多可选择 50 组接口", exact=False)).to_be_visible()
-            expect(page.get_by_role("button", name="创建来源并进入工作区", exact=True)).to_be_disabled()
+            expect(page.get_by_role("button", name="确认接口并生成场景", exact=True)).to_be_disabled()
             page.screenshot(path=str(output / "pagination-fifty-limit.png"), full_page=True)
 
-            task_row("/partial").get_by_role("button", name="查看", exact=True).click()
-            page.get_by_role("button", name="查看已授权样本", exact=True).click()
+            open_task("/partial")
             selected_samples = page.locator(".sample-select .el-checkbox")
             expect(selected_samples).to_have_count(2)
             selected_samples.nth(0).click()
             selected_samples.nth(1).click()
             with page.expect_response(lambda item: item.request.method == "POST" and item.url.endswith("/handoff/")) as handoff:
-                page.get_by_role("button", name="创建来源并进入工作区", exact=True).click()
+                page.get_by_role("button", name="确认接口并生成场景", exact=True).click()
             assert handoff.value.status == 201, handoff.value.text()
             handed_ids = handoff.value.request.post_data_json["record_ids"]
             expected_ids = database(lambda: list(BrowserDiscoveryRecord.objects.filter(
@@ -354,10 +366,14 @@ def verify(origin, fixture, output):
             assert sorted(handed_ids) == expected_ids, "merged selection lost raw evidence IDs"
             source = handoff.value.json()["data"]["workspace"]
             assert source["source_type"] == "browser_capture" and source["source_task_id"] and source["source_name"]
-            expect(page.locator(".el-message-box:visible")).to_have_count(0)
-            expect(page.get_by_text("已创建网页探索来源并加载其 API 工作区", exact=False)).to_be_visible(timeout=15000)
             expect(page).to_have_url(re.compile(r"/workspace/browser\?workspace_id="))
+            confirmation = page.get_by_role("dialog", name="生成并验证确认", exact=True)
+            expect(confirmation).to_be_visible(timeout=15000)
+            expect(confirmation.get_by_role("button", name="确认并开始验证", exact=True)).to_be_enabled()
+            confirmation.get_by_role("button", name="取消", exact=True).click()
+            expect(confirmation).to_be_hidden()
             expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text("网页探索发现")
+            expect(page.get_by_test_id("api-browser-discovery-panel")).to_have_count(0)
             expect(page.locator(".context-panel .el-form-item").filter(has_text="API 规范").locator(".el-select")).to_have_count(0)
             expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(2)
             expect(page.get_by_role("textbox", name="描述测试目标", exact=True)).to_have_value(re.compile("需求历史"))
@@ -415,6 +431,7 @@ def verify(origin, fixture, output):
             expect(tab("browser")).to_have_attribute("aria-selected", "true")
             expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
             expect(page.get_by_test_id("api-browser-discovery-new")).to_be_enabled()
+            expect(page.get_by_test_id("api-browser-discovery-panel")).to_have_count(0)
             page.get_by_test_id("api-workspace-source-readonly").scroll_into_view_if_needed()
             page.screenshot(path=str(output / "browser-refresh-stable-source.png"), full_page=True)
 
@@ -443,9 +460,12 @@ def verify(origin, fixture, output):
             expect(page.get_by_test_id("api-workspace-source-readonly")).to_contain_text(spec.spec_name)
             expect(page.locator(".endpoint-field .el-checkbox.is-checked")).to_have_count(2)
 
-            # A published source keeps its provenance. Deletion must not break
-            # a saved workspace, while ended, unreferenced failures are removable.
-            expect(task_row("/partial").get_by_role("button", name="删除", exact=True)).to_be_disabled()
+            # A published source keeps its provenance. The standalone workspace
+            # exposes an explicit return link instead of mixing task rows into
+            # the editor, and the referenced source remains undeletable.
+            page.get_by_test_id("api-browser-source-task").click()
+            expect(page).to_have_url(re.compile(rf"/workspace/browser\?discovery_id={re.escape(str(partial_task['id']))}$"))
+            expect(page.get_by_role("button", name="删除", exact=True)).to_be_disabled()
 
             def failed_fixture(slug):
                 from django.utils import timezone
@@ -467,9 +487,10 @@ def verify(origin, fixture, output):
 
             failed_id = database(lambda: failed_fixture("delete-failed"))
             other_id = database(lambda: failed_fixture("delete-other"))
+            show_task_list()
             page.locator(".discovery-toolbar").get_by_role("button", name="刷新", exact=True).click()
             expect(task_row("/delete-failed")).to_be_visible(timeout=15000)
-            task_row("/delete-failed").get_by_role("button", name="查看", exact=True).click()
+            open_task("/delete-failed")
             detail = page.locator(".browser-discovery-panel .task-detail")
             expect(detail).to_contain_text(failed_id)
             page.get_by_role("button", name="查看已授权样本", exact=True).click()
@@ -477,7 +498,7 @@ def verify(origin, fixture, output):
 
             # Cancelling confirmation does not send a DELETE or change selection.
             before_delete_count = sum(method == "DELETE" for method, _ in requests)
-            task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
+            detail.get_by_role("button", name="删除", exact=True).click()
             delete_dialog = page.locator(".el-message-box:visible")
             expect(delete_dialog).to_be_visible()
             expect(delete_dialog).to_be_in_viewport()
@@ -491,24 +512,29 @@ def verify(origin, fixture, output):
             # If the rendered row is stale, the server still owns the decision.
             # A conflict must keep the task and show an actionable error.
             database(lambda: BrowserDiscoveryTask.objects.filter(pk=failed_id).update(status="running"))
-            task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
+            detail.get_by_role("button", name="删除", exact=True).click()
             with page.expect_response(lambda item: item.request.method == "DELETE" and item.url.endswith(f"{api_base}{failed_id}/")) as refused:
                 delete_dialog.get_by_role("button", name=re.compile("删除")).click()
             assert refused.value.status == 409, refused.value.text()
             expect(page.locator(".el-message--error").last).to_be_visible()
-            expect(task_row("/delete-failed")).to_be_visible()
+            expect(detail).to_be_visible()
             expect(detail).to_contain_text(failed_id)
             assert database(lambda: BrowserDiscoveryRecord.objects.filter(task_id=failed_id).exists())
             database(lambda: BrowserDiscoveryTask.objects.filter(pk=failed_id).update(status="failed"))
+            show_task_list()
             page.locator(".discovery-toolbar").get_by_role("button", name="刷新", exact=True).click()
             expect(task_row("/delete-failed").get_by_role("button", name="删除", exact=True)).to_be_enabled()
 
-            # Removing another row must keep the selected task and its samples.
+            # List/detail are intentionally separate pages. Deleting another
+            # row returns to the list; reopening the selected task proves that
+            # its detail and samples neither leak nor get replaced.
             task_row("/delete-other").get_by_role("button", name="删除", exact=True).click()
             with page.expect_response(lambda item: item.request.method == "DELETE" and item.url.endswith(f"{api_base}{other_id}/")) as deleted:
                 delete_dialog.get_by_role("button", name=re.compile("删除")).click()
             assert deleted.value.status == 200, deleted.value.text()
             expect(task_row("/delete-other")).to_have_count(0)
+            open_task("/delete-failed")
+            detail = page.locator(".browser-discovery-panel .task-detail")
             expect(detail).to_contain_text(failed_id)
             expect(detail).to_contain_text("GET /delete-failed")
             assert not database(lambda: BrowserDiscoveryRecord.objects.filter(task_id=other_id).exists())
@@ -533,10 +559,11 @@ def verify(origin, fixture, output):
                     break
                 page.wait_for_timeout(50)
             assert len(held_samples) == 1
-            task_row("/delete-failed").get_by_role("button", name="删除", exact=True).click()
+            detail.get_by_role("button", name="删除", exact=True).click()
             with page.expect_response(lambda item: item.request.method == "DELETE" and item.url.endswith(f"{api_base}{failed_id}/")) as deleted:
                 delete_dialog.get_by_role("button", name=re.compile("删除")).click()
             assert deleted.value.status == 200, deleted.value.text()
+            expect(page).to_have_url(re.compile(r"/workspace/browser$"))
             expect(task_row("/delete-failed")).to_have_count(0)
             expect(detail).to_have_count(0)
             for held_route, saved_response in held_samples:
@@ -549,6 +576,7 @@ def verify(origin, fixture, output):
             assert database(lambda: APISpecification.objects.filter(pk=spec.pk).exists())
             assert database(lambda: APIWorkspace.objects.filter(pk=handoff_workspace.pk).exists())
             page.reload()
+            show_task_list()
             expect(task_row("/partial")).to_be_visible(timeout=15000)
             expect(task_row("/delete-failed")).to_have_count(0)
             expect(task_row("/delete-other")).to_have_count(0)

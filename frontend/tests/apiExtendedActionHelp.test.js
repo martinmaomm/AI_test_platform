@@ -27,7 +27,7 @@ test("API workspace helper text covers planning, editing, evidence, and export b
     "components/api-workspace/WorkspaceExecutionHistory.vue": ["运行历史操作", "打开执行详情"],
     "components/api-workspace/PythonExportPanel.vue": ["Python 导出操作"],
     "components/api-workspace/VisualStepEditor.vue": ["步骤编辑操作", "断言操作"],
-    "components/api-testing/BrowserDiscoveryPanel.vue": ["开始探索", "探索任务操作", "允许或拒绝接口来源", "选择此来源", "样本交接操作"],
+    "components/api-testing/BrowserDiscoveryPanel.vue": ["开始探索", "探索任务操作", "允许或拒绝接口来源", "选择此来源", "确认接口并生成场景"],
   };
   for (const [path, labels] of Object.entries(files)) {
     const component = await source(path);
@@ -40,5 +40,7 @@ test("API workspace helper text covers planning, editing, evidence, and export b
   assert.match(await source("components/api-workspace/GenerationVerificationPanel.vue"), /AI 修复只定位到对话输入框/);
   assert.match(await source("components/api-workspace/WorkspaceExecutionHistory.vue"), /已发生的测试数据操作不会回滚/);
   assert.match(await source("components/api-testing/BrowserDiscoveryPanel.vue"), /磁盘日志和截图保留/);
+  assert.match(await source("components/api-testing/BrowserDiscoveryPanel.vue"), /生成前确认框/);
+  assert.match(await source("components/api-testing/BrowserDiscoveryPanel.vue"), /不会立即执行或保存/);
   assert.match(await source("components/api-workspace/PythonExportPanel.vue"), /不能反向更新可视化草稿/);
 });

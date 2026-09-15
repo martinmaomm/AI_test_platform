@@ -5,6 +5,7 @@ import uuid
 import logging
 
 from django.db import transaction
+from django.db.models import prefetch_related_objects
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from rest_framework.permissions import IsAuthenticated
@@ -23,6 +24,7 @@ from .browser_discovery import (
     normalize_http_url,
     origin_resolution,
     serialize_task,
+    task_handoff_prefetch,
     selectable_origins,
     sync_auto_origin,
     write_origin_control,
@@ -97,7 +99,9 @@ class BrowserDiscoveryCollectionView(APIView):
     def get(self, request, project_id):
         try:
             _editable_project(project_id, request.user)
-            tasks = BrowserDiscoveryTask.objects.filter(project_id=project_id, owner=request.user).order_by('-updated_at')
+            tasks = BrowserDiscoveryTask.objects.filter(
+                project_id=project_id, owner=request.user,
+            ).prefetch_related(task_handoff_prefetch()).order_by('-created_at', '-id')
             return response(kind='success', data=[serialize_task(expire_stale_discovery(item)) for item in tasks], message='获取浏览器探索任务成功')
         except PermissionError as exc:
             return _problem(exc, 403)
@@ -160,7 +164,9 @@ class BrowserDiscoveryDetailView(APIView):
 
     def get(self, request, project_id, task_id):
         try:
-            return response(kind='success', data=serialize_task(expire_stale_discovery(_owned_task(project_id, task_id, request.user))), message='获取浏览器探索任务成功')
+            task = _owned_task(project_id, task_id, request.user)
+            prefetch_related_objects([task], task_handoff_prefetch())
+            return response(kind='success', data=serialize_task(expire_stale_discovery(task)), message='获取浏览器探索任务成功')
         except PermissionError as exc:
             return _problem(exc, 403)
         except LookupError as exc:

@@ -308,7 +308,9 @@ def launch_c(args):
         page = context.new_page()
         page.set_default_timeout(20000)
         page.goto(args.frontend + '/api-testing/workspace/browser')
+        expect(page.locator('.discovery-toolbar')).to_be_visible()
         page.get_by_test_id('api-browser-discovery-new').click()
+        expect(page).to_have_url(re.compile(r'/workspace/browser\?view=new$'))
         form = page.get_by_test_id('api-browser-discovery-create-form')
         form.get_by_role('textbox', name='完整页面 URL', exact=True).fill('http://192.168.31.188:9990/')
         form.get_by_role('textbox', name='探索目标说明', exact=True).fill(
@@ -517,8 +519,11 @@ def handoff_c(args):
                                       viewport={'width': 1680, 'height': 1080})
         page = context.new_page()
         page.set_default_timeout(20000)
-        page.goto(args.frontend + '/api-testing/workspace/browser')
-        page.get_by_role('button', name='查看', exact=True).first.click()
+        # Always reopen this ledger's task, never whichever task is newest.
+        detail_url = args.frontend + '/api-testing/workspace/browser?discovery_id=' + record['id']
+        page.goto(detail_url)
+        expect(page).to_have_url(detail_url)
+        expect(page.locator('.task-detail')).to_contain_text(record['id'])
         page.get_by_role('button', name='查看已授权样本', exact=True).click()
         expect(page.locator('.record-row')).to_have_count(4)
         for row in page.locator('.record-row').all():
@@ -534,10 +539,16 @@ def handoff_c(args):
         record['handoff_pending'] = True
         write_json(ledger_path, record)
         with page.expect_response(lambda r: r.url.endswith('/handoff/') and r.request.method == 'POST') as handoff:
-            page.get_by_role('button', name='创建来源并进入工作区', exact=True).click()
+            page.get_by_role('button', name='确认接口并生成场景', exact=True).click()
         assert handoff.value.status in (200, 201)
         data = handoff.value.json()['data']
         assert data['spec']['spec_type'] == 'browser_capture'
+        confirmation = page.get_by_role('dialog', name='生成并验证确认', exact=True)
+        expect(confirmation).to_be_visible()
+        # Handoff never dispatches HTTP/LLM work by itself. This live helper's
+        # separately explicit generate_c step is responsible for that action.
+        confirmation.get_by_role('button', name='取消', exact=True).click()
+        expect(confirmation).to_be_hidden()
         record.update({'root_id': data['workspace']['id'], 'spec_id': data['spec']['id'],
                        'source_type': data['workspace']['source_type'], 'endpoint_ids': data['endpoint_ids'],
                        'handoff_pending': False})

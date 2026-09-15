@@ -50,6 +50,10 @@ def verify(origin, fixture, site, output):
 
         def start():
             page.goto(origin + "/api-testing/workspace/browser")
+            expect(page).to_have_url(re.compile(r"/workspace/browser$"))
+            expect(page.locator(".discovery-toolbar")).to_be_visible(timeout=20000)
+            page.get_by_test_id("api-browser-discovery-new").click()
+            expect(page).to_have_url(re.compile(r"/workspace/browser\?view=new$"))
             form = page.get_by_test_id("api-browser-discovery-create-form")
             expect(form).to_be_visible(timeout=20000)
             expect(form.get_by_role("textbox", name="手动 API origin（可选）", exact=True)).to_be_hidden()
@@ -63,6 +67,7 @@ def verify(origin, fixture, site, output):
                 form.get_by_role("button", name="开始探索", exact=True).click()
             assert created.value.status == 202, created.value.text()
             task = database(lambda: BrowserDiscoveryTask.objects.latest("created_at"))
+            expect(page).to_have_url(re.compile(rf"/workspace/browser\?discovery_id={re.escape(str(task.id))}$"))
             pending = page.locator(".origin-candidate").filter(has_text=site.api_origin)
             expect(pending).to_be_visible(timeout=60000)
             expect(pending).to_contain_text("POST /api/login")
@@ -92,7 +97,7 @@ def verify(origin, fixture, site, output):
             assert any(row.get("event") == "response" and row.get("request_id") == login["request_id"] and row.get("status") == 200 for row in trace)
             expect(page.locator(".record-row strong").filter(has_text="POST /api/login")).to_be_visible(timeout=10000)
             expect(page.get_by_text("没有可交接的已授权样本", exact=True)).to_have_count(0)
-            expect(page.get_by_role("button", name="创建来源并进入工作区", exact=True)).to_be_visible()
+            expect(page.get_by_role("button", name="确认接口并生成场景", exact=True)).to_be_visible()
             page.screenshot(path=str(output / "approved-complete.png"), full_page=True)
             report.update(approved_login_requests=login_count, approved_status=task.status, remaining_items=len(site.items), completed_samples_refreshed=True)
 

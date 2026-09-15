@@ -987,7 +987,7 @@ test("workspace API, routing, navigation, and suite variables use the approved c
   assert.match(workspace, /saved_case_test_type/);
   assert.match(workspace, /suggested_test_type/);
   assert.match(workspace, /payload\.test_type = saveForm\.value\.test_type/);
-  assert.match(workspace, /<main v-if="workspaceReady"/);
+  assert.match(workspace, /<main v-if="workspaceReady && \(isDocumentSource \|\| isBrowserWorkspace\)"/);
   assert.doesNotMatch(workspace, /label="工作区标题"/);
   assert.doesNotMatch(workspace, /:model-value="workspace\.title" disabled/);
   assert.match(workspace, /未命名工作区 #\$\{item\.id\}/);

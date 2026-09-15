@@ -10,8 +10,8 @@
     <template v-else>
       <header class="workspace-header">
         <div>
-          <h2>{{ isBrowserSource ? "网页探索 API 工作区" : "API 对话工作区" }}</h2>
-          <p>{{ isBrowserSource ? "从已确认的网页探索样本进入场景生成、调试和编辑；执行和保存均需明确发起。" : "选择接口文档、模型和接口范围后，可视化编排请求步骤；AI 只提供候选，执行和保存均需明确发起。" }}</p>
+          <h2>{{ browserPageTitle }}</h2>
+          <p>{{ isBrowserSource ? "探索网页 → 确认接口 → 生成并验证场景 → 保存用例。每个任务与其生成结果独立关联。" : "选择接口文档、模型和接口范围后，可视化编排请求步骤；AI 只提供候选，执行和保存均需明确发起。" }}</p>
           <div class="workspace-source-tabs" role="tablist" aria-label="API 工作区来源">
             <button
               type="button"
@@ -33,6 +33,12 @@
           </div>
         </div>
         <div class="header-actions">
+          <template v-if="isBrowserSource">
+            <el-button data-testid="api-browser-discovery-list" :disabled="interactionLocked" @click="showBrowserDiscoveryList">探索任务列表</el-button>
+            <el-button data-testid="api-browser-discovery-new" :disabled="interactionLocked" @click="startNewBrowserDiscovery">新建探索</el-button>
+            <el-button v-if="isBrowserWorkspace && rootWorkspace?.source_task_id" data-testid="api-browser-source-task" :disabled="interactionLocked" @click="selectBrowserDiscovery(rootWorkspace.source_task_id)">查看来源探索</el-button>
+          </template>
+          <template v-if="isDocumentSource || isBrowserWorkspace">
           <label class="workspace-select-label" for="current-workspace-select">当前工作区</label>
           <el-select
             id="current-workspace-select"
@@ -54,12 +60,6 @@
             :disabled="interactionLocked"
             @click="createWorkspace"
           >新建工作区</el-button>
-          <el-button
-            v-else
-            data-testid="api-browser-discovery-new"
-            :disabled="interactionLocked"
-            @click="startNewBrowserDiscovery"
-          >新建探索</el-button>
           <el-button data-testid="api-workspace-manager" :disabled="interactionLocked" @click="managerDialog = true"
             >管理工作区</el-button
           >
@@ -70,13 +70,16 @@
               @click="reloadWorkspace"
               >重新加载</el-button
             >
-            <ActionHelpTooltip label="工作区操作" :content="isDocumentSource ? '新建工作区会创建独立的需求与草稿；管理工作区可查看、重命名或删除历史。重新加载读取服务器最新状态，不会重新生成或运行；有未保存修改时会先提示确认。' : '新建探索会重置探索表单，不会立即运行或删除旧任务；管理工作区管理已交接的工作区。重新加载读取当前工作区的最新状态，不会重新探索。'" />
+            <ActionHelpTooltip label="工作区操作" :content="isDocumentSource ? '新建工作区会创建独立的需求与草稿；管理工作区可查看、重命名或删除历史。重新加载读取服务器最新状态，不会重新生成或运行；有未保存修改时会先提示确认。' : '新建探索进入独立表单，不复用当前工作区。查看来源探索回到当前结果对应的任务；管理工作区管理已交接结果。重新加载只读取当前结果，不会重新探索或生成。'" />
           </span>
+          </template>
         </div>
       </header>
+      <el-alert v-if="isBrowserSource && browserScreen.view === 'invalid'" :title="browserScreen.message" type="error" :closable="false" show-icon />
       <BrowserDiscoveryPanel
-        v-if="isBrowserSource"
+        v-if="isBrowserDiscoveryView"
         ref="browserDiscoveryPanelRef"
+        :view="browserScreen.view"
         :config="browserDiscoveryConfig"
         :tasks="browserDiscoveries"
         :task="browserDiscoveryTask"
@@ -104,8 +107,10 @@
         @load-records="loadBrowserDiscoveryRecords"
         @load-more-records="loadMoreBrowserDiscoveryRecords"
         @handoff="handoffBrowserDiscovery"
+        @open-workspace="openBrowserWorkspace"
         @form-dirty-change="browserDiscoveryFormDirty = $event"
       />
+      <el-alert v-if="isBrowserSource && browserScreen.view === 'detail' && !initializing && !browserDiscoveryDetailLoading && !browserDiscoveryTask" title="探索任务不存在、已删除或无权访问，请返回探索任务列表。" type="warning" :closable="false" show-icon />
       <el-alert
         v-if="isDocumentSource && !specsLoading && !specsLoadFailed && !specs.length"
         data-testid="api-workspace-no-documents"
@@ -129,7 +134,7 @@
           ></template
         >
       </el-alert>
-      <main v-if="workspaceReady" class="workspace-main">
+      <main v-if="workspaceReady && (isDocumentSource || isBrowserWorkspace)" class="workspace-main">
         <ScenarioOverview
           v-if="!hasSavedRootCase || rootWorkspace?.scenarios?.length"
           :root="rootWorkspace || workspace"
@@ -725,6 +730,8 @@ import {
 } from "@/utils/apiBrowserDiscovery";
 import {
   availableChatModels,
+  browserWorkspaceView,
+  browserWorkspacePageKey,
   activeScenario,
   canGenerateWithModel,
   canRepairWorkspace,
@@ -890,6 +897,12 @@ let internalWorkspaceRouteId = null;
 let viewEpoch = 0;
 const isBrowserSource = computed(() => props.sourceType === "browser_capture");
 const isDocumentSource = computed(() => !isBrowserSource.value);
+const browserScreen = computed(() => browserWorkspaceView(route.query));
+const isBrowserWorkspace = computed(() => isBrowserSource.value && browserScreen.value.view === "workspace");
+const isBrowserDiscoveryView = computed(() => isBrowserSource.value && ["list", "create", "detail"].includes(browserScreen.value.view));
+const browserPageTitle = computed(() => isDocumentSource.value ? "API 对话工作区" : ({
+  list: "网页探索任务", create: "新建网页探索", detail: "网页探索详情", workspace: "网页接口场景生成",
+})[browserScreen.value.view] || "网页探索");
 const sourceWorkspace = computed(() => rootWorkspace.value || workspace.value);
 const sourceName = computed(
   () => sourceWorkspace.value?.source_name || "网页探索来源",
@@ -1402,12 +1415,7 @@ const loadBrowserDiscoveryRecords = async (taskId = browserDiscoveryTaskId.value
 };
 const selectBrowserDiscovery = async (taskId) => {
   if (!taskId || interactionLocked.value) return;
-  browserDiscoveryTaskId.value = taskId;
-  browserDiscoveryTask.value = null;
-  browserDiscoveryRecords.value = [];
-  browserDiscoveryRecordsLoaded.value = false;
-  browserDiscoveryRecordsNextAfter.value = null;
-  await loadBrowserDiscoveryDetail(taskId);
+  await router.push({ path: workspaceRouteForSource("browser_capture"), query: { discovery_id: String(taskId) } });
 };
 const refreshBrowserDiscoveries = async () => {
   await loadBrowserDiscoveries();
@@ -1447,8 +1455,7 @@ const submitBrowserDiscovery = async (form) => {
     browserDiscoveryRecordsLoaded.value = false;
     browserDiscoveryRecordsNextAfter.value = null;
     ElMessage.success("网页探索任务已创建");
-    startBrowserDiscoveryPolling();
-    void loadBrowserDiscoveryDetail(task.id, { quiet: true });
+    await router.replace({ path: workspaceRouteForSource("browser_capture"), query: { discovery_id: String(task.id) } });
   } catch (error) {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
       ElMessage.error(errorMessage(error, "创建网页探索任务失败"));
@@ -1550,7 +1557,11 @@ const deleteBrowserDiscoveryTask = async (taskId) => {
       isBrowserSource.value &&
       requestSequence === browserDiscoveryDeleteSequence
     )
-      ElMessage.success("网页探索任务及数据库采样记录已删除；排障日志和截图已保留。");
+      {
+        ElMessage.success("网页探索任务及数据库采样记录已删除；排障日志和截图已保留。");
+        if (browserScreen.value.view === "detail")
+          await router.replace({ path: workspaceRouteForSource("browser_capture"), query: {} });
+      }
   } catch (error) {
     if (
       requestProjectId === projectId.value &&
@@ -1687,21 +1698,12 @@ const handoffBrowserDiscovery = async ({ taskId, version, recordIds }) => {
       !nextWorkspace?.id
     )
       return;
-    internalWorkspaceRouteId = String(nextWorkspace.id);
-    await router.replace({
+    ElMessage.success("接口已确认，将进入对应工作区；确认目标、接口范围和实际请求授权后才开始生成验证。");
+    await router.push({
       path: workspaceRouteForSource("browser_capture"),
-      query: { workspace_id: String(nextWorkspace.id) },
+      query: { workspace_id: String(nextWorkspace.id), confirm_generation: "1" },
     });
-    if (
-      requestProjectId !== projectId.value ||
-      requestEpoch !== browserDiscoveryEpoch ||
-      requestViewEpoch !== viewEpoch
-    )
-      return;
-    await loadWorkspaces();
-    await reloadWorkspace({ id: nextWorkspace.id, skipDirtyCheck: true });
-    internalWorkspaceRouteId = null;
-    ElMessage.success("已创建网页探索来源并加载其 API 工作区；请明确发起生成与运行确认。");
+    // The keyed workspace view loads its own context after navigation.
   } catch (error) {
     if (requestProjectId === projectId.value && requestEpoch === browserDiscoveryEpoch)
       ElMessage.error(errorMessage(error, "交接网页探索结果失败"));
@@ -1765,9 +1767,18 @@ const focusRootContext = () =>
 const focusBrowserDiscoveryForm = () =>
   browserDiscoveryPanelRef.value?.focusCreateForm?.();
 const startNewBrowserDiscovery = async () => {
-  if (!(await confirmDiscardDraft("新建网页探索", { includePrompt: false }))) return;
-  browserDiscoveryPanelRef.value?.resetCreateForm?.();
-  focusBrowserDiscoveryForm();
+  if (browserScreen.value.view === "create") {
+    if (!(await confirmDiscardDraft("新建网页探索", { includePrompt: true }))) return;
+    browserDiscoveryPanelRef.value?.resetCreateForm?.();
+    focusBrowserDiscoveryForm();
+    return;
+  }
+  await router.push({ path: workspaceRouteForSource("browser_capture"), query: { view: "new" } });
+};
+const showBrowserDiscoveryList = () => router.push({ path: workspaceRouteForSource("browser_capture"), query: {} });
+const openBrowserWorkspace = (id) => {
+  if (interactionLocked.value || !Number.isSafeInteger(Number(id)) || Number(id) <= 0) return;
+  return router.push({ path: workspaceRouteForSource("browser_capture"), query: { workspace_id: String(id) } });
 };
 const switchSource = async (sourceType) => {
   const targetPath = workspaceRouteForSource(sourceType);
@@ -3105,9 +3116,9 @@ const initialize = async () => {
   loading.value = true;
   try {
     await Promise.all([
-      loadWorkspaces(),
-      loadAuxiliary(),
-      isBrowserSource.value
+      isDocumentSource.value || isBrowserWorkspace.value ? loadWorkspaces() : Promise.resolve(),
+      isDocumentSource.value || isBrowserWorkspace.value ? loadAuxiliary() : Promise.resolve(),
+      isBrowserDiscoveryView.value
         ? initializeBrowserDiscoveries()
         : Promise.resolve(),
     ]);
@@ -3136,7 +3147,17 @@ const initialize = async () => {
       });
       return;
     }
-    if (plan.action === "none") return;
+    if (plan.action === "none") {
+      if (browserScreen.value.view === "detail") {
+        browserDiscoveryTaskId.value = browserScreen.value.taskId;
+        if (await loadBrowserDiscoveryDetail(browserScreen.value.taskId)) {
+          startBrowserDiscoveryPolling();
+          if (!isBrowserDiscoveryActive(browserDiscoveryTask.value))
+            await loadBrowserDiscoveryRecords(browserScreen.value.taskId);
+        }
+      }
+      return;
+    }
     if (!plan.explicit) {
       await router.replace({
         path: route.path,
@@ -3162,6 +3183,8 @@ watch(projectId, (next, previous) => {
 watch(
   () => route.query.workspace_id,
   (nextWorkspaceId) => {
+    // Browser views are keyed by task/workspace identity and initialize afresh.
+    if (isBrowserSource.value) return;
     const id = Number(nextWorkspaceId);
     if (
       !routeTransitioning.value &&
@@ -3170,6 +3193,26 @@ watch(
       !sameWorkspaceId(id, rootWorkspace.value?.id)
     )
       void reloadWorkspace({ id, skipDirtyCheck: true });
+  },
+);
+let openingBrowserGenerationConfirmation = false;
+watch(
+  () => [route.query.confirm_generation, initializing.value, loading.value, modelsLoading.value, endpointsLoading.value],
+  async () => {
+    if (!isBrowserWorkspace.value || route.query.confirm_generation !== "1" ||
+        initializing.value || loading.value || modelsLoading.value || endpointsLoading.value ||
+        openingBrowserGenerationConfirmation) return;
+    openingBrowserGenerationConfirmation = true;
+    const requestViewEpoch = viewEpoch;
+    try {
+      const { confirm_generation, ...query } = route.query;
+      await router.replace({ path: route.path, query });
+      // Consume the navigation hint once; refresh/revisit must not re-open or run a job.
+      if (requestViewEpoch === viewEpoch && rootWorkspace.value?.id && !rootBusy.value)
+        prepareRootGeneration();
+    } finally {
+      openingBrowserGenerationConfirmation = false;
+    }
   },
 );
 onMounted(initialize);
@@ -3182,6 +3225,11 @@ onBeforeRouteLeave(async (to, from) => {
   return confirmDiscardDraft("切换工作区来源", { includePrompt: true });
 });
 onBeforeRouteUpdate(async (to, from) => {
+  if (isBrowserSource.value) {
+    if (browserWorkspacePageKey(to.query) === browserWorkspacePageKey(from.query)) return true;
+    if (routeTransitioning.value) return true;
+    return confirmDiscardDraft("切换探索任务或生成结果", { includePrompt: true });
+  }
   if (to.path !== from.path || to.query.workspace_id === from.query.workspace_id)
     return true;
   if (

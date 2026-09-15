@@ -12,6 +12,7 @@ import {
   browserDiscoveryErrorCodeLabel,
   browserDiscoveryEvidenceCounts,
   browserDiscoveryFormSnapshot,
+  browserDiscoveryHandoffs,
   browserDiscoveryItems,
   browserDiscoveryOriginResolution,
   browserDiscoveryOriginStateLabel,
@@ -19,12 +20,14 @@ import {
   browserDiscoveryExpandSelectedRecordIds,
   browserDiscoveryRecordIds,
   browserDiscoveryRecordGroups,
+  browserDiscoveryTaskLabel,
   browserDiscoveryTimeoutDefault,
   buildBrowserDiscoveryPayload,
   canConfirmBrowserDiscoveryOrigin,
   canHandoffBrowserDiscovery,
   canSelectBrowserDiscoveryOrigin,
   isApiOrigin,
+  formatBrowserDiscoveryTimestamp,
   shouldApplyBrowserDiscoveryResponse,
 } from "../src/utils/apiBrowserDiscovery.js";
 
@@ -559,6 +562,36 @@ test("browser discovery requires an explicit server deletion grant for an ended 
   );
 });
 
+test("browser discovery formats safe task summaries, local timestamps, and handoff entries", () => {
+  const localDate = new Date(2026, 8, 15, 9, 8, 7);
+  assert.equal(formatBrowserDiscoveryTimestamp(localDate.toISOString()), "2026-09-15 09:08:07");
+  assert.equal(formatBrowserDiscoveryTimestamp(null), "—");
+  assert.equal(formatBrowserDiscoveryTimestamp("not-a-timestamp"), "—");
+  assert.equal(
+    browserDiscoveryTaskLabel({ id: "9876543210abcdef", target_url: "https://example.test/orders?token=secret" }),
+    "https://example.test/orders · #98765432…cdef",
+  );
+  assert.equal(browserDiscoveryTaskLabel({ id: 18, target_url: "invalid" }), "任务 #18");
+  assert.deepEqual(
+    browserDiscoveryHandoffs({
+      handoffs: [
+        { workspace_id: 12, workspace_title: "订单生成", created_at: "2026-09-15T01:08:07Z", source_version: 4 },
+        { workspace_id: "12", workspace_title: "重复项" },
+        { workspace_id: "", workspace_title: "无效项" },
+        { workspace_id: "0", workspace_title: "零值" },
+        { workspace_id: -3, workspace_title: "负值" },
+        { workspace_id: true, workspace_title: "布尔值" },
+        { workspace_id: [9], workspace_title: "数组" },
+        { workspace_id: "9", workspace_title: "", created_at: null, source_version: null },
+      ],
+    }),
+    [
+      { workspaceId: "12", workspaceTitle: "订单生成", createdAt: "2026-09-15T01:08:07Z", sourceVersion: 4 },
+      { workspaceId: "9", workspaceTitle: "生成结果 #9", createdAt: null, sourceVersion: null },
+    ],
+  );
+});
+
 test("browser discovery panel is feature-gated and hands off record ids with version", async () => {
   const [source, specs, workspace, router, documents, browser] = await Promise.all([
     readFile(new URL("../src/components/api-testing/BrowserDiscoveryPanel.vue", import.meta.url), "utf8"),
@@ -595,7 +628,12 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(source, /选择此来源/);
   assert.match(source, /resolve-origin/);
   assert.match(source, /browser-discovery-timeout-\$\{disabled \|\| creating\}/);
-  assert.match(source, />开始探索</);
+  assert.match(source, /view: \{ type: String, default: "list"/);
+  assert.match(source, /view === 'create'/);
+  assert.match(source, /view === 'list'/);
+  assert.match(source, /view === 'detail'/);
+  assert.match(source, /open-workspace/);
+  assert.match(source, /确认接口并生成场景/);
   assert.match(specs, /网页探索发现/);
   assert.match(workspace, /v-if="isBrowserSource"/);
   assert.match(workspace, /data-testid="api-workspace-source-documents"/);
@@ -604,7 +642,8 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(workspace, /data-testid="api-workspace-source-readonly"/);
   assert.match(workspace, /source_type: requestSourceType/);
   assert.match(workspace, /isDocumentSource\.value\n        \? getAPISpecifications/);
-  assert.match(workspace, /isBrowserSource\.value\n        \? initializeBrowserDiscoveries/);
+  assert.match(workspace, /:view="browserScreen\.view"/);
+  assert.match(workspace, /@open-workspace="openBrowserWorkspace"/);
   assert.match(workspace, /requestSequence === reloadSequence/);
   assert.match(workspace, /requestViewEpoch === viewEpoch/);
   assert.match(workspace, /viewEpoch \+= 1/);

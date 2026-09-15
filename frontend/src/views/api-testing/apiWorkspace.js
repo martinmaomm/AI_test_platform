@@ -42,11 +42,42 @@ const positiveQueryInteger = (value) => {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+// Browser discovery and script editing are different screens, not two mutable
+// selections on one page. Only an explicit workspace link opens its editor.
+export const browserWorkspaceView = (query = {}) => {
+  const hasWorkspace = query.workspace_id != null;
+  const hasTask = query.discovery_id != null;
+  const hasView = query.view != null;
+  if ([hasWorkspace, hasTask, hasView].filter(Boolean).length > 1)
+    return { view: "invalid", message: "探索任务与生成工作区入口不能混用，请从任务列表重新打开。" };
+  if (hasWorkspace) {
+    const id = positiveQueryInteger(query.workspace_id);
+    return id ? { view: "workspace", workspaceId: id }
+      : { view: "invalid", message: "workspace_id 必须是正整数。" };
+  }
+  if (hasTask) {
+    const id = query.discovery_id;
+    return typeof id === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)
+      ? { view: "detail", taskId: id.toLowerCase() }
+      : { view: "invalid", message: "探索任务 ID 无效，请从任务列表重新打开。" };
+  }
+  if (hasView) return query.view === "new" ? { view: "create" }
+    : { view: "invalid", message: "探索页面入口无效。" };
+  return { view: "list" };
+};
+
+export const browserWorkspacePageKey = (query = {}) =>
+  JSON.stringify([query.workspace_id ?? null, query.discovery_id ?? null, query.view ?? null]);
+
 export const workspaceInitializationPlan = (
   query = {},
   workspaces = [],
   { sourceType = "document" } = {},
 ) => {
+  if (sourceType === "browser_capture") {
+    const screen = browserWorkspaceView(query);
+    if (screen.view === "invalid") return { action: "invalid", message: screen.message };
+  }
   const hasWorkspaceId = query.workspace_id != null;
   if (hasWorkspaceId) {
     const workspaceId = positiveQueryInteger(query.workspace_id);
@@ -77,11 +108,10 @@ export const workspaceInitializationPlan = (
       : { action: "create", caseId, endpointId, targetEndpointId, specId, explicit: true };
   }
 
+  if (sourceType === "browser_capture") return { action: "none", explicit: false };
   const workspaceId = workspaces[0]?.id;
   if (workspaceId) return { action: "load", workspaceId, explicit: false };
-  return sourceType === "browser_capture"
-    ? { action: "none", explicit: false }
-    : { action: "create", caseId: null, endpointId: null, explicit: false };
+  return { action: "create", caseId: null, endpointId: null, explicit: false };
 };
 
 export const endpointCaseScope = (ids, targetEndpointId, max = 50) => {

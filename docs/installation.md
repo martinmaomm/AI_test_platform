@@ -184,6 +184,22 @@ npm run build
 
 当前仓库没有现成的 Docker / Compose 或生产反向代理、进程守护配置。生产部署还需配置 HTTPS、`/api/v1` 的 HTTP 反向代理、`/ws` 的 Upgrade/WebSocket 转发、`dist/` 托管和 SPA 路由回退，以及合适的 `ALLOWED_HOSTS`、`FRONTEND_BASE_URL`、CORS/CSRF 来源。使用 Django 管理后台时还需 `collectstatic` 和 `/static/` 托管；不要公开挂载日志或整个媒体目录。这些不是 `npm run build` 自动完成的内容。
 
+生产反向代理若直接托管 `MEDIA_ROOT`，必须先拒绝执行截图子目录，再配置其余公开媒体；不能依赖 Django 的开发 media guard。Nginx 至少应使用大小写不敏感的精确目录边界，且 deny 规则必须位于通用 `/media/` alias 之前：
+
+```nginx
+location ~* ^/media/webui_failure_screenshots(?:/|$) {
+    return 404;
+}
+
+location /media/ {
+    alias /absolute/path/to/automation-platform/backend/media/;
+    autoindex off;
+    disable_symlinks on from=/absolute/path/to/automation-platform/backend/media/;
+}
+```
+
+不要在公开媒体目录中创建指向 `webui_failure_screenshots` 或其他私有目录的符号链接。执行截图只允许通过 `/api/v1/projects/<project_id>/web-testing/executions/.../screenshot/` 鉴权接口读取；修改反向代理配置后，用本轮自有夹具分别验证原始路径、大小写变体、URL 编码路径和符号链接别名均为 404，再验证鉴权接口，而不是扫描历史截图目录。
+
 此外，当前 Vite `allowedHosts` 列了项目原开发域名。换用其他自定义域名时，在 `frontend/vite.config.js` 的 `server.allowedHosts` 中添加该域名并重启 Vite；不要改成无条件放行。直接使用 IP 的访问不能简单按这份域名名单判断。旧资料若提到 Vite 代理 `/playwright-reports`，与当前代码不一致：当前只代理 `/api/v1` 和 `/ws`，原生报告使用平台路由与接口。
 
 ## 6. 两套 Playwright 浏览器运行时

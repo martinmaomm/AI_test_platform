@@ -6,6 +6,7 @@ from django.urls import path, include
 from django.conf import settings
 from rest_framework.routers import DefaultRouter
 from django.conf.urls.static import static
+from common.media import public_media_serve
 from scheduled_tasks import views as views_scheduled_tasks
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
@@ -41,8 +42,8 @@ urlpatterns = [
     path('api/v1/util/', include('common.urls'))
 ]
 
-# 开发环境媒体文件；原生报告通过认证接口读取，不公开执行工作目录。
-urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# 开发环境只公开普通媒体；执行截图必须通过带项目权限的认证接口读取。
+urlpatterns += static(settings.MEDIA_URL, view=public_media_serve)
 # 开发环境下额外静态资源
 if settings.DEBUG:
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

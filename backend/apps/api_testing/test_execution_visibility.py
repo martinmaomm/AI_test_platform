@@ -101,13 +101,17 @@ class APITestExecutionVisibilityTests(TestCase):
             execution=execution, test_case=None, name=execution.name, status='running', httprunner_result='{}',
         )
 
-        outsider_ids = {item['id'] for item in self.items(self.list(self.outsider))}
-        self.assertNotIn(execution.id, outsider_ids)
+        outsider_list = self.list(self.outsider)
+        self.assertEqual(outsider_list.status_code, 404, outsider_list.data)
+        self.assertFalse(outsider_list.data['success'])
+        self.assertNotIn('data', outsider_list.data)
+        self.assertNotIn('items', str(outsider_list.data))
+        self.assertNotIn(execution.name, str(outsider_list.data))
 
         detail = self.client.get(
             f'/api/v1/projects/{self.project.pk}/api-testing/executions/case/{execution.pk}/',
         )
-        self.assertEqual(detail.status_code, 400, detail.data)
+        self.assertEqual(detail.status_code, 404, detail.data)
         self.assertFalse(detail.data['success'])
         report = self.client.get(
             f'/api/v1/projects/{self.project.pk}/api-testing/executions/{execution.pk}/report/',

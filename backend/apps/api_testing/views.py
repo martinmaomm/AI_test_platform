@@ -38,10 +38,43 @@ from projects.knowledge.models import UploadedFile
 from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
 from django.core.files.storage import default_storage
 from ai_core.models import LLMConfiguration
 
 logger = logging.getLogger(__name__)
+
+
+def _get_api_project_for_user(
+    project_id, user, capability='read', *, allow_superuser=False,
+):
+    """Resolve an API project without disclosing it to non-members.
+
+    Owners and creators have every capability. A missing project, a project of
+    another type, or an absent membership is hidden as 404. Existing members
+    lacking an explicit capability receive 403, matching the project-scoped
+    access contract used by the Web UI APIs.
+    """
+    project = Project.objects.filter(pk=project_id, project_type='api').first()
+    if project is None:
+        raise Http404('项目不存在')
+    if allow_superuser and user.is_superuser:
+        return project
+    if project.owner_id == user.id or project.created_by_id == user.id:
+        return project
+
+    member = project.members.filter(user=user).first()
+    if member is None:
+        raise Http404('项目不存在或无权限访问')
+    required_flag = {
+        'edit': 'can_edit',
+        'delete': 'can_delete',
+        'execute': 'can_execute_tests',
+        'report': 'can_view_reports',
+    }.get(capability)
+    if required_flag and not getattr(member, required_flag, False):
+        raise PermissionDenied('没有执行此项目操作的权限')
+    return project
 
 
 def _get_response_definitions(spec):
@@ -84,6 +117,7 @@ class APISpecificationListView(generics.ListCreateAPIView):
         # 使用URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
         if project_id:
+            _get_api_project_for_user(project_id, self.request.user)
             return _source_visible_specifications(project_id, self.request.user)
         else:
             # 如果没有项目ID，返回空查询集
@@ -205,6 +239,7 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
         """获取当前项目的API规范"""
         project_id = self.kwargs.get('project_id')
         if project_id:
+            _get_api_project_for_user(project_id, self.request.user)
             return _source_visible_specifications(project_id, self.request.user)
         return APISpecification.objects.none()
     
@@ -218,7 +253,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
             
             # 检查权限
             project = instance.project
-            if not (project.created_by == request.user or
+            if not (project.owner_id == request.user.id or
+                    project.created_by == request.user or
                     project.members.filter(user=request.user).exists()):
                 return response(
                     kind="permission_denied",
@@ -252,7 +288,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
             
             # 检查权限
             project = instance.project
-            if not (project.created_by == request.user or
+            if not (project.owner_id == request.user.id or
+                    project.created_by == request.user or
                     project.members.filter(user=request.user, can_edit=True).exists()):
                 return response(
                     kind="permission_denied",
@@ -298,7 +335,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
             
             # 检查权限
             project = instance.project
-            if not (project.created_by == request.user or
+            if not (project.owner_id == request.user.id or
+                    project.created_by == request.user or
                     project.members.filter(user=request.user, can_edit=True).exists()):
                 return response(
                     kind="permission_denied",
@@ -364,12 +402,15 @@ class APIEndpointListView(generics.ListAPIView):
         if not spec_id or not project_id:
             return APIEndpoint.objects.none()
 
+        _get_api_project_for_user(project_id, self.request.user)
+
         # 检查权限：用户是否有权限查看此API规范
         spec = get_object_or_404(
             _source_visible_specifications(project_id, self.request.user).select_related('project', 'source_task'),
             id=spec_id,
         )
-        if not (spec.project.created_by == self.request.user or
+        if not (spec.project.owner_id == self.request.user.id or
+                spec.project.created_by == self.request.user or
                 spec.project.members.filter(user=self.request.user).exists()):
             return APIEndpoint.objects.none()
 
@@ -424,12 +465,15 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
         if not spec_id or not project_id:
             return APIEndpoint.objects.none()
 
+        _get_api_project_for_user(project_id, self.request.user)
+
         # 检查权限：用户是否有权限查看此API规范
         spec = get_object_or_404(
             _source_visible_specifications(project_id, self.request.user).select_related('project', 'source_task'),
             id=spec_id,
         )
-        if not (spec.project.created_by == self.request.user or
+        if not (spec.project.owner_id == self.request.user.id or
+                spec.project.created_by == self.request.user or
                 spec.project.members.filter(user=self.request.user).exists()):
             return APIEndpoint.objects.none()
 
@@ -465,12 +509,14 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
         )
 
     def update(self, request, *args, **kwargs):
+        _get_api_project_for_user(self.kwargs.get('project_id'), request.user, 'edit')
         instance = self.get_object()
         if instance.spec.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
             return response(kind='error', message='浏览器探索来源端点不可通过普通端点接口修改。', status_code=409)
         return super().update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
+        _get_api_project_for_user(self.kwargs.get('project_id'), request.user, 'delete')
         instance = self.get_object()
         if instance.spec.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
             return response(kind='error', message='浏览器探索来源端点不可通过普通端点接口删除。', status_code=409)
@@ -495,10 +541,12 @@ class APITestCaseListCreateView(generics.ListCreateAPIView):
     
     def get_queryset(self):
         """获取当前用户的测试用例"""
+        project_id = self.kwargs.get('project_id')
+        if project_id:
+            _get_api_project_for_user(project_id, self.request.user)
         queryset = APITestCase.objects.filter(created_by=self.request.user)
         
         # 项目过滤（使用URL路径参数）
-        project_id = self.kwargs.get('project_id')
         if project_id:
             queryset = queryset.filter(project_id=project_id)
         
@@ -633,10 +681,12 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
     
     def get_queryset(self):
         """获取当前用户的测试用例"""
+        project_id = self.kwargs.get('project_id')
+        if project_id:
+            _get_api_project_for_user(project_id, self.request.user)
         queryset = APITestCase.objects.filter(created_by=self.request.user)
         
         # 使用URL路径参数中的项目ID
-        project_id = self.kwargs.get('project_id')
         if project_id:
             queryset = queryset.filter(project_id=project_id)
         
@@ -653,10 +703,10 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
                 data=serializer.data,
                 message="获取API测试用例详情成功"
             )
-        except APITestCase.DoesNotExist:
+        except (APITestCase.DoesNotExist, Http404):
             return response(
                 kind="error",
-                message="API测试用例不存在或无权限访问"
+                message="API测试用例不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"获取API测试用例详情失败: {e}", exc_info=True)
@@ -694,10 +744,10 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
                     message="数据验证失败",
                     errors=serializer.errors
                 )
-        except APITestCase.DoesNotExist:
+        except (APITestCase.DoesNotExist, Http404):
             return response(
                 kind="error",
-                message="API测试用例不存在或无权限访问"
+                message="API测试用例不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"更新API测试用例失败: {e}", exc_info=True)
@@ -720,10 +770,10 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
                 kind="success",
                 message="API测试用例删除成功"
             )
-        except APITestCase.DoesNotExist:
+        except (APITestCase.DoesNotExist, Http404):
             return response(
                 kind="error",
-                message="API测试用例不存在或无权限访问"
+                message="API测试用例不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"删除API测试用例失败: {e}", exc_info=True)
@@ -1319,6 +1369,7 @@ class APITestExecutionListView(generics.ListAPIView):
         """获取当前用户的执行记录"""
         user = self.request.user
         project_id = self.kwargs.get('project_id')
+        _get_api_project_for_user(project_id, user, allow_superuser=True)
         
         queryset = _report_execution_queryset(user, project_id).select_related(
             'executor', 'environment', 'project'
@@ -1378,6 +1429,9 @@ class APITestCaseExecutionDetailView(APIView):
 
     def get(self, request, project_id, pk):
         """获取单用例执行详情"""
+        _get_api_project_for_user(
+            project_id, request.user, allow_superuser=True,
+        )
         try:
             user = request.user
             # 使用filter().first()而不是get()，避免MultipleObjectsReturned错误
@@ -1392,8 +1446,8 @@ class APITestCaseExecutionDetailView(APIView):
             
             if not case_detail:
                 return response(
-                    kind="error",
-                    message="执行记录不存在或无权限访问"
+                    kind="not_found",
+                    message="执行记录不存在或无权限访问", status_code=404,
                 )
             
             serializer = APITestCaseExecutionDetailSerializer(case_detail)
@@ -1416,6 +1470,9 @@ class APITestSuiteExecutionDetailView(APIView):
 
     def get(self, request, project_id, pk):
         """获取套件执行详情"""
+        _get_api_project_for_user(
+            project_id, request.user, allow_superuser=True,
+        )
         try:
             user = request.user
             suite_detail = APITestSuiteExecutionDetail.objects.select_related(
@@ -1435,8 +1492,8 @@ class APITestSuiteExecutionDetailView(APIView):
             )
         except APITestSuiteExecutionDetail.DoesNotExist:
             return response(
-                kind="error",
-                message="执行记录不存在或无权限访问"
+                kind="not_found",
+                message="执行记录不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"获取套件执行详情失败: {e}", exc_info=True)
@@ -1522,6 +1579,7 @@ class APITestExecutionDeleteView(APIView):
 
     def delete(self, request, project_id, pk):
         """删除执行记录"""
+        _get_api_project_for_user(project_id, request.user)
         try:
             user = request.user
 
@@ -1529,7 +1587,7 @@ class APITestExecutionDeleteView(APIView):
             execution = APITestExecution.objects.select_related(
                 'case_execution_detail', 'suite_execution_detail'
             ).get(
-                pk=pk,
+                pk=pk, project_id=project_id,
                 executor=user
             )
 
@@ -1556,10 +1614,10 @@ class APITestExecutionDeleteView(APIView):
                 message=f"删除{exec_type}执行记录成功"
             )
 
-        except APITestExecution.DoesNotExist:
+        except (APITestExecution.DoesNotExist, Http404):
             return response(
-                kind="error",
-                message="执行记录不存在或无权限访问"
+                kind="not_found",
+                message="执行记录不存在或无权限访问", status_code=404,
             )
         except Exception as e:
             logger.error(f"删除执行记录失败: {e}", exc_info=True)

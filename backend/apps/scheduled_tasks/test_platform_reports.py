@@ -38,6 +38,10 @@ class PlatformNativeReportTests(TestCase):
             name='Native reports', project_type='api', owner=self.owner, created_by=self.owner,
         )
         ProjectMember.objects.create(
+            project=self.project, user=self.owner, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
+        ProjectMember.objects.create(
             project=self.project, user=self.reviewer, can_view_reports=True,
         )
         self.environment = Environment.objects.create(

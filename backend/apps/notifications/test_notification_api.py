@@ -23,6 +23,14 @@ class NotificationApiContractTests(TestCase):
         self.admin = users.objects.create_user("notification-admin", "admin@example.test", "password", is_staff=True)
         self.project = Project.objects.create(name="Notification project", project_type="web", owner=self.owner, created_by=self.owner)
         self.other_project = Project.objects.create(name="Other project", project_type="api", owner=self.outsider, created_by=self.outsider)
+        ProjectMember.objects.create(
+            project=self.project, user=self.owner, role="editor", can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
+        ProjectMember.objects.create(
+            project=self.other_project, user=self.outsider, role="editor", can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         ProjectMember.objects.create(project=self.project, user=self.editor, role="editor", can_edit=True, can_delete=True, can_execute_tests=True)
         ProjectMember.objects.create(project=self.project, user=self.viewer, role="viewer", can_edit=False, can_delete=False, can_execute_tests=False)
         self.email = NotificationChannel.objects.create(channel_code="email", channel_name="邮件")

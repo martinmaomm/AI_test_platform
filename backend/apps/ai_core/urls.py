@@ -16,6 +16,7 @@ urlpatterns = [
     
     # ============ LLM配置管理 ============
     path('llm-configs/', views.LLMConfigurationViewSet.as_view(), name='llm_configs'),
+    path('llm-configs/available/', views.AvailableLLMConfigurationView.as_view(), name='available_llm_configs'),
     path('llm-configs/<int:config_id>/', views.LLMConfigurationDetailView.as_view(), name='llm_config_detail'),
     path('llm-configs/<int:config_id>/<str:action>/', views.LLMConfigurationActionView.as_view(), name='llm_config_action'),
     path('llm-configs/test_connection/', views.LLMTestConnectionView.as_view(), name='llm_test_connection'),

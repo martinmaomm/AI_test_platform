@@ -26,12 +26,12 @@ class ExplorationActionScopeTests(SimpleTestCase):
             '检查上传历史和下载记录', 'Inspect payment and approval history',
         ):
             with self.subTest(description=description), patch(
-                'web_testing.generation_preflight.LLMConfiguration.objects.filter',
+                'web_testing.generation_preflight.usable_llm_configurations',
             ) as models, patch(
                 'web_testing.generation_preflight.resolve_active_playwright_mcp_config',
                 return_value=(2, {'mcpServers': {}}),
             ):
-                models.return_value.exists.return_value = True
+                models.return_value.filter.return_value.exists.return_value = True
                 result = run_safety_preflight(
                     SimpleNamespace(model_info={'config_id': 1}, user_id=3, description_safe=description),
                     {'allow_test_data_writes': False},

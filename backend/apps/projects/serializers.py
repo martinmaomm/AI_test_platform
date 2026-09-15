@@ -252,20 +252,8 @@ class ProjectCreateSerializer(serializers.ModelSerializer):
         fields = ['name', 'description', 'project_type']
     
     def create(self, validated_data):
-        project = super().create(validated_data)
-        
-        # 创建者自动成为项目所有者
-        ProjectMember.objects.create(
-            project=project,
-            user=self.context['request'].user,
-            role='owner',
-            can_edit=True,
-            can_delete=True,
-            can_execute_tests=True,
-            can_view_reports=True
-        )
-        
-        return project
+        # 项目只能由平台管理员创建；管理员不需要冗余成员关系。
+        return super().create(validated_data)
 
 
 class ProjectMemberCreateSerializer(serializers.ModelSerializer):
@@ -284,6 +272,17 @@ class ProjectMemberCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('该用户已经是项目成员')
         
         return attrs
+
+    def create(self, validated_data):
+        validated_data.update(
+            project=self.context['project'],
+            role='editor',
+            can_edit=True,
+            can_delete=True,
+            can_execute_tests=True,
+            can_view_reports=True,
+        )
+        return super().create(validated_data)
 
 
 

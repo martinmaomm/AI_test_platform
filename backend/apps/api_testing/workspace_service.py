@@ -12,10 +12,13 @@ from datetime import timedelta
 from typing import Any
 
 from django.db import models, transaction
+from django.http import Http404
+from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from .models import APIEndpoint, APIWorkspace, APITestCase, APISpecification, default_api_workspace_draft
+from projects.access import EDIT, EXECUTE, get_project_for_user
 from projects.models import Project
 
 
@@ -46,40 +49,38 @@ def scenario_authenticated_endpoint_ids(scenario: dict[str, Any], *, target_endp
 
 
 def can_edit_project(project: Project, user) -> bool:
-    return (
-        project.created_by_id == user.id
-        or project.owner_id == user.id
-        or project.members.filter(user=user, can_edit=True).exists()
-    )
+    try:
+        get_project_for_user(project.pk, user, EDIT)
+    except (Http404, PermissionDenied):
+        return False
+    return True
 
 
 def can_execute_project(project: Project, user) -> bool:
-    return (
-        project.created_by_id == user.id
-        or project.owner_id == user.id
-        or project.members.filter(user=user, can_execute_tests=True).exists()
-    )
+    try:
+        get_project_for_user(project.pk, user, EXECUTE)
+    except (Http404, PermissionDenied):
+        return False
+    return True
 
 
 def validate_model_id(model_id: Any, *, owner) -> int | None:
-    """Validate a persisted model binding without allowing cross-user reuse."""
+    """Validate a persisted binding against platform-usable model configs."""
     if model_id is None:
         return None
     if not isinstance(model_id, int) or isinstance(model_id, bool) or model_id <= 0:
         raise WorkspaceValidationError('model_id 必须是正整数或 null。')
-    from ai_core.models import LLMConfiguration, ModelType
-    if not LLMConfiguration.objects.filter(
-        pk=model_id, created_by=owner, model_type=ModelType.LLM, is_active=True,
-    ).exists():
-        raise WorkspaceValidationError('model_id 不存在、不属于当前工作区所有者、不是 LLM 或已被禁用。')
+    from ai_core.config_access import usable_llm_configurations
+    if not usable_llm_configurations().filter(pk=model_id).exists():
+        raise WorkspaceValidationError('model_id 不存在、不是 LLM 或已被禁用。')
     return model_id
 
 
 def require_generation_model_id(model_id: Any, *, owner) -> int:
-    """Generation must use an explicit, currently available owner-scoped model."""
+    """Generation must use an explicit, currently platform-available model."""
     validated_model_id = validate_model_id(model_id, owner=owner)
     if validated_model_id is None:
-        raise WorkspaceValidationError('发起 AI 对话前必须选择当前工作区所有者的启用 LLM 模型。')
+        raise WorkspaceValidationError('发起 AI 对话前必须选择启用的 LLM 模型。')
     return validated_model_id
 
 
@@ -101,17 +102,16 @@ def require_executable_draft(value: Any) -> dict[str, Any]:
 
 
 def _require_browser_capture_source_owner(spec: APISpecification, *, owner) -> None:
-    """Enforce browser evidence ownership at user-scoped workspace boundaries.
+    """Validate published capture provenance without exposing the raw task.
 
-    ``endpoint_specs`` is also used by trusted internal projections and offline
-    contract tests.  Those callers have no request principal and therefore do
-    not receive an implicit project-wide grant; every HTTP workspace entry
-    passes its owner explicitly below.
+    ``owner`` remains for call compatibility. Published specifications and
+    endpoints are project assets; BrowserDiscoveryTask records and workspaces
+    remain owner-private at their own HTTP boundaries.
     """
     if spec.spec_type != APISpecification.SpecType.BROWSER_CAPTURE:
         return
-    if owner is not None and (not spec.source_task_id or spec.source_task.owner_id != owner.id):
-        raise WorkspaceValidationError('浏览器探索来源仅限其发起者用于工作区生成。')
+    if not spec.source_task_id or spec.source_task.project_id != spec.project_id:
+        raise WorkspaceValidationError('浏览器探索来源不存在或与当前项目不一致。')
 
 
 def validate_spec_id(project_id: int, spec_id: Any, *, owner=None) -> APISpecification | None:
@@ -998,9 +998,9 @@ def generation_budget(*, model_id: int | None, owner, queued_at=None) -> dict[st
     """Freeze queue/active/batch/LLM budgets when the request is accepted."""
     queued_at = queued_at or timezone.now()
     from ai_core.model_manager import DEFAULT_LLM_TIMEOUT
-    from ai_core.models import LLMConfiguration
+    from ai_core.config_access import usable_llm_configurations
     llm_seconds = DEFAULT_LLM_TIMEOUT
-    model = LLMConfiguration.objects.filter(pk=model_id, created_by=owner).only('provider', 'extra_config').first()
+    model = usable_llm_configurations().filter(pk=model_id).only('provider', 'extra_config').first()
     if model:
         default_llm = 30 if model.provider == 'ollama' else DEFAULT_LLM_TIMEOUT
         configured = model.extra_config.get('timeout', default_llm) if isinstance(model.extra_config, dict) else default_llm

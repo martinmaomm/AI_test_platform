@@ -177,7 +177,7 @@ class WebSocketJWTAuthMiddleware(BaseMiddleware):
                 return None
             
             try:
-                user = User.objects.get(id=user_id)
+                user = User.objects.get(id=user_id, is_active=True)
                 return user
             except User.DoesNotExist:
                 logger.warning(f"用户不存在: {user_id}")

@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { usersApi } from '@/api/users'
 import { useProjectStore } from './project'
+import { isCurrentUserAuthenticationFailure } from '@/utils/sessionErrors'
 
 export const useAuthStore = defineStore('auth', () => {
   // 状态
@@ -134,6 +135,20 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  // 每次进入受保护路由时由路由守卫调用，以服务端当前角色覆盖持久化状态。
+  const refreshCurrentUser = async () => {
+    if (!accessToken.value) return { ok: false, authenticationFailed: true }
+    try {
+      const response = await usersApi.getCurrentUser()
+      const currentUser = response?.data?.data
+      if (!currentUser) return { ok: false, authenticationFailed: false }
+      user.value = currentUser
+      return { ok: true, authenticationFailed: false }
+    } catch (error) {
+      return { ok: false, authenticationFailed: isCurrentUserAuthenticationFailure(error) }
+    }
+  }
+
 
 
   // 初始化时检查token状态
@@ -158,7 +173,8 @@ export const useAuthStore = defineStore('auth', () => {
     login,
     register,
     logout,
-    refreshAccessToken
+    refreshAccessToken,
+    refreshCurrentUser
   }
 }, {
   // 持久化配置

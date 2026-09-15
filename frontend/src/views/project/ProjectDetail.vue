@@ -6,8 +6,8 @@
         <h1>{{ project?.name || '项目详情' }}</h1>
       </div>
       <div class="header-actions">
-        <el-button type="warning" @click="editProject">编辑项目</el-button>
-        <el-button type="danger" @click="deleteProject">删除项目</el-button>
+        <el-button v-if="canManageProjects" type="warning" @click="editProject">编辑项目</el-button>
+        <el-button v-if="canManageProjects" type="danger" @click="deleteProject">删除项目</el-button>
       </div>
     </div>
     
@@ -17,7 +17,7 @@
         <div class="card-header">
           <span>项目概览</span>
           <div class="header-actions">
-            <el-button type="primary" @click="editProject">编辑项目</el-button>
+            <el-button v-if="canManageProjects" type="primary" @click="editProject">编辑项目</el-button>
             <el-button type="success" @click="goToKnowledgeBase">知识库管理</el-button>
           </div>
         </div>
@@ -103,7 +103,7 @@
         <el-button type="success" icon="Document" @click="goToKnowledgeBase">
           查看知识库
         </el-button>
-        <el-button type="warning" icon="Setting" @click="manageMembers">
+        <el-button v-if="canManageProjects" type="warning" icon="Setting" @click="manageMembers">
           管理成员
         </el-button>
         <el-button type="info" icon="Connection" @click="manageEnvironments">
@@ -115,10 +115,12 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import BackButton from '@/components/BackButton.vue'
 import { useProjectStore } from '@/stores/project'
+import { useAuthStore } from '@/stores/auth'
+import { canManageProjectMetadata } from '@/utils/accessControl'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import dayjs from 'dayjs'
 import { getProject, getProjectStatistics } from '@/api/projects'
@@ -126,6 +128,8 @@ import { getProject, getProjectStatistics } from '@/api/projects'
 const route = useRoute()
 const router = useRouter()
 const projectStore = useProjectStore()
+const authStore = useAuthStore()
+const canManageProjects = computed(() => canManageProjectMetadata(authStore.user))
 const projectId = route.params.id
 
 // 响应式数据
@@ -175,9 +179,9 @@ const goToKnowledgeBase = async () => {
   router.push('/project/knowledge-base')
 }
 
-// 管理成员（当前无独立成员页，暂用项目列表）
+// 项目成员由全局用户管理中的项目分配统一维护。
 const manageMembers = () => {
-  router.push('/project/project-list')
+  router.push('/settings/users')
 }
 
 // 环境配置：先设为当前项目，再跳转扁平路由 /project/environments

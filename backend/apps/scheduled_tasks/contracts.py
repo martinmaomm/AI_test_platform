@@ -2,17 +2,11 @@
 from django.http import Http404
 from rest_framework.exceptions import ValidationError
 
-from projects.models import Project
-from web_testing.project_access import get_project_for_user
+from projects.access import get_project_for_user
 
 
 def get_schedule_project(project_id, user, capability='read'):
-    if user.is_superuser:
-        project = Project.objects.filter(pk=project_id).first()
-        if project is None:
-            raise Http404('项目不存在')
-    else:
-        project = get_project_for_user(project_id, user, capability, expected_project_type=None)
+    project = get_project_for_user(project_id, user, capability, expected_project_type=None)
     if project.project_type not in {'web', 'api'}:
         raise ValidationError('当前项目不支持计划任务，仅支持 UI 和 API 项目')
     return project

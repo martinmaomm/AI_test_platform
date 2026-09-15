@@ -5,7 +5,7 @@ Web Testing Serializers
 from collections.abc import Mapping
 
 from rest_framework import serializers
-from ai_core.models import LLMConfiguration, ModelType
+from ai_core.config_access import usable_llm_configurations
 from .models import (
     WebUITestCase, WebUITestExecution, WebUITestSuite, WebUITestModule,
     WebUITestCaseExecutionDetail, WebUITestSuiteExecutionDetail, WebUITestSuiteCaseExecution,
@@ -194,7 +194,7 @@ class WebUIScriptGenerationCreateSerializer(serializers.Serializer):
             module = WebUITestModule.ensure_default(project.id)
 
         requested_model_id = attrs.get('model_config_id')
-        model_query = LLMConfiguration.objects.filter(model_type=ModelType.LLM, is_active=True)
+        model_query = usable_llm_configurations()
         model_config = (
             model_query.filter(pk=requested_model_id).first()
             if requested_model_id is not None

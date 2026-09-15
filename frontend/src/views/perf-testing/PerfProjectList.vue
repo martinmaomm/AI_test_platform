@@ -7,7 +7,7 @@
         </template>
         <template #title />
         <template #extra>
-          <el-button type="primary" @click="showCreateDialog = true">
+          <el-button v-if="canManageProjects" type="primary" @click="showCreateDialog = true">
             <el-icon><Plus /></el-icon>
             新建性能项目
           </el-button>
@@ -57,17 +57,21 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Plus, DataLine } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
 import { getProjects, createProject } from '@/api/projects'
 import { useProjectStore } from '@/stores/project'
+import { useAuthStore } from '@/stores/auth'
+import { canManageProjectMetadata } from '@/utils/accessControl'
 import dayjs from 'dayjs'
 
 const router = useRouter()
 const projectStore = useProjectStore()
+const authStore = useAuthStore()
+const canManageProjects = computed(() => canManageProjectMetadata(authStore.user))
 
 const loading = ref(false)
 const creating = ref(false)

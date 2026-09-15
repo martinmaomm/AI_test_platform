@@ -1,14 +1,18 @@
 from rest_framework import generics, permissions, status, viewsets
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
+from django.db import transaction
 from django.db.models import Q
+from django.contrib.auth import get_user_model
 from django.core.paginator import Paginator
 from django.core.files.storage import default_storage
 import logging
 
 from users.models import UserPreference
+from users.permissions import IsPlatformAdmin, is_platform_admin
+from .access import REPORT, get_project_for_user, projects_for_user
 from .models import Project, ProjectMember
 from .serializers import (
     ProjectSerializer, ProjectCreateSerializer, ProjectMemberSerializer,
@@ -17,17 +21,36 @@ from .serializers import (
 from common.api import response
 
 logger = logging.getLogger(__name__)
+User = get_user_model()
+
+
+def _lock_admin_and_target(request, target_user_id):
+    users = {user.pk: user for user in User.objects.select_for_update().filter(
+        pk__in={request.user.pk, target_user_id},
+    ).order_by('pk')}
+    actor = users.get(request.user.pk)
+    if not is_platform_admin(actor):
+        raise PermissionDenied('您的管理员权限已变更，请刷新后重试。')
+    target = users.get(target_user_id)
+    if target is None:
+        raise ValidationError({'user': '用户不存在'})
+    if is_platform_admin(target):
+        raise ValidationError({'user': '管理员可以管理全部项目，无需加入项目成员。'})
+    return target
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
     """项目管理ViewSet"""
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        permission_types = [permissions.IsAuthenticated]
+        if self.action in {'create', 'update', 'partial_update', 'destroy'}:
+            permission_types.append(IsPlatformAdmin)
+        return [permission() for permission in permission_types]
     
     def get_queryset(self):
-        user = self.request.user
-        queryset = Project.objects.filter(
-            Q(members__user=user) | Q(created_by=user) | Q(owner=user)
-        ).distinct()
+        queryset = projects_for_user(self.request.user)
 
         # 按项目类型过滤
         project_type = self.request.query_params.get('project_type', '')
@@ -57,15 +80,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
     def perform_update(self, serializer):
-        """仅允许项目负责人或拥有编辑权限的成员修改项目基本信息。"""
-        project = self.get_object()
-        can_edit = (
-            project.created_by_id == self.request.user.id
-            or project.owner_id == self.request.user.id
-            or project.members.filter(user=self.request.user, can_edit=True).exists()
-        )
-        if not can_edit:
-            raise PermissionDenied('您没有权限编辑此项目')
+        """Project metadata is managed by platform administrators only."""
         serializer.save()
 
     def list(self, request, *args, **kwargs):
@@ -112,10 +127,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def user_projects(self, request):
         """获取当前用户的项目列表"""
-        user = request.user
-        projects = Project.objects.filter(
-            Q(members__user=user) | Q(created_by=user) | Q(owner=user)
-        ).distinct()
+        projects = projects_for_user(request.user)
         serializer = ProjectSerializer(projects, many=True)
         return response(
             kind="success",
@@ -129,13 +141,6 @@ class ProjectViewSet(viewsets.ModelViewSet):
         project = self.get_object()
         member = get_object_or_404(ProjectMember, project=project, user=request.user)
 
-        # 项目所有者不能离开项目
-        if project.owner == request.user:
-            return response(
-                kind="error",
-                message="项目所有者不能离开项目"
-            )
-
         member.delete()
         return response(
             kind="success",
@@ -148,12 +153,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         """获取项目统计信息"""
         project = self.get_object()
 
-        # 检查用户权限
-        if not project.members.filter(user=request.user, can_view_reports=True).exists():
-            return response(
-                kind="error",
-                message="您没有权限查看此项目的统计信息"
-            )
+        get_project_for_user(project.pk, request.user, REPORT)
 
         # 统计信息
         total_members = project.members.count()
@@ -178,14 +178,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
 class ProjectMemberListView(generics.ListCreateAPIView):
     """项目成员列表和添加视图"""
     serializer_class = ProjectMemberSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, IsPlatformAdmin]
 
     def get_queryset(self):
         project_id = self.kwargs.get('project_id')
         project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限查看成员
-        if not project.members.filter(user=self.request.user, can_view_reports=True).exists():
-            return ProjectMember.objects.none()
         return ProjectMember.objects.filter(project=project)
 
     def get_serializer_class(self):
@@ -198,16 +195,46 @@ class ProjectMemberListView(generics.ListCreateAPIView):
         context['project'] = get_object_or_404(Project, id=self.kwargs.get('project_id'))
         return context
 
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            target = _lock_admin_and_target(self.request, serializer.validated_data['user'].pk)
+            project = get_object_or_404(
+                Project.objects.select_for_update(), pk=self.kwargs.get('project_id'),
+            )
+            if ProjectMember.objects.filter(project=project, user=target).exists():
+                raise ValidationError({'user': '该用户已经是项目成员'})
+            serializer.save(project=project, user=target)
+
 
 class ProjectMemberDetailView(generics.RetrieveUpdateDestroyAPIView):
     """项目成员详情视图"""
     serializer_class = ProjectMemberSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, IsPlatformAdmin]
 
     def get_queryset(self):
         project_id = self.kwargs.get('project_id')
-        project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限管理成员
-        if not project.members.filter(user=self.request.user, can_edit=True).exists():
-            return ProjectMember.objects.none()
-        return ProjectMember.objects.filter(project=project)
+        return ProjectMember.objects.filter(project_id=project_id)
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            target = _lock_admin_and_target(self.request, serializer.instance.user_id)
+            project = get_object_or_404(
+                Project.objects.select_for_update(), pk=self.kwargs.get('project_id'),
+            )
+            serializer.instance = get_object_or_404(
+                ProjectMember.objects.select_for_update(),
+                pk=serializer.instance.pk, project=project, user=target,
+            )
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            target = _lock_admin_and_target(self.request, instance.user_id)
+            project = get_object_or_404(
+                Project.objects.select_for_update(), pk=self.kwargs.get('project_id'),
+            )
+            member = get_object_or_404(
+                ProjectMember.objects.select_for_update(),
+                pk=instance.pk, project=project, user=target,
+            )
+            member.delete()

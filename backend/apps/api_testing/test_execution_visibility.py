@@ -28,6 +28,11 @@ class APITestExecutionVisibilityTests(TestCase):
         self.other_project = Project.objects.create(
             name='Other execution visibility', project_type='api', owner=self.owner, created_by=self.owner,
         )
+        for project in (self.project, self.other_project):
+            ProjectMember.objects.create(
+                project=project, user=self.owner, role='editor', can_edit=True,
+                can_delete=True, can_execute_tests=True, can_view_reports=True,
+            )
         ProjectMember.objects.create(
             project=self.project, user=self.reporter, role='viewer', can_view_reports=True,
         )
@@ -91,9 +96,8 @@ class APITestExecutionVisibilityTests(TestCase):
         self.assertIn(denied_execution.id, reporter_ids)
         self.assertNotIn(other_project_execution.id, reporter_ids)
 
-        denied_ids = {item['id'] for item in self.items(self.list(self.denied))}
-        self.assertNotIn(visible.id, denied_ids)
-        self.assertNotIn(denied_execution.id, denied_ids)
+        denied_reply = self.list(self.denied)
+        self.assertEqual(denied_reply.status_code, 403)
 
     def test_non_member_cannot_manage_execution_but_can_read_public_report(self):
         execution = self.execution(executor=self.outsider, source='workspace_debug')
@@ -161,8 +165,8 @@ class APITestExecutionVisibilityTests(TestCase):
                 'total': 3, 'pending': 0, 'running': 1, 'passed': 1,
                 'failed': 1, 'error': 0, 'stopped': 0, 'success_rate': 33.3,
             })
-        for user in (self.denied, self.outsider):
+        for user, expected_status in ((self.denied, 403), (self.outsider, 404)):
             self.client.force_authenticate(user)
             reply = self.client.get(url)
-            self.assertEqual(reply.status_code, 403)
+            self.assertEqual(reply.status_code, expected_status)
             self.assertFalse(reply.data['success'])

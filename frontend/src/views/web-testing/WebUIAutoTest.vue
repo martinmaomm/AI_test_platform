@@ -24,7 +24,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
 import { useAuthStore } from '@/stores/auth'
-import { getLLMConfigurations } from '@/api/aiConfig'
+import { getAvailableLLMConfigurations } from '@/api/aiConfig'
 import { getWebUIScriptGenerationSettings, getWebUITestModules } from '@/api/webTesting'
 import { WebSocketManager } from '@/config/websocket'
 import { useWebUIScriptGeneration } from '@/composables/useWebUIScriptGeneration'
@@ -64,7 +64,7 @@ const asList = (response) => {
 }
 const loadModels = async () => {
   loadingModels.value = true
-  try { modelConfigs.value = asList(await getLLMConfigurations()).filter(item => item.is_active && item.model_type === 'llm') } catch { modelConfigs.value = []; ElMessage.error('加载可用模型失败') } finally { loadingModels.value = false }
+  try { modelConfigs.value = asList(await getAvailableLLMConfigurations()).filter(item => item.is_active && item.model_type === 'llm') } catch { modelConfigs.value = []; ElMessage.error('加载可用模型失败') } finally { loadingModels.value = false }
 }
 const loadModules = async () => {
   if (!projectId.value) { modules.value = []; return }

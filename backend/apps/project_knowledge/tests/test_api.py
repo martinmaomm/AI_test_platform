@@ -38,6 +38,10 @@ class ProjectKnowledgeApiTests(TestCase):
         self.viewer = get_user_model().objects.create_user(username='knowledge-api-viewer', email='knowledge-api-viewer@example.test')
         self.project = Project.objects.create(name='知识 API', project_type='web', owner=self.user, created_by=self.user)
         self.other_project = Project.objects.create(name='其他知识 API', project_type='web', owner=self.viewer, created_by=self.viewer)
+        ProjectMember.objects.create(
+            project=self.project, user=self.user, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         ProjectMember.objects.create(project=self.project, user=self.viewer, role='viewer', can_view_reports=True, can_edit=False)
         self.model = LLMConfiguration.objects.create(
             model_type=ModelType.LLM, provider='openai', provider_name='测试提供商',

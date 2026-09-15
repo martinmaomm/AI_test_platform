@@ -676,11 +676,11 @@ class APITestSuiteAddTestCaseSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("测试用例ID列表不能为空")
         
-        # 验证测试用例是否存在且属于当前用户
-        user = self.context['request'].user
+        # 验证测试用例是否属于当前项目；项目权限由视图统一校验。
+        project = self.context['project']
         existing_cases = APITestCase.objects.filter(
-            id__in=value, 
-            created_by=user
+            id__in=value,
+            project=project,
         ).values_list('id', flat=True)
         
         missing_cases = set(value) - set(existing_cases)

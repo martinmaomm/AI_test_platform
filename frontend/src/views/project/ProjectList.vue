@@ -14,7 +14,7 @@
         </div>
       </div>
       <div class="header-actions">
-        <el-button type="primary" icon="Plus" @click="showCreateDialog = true" class="create-btn">
+        <el-button v-if="canManageProjects" type="primary" icon="Plus" @click="showCreateDialog = true" class="create-btn">
           新建项目
         </el-button>
       </div>
@@ -68,10 +68,10 @@
             :disabled="isCurrentProject(scope.row.id)">
             {{ isCurrentProject(scope.row.id) ? '当前项目' : '设为当前项目' }}
           </el-button>
-          <el-button type="warning" size="small" @click="editProject(scope.row)">
+          <el-button v-if="canManageProjects" type="warning" size="small" @click="editProject(scope.row)">
             编辑
           </el-button>
-          <el-button type="danger" size="small" @click="deleteProject(scope.row)">
+          <el-button v-if="canManageProjects" type="danger" size="small" @click="deleteProject(scope.row)">
             删除
           </el-button>
         </template>
@@ -166,9 +166,13 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import dayjs from 'dayjs'
 import { getProjects, createProject as createProjectAPI, updateProject as updateProjectAPI, deleteProject as deleteProjectAPI } from '@/api/projects'
 import { useProjectStore } from '@/stores/project'
+import { useAuthStore } from '@/stores/auth'
+import { canManageProjectMetadata } from '@/utils/accessControl'
 
 const router = useRouter()
 const projectStore = useProjectStore()
+const authStore = useAuthStore()
+const canManageProjects = computed(() => canManageProjectMetadata(authStore.user))
 
 // 响应式数据
 const loading = ref(false)

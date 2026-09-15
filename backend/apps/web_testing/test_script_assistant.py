@@ -48,6 +48,14 @@ class ScriptAssistantApiTests(TestCase):
         self.project = Project.objects.create(
             name="assistant", project_type="web", owner=self.user, created_by=self.user
         )
+        ProjectMember.objects.create(
+            project=self.project,
+            user=self.user,
+            role="editor",
+            can_edit=True,
+            can_execute_tests=True,
+            can_view_reports=True,
+        )
         self.model = LLMConfiguration.objects.create(
             model_type=ModelType.LLM,
             provider="openai",
@@ -360,11 +368,10 @@ class ScriptAssistantApiTests(TestCase):
         self.assertEqual(session.model_info["provider_name"], "Next provider")
         self.assertEqual(session.messages[-1]["content"], "use new model")
 
-    def test_message_rejects_disabled_foreign_or_missing_model_without_mutation(self):
+    def test_message_accepts_active_global_model_from_another_creator(self):
         session = self._create_edit()
         session.status = "candidate_ready"
         session.save(update_fields=["status"])
-        before = (session.revision, session.model_config_id, session.messages)
         other = get_user_model().objects.create_user(
             username="model-other", email="model-other@example.test"
         )
@@ -376,9 +383,31 @@ class ScriptAssistantApiTests(TestCase):
             is_active=True,
             created_by=other,
         )
+        with patch("web_testing.script_assistant_views._dispatch") as dispatch:
+            result = self._post(
+                ScriptAssistantMessageView,
+                {
+                    "expected_revision": session.revision,
+                    "model_config_id": foreign.id,
+                    "script_content": SCRIPT,
+                    "message": "use global model",
+                    "use_candidate": False,
+                },
+                session_id=session.id,
+            )
+        self.assertEqual(result.status_code, 202, result.data)
+        dispatch.assert_called_once()
+        session.refresh_from_db()
+        self.assertEqual(session.model_config_id, foreign.id)
+
+    def test_message_rejects_disabled_or_missing_model_without_mutation(self):
+        session = self._create_edit()
+        session.status = "candidate_ready"
+        session.save(update_fields=["status"])
+        before = (session.revision, session.model_config_id, session.messages)
         self.model.is_active = False
         self.model.save(update_fields=["is_active"])
-        for config_id in (self.model.id, foreign.id, 999999):
+        for config_id in (self.model.id, 999999):
             with self.subTest(config_id=config_id), patch(
                 "web_testing.script_assistant_views._dispatch"
             ) as dispatch:

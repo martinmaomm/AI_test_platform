@@ -8,6 +8,7 @@ from django.core.files.storage import default_storage
 import logging
 
 from ..models import Project
+from ..access import DELETE, EDIT, READ, get_project_for_user
 from .models import KnowledgeBaseFile, UploadedFile
 from ..serializers import KnowledgeBaseFileSerializer, KnowledgeBaseFileCreateSerializer
 from ..tasks import process_knowledge_base_file_async
@@ -25,16 +26,13 @@ class KnowledgeBaseFileListView(generics.ListCreateAPIView):
     pagination_class = None  # 禁用默认分页，使用自定义分页
 
     def get_queryset(self):
-        user = self.request.user
         # 使用URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return KnowledgeBaseFile.objects.none()
         
-        project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限查看文件
-        if not project.members.filter(user=user, can_view_reports=True).exists():
-            return KnowledgeBaseFile.objects.none()
+        capability = EDIT if self.request.method == 'POST' else READ
+        project = get_project_for_user(project_id, self.request.user, capability)
         return KnowledgeBaseFile.objects.filter(project=project)
 
     def get_serializer_class(self):
@@ -53,29 +51,7 @@ class KnowledgeBaseFileListView(generics.ListCreateAPIView):
                 status_code=status.HTTP_400_BAD_REQUEST
             )
         
-        project = get_object_or_404(Project, id=project_id)
-
-        # 检查用户权限 - 包括项目创建者、所有者和项目成员
-        has_permission = False
-
-        # 检查是否是项目创建者
-        if project.created_by == request.user:
-            has_permission = True
-        # 检查是否是项目所有者
-        elif project.owner == request.user:
-            has_permission = True
-        # 检查项目成员权限
-        else:
-            project_members = project.members.filter(user=request.user)
-            if project_members.filter(can_edit=True).exists():
-                has_permission = True
-
-        if not has_permission:
-            return response(
-                kind="permission_denied",
-                message="权限不足",
-                status_code=status.HTTP_403_FORBIDDEN
-            )
+        project = get_project_for_user(project_id, request.user, EDIT)
 
         # 获取上传的文件
         uploaded_file = request.FILES.get('file')
@@ -171,16 +147,13 @@ class KnowledgeBaseFileDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
         # 使用URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return KnowledgeBaseFile.objects.none()
         
-        project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限管理文件
-        if not project.members.filter(user=user, can_edit=True).exists():
-            return KnowledgeBaseFile.objects.none()
+        capability = DELETE if self.request.method == 'DELETE' else EDIT if self.request.method in {'PUT', 'PATCH'} else READ
+        project = get_project_for_user(project_id, self.request.user, capability)
         return KnowledgeBaseFile.objects.filter(project=project)
 
     def destroy(self, request, *args, **kwargs):
@@ -210,6 +183,7 @@ class KnowledgeBaseFileDetailView(generics.RetrieveUpdateDestroyAPIView):
 @permission_classes([permissions.IsAuthenticated])
 def reprocess_file(request, project_id, file_id):
     """重新处理文件（解析和RAG入库）"""
+    get_project_for_user(project_id, request.user, EDIT)
     try:
         # 使用URL路径参数获取项目ID
         if not project_id:
@@ -221,14 +195,6 @@ def reprocess_file(request, project_id, file_id):
 
         file_obj = get_object_or_404(KnowledgeBaseFile, id=file_id, project_id=project_id)
 
-        # 检查用户权限
-        if not file_obj.project.members.filter(user=request.user, can_edit=True).exists():
-            return response(
-                kind="permission_denied",
-                message="权限不足",
-                status_code=status.HTTP_403_FORBIDDEN
-            )
-        
         # 检查是否有关联的上传文件
         if not file_obj.uploaded_file:
             return response(
@@ -267,6 +233,7 @@ def reprocess_file(request, project_id, file_id):
 @permission_classes([permissions.IsAuthenticated])
 def start_file_processing(request, project_id, file_id):
     """处理知识库文件（解析和RAG入库）"""
+    project = get_project_for_user(project_id, request.user, EDIT)
     try:
         # 使用URL路径参数获取项目ID
         if not project_id:
@@ -276,17 +243,6 @@ def start_file_processing(request, project_id, file_id):
                 status_code=status.HTTP_400_BAD_REQUEST
             )
 
-        # 获取项目
-        project = get_object_or_404(Project, id=project_id)
-
-        # 检查用户权限
-        if not project.members.filter(user=request.user, can_edit=True).exists():
-            return response(
-                kind="permission_denied",
-                message="权限不足",
-                status_code=status.HTTP_403_FORBIDDEN
-            )
-        
         # 获取知识库文件
         knowledge_file = get_object_or_404(KnowledgeBaseFile, id=file_id, project=project)
         
@@ -336,6 +292,7 @@ def start_file_processing(request, project_id, file_id):
 @permission_classes([permissions.IsAuthenticated])
 def get_task_status(request, project_id, task_id):
     """获取知识库文件处理任务状态"""
+    get_project_for_user(project_id, request.user, READ)
     try:
         from common.task import get_celery_task_status
 

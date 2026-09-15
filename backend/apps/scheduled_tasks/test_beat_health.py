@@ -145,6 +145,10 @@ class ServiceStatusApiTests(TestCase):
         self.project = Project.objects.create(
             name='Schedule status project', project_type='web', owner=self.user, created_by=self.user,
         )
+        ProjectMember.objects.create(
+            project=self.project, user=self.user, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         self.client = APIClient()
         self.client.force_authenticate(self.user)
         self.path = f'/api/v1/projects/{self.project.pk}/scheduled-tasks/service-status/'

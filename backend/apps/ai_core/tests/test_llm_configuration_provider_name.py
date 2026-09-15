@@ -9,7 +9,7 @@ from ai_core.views import LLMConfigurationDetailView, LLMConfigurationViewSet
 class LLMConfigurationProviderNameAPITests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(
-            username='provider-name-user', password='test-password'
+            username='provider-name-user', password='test-password', is_staff=True,
         )
         self.factory = APIRequestFactory()
 

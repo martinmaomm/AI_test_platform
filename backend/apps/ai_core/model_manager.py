@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 
 from .models import LLMConfiguration
+from .config_access import usable_llm_configurations
 from .llm_configuration import (
     get_html_gateway_error_message,
     normalize_openai_compatible_base_url,
@@ -66,11 +67,17 @@ class ModelManager:
     
     def _load_config(self) -> Dict[str, Any]:
         """从数据库加载配置"""
-        if self.config_id is not None:
-            selected_config = LLMConfiguration.objects.filter(
-                id=self.config_id,
+        configurations = (
+            usable_llm_configurations()
+            if self.model_type == 'llm'
+            else LLMConfiguration.objects.filter(
                 model_type=self.model_type,
                 is_active=True,
+            )
+        )
+        if self.config_id is not None:
+            selected_config = configurations.filter(
+                id=self.config_id,
             ).first()
             if not selected_config:
                 raise ValueError(f"配置 {self.config_id} 不存在、已停用或模型类型不匹配")
@@ -82,18 +89,11 @@ class ModelManager:
             )
             return self._config_from_db(selected_config)
 
-        active_config = LLMConfiguration.objects.filter(
-            model_type=self.model_type, is_active=True
-        ).order_by('-created_at').first()
+        active_config = configurations.order_by('-created_at').first()
         
         if active_config:
             logger.info(f"从数据库加载{self.model_type}配置: {active_config.provider} - {active_config.model_name}")
             return self._config_from_db(active_config)
-        
-        any_config = LLMConfiguration.objects.filter(model_type=self.model_type).first()
-        if any_config:
-            logger.warning(f"从数据库加载{self.model_type}配置（已禁用）: {any_config.provider} - {any_config.model_name}")
-            return self._config_from_db(any_config)
         
         error_msg = f"数据库中没有可用的{self.model_type}配置，请先创建并配置{self.model_type}"
         logger.error(error_msg)
@@ -420,13 +420,17 @@ class ModelManager:
     
     def switch_to_config(self, config_id: int) -> bool:
         """切换到指定的配置"""
-        config = LLMConfiguration.objects.filter(id=config_id, is_active=True).first()
+        configurations = (
+            usable_llm_configurations()
+            if self.model_type == 'llm'
+            else LLMConfiguration.objects.filter(
+                model_type=self.model_type,
+                is_active=True,
+            )
+        )
+        config = configurations.filter(id=config_id).first()
         if not config:
             logger.error(f"配置 {config_id} 不存在或未激活")
-            return False
-        
-        if config.model_type != self.model_type:
-            logger.error(f"配置 {config_id} 的模型类型 {config.model_type} 与当前管理器类型 {self.model_type} 不匹配")
             return False
         
         try:

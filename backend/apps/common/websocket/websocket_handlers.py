@@ -6,6 +6,7 @@ WebSocket处理器模块
 import json
 import logging
 from typing import Dict, Any
+from users.permissions import is_platform_admin
 
 from .websocket_core import (
     BaseWebSocketConsumer, 
@@ -75,6 +76,12 @@ class TaskStatusConsumer(BaseWebSocketConsumer, TaskStatusMixin):
             self.user = self.scope.get('user', AnonymousUser())
             if isinstance(self.user, AnonymousUser):
                 await self.close(code=4001)
+                return
+
+            # This legacy task-ID room has no project or owner contract. Keep
+            # it admin-only; normal generation uses the per-user stream rooms.
+            if not is_platform_admin(self.user):
+                await self.close(code=4003)
                 return
             
             # 生成房间名称

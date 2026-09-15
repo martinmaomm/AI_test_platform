@@ -4,9 +4,11 @@ from common.api import response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from django.shortcuts import get_object_or_404
+from django.db import transaction
 from django.middleware.csrf import get_token
 
 from .models import User, UserProfile
+from .permissions import IsPlatformAdmin
 from .serializers import (
     UserSerializer, UserProfileSerializer, 
     UserLoginSerializer, UserRegistrationSerializer
@@ -101,12 +103,21 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
     def get_object(self):
         return self.request.user
 
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        # The profile form sends only editable fields, even when using PUT.
+        serializer = self.get_serializer(self.get_object(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        user.refresh_from_db()
+        return response(kind='success', data=self.get_serializer(user).data, message='个人资料已更新')
+
 
 class UserListView(generics.ListAPIView):
     """用户列表视图（仅管理员）"""
     queryset = User.objects.all()
     serializer_class = UserSerializer
-    permission_classes = [permissions.IsAdminUser]
+    permission_classes = [IsPlatformAdmin]
 
 
 @api_view(['GET'])

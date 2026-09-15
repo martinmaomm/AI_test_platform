@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from api_testing.models import APITestSuite, APITestCase
-from projects.models import Environment, Project
+from projects.models import Environment, Project, ProjectMember
 from web_testing.models import WebUITestSuite, WebUITestCase
 
 from .serializers import ScheduledTaskCreateSerializer
@@ -18,6 +18,11 @@ class ScheduledTaskEnvironmentContractTests(TestCase):
             owner=self.user, created_by=self.user,
         )
         self.api_project = Project.objects.create(name='API project', project_type='api', created_by=self.user)
+        for project in (self.project, self.api_project):
+            ProjectMember.objects.create(
+                project=project, user=self.user, role='editor', can_edit=True,
+                can_delete=True, can_execute_tests=True, can_view_reports=True,
+            )
         self.environment = Environment.objects.create(
             project=self.api_project, name='API environment',
             category=Environment.EnvironmentCategory.API,

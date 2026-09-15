@@ -13,7 +13,8 @@ from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
-from ai_core.models import LLMConfiguration, ModelType
+from ai_core.config_access import usable_llm_configurations
+from ai_core.models import LLMConfiguration
 from common.api import response
 from .constants import normalize_webui_execution_options
 from .execution_variables import (
@@ -83,14 +84,11 @@ def assistant_payload(item: WebUIScriptAssistant) -> dict:
 
 def _model(request, config_id: object) -> LLMConfiguration:
     try:
-        return LLMConfiguration.objects.get(
+        return usable_llm_configurations().get(
             id=int(config_id),
-            is_active=True,
-            model_type=ModelType.LLM,
-            created_by=request.user,
         )
     except (LLMConfiguration.DoesNotExist, TypeError, ValueError):
-        raise ValueError("所选模型不存在、未启用或不属于当前用户。")
+        raise ValueError("所选模型不存在、未启用或类型不匹配。")
 
 
 def _dispatch(item: WebUIScriptAssistant) -> None:

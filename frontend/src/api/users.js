@@ -56,6 +56,13 @@ export const usersApi = {
   // 获取当前用户信息
   getCurrentUser: () => api.get('/users/current-user/'),
 
+  listManagedUsers: (params = {}) => api.get('/users/manage/', { params }),
+  createManagedUser: (data) => api.post('/users/manage/', data),
+  getManagedUser: (id) => api.get(`/users/manage/${id}/`),
+  updateManagedUser: (id, data) => api.patch(`/users/manage/${id}/`, data),
+  getManagedUserProjects: (id) => api.get(`/users/manage/${id}/projects/`),
+  updateManagedUserProjects: (id, projectIds) => api.put(`/users/manage/${id}/projects/`, { project_ids: projectIds }),
+
   // 修改密码
   changePassword: (passwordData) =>
     api.post('/users/change-password/', passwordData),

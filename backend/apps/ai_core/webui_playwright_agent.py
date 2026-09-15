@@ -19,7 +19,7 @@ from typing import TypedDict, Dict, Any, Optional
 from datetime import datetime
 from django.conf import settings
 from django.core.cache import cache
-from .models import MCPConfiguration
+from .config_access import usable_mcp_configurations
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langgraph.graph import StateGraph, END
@@ -1056,18 +1056,13 @@ class WebUIPlaywrightAgent:
             # 发送开始加载的消息
             self._send_websocket_message("开始加载MCP配置...\n", "加载MCP配置")
             
-            # 构建查询条件
-            query_filter = {'is_active': True}
-            if user_id:
-                query_filter['created_by_id'] = user_id
-            
-            # 查询启用的MCP配置
-            mcp_configs = MCPConfiguration.objects.filter(**query_filter)
+            # MCP configuration is platform-global; user_id remains task audit data.
+            mcp_configs = usable_mcp_configurations()
             
             if not mcp_configs.exists():
-                logger.info(f"用户 {user_id} 没有找到启用的MCP配置")
+                logger.info("没有找到启用的全局MCP配置")
                 mcp_config = {"mcpServers": {}}
-                self._send_websocket_message(f"⚠️ 用户 {user_id} 没有找到启用的MCP配置\n", "加载MCP配置")
+                self._send_websocket_message("⚠️ 没有找到启用的全局MCP配置\n", "加载MCP配置")
             else:
                 logger.info(f"找到 {mcp_configs.count()} 个启用的MCP配置")
                 

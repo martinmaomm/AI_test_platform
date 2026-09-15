@@ -4,21 +4,20 @@ import json
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import ValidationError
 from rest_framework.views import APIView
 
 from common.api import response
-from projects.models import Environment, Project
+from projects.access import EXECUTE, get_project_for_user
+from projects.models import Environment
 from .execution_snapshots import capture_case_snapshot, capture_suite_snapshot
 from .models import APITestCase, APITestExecution, APITestSuite
 
 
 def execution_project(user, project_id):
-    project = get_object_or_404(Project, pk=project_id)
-    if not (user.is_superuser or project.created_by_id == user.pk or project.owner_id == user.pk
-            or project.members.filter(user=user, can_execute_tests=True).exists()):
-        raise PermissionDenied('没有权限执行此项目的测试')
-    return project
+    return get_project_for_user(
+        project_id, user, EXECUTE, expected_project_type='api',
+    )
 
 
 def selected_environment(project, data):

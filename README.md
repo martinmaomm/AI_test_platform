@@ -206,6 +206,7 @@ automation-platform/
 | [离线浏览器资源](backend/resource/README.md) | 指定版本的下载地址、目录布局和校验方式 |
 | [项目知识库指南](docs/project-knowledge-guide.md) | 资料处理、手工用例、问答和验收边界 |
 | [原生执行报告](docs/platform-native-reports.md) | UI / API / 计划任务报告规则 |
+| [用户管理与项目分配](docs/user-management.md) | 管理员管理全部项目、普通用户多人协作、账号启停与项目分配 |
 | [优化与技术债](docs/TODO-OPT.md) | 已知限制，以及正式应用前的报告权限、多用户管理与隐私待办 |
 | [计划任务](docs/scheduled-tasks.md) | 顺序调度、Beat 心跳、暂停与防重复执行 |
 | [网页探索发现 API](docs/api-browser-discovery.md) | 无 Swagger 的采集、来源交接、启用配置和使用边界 |

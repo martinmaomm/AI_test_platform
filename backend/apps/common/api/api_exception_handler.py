@@ -31,6 +31,14 @@ def custom_exception_handler(exc: Exception, context: Dict[str, Any]):
     # --- DRF 默认异常处理 ---
     drf_response = exception_handler(exc, context)
     if drf_response is not None:
+        # SimpleJWT's disabled-user/token errors carry a dict, but remain 401,
+        # not form-validation 400. Clients must discard the unusable session.
+        if isinstance(exc, (AuthenticationFailed, NotAuthenticated)):
+            detail = exc.detail.get('detail', '登录状态无效，请重新登录。') if isinstance(exc.detail, dict) else exc.detail
+            result = response(kind='error', message=str(detail), status_code=drf_response.status_code)
+            if 'WWW-Authenticate' in drf_response:
+                result['WWW-Authenticate'] = drf_response['WWW-Authenticate']
+            return result
         # 如果 DRF 已经处理了异常，我们将其转换为统一格式
         if hasattr(exc, 'detail'):
             if isinstance(exc.detail, dict):

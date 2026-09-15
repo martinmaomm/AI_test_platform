@@ -1,11 +1,14 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { canAccessRoute } from '@/utils/accessControl'
+import { currentUserFailureLocation } from '@/utils/routeAuth'
 
 const routes = [
   // ========== 顶层入口 ==========
   { path: '/', name: 'Root', component: () => import('@/views/RootRedirect.vue'), meta: { requiresAuth: false } },
   { path: '/login', name: 'Login', component: () => import('@/views/Login.vue'), meta: { requiresAuth: false } },
   { path: '/register', name: 'Register', component: () => import('@/views/Register.vue'), meta: { requiresAuth: false } },
+  { path: '/permission-load-failure', name: 'PermissionLoadFailure', component: () => import('@/views/PermissionLoadFailure.vue'), meta: { requiresAuth: false } },
   { path: '/reports/detail/:id', name: 'TestReportDetail', component: () => import('@/views/reports/TestReportDetail.vue'), meta: { requiresAuth: false, publicReport: true } },
   { path: '/reports/web/:projectId/:executionId', name: 'WebExecutionReport', component: () => import('@/views/reports/ExecutionReportPage.vue'), props: { kind: 'web' }, meta: { requiresAuth: false, publicReport: true } },
   { path: '/reports/api/:projectId/:executionId', name: 'ApiExecutionReport', component: () => import('@/views/reports/ExecutionReportPage.vue'), props: { kind: 'api' }, meta: { requiresAuth: false, publicReport: true } },
@@ -24,13 +27,14 @@ const routes = [
   {
     path: '/settings',
     component: () => import('@/layouts/PortalLayout.vue'),
-    meta: { requiresAuth: true, layout: 'portal' },
+    meta: { requiresAuth: true, layout: 'portal', requiresPlatformAdmin: true },
     children: [
       { path: '', name: 'SystemSettings', component: () => import('@/views/settings/SystemSettings.vue'), meta: { title: '全局系统配置' } },
       { path: 'channel-config', redirect: '/settings/email-config' },
       { path: 'email-config', name: 'EmailConfig', component: () => import('@/views/notifications/EmailConfigList.vue'), meta: { title: '邮件服务配置' } },
       { path: 'general-params', name: 'GeneralSystemParams', component: () => import('@/views/settings/GeneralSystemParams.vue'), meta: { title: '通用系统参数' } },
-      { path: 'notification-channels', redirect: '/settings/email-config' }
+      { path: 'notification-channels', redirect: '/settings/email-config' },
+      { path: 'users', name: 'UserManagement', component: () => import('@/views/settings/UserManagement.vue'), meta: { title: '用户管理', requiresPlatformAdmin: true } }
     ]
   },
 
@@ -48,7 +52,7 @@ const routes = [
   {
     path: '/ai-config',
     component: () => import('@/layouts/PortalLayout.vue'),
-    meta: { requiresAuth: true, layout: 'portal' },
+    meta: { requiresAuth: true, layout: 'portal', requiresPlatformAdmin: true },
     children: [
       { path: '', name: 'AIConfig', component: () => import('@/views/ai_config/AIConfig.vue'), meta: { title: 'AI 实验室配置' } },
       { path: 'llm', name: 'LLMConfig', component: () => import('@/views/ai_config/LLMConfig.vue'), meta: { title: 'LLM模型配置' } },
@@ -213,6 +217,12 @@ router.beforeEach(async (to, from, next) => {
 
   if (to.path === '/login' && authStore.isAuthenticated) {
     return next('/dashboard')
+  }
+
+  if (to.meta.requiresAuth) {
+    const refreshed = await authStore.refreshCurrentUser()
+    if (!refreshed.ok) return next(currentUserFailureLocation(to, refreshed.authenticationFailed))
+    if (!canAccessRoute(authStore.user, to)) return next('/dashboard')
   }
 
   next()

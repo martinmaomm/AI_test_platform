@@ -99,6 +99,31 @@ class LLMConfigurationListSerializer(serializers.ModelSerializer):
             return '*' * len(key)
         
         return key[:4] + '*' * (len(key) - 8) + key[-4:]
+
+
+class AvailableLLMConfigurationSerializer(serializers.ModelSerializer):
+    """Public-in-app model option without connection credentials or settings."""
+
+    name = serializers.SerializerMethodField()
+    display_name = serializers.SerializerMethodField()
+    provider_display = serializers.CharField(source='get_provider_display', read_only=True)
+
+    class Meta:
+        model = LLMConfiguration
+        fields = [
+            'id', 'name', 'model_name', 'provider', 'provider_display',
+            'provider_name', 'display_name', 'model_type', 'is_active',
+        ]
+        read_only_fields = fields
+
+    def _display_name(self, obj):
+        return f'{obj.get_provider_display()} - {obj.model_name}'
+
+    def get_name(self, obj):
+        return self._display_name(obj)
+
+    def get_display_name(self, obj):
+        return self._display_name(obj)
     
 
 

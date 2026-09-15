@@ -11,7 +11,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
-from ai_core.models import LLMConfiguration, ModelType
+from ai_core.config_access import usable_llm_configurations
 from common.api import response
 from projects.models import Project
 from .browser_discovery import (
@@ -75,9 +75,7 @@ class BrowserDiscoveryConfigView(APIView):
     def get(self, request, project_id):
         try:
             _editable_project(project_id, request.user)
-            models = LLMConfiguration.objects.filter(
-                created_by=request.user, model_type=ModelType.LLM, is_active=True,
-            ).order_by('-created_at')
+            models = usable_llm_configurations().order_by('-created_at')
             return response(kind='success', data={
                 'enabled': browser_discovery_enabled(),
                 'limits': discovery_limits(),

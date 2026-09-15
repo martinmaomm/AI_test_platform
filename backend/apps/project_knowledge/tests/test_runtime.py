@@ -9,7 +9,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from projects.models import Project, UploadedFile
+from projects.models import Project, ProjectMember, UploadedFile
 from project_knowledge.models import DocumentRevision, KnowledgeDocument, KnowledgeTask, KnowledgeConversation, KnowledgeMessage
 from project_knowledge.runtime import TaskContext, TaskConflict, TaskStopped, enqueue_task, execute_task, expire_task
 
@@ -18,6 +18,10 @@ class KnowledgeRuntimeTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(username='knowledge-owner', email='knowledge-owner@example.test')
         self.project = Project.objects.create(name='知识库', project_type='web', owner=self.user, created_by=self.user)
+        ProjectMember.objects.create(
+            project=self.project, user=self.user, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         self.upload = UploadedFile.objects.create(
             project=self.project, uploaded_by=self.user, original_name='需求.md', file_size=20,
             file_hash='a' * 64, file_type='md', file=SimpleUploadedFile('requirements.md', '# 用户\n用户名称不能重复。'.encode()),
@@ -97,6 +101,10 @@ class KnowledgeRuntimeTests(TestCase):
 
     def test_cross_project_snapshot_is_rejected(self):
         other = Project.objects.create(name='其他项目', created_by=self.user)
+        ProjectMember.objects.create(
+            project=other, user=self.user, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         task = self.task(project=other, status='running', started_at=timezone.now())
         with self.assertRaises(TaskStopped) as error:
             TaskContext(task).check_active()

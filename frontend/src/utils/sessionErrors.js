@@ -8,3 +8,6 @@ export function isSessionExpiredError(error) {
   return [data?.code, data?.error?.code, data?.error?.details?.code]
     .some(code => code === 'token_not_valid')
 }
+
+// current-user 读取失败只有在明确认证失效时才可以清理会话并跳转登录。
+export const isCurrentUserAuthenticationFailure = isSessionExpiredError

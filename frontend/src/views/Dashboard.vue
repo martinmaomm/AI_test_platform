@@ -26,7 +26,7 @@
             :value="p.id"
           />
         </el-select>
-        <el-tooltip :content="editMode ? '退出编辑' : '自定义布局'" placement="bottom">
+        <el-tooltip v-if="canManagePlatform" :content="editMode ? '退出编辑' : '自定义布局'" placement="bottom">
           <el-switch
             v-model="editMode"
             inline-prompt
@@ -53,7 +53,7 @@
       >
         <!-- 指标卡片区 -->
         <GridItem
-          v-for="item in layout"
+          v-for="item in visibleLayout"
           :key="item.i"
           :x="item.x"
           :y="item.y"
@@ -228,6 +228,8 @@ import {
 } from '@element-plus/icons-vue'
 import { useAppStore } from '@/stores/app'
 import { useProjectStore } from '@/stores/project'
+import { useAuthStore } from '@/stores/auth'
+import { isPlatformAdmin, visibleDashboardLayout } from '@/utils/accessControl'
 import { getProjects } from '@/api/projects'
 import {
   getDashboardSummary,
@@ -239,6 +241,7 @@ const LAYOUT_KEY = 'platform-cockpit-layout'
 
 const appStore = useAppStore()
 const projectStore = useProjectStore()
+const authStore = useAuthStore()
 const { effectiveTheme } = appStore
 
 use([
@@ -274,6 +277,8 @@ const defaultLayout = [
 ]
 
 const layout = ref(loadLayout())
+const visibleLayout = computed(() => visibleDashboardLayout(layout.value, authStore.user))
+const canManagePlatform = computed(() => isPlatformAdmin(authStore.user))
 
 const INFRA_ITEMS = ['section-infra', 'portal-ai-config', 'portal-settings']
 const DISABLED_PORTAL_ITEMS = ['portal-app', 'portal-perf']
@@ -330,6 +335,10 @@ watch(layout, () => {
 }, { deep: true })
 
 function onEditModeChange() {
+  if (editMode.value && !canManagePlatform.value) {
+    editMode.value = false
+    return
+  }
   if (editMode.value) return
   saveLayout()
 }

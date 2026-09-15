@@ -8,6 +8,7 @@ import json
 import time
 
 from ..models import Project, Environment
+from ..access import DELETE, EDIT, READ, get_project_for_user
 from ..serializers import EnvironmentSerializer, EnvironmentCreateSerializer
 from common.api import response
 
@@ -29,16 +30,13 @@ class EnvironmentListView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
         # 使用URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return Environment.objects.none()
         
-        project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限管理环境
-        if not project.members.filter(user=user, can_edit=True).exists():
-            return Environment.objects.none()
+        capability = EDIT if self.request.method == 'POST' else READ
+        project = get_project_for_user(project_id, self.request.user, capability)
         
         category = get_project_environment_category(project)
         if category is None:
@@ -61,10 +59,7 @@ class EnvironmentListView(generics.ListCreateAPIView):
         if not project_id:
             raise ValueError("未提供项目ID")
         
-        project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限管理环境
-        if not project.members.filter(user=self.request.user, can_edit=True).exists():
-            raise ValueError("没有权限管理环境")
+        project = get_project_for_user(project_id, self.request.user, EDIT)
         
         expected_category = get_project_environment_category(project)
         if expected_category is None:
@@ -94,16 +89,13 @@ class EnvironmentDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
         # 使用URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
         if not project_id:
             return Environment.objects.none()
         
-        project = get_object_or_404(Project, id=project_id)
-        # 检查用户是否有权限管理环境
-        if not project.members.filter(user=user, can_edit=True).exists():
-            return Environment.objects.none()
+        capability = {'PUT': EDIT, 'PATCH': EDIT, 'DELETE': DELETE}.get(self.request.method, READ)
+        project = get_project_for_user(project_id, self.request.user, capability)
         category = get_project_environment_category(project)
         if category is None:
             return Environment.objects.none()

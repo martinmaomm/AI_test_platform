@@ -34,13 +34,13 @@ from common.storage import APISpecFileService
 from .api_parser_service import APIParserService
 
 from projects.models import Project
+from projects.access import get_project_for_user
 from projects.knowledge.models import UploadedFile
 from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from django.core.files.storage import default_storage
-from ai_core.models import LLMConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -48,33 +48,10 @@ logger = logging.getLogger(__name__)
 def _get_api_project_for_user(
     project_id, user, capability='read', *, allow_superuser=False,
 ):
-    """Resolve an API project without disclosing it to non-members.
-
-    Owners and creators have every capability. A missing project, a project of
-    another type, or an absent membership is hidden as 404. Existing members
-    lacking an explicit capability receive 403, matching the project-scoped
-    access contract used by the Web UI APIs.
-    """
-    project = Project.objects.filter(pk=project_id, project_type='api').first()
-    if project is None:
-        raise Http404('项目不存在')
-    if allow_superuser and user.is_superuser:
-        return project
-    if project.owner_id == user.id or project.created_by_id == user.id:
-        return project
-
-    member = project.members.filter(user=user).first()
-    if member is None:
-        raise Http404('项目不存在或无权限访问')
-    required_flag = {
-        'edit': 'can_edit',
-        'delete': 'can_delete',
-        'execute': 'can_execute_tests',
-        'report': 'can_view_reports',
-    }.get(capability)
-    if required_flag and not getattr(member, required_flag, False):
-        raise PermissionDenied('没有执行此项目操作的权限')
-    return project
+    """Resolve an API project for a platform admin or current member."""
+    return get_project_for_user(
+        project_id, user, capability, expected_project_type='api',
+    )
 
 
 def _get_response_definitions(spec):
@@ -92,17 +69,20 @@ def _get_response_definitions(spec):
 
 
 def _browser_capture_source_allowed(spec, user) -> bool:
-    """Captured browser evidence never becomes a project-wide asset."""
+    """Published API assets are shared, but must retain a same-project source."""
     return (
         spec.spec_type != APISpecification.SpecType.BROWSER_CAPTURE
-        or (spec.source_task_id is not None and spec.source_task.owner_id == user.id)
+        or (
+            spec.source_task_id is not None
+            and spec.source_task.project_id == spec.project_id
+        )
     )
 
 
 def _source_visible_specifications(project_id, user):
-    """Keep legacy Swagger visibility unchanged while scoping browser captures."""
+    """Share published specs while hiding malformed cross-project sources."""
     return APISpecification.objects.filter(project_id=project_id).filter(
-        Q(spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task__owner=user)
+        Q(spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task__project_id=project_id)
         | ~Q(spec_type=APISpecification.SpecType.BROWSER_CAPTURE)
     )
 
@@ -155,12 +135,6 @@ class APISpecificationListView(generics.ListCreateAPIView):
             message="API规范创建成功"
         )
 
-    def _check_permission(self, project, user):
-        return (
-                project.created_by == user or
-                project.members.filter(user=user, can_edit=True).exists()
-        )
-
     def create(self, request, *args, **kwargs):
         # 从URL路径参数获取项目ID
         project_id = self.kwargs.get('project_id')
@@ -171,13 +145,7 @@ class APISpecificationListView(generics.ListCreateAPIView):
                 message="项目ID未提供"
             )
 
-        project = get_object_or_404(Project, id=project_id)
-
-        if not self._check_permission(project, request.user):
-            return response(
-                kind="permission_denied",
-                message="没有权限"
-            )
+        project = _get_api_project_for_user(project_id, request.user, 'edit')
 
         spec_file = request.FILES.get('spec_file')
         if not spec_file:
@@ -251,16 +219,6 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                 raise Http404
             serializer = self.get_serializer(instance)
             
-            # 检查权限
-            project = instance.project
-            if not (project.owner_id == request.user.id or
-                    project.created_by == request.user or
-                    project.members.filter(user=request.user).exists()):
-                return response(
-                    kind="permission_denied",
-                    message="没有权限访问此API规范"
-                )
-            
             return response(
                 kind="success",
                 data=serializer.data,
@@ -271,6 +229,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                 kind="error",
                 message="API规范不存在或无权限访问", status_code=404,
             )
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"获取API规范详情失败: {e}", exc_info=True)
             return response(
@@ -286,15 +246,7 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
             if instance.spec_type == APISpecification.SpecType.BROWSER_CAPTURE:
                 return response(kind="error", message="浏览器探索来源快照不可通过 API 规范编辑接口修改。", status_code=409)
             
-            # 检查权限
-            project = instance.project
-            if not (project.owner_id == request.user.id or
-                    project.created_by == request.user or
-                    project.members.filter(user=request.user, can_edit=True).exists()):
-                return response(
-                    kind="permission_denied",
-                    message="没有权限编辑此API规范"
-                )
+            _get_api_project_for_user(instance.project_id, request.user, 'edit')
             
             serializer = self.get_serializer(instance, data=request.data, partial=partial)
             if serializer.is_valid():
@@ -317,6 +269,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                 kind="error",
                 message="API规范不存在或无权限访问", status_code=404,
             )
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"更新API规范失败: {e}", exc_info=True)
             return response(
@@ -333,15 +287,7 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
             instance_id = instance.id
             instance_name = instance.spec_name or (instance.uploaded_file.original_name if instance.uploaded_file else "Unknown")
             
-            # 检查权限
-            project = instance.project
-            if not (project.owner_id == request.user.id or
-                    project.created_by == request.user or
-                    project.members.filter(user=request.user, can_edit=True).exists()):
-                return response(
-                    kind="permission_denied",
-                    message="没有权限删除此API规范"
-                )
+            _get_api_project_for_user(instance.project_id, request.user, 'delete')
             
             # 保存上传文件引用，用于后续删除
             uploaded_file = instance.uploaded_file
@@ -382,6 +328,8 @@ class APISpecificationRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAP
                 kind="error",
                 message="API规范不存在或无权限访问", status_code=404,
             )
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"删除API规范失败: {e}", exc_info=True)
             return response(
@@ -409,11 +357,6 @@ class APIEndpointListView(generics.ListAPIView):
             _source_visible_specifications(project_id, self.request.user).select_related('project', 'source_task'),
             id=spec_id,
         )
-        if not (spec.project.owner_id == self.request.user.id or
-                spec.project.created_by == self.request.user or
-                spec.project.members.filter(user=self.request.user).exists()):
-            return APIEndpoint.objects.none()
-
         # 返回此规范下的所有端点（预加载 module/spec 避免 N+1）
         return spec.endpoints.select_related('module', 'spec').all()
 
@@ -472,11 +415,6 @@ class APIEndpointDetailView(generics.RetrieveUpdateDestroyAPIView):
             _source_visible_specifications(project_id, self.request.user).select_related('project', 'source_task'),
             id=spec_id,
         )
-        if not (spec.project.owner_id == self.request.user.id or
-                spec.project.created_by == self.request.user or
-                spec.project.members.filter(user=self.request.user).exists()):
-            return APIEndpoint.objects.none()
-
         # 返回此规范下的所有端点（预加载 module/spec 避免 N+1）
         return spec.endpoints.select_related('module', 'spec').all()
 
@@ -544,7 +482,7 @@ class APITestCaseListCreateView(generics.ListCreateAPIView):
         project_id = self.kwargs.get('project_id')
         if project_id:
             _get_api_project_for_user(project_id, self.request.user)
-        queryset = APITestCase.objects.filter(created_by=self.request.user)
+        queryset = APITestCase.objects.all()
         
         # 项目过滤（使用URL路径参数）
         if project_id:
@@ -603,19 +541,11 @@ class APITestCaseListCreateView(generics.ListCreateAPIView):
                 # 获取项目对象
                 from projects.models import Project
                 try:
-                    project = Project.objects.get(id=project_id)
-                except Project.DoesNotExist:
+                    project = _get_api_project_for_user(project_id, request.user, 'edit')
+                except (Project.DoesNotExist, Http404):
                     return response(
                         kind="error",
                         message="项目不存在"
-                    )
-                
-                # 检查项目权限
-                if not (project.created_by == request.user or
-                        project.members.filter(user=request.user, can_execute_tests=True).exists()):
-                    return response(
-                        kind="permission_denied",
-                        message="没有权限在此项目中创建测试用例"
                     )
                 
                 # 保存测试用例
@@ -636,6 +566,8 @@ class APITestCaseListCreateView(generics.ListCreateAPIView):
                     message="数据验证失败",
                     errors=serializer.errors
                 )
+        except (PermissionDenied, Http404):
+            raise
         except Exception as e:
             logger.error(f"创建API测试用例失败: {e}", exc_info=True)
             return response(
@@ -650,17 +582,19 @@ class APITestCaseBatchDeleteView(APIView):
 
     def post(self, request, project_id):
         try:
+            _get_api_project_for_user(project_id, request.user, 'delete')
             case_ids = request.data.get('case_ids', [])
             if not case_ids:
                 return response(kind="error", message="case_ids 不能为空")
             queryset = APITestCase.objects.filter(
                 id__in=case_ids,
-                created_by=request.user,
                 project_id=project_id
             )
             count = queryset.count()
             queryset.delete()
             return response(kind="success", data={'deleted_count': count}, message=f"成功删除 {count} 个测试用例")
+        except (PermissionDenied, Http404):
+            raise
         except Exception as e:
             logger.error(f"批量删除API测试用例失败: {e}", exc_info=True)
             return response(kind="error", message=f"批量删除失败: {str(e)}")
@@ -682,9 +616,9 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
     def get_queryset(self):
         """获取当前用户的测试用例"""
         project_id = self.kwargs.get('project_id')
-        if project_id:
-            _get_api_project_for_user(project_id, self.request.user)
-        queryset = APITestCase.objects.filter(created_by=self.request.user)
+        capability = {'PUT': 'edit', 'PATCH': 'edit', 'DELETE': 'delete'}.get(self.request.method, 'read')
+        _get_api_project_for_user(project_id, self.request.user, capability)
+        queryset = APITestCase.objects.all()
         
         # 使用URL路径参数中的项目ID
         if project_id:
@@ -708,6 +642,8 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
                 kind="error",
                 message="API测试用例不存在或无权限访问", status_code=404,
             )
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"获取API测试用例详情失败: {e}", exc_info=True)
             return response(
@@ -749,6 +685,8 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
                 kind="error",
                 message="API测试用例不存在或无权限访问", status_code=404,
             )
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"更新API测试用例失败: {e}", exc_info=True)
             return response(
@@ -775,6 +713,8 @@ class APITestCaseRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView
                 kind="error",
                 message="API测试用例不存在或无权限访问", status_code=404,
             )
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"删除API测试用例失败: {e}", exc_info=True)
             return response(
@@ -793,14 +733,7 @@ class TestStatisticsView(APIView):
     def get(self, request, project_id):
         """获取项目测试统计信息"""
         # 检查项目权限
-        project = get_object_or_404(Project, id=project_id)
-        if not (request.user.is_superuser or project.owner_id == request.user.id or
-                project.created_by == request.user or
-                project.members.filter(user=request.user, can_view_reports=True).exists()):
-            return response(
-                kind="permission_denied",
-                message="没有权限查看此项目的测试报告"
-            )
+        _get_api_project_for_user(project_id, request.user, 'report')
 
         # Use the same project/report scope as the execution list. Workspace
         # debug and AI verification deliberately have no Environment.
@@ -837,16 +770,9 @@ class EndpointTestCasesView(APIView):
 
     def get(self, request, project_id, spec_id, endpoint_id):
         """获取指定端点的测试用例列表"""
+        _get_api_project_for_user(project_id, request.user, 'read')
         # 获取API规范
-        api_spec = get_object_or_404(APISpecification, id=spec_id)
-
-        # 检查权限
-        if not (api_spec.project.created_by == request.user or
-                api_spec.project.members.filter(user=request.user).exists()):
-            return response(
-                kind="permission_denied",
-                message="没有权限访问此API规范"
-            )
+        api_spec = get_object_or_404(APISpecification, id=spec_id, project_id=project_id)
 
         # 获取端点
         endpoint = get_object_or_404(APIEndpoint, id=endpoint_id, spec=api_spec)
@@ -876,10 +802,8 @@ class EndpointTestCasesOrderView(APIView):
         批量更新端点下测试用例的 sort_order
         Payload: {"case_ids": [5, 2, 8, 1]} 按拖拽后的顺序
         """
+        _get_api_project_for_user(project_id, request.user, 'edit')
         api_spec = get_object_or_404(APISpecification, id=spec_id, project_id=project_id)
-        if not (api_spec.project.created_by == request.user or
-                api_spec.project.members.filter(user=request.user).exists()):
-            return response(kind="permission_denied", message="没有权限访问此API规范")
 
         endpoint = get_object_or_404(APIEndpoint, id=endpoint_id, spec=api_spec)
 
@@ -894,7 +818,6 @@ class EndpointTestCasesOrderView(APIView):
         cases = list(APITestCase.objects.filter(
             id__in=case_ids,
             endpoint=endpoint,
-            created_by=request.user
         ))
         if len(cases) != len(case_ids):
             return response(kind="error", message="部分用例不存在或不属于该端点")
@@ -917,10 +840,7 @@ class ScenarioTestCasesOrderView(APIView):
         批量更新项目下场景测试用例的 sort_order
         Payload: {"case_ids": [45, 12, 33, ...]} 按拖拽后的顺序
         """
-        project = get_object_or_404(Project, id=project_id)
-        if not (project.created_by == request.user or
-                project.members.filter(user=request.user).exists()):
-            return response(kind="permission_denied", message="没有权限访问此项目")
+        _get_api_project_for_user(project_id, request.user, 'edit')
 
         case_ids = request.data.get('case_ids')
         if not isinstance(case_ids, list):
@@ -935,7 +855,6 @@ class ScenarioTestCasesOrderView(APIView):
             project_id=project_id,
             test_case_type='scenario',
             endpoint__isnull=True,
-            created_by=request.user
         ))
         if len(cases) != len(case_ids):
             return response(kind="error", message="部分用例不存在或不属于该项目的场景测试用例")
@@ -954,10 +873,7 @@ class APIModuleListView(APIView):
 
     def get(self, request, project_id):
         """返回模块列表，按 sort_order 排序"""
-        project = get_object_or_404(Project, id=project_id)
-        if not (project.created_by == request.user or
-                project.members.filter(user=request.user).exists()):
-            return response(kind="permission_denied", message="没有权限访问此项目")
+        _get_api_project_for_user(project_id, request.user)
 
         modules = list(APIModule.objects.filter(project_id=project_id).order_by('sort_order', '-created_at'))
         data = [{'id': m.id, 'name': m.name, 'sort_order': m.sort_order} for m in modules]
@@ -973,10 +889,7 @@ class APIModuleOrderView(APIView):
         批量更新模块的 sort_order
         Payload: {"module_ids": [3, 1, 2]} 或 {"module_names": ["用户相关操作", "订单", "其他"]}
         """
-        project = get_object_or_404(Project, id=project_id)
-        if not (project.created_by == request.user or
-                project.members.filter(user=request.user).exists()):
-            return response(kind="permission_denied", message="没有权限访问此项目")
+        _get_api_project_for_user(project_id, request.user, 'edit')
 
         module_ids = request.data.get('module_ids')
         module_names = request.data.get('module_names')
@@ -1026,10 +939,8 @@ class APIEndpointOrderView(APIView):
         批量更新端点的 sort_order
         Payload: {"endpoint_ids": [5, 8, 4]} 按拖拽后的顺序
         """
+        _get_api_project_for_user(project_id, request.user, 'edit')
         api_spec = get_object_or_404(APISpecification, id=spec_id, project_id=project_id)
-        if not (api_spec.project.created_by == request.user or
-                api_spec.project.members.filter(user=request.user).exists()):
-            return response(kind="permission_denied", message="没有权限访问此API规范")
 
         endpoint_ids = request.data.get('endpoint_ids')
         if not isinstance(endpoint_ids, list):
@@ -1133,12 +1044,11 @@ class APITestSuiteListCreateView(generics.ListCreateAPIView):
         return APITestSuiteSerializer
 
     def get_queryset(self):
-        """获取当前用户的测试套件"""
-        user = self.request.user
+        """获取当前项目的共享测试套件"""
         project_id = self.kwargs.get('project_id')
-        
+        capability = 'edit' if self.request.method == 'POST' else 'read'
+        _get_api_project_for_user(project_id, self.request.user, capability)
         queryset = APITestSuite.objects.filter(
-            user=user,
             project_id=project_id
         ).select_related(
             'user', 'project'
@@ -1155,11 +1065,11 @@ class APITestSuiteListCreateView(generics.ListCreateAPIView):
         project_id = self.kwargs.get('project_id')
         
         if project_id:
-            from projects.models import Project
             try:
-                project = Project.objects.get(id=project_id)
+                capability = 'edit' if self.request.method == 'POST' else 'read'
+                project = _get_api_project_for_user(project_id, self.request.user, capability)
                 context['project'] = project
-            except Project.DoesNotExist:
+            except Http404:
                 pass
         
         return context
@@ -1211,12 +1121,11 @@ class APITestSuiteRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIVie
         return APITestSuiteSerializer
     
     def get_queryset(self):
-        """获取当前用户的测试套件"""
-        user = self.request.user
+        """获取当前项目的共享测试套件"""
         project_id = self.kwargs.get('project_id')
-        
+        capability = {'PUT': 'edit', 'PATCH': 'edit', 'DELETE': 'delete'}.get(self.request.method, 'read')
+        _get_api_project_for_user(project_id, self.request.user, capability)
         return APITestSuite.objects.filter(
-            user=user,
             project_id=project_id
         ).select_related(
             'user', 'project'
@@ -1268,11 +1177,13 @@ class APITestSuiteAddTestCaseView(APIView):
             logger.info(f"开始添加测试用例到套件 {pk}, 项目: {project_id}, 用户: {request.user.id}")
             logger.info(f"请求数据: {request.data}")
             
-            # 获取测试套件
-            test_suite = get_object_or_404(APITestSuite, pk=pk, user=request.user)
+            project = _get_api_project_for_user(project_id, request.user, 'edit')
+            test_suite = get_object_or_404(APITestSuite, pk=pk, project=project)
             
             # 验证数据
-            serializer = APITestSuiteAddTestCaseSerializer(data=request.data, context={'request': request})
+            serializer = APITestSuiteAddTestCaseSerializer(
+                data=request.data, context={'request': request, 'project': project},
+            )
             if not serializer.is_valid():
                 return response(
                     kind="error",
@@ -1299,6 +1210,8 @@ class APITestSuiteAddTestCaseView(APIView):
                 message=f"成功添加 {len(test_case_ids)} 个测试用例到套件"
             )
             
+        except (PermissionDenied, Http404):
+            raise
         except Exception as e:
             logger.error(f"添加测试用例到套件失败: {e}", exc_info=True)
             return response(
@@ -1314,11 +1227,11 @@ class APITestSuiteRemoveTestCaseView(APIView):
     def delete(self, request, project_id, pk, test_case_id):
         """从套件中移除测试用例"""
         try:
-            # 获取测试套件
-            test_suite = get_object_or_404(APITestSuite, pk=pk, user=request.user)
+            project = _get_api_project_for_user(project_id, request.user, 'edit')
+            test_suite = get_object_or_404(APITestSuite, pk=pk, project=project)
             
             # 获取测试用例
-            test_case = get_object_or_404(APITestCase, pk=test_case_id, created_by=request.user)
+            test_case = get_object_or_404(APITestCase, pk=test_case_id, project=project)
             
             # 从套件中移除测试用例
             test_suite.test_cases.remove(test_case)
@@ -1336,6 +1249,8 @@ class APITestSuiteRemoveTestCaseView(APIView):
                 message="成功从套件中移除测试用例"
             )
             
+        except (PermissionDenied, Http404):
+            raise
         except Exception as e:
             logger.error(f"从套件中移除测试用例失败: {e}", exc_info=True)
             return response(
@@ -1351,14 +1266,8 @@ from .execution_views import ExecuteAPITestSuiteView
 
 def _report_execution_queryset(user, project_id):
     """Executions visible in a project report (not only to the executor)."""
-    queryset = APITestExecution.objects.filter(project_id=project_id)
-    if user.is_superuser:
-        return queryset
-    return queryset.filter(
-        Q(project__owner=user)
-        | Q(project__created_by=user)
-        | Q(project__members__user=user, project__members__can_view_reports=True)
-    ).distinct()
+    _get_api_project_for_user(project_id, user, 'report')
+    return APITestExecution.objects.filter(project_id=project_id)
 
 class APITestExecutionListView(generics.ListAPIView):
     """统一执行记录列表视图 - 获取所有执行记录（包含类型）"""
@@ -1580,16 +1489,13 @@ class APITestExecutionDeleteView(APIView):
 
     def delete(self, request, project_id, pk):
         """删除执行记录"""
-        _get_api_project_for_user(project_id, request.user)
+        _get_api_project_for_user(project_id, request.user, 'delete')
         try:
-            user = request.user
-
             # 获取执行记录
             execution = APITestExecution.objects.select_related(
                 'case_execution_detail', 'suite_execution_detail'
             ).get(
                 pk=pk, project_id=project_id,
-                executor=user
             )
 
             # 记录执行信息用于日志
@@ -1608,7 +1514,7 @@ class APITestExecutionDeleteView(APIView):
             # 删除主执行记录
             execution.delete()
 
-            logger.info(f"用户 {user.username} 删除了{exec_type}执行记录: {exec_name} (ID: {pk})")
+            logger.info(f"用户 {request.user.username} 删除了{exec_type}执行记录: {exec_name} (ID: {pk})")
 
             return response(
                 kind="success",

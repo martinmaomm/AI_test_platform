@@ -194,7 +194,8 @@ class RAGConfiguration(models.Model):
         verbose_name_plural = 'RAG配置'
         ordering = ['-is_default', '-is_active', '-created_at']
         
-        # 确保每个用户只能有一个默认配置
+        # Historical database constraint; platform-global default selection is
+        # enforced by save() below so legacy creator ownership remains audit-only.
         constraints = [
             models.UniqueConstraint(
                 fields=['created_by', 'is_default'],
@@ -207,11 +208,9 @@ class RAGConfiguration(models.Model):
         return f"{self.name} ({self.vector_db_type})"
     
     def save(self, *args, **kwargs):
-        """保存时确保只有一个默认配置"""
+        """Save while keeping a single platform-global default configuration."""
         if self.is_default:
-            # 将同一用户的其他配置设为非默认
             RAGConfiguration.objects.filter(
-                created_by=self.created_by,
                 is_default=True
             ).exclude(pk=self.pk).update(is_default=False)
         
@@ -391,4 +390,3 @@ class MCPTool(models.Model):
     
     def __str__(self):
         return f"{self.name} ({self.mcp_config.name})"
-

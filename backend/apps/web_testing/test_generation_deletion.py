@@ -35,6 +35,11 @@ class WebUIScriptGenerationDeletionTests(TestCase):
             name='Deletion project', project_type='web',
             owner=self.owner, created_by=self.owner,
         )
+        ProjectMember.objects.create(
+            project=self.project, user=self.owner, role='owner',
+            can_edit=True, can_delete=True, can_execute_tests=True,
+            can_view_reports=True,
+        )
         self.membership = ProjectMember.objects.create(
             project=self.project, user=self.member, role='editor',
             can_edit=True, can_delete=True,
@@ -163,6 +168,61 @@ class WebUIScriptGenerationDeletionTests(TestCase):
         self.assertEqual(self.delete(generation, project_id=other_project.id).status_code, 404)
         self.assertEqual(self.delete(generation, user=self.member).status_code, 200)
 
+    def test_non_creator_admin_without_membership_can_read_and_delete_own_generation(self):
+        admin = get_user_model().objects.create_user(
+            username='delete-admin', email='delete-admin@example.test', is_staff=True,
+        )
+        generation = self.generation(user=admin)
+
+        history = self.history(admin)
+        self.assertEqual(history.status_code, 200, history.data)
+        self.assertTrue(history.data['data']['items'][0]['can_delete'])
+
+        request = self.factory.get('/script-generations/')
+        force_authenticate(request, user=admin)
+        detail = WebUIScriptGenerationDetailView.as_view()(
+            request, project_id=self.project.id, generation_id=generation.id,
+        )
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(self.delete(generation, user=admin).status_code, 200)
+
+    def test_demoted_project_creator_cannot_access_another_users_private_draft(self):
+        creator = get_user_model().objects.create_user(
+            username='demoted-creator',
+            email='demoted-creator@example.test',
+            is_staff=True,
+        )
+        author = get_user_model().objects.create_user(
+            username='private-draft-author',
+            email='private-draft-author@example.test',
+        )
+        project = Project.objects.create(
+            name='Demoted creator project', project_type='web',
+            owner=creator, created_by=creator,
+        )
+        ProjectMember.objects.create(
+            project=project, user=creator, role='owner',
+            can_edit=True, can_delete=True, can_execute_tests=True,
+            can_view_reports=True,
+        )
+        ProjectMember.objects.create(
+            project=project, user=author, role='editor', can_edit=True,
+        )
+        generation = self.generation(project=project, user=author)
+        creator.is_staff = False
+        creator.save(update_fields=['is_staff'])
+
+        request = self.factory.get('/script-generations/')
+        force_authenticate(request, user=creator)
+        detail = WebUIScriptGenerationDetailView.as_view()(
+            request, project_id=project.id, generation_id=generation.id,
+        )
+        self.assertEqual(detail.status_code, 403, detail.data)
+        self.assertEqual(
+            self.delete(generation, user=creator, project_id=project.id).status_code,
+            403,
+        )
+
     def test_only_generation_deleted_saved_case_execution_detail_and_files_survive(self):
         case = WebUITestCase.objects.create(
             title='Saved case', user=self.owner, project=self.project, description='fixture',
@@ -200,7 +260,9 @@ class WebUIScriptGenerationDeletionTests(TestCase):
         busy = self.generation(workspace={'verification': {'status': 'running'}})
         repair = self.generation(workspace={'repair': {'status': 'pending'}})
         active = self.generation(status='exploring')
-        with self.assertNumQueries(3):
+        # Project access and record-delete capability each check membership;
+        # the history itself remains one count plus one page query.
+        with self.assertNumQueries(5):
             response = self.history()
         self.assertEqual(response.status_code, 200, response.data)
         items = {item['id']: item for item in response.data['data']['items']}

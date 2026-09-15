@@ -12,6 +12,11 @@ export function getLLMConfigurations(params = {}) {
   return api.get('/ai-core/llm-configs/', { params })
 }
 
+// 业务页面只读取安全字段；配置管理页面仍使用 getLLMConfigurations。
+export function getAvailableLLMConfigurations() {
+  return api.get('/ai-core/llm-configs/available/')
+}
+
 /**
  * 创建LLM配置
  */
@@ -231,4 +236,3 @@ export function getMCPConfiguration(id) {
 export function toggleMCPConfigurationActive(id) {
   return api.post(`/ai-core/mcp-configs/${id}/toggle_active/`)
 }
-

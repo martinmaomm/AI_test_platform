@@ -65,6 +65,12 @@ class APIProjectAccessBoundaryTests(TestCase):
             name="ACCESS-BOUNDARY-OTHER", project_type="api",
             owner=self.owner, created_by=self.owner,
         )
+        for project in (self.project, self.other_project):
+            ProjectMember.objects.create(
+                project=project, user=self.owner, role="editor",
+                can_edit=True, can_delete=True,
+                can_execute_tests=True, can_view_reports=True,
+            )
         ProjectMember.objects.create(
             project=self.project, user=self.viewer, role="viewer",
             can_edit=False, can_delete=False,
@@ -198,6 +204,11 @@ class APIWorkspaceFaultAcceptanceTests(TestCase):
         self.project = Project.objects.create(
             name="Fault acceptance", project_type="api",
             owner=self.user, created_by=self.user,
+        )
+        ProjectMember.objects.create(
+            project=self.project, user=self.user, role="editor",
+            can_edit=True, can_delete=True,
+            can_execute_tests=True, can_view_reports=True,
         )
         self.model = LLMConfiguration.objects.create(
             model_type="llm", provider="openai", model_name="offline-fault-model",

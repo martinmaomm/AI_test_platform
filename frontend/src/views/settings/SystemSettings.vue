@@ -3,7 +3,7 @@
     <div class="config-header">
       <BackButton to="/dashboard" text="返回首页" />
       <h1 class="config-title">全局系统配置</h1>
-      <p class="config-desc">邮件通知服务与通用系统参数</p>
+      <p class="config-desc">邮件通知服务、用户管理与通用系统参数</p>
     </div>
 
     <div class="card-grid">
@@ -30,10 +30,14 @@
 </template>
 
 <script setup>
-import { Message, Operation } from '@element-plus/icons-vue'
+import { Message, Operation, User } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
+import { computed } from 'vue'
+import { useAuthStore } from '@/stores/auth'
+import { canManageUsers } from '@/utils/accessControl'
 
-const cards = [
+const authStore = useAuthStore()
+const cards = computed(() => [
   {
     id: 'email',
     path: '/settings/email-config',
@@ -47,8 +51,16 @@ const cards = [
     title: '通用系统参数',
     desc: '环境标识、系统备份、基础参数配置',
     icon: Operation
+  },
+  {
+    id: 'users',
+    path: '/settings/users',
+    title: '用户管理',
+    desc: '创建账号、调整普通用户角色与状态，并分配项目成员权限',
+    icon: User,
+    visible: canManageUsers(authStore.user)
   }
-]
+].filter((card) => card.visible !== false))
 </script>
 
 <style scoped>
@@ -127,6 +139,8 @@ const cards = [
   background: linear-gradient(180deg, #64748b, #94a3b8);
 }
 
+.config-card.card-users .card-glow-bar { background: linear-gradient(180deg, #8b5cf6, #a78bfa); }
+
 .card-inner {
   display: flex;
   align-items: center;
@@ -155,6 +169,8 @@ const cards = [
   background: rgba(100, 116, 139, 0.15);
   color: #64748b;
 }
+
+.card-icon.users { background: rgba(139, 92, 246, 0.15); color: #8b5cf6; }
 
 .card-content {
   flex: 1;

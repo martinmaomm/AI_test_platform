@@ -13,7 +13,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from rest_framework.views import APIView
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from users.permissions import IsPlatformAdmin
 from rest_framework.response import Response
 import json
 from ..api.api_response import response
@@ -46,7 +46,8 @@ FILE_TYPE_MAP = {
 class FileDownloadView(APIView):
     """文件下载视图"""
     
-    permission_classes = [IsAuthenticated]
+    # This legacy utility accepts machine paths, not project-scoped file IDs.
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request):
         """
@@ -132,7 +133,7 @@ class FileDownloadView(APIView):
 class FileListView(APIView):
     """文件列表视图"""
     
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request):
         """
@@ -694,4 +695,3 @@ class APISpecFileService:
         extension_valid = file_extension in type_config['extensions']
         
         return content_type_valid or extension_valid
-

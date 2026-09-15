@@ -36,6 +36,10 @@ class BrowserDiscoveryContractsTests(TestCase):
         self.owner = get_user_model().objects.create_user(username='browser-owner', email='browser-owner@example.test', password='pw')
         self.other = get_user_model().objects.create_user(username='browser-other', email='browser-other@example.test', password='pw')
         self.project = Project.objects.create(name='Browser capture', project_type='api', owner=self.owner, created_by=self.owner)
+        ProjectMember.objects.create(
+            project=self.project, user=self.owner, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         ProjectMember.objects.create(project=self.project, user=self.other, role='editor', can_edit=True, can_execute_tests=True)
         self.model = LLMConfiguration.objects.create(
             model_type='llm', provider='offline', model_name='offline-browser', created_by=self.owner, is_active=True,
@@ -343,18 +347,19 @@ class BrowserDiscoveryContractsTests(TestCase):
                 self.assertEqual(data['model_failure'], task.evidence_summary['diagnostic'])
                 self.assertNotIn('SECRET', str(data['model_failure']))
 
-    def test_browser_capture_workspace_source_is_owner_scoped_at_create_patch_and_messages(self):
+    def test_published_browser_capture_is_shared_while_workspaces_stay_personal(self):
         task = self.task()
         spec = APISpecification.objects.create(
             project=self.project, created_by=self.owner, status=APISpecification.TaskStatus.COMPLETED,
             spec_type=APISpecification.SpecType.BROWSER_CAPTURE, source_task=task,
         )
         endpoint = APIEndpoint.objects.create(spec=spec, method='GET', path='/private-sample')
-        create_request = self.factory.post('/', {'spec_id': spec.id, 'endpoint_ids': [endpoint.id]}, format='json')
+        create_request = self.factory.post('/', {
+            'spec_id': spec.id, 'endpoint_ids': [endpoint.id], 'model_id': self.model.id,
+        }, format='json')
         force_authenticate(create_request, user=self.other)
         create_reply = APIWorkspaceCollectionView.as_view()(create_request, project_id=self.project.id)
-        self.assertEqual(create_reply.status_code, 400)
-        self.assertIn('发起者', create_reply.data['message'])
+        self.assertEqual(create_reply.status_code, 201, create_reply.data)
 
         other_model = LLMConfiguration.objects.create(
             model_type='llm', provider='offline', model_name='other-browser', created_by=self.other, is_active=True,
@@ -366,31 +371,25 @@ class BrowserDiscoveryContractsTests(TestCase):
         patch_request = self.factory.patch('/', {'revision': legacy_workspace.revision, 'endpoint_ids': [endpoint.id]}, format='json')
         force_authenticate(patch_request, user=self.other)
         patch_reply = APIWorkspaceDetailView.as_view()(patch_request, project_id=self.project.id, workspace_id=legacy_workspace.id)
-        self.assertEqual(patch_reply.status_code, 400)
-        with self.assertRaises(WorkspaceValidationError):
-            generation_endpoint_specs(legacy_workspace)
-
-        message_request = self.factory.post('/', {
-            'revision': legacy_workspace.revision, 'message': '生成私有样本', 'mode': 'generate',
-            'execution_confirmed': True, 'base_url': 'https://api.example.test', 'variables': {},
-        }, format='json')
-        force_authenticate(message_request, user=self.other)
-        message_reply = APIWorkspaceMessagesView.as_view()(message_request, project_id=self.project.id, workspace_id=legacy_workspace.id)
-        self.assertEqual(message_reply.status_code, 400)
-        self.assertIn('发起者', message_reply.data['message'])
+        self.assertEqual(patch_reply.status_code, 200, patch_reply.data)
+        self.assertEqual([item['id'] for item in generation_endpoint_specs(legacy_workspace)], [endpoint.id])
 
         list_request = self.factory.get('/')
         force_authenticate(list_request, user=self.other)
         list_reply = APIEndpointListView.as_view()(list_request, project_id=self.project.id, spec_id=spec.id)
-        self.assertEqual(list_reply.status_code, 404)
+        self.assertEqual(list_reply.status_code, 200, list_reply.data)
         detail_request = self.factory.get('/')
         force_authenticate(detail_request, user=self.other)
         detail_reply = APISpecificationRetrieveUpdateDestroyView.as_view()(detail_request, project_id=self.project.id, pk=spec.id)
-        self.assertEqual(detail_reply.status_code, 404)
+        self.assertEqual(detail_reply.status_code, 200, detail_reply.data)
 
     @override_settings(API_BROWSER_DISCOVERY_ENABLED=True)
     def test_create_rejects_non_api_project_and_does_not_store_queue_exception_details(self):
         web_project = Project.objects.create(name='Not API', project_type='web', owner=self.owner, created_by=self.owner)
+        ProjectMember.objects.create(
+            project=web_project, user=self.owner, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
         payload = {
             'target_url': 'https://shop.example.test/app?tenant=a#items', 'description': '仅用于测试',
             'api_origin': 'https://api.example.test', 'model_id': self.model.id,

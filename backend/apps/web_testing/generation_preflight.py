@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 from django.conf import settings
 
-from ai_core.models import LLMConfiguration, MCPConfiguration, ModelType
+from ai_core.config_access import usable_llm_configurations, usable_mcp_configurations
 
 
 _EXECUTEAUTOMATION_PLAYWRIGHT_MCP_PACKAGE = '@executeautomation/playwright-mcp-server'
@@ -222,12 +222,9 @@ def prepare_playwright_mcp_config(
     return config
 
 
-def resolve_active_playwright_mcp_config(user_id: int) -> tuple[int, dict[str, Any]] | None:
-    """Synchronously select an active user-owned MCP configuration with Playwright."""
-    configurations = MCPConfiguration.objects.filter(
-        created_by_id=user_id,
-        is_active=True,
-    ).order_by('-created_at')
+def resolve_active_playwright_mcp_config(user_id: int | None = None) -> tuple[int, dict[str, Any]] | None:
+    """Synchronously select a globally active MCP configuration with Playwright."""
+    configurations = usable_mcp_configurations().order_by('-created_at')
     for configuration in configurations:
         try:
             config = prepare_playwright_mcp_config(configuration.get_config_dict())
@@ -240,10 +237,8 @@ def resolve_active_playwright_mcp_config(user_id: int) -> tuple[int, dict[str, A
 def run_safety_preflight(generation, brief: Any) -> PreflightResult:
     """Return a stable, user-actionable decision without starting MCP."""
     config_id = (generation.model_info or {}).get('config_id')
-    active_model = LLMConfiguration.objects.filter(
+    active_model = usable_llm_configurations().filter(
         id=config_id,
-        model_type=ModelType.LLM,
-        is_active=True,
     ).exists()
     if not active_model:
         return PreflightResult('failed', 'MODEL_CONFIG_MISSING', '本次锁定的 LLM 配置不存在或已停用。')

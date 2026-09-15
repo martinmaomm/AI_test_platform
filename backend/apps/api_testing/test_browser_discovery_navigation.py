@@ -37,6 +37,14 @@ class BrowserDiscoveryNavigationTests(TestCase):
             name='其他项目', project_type='api', owner=self.other, created_by=self.other,
         )
         ProjectMember.objects.create(
+            project=self.project, user=self.owner, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
+        ProjectMember.objects.create(
+            project=self.other_project, user=self.other, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
+        )
+        ProjectMember.objects.create(
             project=self.project, user=self.other, role='editor', can_edit=True, can_execute_tests=True,
         )
         self.model = LLMConfiguration.objects.create(

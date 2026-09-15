@@ -12,7 +12,7 @@ from api_testing.models import (
     APITestSuite,
 )
 from api_testing.tasks import _execute_api_test_suite
-from projects.models import Environment, Project
+from projects.models import Environment, Project, ProjectMember
 
 from .models import ScheduledTask, TaskExecutionLog
 from .scheduling import (
@@ -31,6 +31,10 @@ class ScheduledRunReliabilityTests(TestCase):
         self.project = Project.objects.create(
             name='Scheduled reliability', project_type='api',
             owner=self.user, created_by=self.user,
+        )
+        ProjectMember.objects.create(
+            project=self.project, user=self.user, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
         )
         self.environment = Environment.objects.create(
             project=self.project, name='API environment',

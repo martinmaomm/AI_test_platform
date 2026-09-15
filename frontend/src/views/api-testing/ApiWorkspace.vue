@@ -688,7 +688,7 @@ import { copyText } from "@/utils/reportLinks";
 import { useProjectStore } from "@/stores/project";
 import { getAPISpecifications, getAPIEndpoints } from "@/api/apiTesting";
 import { getProjectEnvironments } from "@/api/projects";
-import { getLLMConfigurations } from "@/api/aiConfig";
+import { getAvailableLLMConfigurations } from "@/api/aiConfig";
 import {
   cancelApiWorkspace,
   createApiWorkspace,
@@ -2052,7 +2052,7 @@ const loadAuxiliary = async () => {
   specsLoading.value = true;
   const [modelsResult, specsResult, environmentsResult] =
     await Promise.allSettled([
-      getLLMConfigurations(),
+      getAvailableLLMConfigurations(),
       isDocumentSource.value
         ? getAPISpecifications(projectId.value)
         : Promise.resolve(null),

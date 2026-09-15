@@ -2,42 +2,24 @@
 
 from django.http import Http404
 from rest_framework.exceptions import PermissionDenied
-
-from projects.models import Project, ProjectMember
+from projects.access import EDIT, READ, get_project_for_user
+from projects.models import Project
+from users.permissions import is_platform_admin
 
 
 def can_edit(project: Project, user) -> bool:
     """Whether ``user`` can change project knowledge owned by ``project``."""
     if not getattr(user, 'is_authenticated', False):
         return False
-    if project.owner_id == user.id or project.created_by_id == user.id:
+    if is_platform_admin(user):
         return True
-    return ProjectMember.objects.filter(
-        project=project, user=user, can_edit=True,
-    ).exists()
+    try:
+        get_project_for_user(project.pk, user, EDIT)
+    except (Http404, PermissionDenied):
+        return False
+    return True
 
 
 def require_project(project_id, user, edit: bool = False) -> Project:
-    """Return an accessible project without disclosing unrelated projects.
-
-    Creators and owners are intentionally allowed even when they have no
-    ``ProjectMember`` row.  A user who is not a project member receives 404;
-    an existing read-only member receives 403 for a requested edit operation.
-    """
-    project = Project.objects.filter(pk=project_id).first()
-    if project is None:
-        raise Http404('项目不存在')
-
-    if not getattr(user, 'is_authenticated', False):
-        raise Http404('项目不存在')
-    if project.owner_id == user.id or project.created_by_id == user.id:
-        return project
-
-    member = ProjectMember.objects.filter(project=project, user=user).first()
-    if member is None:
-        raise Http404('项目不存在或无访问权限')
-    if edit and not member.can_edit:
-        raise PermissionDenied('没有修改此项目知识库的权限')
-    if not edit and not member.can_view_reports:
-        raise PermissionDenied('没有查看此项目知识库的权限')
-    return project
+    """Return a project for platform admins or current project members."""
+    return get_project_for_user(project_id, user, EDIT if edit else READ)

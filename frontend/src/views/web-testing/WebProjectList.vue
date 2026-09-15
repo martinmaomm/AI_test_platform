@@ -7,7 +7,7 @@
         </template>
         <template #title />
         <template #extra>
-          <el-button type="primary" @click="showCreateDialog = true">
+          <el-button v-if="canManageProjects" type="primary" @click="showCreateDialog = true">
             <el-icon><Plus /></el-icon>
             新建Web项目
           </el-button>
@@ -32,7 +32,7 @@
               <div class="card-footer">
                 <span class="project-meta">{{ formatDate(project.created_at) }}</span>
                 <div class="footer-actions">
-                  <el-button type="warning" size="small" @click="openEditDialog(project)">编辑</el-button>
+                  <el-button v-if="canManageProjects" type="warning" size="small" @click="openEditDialog(project)">编辑</el-button>
                   <el-button type="primary" size="small" @click="enterProject(project)">进入工作区</el-button>
                 </div>
               </div>
@@ -68,7 +68,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Plus, Monitor } from '@element-plus/icons-vue'
@@ -76,10 +76,14 @@ import BackButton from '@/components/BackButton.vue'
 import ProjectEditDialog from '@/components/project/ProjectEditDialog.vue'
 import { getProjects, createProject, updateProject } from '@/api/projects'
 import { useProjectStore } from '@/stores/project'
+import { useAuthStore } from '@/stores/auth'
+import { canManageProjectMetadata } from '@/utils/accessControl'
 import dayjs from 'dayjs'
 
 const router = useRouter()
 const projectStore = useProjectStore()
+const authStore = useAuthStore()
+const canManageProjects = computed(() => canManageProjectMetadata(authStore.user))
 
 const loading = ref(false)
 const creating = ref(false)

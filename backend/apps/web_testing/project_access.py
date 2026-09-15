@@ -5,17 +5,13 @@ from __future__ import annotations
 from functools import wraps
 from typing import Optional
 
-from django.http import Http404
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import ValidationError
 
-from projects.models import Project, ProjectMember
-
-
-READ = 'read'
-EDIT = 'edit'
-DELETE = 'delete'
-EXECUTE = 'execute'
-REPORT = 'report'
+from projects.access import (
+    DELETE, EDIT, EXECUTE, READ, REPORT,
+    get_project_for_user as get_scoped_project_for_user,
+)
+from projects.models import Project
 
 
 def get_project_for_user(
@@ -24,37 +20,9 @@ def get_project_for_user(
     capability: str = READ,
     expected_project_type: Optional[str] = 'web',
 ) -> Project:
-    """Return a project only when the user has the requested capability.
-
-    A missing or type-mismatched project receives 404 so project existence and
-    module ownership are not disclosed. A member without the requested
-    capability receives the normal DRF 403 response. Owners and creators
-    bypass member capability flags.
-    """
-
-    project = Project.objects.filter(pk=project_id).first()
-    if project is None:
-        raise Http404('项目不存在')
-
-    if expected_project_type and project.project_type != expected_project_type:
-        raise Http404('项目不存在')
-
-    if project.owner_id == user.id or project.created_by_id == user.id:
-        return project
-
-    member = ProjectMember.objects.filter(project_id=project_id, user_id=user.id).first()
-    if member is None:
-        raise Http404('项目不存在或无权限访问')
-
-    required_flag = {
-        EDIT: 'can_edit',
-        DELETE: 'can_delete',
-        EXECUTE: 'can_execute_tests',
-        REPORT: 'can_view_reports',
-    }.get(capability)
-    if required_flag and not getattr(member, required_flag, False):
-        raise PermissionDenied('没有执行此项目操作的权限')
-    return project
+    return get_scoped_project_for_user(
+        project_id, user, capability, expected_project_type=expected_project_type,
+    )
 
 
 def project_access_required(

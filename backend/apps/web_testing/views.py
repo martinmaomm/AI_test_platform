@@ -22,6 +22,7 @@ from rest_framework.views import APIView
 
 from common.api import response
 from projects.models import ProjectMember
+from users.permissions import is_platform_admin
 
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .assertion_state import analyze_assertion_state
@@ -147,11 +148,7 @@ class StandardResultsSetPagination(PageNumberPagination):
 
 
 def _is_generation_owner(project, generation, user) -> bool:
-    return (
-        generation.user_id == user.id
-        or project.owner_id == user.id
-        or project.created_by_id == user.id
-    )
+    return generation.user_id == user.id or is_platform_admin(user)
 
 
 class WebUIScriptGenerationCreateView(APIView):
@@ -160,7 +157,7 @@ class WebUIScriptGenerationCreateView(APIView):
     def get(self, request, project_id):
         project = get_project_for_user(project_id, request.user, READ)
         can_delete_records = (
-            request.user.id in {project.owner_id, project.created_by_id}
+            is_platform_admin(request.user)
             or ProjectMember.objects.filter(
                 project=project, user=request.user, can_delete=True,
             ).exists()

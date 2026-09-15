@@ -2,15 +2,14 @@
 
 import logging
 
-from django.http import Http404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
-from rest_framework.permissions import IsAdminUser, IsAuthenticated
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from projects.models import Project
-from web_testing.project_access import DELETE, EDIT, EXECUTE, READ, get_project_for_user
+from projects.access import DELETE, EDIT, EXECUTE, READ, get_project_for_user
+from users.permissions import IsPlatformAdmin
 
 from .delivery import NotificationDeliveryError, parse_recipients, send_email, test_smtp_connection
 from .models import EmailConfig, NotificationChannel, NotificationReceiver
@@ -51,11 +50,6 @@ class NotificationReceiverViewSet(viewsets.ModelViewSet):
             project_id = int(project_id)
         except (TypeError, ValueError) as exc:
             raise ValidationError({"project_id": "project_id 必须为有效整数"}) from exc
-        if self.request.user.is_superuser:
-            project = Project.objects.filter(pk=project_id).first()
-            if project is None:
-                raise Http404("项目不存在")
-            return project
         return get_project_for_user(
             project_id,
             self.request.user,
@@ -141,7 +135,7 @@ class EmailConfigViewSet(viewsets.ModelViewSet):
     """Admin-only SMTP configuration CRUD and connection/authentication test."""
 
     serializer_class = EmailConfigSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsPlatformAdmin]
 
     def get_queryset(self):
         return EmailConfig.objects.all().order_by("-updated_at", "-pk")

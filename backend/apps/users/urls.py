@@ -1,5 +1,6 @@
 from django.urls import path
 from . import views
+from .management_views import UserManagementListView, UserManagementDetailView, UserProjectAssignmentView
 
 app_name = 'users'
 
@@ -18,6 +19,9 @@ urlpatterns = [
     
     # 用户管理
     path('users/', views.UserListView.as_view(), name='user_list'),
+    path('manage/', UserManagementListView.as_view(), name='user_manage_list'),
+    path('manage/<int:pk>/', UserManagementDetailView.as_view(), name='user_manage_detail'),
+    path('manage/<int:pk>/projects/', UserProjectAssignmentView.as_view(), name='user_manage_projects'),
     path('manage/profile/', views.UserProfileView.as_view(), name='user_profile'),
     path('manage/preferences/', views.user_preferences, name='user_preferences'),
 ]

@@ -10,18 +10,25 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
+from users.permissions import IsPlatformAdmin
+
+from .config_access import usable_llm_configurations
 from .model_manager import get_llm_manager, ModelManager
 from .models import MCPConfiguration, MCPTool, LLMConfiguration
-from .serializers import LLMTestConnectionSerializer, VisionTestConnectionSerializer
+from .serializers import (
+    AvailableLLMConfigurationSerializer,
+    LLMTestConnectionSerializer,
+    VisionTestConnectionSerializer,
+)
 from common.api import response
 
 logger = logging.getLogger(__name__)
 
 
 def get_config_or_404(model_class, config_id, user):
-    """获取配置或返回404错误"""
+    """Get a platform configuration; ``user`` remains for call compatibility."""
     try:
-        return model_class.objects.get(id=config_id, created_by=user)
+        return model_class.objects.get(id=config_id)
     except model_class.DoesNotExist:
         return None
 
@@ -65,15 +72,14 @@ def test_llm_connection_with_config(config: LLMConfiguration) -> Dict[str, Any]:
 
 class RAGConfigurationViewSet(APIView):
     """RAG配置管理视图集"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request):
         """获取RAG配置列表"""
         from .models import RAGConfiguration
         from .serializers import RAGConfigurationListSerializer
         
-        # 获取当前用户的配置
-        configs = RAGConfiguration.objects.filter(created_by=request.user).order_by('-is_default', '-is_active', '-created_at')
+        configs = RAGConfiguration.objects.all().order_by('-is_default', '-is_active', '-created_at')
         serializer = RAGConfigurationListSerializer(configs, many=True)
         
         return response(
@@ -88,7 +94,7 @@ class RAGConfigurationViewSet(APIView):
         from .models import RAGConfiguration
         
         # 检查是否已存在配置
-        existing_config = RAGConfiguration.objects.filter(created_by=request.user).first()
+        existing_config = RAGConfiguration.objects.first()
         if existing_config:
             return response(
                 kind="error",
@@ -117,7 +123,7 @@ class RAGConfigurationViewSet(APIView):
 
 class RAGConfigurationDetailView(APIView):
     """RAG配置详情视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request, config_id):
         """获取RAG配置详情"""
@@ -193,7 +199,7 @@ class RAGConfigurationDetailView(APIView):
 
 class RAGConfigurationActionView(APIView):
     """RAG配置操作视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request, config_id, action):
         """执行配置操作"""
@@ -208,7 +214,7 @@ class RAGConfigurationActionView(APIView):
         
         if action == 'set_default':
             # 设置默认配置
-            RAGConfiguration.objects.filter(created_by=request.user, is_default=True).update(is_default=False)
+            RAGConfiguration.objects.filter(is_default=True).update(is_default=False)
             config.is_default = True
             config.save()
             
@@ -237,7 +243,7 @@ class RAGConfigurationActionView(APIView):
 
 class RAGTestConnectionView(APIView):
     """RAG连接测试视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request):
         """测试RAG连接"""
@@ -254,7 +260,7 @@ class RAGTestConnectionView(APIView):
         config_id = serializer.validated_data['config_id']
         
         try:
-            config = RAGConfiguration.objects.get(id=config_id, created_by=request.user)
+            config = RAGConfiguration.objects.get(id=config_id)
         except RAGConfiguration.DoesNotExist:
             return response(
                 kind="not_found",
@@ -305,15 +311,14 @@ class RAGTestConnectionView(APIView):
 
 class LLMConfigurationViewSet(APIView):
     """LLM配置管理视图集"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request):
         """获取LLM配置列表"""
         from .models import LLMConfiguration
         from .serializers import LLMConfigurationListSerializer
         
-        # 获取当前用户的配置
-        configs = LLMConfiguration.objects.filter(created_by=request.user).order_by('-is_active', '-created_at')
+        configs = LLMConfiguration.objects.all().order_by('-is_active', '-created_at')
         serializer = LLMConfigurationListSerializer(configs, many=True)
         
         return response(
@@ -349,7 +354,7 @@ class LLMConfigurationViewSet(APIView):
 
 class LLMConfigurationDetailView(APIView):
     """LLM配置详情视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request, config_id):
         """获取LLM配置详情"""
@@ -418,7 +423,7 @@ class LLMConfigurationDetailView(APIView):
 
 class LLMConfigurationActionView(APIView):
     """LLM配置操作视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request, config_id, action):
         """执行配置操作"""
@@ -451,7 +456,7 @@ class LLMConfigurationActionView(APIView):
 
 class LLMTestConnectionView(APIView):
     """LLM连接测试视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request):
         """测试LLM连接"""
@@ -467,7 +472,7 @@ class LLMTestConnectionView(APIView):
             config_id = serializer.validated_data['config_id']
             
             try:
-                config = LLMConfiguration.objects.get(id=config_id, created_by=request.user)
+                config = LLMConfiguration.objects.get(id=config_id)
             except LLMConfiguration.DoesNotExist:
                 return response(
                     kind="not_found",
@@ -498,16 +503,30 @@ class LLMTestConnectionView(APIView):
 
 
 
+class AvailableLLMConfigurationView(APIView):
+    """Safe global chat-model options for authenticated project workflows."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        configurations = usable_llm_configurations().order_by('-created_at')
+        serializer = AvailableLLMConfigurationSerializer(configurations, many=True)
+        return response(
+            kind='success',
+            data=serializer.data,
+            message='获取可用LLM配置成功',
+        )
+
+
 class LLMUsageStatisticsView(APIView):
     """LLM使用统计视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request):
         """获取LLM使用统计"""
         from .models import LLMUsageLog
         
-        # 获取当前用户的统计信息
-        user_logs = LLMUsageLog.objects.filter(configuration__created_by=request.user)
+        user_logs = LLMUsageLog.objects.all()
         
         total_requests = user_logs.count()
         successful_requests = user_logs.filter(success=True).count()
@@ -538,7 +557,7 @@ class LLMUsageStatisticsView(APIView):
 
 class VisionTestConnectionView(APIView):
     """测试视觉模型连接视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request):
         """测试视觉模型连接"""
@@ -557,7 +576,6 @@ class VisionTestConnectionView(APIView):
                 configuration = LLMConfiguration.objects.get(
                     pk=config_id,
                     model_type='vision',
-                    created_by=request.user
                 )
             except LLMConfiguration.DoesNotExist:
                 return response(
@@ -567,7 +585,7 @@ class VisionTestConnectionView(APIView):
             
             # 使用视觉模型管理器进行连接测试
             from .model_manager import get_vision_manager
-            vision_manager = get_vision_manager()
+            vision_manager = get_vision_manager(config_id=configuration.id)
             test_result = vision_manager.test_connection()
             
             return response(
@@ -586,7 +604,7 @@ class VisionTestConnectionView(APIView):
 
 class VisionSetDefaultView(APIView):
     """设置默认视觉模型配置视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request, pk):
         """设置默认视觉模型配置"""
@@ -595,7 +613,6 @@ class VisionSetDefaultView(APIView):
                 configuration = LLMConfiguration.objects.get(
                     pk=pk,
                     model_type='vision',
-                    created_by=request.user
                 )
             except LLMConfiguration.DoesNotExist:
                 return response(
@@ -605,7 +622,6 @@ class VisionSetDefaultView(APIView):
             
             # 将其他配置设为非默认
             LLMConfiguration.objects.filter(
-                created_by=request.user,
                 model_type='vision',
                 is_default=True
             ).exclude(pk=pk).update(is_default=False)
@@ -629,7 +645,7 @@ class VisionSetDefaultView(APIView):
 
 class VisionToggleActiveView(APIView):
     """切换视觉模型配置激活状态视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request, pk):
         """切换视觉模型配置激活状态"""
@@ -638,7 +654,6 @@ class VisionToggleActiveView(APIView):
                 configuration = LLMConfiguration.objects.get(
                     pk=pk,
                     model_type='vision',
-                    created_by=request.user
                 )
             except LLMConfiguration.DoesNotExist:
                 return response(
@@ -667,25 +682,25 @@ class VisionToggleActiveView(APIView):
 
 class MCPConfigurationViewSet(APIView):
     """MCP配置管理视图集"""
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request):
         """获取MCP配置列表"""
         try:
-            configurations = MCPConfiguration.objects.filter(created_by=request.user)
+            configurations = MCPConfiguration.objects.all()
             
             # 搜索过滤
             search_query = request.GET.get('search', '')
             if search_query:
                 configurations = configurations.filter(
                     Q(name__icontains=search_query) |
-                    Q(description__icontains=search_query) |
-                    Q(server_name__icontains=search_query)
+                    Q(raw_config__icontains=search_query)
                 )
             
             # 提供商过滤
             provider_filter = request.GET.get('provider', '')
             if provider_filter:
-                configurations = configurations.filter(provider=provider_filter)
+                configurations = configurations.filter(raw_config__icontains=provider_filter)
             
             # 状态过滤
             status_filter = request.GET.get('status', '')
@@ -800,6 +815,7 @@ class MCPConfigurationViewSet(APIView):
 
 class MCPConfigurationDetailView(APIView):
     """MCP配置详情视图"""
+    permission_classes = [IsPlatformAdmin]
     
     def get(self, request, config_id):
         """获取MCP配置详情"""
@@ -933,7 +949,7 @@ class MCPConfigurationDetailView(APIView):
 
 class MCPConfigurationActionView(APIView):
     """MCP配置操作视图"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsPlatformAdmin]
     
     def _build_mcp_connections(self, mcp_servers: dict) -> dict:
         """构建 MultiServerMCPClient 连接配置"""
@@ -1129,7 +1145,7 @@ class MCPConfigurationActionView(APIView):
         
         elif action == 'set_default':
             # 设置默认配置
-            MCPConfiguration.objects.filter(created_by=request.user, is_default=True).update(is_default=False)
+            MCPConfiguration.objects.filter(is_default=True).update(is_default=False)
             config.is_default = True
             config.save()
             
@@ -1147,6 +1163,7 @@ class MCPConfigurationActionView(APIView):
 
 class MCPTestConnectionView(APIView):
     """MCP连接测试视图"""
+    permission_classes = [IsPlatformAdmin]
     
     def post(self, request):
         """测试MCP连接"""
@@ -1186,4 +1203,3 @@ class MCPTestConnectionView(APIView):
             },
             message="MCP连接测试成功"
         )
-

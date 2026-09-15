@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, ref, unref, watch } from 'vue'
-import { getLLMConfigurations } from '@/api/aiConfig'
+import { getAvailableLLMConfigurations } from '@/api/aiConfig'
 import { applyWebUIScriptAssistant, cancelWebUIScriptAssistant, createWebUIScriptAssistant, getWebUIScriptAssistant, getWebUIScriptAssistants, resetWebUIScriptAssistant, sendWebUIScriptAssistantMessage, verifyWebUIScriptAssistant } from '@/api/webTesting'
 import { assistantErrorMessage, assistantList, assistantListParams, assistantsForContext, isAssistantActive, unwrapAssistantResponse } from './webUIScriptAssistantPresentation'
 
@@ -17,7 +17,7 @@ const defaultRequests = {
   verify: verifyWebUIScriptAssistant
 }
 
-export const useWebUIScriptAssistant = ({ projectId, context, requests = defaultRequests, loadModelConfigs = getLLMConfigurations }) => {
+export const useWebUIScriptAssistant = ({ projectId, context, requests = defaultRequests, loadModelConfigs = getAvailableLLMConfigurations }) => {
   const assistants = ref([])
   const assistant = ref(null)
   const modelConfigs = ref([])

@@ -152,8 +152,8 @@
         >
           <el-icon
             ><Connection v-if="item.i === 'portal-api'" /><Monitor
-              v-else-if="item.i === 'portal-web'" /><Cellphone
-              v-else-if="item.i === 'portal-app'" /><Timer
+              v-else-if="item.i === 'portal-web'" /><Lock
+              v-else-if="item.i === 'portal-security'" /><Timer
               v-else-if="item.i === 'portal-perf'" /><Cpu
               v-else-if="item.i === 'portal-ai-config'" /><Setting v-else
           /></el-icon>
@@ -186,7 +186,7 @@ import {
   VideoPlay,
   Connection,
   Monitor,
-  Cellphone,
+  Lock,
   Timer,
   Cpu,
   WarningFilled,
@@ -232,7 +232,7 @@ const dashboardItems = [
   { i: "portal-api" },
   { i: "portal-web" },
   { i: "portal-perf" },
-  { i: "portal-app" },
+  { i: "portal-security" },
   { i: "portal-ai-config" },
   { i: "portal-settings" },
 ];
@@ -445,12 +445,12 @@ const metricValue = (i) => {
         ? `${s.ai_contribution_rate}%`
         : s.total_cases;
 };
-const portalDisabled = (i) => ["portal-app", "portal-perf"].includes(i);
+const portalDisabled = (i) => ["portal-security", "portal-perf"].includes(i);
 const portalTitle = (i) =>
   ({
     "portal-api": "API 自动化",
     "portal-web": "Web 自动化",
-    "portal-app": "App 自动化（开发中）",
+    "portal-security": "安全测试（开发中）",
     "portal-perf": "性能测试（开发中）",
     "portal-ai-config": "AI 实验室配置",
     "portal-settings": "全局系统设置",
@@ -461,7 +461,7 @@ const portalDescription = (i) =>
       "基于接口文档或网页探索，通过 AI 对话生成、验证和修复接口测试用例。",
     "portal-web":
       "基于 Playwright MCP 自动生成自动化代码，支持自动修复和运行。",
-    "portal-app": "移动端 UI 自动化、POM 解析与智能体。",
+    "portal-security": "检测应用安全风险与常见漏洞，提供修复建议。",
     "portal-perf": "负载压测、性能分析与专项测试。",
     "portal-ai-config": "LLM 厂商对接、RAG 向量库配置、MCP 协议管理。",
     "portal-settings": "邮件通知配置、环境变量、用户权限。",
@@ -557,7 +557,7 @@ onMounted(async () => {
   display: grid;
   gap: 16px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-areas: "pass exec ai cases" "chart chart chart failures" "chart chart chart failures" "api web perf app" "config config settings settings";
+  grid-template-areas: "pass exec ai cases" "chart chart chart failures" "chart chart chart failures" "api web perf security" "config config settings settings";
 }
 .metric-pass-rate {
   grid-area: pass;
@@ -587,8 +587,8 @@ onMounted(async () => {
 .portal-perf {
   grid-area: perf;
 }
-.portal-app {
-  grid-area: app;
+.portal-security {
+  grid-area: security;
 }
 .portal-ai-config {
   grid-area: config;
@@ -682,7 +682,7 @@ onMounted(async () => {
 @media (max-width: 800px) {
   .dashboard-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-template-areas: "pass exec" "ai cases" "chart chart" "failures failures" "api web" "perf app" "config settings";
+    grid-template-areas: "pass exec" "ai cases" "chart chart" "failures failures" "api web" "perf security" "config settings";
   }
 }
 @media (max-width: 520px) {
@@ -696,7 +696,7 @@ onMounted(async () => {
   }
   .dashboard-grid {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "pass" "exec" "ai" "cases" "chart" "failures" "api" "web" "perf" "app" "config" "settings";
+    grid-template-areas: "pass" "exec" "ai" "cases" "chart" "failures" "api" "web" "perf" "security" "config" "settings";
   }
 }
 </style>

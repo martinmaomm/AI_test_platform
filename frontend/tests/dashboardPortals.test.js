@@ -15,10 +15,10 @@ test("dashboard API description explains both sources and the AI workflow", () =
   assert.doesNotMatch(source, /多协议接口测试、复杂场景链路编排/);
 });
 
-test("dashboard uses a fixed CSS grid and keeps performance before app automation", () => {
+test("dashboard uses a fixed CSS grid and keeps performance before security testing", () => {
   assert.match(
     source,
-    /const dashboardItems = \[.*["']portal-api["'].*["']portal-web["'].*["']portal-perf["'].*["']portal-app["']/s,
+    /const dashboardItems = \[.*["']portal-api["'].*["']portal-web["'].*["']portal-perf["'].*["']portal-security["']/s,
   );
   assert.match(source, /grid-template-areas/);
   assert.doesNotMatch(
@@ -30,10 +30,20 @@ test("dashboard uses a fixed CSS grid and keeps performance before app automatio
 test("unavailable dashboard portals remain grey and non-clickable", () => {
   assert.match(
     source,
-    /const portalDisabled = \(i\) => \[["']portal-app["'], ["']portal-perf["']\]\.includes\(i\)/,
+    /const portalDisabled = \(i\) => \[["']portal-security["'], ["']portal-perf["']\]\.includes\(i\)/,
   );
   assert.match(source, /!portalDisabled\(item\.i\) && openPortal\(item\.i\)/);
   assert.match(source, /\.portal\.disabled/);
+});
+
+test("security placeholder has matching copy, icon and responsive grid areas", () => {
+  assert.match(source, /安全测试（开发中）/);
+  assert.match(source, /检测应用安全风险与常见漏洞，提供修复建议。/);
+  assert.match(source, /<Lock\s+v-else-if="item\.i === 'portal-security'"/);
+  assert.match(source, /\.portal-security\s*\{\s*grid-area: security;/);
+  assert.match(source, /"api web perf security"/);
+  assert.match(source, /"perf security"/);
+  assert.doesNotMatch(source, /portal-app|App 自动化|Cellphone/);
 });
 
 test("dashboard portals remain available when no project is selected", () => {

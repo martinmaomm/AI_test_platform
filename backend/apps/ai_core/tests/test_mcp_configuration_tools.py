@@ -16,6 +16,10 @@ def raw_config(command='offline-mcp'):
     return json.dumps({'mcpServers': {'fixture': {'command': command}}})
 
 
+def playwright_raw_config(command='offline-playwright-mcp'):
+    return json.dumps({'mcpServers': {'playwright': {'command': command}}})
+
+
 def discovered_tool(name, description='tool description'):
     return {
         'name': name,
@@ -40,7 +44,7 @@ class MCPConfigurationToolsAPITests(TestCase):
             'mcp-member', email='mcp-member@example.test',
         )
         self.config = MCPConfiguration.objects.create(
-            raw_config=raw_config(), created_by=self.admin, is_active=True,
+            raw_config=playwright_raw_config(), created_by=self.admin, is_active=True,
         )
         self.client = APIClient()
         self.client.force_authenticate(self.admin)
@@ -49,22 +53,16 @@ class MCPConfigurationToolsAPITests(TestCase):
         self.assertTrue(self.required_configuration_fields.issubset(data), data)
 
     @patch('ai_core.views.discover_mcp_tools')
-    def test_create_is_active_but_unchecked_without_discovery(self, discover):
+    def test_existing_singleton_rejects_create_without_discovery(self, discover):
         result = self.client.post(
             '/api/v1/ai-core/mcp-configs/',
-            {'rawConfig': raw_config('new-offline-mcp')},
+            {'rawConfig': playwright_raw_config('new-offline-mcp')},
             format='json',
         )
 
-        self.assertEqual(result.status_code, 200, result.data)
-        self.assertTrue(result.data['success'])
-        data = result.data['data']
-        self.assert_contract(data)
-        self.assertTrue(data['is_active'])
-        self.assertEqual(data['tools_status'], 'unchecked')
-        self.assertEqual(data['tools_count'], 0)
-        self.assertIsNone(data['tools_checked_at'])
-        self.assertEqual(data['tools_error'], '')
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertFalse(result.data['success'])
+        self.assertIn('已存在', result.data['message'])
         discover.assert_not_called()
 
     def test_list_and_detail_return_status_and_tool_fields(self):
@@ -87,22 +85,21 @@ class MCPConfigurationToolsAPITests(TestCase):
         self.assert_contract(detail.data['data'])
 
     @patch('ai_core.views.discover_mcp_tools')
-    def test_toggle_only_changes_target_row_and_never_discovers(self, discover):
-        other = MCPConfiguration.objects.create(
-            raw_config=raw_config('other-mcp'), created_by=self.admin, is_active=False,
+    def test_toggle_changes_the_singleton_state_and_never_discovers(self, discover):
+        disabled = self.client.post(
+            f'/api/v1/ai-core/mcp-configs/{self.config.id}/toggle_active/', {}, format='json',
         )
-
-        result = self.client.post(
+        enabled = self.client.post(
             f'/api/v1/ai-core/mcp-configs/{self.config.id}/toggle_active/', {}, format='json',
         )
 
-        self.assertEqual(result.status_code, 200, result.data)
-        self.assert_contract(result.data['data'])
-        self.assertFalse(result.data['data']['is_active'])
+        self.assertEqual(disabled.status_code, 200, disabled.data)
+        self.assert_contract(disabled.data['data'])
+        self.assertFalse(disabled.data['data']['is_active'])
+        self.assertEqual(enabled.status_code, 200, enabled.data)
+        self.assertTrue(enabled.data['data']['is_active'])
         self.config.refresh_from_db()
-        other.refresh_from_db()
-        self.assertFalse(self.config.is_active)
-        self.assertFalse(other.is_active)
+        self.assertTrue(self.config.is_active)
         discover.assert_not_called()
 
     @patch('ai_core.views.discover_mcp_tools', return_value=[])
@@ -199,7 +196,7 @@ class MCPConfigurationToolsAPITests(TestCase):
 
         changed = self.client.put(
             f'/api/v1/ai-core/mcp-configs/{self.config.id}/',
-            {'rawConfig': raw_config('changed-mcp')}, format='json',
+            {'rawConfig': playwright_raw_config('changed-mcp')}, format='json',
         )
         self.assertEqual(changed.status_code, 200, changed.data)
         self.assertEqual(changed.data['data']['tools_status'], 'unchecked')
@@ -248,7 +245,7 @@ class MCPConfigurationToolsAPITests(TestCase):
         def edit_configuration(_raw):
             edited = self.client.put(
                 f'/api/v1/ai-core/mcp-configs/{self.config.id}/',
-                {'rawConfig': raw_config('edited-during-refresh')},
+                {'rawConfig': playwright_raw_config('edited-during-refresh')},
                 format='json',
             )
             self.assertEqual(edited.status_code, 200, edited.data)

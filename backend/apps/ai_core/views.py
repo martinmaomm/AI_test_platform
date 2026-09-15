@@ -6,7 +6,7 @@ import logging
 from typing import Dict, Any
 from uuid import uuid4
 
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
@@ -702,12 +702,23 @@ def _validate_mcp_raw_config(raw_config):
     servers = parsed['mcpServers']
     if not isinstance(servers, dict):
         return None, "mcpServers必须是对象格式"
-    if not servers:
-        return None, "MCP配置中至少需要一个服务器配置"
-    for server_name, server_config in servers.items():
-        if not isinstance(server_config, dict) or not server_config.get('command'):
-            return None, f"服务器 '{server_name}' 必须包含command字段"
+    if set(servers) != {'playwright'}:
+        return None, "全局MCP配置必须且只能包含一个名为playwright的服务"
+    server_config = servers['playwright']
+    if not isinstance(server_config, dict):
+        return None, "playwright服务配置必须是对象格式"
+    command = server_config.get('command')
+    if not isinstance(command, str) or not command.strip():
+        return None, "playwright服务必须包含非空字符串command字段"
     return parsed, None
+
+
+def _mcp_singleton_conflict_response():
+    return response(
+        kind='error',
+        status_code=409,
+        message='全局Playwright MCP配置已存在，请编辑、启停或刷新现有配置',
+    )
 
 
 def _serialize_mcp_tool(tool):
@@ -845,26 +856,6 @@ class MCPConfigurationViewSet(APIView):
         try:
             configurations = MCPConfiguration.objects.prefetch_related('tools').all()
             
-            # 搜索过滤
-            search_query = request.GET.get('search', '')
-            if search_query:
-                configurations = configurations.filter(
-                    Q(name__icontains=search_query) |
-                    Q(raw_config__icontains=search_query)
-                )
-            
-            # 提供商过滤
-            provider_filter = request.GET.get('provider', '')
-            if provider_filter:
-                configurations = configurations.filter(raw_config__icontains=provider_filter)
-            
-            # 状态过滤
-            status_filter = request.GET.get('status', '')
-            if status_filter == 'active':
-                configurations = configurations.filter(is_active=True)
-            elif status_filter == 'inactive':
-                configurations = configurations.filter(is_active=False)
-            
             # 序列化数据
             data = [_serialize_mcp_configuration(config) for config in configurations]
             
@@ -885,6 +876,9 @@ class MCPConfigurationViewSet(APIView):
         """创建MCP配置"""
         try:
             data = request.data
+
+            if MCPConfiguration.objects.exists():
+                return _mcp_singleton_conflict_response()
             
             # 验证必填字段
             if not data.get('rawConfig'):
@@ -897,12 +891,20 @@ class MCPConfigurationViewSet(APIView):
             if validation_error:
                 return response(kind='error', message=validation_error)
             
-            # 创建配置，保存完整的MCP配置
-            configuration = MCPConfiguration.objects.create(
-                raw_config=data['rawConfig'],  # 直接保存原始配置
-                is_active=True,  # 默认启用
-                created_by=request.user
-            )
+            try:
+                with transaction.atomic():
+                    if MCPConfiguration.objects.exists():
+                        return _mcp_singleton_conflict_response()
+                    # singleton_key、主键和状态均不接受客户端覆盖。
+                    configuration = MCPConfiguration.objects.create(
+                        raw_config=data['rawConfig'],
+                        is_active=True,
+                        created_by=request.user,
+                    )
+            except IntegrityError:
+                # Concurrent empty-slot requests are resolved by the DB unique
+                # constraint; expose the same stable API result as a pre-check.
+                return _mcp_singleton_conflict_response()
             
             return response(
                 kind="success",
@@ -979,20 +981,11 @@ class MCPConfigurationDetailView(APIView):
         )
     
     def delete(self, request, config_id):
-        """删除MCP配置"""
-        config = get_config_or_404(MCPConfiguration, config_id, request.user)
-        if not config:
-            return response(
-                kind="error",
-                message="MCP配置不存在"
-            )
-        
-        config_name = str(config)
-        config.delete()
-        
+        """全局MCP槽位不能删除；停用时保留配置供后续编辑。"""
         return response(
-            kind="success",
-            message=f"MCP配置 '{config_name}' 删除成功"
+            kind='error',
+            status_code=405,
+            message='全局Playwright MCP配置不支持删除，请编辑或禁用现有配置',
         )
 
 

@@ -307,6 +307,14 @@ class MCPConfiguration(models.Model):
     
     # MCP配置名称
     name = models.CharField(max_length=100, verbose_name='MCP配置名称')
+
+    # 固定槽位由数据库唯一约束和检查约束共同保证全局单例。
+    singleton_key = models.PositiveSmallIntegerField(
+        default=1,
+        unique=True,
+        editable=False,
+        verbose_name='全局配置槽位',
+    )
     
     # 原始MCP配置JSON
     raw_config = models.TextField(verbose_name='原始MCP配置JSON')
@@ -344,6 +352,12 @@ class MCPConfiguration(models.Model):
         verbose_name = 'MCP配置'
         verbose_name_plural = 'MCP配置'
         ordering = ['-created_at']
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(singleton_key=1),
+                name='mcp_configuration_singleton_key_is_one',
+            ),
+        ]
     
     def __str__(self):
         return self.name

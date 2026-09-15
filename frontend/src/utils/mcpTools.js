@@ -4,6 +4,58 @@ export const MCP_TOOLS_STATUS = Object.freeze({
   ERROR: 'error',
 })
 
+export const MCP_SINGLETON_PAGE_STATE = Object.freeze({
+  LOADING: 'loading',
+  FAILED: 'failed',
+  EMPTY: 'empty',
+  READY: 'ready',
+  CONFLICT: 'conflict',
+})
+
+export const DEFAULT_PLAYWRIGHT_MCP_RAW_CONFIG = JSON.stringify({
+  mcpServers: {
+    playwright: {
+      command: 'npx',
+      args: ['-y', '@executeautomation/playwright-mcp-server@1.0.12'],
+    },
+  },
+}, null, 2)
+
+export function getMCPSingletonPageState({ loading = false, loadError = '', configurations } = {}) {
+  if (loading) return MCP_SINGLETON_PAGE_STATE.LOADING
+  if (loadError || !Array.isArray(configurations)) return MCP_SINGLETON_PAGE_STATE.FAILED
+  if (configurations.length === 0) return MCP_SINGLETON_PAGE_STATE.EMPTY
+  if (configurations.length === 1) return MCP_SINGLETON_PAGE_STATE.READY
+  return MCP_SINGLETON_PAGE_STATE.CONFLICT
+}
+
+export function validatePlaywrightMCPRawConfig(rawConfig) {
+  let config
+  try {
+    config = JSON.parse(rawConfig)
+  } catch {
+    return { valid: false, message: 'JSON格式不正确' }
+  }
+  const servers = config?.mcpServers
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+    return { valid: false, message: '请提供包含mcpServers对象的配置' }
+  }
+  const names = Object.keys(servers)
+  if (names.length !== 1 || names[0] !== 'playwright') {
+    return { valid: false, message: '全局MCP配置只能包含一个 playwright 服务器' }
+  }
+  if (
+    !servers.playwright
+    || typeof servers.playwright !== 'object'
+    || Array.isArray(servers.playwright)
+    || typeof servers.playwright.command !== 'string'
+    || !servers.playwright.command.trim()
+  ) {
+    return { valid: false, message: 'playwright服务器必须包含command字段' }
+  }
+  return { valid: true }
+}
+
 export function normalizeToolsStatus(status) {
   return Object.values(MCP_TOOLS_STATUS).includes(status)
     ? status

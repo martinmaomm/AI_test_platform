@@ -2,13 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   getMCPRequestError,
+  getMCPSingletonPageState,
   getMCPToolsError,
   getMCPToolsRefreshNotAppliedMessage,
   getMCPToolsStatusPresentation,
   isMCPConfigurationBusy,
   isMCPToolsRefreshSuccessful,
+  MCP_SINGLETON_PAGE_STATE,
+  DEFAULT_PLAYWRIGHT_MCP_RAW_CONFIG,
   normalizeMCPConfiguration,
   unwrapMCPConfigurationResponse,
+  validatePlaywrightMCPRawConfig,
 } from '../src/utils/mcpTools.js'
 
 test('未检测、空工具成功和检测失败使用不同的工具状态文案', () => {
@@ -24,6 +28,33 @@ test('未检测、空工具成功和检测失败使用不同的工具状态文�
   assert.deepEqual(getMCPToolsStatusPresentation({ tools_status: 'error' }), {
     type: 'danger', text: '检测失败',
   })
+})
+
+test('单例页面不会把加载失败或多配置误显示为可添加的空状态', () => {
+  assert.equal(getMCPSingletonPageState({ loading: true, configurations: [] }), MCP_SINGLETON_PAGE_STATE.LOADING)
+  assert.equal(getMCPSingletonPageState({ loadError: '加载失败', configurations: [] }), MCP_SINGLETON_PAGE_STATE.FAILED)
+  assert.equal(getMCPSingletonPageState({ configurations: [] }), MCP_SINGLETON_PAGE_STATE.EMPTY)
+  assert.equal(getMCPSingletonPageState({ configurations: [{ id: 1 }] }), MCP_SINGLETON_PAGE_STATE.READY)
+  assert.equal(getMCPSingletonPageState({ configurations: [{ id: 1 }, { id: 2 }] }), MCP_SINGLETON_PAGE_STATE.CONFLICT)
+  assert.equal(getMCPSingletonPageState({ configurations: null }), MCP_SINGLETON_PAGE_STATE.FAILED)
+})
+
+test('创建和编辑只接受单个 playwright 服务器配置', () => {
+  assert.equal(validatePlaywrightMCPRawConfig(DEFAULT_PLAYWRIGHT_MCP_RAW_CONFIG).valid, true)
+  assert.deepEqual(validatePlaywrightMCPRawConfig('{').message, 'JSON格式不正确')
+  assert.deepEqual(validatePlaywrightMCPRawConfig(JSON.stringify({ mcpServers: { other: { command: 'npx' } } })).message, '全局MCP配置只能包含一个 playwright 服务器')
+  assert.deepEqual(validatePlaywrightMCPRawConfig(JSON.stringify({ mcpServers: {
+    playwright: { command: 'npx' }, another: { command: 'npx' },
+  } })).message, '全局MCP配置只能包含一个 playwright 服务器')
+  assert.equal(validatePlaywrightMCPRawConfig(JSON.stringify({ mcpServers: {
+    playwright: { command: 123 },
+  } })).valid, false)
+  assert.equal(validatePlaywrightMCPRawConfig(JSON.stringify({ mcpServers: {
+    playwright: { command: '  ' },
+  } })).valid, false)
+  assert.equal(validatePlaywrightMCPRawConfig(JSON.stringify({ mcpServers: {
+    playwright: [],
+  } })).valid, false)
 })
 
 test('未知工具状态回退为尚未检测，缺失数量从工具列表推导', () => {

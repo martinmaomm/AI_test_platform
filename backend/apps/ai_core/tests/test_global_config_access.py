@@ -56,11 +56,6 @@ class GlobalAIConfigurationAccessTests(TestCase):
             is_active=True,
             created_by=self.legacy_creator,
         )
-        self.disabled_mcp = MCPConfiguration.objects.create(
-            raw_config=json.dumps({'mcpServers': {'playwright': {'command': 'disabled'}}}),
-            is_active=False,
-            created_by=self.member,
-        )
         self.rag = RAGConfiguration.objects.create(
             name='legacy-rag',
             is_active=True,
@@ -171,7 +166,7 @@ class GlobalAIConfigurationAccessTests(TestCase):
         self.assertEqual([item['id'] for item in rag.data['data']], [self.rag.id])
         self.assertEqual(
             {item['id'] for item in mcp.data['data']},
-            {self.mcp.id, self.disabled_mcp.id},
+            {self.mcp.id},
         )
 
     def test_rag_default_is_platform_global_not_creator_scoped(self):
@@ -188,15 +183,13 @@ class GlobalAIConfigurationAccessTests(TestCase):
         self.assertFalse(other.is_default)
         self.assertTrue(self.rag.is_default)
 
-    def test_admin_mcp_search_uses_real_configuration_fields(self):
+    def test_admin_mcp_list_query_parameters_never_hide_the_singleton(self):
         self.client.force_authenticate(self.admin)
-        by_name = self.client.get('/api/v1/ai-core/mcp-configs/?search=playwright')
-        by_provider = self.client.get('/api/v1/ai-core/mcp-configs/?provider=offline')
+        self.mcp.is_active = False
+        self.mcp.save(update_fields=['is_active'])
 
-        self.assertEqual(by_name.status_code, 200, by_name.data)
-        self.assertEqual(
-            {item['id'] for item in by_name.data['data']},
-            {self.mcp.id, self.disabled_mcp.id},
-        )
-        self.assertEqual(by_provider.status_code, 200, by_provider.data)
-        self.assertEqual([item['id'] for item in by_provider.data['data']], [self.mcp.id])
+        for query in ('search=does-not-match', 'provider=does-not-match', 'status=active'):
+            with self.subTest(query=query):
+                result = self.client.get(f'/api/v1/ai-core/mcp-configs/?{query}')
+                self.assertEqual(result.status_code, 200, result.data)
+                self.assertEqual([item['id'] for item in result.data['data']], [self.mcp.id])

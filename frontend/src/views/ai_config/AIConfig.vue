@@ -52,7 +52,7 @@ const cards = [
     id: 'mcp',
     path: '/ai-config/mcp',
     title: 'MCP 协议配置',
-    desc: '配置模型上下文协议、工具集接入',
+    desc: '管理 Playwright 浏览器工具，支持 AI 探索网页与生成测试脚本。',
     icon: Connection
   }
 ]

@@ -63,3 +63,10 @@ test("dashboard does not let project preference initialization block project loa
   );
   assert.match(source, /await loadProjectsAndSelect\(\)/);
 });
+
+test("AI case ratio has an explicit accessible question-mark tooltip trigger", () => {
+  assert.match(source, /v-if="item\.i === 'metric-ai-rate'" class="metric-label-row"/);
+  assert.match(source, /<el-tooltip\s+:content="metricHint\(item\.i\)"[\s\S]*?<button\s+type="button"\s+class="metric-help"\s+aria-label="查看 AI 生成用例占比说明"/);
+  assert.match(source, /<QuestionFilled\s*\/>/);
+  assert.match(source, /\.metric-help:focus-visible/);
+});

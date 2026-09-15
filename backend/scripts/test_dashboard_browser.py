@@ -79,9 +79,20 @@ def verify(origin, fixture, output):
             expect(page.locator('.metric-executions strong')).to_have_text('3')
             expect(page.locator('.metric-ai-rate strong')).to_have_text('33.33%')
             expect(page.locator('.metric-ai-rate .metric-label')).to_have_text('AI 生成用例占比')
-            page.locator('.metric-ai-rate .metric-label').hover()
+            metric_help = page.get_by_role('button', name='查看 AI 生成用例占比说明')
+            expect(metric_help).to_be_visible()
+            metric_help.hover()
             expect(page.get_by_role('tooltip')).to_contain_text('后续编辑、AI 修复或删除工作区不改变来源')
+            page.wait_for_function("""() => [...document.querySelectorAll('[role="tooltip"]')]
+                .some(element => element.getBoundingClientRect().width > 0
+                    && getComputedStyle(element).opacity === '1')""")
+            page.screenshot(path=str(output / 'ai-ratio-help.png'), full_page=True)
             page.locator('.cockpit-toolbar h1').hover()
+            expect(page.get_by_role('tooltip')).not_to_be_visible()
+            metric_help.focus()
+            expect(page.get_by_role('tooltip')).to_contain_text('首次保存为 AI 生成的用例数 ÷ 已保存用例总数')
+            metric_help.evaluate('(element) => element.blur()')
+            expect(page.get_by_role('tooltip')).not_to_be_visible()
             expect(page.locator('.top-failures')).to_contain_text('注册调试')
             expect(page.locator('.top-failures')).not_to_contain_text('None')
             assert page.locator('.vue-grid-layout, .vue-resizable-handle, .drag-handle').count() == 0

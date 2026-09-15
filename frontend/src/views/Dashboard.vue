@@ -63,11 +63,27 @@
               v-else-if="item.i === 'metric-ai-rate'" /><Document v-else
           /></el-icon>
           <div>
-            <el-tooltip :content="metricHint(item.i)"
-              ><span class="metric-label">{{
-                metricLabel(item.i)
-              }}</span></el-tooltip
-            ><strong>{{ metricValue(item.i) }}</strong>
+            <div v-if="item.i === 'metric-ai-rate'" class="metric-label-row">
+              <span class="metric-label">{{ metricLabel(item.i) }}</span>
+              <el-tooltip
+                :content="metricHint(item.i)"
+                :trigger="['hover', 'focus']"
+                :popper-style="{ maxWidth: '320px', lineHeight: '1.6' }"
+                placement="top"
+              >
+                <button
+                  type="button"
+                  class="metric-help"
+                  aria-label="查看 AI 生成用例占比说明"
+                >
+                  <el-icon aria-hidden="true"><QuestionFilled /></el-icon>
+                </button>
+              </el-tooltip>
+            </div>
+            <el-tooltip v-else :content="metricHint(item.i)">
+              <span class="metric-label">{{ metricLabel(item.i) }}</span>
+            </el-tooltip>
+            <strong>{{ metricValue(item.i) }}</strong>
           </div>
         </div>
         <div v-else-if="item.i === 'chart'" class="dashboard-item chart">
@@ -174,6 +190,7 @@ import {
   Timer,
   Cpu,
   WarningFilled,
+  QuestionFilled,
   Setting,
 } from "@element-plus/icons-vue";
 import { useAppStore } from "@/stores/app";
@@ -598,6 +615,30 @@ onMounted(async () => {
   display: block;
   color: var(--cockpit-text-muted);
   cursor: help;
+}
+.metric-label-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.metric-help {
+  display: inline-flex;
+  flex-shrink: 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--cockpit-text-muted);
+  font-size: 14px;
+  cursor: help;
+}
+.metric-help:hover,
+.metric-help:focus-visible {
+  color: #409eff;
+}
+.metric-help:focus-visible {
+  outline: 2px solid #409eff;
+  outline-offset: 2px;
 }
 .metric strong {
   font-size: 24px;

@@ -236,3 +236,10 @@ export function getMCPConfiguration(id) {
 export function toggleMCPConfigurationActive(id) {
   return api.post(`/ai-core/mcp-configs/${id}/toggle_active/`)
 }
+
+/**
+ * 检测 MCP 配置可发现的工具，不会启用该配置。
+ */
+export function refreshMCPConfigurationTools(id) {
+  return api.post(`/ai-core/mcp-configs/${id}/refresh_tools/`, {}, { timeout: 30000 })
+}

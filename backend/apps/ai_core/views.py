@@ -4,8 +4,11 @@ AI核心功能API视图
 """
 import logging
 from typing import Dict, Any
-from django.db import models
+from uuid import uuid4
+
+from django.db import models, transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -15,6 +18,12 @@ from users.permissions import IsPlatformAdmin
 from .config_access import usable_llm_configurations
 from .model_manager import get_llm_manager, ModelManager
 from .models import MCPConfiguration, MCPTool, LLMConfiguration
+from .mcp_tool_discovery import (
+    MCPToolDiscoveryError,
+    build_mcp_connections,
+    discover_mcp_tools,
+    validate_discovered_tools,
+)
 from .serializers import (
     AvailableLLMConfigurationSerializer,
     LLMTestConnectionSerializer,
@@ -680,6 +689,153 @@ class VisionToggleActiveView(APIView):
 
 # ============ MCP配置管理 ============
 
+def _validate_mcp_raw_config(raw_config):
+    """Return parsed MCP JSON or a user-facing validation error."""
+    import json
+
+    try:
+        parsed = json.loads(raw_config)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return None, f"rawConfig必须是有效的JSON格式: {exc}"
+    if not isinstance(parsed, dict) or 'mcpServers' not in parsed:
+        return None, "请提供完整的MCP配置格式，必须包含mcpServers字段"
+    servers = parsed['mcpServers']
+    if not isinstance(servers, dict):
+        return None, "mcpServers必须是对象格式"
+    if not servers:
+        return None, "MCP配置中至少需要一个服务器配置"
+    for server_name, server_config in servers.items():
+        if not isinstance(server_config, dict) or not server_config.get('command'):
+            return None, f"服务器 '{server_name}' 必须包含command字段"
+    return parsed, None
+
+
+def _serialize_mcp_tool(tool):
+    return {
+        'id': tool.id,
+        'name': tool.name,
+        'description': tool.description,
+        'tool_schema': tool.tool_schema,
+        'is_available': tool.is_available,
+        'created_at': tool.created_at.isoformat(),
+    }
+
+
+def _serialize_mcp_configuration(config):
+    tools = [_serialize_mcp_tool(tool) for tool in config.tools.all()]
+    return {
+        'id': config.id,
+        'name': config.name,
+        'rawConfig': config.raw_config,
+        'is_active': config.is_active,
+        'tools_count': len(tools),
+        'tools_status': config.tools_status,
+        'tools_checked_at': (
+            config.tools_checked_at.isoformat() if config.tools_checked_at else None
+        ),
+        'tools_error': config.tools_error,
+        'tools': tools,
+        'created_at': config.created_at.isoformat(),
+        'updated_at': config.updated_at.isoformat(),
+    }
+
+
+def _refresh_mcp_configuration_tools(config_id):
+    """Probe outside transactions, then atomically apply only the latest result."""
+    with transaction.atomic():
+        config = (
+            MCPConfiguration.objects.select_for_update()
+            .filter(id=config_id)
+            .first()
+        )
+        if config is None:
+            return None, False, 'missing'
+        probe_token = uuid4()
+        raw_config_snapshot = config.raw_config
+        config.tools_probe_token = probe_token
+        config.save(update_fields=['tools_probe_token'])
+
+    discovered_tools = None
+    discovery_error = None
+    try:
+        discovered_tools = discover_mcp_tools(raw_config_snapshot)
+        validate_discovered_tools(discovered_tools)
+    except MCPToolDiscoveryError as exc:
+        discovery_error = str(exc)
+        logger.warning(
+            "MCP配置 %s 工具检测失败: code=%s cause=%s",
+            config_id,
+            exc.code,
+            exc.cause_type or 'unknown',
+        )
+    except Exception as exc:
+        # Discovery implementations should return MCPToolDiscoveryError. Keep this
+        # fallback credential-safe if a dependency violates that contract.
+        discovery_error = f'MCP工具检测失败（{type(exc).__name__}），请检查配置和服务日志。'
+        logger.warning(
+            "MCP配置 %s 工具检测异常: cause=%s",
+            config_id,
+            type(exc).__name__,
+        )
+
+    with transaction.atomic():
+        config = (
+            MCPConfiguration.objects.select_for_update()
+            .filter(id=config_id)
+            .first()
+        )
+        if config is None:
+            return None, False, 'missing'
+        if config.tools_probe_token != probe_token:
+            return config, False, 'stale'
+
+        checked_at = timezone.now()
+        if discovery_error is not None:
+            config.tools_status = MCPConfiguration.ToolsStatus.ERROR
+            config.tools_checked_at = checked_at
+            config.tools_error = discovery_error
+        else:
+            config.tools.all().delete()
+            MCPTool.objects.bulk_create([
+                MCPTool(
+                    mcp_config=config,
+                    name=tool['name'],
+                    description=tool.get('description', ''),
+                    tool_schema=tool.get('tool_schema') or {},
+                    is_available=True,
+                )
+                for tool in discovered_tools
+            ])
+            config.tools_status = MCPConfiguration.ToolsStatus.READY
+            config.tools_checked_at = checked_at
+            config.tools_error = ''
+        config.tools_probe_token = None
+        config.save(update_fields=[
+            'tools_status', 'tools_checked_at', 'tools_error', 'tools_probe_token',
+        ])
+        return config, True, 'error' if discovery_error is not None else 'ready'
+
+
+def _mcp_refresh_response(config_id):
+    config, applied, outcome = _refresh_mcp_configuration_tools(config_id)
+    if config is None:
+        return response(kind='not_found', message='MCP配置不存在')
+    data = _serialize_mcp_configuration(config)
+    data['tools_refresh_applied'] = applied
+    if not applied:
+        return response(
+            kind='success',
+            data=data,
+            message='配置在检测期间已变化，本次工具检测结果未保存',
+        )
+    if outcome == 'error':
+        return response(
+            kind='success',
+            data=data,
+            message='MCP工具检测失败，请根据状态信息检查配置',
+        )
+    return response(kind='success', data=data, message='MCP工具清单刷新成功')
+
 class MCPConfigurationViewSet(APIView):
     """MCP配置管理视图集"""
     permission_classes = [IsPlatformAdmin]
@@ -687,7 +843,7 @@ class MCPConfigurationViewSet(APIView):
     def get(self, request):
         """获取MCP配置列表"""
         try:
-            configurations = MCPConfiguration.objects.all()
+            configurations = MCPConfiguration.objects.prefetch_related('tools').all()
             
             # 搜索过滤
             search_query = request.GET.get('search', '')
@@ -710,17 +866,7 @@ class MCPConfigurationViewSet(APIView):
                 configurations = configurations.filter(is_active=False)
             
             # 序列化数据
-            data = []
-            for config in configurations:
-                data.append({
-                    'id': config.id,
-                    'name': config.name,
-                    'rawConfig': config.raw_config,
-                    'is_active': config.is_active,
-                    'created_at': config.created_at.isoformat(),
-                    'updated_at': config.updated_at.isoformat(),
-                    'tools_count': config.tools.count()
-                })
+            data = [_serialize_mcp_configuration(config) for config in configurations]
             
             return response(
                 kind="success",
@@ -747,45 +893,9 @@ class MCPConfigurationViewSet(APIView):
                     message="缺少必填字段: rawConfig"
                 )
             
-            # 验证rawConfig是否为有效JSON
-            try:
-                import json
-                config_json = json.loads(data['rawConfig'])
-                
-                # 验证必须是完整的MCP配置格式
-                if not config_json.get('mcpServers'):
-                    return response(
-                        kind="error",
-                        message="请提供完整的MCP配置格式，必须包含mcpServers字段"
-                    )
-                
-                # 验证mcpServers格式
-                if not isinstance(config_json['mcpServers'], dict):
-                    return response(
-                        kind="error",
-                        message="mcpServers必须是对象格式"
-                    )
-                
-                # 验证至少有一个服务器配置
-                if len(config_json['mcpServers']) == 0:
-                    return response(
-                        kind="error",
-                        message="MCP配置中至少需要一个服务器配置"
-                    )
-                
-                # 验证每个服务器配置
-                for server_name, server_config in config_json['mcpServers'].items():
-                    if not server_config.get('command'):
-                        return response(
-                            kind="error",
-                            message=f"服务器 '{server_name}' 必须包含command字段"
-                        )
-                
-            except (json.JSONDecodeError, TypeError) as e:
-                return response(
-                    kind="error",
-                    message=f"rawConfig必须是有效的JSON格式: {str(e)}"
-                )
+            _, validation_error = _validate_mcp_raw_config(data['rawConfig'])
+            if validation_error:
+                return response(kind='error', message=validation_error)
             
             # 创建配置，保存完整的MCP配置
             configuration = MCPConfiguration.objects.create(
@@ -796,12 +906,7 @@ class MCPConfigurationViewSet(APIView):
             
             return response(
                 kind="success",
-                data={
-                    'id': configuration.id,
-                    'name': configuration.name,
-                    'rawConfig': configuration.raw_config,
-                    'is_active': configuration.is_active
-                },
+                data=_serialize_mcp_configuration(configuration),
                 message="MCP配置创建成功"
             )
             
@@ -826,106 +931,50 @@ class MCPConfigurationDetailView(APIView):
                 message="MCP配置不存在"
             )
         
-        # 获取工具列表
-        tools = []
-        for tool in config.tools.all():
-            tools.append({
-                'id': tool.id,
-                'name': tool.name,
-                'description': tool.description,
-                'tool_schema': tool.tool_schema,
-                'is_available': tool.is_available,
-                'created_at': tool.created_at.isoformat()
-            })
-        
-        data = {
-            'id': config.id,
-            'name': config.name,
-            'rawConfig': config.raw_config,
-            'is_active': config.is_active,
-            'created_at': config.created_at.isoformat(),
-            'updated_at': config.updated_at.isoformat(),
-            'tools': tools
-        }
-        
         return response(
             kind="success",
-            data=data,
+            data=_serialize_mcp_configuration(config),
             message="MCP配置详情获取成功"
         )
     
     def put(self, request, config_id):
         """更新MCP配置"""
-        config = get_config_or_404(MCPConfiguration, config_id, request.user)
-        if not config:
-            return response(
-                kind="error",
-                message="MCP配置不存在"
-            )
-        
         data = request.data
-        
+        parsed_raw_config = None
         # 验证rawConfig是否为有效JSON（如果提供）
         if 'rawConfig' in data:
-            try:
-                import json
-                config_json = json.loads(data['rawConfig'])
-                
-                # 验证必须是完整的MCP配置格式
-                if not config_json.get('mcpServers'):
-                    return response(
-                        kind="error",
-                        message="请提供完整的MCP配置格式，必须包含mcpServers字段"
-                    )
-                
-                # 验证mcpServers格式
-                if not isinstance(config_json['mcpServers'], dict):
-                    return response(
-                        kind="error",
-                        message="mcpServers必须是对象格式"
-                    )
-                
-                # 验证至少有一个服务器配置
-                if len(config_json['mcpServers']) == 0:
-                    return response(
-                        kind="error",
-                        message="MCP配置中至少需要一个服务器配置"
-                    )
-                
-                # 验证每个服务器配置
-                for server_name, server_config in config_json['mcpServers'].items():
-                    if not server_config.get('command'):
-                        return response(
-                            kind="error",
-                            message=f"服务器 '{server_name}' 必须包含command字段"
-                        )
-                
-            except (json.JSONDecodeError, TypeError) as e:
-                return response(
-                    kind="error",
-                    message=f"rawConfig必须是有效的JSON格式: {str(e)}"
-                )
-        
-        # 更新字段
-        field_mapping = {
-            'rawConfig': 'raw_config',
-            'is_active': 'is_active'
-        }
-        
-        for api_field, model_field in field_mapping.items():
-            if api_field in data:
-                setattr(config, model_field, data[api_field])
-        
-        config.save()
+            parsed_raw_config, validation_error = _validate_mcp_raw_config(data['rawConfig'])
+            if validation_error:
+                return response(kind='error', message=validation_error)
+
+        with transaction.atomic():
+            config = (
+                MCPConfiguration.objects.select_for_update()
+                .filter(id=config_id)
+                .first()
+            )
+            if config is None:
+                return response(kind='not_found', message='MCP配置不存在')
+
+            raw_config_changed = (
+                parsed_raw_config is not None
+                and config.get_config_dict() != parsed_raw_config
+            )
+            if 'rawConfig' in data:
+                config.raw_config = data['rawConfig']
+            if 'is_active' in data:
+                config.is_active = data['is_active']
+            if raw_config_changed:
+                config.tools.all().delete()
+                config.tools_status = MCPConfiguration.ToolsStatus.UNCHECKED
+                config.tools_checked_at = None
+                config.tools_error = ''
+                config.tools_probe_token = None
+            config.save()
         
         return response(
             kind="success",
-            data={
-                'id': config.id,
-                'name': config.name,
-                'rawConfig': config.raw_config,
-                'is_active': config.is_active
-            },
+            data=_serialize_mcp_configuration(config),
             message="MCP配置更新成功"
         )
     
@@ -953,157 +1002,7 @@ class MCPConfigurationActionView(APIView):
     
     def _build_mcp_connections(self, mcp_servers: dict) -> dict:
         """构建 MultiServerMCPClient 连接配置"""
-        from web_testing.generation_preflight import prepare_playwright_mcp_output_config
-
-        # Configuration probes launch the same server as generation tasks.
-        # Give each probe its own output id without rewriting the saved JSON.
-        runtime_config = prepare_playwright_mcp_output_config(
-            {'mcpServers': mcp_servers}, None,
-        )
-        connections = {}
-        for server_name, server_config in runtime_config['mcpServers'].items():
-            if 'command' in server_config:
-                # stdio transport
-                conn = {
-                    'command': server_config['command'],
-                    'transport': 'stdio'
-                }
-                if 'args' in server_config:
-                    conn['args'] = server_config['args']
-                if 'env' in server_config:
-                    conn['env'] = server_config['env']
-                connections[server_name] = conn
-            elif 'url' in server_config:
-                # streamable_http transport
-                conn = {
-                    'url': server_config['url'],
-                    'transport': 'streamable_http'
-                }
-                if 'headers' in server_config:
-                    conn['headers'] = server_config['headers']
-                connections[server_name] = conn
-            else:
-                logger.warning(f"MCP服务器 {server_name} 配置不完整，跳过")
-        return connections
-    
-    def _extract_tool_schema(self, tool) -> dict:
-        """从 LangChain Tool 对象提取工具架构"""
-        if not hasattr(tool, 'args_schema') or not tool.args_schema:
-            return {}
-        
-        try:
-            if hasattr(tool.args_schema, 'schema'):
-                return tool.args_schema.schema()
-            elif hasattr(tool.args_schema, 'model_json_schema'):
-                return tool.args_schema.model_json_schema()
-        except Exception as e:
-            logger.warning(f"解析工具架构失败: {e}")
-        return {}
-    
-    def _extract_server_name(self, tool_name: str, connections: dict) -> str:
-        """从工具名称中提取服务器名称"""
-        if '_' in tool_name:
-            server_name = tool_name.split('_', 1)[0]
-            if server_name in connections:
-                return server_name
-        return 'unknown'
-    
-    def _save_tool_to_db(self, tool, config: MCPConfiguration, connections: dict):
-        """保存工具到数据库并返回工具信息"""
-        try:
-            tool_name = getattr(tool, 'name', 'unknown')
-            tool_description = getattr(tool, 'description', '')
-            tool_schema = self._extract_tool_schema(tool)
-            server_name = self._extract_server_name(tool_name, connections)
-            
-            mcp_tool, created = MCPTool.objects.update_or_create(
-                name=tool_name,
-                mcp_config=config,
-                defaults={
-                    'description': tool_description,
-                    'tool_schema': tool_schema,
-                    'is_available': True
-                }
-            )
-            
-            # 如果已存在，更新字段
-            if not created:
-                mcp_tool.description = tool_description
-                mcp_tool.tool_schema = tool_schema
-                mcp_tool.is_available = True
-                mcp_tool.save()
-            
-            return {
-                'id': mcp_tool.id,
-                'name': mcp_tool.name,
-                'description': mcp_tool.description,
-                'server_name': server_name
-            }
-        except Exception as e:
-            logger.error(f"保存工具失败: {e}", exc_info=True)
-            return None
-    
-    def _load_mcp_tools(self, config: MCPConfiguration) -> tuple[int, list]:
-        """
-        加载MCP工具列表并保存到数据库
-        使用 langchain-mcp-adapters 的 MultiServerMCPClient
-        
-        Returns:
-            tuple: (工具数量, 工具列表)
-        """
-        import asyncio
-        
-        try:
-            from langchain_mcp_adapters.client import MultiServerMCPClient
-        except ImportError:
-            logger.error("langchain-mcp-adapters 未安装，请运行: pip install langchain-mcp-adapters")
-            return config.tools.count(), []
-        
-        config_dict = config.get_config_dict()
-        mcp_servers = config_dict.get('mcpServers', {})
-        
-        if not mcp_servers:
-            logger.warning(f"MCP配置 {config.id} 中没有找到mcpServers")
-            return 0, []
-        
-        # 构建连接配置
-        connections = self._build_mcp_connections(mcp_servers)
-        if not connections:
-            logger.warning(f"MCP配置 {config.id} 中没有有效的服务器配置")
-            return 0, []
-        
-        # 异步获取工具列表
-        async def get_all_tools():
-            try:
-                client = MultiServerMCPClient(connections)
-                tools = await client.get_tools()
-                logger.info(f"从 MultiServerMCPClient 获取到 {len(tools)} 个工具")
-                return tools
-            except Exception as e:
-                logger.error(f"使用 MultiServerMCPClient 获取工具失败: {e}", exc_info=True)
-                return []
-        
-        # 运行异步函数
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        all_tools = loop.run_until_complete(get_all_tools())
-        
-        # 保存工具到数据库
-        tools_list = []
-        for tool in all_tools:
-            tool_info = self._save_tool_to_db(tool, config, connections)
-            if tool_info:
-                tools_list.append(tool_info)
-        
-        logger.info(f"MCP配置 {config.id} 共加载了 {len(tools_list)} 个工具")
-        return len(tools_list), tools_list
+        return build_mcp_connections(mcp_servers)
     
     def post(self, request, config_id, action):
         """执行MCP配置操作"""
@@ -1117,42 +1016,18 @@ class MCPConfigurationActionView(APIView):
             )
         
         if action == 'toggle_active':
-            # 切换启用状态
-            config.is_active = not config.is_active
-            config.save()
-            
-            tools_count = 0
-            tools = []
-            
-            # 如果启用配置，加载MCP工具列表
-            if config.is_active:
-                try:
-                    tools_count, tools = self._load_mcp_tools(config)
-                except Exception as e:
-                    logger.error(f"加载MCP工具失败: {e}", exc_info=True)
-                    # 即使加载工具失败，也允许启用配置
-                    tools_count = config.tools.count()
-            
+            with transaction.atomic():
+                config = MCPConfiguration.objects.select_for_update().get(id=config.id)
+                config.is_active = not config.is_active
+                config.save(update_fields=['is_active', 'updated_at'])
             status_text = '启用' if config.is_active else '禁用'
             return response(
                 kind="success",
-                data={
-                    'tools_count': tools_count,
-                    'tools': tools
-                },
+                data=_serialize_mcp_configuration(config),
                 message=f'MCP配置已{status_text}'
             )
-        
-        elif action == 'set_default':
-            # 设置默认配置
-            MCPConfiguration.objects.filter(is_default=True).update(is_default=False)
-            config.is_default = True
-            config.save()
-            
-            return response(
-                kind="success",
-                message='MCP配置已设为默认'
-            )
+        elif action == 'refresh_tools':
+            return _mcp_refresh_response(config.id)
         
         else:
             return response(
@@ -1181,25 +1056,4 @@ class MCPTestConnectionView(APIView):
                 message="MCP配置不存在"
             )
         
-        if not config.is_active:
-            return response(
-                kind="error",
-                message="配置未启用，无法测试连接"
-            )
-        
-        # 这里可以添加实际的MCP连接测试逻辑
-        # 目前返回模拟的成功响应
-        import time
-        time.sleep(1)  # 模拟连接测试时间
-        
-        return response(
-            kind="success",
-            data={
-                'success': True,
-                'response_time': 1.0,
-                'message': f"MCP服务器 '{config.server_name}' 连接测试成功",
-                'server_name': config.server_name,
-                'transport_type': config.transport_type_display
-            },
-            message="MCP连接测试成功"
-        )
+        return _mcp_refresh_response(config.id)

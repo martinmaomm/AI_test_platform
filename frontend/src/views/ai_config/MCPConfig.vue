@@ -47,7 +47,7 @@
       </div>
 
       <el-table :data="filteredConfigurations" v-loading="loading" style="width: 100%">
-        <el-table-column prop="name" label="配置名称" min-width="100">
+        <el-table-column prop="name" label="配置名称" min-width="220">
           <template #default="scope">
             <div class="config-name">
               <div class="config-icon-wrapper mcp-icon-wrapper" :style="{ backgroundColor: getMCPIconColor(scope.row.name) }">
@@ -64,18 +64,29 @@
         <el-table-column prop="is_active" label="状态" width="150" align="center">
           <template #default="scope">
             <el-switch
-              v-model="mcpStatusLoading"
-              @update:model-value="toggleMCPStatus(scope.row)"
-              :loading="scope.row.statusLoading" 
+              :model-value="scope.row.is_active"
+              :loading="scope.row.statusLoading"
+              :disabled="isMCPRowBusy(scope.row)"
+              @change="toggleMCPStatus(scope.row)"
             />
-            
           </template>
         </el-table-column>
 
-        <el-table-column label="工具" width="500">
+        <el-table-column label="工具" min-width="500">
           <template #default="scope">
-            <div style="display: flex; align-items: center; gap: 8px;">
-              <el-tag type="info" >已启用{{ scope.row.tools_count || 0 }}个Tools</el-tag>
+            <div class="mcp-tools-cell">
+              <div class="mcp-tools-main">
+                <el-tag :type="getMCPToolsStatusPresentation(scope.row).type">
+                  {{ getMCPToolsStatusPresentation(scope.row).text }}
+                </el-tag>
+                <el-button
+                  size="small"
+                  :loading="scope.row.toolsRefreshing"
+                  :disabled="isMCPRowBusy(scope.row)"
+                  @click="refreshMCPTools(scope.row)"
+                >
+                  刷新工具
+                </el-button>
               <el-popover
                 v-if="scope.row.tools_count > 0"
                 placement="right"
@@ -95,7 +106,9 @@
                 </template>
                 <template v-if="scope.row.tools && scope.row.tools.length > 0">
                   <div class="tools-popover-header">
-                    <span style="font-weight: 500; color: #303133;">工具列表 ({{ scope.row.tools.length }})</span>
+                    <span style="font-weight: 500; color: #303133;">
+                      {{ scope.row.tools_status === 'error' ? '上次检测清单' : '工具列表' }} ({{ scope.row.tools.length }})
+                    </span>
                   </div>
                   <div class="tools-popover-content">
                     <el-tooltip
@@ -124,6 +137,17 @@
                   <div style="color: #909399; font-size: 13px;">暂无工具</div>
                 </div>
               </el-popover>
+              </div>
+              <div v-if="scope.row.tools_status === 'error'" class="mcp-tools-error">
+                {{ getMCPToolsError(scope.row) || '工具检测失败，请刷新后重试' }}
+              </div>
+              <div v-if="scope.row.tools_checked_at" class="mcp-tools-meta">
+                检测时间：{{ formatDate(scope.row.tools_checked_at) }}
+              </div>
+              <div v-else-if="scope.row.tools_status === 'unchecked'" class="mcp-tools-meta">
+                尚无检测记录
+              </div>
+              <div class="mcp-tools-hint">检测结果不等于运行时连接状态</div>
             </div>
           </template>
         </el-table-column>
@@ -136,10 +160,10 @@
 
         <el-table-column label="操作" width="160" fixed="right">
           <template #default="scope">
-            <el-button type="warning" size="small" @click="editMCPConfig(scope.row)">
+            <el-button type="warning" size="small" :disabled="isMCPRowBusy(scope.row)" @click="editMCPConfig(scope.row)">
               编辑
             </el-button>
-            <el-button type="danger" size="small" @click="handleDeleteMCPConfiguration(scope.row)">
+            <el-button type="danger" size="small" :disabled="isMCPRowBusy(scope.row)" @click="handleDeleteMCPConfiguration(scope.row)">
               删除
             </el-button>
           </template>
@@ -223,7 +247,18 @@ import {
   deleteMCPConfiguration,
   getMCPConfiguration,
   toggleMCPConfigurationActive,
+  refreshMCPConfigurationTools,
 } from '@/api/aiConfig'
+import {
+  getMCPRequestError,
+  getMCPToolsError,
+  getMCPToolsRefreshNotAppliedMessage,
+  getMCPToolsStatusPresentation,
+  isMCPConfigurationBusy,
+  isMCPToolsRefreshSuccessful,
+  normalizeMCPConfiguration,
+  unwrapMCPConfigurationResponse,
+} from '@/utils/mcpTools'
 
 // 响应式数据
 const loading = ref(false)
@@ -232,7 +267,6 @@ const showCreateMCPDialog = ref(false)
 const editingMCPConfig = ref(null)
 const searchQuery = ref('')
 const providerFilter = ref('')
-const mcpStatusLoading = ref(true)
 
 // Monaco Editor 配置
 const monacoOptions = ref({
@@ -255,6 +289,8 @@ const monacoOptions = ref({
 
 // 数据
 const configurations = ref([])
+
+const isMCPRowBusy = isMCPConfigurationBusy
 
 // MCP表单数据
 const mcpConfigForm = reactive({
@@ -301,10 +337,11 @@ const loadConfigurations = async () => {
     
     // 为每个配置项初始化状态
     configurations.value = configs.map(config => ({
-      ...config,
+      ...normalizeMCPConfiguration(config),
       statusLoading: false,
-      tools: config.tools || [],
-      toolsPopoverVisible: false
+      toolsRefreshing: false,
+      toolsPopoverVisible: false,
+      local_tools_error: '',
     }))
   } catch (error) {
     console.error('加载MCP配置失败:', error)
@@ -315,9 +352,8 @@ const loadConfigurations = async () => {
 }
 
 const editMCPConfig = (config) => {
-  console.log('编辑MCP配置，原始数据:', config)
-  console.log('rawConfig字段值:', config.rawConfig)
-  
+  if (isMCPRowBusy(config)) return
+
   editingMCPConfig.value = config
   Object.assign(mcpConfigForm, {
     rawConfig: config.rawConfig || ''
@@ -328,8 +364,6 @@ const editMCPConfig = (config) => {
 
 // 添加MCP配置
 const addMCPConfiguration = () => {
-  console.log('添加MCP配置')
-  
   editingMCPConfig.value = null
   mcpConfigForm.rawConfig = ''
   
@@ -337,36 +371,24 @@ const addMCPConfiguration = () => {
   
   setTimeout(() => {
     if (mcpEditorRef.value) {
-      console.log('通过ref设置MonacoEditor内容: 空')
       mcpEditorRef.value.setValue('')
-    } else {
-      console.warn('MonacoEditor ref未找到')
     }
   }, 300)
 }
 
 // 编辑MCP配置
 const editMCPConfiguration = () => {
-  console.log('编辑MCP配置')
-  
-  console.log('当前rawConfig:', mcpConfigForm.rawConfig)
-  
   showCreateMCPDialog.value = true
   
   setTimeout(() => {
     if (mcpEditorRef.value) {
-      console.log('通过ref设置MonacoEditor内容:', mcpConfigForm.rawConfig)
       mcpEditorRef.value.setValue(mcpConfigForm.rawConfig || '')
-    } else {
-      console.warn('MonacoEditor ref未找到')
     }
   }, 300)
 }
 
 const saveMCPConfiguration = async () => {
   try {
-    console.log('开始保存MCP配置，表单数据:', mcpConfigForm)
-    
     if (!mcpConfigForm.rawConfig || mcpConfigForm.rawConfig.trim() === '') {
       ElMessage.error('请输入MCP配置JSON')
       return
@@ -397,27 +419,18 @@ const saveMCPConfiguration = async () => {
       return
     }
     
-    console.log('验证通过')
-    
     saving.value = true
 
     const data = { ...mcpConfigForm }
-    console.log('发送的数据:', data)
 
     if (editingMCPConfig.value) {
-      console.log('更新MCP配置，ID:', editingMCPConfig.value.id)
-      const result = await updateMCPConfiguration(editingMCPConfig.value.id, data)
-      console.log('更新结果:', result)
+      await updateMCPConfiguration(editingMCPConfig.value.id, data)
       ElMessage.success('MCP配置更新成功')
     } else {
-      console.log('创建MCP配置')
-      
       const config = JSON.parse(mcpConfigForm.rawConfig)
       const serverEntries = Object.entries(config.mcpServers)
       
       if (serverEntries.length > 1) {
-        console.log(`检测到 ${serverEntries.length} 个MCP服务器，将拆分成多个配置`)
-        
         let successCount = 0
         let errorCount = 0
         
@@ -431,9 +444,7 @@ const saveMCPConfiguration = async () => {
               })
             }
             
-            console.log(`创建单个MCP配置: ${serverName}`)
-            const result = await createMCPConfiguration(singleServerData)
-            console.log(`创建结果 ${serverName}:`, result)
+            await createMCPConfiguration(singleServerData)
             successCount++
           } catch (error) {
             console.error(`创建MCP配置 ${serverName} 失败:`, error)
@@ -447,8 +458,7 @@ const saveMCPConfiguration = async () => {
           ElMessage.warning(`成功创建 ${successCount} 个MCP配置，${errorCount} 个失败`)
         }
       } else {
-        const result = await createMCPConfiguration(data)
-        console.log('创建结果:', result)
+        await createMCPConfiguration(data)
         ElMessage.success('MCP配置创建成功')
       }
     }
@@ -472,6 +482,8 @@ const cancelMCPEdit = () => {
 
 // 删除MCP配置
 const handleDeleteMCPConfiguration = async (config) => {
+  if (isMCPRowBusy(config)) return
+
   try {
     await ElMessageBox.confirm(
       `确定要删除MCP配置 "${config.name}" 吗？`,
@@ -531,36 +543,70 @@ watch(showCreateMCPDialog, (newVal) => {
 
 // 切换MCP状态
 const toggleMCPStatus = async (config) => {
-  // 点击时立即显示loading
+  if (isMCPRowBusy(config)) return
+
   config.statusLoading = true
-  
   try {
-    const originalStatus = config.is_active
-    
-    // 调用接口切换状态
     const response = await toggleMCPConfigurationActive(config.id)
-    
-    // 切换状态
-    config.is_active = !originalStatus
-    
-    // 如果接口返回了工具信息，更新工具数量和工具列表
-    if (response?.data?.data) {
-      const responseData = response.data.data
-      if (typeof responseData.tools_count === 'number') {
-        config.tools_count = responseData.tools_count
-      }
-      if (Array.isArray(responseData.tools)) {
-        config.tools = responseData.tools
-      }
+    const responseData = unwrapMCPConfigurationResponse(response)
+    if (typeof responseData?.is_active !== 'boolean') {
+      throw new Error(getMCPRequestError({ response }, '服务器未返回配置启用状态'))
     }
-    
+
+    // toggle 接口只负责启用状态，工具检测状态保持现状。
+    config.is_active = responseData.is_active
     ElMessage.success(config.is_active ? 'MCP配置已启用' : 'MCP配置已禁用')
   } catch (error) {
-    console.error('切换MCP状态失败:', error)
-    ElMessage.error(`切换MCP状态失败: ${error.response?.data?.message || error.message}`)
+    ElMessage.error(`切换MCP状态失败: ${getMCPRequestError(error)}`)
   } finally {
-    // 接口返回后关闭loading
     config.statusLoading = false
+  }
+}
+
+const refreshMCPTools = async (config) => {
+  if (isMCPRowBusy(config)) return
+
+  config.toolsRefreshing = true
+  config.local_tools_error = ''
+  try {
+    const response = await refreshMCPConfigurationTools(config.id)
+    const responseData = unwrapMCPConfigurationResponse(response)
+    if (!responseData) {
+      throw new Error(getMCPRequestError({ response }, '服务器未返回工具检测结果'))
+    }
+
+    const toolsResult = Object.fromEntries(
+      Object.entries(responseData).filter(([key]) => key !== 'is_active')
+    )
+    Object.assign(config, normalizeMCPConfiguration({
+      ...config,
+      ...toolsResult,
+      // 刷新失败时后端可返回旧清单；没有 tools 字段时也必须继续保留它。
+      tools: Array.isArray(toolsResult.tools) ? toolsResult.tools : config.tools,
+    }))
+
+    const refreshNotAppliedMessage = getMCPToolsRefreshNotAppliedMessage(responseData)
+    if (refreshNotAppliedMessage) {
+      ElMessage.warning(refreshNotAppliedMessage)
+      return
+    }
+    if (isMCPToolsRefreshSuccessful(config.tools_status)) {
+      ElMessage.success('工具检测完成')
+      return
+    }
+    if (config.tools_status === 'error') {
+      ElMessage.error(`工具检测失败: ${getMCPToolsError(config) || '请刷新后重试'}`)
+      return
+    }
+    ElMessage.warning('工具检测结果未生效，请重试')
+  } catch (error) {
+    const message = getMCPRequestError(error, '工具检测请求失败')
+    // 传输层失败时没有权威响应，保留旧清单，但在当前行明确显示失败原因。
+    config.tools_status = 'error'
+    config.local_tools_error = message
+    ElMessage.error(`工具检测失败: ${message}`)
+  } finally {
+    config.toolsRefreshing = false
   }
 }
 
@@ -585,23 +631,18 @@ const loadToolsIfNeeded = async (config) => {
   // 加载工具列表
   try {
     const response = await getMCPConfiguration(config.id)
-    if (response?.data?.data?.tools) {
-      config.tools = response.data.data.tools
-    } else if (response?.data?.tools) {
-      config.tools = response.data.tools
-    } else {
-      config.tools = []
-    }
+    const responseData = unwrapMCPConfigurationResponse(response)
+    if (Array.isArray(responseData?.tools)) config.tools = responseData.tools
   } catch (error) {
-    console.error('获取工具列表失败:', error)
     ElMessage.warning('获取工具列表失败')
-    config.tools = []
   }
 }
 
 // 工具方法
 const formatDate = (dateString) => {
-  return dayjs(dateString).format('YYYY-MM-DD HH:mm:ss')
+  return dateString && dayjs(dateString).isValid()
+    ? dayjs(dateString).format('YYYY-MM-DD HH:mm:ss')
+    : '—'
 }
 
 // 通用图标工具函数
@@ -969,6 +1010,37 @@ onMounted(() => {
 
 .tools-expand-icon.is-expanded {
   transform: rotate(270deg);
+}
+
+.mcp-tools-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.mcp-tools-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-tools-meta,
+.mcp-tools-hint {
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.mcp-tools-hint {
+  color: #a8abb2;
+}
+
+.mcp-tools-error {
+  color: #f56c6c;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
 }
 
 

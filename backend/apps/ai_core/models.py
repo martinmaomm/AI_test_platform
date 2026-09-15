@@ -299,6 +299,11 @@ class MCPProvider(models.TextChoices):
 
 class MCPConfiguration(models.Model):
     """MCP配置模型"""
+
+    class ToolsStatus(models.TextChoices):
+        UNCHECKED = 'unchecked', '尚未检测'
+        READY = 'ready', '检测成功'
+        ERROR = 'error', '检测失败'
     
     # MCP配置名称
     name = models.CharField(max_length=100, verbose_name='MCP配置名称')
@@ -308,6 +313,20 @@ class MCPConfiguration(models.Model):
     
     # 状态信息
     is_active = models.BooleanField(default=True, verbose_name='是否启用')
+    tools_status = models.CharField(
+        max_length=16,
+        choices=ToolsStatus.choices,
+        default=ToolsStatus.UNCHECKED,
+        verbose_name='工具清单状态',
+    )
+    tools_checked_at = models.DateTimeField(null=True, blank=True, verbose_name='工具检测时间')
+    tools_error = models.TextField(blank=True, default='', verbose_name='工具检测错误')
+    tools_probe_token = models.UUIDField(
+        null=True,
+        blank=True,
+        editable=False,
+        verbose_name='工具探测令牌',
+    )
     
     # 时间信息
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')

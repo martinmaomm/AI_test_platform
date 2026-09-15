@@ -79,6 +79,29 @@ class SharedAIConfigurationRuntimeTests(TestCase):
         self.assertEqual(config_id, self.mcp.id)
         self.assertIn('playwright', config['mcpServers'])
 
+    def test_multiple_configs_select_latest_enabled_playwright_for_both_users(self):
+        latest = MCPConfiguration.objects.create(
+            raw_config=self.mcp.raw_config, is_active=True, created_by=self.admin,
+        )
+        MCPConfiguration.objects.create(
+            raw_config=self.mcp.raw_config, is_active=False, created_by=self.admin,
+        )
+        MCPConfiguration.objects.create(
+            raw_config=json.dumps({'mcpServers': {'filesystem': {'command': 'offline'}}}),
+            is_active=True, created_by=self.admin,
+        )
+        for user in (self.admin, self.member):
+            self.assertEqual(resolve_active_playwright_mcp_config(user.id)[0], latest.id)
+        latest.is_active = False
+        latest.save(update_fields=['is_active'])
+        self.assertEqual(resolve_active_playwright_mcp_config(self.member.id)[0], self.mcp.id)
+
+    def test_tool_catalog_status_does_not_change_runtime_config_selection(self):
+        self.mcp.tools_status = 'error'
+        self.mcp.tools_error = '清单检测失败不代表正在运行的任务不可用'
+        self.mcp.save(update_fields=['tools_status', 'tools_error'])
+        self.assertEqual(resolve_active_playwright_mcp_config(self.member.id)[0], self.mcp.id)
+
     def test_member_exploration_runtime_loads_admin_created_mcp(self):
         agent = WebUIPlaywrightAgent.__new__(WebUIPlaywrightAgent)
         agent._send_node_start_notification = lambda *_args: None

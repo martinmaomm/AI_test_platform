@@ -47,7 +47,10 @@ class MCPProbeOutputRoutingTests(SimpleTestCase):
 
     def test_other_mcp_servers_keep_existing_connection_options(self):
         servers = {
-            'filesystem': {'command': 'local-server', 'args': ['/test/root'], 'env': {'MODE': 'readonly'}},
+            'filesystem': {
+                'command': 'local-server', 'args': ['/test/root'],
+                'env': {'MODE': 'readonly'}, 'cwd': '/test/workspace',
+            },
             'remote': {'url': 'https://example.test/mcp', 'headers': {'X-Test': 'value'}},
         }
         original = deepcopy(servers)
@@ -56,7 +59,8 @@ class MCPProbeOutputRoutingTests(SimpleTestCase):
 
         self.assertEqual(servers, original)
         self.assertEqual(connections['filesystem'], {
-            'command': 'local-server', 'transport': 'stdio', 'args': ['/test/root'], 'env': {'MODE': 'readonly'},
+            'command': 'local-server', 'transport': 'stdio', 'args': ['/test/root'],
+            'env': {'MODE': 'readonly'}, 'cwd': '/test/workspace',
         })
         self.assertEqual(connections['remote'], {
             'url': 'https://example.test/mcp', 'transport': 'streamable_http', 'headers': {'X-Test': 'value'},

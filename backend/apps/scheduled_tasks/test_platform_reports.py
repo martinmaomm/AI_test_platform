@@ -223,7 +223,7 @@ class PlatformNativeReportTests(TestCase):
             ['passed', 'passed'],
         )
 
-    def test_report_and_case_endpoints_use_project_report_permission(self):
+    def test_public_reports_do_not_open_management_case_endpoints(self):
         log = self.make_log()
         _, execution, _ = self.make_suite_execution(child_statuses=('passed', 'passed'))
         self.link(log, execution)
@@ -247,9 +247,13 @@ class PlatformNativeReportTests(TestCase):
         self.assertIn('httprunner_result', report_data['case_executions'][0])
 
         client.force_authenticate(self.denied)
-        self.assertEqual(client.get(f'/api/v1/reports/detail/{log.id}/').status_code, 404)
+        self.assertEqual(client.get(f'/api/v1/reports/detail/{log.id}/').status_code, 200)
         self.assertEqual(
             client.get(f'/api/v1/projects/{self.project.id}/api-testing/executions/{execution.id}/report/').status_code,
+            200,
+        )
+        self.assertEqual(
+            client.get(f'/api/v1/projects/{self.project.id}/api-testing/executions/{execution.id}/cases/').status_code,
             404,
         )
 

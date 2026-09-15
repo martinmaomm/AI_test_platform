@@ -1545,12 +1545,13 @@ class APITestExecutionCasesView(APIView):
 
 
 class APITestExecutionReportView(APIView):
-    """Platform-native API report endpoint for one durable execution."""
-    permission_classes = [IsAuthenticated]
+    """Public read-only report for one saved execution, not a management API."""
+    authentication_classes = []  # A stale login must not block a public report.
+    permission_classes = [permissions.AllowAny]
 
     def get(self, request, project_id, pk):
         execution = get_object_or_404(
-            _report_execution_queryset(request.user, project_id), pk=pk,
+            APITestExecution.objects.filter(project_id=project_id), pk=pk,
         )
         if execution.exec_type == 'suite':
             detail = get_object_or_404(

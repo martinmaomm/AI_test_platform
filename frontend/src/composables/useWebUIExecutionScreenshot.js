@@ -1,7 +1,8 @@
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import { getWebUITestExecutionScreenshot } from '@/api/webTesting'
+import { getPublicWebUITestExecutionScreenshot } from '@/api/publicReports'
 
-// One authenticated screenshot per execution (or suite member). Never retain a
+// One controlled screenshot per execution (or suite member). Never retain a
 // previous execution's image when the detail panel changes or polling finishes.
 export function useWebUIExecutionScreenshot(getExecution) {
   const screenshotUrl = ref('')
@@ -33,7 +34,10 @@ export function useWebUIExecutionScreenshot(getExecution) {
     if (!projectId || !executionId || !screenshotPath) return
     loading.value = true
     try {
-      const blob = await getWebUITestExecutionScreenshot(projectId, executionId, caseExecutionId)
+      const getScreenshot = getExecution().publicReport
+        ? getPublicWebUITestExecutionScreenshot
+        : getWebUITestExecutionScreenshot
+      const blob = await getScreenshot(projectId, executionId, caseExecutionId)
       if (version !== requestVersion) return
       screenshotUrl.value = URL.createObjectURL(blob)
     } catch {
@@ -45,7 +49,7 @@ export function useWebUIExecutionScreenshot(getExecution) {
 
   watch(() => {
     const item = getExecution()
-    return [item.projectId, item.executionId, item.caseExecutionId, item.screenshotPath, item.status]
+    return [item.projectId, item.executionId, item.caseExecutionId, item.screenshotPath, item.status, item.publicReport]
   }, reload, { immediate: true })
   onScopeDispose(() => {
     requestVersion += 1

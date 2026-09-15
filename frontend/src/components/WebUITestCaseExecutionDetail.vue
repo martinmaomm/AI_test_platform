@@ -65,6 +65,7 @@
               :execution-id="execution.execution || execution.id"
               :screenshot-path="execution.screenshot_path || ''"
               :status="execution.status"
+              :public-report="publicReport"
             />
 
             <!-- Execution Logs -->
@@ -92,10 +93,11 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, defineAsyncComponent, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import WebUIExecutionScreenshot from '@/components/WebUIExecutionScreenshot.vue'
-import WebUIScriptAssistantPanel from '@/components/WebUIScriptAssistantPanel.vue'
+
+const WebUIScriptAssistantPanel = defineAsyncComponent(() => import('@/components/WebUIScriptAssistantPanel.vue'))
 
 const props = defineProps({
   execution: {
@@ -107,14 +109,15 @@ const props = defineProps({
     type: Boolean,
     default: false
   },
-  hideAiRepair: { type: Boolean, default: false }
+  hideAiRepair: { type: Boolean, default: false },
+  publicReport: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['close'])
 const openLogSections = ref([])
 const assistantVisible = ref(false)
-const canRepair = computed(() => !props.hideAiRepair && props.execution?.repair_availability?.available === true && ['failed', 'error'].includes(props.execution?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id)))
-const repairUnavailableReason = computed(() => !props.hideAiRepair && ['failed', 'error'].includes(props.execution?.status) && props.execution?.repair_availability?.available === false ? props.execution.repair_availability.reason : '')
+const canRepair = computed(() => !props.publicReport && !props.hideAiRepair && props.execution?.repair_availability?.available === true && ['failed', 'error'].includes(props.execution?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id)))
+const repairUnavailableReason = computed(() => !props.publicReport && !props.hideAiRepair && ['failed', 'error'].includes(props.execution?.status) && props.execution?.repair_availability?.available === false ? props.execution.repair_availability.reason : '')
 watch(() => props.execution?.execution || props.execution?.id, () => { assistantVisible.value = false })
 
 const technicalLog = computed(() => {

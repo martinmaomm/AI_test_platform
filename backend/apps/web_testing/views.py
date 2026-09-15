@@ -16,7 +16,7 @@ from rest_framework import generics, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -122,6 +122,7 @@ from .serializers import (
     WebUITestSuiteAddTestCaseSerializer,
     WebUITestSuiteCreateSerializer,
     WebUITestSuiteExecutionDetailSerializer,
+    WebUITestSuiteCaseExecutionSerializer,
     WebUITestSuiteSerializer,
     WebUITestSuiteUpdateSerializer,
 )
@@ -1636,11 +1637,11 @@ class TestCaseExecutionDetailView(APIView):
 
 
 class TestExecutionReportView(APIView):
-    """Return a report-ready execution snapshot without inferring its type client-side."""
+    """Public read-only execution report, including saved suite child results."""
 
-    permission_classes = [IsAuthenticated]
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
-    @project_access_required(REPORT)
     def get(self, request, project_id, pk):
         execution = get_object_or_404(
             WebUITestExecution.objects.select_related('executor', 'project'),
@@ -1653,6 +1654,14 @@ class TestExecutionReportView(APIView):
                 execution=execution,
             )
             detail_data = WebUITestSuiteExecutionDetailSerializer(detail).data
+            children = WebUITestSuiteCaseExecutionSerializer(
+                detail.case_executions.order_by('execution_order', 'id'), many=True,
+            ).data
+            for child in children:
+                child.pop('repair_availability', None)
+                if execution.status not in {'pending', 'running'} and child['status'] in {'pending', 'running'}:
+                    child['status_display'] = '未执行（套件已结束）'
+            detail_data['case_executions'] = children
         else:
             detail = get_object_or_404(
                 WebUITestCaseExecutionDetail.objects.select_related('execution__executor'),
@@ -1665,6 +1674,7 @@ class TestExecutionReportView(APIView):
         data['id'] = execution.id
         data['execution'] = execution.id
         data['detail_id'] = detail_id
+        data.pop('repair_availability', None)
         return response(kind='success', data=data, message='获取执行报告成功')
 
 
@@ -1783,12 +1793,15 @@ def _resolve_screenshot_file(relative_path, execution_id=None):
 
 
 class TestExecutionScreenshotView(APIView):
-    permission_classes = [IsAuthenticated]
+    """Report screenshot by execution identity; never an arbitrary file path."""
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
-    @project_access_required(REPORT)
     def get(self, request, project_id, pk, case_pk=None):
         execution = get_object_or_404(WebUITestExecution, pk=pk, project_id=project_id)
         if execution.exec_type == 'case':
+            if case_pk is not None:
+                raise Http404('单用例执行不存在套件子用例截图')
             detail = getattr(execution, 'case_execution_detail', None)
             screenshot_path = detail.screenshot_path if detail else None
         elif case_pk is not None:

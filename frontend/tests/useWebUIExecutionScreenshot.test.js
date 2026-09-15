@@ -8,17 +8,22 @@ const flush = async () => { await nextTick(); await new Promise(resolve => setIm
 let moduleId = 0
 
 async function harness(t, initial = {}) {
-  const props = reactive({ projectId: 1, executionId: 2, caseExecutionId: null, screenshotPath: '', status: 'running', ...initial })
-  const calls = [], created = [], revoked = []
+  const props = reactive({ projectId: 1, executionId: 2, caseExecutionId: null, screenshotPath: '', status: 'running', publicReport: false, ...initial })
+  const calls = [], publicCalls = [], created = [], revoked = []
   const api = { fetch: async () => new Blob(['fixture'], { type: 'image/png' }) }
   const key = `__automationScreenshotTest${++moduleId}`
   globalThis[key] = async (...args) => { calls.push(args); return api.fetch(...args) }
   const apiModule = dataModule(`export const getWebUITestExecutionScreenshot = globalThis[${JSON.stringify(key)}]`)
+  const publicKey = `${key}Public`
+  globalThis[publicKey] = async (...args) => { publicCalls.push(args); return api.fetch(...args) }
+  const publicApiModule = dataModule(`export const getPublicWebUITestExecutionScreenshot = globalThis[${JSON.stringify(publicKey)}]`)
   const source = (await readFile(new URL('../src/composables/useWebUIExecutionScreenshot.js', import.meta.url), 'utf8'))
     .replace("from 'vue'", `from '${import.meta.resolve('vue')}'`)
     .replace("from '@/api/webTesting'", `from '${apiModule}'`)
+    .replace("from '@/api/publicReports'", `from '${publicApiModule}'`)
   const { useWebUIExecutionScreenshot } = await import(dataModule(source))
   delete globalThis[key]
+  delete globalThis[publicKey]
   const originalCreate = URL.createObjectURL, originalRevoke = URL.revokeObjectURL
   URL.createObjectURL = blob => { const url = `blob:fixture-${created.length + 1}`; created.push({ blob, url }); return url }
   URL.revokeObjectURL = url => revoked.push(url)
@@ -26,7 +31,7 @@ async function harness(t, initial = {}) {
   const state = scope.run(() => useWebUIExecutionScreenshot(() => props))
   t.after(() => { scope.stop(); URL.createObjectURL = originalCreate; URL.revokeObjectURL = originalRevoke })
   await flush()
-  return { props, calls, created, revoked, api, state, scope }
+  return { props, calls, publicCalls, created, revoked, api, state, scope }
 }
 
 test('successful runs fetch an authenticated screenshot without an error message', async t => {
@@ -35,6 +40,15 @@ test('successful runs fetch an authenticated screenshot without an error message
   assert.equal(state.title.value, '执行完成截图')
   assert.equal(state.screenshotUrl.value, 'blob:fixture-1')
   assert.deepEqual(calls, [[1, 2, null]])
+})
+
+test('public reports use the interceptor-free screenshot client', async t => {
+  const { calls, publicCalls, state } = await harness(t, {
+    status: 'failed', screenshotPath: 'fixture.png', publicReport: true
+  })
+  assert.equal(state.screenshotUrl.value, 'blob:fixture-1')
+  assert.deepEqual(calls, [])
+  assert.deepEqual(publicCalls, [[1, 2, null]])
 })
 
 test('failed suite members and incomplete runs show screenshots with accurate labels', async t => {

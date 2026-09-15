@@ -189,7 +189,6 @@ def verify(origin, fixture, output, dispatches):
         }),
         ("execution-list", "GET", f"{api}/executions/", None),
         ("execution-detail", "GET", f"{api}/executions/case/{execution}/", None),
-        ("execution-report", "GET", f"{api}/executions/{execution}/report/", None),
         ("execution-task", "GET", f"{api}/task-status/owner-execution-task/", None),
         ("execution-delete", "DELETE", f"{api}/executions/{execution}/delete/", None),
     ]
@@ -218,16 +217,19 @@ def verify(origin, fixture, output, dispatches):
             lambda route: route.continue_() if route.request.url.startswith(origin + "/") else route.abort(),
         )
         outsider_page = outsider_context.new_page()
-        report_response = login(
-            outsider_page, origin, fixture["outsider"], report_path,
-            expected_after_login=lambda item: item.url.endswith(
+        login(outsider_page, origin, fixture["outsider"])
+        with outsider_page.expect_response(
+            lambda item: item.url.endswith(
                 f"/api/v1/projects/{project}/api-testing/executions/{execution}/report/"
-            ),
-        )
+            )
+        ) as report_response:
+            outsider_page.goto(origin + report_path)
+        report_response = report_response.value
         results.append({"actor": "outsider-ui", "check": "direct-report", "status": report_response.status})
-        if report_response.status not in {403, 404}:
+        if report_response.status != 200:
             failures.append(f"outsider-ui direct-report returned {report_response.status}")
-        expect(outsider_page.get_by_text("ACCESS-OWNER-REPORT", exact=False)).to_have_count(0)
+        expect(outsider_page.get_by_text("ACCESS-OWNER-REPORT", exact=False).first).to_be_visible()
+        expect(outsider_page.get_by_text("AI 修复", exact=False)).to_have_count(0)
         outsider_page.screenshot(path=str(output / "outsider-report-direct-link.png"), full_page=True)
 
         outsider_page.evaluate(
@@ -256,6 +258,19 @@ def verify(origin, fixture, output, dispatches):
                 failures.append(f"outsider {label} returned {reply['status']}")
             if leaked:
                 failures.append(f"outsider {label} exposed owner marker")
+        public_report = browser_fetch(outsider_page, {
+            "path": f"{api}/executions/{execution}/report/", "method": "GET", "body": None,
+        })
+        report_marker_visible = any(marker in public_report["text"] for marker in OWNER_MARKERS)
+        results.append({
+            "actor": "outsider", "check": "public-execution-report",
+            "status": public_report["status"], "owner_marker_visible": report_marker_visible,
+        })
+        if public_report["status"] != 200 or not report_marker_visible:
+            failures.append(
+                f"outsider public report returned {public_report['status']} "
+                f"with marker={report_marker_visible}"
+            )
         outsider_context.close()
 
         viewer_context = browser.new_context(viewport={"width": 1280, "height": 900})

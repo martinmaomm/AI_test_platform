@@ -24,19 +24,24 @@ test('API native reports distinguish unknown outcomes from assertion failures an
   assert.match(source, /'stopped': '已停止'/)
 })
 
-test('report routes are authenticated and old static-report proxy is absent', async () => {
-  const [router, vite, api, login] = await Promise.all([
+test('report routes are public while management routes remain authenticated', async () => {
+  const [router, vite, api, publicReports, login] = await Promise.all([
     readFile(new URL('../src/router/index.js', import.meta.url), 'utf8'),
     readFile(new URL('../vite.config.js', import.meta.url), 'utf8'),
     readFile(new URL('../src/api/index.js', import.meta.url), 'utf8'),
+    readFile(new URL('../src/api/publicReports.js', import.meta.url), 'utf8'),
     readFile(new URL('../src/views/Login.vue', import.meta.url), 'utf8')
   ])
-  assert.match(router, /path: '\/reports\/web\/:projectId\/:executionId'[\s\S]*requiresAuth: true/)
-  assert.match(router, /path: '\/reports\/api\/:projectId\/:executionId'[\s\S]*requiresAuth: true/)
-  assert.match(router, /path: '\/reports\/detail\/:id'[\s\S]*requiresAuth: true/)
+  assert.match(router, /path: '\/reports\/web\/:projectId\/:executionId'[^\n]*requiresAuth: false[^\n]*publicReport: true/)
+  assert.match(router, /path: '\/reports\/api\/:projectId\/:executionId'[^\n]*requiresAuth: false[^\n]*publicReport: true/)
+  assert.match(router, /path: '\/reports\/detail\/:id'[^\n]*requiresAuth: false[^\n]*publicReport: true/)
+  assert.match(router, /path: '\/api-testing'[\s\S]*requiresAuth: true/)
+  assert.match(router, /path: '\/web-testing'[\s\S]*requiresAuth: true/)
   assert.match(router, /query: \{ redirect: to\.fullPath \}/)
   assert.doesNotMatch(vite, /playwright-reports/)
   assert.doesNotMatch(api, /reports\/detail/)
+  assert.match(publicReports, /axios\.create/)
+  assert.doesNotMatch(publicReports, /from ['"]\.\/index['"]|Authorization|useAuthStore|interceptors/)
   assert.match(login, /route\.query\.redirect/)
 })
 
@@ -52,15 +57,26 @@ test('frontend has no runtime Allure report reference', async () => {
   }
 })
 
-test('independent report page calls the direct authenticated report endpoint without list scanning', async () => {
+test('independent report page calls direct public endpoints without list scanning', async () => {
   const source = await readFile(new URL('../src/views/reports/ExecutionReportPage.vue', import.meta.url), 'utf8')
-  assert.match(source, /getWebUITestExecutionReport/)
-  assert.match(source, /getAPITestExecutionReport/)
+  assert.match(source, /getPublicWebUITestExecutionReport/)
+  assert.match(source, /getPublicAPITestExecutionReport/)
+  assert.match(source, /public-report/)
+  assert.match(source, /hide-ai-repair/)
   assert.match(source, /const executionId = computed/)
   assert.match(source, /let requestVersion = 0/)
   assert.match(source, /onBeforeUnmount\(\(\) => \{ requestVersion \+= 1 \}\)/)
   assert.match(source, /status === 404 \|\| status === 403/)
   assert.doesNotMatch(source, /getTestExecutions|getAPITestExecutions|findExecution/)
+})
+
+test('public WebUI suites consume embedded children and preserve management behavior', async () => {
+  const source = await readFile(new URL('../src/components/WebUITestSuiteExecutionDetail.vue', import.meta.url), 'utf8')
+  assert.match(source, /if \(props\.publicReport\)/)
+  assert.match(source, /props\.execution\?\.case_executions/)
+  assert.match(source, /test_case_id: item\?\.test_case_id \?\? item\?\.test_case/)
+  assert.match(source, /getTestExecutionCases\(projectId, executionId\)/)
+  assert.match(source, /!props\.publicReport && item\?\.repair_availability/)
 })
 
 test('scheduled report renders native status counts and reloads safely when its id changes', async () => {

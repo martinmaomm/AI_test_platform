@@ -1,7 +1,7 @@
 <template>
   <main class="report-detail-page">
     <div v-if="loading" class="state-wrap"><el-icon class="is-loading"><Loading /></el-icon>加载中…</div>
-    <el-result v-else-if="error || is404" :icon="is404 ? 'warning' : 'error'" :title="is404 ? '报告不存在或无权访问' : '报告加载失败'" :sub-title="error">
+    <el-result v-else-if="error || is404" :icon="is404 ? 'warning' : 'error'" :title="is404 ? '报告不存在或已删除' : '报告加载失败'" :sub-title="error">
       <template #extra><el-button type="primary" @click="fetchDetail">重试</el-button></template>
     </el-result>
     <article v-else-if="log" class="report-card">
@@ -23,7 +23,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { Loading } from '@element-plus/icons-vue'
-import api from '@/api/index'
+import { getPublicScheduledReport } from '@/api/publicReports'
 import dayjs from 'dayjs'
 import { reportPath } from '@/utils/reportLinks'
 
@@ -45,9 +45,9 @@ async function fetchDetail() {
   const version = ++requestVersion
   loading.value = true; error.value = ''; is404.value = false; log.value = null
   try {
-    const response = await api.get(`/reports/detail/${id.value}/`)
+    const response = await getPublicScheduledReport(id.value)
     if (version !== requestVersion) return
-    const data = response.data?.data || response.data
+    const data = response?.data || response
     if (!data || typeof data !== 'object') { is404.value = true; error.value = '请检查报告链接是否正确。'; return }
     log.value = data
   } catch (requestError) {

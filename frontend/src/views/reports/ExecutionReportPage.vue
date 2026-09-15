@@ -4,7 +4,7 @@
     <el-result
       v-else-if="error"
       :icon="isNotFound ? 'warning' : 'error'"
-      :title="isNotFound ? '报告不存在或无权访问' : '报告加载失败'"
+      :title="isNotFound ? '报告不存在或已删除' : '报告加载失败'"
       :sub-title="error"
     >
       <template #extra><el-button type="primary" @click="loadReport">重试</el-button></template>
@@ -21,10 +21,13 @@
       <WebUITestSuiteExecutionDetail
         v-if="kind === 'web' && execution.exec_type === 'suite'"
         :execution="execution"
+        public-report
       />
       <WebUITestCaseExecutionDetail
         v-else-if="kind === 'web'"
         :execution="execution"
+        hide-ai-repair
+        public-report
       />
       <APITestSuiteExecutionDetai
         v-else-if="execution.exec_type === 'suite'"
@@ -40,8 +43,10 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
-import { getWebUITestExecutionReport } from '@/api/webTesting'
-import { getAPITestExecutionReport } from '@/api/apiTesting'
+import {
+  getPublicAPITestExecutionReport,
+  getPublicWebUITestExecutionReport
+} from '@/api/publicReports'
 import WebUITestSuiteExecutionDetail from '@/components/WebUITestSuiteExecutionDetail.vue'
 import WebUITestCaseExecutionDetail from '@/components/WebUITestCaseExecutionDetail.vue'
 import APITestSuiteExecutionDetai from '@/components/APITestSuiteExecutionDetai.vue'
@@ -71,7 +76,9 @@ const loadReport = async () => {
   isNotFound.value = false
   execution.value = null
   try {
-    const getExecutionReport = props.kind === 'web' ? getWebUITestExecutionReport : getAPITestExecutionReport
+    const getExecutionReport = props.kind === 'web'
+      ? getPublicWebUITestExecutionReport
+      : getPublicAPITestExecutionReport
     const response = await getExecutionReport(projectId.value, executionId.value)
     if (version !== requestVersion) return
     if (!response?.success) throw new Error(response?.message || '获取执行报告失败')

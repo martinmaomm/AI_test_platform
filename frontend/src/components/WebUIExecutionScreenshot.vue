@@ -30,7 +30,8 @@ const props = defineProps({
   executionId: [Number, String],
   caseExecutionId: { type: [Number, String], default: null },
   screenshotPath: { type: String, default: '' },
-  status: { type: String, default: '' }
+  status: { type: String, default: '' },
+  publicReport: { type: Boolean, default: false }
 })
 const { screenshotUrl, loading, error, showScreenshot, title, reload } = useWebUIExecutionScreenshot(() => props)
 </script>

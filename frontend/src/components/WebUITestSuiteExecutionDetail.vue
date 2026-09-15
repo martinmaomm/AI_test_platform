@@ -44,14 +44,14 @@
             <div class="case-title"><span>{{ caseItem.test_case_title || caseItem.name || '未命名用例' }}</span><el-tag :type="statusType(caseItem.status)" size="small">{{ caseItem.status_display || statusText(caseItem.status) }}</el-tag><small>{{ formatDuration(caseItem.duration) }}</small><el-button v-if="canRepairCase(caseItem)" size="small" type="danger" plain @click.stop="toggleRepairCase(caseItem)">AI 修复</el-button></div>
           </template>
           <pre v-if="caseItem.error_message" class="case-error">{{ caseItem.error_message }}</pre>
-          <el-alert v-if="['failed', 'error'].includes(caseItem.status) && caseItem.repair_availability?.available === false" :title="caseItem.repair_availability.reason" type="info" :closable="false" show-icon />
+          <el-alert v-if="!publicReport && ['failed', 'error'].includes(caseItem.status) && caseItem.repair_availability?.available === false" :title="caseItem.repair_availability.reason" type="info" :closable="false" show-icon />
           <WebUIScriptAssistantPanel
             v-if="selectedRepairCaseId === String(caseItem.id) && canRepairCase(caseItem)"
             :ref="element => setRepairPanelRef(caseItem.id, element)"
             :project-id="execution.project_id"
             :repair-context="{ executionId: execution.execution || execution.id, suiteCaseId: caseItem.id }"
           />
-          <WebUIExecutionScreenshot v-if="expandedCases.includes(String(caseItem.id))" :project-id="execution.project_id" :execution-id="execution.execution || execution.id" :case-execution-id="caseItem.id" :screenshot-path="caseItem.screenshot_path || ''" :status="caseItem.status" />
+          <WebUIExecutionScreenshot v-if="expandedCases.includes(String(caseItem.id))" :project-id="execution.project_id" :execution-id="execution.execution || execution.id" :case-execution-id="caseItem.id" :screenshot-path="caseItem.screenshot_path || ''" :status="caseItem.status" :public-report="publicReport" />
           <el-collapse v-if="caseLog(caseItem)" class="raw-log"><el-collapse-item title="查看原始 stdout / stderr / log" name="log"><pre>{{ caseLog(caseItem) }}</pre></el-collapse-item></el-collapse>
         </el-collapse-item>
       </el-collapse>
@@ -65,16 +65,20 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 import { getTestExecutionCases } from '@/api/webTesting'
 import WebUIExecutionScreenshot from '@/components/WebUIExecutionScreenshot.vue'
-import WebUIScriptAssistantPanel from '@/components/WebUIScriptAssistantPanel.vue'
 import { copyText } from '@/utils/reportLinks'
 import { expandedAssistantRowIds } from '@/composables/webUIScriptAssistantPresentation'
 
-const props = defineProps({ execution: { type: Object, required: true, default: () => ({}) } })
+const WebUIScriptAssistantPanel = defineAsyncComponent(() => import('@/components/WebUIScriptAssistantPanel.vue'))
+
+const props = defineProps({
+  execution: { type: Object, required: true, default: () => ({}) },
+  publicReport: { type: Boolean, default: false }
+})
 const caseExecutions = ref([])
 const casesLoading = ref(false)
 const casesError = ref('')
@@ -86,7 +90,7 @@ let requestVersion = 0
 
 const filteredCases = computed(() => onlyFailures.value ? caseExecutions.value.filter(item => ['failed', 'error'].includes(item.status)) : caseExecutions.value)
 const actualUrl = computed(() => props.execution?.diagnostics?.actual_url || props.execution?.actual_url || '')
-const canRepairCase = item => item?.repair_availability?.available === true && ['failed', 'error'].includes(item?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id) && item?.id)
+const canRepairCase = item => !props.publicReport && item?.repair_availability?.available === true && ['failed', 'error'].includes(item?.status) && Boolean(props.execution?.project_id && (props.execution?.execution || props.execution?.id) && item?.id)
 const setRepairPanelRef = (id, element) => {
   const key = String(id)
   if (element) repairPanelRefs.set(key, element)
@@ -109,6 +113,21 @@ const loadCases = async () => {
   expandedCases.value = []
   selectedRepairCaseId.value = null
   casesError.value = ''
+  casesLoading.value = false
+  if (props.publicReport) {
+    const embeddedCases = props.execution?.case_executions
+    if (!Array.isArray(embeddedCases)) {
+      casesError.value = '公开报告缺少子用例结果。'
+      return
+    }
+    caseExecutions.value = embeddedCases.map(item => ({
+      ...item,
+      test_case_id: item?.test_case_id ?? item?.test_case ?? null,
+      test_case_description: item?.test_case_description ?? item?.description ?? '',
+      test_case_module: item?.test_case_module ?? item?.module_name ?? null
+    }))
+    return
+  }
   if (!projectId || !executionId) {
     casesError.value = '缺少执行记录信息，无法加载子用例结果。'
     return
@@ -135,7 +154,7 @@ const statusType = status => ({ passed: 'success', incomplete: 'warning', failed
 const statusText = status => ({ passed: '通过', incomplete: '验证未完成', failed: '失败', error: '错误', running: '执行中', pending: '待执行', skipped: '跳过', stopped: '已停止' }[status] || status || '未知')
 const copyLogs = async () => { try { await copyText(props.execution.log || '暂无技术日志'); ElMessage.success('日志已复制') } catch { ElMessage.error('日志复制失败') } }
 
-watch(() => [props.execution?.project_id, props.execution?.execution || props.execution?.id], loadCases, { immediate: true })
+watch(() => [props.execution?.project_id, props.execution?.execution || props.execution?.id, props.execution?.case_executions, props.publicReport], loadCases, { immediate: true })
 onBeforeUnmount(() => { requestVersion += 1 })
 </script>
 

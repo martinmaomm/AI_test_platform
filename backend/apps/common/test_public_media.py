@@ -1,4 +1,4 @@
-"""Public-media guard and authenticated screenshot route regressions."""
+"""Public media guard and controlled public report screenshot regressions."""
 from __future__ import annotations
 
 import os
@@ -125,7 +125,7 @@ class PublicMediaAccessTests(TestCase):
                 self.assertEqual(self.client.get(path).status_code, 404)
 
 
-class AuthenticatedScreenshotRouteTests(TestCase):
+class ReportScreenshotRouteTests(TestCase):
     def setUp(self):
         media = tempfile.TemporaryDirectory(prefix="automation-auth-screenshot-")
         self.addCleanup(media.cleanup)
@@ -160,17 +160,12 @@ class AuthenticatedScreenshotRouteTests(TestCase):
         )
         self.client = APIClient()
 
-    def test_screenshot_is_only_readable_through_authorized_api(self):
-        anonymous = self.client.get(self.url)
-        self.assertEqual(anonymous.status_code, 401)
-
-        self.client.force_authenticate(self.outsider)
-        outsider = self.client.get(self.url)
-        self.assertEqual(outsider.status_code, 404)
-
-        self.client.force_authenticate(self.owner)
-        owner = self.client.get(self.url)
-        self.assertEqual(owner.status_code, 200)
-        self.assertEqual(owner["Content-Type"], "image/png")
-        self.assertEqual(b"".join(owner.streaming_content), b"authenticated screenshot")
-        owner.close()
+    def test_report_screenshot_is_public_but_only_through_controlled_endpoint(self):
+        for user in (None, self.outsider, self.owner):
+            with self.subTest(user=user):
+                self.client.force_authenticate(user)
+                reply = self.client.get(self.url)
+                self.assertEqual(reply.status_code, 200)
+                self.assertEqual(reply["Content-Type"], "image/png")
+                self.assertEqual(b"".join(reply.streaming_content), b"authenticated screenshot")
+                reply.close()

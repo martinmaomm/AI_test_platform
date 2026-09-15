@@ -10,6 +10,7 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import tempfile
@@ -65,6 +66,7 @@ def bootstrap(root):
     from api_testing.models import APITestExecution, APITestSuiteExecutionDetail, APITestSuiteCaseExecution
 
     user = get_user_model().objects.create_user(username='reports-offline', email='reports@example.test', password='fixture-only')
+    outsider = get_user_model().objects.create_user(username='reports-outsider', email='reports-outsider@example.test', password='fixture-only')
     project = Project.objects.create(name='原生报告隔离项目', project_type='web', created_by=user)
     start = timezone.now() - timedelta(seconds=31)
     execution = WebUITestExecution.objects.create(
@@ -109,11 +111,22 @@ def bootstrap(root):
             }, 'validators': [{'comparator': 'eq', 'check': 'status_code', 'expect': 200, 'check_value': 200, 'check_result': 'pass'}]}],
         }]}, ensure_ascii=False),
     )
-    return {'token': str(AccessToken.for_user(user)), 'user_id': user.id, 'project_id': project.id, 'execution_id': execution.id, 'log_id': log.id, 'api_project_id': api_project.id, 'api_execution_id': api_execution.id}
+    return {
+        'token': str(AccessToken.for_user(user)),
+        'outsider_token': str(AccessToken.for_user(outsider)),
+        'user_id': user.id,
+        'outsider_id': outsider.id,
+        'project_id': project.id,
+        'execution_id': execution.id,
+        'log_id': log.id,
+        'api_project_id': api_project.id,
+        'api_execution_id': api_execution.id,
+    }
 
 
 def verify_browser(origin, fixture, output):
     from playwright.sync_api import sync_playwright, expect
+
     def settle_expanded_sections(page):
         # Vue's collapse hooks clear the inline height after the CSS transition.
         # Wait for that hook, not just visible text, before visual evidence.
@@ -121,28 +134,60 @@ def verify_browser(origin, fixture, output):
             '.el-collapse-item.is-active > .el-collapse-item__wrap'
         )).every(node => !node.style.height && !node.className.includes('-enter-'))""")
 
+    def report_paths():
+        return {
+            'web': f'/reports/web/{fixture["project_id"]}/{fixture["execution_id"]}',
+            'scheduled': f'/reports/detail/{fixture["log_id"]}',
+            'api': f'/reports/api/{fixture["api_project_id"]}/{fixture["api_execution_id"]}',
+        }
+
+    def expect_all_reports(page):
+        paths = report_paths()
+        page.goto(origin + paths['web'])
+        expect(page.get_by_text('报告验收套件', exact=False).first).to_be_visible(timeout=20000)
+        page.goto(origin + paths['scheduled'])
+        expect(page.get_by_text('定时报告验收', exact=False).first).to_be_visible(timeout=15000)
+        page.goto(origin + paths['api'])
+        expect(page.get_by_text('API 报告验收套件', exact=True).first).to_be_visible(timeout=15000)
+
+    def assert_public_requests(requests):
+        allowed = re.compile(
+            r'/api/v1/(?:reports/detail/\d+/|projects/\d+/(?:api-testing/executions/\d+/report/'
+            r'|web-testing/executions/\d+/(?:report/|screenshot/|cases/\d+/screenshot/)))$'
+        )
+        unexpected = [item for item in requests if not allowed.search(item['url'])]
+        assert not unexpected, f'public report loaded non-report APIs: {unexpected}'
+        assert all(not item['authorization'] for item in requests), requests
+
     errors = []
-    report_path = f'/reports/web/{fixture["project_id"]}/{fixture["execution_id"]}'
+    paths = report_paths()
     with sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=str(CHROME), headless=True)
-        context = browser.new_context(viewport={'width': 1440, 'height': 1000})
-        context.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin + '/') else route.abort())
-        context.add_init_script("localStorage.setItem('auth-store', JSON.stringify(" + json.dumps({
-            'accessToken': fixture['token'], 'refreshToken': None,
-            'user': {'id': fixture['user_id'], 'username': 'reports-offline'},
-        }) + ")); localStorage.removeItem('project-store');")
-        page = context.new_page()
+        anonymous = browser.new_context(viewport={'width': 1440, 'height': 1000})
+        anonymous.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin + '/') else route.abort())
+        page = anonymous.new_page()
         page.on('pageerror', lambda error: errors.append(str(error)))
+        report_requests = []
+        loaded_assets = []
+        page.on('request', lambda request: loaded_assets.append(request.url) if '/assets/' in request.url else None)
+        page.on('request', lambda request: report_requests.append({
+            'url': request.url,
+            'authorization': request.headers.get('authorization'),
+        }) if '/api/v1/' in request.url else None)
         try:
-            page.goto(origin + report_path)
+            page.goto(origin + paths['web'])
             expect(page.get_by_text('报告验收套件', exact=False).first).to_be_visible(timeout=20000)
             expect(page.get_by_text('菜单删除验证', exact=False).first).to_be_visible()
             expect(page.get_by_text('75%', exact=False).first).to_be_visible()
+            expect(page.get_by_text('AI 修复', exact=False)).to_have_count(0)
             expect(page.locator('iframe')).to_have_count(0)
             page.get_by_text('菜单删除验证', exact=True).click()
             expect(page.get_by_text('点击「删除」按钮超时', exact=True)).to_be_visible()
             expect(page.get_by_role('img', name='异常结束截图', exact=True)).to_be_visible()
             page.wait_for_function("document.querySelector('img[alt=\"异常结束截图\"]')?.naturalWidth > 0")
+            failed_case = page.locator('.el-collapse-item').filter(has_text='菜单删除验证').first
+            failed_case.get_by_text('查看原始 stdout / stderr / log', exact=True).click()
+            expect(failed_case.get_by_text('验证 菜单删除验证 失败', exact=False)).to_be_visible()
             page.get_by_text('只看失败', exact=True).click()
             expect(page.get_by_role('switch')).to_be_checked()
             expect(page.get_by_text('用户新增验证', exact=True)).to_have_count(0)
@@ -154,12 +199,12 @@ def verify_browser(origin, fixture, output):
             # Missing/denied record must present an error, never stale report data.
             page.goto(origin + '/reports/web/999999/999999')
             expect(page.get_by_text('报告验收套件', exact=False)).to_have_count(0)
-            page.goto(origin + f'/reports/detail/{fixture["log_id"]}')
+            page.goto(origin + paths['scheduled'])
             expect(page.get_by_text('定时报告验收', exact=False).first).to_be_visible(timeout=15000)
-            expect(page.locator(f'a[href$="{report_path}"]')).to_have_count(1)
+            expect(page.locator(f'a[href$="{paths["web"]}"]')).to_have_count(1)
             expect(page.locator('iframe')).to_have_count(0)
             page.screenshot(path=str(output / 'scheduled-report.png'), full_page=True, animations='disabled')
-            page.goto(origin + f'/reports/api/{fixture["api_project_id"]}/{fixture["api_execution_id"]}')
+            page.goto(origin + paths['api'])
             expect(page.get_by_text('API 报告验收套件', exact=True).first).to_be_visible(timeout=15000)
             page.get_by_text('健康检查接口', exact=True).first.click()
             expect(page.get_by_text('验证 状态码 通过', exact=False).first).to_be_visible()
@@ -168,30 +213,75 @@ def verify_browser(origin, fixture, output):
             expect(page.locator('iframe')).to_have_count(0)
             settle_expanded_sections(page)
             page.screenshot(path=str(output / 'api-report.png'), full_page=True, animations='disabled')
+            assert report_requests, 'no public report API requests were observed'
+            assert_public_requests(report_requests)
+            assert not any('WebUIScriptAssistantPanel-' in url for url in loaded_assets), loaded_assets
+            media = anonymous.request.get(
+                origin + f'/media/webui_failure_screenshots/execution_{fixture["execution_id"]}/case_3.png'
+            )
+            assert media.status == 404, media.status
+            for endpoint in (
+                f'/api/v1/projects/{fixture["project_id"]}/web-testing/executions/{fixture["execution_id"]}/report/',
+                f'/api/v1/projects/{fixture["project_id"]}/web-testing/executions/{fixture["execution_id"]}/cases/3/screenshot/',
+                f'/api/v1/projects/{fixture["project_id"]}/web-testing/executions/',
+            ):
+                response = anonymous.request.post(origin + endpoint)
+                expected = {401} if endpoint.endswith('/executions/') else {405}
+                assert response.status in expected, (endpoint, response.status)
+            page.goto(origin + '/api-testing/test-executions')
+            expect(page).to_have_url(__import__('re').compile(r'/login\?redirect='))
             if errors:
                 raise AssertionError(f'Browser JS errors: {errors}')
         except Exception:
             page.screenshot(path=str(output / 'failure.png'), full_page=True)
             raise
         finally:
-            context.close()
-        anonymous = browser.new_context()
-        anonymous.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin + '/') else route.abort())
-        page = anonymous.new_page()
-        page.goto(origin + report_path)
-        expect(page).to_have_url(__import__('re').compile(r'/login\?redirect='))
-        page.get_by_placeholder('用户名', exact=True).fill('reports-offline')
-        page.get_by_placeholder('密码', exact=True).fill('fixture-only')
-        page.get_by_role('button', name='登录', exact=True).click()
-        expect(page).to_have_url(origin + report_path, timeout=15000)
-        expect(page.get_by_text('报告验收套件', exact=True).first).to_be_visible()
-        anonymous.close()
+            anonymous.close()
+
+        outsider = browser.new_context()
+        outsider.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin + '/') else route.abort())
+        outsider.add_init_script("localStorage.setItem('auth-store', JSON.stringify(" + json.dumps({
+            'accessToken': fixture['outsider_token'], 'refreshToken': None,
+            'user': {'id': fixture['outsider_id'], 'username': 'reports-outsider'},
+        }) + "));")
+        outsider_page = outsider.new_page()
+        outsider_requests = []
+        outsider_page.on('request', lambda request: outsider_requests.append({
+            'url': request.url, 'authorization': request.headers.get('authorization'),
+        }) if '/api/v1/' in request.url else None)
+        expect_all_reports(outsider_page)
+        assert_public_requests(outsider_requests)
+        outsider.close()
+
+        expired_state = {
+            'accessToken': 'eyJhbGciOiJub25lIn0.eyJleHAiOjF9.fixture',
+            'refreshToken': 'expired-refresh-fixture',
+            'user': {'id': 999999, 'username': 'expired-viewer'},
+        }
+        expired = browser.new_context()
+        expired.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin + '/') else route.abort())
+        expired.add_init_script("localStorage.setItem('auth-store', JSON.stringify(" + json.dumps(expired_state) + "));")
+        expired_page = expired.new_page()
+        expired_requests = []
+        expired_page.on('request', lambda request: expired_requests.append({
+            'url': request.url, 'authorization': request.headers.get('authorization'),
+        }) if '/api/v1/' in request.url else None)
+        expect_all_reports(expired_page)
+        expect(expired_page.locator('.el-message-box')).to_have_count(0)
+        assert expired_page.evaluate("localStorage.getItem('auth-store')") == json.dumps(expired_state, separators=(',', ':'))
+        assert_public_requests(expired_requests)
+        expired_page.goto(origin + '/web-testing/test-executions')
+        expect(expired_page).to_have_url(__import__('re').compile(r'/login\?redirect='))
+        expired.close()
         browser.close()
 
 
 def main():
     output = BACKEND / 'logs' / 'native-report-browser-check'
     output.mkdir(parents=True, exist_ok=True)
+    stale_failure = output / 'failure.png'
+    if stale_failure.exists():
+        stale_failure.unlink()
     with tempfile.TemporaryDirectory(prefix='automation-native-report-browser-') as temp, patch.object(
         socket.socket, 'connect', loopback_only(socket.socket.connect),
     ), patch.object(socket.socket, 'connect_ex', loopback_only(socket.socket.connect_ex)):
@@ -206,7 +296,7 @@ def main():
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
-    print('PASS: isolated native WebUI / API / scheduled reports, historical snapshots, refresh and auth redirect')
+    print('PASS: public native reports, embedded suite evidence, stale-token safety and protected management routes')
 
 
 if __name__ == '__main__':

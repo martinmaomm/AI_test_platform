@@ -243,7 +243,7 @@ class ExecutionScreenshotDownloadAccessTests(ScreenshotMediaTestCase):
         force_authenticate(request, user=user)
         return TestExecutionScreenshotView.as_view()(request, project_id=self.project.id, pk=self.execution.id)
 
-    def test_existing_screenshot_endpoint_returns_png_only_to_report_authorized_user(self):
+    def test_report_screenshot_is_readable_without_project_membership(self):
         owner_response = self.request(self.owner)
         self.assertEqual(owner_response.status_code, 200)
         self.assertEqual(owner_response['Content-Type'], 'image/png')
@@ -251,4 +251,6 @@ class ExecutionScreenshotDownloadAccessTests(ScreenshotMediaTestCase):
         owner_response.close()
 
         denied_response = self.request(self.viewer)
-        self.assertEqual(denied_response.status_code, 403)
+        self.assertEqual(denied_response.status_code, 200)
+        self.assertEqual(b''.join(denied_response.streaming_content), b'PNG artifact')
+        denied_response.close()

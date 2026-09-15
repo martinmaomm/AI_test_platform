@@ -95,7 +95,7 @@ class APITestExecutionVisibilityTests(TestCase):
         self.assertNotIn(visible.id, denied_ids)
         self.assertNotIn(denied_execution.id, denied_ids)
 
-    def test_non_member_executor_cannot_list_or_read_execution_details(self):
+    def test_non_member_cannot_manage_execution_but_can_read_public_report(self):
         execution = self.execution(executor=self.outsider, source='workspace_debug')
         APITestCaseExecutionDetail.objects.create(
             execution=execution, test_case=None, name=execution.name, status='running', httprunner_result='{}',
@@ -116,8 +116,8 @@ class APITestExecutionVisibilityTests(TestCase):
         report = self.client.get(
             f'/api/v1/projects/{self.project.pk}/api-testing/executions/{execution.pk}/report/',
         )
-        self.assertEqual(report.status_code, 404, report.data)
-        self.assertFalse(report.data['success'])
+        self.assertEqual(report.status_code, 200, report.data)
+        self.assertEqual(report.data['data']['id'], execution.id)
 
     def test_source_filter_preserves_execution_type_and_status_filters(self):
         matching = self.execution(source='workspace_debug', exec_type='case', status='running')

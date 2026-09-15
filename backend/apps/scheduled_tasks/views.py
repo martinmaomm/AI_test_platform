@@ -267,20 +267,13 @@ class TaskExecutionLogDetailView(generics.RetrieveDestroyAPIView):
 
 
 class ReportExecutionLogPublicView(generics.RetrieveAPIView):
-    """登录后的平台报告详情；保留类名以兼容既有全局 URL。"""
-    permission_classes = [permissions.IsAuthenticated]
+    """公开只读的计划执行报告；不开放计划配置和执行操作。"""
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
     serializer_class = TaskExecutionLogSerializer
 
     def get_queryset(self):
-        user = self.request.user
-        queryset = TaskExecutionLog.objects.select_related('task', 'task__project')
-        if user.is_superuser:
-            return queryset
-        return queryset.filter(
-            Q(task__project__owner=user)
-            | Q(task__project__created_by=user)
-            | Q(task__project__members__user=user, task__project__members__can_view_reports=True)
-        ).distinct()
+        return TaskExecutionLog.objects.select_related('task', 'task__project')
 
 
 class TaskExecutionLogsByTaskView(generics.ListAPIView):

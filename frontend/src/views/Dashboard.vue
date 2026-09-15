@@ -128,9 +128,6 @@
           /></el-table>
           <div v-else class="state">近 7 天无失败记录</div>
         </div>
-        <div v-else-if="item.i === 'section-infra'" class="section-infra">
-          系统基础设施
-        </div>
         <div
           v-else
           class="dashboard-item portal"
@@ -219,7 +216,6 @@ const dashboardItems = [
   { i: "portal-web" },
   { i: "portal-perf" },
   { i: "portal-app" },
-  { i: "section-infra" },
   { i: "portal-ai-config" },
   { i: "portal-settings" },
 ];
@@ -521,8 +517,7 @@ onMounted(async () => {
 .dashboard-alert {
   margin-bottom: 16px;
 }
-.dashboard-item,
-.section-infra {
+.dashboard-item {
   min-width: 0;
   background: var(--cockpit-card-bg);
   backdrop-filter: blur(var(--cockpit-blur));
@@ -545,7 +540,7 @@ onMounted(async () => {
   display: grid;
   gap: 16px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-template-areas: "pass exec ai cases" "chart chart chart failures" "chart chart chart failures" "api web perf app" "infra infra infra infra" "config config settings settings";
+  grid-template-areas: "pass exec ai cases" "chart chart chart failures" "chart chart chart failures" "api web perf app" "config config settings settings";
 }
 .metric-pass-rate {
   grid-area: pass;
@@ -577,10 +572,6 @@ onMounted(async () => {
 }
 .portal-app {
   grid-area: app;
-}
-.section-infra {
-  grid-area: infra;
-  padding: 12px;
 }
 .portal-ai-config {
   grid-area: config;
@@ -650,7 +641,7 @@ onMounted(async () => {
 @media (max-width: 800px) {
   .dashboard-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-template-areas: "pass exec" "ai cases" "chart chart" "failures failures" "api web" "perf app" "infra infra" "config settings";
+    grid-template-areas: "pass exec" "ai cases" "chart chart" "failures failures" "api web" "perf app" "config settings";
   }
 }
 @media (max-width: 520px) {
@@ -664,7 +655,7 @@ onMounted(async () => {
   }
   .dashboard-grid {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "pass" "exec" "ai" "cases" "chart" "failures" "api" "web" "perf" "app" "infra" "config" "settings";
+    grid-template-areas: "pass" "exec" "ai" "cases" "chart" "failures" "api" "web" "perf" "app" "config" "settings";
   }
 }
 </style>

@@ -42,6 +42,12 @@ test("dashboard portals remain available when no project is selected", () => {
   assert.match(source, /v-if="!selectedProjectId" class="state"/);
 });
 
+test("dashboard removes the infrastructure heading and its grid row while retaining configuration portals", () => {
+  assert.doesNotMatch(source, /系统基础设施|section-infra|\binfra\b/);
+  assert.match(source, /\{ i: "portal-ai-config" \}/);
+  assert.match(source, /\{ i: "portal-settings" \}/);
+});
+
 test("dashboard does not let project preference initialization block project loading forever", () => {
   assert.match(
     source,

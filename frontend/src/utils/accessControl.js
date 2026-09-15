@@ -21,7 +21,6 @@ export const canAccessRoute = (user, route) =>
 export const visibleDashboardItems = (items, user) => {
   if (isPlatformAdmin(user)) return items;
   const restricted = new Set([
-    "section-infra",
     "portal-ai-config",
     "portal-settings",
   ]);

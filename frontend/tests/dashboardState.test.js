@@ -34,7 +34,6 @@ test("dashboard fixed item order removes global settings for ordinary users", ()
   const items = [
     "metric-pass-rate",
     "chart",
-    "section-infra",
     "portal-settings",
   ].map((i) => ({ i }));
   assert.deepEqual(

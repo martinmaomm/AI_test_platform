@@ -26,7 +26,6 @@ test("ordinary users cannot enter global configuration routes or manage project 
 test("dashboard filtering removes restricted fixed items for ordinary users", () => {
   const items = [
     { i: "portal-api" },
-    { i: "section-infra" },
     { i: "portal-ai-config" },
     { i: "portal-settings" },
   ];
@@ -34,7 +33,7 @@ test("dashboard filtering removes restricted fixed items for ordinary users", ()
     visibleDashboardItems(items, user).map((item) => item.i),
     ["portal-api"],
   );
-  assert.equal(visibleDashboardItems(items, admin).length, 4);
+  assert.equal(visibleDashboardItems(items, admin).length, 3);
 });
 
 test("only superusers can modify administrators and no one modifies self or superusers", () => {

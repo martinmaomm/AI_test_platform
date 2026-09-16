@@ -31,7 +31,10 @@
               </div>
               <div class="card-footer">
                 <span class="project-meta">{{ formatDate(project.created_at) }}</span>
-                <el-button type="primary" size="small" @click="enterProject(project)">进入工作区</el-button>
+                <div class="card-actions">
+                  <el-button v-if="canManageProjects" type="warning" size="small" @click="openEditDialog(project)">编辑</el-button>
+                  <el-button type="primary" size="small" @click="enterProject(project)">进入工作区</el-button>
+                </div>
               </div>
             </el-card>
           </el-col>
@@ -52,6 +55,14 @@
           <el-button type="primary" :loading="creating" @click="submitCreate">确定</el-button>
         </template>
       </el-dialog>
+
+      <ProjectEditDialog
+        v-model="showEditDialog"
+        :project="editingProject"
+        project-type-label="性能"
+        :saving="updating"
+        @save="submitEdit"
+      />
     </div>
   </div>
 </template>
@@ -62,7 +73,8 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Plus, DataLine } from '@element-plus/icons-vue'
 import BackButton from '@/components/BackButton.vue'
-import { getProjects, createProject } from '@/api/projects'
+import ProjectEditDialog from '@/components/project/ProjectEditDialog.vue'
+import { getProjects, createProject, updateProject } from '@/api/projects'
 import { useProjectStore } from '@/stores/project'
 import { useAuthStore } from '@/stores/auth'
 import { canManageProjectMetadata } from '@/utils/accessControl'
@@ -78,6 +90,9 @@ const creating = ref(false)
 const projectList = ref([])
 const showCreateDialog = ref(false)
 const createFormRef = ref(null)
+const showEditDialog = ref(false)
+const editingProject = ref(null)
+const updating = ref(false)
 
 const createForm = reactive({ name: '', description: '' })
 
@@ -117,6 +132,48 @@ const enterProject = async (project) => {
     router.push('/perf-testing/workspace')
   } catch {
     ElMessage.error('设置项目失败，请重试')
+  }
+}
+
+const openEditDialog = (project) => {
+  if (!canManageProjects.value || updating.value) return
+  editingProject.value = { ...project }
+  showEditDialog.value = true
+}
+
+const submitEdit = async (data) => {
+  if (!editingProject.value || !canManageProjects.value || updating.value) return
+  updating.value = true
+  try {
+    const response = await updateProject(editingProject.value.id, data)
+    const responseData = response?.data && typeof response.data === 'object'
+      ? response.data
+      : (response || {})
+    const updatedProject = { ...editingProject.value, ...data, ...responseData }
+    const projectIndex = projectList.value.findIndex(item => item.id === updatedProject.id)
+    if (projectIndex >= 0) projectList.value[projectIndex] = updatedProject
+
+    if (projectStore.currentProject?.id === updatedProject.id) {
+      try {
+        await projectStore.setCurrentProject(updatedProject)
+      } catch {
+        // 项目已保存成功，偏好同步失败时仍保留本地新名称。
+        projectStore.currentProject = updatedProject
+      }
+    }
+
+    showEditDialog.value = false
+    ElMessage.success('项目更新成功')
+    await loadProjects()
+  } catch (error) {
+    const detail = error.response?.data
+    ElMessage.error(
+      detail?.message || detail?.error?.message ||
+      (typeof detail?.detail === 'string' ? detail.detail : null) ||
+      '项目更新失败'
+    )
+  } finally {
+    updating.value = false
   }
 }
 
@@ -278,6 +335,19 @@ onMounted(() => loadProjects())
   justify-content: space-between;
   padding-top: 16px;
   border-top: 1px solid var(--app-border-light);
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.card-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.card-actions .el-button + .el-button {
+  margin-left: 0;
 }
 
 .project-meta {

@@ -93,6 +93,15 @@ class ConfigurationCleanupTests(unittest.TestCase):
         self.assertNotIn("模板没有列出当前数据库连接所需的五个 `DB_*` 键", installation)
         self.assertNotIn("env.example` 中的 `FILE_UPLOAD_MAX_MEMORY_SIZE`", installation)
 
+    def test_asgi_preserves_transport_peer_for_login_record_trust_boundary(self):
+        tree = ast.parse((BACKEND_DIR / 'run_asgi.py').read_text(encoding='utf-8'))
+        launch = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and isinstance(node.func.value, ast.Name)
+                      and node.func.value.id == 'uvicorn' and node.func.attr == 'run')
+        proxy_headers = next(option.value for option in launch.keywords if option.arg == 'proxy_headers')
+        self.assertIs(ast.literal_eval(proxy_headers), False)
+
 
 if __name__ == "__main__":
     unittest.main()

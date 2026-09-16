@@ -9,10 +9,10 @@ from django.conf.urls.static import static
 from common.media import public_media_serve
 from scheduled_tasks import views as views_scheduled_tasks
 from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
     TokenRefreshView,
     TokenVerifyView,
 )
+from users.views import LoginRecordingTokenObtainPairView
 
 # 创建路由器
 router = DefaultRouter()
@@ -22,7 +22,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/users/', include('users.urls')),
     # JWT认证路由
-    path('api/v1/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('api/v1/auth/token/', LoginRecordingTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/v1/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('api/v1/auth/token/verify/', TokenVerifyView.as_view(), name='token_verify'),
     

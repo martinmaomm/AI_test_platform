@@ -3,14 +3,18 @@ from rest_framework.decorators import api_view, permission_classes
 from common.api import response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.views import TokenObtainPairView
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.middleware.csrf import get_token
+from rest_framework.exceptions import ValidationError
+from rest_framework.views import APIView
 
-from .models import User, UserProfile
+from .login_history import record_successful_login
+from .models import LoginRecord, User, UserProfile
 from .permissions import IsPlatformAdmin
 from .serializers import (
-    UserSerializer, UserProfileSerializer, 
+    LoginRecordingTokenObtainPairSerializer, LoginRecordSerializer, UserSerializer, UserProfileSerializer,
     UserLoginSerializer, UserRegistrationSerializer
 )
 
@@ -55,6 +59,7 @@ class UserLoginView(generics.GenericAPIView):
                 "refresh": str(refresh),
                 "user": UserSerializer(user).data
             }
+            record_successful_login(user=user, request=request)
             return response(
                 kind="success",
                 data=data,
@@ -66,6 +71,36 @@ class UserLoginView(generics.GenericAPIView):
             errors=serializer.errors,
             message="登录失败"
         )
+
+
+class LoginRecordingTokenObtainPairView(TokenObtainPairView):
+    serializer_class = LoginRecordingTokenObtainPairSerializer
+
+
+class LoginRecordListView(APIView):
+    """List only the authenticated user's own successful logins."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            page = int(request.query_params.get('page', 1))
+            page_size = int(request.query_params.get('page_size', 20))
+        except (TypeError, ValueError):
+            raise ValidationError('分页参数必须是数字。')
+        if page < 1 or not 1 <= page_size <= 100:
+            raise ValidationError('页码必须大于等于 1，且每页数量必须在 1 到 100 之间。')
+
+        records = LoginRecord.objects.filter(user=request.user).order_by('-logged_in_at', '-id')
+        result = response(
+            kind='paginated_queryset',
+            data=records,
+            page=page,
+            page_size=page_size,
+            serializer_class=LoginRecordSerializer,
+            message='获取登录记录成功',
+        )
+        result['Cache-Control'] = 'no-store'
+        return result
 
 
 class UserLogoutView(generics.GenericAPIView):

@@ -47,6 +47,16 @@ const routes = [
     ]
   },
 
+  // 个人登录记录
+  {
+    path: '/login-records',
+    component: () => import('@/layouts/PortalLayout.vue'),
+    meta: { requiresAuth: true, layout: 'portal' },
+    children: [
+      { path: '', name: 'LoginRecords', component: () => import('@/views/LoginRecords.vue'), meta: { title: '登录记录' } }
+    ]
+  },
+
   // AI配置管理
   {
     path: '/ai-config',

@@ -92,6 +92,7 @@
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="profile">个人资料</el-dropdown-item>
+                <el-dropdown-item command="login-records">登录记录</el-dropdown-item>
                 <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -445,6 +446,9 @@ const handleCommand = async (command) => {
   switch (command) {
     case 'profile':
       router.push('/profile')
+      break
+    case 'login-records':
+      router.push('/login-records')
       break
     case 'logout':
       try {

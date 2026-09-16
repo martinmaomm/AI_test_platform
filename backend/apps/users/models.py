@@ -27,6 +27,23 @@ class User(AbstractUser):
         return self.username
 
 
+class LoginRecord(models.Model):
+    """A minimal audit record created after a successful token login."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='login_records')
+    logged_in_at = models.DateTimeField(_('logged in at'), auto_now_add=True)
+    ip_address = models.GenericIPAddressField(_('IP address'), null=True, blank=True)
+    user_agent = models.CharField(_('user agent'), max_length=512, blank=True, default='')
+
+    class Meta:
+        verbose_name = _('login record')
+        verbose_name_plural = _('login records')
+        db_table = 'user_login_records'
+        ordering = ['-logged_in_at', '-id']
+        indexes = [
+            models.Index(fields=['user', '-logged_in_at', '-id'], name='login_user_time_id_idx'),
+        ]
+
+
 class UserProfile(models.Model):
     """用户详细资料"""
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')

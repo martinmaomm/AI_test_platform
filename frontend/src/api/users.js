@@ -56,6 +56,9 @@ export const usersApi = {
   // 获取当前用户信息
   getCurrentUser: () => api.get('/users/current-user/'),
 
+  // 获取当前用户的成功登录记录
+  getLoginRecords: (params = {}) => api.get('/users/login-records/', { params }),
+
   listManagedUsers: (params = {}) => api.get('/users/manage/', { params }),
   createManagedUser: (data) => api.post('/users/manage/', data),
   getManagedUser: (id) => api.get(`/users/manage/${id}/`),

@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
+import { forwardClientAddress } from './dev/clientAddress.js'
 
 export default defineConfig({
   plugins: [vue()],
@@ -25,6 +26,10 @@ export default defineConfig({
       '/api/v1': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
+        configure(proxy) {
+          // start 在创建上游请求前触发；带 Expect 的请求也不能跳过 IP 头覆盖。
+          proxy.on('start', forwardClientAddress)
+        },
       },
       // WebSocket代理配置
       '/ws': {

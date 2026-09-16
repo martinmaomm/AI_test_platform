@@ -42,5 +42,7 @@ if __name__ == "__main__":
         "run_asgi:application",
         host="0.0.0.0",
         port=8000,
+        # 保留真实 TCP 对端，登录记录只在 Django 配置的可信代理范围内解析转发 IP。
+        proxy_headers=False,
         log_level="info"
     )

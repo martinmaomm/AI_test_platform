@@ -8,6 +8,7 @@ urlpatterns = [
     # 认证相关
     path('register/', views.UserRegistrationView.as_view(), name='register'),
     path('login/', views.UserLoginView.as_view(), name='login'),
+    path('login-records/', views.LoginRecordListView.as_view(), name='login_records'),
     path('logout/', views.UserLogoutView.as_view(), name='logout'),
     path('current-user/', views.current_user, name='current_user'),
     path('change-password/', views.change_password, name='change_password'),

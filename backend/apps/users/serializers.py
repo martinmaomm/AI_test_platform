@@ -1,6 +1,9 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
-from .models import User, UserProfile
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+from .login_history import record_successful_login
+from .models import LoginRecord, User, UserProfile
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
@@ -130,6 +133,26 @@ class UserLoginSerializer(serializers.Serializer):
             raise serializers.ValidationError('必须提供用户名和密码')
         
         return attrs
+
+
+class LoginRecordingTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """Preserve SimpleJWT's contract while recording successful token login."""
+
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        request = self.context.get('request')
+        if request is not None:
+            record_successful_login(user=self.user, request=request)
+        return data
+
+
+class LoginRecordSerializer(serializers.ModelSerializer):
+    """Read-only personal login history representation."""
+
+    class Meta:
+        model = LoginRecord
+        fields = ['id', 'logged_in_at', 'ip_address', 'user_agent']
+        read_only_fields = fields
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):

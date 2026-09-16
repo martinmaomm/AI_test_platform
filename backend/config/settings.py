@@ -25,6 +25,13 @@ DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
 
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,::1').split(',')
 
+# Only these direct TCP peers may supply the client chain used for login audit IPs.
+LOGIN_RECORD_TRUSTED_PROXIES = tuple(
+    value.strip()
+    for value in os.getenv('LOGIN_RECORD_TRUSTED_PROXIES', '127.0.0.1/32,::1/128').split(',')
+    if value.strip()
+)
+
 # Application definition
 INSTALLED_APPS = [
     'django.contrib.admin',

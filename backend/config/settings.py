@@ -53,6 +53,7 @@ INSTALLED_APPS = [
     'scheduled_tasks',
     'notifications',
     'project_knowledge',
+    'performance_testing',
 ]
 
 # 独立知识应用；关闭后禁止提交新任务，不影响原 API RAG 或 WebUI 脚本。

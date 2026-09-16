@@ -411,3 +411,19 @@ npm run build
 
 - `env.example` 为 `LLM_TIMEOUT_SECONDS` 写了 300 秒，而未设置该键时模型管理器代码默认 600 秒；显式 `.env` 值优先。
 - 仓库当前没有可直接投入生产的反向代理、TLS、静态站点或进程守护配置；部署这些基础设施前应先完成安全评审。
+
+## 13. 性能测试第一批：计划管理与节点接入
+
+本批新增 `performance_testing`，迁移只新增性能目标、计划和节点表。升级时在后端虚拟环境执行：
+
+```bash
+python manage.py migrate performance_testing
+```
+
+迁移后按第 7 节重启后端和 Celery。首页进入性能项目后，可以管理计划；平台管理员管理压测目标和节点，普通用户按项目权限访问。当前没有“开始压测”，节点在线也仅表示心跳成功，不表示 Worker 就绪。
+
+节点程序在独立的 `performance-node/` 目录，依照其 [部署说明](../performance-node/README.md) 安装，不需要后端整套依赖、Redis 或数据库。Agent 必须连接可信 HTTPS 入口；内网私有 CA 可显式配置，不能将 `http://...:8000` 当作节点生产接入地址，也不要为了接入而关闭证书校验。不要将长期身份文件、一次性注册凭证提交到仓库。
+
+注册凭证只显示一次；丢失、过期或登记后本地身份未保存时，由管理员重置凭证并重新登记。重置/吊销立即作废原身份，客户端不会自动绕过重新注册。
+
+Locust Master/Worker 和 stunnel 的本机验证原型位于 `backend/scripts/verify_performance_transport.py`，需要单独安装 stunnel，并显式传 `--confirm-local-load` 才执行。它固定访问本机临时服务，1 个虚拟用户、5 秒；不属于已接入平台的执行功能，也不能代替公网/Linux 部署验收。普通平台启动不需要运行该原型或启动 stunnel。

@@ -27,13 +27,19 @@ test("dashboard uses a fixed CSS grid and keeps performance before security test
   );
 });
 
-test("unavailable dashboard portals remain grey and non-clickable", () => {
+test("only the unavailable security portal remains grey and non-clickable", () => {
   assert.match(
     source,
-    /const portalDisabled = \(i\) => \[["']portal-security["'], ["']portal-perf["']\]\.includes\(i\)/,
+    /const portalDisabled = \(i\) => \[["']portal-security["']\]\.includes\(i\)/,
   );
   assert.match(source, /!portalDisabled\(item\.i\) && openPortal\(item\.i\)/);
   assert.match(source, /\.portal\.disabled/);
+});
+
+test("performance portal enters its construction workspace without claiming execution", () => {
+  assert.match(source, /["']portal-perf["']:\s*["']性能测试（建设中）["']/);
+  assert.match(source, /["']portal-perf["']:\s*["']管理受控压测目标、计划与接入节点；当前不提供发压执行能力。["']/);
+  assert.match(source, /["']portal-perf["']:\s*["']\/perf-testing\/projects["']/);
 });
 
 test("security placeholder has matching copy, icon and responsive grid areas", () => {

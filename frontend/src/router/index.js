@@ -157,13 +157,13 @@ const routes = [
   {
     path: '/perf-testing',
     component: () => import('@/layouts/MainLayout.vue'),
-    meta: { requiresAuth: true, layout: 'workspace', module: 'perf', title: '性能专项测试' },
+    meta: { requiresAuth: true, layout: 'workspace', module: 'perf', title: '性能测试（建设中）' },
     children: [
-      { path: '', redirect: '/perf-testing/workspace' },
-      { path: 'workspace', name: 'PerfWorkspace', component: () => import('@/views/perf-testing/PerfWorkspacePlaceholder.vue'), meta: { title: '性能测试工作区' } },
-      { path: 'scheduled-tasks', name: 'PerfScheduledTasks', component: () => import('@/views/scheduledTasks/ScheduledTasksPage.vue'), meta: { title: '定时任务' } },
-      { path: 'environments', name: 'PerfEnvironments', component: () => import('@/views/project/ProjectEnvironments.vue'), meta: { title: '环境管理' } },
-      { path: 'notification-receivers', name: 'PerfNotificationReceivers', component: () => import('@/views/project/NotificationReceivers.vue'), meta: { title: '通知接收管理' } }
+      { path: '', redirect: '/perf-testing/plans' },
+      { path: 'workspace', redirect: '/perf-testing/plans' },
+      { path: 'plans', name: 'PerfPlans', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '压测计划' } },
+      { path: 'nodes', name: 'PerfNodes', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '节点管理' } },
+      { path: 'targets', name: 'PerfTargets', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '压测目标' } }
     ]
   }
 ]

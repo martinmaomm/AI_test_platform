@@ -4,6 +4,12 @@
 
 # 1. 核心隐私与数据 (本地必须保留，严禁上传 GitHub)
 backend/.env
+performance-node/.env
+performance-node/.state/
+performance-node/.venv/
+performance-node/build/
+performance-node/dist/
+performance-node/src/*.egg-info/
 backend/db.sqlite3
 backend/chroma_db/
 backend/project_knowledge_chroma_db/

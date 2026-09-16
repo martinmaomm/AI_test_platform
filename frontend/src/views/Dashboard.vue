@@ -445,13 +445,13 @@ const metricValue = (i) => {
         ? `${s.ai_contribution_rate}%`
         : s.total_cases;
 };
-const portalDisabled = (i) => ["portal-security", "portal-perf"].includes(i);
+const portalDisabled = (i) => ["portal-security"].includes(i);
 const portalTitle = (i) =>
   ({
     "portal-api": "API 自动化",
     "portal-web": "Web 自动化",
     "portal-security": "安全测试（开发中）",
-    "portal-perf": "性能测试（开发中）",
+    "portal-perf": "性能测试（建设中）",
     "portal-ai-config": "AI 实验室配置",
     "portal-settings": "全局系统设置",
   })[i];
@@ -462,7 +462,7 @@ const portalDescription = (i) =>
     "portal-web":
       "基于 Playwright MCP 自动生成自动化代码，支持自动修复和运行。",
     "portal-security": "检测应用安全风险与常见漏洞，提供修复建议。",
-    "portal-perf": "负载压测、性能分析与专项测试。",
+    "portal-perf": "管理受控压测目标、计划与接入节点；当前不提供发压执行能力。",
     "portal-ai-config": "LLM 厂商对接、RAG 向量库配置、MCP 协议管理。",
     "portal-settings": "邮件通知配置、环境变量、用户权限。",
   })[i];
@@ -470,6 +470,7 @@ function openPortal(i) {
   const path = {
     "portal-api": "/api-testing/projects",
     "portal-web": "/web-testing/projects",
+    "portal-perf": "/perf-testing/projects",
     "portal-ai-config": "/ai-config",
     "portal-settings": "/settings",
   }[i];

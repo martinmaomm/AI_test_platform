@@ -1,0 +1,101 @@
+"""Phase-one node protocol. It intentionally has no Worker or load execution code."""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+import psutil
+
+from . import ENGINE_VERSION, PROTOCOL_VERSION, __version__
+from .config import NodeConfig
+from .errors import AgentStopped, ProtocolError
+from .state import NodeIdentity, StateStore
+from .transport import AgentTransport
+
+
+@dataclass(frozen=True)
+class HeartbeatResult:
+    interval_seconds: int
+    lease_seconds: int
+
+
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProtocolError(f"服务端 {name} 不符合协议")
+    return value
+
+
+def _node_id(value: object, name: str = "node_id") -> str:
+    if not isinstance(value, str):
+        raise ProtocolError(f"服务端 {name} 不符合协议")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise ProtocolError(f"服务端 {name} 不符合协议") from exc
+
+
+class PerformanceNodeClient:
+    def __init__(self, config: NodeConfig, transport: AgentTransport | None = None):
+        self.config = config
+        self.store = StateStore(config.state_dir)
+        self.transport = transport or AgentTransport(config.ca_bundle)
+
+    def enroll(self, enrollment_token: str) -> NodeIdentity:
+        if self.store.exists():
+            raise AgentStopped("已有节点身份；不会自动重新注册")
+        data = self.transport.post(
+            self.config.endpoint("enroll"),
+            {"enrollment_token": enrollment_token, "protocol_version": PROTOCOL_VERSION,
+             "agent_version": __version__, "engine_version": ENGINE_VERSION},
+        )
+        self._validate_common(data)
+        node_id = _node_id(data.get("node_id"))
+        token = data.get("agent_token")
+        try:
+            identity = NodeIdentity(node_id=node_id, agent_token=token)
+        except Exception as exc:
+            raise ProtocolError("服务端 agent_token 不符合协议") from exc
+        self.store.save(identity)
+        return identity
+
+    def heartbeat(self, identity: NodeIdentity | None = None) -> HeartbeatResult:
+        identity = identity or self.store.load()
+        data = self.transport.post(
+            self.config.endpoint("heartbeat"),
+            {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
+             "engine_version": ENGINE_VERSION, "resources": self.resources()},
+            token=identity.agent_token,
+        )
+        self._validate_common(data)
+        if _node_id(data.get("node_id")) != identity.node_id:
+            raise AgentStopped("服务端节点身份不匹配")
+        if not isinstance(data.get("server_time"), str) or not data["server_time"]:
+            raise ProtocolError("服务端 server_time 不符合协议")
+        command = data.get("command")
+        if not isinstance(command, dict) or set(command) != {"type"} or command["type"] != "idle":
+            raise AgentStopped("收到未知或不可执行命令，已停止")
+        if data.get("execution_enabled") is not False:
+            raise AgentStopped("服务端请求的执行能力未在本批客户端启用")
+        return HeartbeatResult(
+            interval_seconds=_positive_int(data.get("heartbeat_interval_seconds"), "heartbeat_interval_seconds"),
+            lease_seconds=_positive_int(data.get("lease_seconds"), "lease_seconds"),
+        )
+
+    @staticmethod
+    def resources() -> dict[str, float]:
+        return {
+            "cpu_percent": float(psutil.cpu_percent(interval=None)),
+            "memory_percent": float(psutil.virtual_memory().percent),
+        }
+
+    @staticmethod
+    def _validate_common(data: dict[str, Any]) -> None:
+        protocol_version = data.get("protocol_version")
+        if isinstance(protocol_version, bool) or not isinstance(protocol_version, int) or protocol_version != PROTOCOL_VERSION:
+            raise AgentStopped("服务端协议版本不匹配")
+        if data.get("execution_enabled") is not False:
+            raise AgentStopped("服务端执行能力状态不符合本批协议")
+        _positive_int(data.get("heartbeat_interval_seconds"), "heartbeat_interval_seconds")
+        _positive_int(data.get("lease_seconds"), "lease_seconds")

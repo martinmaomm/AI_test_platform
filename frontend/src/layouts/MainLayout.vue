@@ -260,12 +260,11 @@ const MENU_CONFIG = {
     ]
   },
   perf: {
-    title: '性能专项测试',
+    title: '性能测试（建设中）',
     items: [
-      { path: '/perf-testing/workspace', label: '性能测试工作区' },
-      { path: '/perf-testing/scheduled-tasks', label: '定时任务' },
-      { path: '/perf-testing/environments', label: '环境管理' },
-      { path: '/perf-testing/notification-receivers', label: '通知接收管理' }
+      { path: '/perf-testing/plans', label: '压测计划' },
+      { path: '/perf-testing/nodes', label: '节点管理' },
+      { path: '/perf-testing/targets', label: '压测目标' }
     ]
   }
 }
@@ -433,7 +432,7 @@ const activeMenuIndex = computed(() => {
   // 模块基础路径 -> 默认子页
   if (p === '/api-testing') return '/api-testing/workspace'
   if (p === '/web-testing' || p === '/web-testing/create' || p.startsWith('/web-testing/create/')) return '/web-testing/create'
-  if (p === '/perf-testing') return '/perf-testing/workspace'
+  if (p === '/perf-testing' || p === '/perf-testing/workspace') return '/perf-testing/plans'
   if (p === '/project') return '/project/project-list'
   return p
 })

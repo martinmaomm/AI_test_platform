@@ -34,6 +34,8 @@ urlpatterns = [
     path('api/v1/projects/<int:project_id>/api-testing/', include('api_testing.urls')),
     path('api/v1/ai-core/', include('ai_core.urls')),
     path('api/v1/projects/<int:project_id>/web-testing/', include('web_testing.urls')),
+    path('api/v1/projects/<int:project_id>/performance/', include('performance_testing.urls')),
+    path('api/v1/performance-agent/', include('performance_testing.agent_urls')),
     path('api/v1/projects/<int:project_id>/scheduled-tasks/', include('scheduled_tasks.urls')),
     path('api/v1/projects/<int:project_id>/notification-receivers/', include('notifications.project_urls')),
     path('api/v1/reports/execution/<int:pk>/', views_scheduled_tasks.ReportExecutionLogPublicView.as_view(), name='report-execution-detail'),

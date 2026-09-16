@@ -15,3 +15,14 @@ class PerformanceMigrationTests(SimpleTestCase):
             {'PerformanceTarget', 'PerformancePlan', 'PerformanceNode'},
         )
         self.assertTrue(all(item.reversible for item in migration.operations))
+
+    def test_execution_migration_is_additive_and_reversible(self):
+        migration = importlib.import_module(
+            'performance_testing.migrations.0002_execution_control_plane',
+        ).Migration
+        creates = [item for item in migration.operations if isinstance(item, CreateModel)]
+        self.assertEqual(
+            {item.name for item in creates},
+            {'PerformanceRun', 'PerformanceControllerState'},
+        )
+        self.assertTrue(all(item.reversible for item in migration.operations))

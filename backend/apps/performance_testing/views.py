@@ -20,6 +20,7 @@ from .serializers import (
 from .services import (
     create_node_with_enrollment, enrollment_response, issue_enrollment, revoke_node,
 )
+from .run_services import controller_execution_status
 
 
 def _ok(data, code=status.HTTP_200_OK):
@@ -62,7 +63,12 @@ class ManagementAPIView(APIView):
 class PerformanceConfigView(ManagementAPIView):
     def get(self, request, project_id):
         _project(request, project_id, READ)
-        return _ok(platform_config())
+        execution = controller_execution_status()
+        return _ok(platform_config(
+            controller_online=execution['controller_online'],
+            execution_available=execution['available'],
+            unavailable_reason=execution['reason'],
+        ))
 
 
 class TargetListCreateView(ManagementAPIView):

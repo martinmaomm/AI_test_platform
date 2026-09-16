@@ -5,6 +5,7 @@ Run from backend: .venv/bin/python scripts/verify_performance_ui.py
 """
 import base64
 import json
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -19,6 +20,7 @@ def main():
     payload = base64.urlsafe_b64encode(json.dumps({'exp': int(time.time()) + 600}).encode()).decode().rstrip('=')
     auth = {'accessToken': f'fixture.{payload}.fixture', 'refreshToken': '', 'user': user}
     lists = {'targets': [], 'plans': [], 'nodes': []}
+    runtime = {'enabled': False, 'run': None}
     mutations = []
     errors = []
 
@@ -40,9 +42,31 @@ def main():
         elif path.endswith('/projects/'):
             data = {'items': [project]}
         elif '/performance/' in path:
-            kind = path.split('/performance/')[1].split('/')[0]
+            segments = path.split('/performance/')[1].strip('/').split('/')
+            kind = segments[0]
             if kind == 'config':
-                data = {'execution_enabled': False, 'phase': 'node_access', 'heartbeat_interval_seconds': 5}
+                data = {'execution_enabled': runtime['enabled'], 'controller_online': runtime['enabled'],
+                        'phase': 'execution', 'heartbeat_interval_seconds': 5,
+                        'execution_unavailable_reason': '' if runtime['enabled'] else '控制器尚未启动（本机模拟）'}
+            elif kind == 'plans' and len(segments) == 3 and segments[2] == 'runs':
+                mutations.append(('runs', request.method, request.post_data_json))
+                runtime['run'] = {
+                    'id': 'b91d46dc-821f-4db9-b198-f917f34c2323', 'plan_name': '单用户样本计划',
+                    'node_name': '本机验收节点', 'status': 'running', 'reason': '',
+                    'created_at': '2026-09-16T10:00:00Z', 'started_at': '2026-09-16T10:00:01Z',
+                    'latest_metrics': {'requests': 12, 'failures': 1, 'error_rate': 1 / 12,
+                                       'rps': 2.4, 'p95': 25, 'p99': 30, 'avg_response_time': 12, 'users': 1,
+                                       'entries': [{'name': '读取健康页', 'method': 'GET', 'requests': 12,
+                                                    'failures': 1, 'avg_response_time': 12, 'p95': 25, 'p99': 30}]},
+                    'metrics_samples': [{'timestamp': '2026-09-16T10:00:03Z',
+                                         'metrics': {'rps': 2.4, 'failures': 1, 'p95': 25}}],
+                }
+                data = runtime['run']
+            elif kind == 'runs':
+                if segments[-1] == 'stop':
+                    mutations.append(('stop', request.method, request.post_data_json))
+                    runtime['run']['status'] = 'stopping'
+                data = {'items': [runtime['run']]} if len(segments) == 1 else runtime['run']
             elif kind in lists:
                 if request.method == 'GET':
                     data = {'items': lists[kind]}
@@ -63,12 +87,13 @@ def main():
         context = browser.new_context(viewport={'width': 1440, 'height': 1050})
         context.route('**/*', fulfill)
         context.add_init_script('localStorage.setItem("auth-store", ' + json.dumps(json.dumps(auth)) + ');'
-                                'localStorage.setItem("project-store", ' + json.dumps(json.dumps({'currentProject': project})) + ');')
+                                'localStorage.setItem("project-store", ' + json.dumps(json.dumps({'currentProject': project})) + ');'
+                                'Object.defineProperty(crypto, "randomUUID", {value: undefined});')
         page = context.new_page()
         page.on('pageerror', lambda error: errors.append(str(error)))
         try:
             page.goto('http://127.0.0.1:5173/perf-testing/targets')
-            expect(page.get_by_text('性能测试第一阶段：仅管理计划、受控目标和接入节点；当前没有压测执行能力。')).to_be_visible()
+            expect(page.get_by_text('性能测试第一阶段：每次运行仅选择一个在线节点。')).to_be_visible()
             page.get_by_role('button', name='新建目标', exact=True).click()
             dialog = page.get_by_role('dialog')
             dialog.locator('.el-form-item').filter(has_text='名称').locator('input').fill('本机目标')
@@ -99,10 +124,34 @@ def main():
             assert [item[0] for item in mutations] == ['targets', 'plans', 'nodes'], mutations
             assert mutations[1][2]['spawn_rate'] == 1
             assert mutations[1][2]['steps'][0]['path'] == '/probe'
+            page.get_by_role('tab', name='压测计划', exact=True).click()
+            expect(page.get_by_role('button', name='执行', exact=True)).to_be_disabled()
+            runtime['enabled'] = True
+            lists['nodes'][0].update(status='online', agent_version='0.2.0', engine_version='2.43.3')
+            # Config polling must discover the controller without a browser reload.
+            expect(page.get_by_role('button', name='执行', exact=True)).to_be_enabled(timeout=12000)
+            page.get_by_role('button', name='执行', exact=True).click()
+            run_dialog = page.get_by_role('dialog', name='确认执行压测', exact=True)
+            expect(run_dialog).to_be_visible()
+            run_dialog.get_by_role('button', name='确认执行', exact=True).click()
+            expect(page.get_by_role('button', name='停止执行', exact=True)).to_be_visible()
+            expect(page.get_by_text('8.33%', exact=True)).to_be_visible()
+            page.get_by_role('button', name='停止执行', exact=True).click()
+            page.wait_for_timeout(2500)  # A detail poll must not invalidate an open stop confirmation.
+            page.get_by_role('button', name='停止', exact=True).click()
+            expect(page.get_by_text('停止中', exact=True)).to_be_visible()
+            runtime['run']['status'] = 'completed'
+            expect(page.get_by_text('执行完成，存在失败请求。', exact=True)).to_be_visible(timeout=6000)
+            page.get_by_role('button', name='返回执行记录', exact=True).click()
+            expect(page).to_have_url(re.compile(r'/perf-testing/runs$'))
+            expect(page.get_by_role('cell', name='单用户样本计划', exact=True)).to_be_visible()
+            import uuid
+            uuid.UUID(mutations[3][2]['request_id'])
+            assert [item[0] for item in mutations] == ['targets', 'plans', 'nodes', 'runs', 'stop']
             assert not errors, errors
             with tempfile.NamedTemporaryFile(prefix='performance-ui-', suffix='.png', delete=False) as image:
                 page.screenshot(path=image.name, full_page=True)
-                print(json.dumps({'mocked_browser_crud': 'passed', 'mutations': len(mutations),
+                print(json.dumps({'mocked_browser_crud_and_execution': 'passed', 'mutations': len(mutations),
                                   'page_errors': errors, 'screenshot': str(Path(image.name).resolve())}))
         finally:
             context.close()

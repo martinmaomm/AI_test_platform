@@ -29,12 +29,20 @@ class AgentTransport:
         self.session.trust_env = False
         self.sleep = sleep
 
-    def post(self, url: str, payload: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+    def post(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        token: str | None = None,
+        *,
+        retry_transient: bool = True,
+    ) -> dict[str, Any]:
         _validate_endpoint(url)
         headers = {"Accept": "application/json"}
         if token is not None:
             headers["Authorization"] = f"Node {token}"
-        for attempt in range(MAX_ATTEMPTS):
+        attempts = MAX_ATTEMPTS if retry_transient else 1
+        for attempt in range(attempts):
             try:
                 response = self.session.post(
                     url,
@@ -45,7 +53,7 @@ class AgentTransport:
                     allow_redirects=False,
                 )
             except requests.RequestException as exc:
-                if attempt == MAX_ATTEMPTS - 1:
+                if attempt == attempts - 1:
                     raise RetryExhausted("网络请求失败，已停止本次尝试") from exc
                 self.sleep(2**attempt)
                 continue
@@ -54,7 +62,7 @@ class AgentTransport:
             if response.status_code in {401, 403, 409}:
                 raise AgentStopped(f"身份或协议被服务端拒绝（HTTP {response.status_code}）")
             if response.status_code == 429 or response.status_code >= 500:
-                if attempt == MAX_ATTEMPTS - 1:
+                if attempt == attempts - 1:
                     raise RetryExhausted(f"服务暂时不可用（HTTP {response.status_code}）")
                 self.sleep(2**attempt)
                 continue

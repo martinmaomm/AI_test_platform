@@ -4,18 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "performance-node"
-version = "0.1.0"
-description = "Independent performance node enrollment and heartbeat client"
+version = "0.2.0"
+description = "Independent performance node execution agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "requests==2.32.5",
     "psutil==7.2.2",
+    "locust==2.43.3",
 ]
-
-[project.optional-dependencies]
-# Reserved for the next delivery. This package deliberately does not import it yet.
-engine = ["locust==2.43.3"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

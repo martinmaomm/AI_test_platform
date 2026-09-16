@@ -2,6 +2,7 @@ import uuid
 from datetime import timedelta
 
 from django.db import models
+from django.conf import settings
 from django.utils import timezone
 
 from projects.models import Project
@@ -107,3 +108,96 @@ class PerformanceNode(models.Model):
         current_time = current_time or timezone.now()
         cutoff = current_time - timedelta(seconds=NODE_OFFLINE_AFTER_SECONDS)
         return 'online' if self.last_seen_at >= cutoff else 'offline'
+
+
+class PerformanceRun(models.Model):
+    class Status(models.TextChoices):
+        QUEUED = 'queued', 'Queued'
+        PREPARING = 'preparing', 'Preparing'
+        RUNNING = 'running', 'Running'
+        STOPPING = 'stopping', 'Stopping'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+        CANCELLED = 'cancelled', 'Cancelled'
+        INCOMPLETE = 'incomplete', 'Incomplete'
+
+    ACTIVE_STATUSES = (
+        Status.QUEUED, Status.PREPARING, Status.RUNNING, Status.STOPPING,
+    )
+    TERMINAL_STATUSES = (
+        Status.COMPLETED, Status.FAILED, Status.CANCELLED, Status.INCOMPLETE,
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name='performance_runs',
+    )
+    plan = models.ForeignKey(
+        PerformancePlan, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='runs',
+    )
+    node = models.ForeignKey(
+        PerformanceNode, on_delete=models.RESTRICT, related_name='runs',
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_performance_runs',
+    )
+    request_id = models.UUIDField()
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.QUEUED,
+    )
+    snapshot = models.JSONField(default=dict)
+    snapshot_sha256 = models.CharField(max_length=64)
+    node_command = models.JSONField(default=dict, blank=True, editable=False)
+    node_report = models.JSONField(default=dict, blank=True, editable=False)
+    node_report_seq = models.PositiveBigIntegerField(default=0, editable=False)
+    latest_metrics = models.JSONField(default=dict, blank=True)
+    metrics_samples = models.JSONField(default=list, blank=True)
+    reason_code = models.CharField(max_length=64, blank=True, default='')
+    reason = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    stop_requested_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'performance_runs'
+        ordering = ('-created_at', '-id')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('project', 'request_id'), name='perf_run_project_request_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('status', 'created_at'), name='perf_run_status_created'),
+        ]
+
+    @property
+    def is_terminal(self):
+        return self.status in self.TERMINAL_STATUSES
+
+
+class PerformanceControllerState(models.Model):
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    owner_id = models.CharField(max_length=200, blank=True, default='')
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    lease_until = models.DateTimeField(null=True, blank=True)
+    current_run = models.ForeignKey(
+        PerformanceRun, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='+',
+    )
+
+    class Meta:
+        db_table = 'performance_controller_state'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(id=1), name='perf_controller_singleton_id',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk not in (None, 1):
+            raise ValueError('PerformanceControllerState 只能使用主键 1。')
+        self.pk = 1
+        return super().save(*args, **kwargs)

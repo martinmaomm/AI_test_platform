@@ -228,6 +228,34 @@ class ClientTests(unittest.TestCase):
             client.heartbeat()
             self.assertEqual(session.calls[0][1]["headers"]["Authorization"], f"Node {TOKEN}")
 
+    def test_v2_heartbeat_sends_run_report_and_returns_execution_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = str(uuid.uuid4())
+            report = {
+                "run_id": run_id, "sequence": 3, "state": "ready",
+                "reason_code": "", "reason": "",
+            }
+            command = {"type": "stop", "run_id": run_id, "reason": "fixture"}
+            response = common(
+                node_id=NODE_ID, server_time="2026-09-16T00:00:00Z",
+                command=command, execution_enabled=True,
+            )
+            session = Session([Response(200, wrapped(response))])
+            client = PerformanceNodeClient(self.config(directory), AgentTransport(session=session))
+            client.store.save(NodeIdentity(NODE_ID, TOKEN))
+            result = client.heartbeat(run_report=report)
+            self.assertEqual(result.command, command)
+            self.assertEqual(session.calls[0][1]["json"]["run_report"], report)
+
+    def test_heartbeat_does_not_reuse_a_strict_report_sequence_on_transport_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Session([Response(503, {}), Response(200, wrapped({}))])
+            client = PerformanceNodeClient(self.config(directory), AgentTransport(session=session, sleep=lambda _seconds: None))
+            client.store.save(NodeIdentity(NODE_ID, TOKEN))
+            with self.assertRaises(RetryExhausted):
+                client.heartbeat(run_report=None)
+            self.assertEqual(len(session.calls), 1)
+
 
 class RunnerTests(unittest.TestCase):
     def test_unknown_command_stops_loop_and_sigterm_handler_sets_event(self):
@@ -244,11 +272,23 @@ class RunnerTests(unittest.TestCase):
 
         class Client:
             store = Store()
-            def heartbeat(self, _identity):
+            def heartbeat(self, _identity, _run_report):
                 raise AgentStopped("收到未知或不可执行命令，已停止")
 
+        class Executor:
+            def report_for_heartbeat(self):
+                return None
+
+            def stop_active(self, *_args, **_kwargs):
+                pass
+
+            def close(self):
+                pass
+
         with self.assertLogs("performance_node.runner", level="ERROR") as captured:
-            self.assertEqual(run_forever(Client(), threading.Event(), lambda _seconds: False), 2)
+            self.assertEqual(run_forever(
+                Client(), threading.Event(), lambda _seconds: False, executor=Executor(),
+            ), 2)
         self.assertNotIn(TOKEN, "\n".join(captured.output))
 
 
@@ -286,6 +326,7 @@ class TlsTests(unittest.TestCase):
                     AgentTransport(sleep=lambda _seconds: None).post(url, {})
             finally:
                 server.shutdown()
+                server.server_close()
                 thread.join()
 
 

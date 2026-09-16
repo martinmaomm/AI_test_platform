@@ -1,6 +1,9 @@
 FROM python:3.13-slim
 
 WORKDIR /app
+RUN apt-get update && \
+    apt-get install --no-install-recommends --yes stunnel4 && \
+    rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir . && \
@@ -10,5 +13,6 @@ RUN pip install --no-cache-dir . && \
 
 USER nodeagent
 ENV PERFORMANCE_NODE_STATE_DIR=/var/lib/performance-node
+ENV PERFORMANCE_STUNNEL_BINARY=/usr/bin/stunnel4
 ENTRYPOINT ["python", "-m", "performance_node"]
 CMD ["run"]

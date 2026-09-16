@@ -64,6 +64,7 @@ class NodeConfig:
     platform_url: str
     state_dir: Path
     ca_bundle: str | bool
+    stunnel_binary: str = "stunnel"
 
     @classmethod
     def from_env(cls) -> "NodeConfig":
@@ -74,6 +75,7 @@ class NodeConfig:
             platform_url=platform_base_url(_required_env("PERFORMANCE_PLATFORM_URL")),
             state_dir=Path(_required_env("PERFORMANCE_NODE_STATE_DIR")),
             ca_bundle=ca_file or True,
+            stunnel_binary=os.environ.get("PERFORMANCE_STUNNEL_BINARY", "stunnel"),
         )
 
     def endpoint(self, name: str) -> str:

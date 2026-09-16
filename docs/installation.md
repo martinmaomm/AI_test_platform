@@ -412,18 +412,60 @@ npm run build
 - `env.example` 为 `LLM_TIMEOUT_SECONDS` 写了 300 秒，而未设置该键时模型管理器代码默认 600 秒；显式 `.env` 值优先。
 - 仓库当前没有可直接投入生产的反向代理、TLS、静态站点或进程守护配置；部署这些基础设施前应先完成安全评审。
 
-## 13. 性能测试第一批：计划管理与节点接入
+## 13. 性能测试：节点接入与单节点执行
 
-本批新增 `performance_testing`，迁移只新增性能目标、计划和节点表。升级时在后端虚拟环境执行：
+`performance_testing` 迁移新增目标、计划、节点及运行/控制器租约表，不删除 UI/API 数据。升级时在后端虚拟环境执行：
 
 ```bash
 python manage.py migrate performance_testing
 ```
 
-迁移后按第 7 节重启后端和 Celery。首页进入性能项目后，可以管理计划；平台管理员管理压测目标和节点，普通用户按项目权限访问。当前没有“开始压测”，节点在线也仅表示心跳成功，不表示 Worker 就绪。
+迁移后按第 7 节重启后端和 Celery。首页进入性能项目后，可以管理计划；平台管理员管理压测目标和节点，普通用户按项目权限访问。执行需要项目执行权限，执行详情需要报告权限。节点在线只代表心跳成功；运行进入“准备中”后还要验证加密连接、固定脚本版本和 Worker 身份，才实际发压。
 
 节点程序在独立的 `performance-node/` 目录，依照其 [部署说明](../performance-node/README.md) 安装，不需要后端整套依赖、Redis 或数据库。Agent 必须连接可信 HTTPS 入口；内网私有 CA 可显式配置，不能将 `http://...:8000` 当作节点生产接入地址，也不要为了接入而关闭证书校验。不要将长期身份文件、一次性注册凭证提交到仓库。
 
 注册凭证只显示一次；丢失、过期或登记后本地身份未保存时，由管理员重置凭证并重新登记。重置/吊销立即作废原身份，客户端不会自动绕过重新注册。
 
-Locust Master/Worker 和 stunnel 的本机验证原型位于 `backend/scripts/verify_performance_transport.py`，需要单独安装 stunnel，并显式传 `--confirm-local-load` 才执行。它固定访问本机临时服务，1 个虚拟用户、5 秒；不属于已接入平台的执行功能，也不能代替公网/Linux 部署验收。普通平台启动不需要运行该原型或启动 stunnel。
+### 13.1 启动执行控制器
+
+控制器与 Django 使用同一套后端依赖和数据库，单独运行；不在 Django 请求或 Celery 中运行 Locust。先安装系统 `stunnel`（macOS 可用 `brew install stunnel`，Debian/Ubuntu 为 `stunnel4`），并确认后端 Locust 固定为 `2.43.3`。
+
+在实际 `backend/.env` 中设置以下参数，示例地址须替换：
+
+```dotenv
+PERFORMANCE_EXECUTION_ENABLED=true
+PERFORMANCE_RPC_BIND_HOST=0.0.0.0
+PERFORMANCE_RPC_PORT=9443
+PERFORMANCE_RPC_PUBLIC_HOST=load.example.com
+PERFORMANCE_RPC_SERVER_NAME=load.example.com
+PERFORMANCE_STUNNEL_BINARY=stunnel
+```
+
+`PUBLIC_HOST` 是节点实际可达的加密 RPC 地址；`SERVER_NAME` 是节点要核对的证书名称，一般与前者一致。二者只填主机名/IP，不填 `https://`。`BIND_HOST` 默认回环；需要其他机器连接时才显式调整监听、防火墙/NAT。只有 TLS 入口可暴露，原生 Locust RPC 始终是随机回环端口。每轮签发临时 CA 与节点证书，不需要用户手工复制这些运行证书；节点注册仍须使用可信 HTTPS 平台入口。
+
+```bash
+cd backend
+source .venv/bin/activate
+python manage.py run_performance_controller
+```
+
+仅启动一个控制器；第二个实例会拒绝争用租约。修改配置后重启控制器和后端。控制器默认关闭，未配置或未启动时页面会提示并禁止提交运行，不影响 UI/API 自动化。私有运行目录默认 `backend/temp/performance-runtime/`，目录权限必须 `0700`，不要映射到静态站点；正常结束会清理临时私钥，崩溃遗留文件仍须按私有运行数据管理。
+
+### 13.2 执行及限制
+
+按“批准压测目标 → 编写请求计划 → 接入节点 → 选择在线节点执行 → 查看执行记录”使用。当前每轮恰好一个节点，多个运行全局排队；每轮虚拟用户并发执行步骤。不支持任意 Python 脚本、多节点负载拆分或 API 场景自动转换。
+
+请求默认校验被测 HTTPS 证书、不跟随重定向，每响应最多读取 1 MiB；统计区分“执行完整”和“请求断言成功”。运行完成但存在失败请求会单独提示。RPS 为累计请求数/运行用时；P95/P99 由 Locust 合并响应时间分布计算。
+
+执行时只能修改后续计划，当前冻结快照不受影响。手动停止先收尾统计，再清理进程；失联、重启或异常不自动重跑，统计缺失会显示“执行不完整”。升级节点须与平台固定模板匹配，旧 `0.1.0` 客户端不能接收协议 2 指令。
+
+### 13.3 本机隔离验收
+
+以下检查只创建 SQLite 临时库、临时 HTTPS 平台及本机临时 HTTP 目标，单轮固定 1 个用户、最多 5 秒；不连接配置中的 NAS/业务库。须安装 stunnel，且应在允许本机低负载验证后执行：
+
+```bash
+cd backend
+.venv/bin/python scripts/test_webui_generation_offline.py scripts.test_performance_execution_contract
+```
+
+这不是远程 Linux/公网部署验收。远程上线还需验证 HTTPS 入口、端口可达、容器架构和实际网络断连行为。旧 `verify_performance_transport.py --confirm-local-load` 仅是底层传输原型，不代替平台链路验收。

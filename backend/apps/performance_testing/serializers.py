@@ -11,7 +11,7 @@ from .constants import (
     ALLOWED_HTTP_METHODS, MAX_DURATION_SECONDS, MAX_REQUEST_BYTES,
     MAX_SPAWN_RATE, MAX_STEPS, MAX_USERS,
 )
-from .models import PerformanceNode, PerformancePlan, PerformanceTarget
+from .models import PerformanceNode, PerformancePlan, PerformanceRun, PerformanceTarget
 
 
 _CONTROL_RE = re.compile(r'[\x00-\x1f\x7f]')
@@ -323,3 +323,49 @@ class ResourceSerializer(StrictSerializer):
 
 class HeartbeatSerializer(AgentVersionSerializer):
     resources = ResourceSerializer()
+    run_report = serializers.JSONField(required=False, allow_null=True, default=None)
+
+    def validate_run_report(self, value):
+        if value is None:
+            return None
+        serializer = RunReportSerializer(data=value)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data
+
+
+class RunReportSerializer(StrictSerializer):
+    run_id = serializers.UUIDField()
+    sequence = StrictIntegerField(min_value=1, max_value=9223372036854775807)
+    state = serializers.ChoiceField(choices=('preparing', 'ready', 'running', 'stopped', 'failed'))
+    reason_code = serializers.CharField(max_length=64, allow_blank=True)
+    reason = serializers.CharField(max_length=2000, allow_blank=True)
+
+
+class PerformanceRunCreateSerializer(StrictSerializer):
+    node_id = serializers.UUIDField()
+    request_id = serializers.UUIDField()
+
+
+class PerformanceRunListSerializer(serializers.ModelSerializer):
+    plan_name = serializers.SerializerMethodField()
+    node_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PerformanceRun
+        fields = (
+            'id', 'plan_id', 'plan_name', 'node_id', 'node_name', 'status',
+            'created_at', 'started_at', 'finished_at', 'reason_code', 'reason',
+            'latest_metrics',
+        )
+        read_only_fields = fields
+
+    def get_plan_name(self, obj):
+        return (obj.snapshot or {}).get('plan_name', '')
+
+    def get_node_name(self, obj):
+        return obj.node.name
+
+
+class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
+    class Meta(PerformanceRunListSerializer.Meta):
+        fields = PerformanceRunListSerializer.Meta.fields + ('metrics_samples', 'snapshot')

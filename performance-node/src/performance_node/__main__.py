@@ -1,4 +1,4 @@
-"""CLI entry point: only `enroll` and idle-only `run` are supported."""
+"""CLI entry point for enrollment and the protocol-v2 execution agent."""
 
 from __future__ import annotations
 

@@ -1,13 +1,14 @@
 services:
   performance-node:
     build: .
-    image: automation-platform-performance-node:0.1.0
+    image: automation-platform-performance-node:0.2.0
     restart: unless-stopped
     environment:
       PERFORMANCE_PLATFORM_URL:
       PERFORMANCE_NODE_CA_BUNDLE:
       PERFORMANCE_NODE_ENROLLMENT_TOKEN:
       PERFORMANCE_NODE_ENROLLMENT_TOKEN_FILE:
+      PERFORMANCE_STUNNEL_BINARY: /usr/bin/stunnel4
       PERFORMANCE_NODE_STATE_DIR: /var/lib/performance-node
     volumes:
       - performance-node-state:/var/lib/performance-node

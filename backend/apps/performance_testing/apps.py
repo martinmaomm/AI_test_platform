@@ -5,3 +5,6 @@ class PerformanceTestingConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
     name = 'performance_testing'
     verbose_name = 'Performance Testing'
+
+    def ready(self):
+        from . import signals  # noqa: F401

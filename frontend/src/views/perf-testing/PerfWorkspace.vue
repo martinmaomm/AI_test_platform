@@ -1,20 +1,21 @@
 <template>
   <div class="perf-workspace">
     <el-alert type="info" :closable="false" show-icon class="phase-notice">
-      <template #title>性能测试第一阶段：仅管理计划、受控目标和接入节点；当前没有压测执行能力。</template>
-      <template #default>节点“在线”仅表示 Agent 最近成功心跳，不代表 Locust Worker 已就绪或能发压。</template>
+      <template #title>性能测试第一阶段：每次运行仅选择一个在线节点。</template>
+      <template #default>节点“在线”仅表示 Agent 最近成功心跳，不代表 Worker 已就绪或能发压；启动速率是每秒启动虚拟用户数，不是每秒请求数。</template>
     </el-alert>
 
     <el-tabs v-model="activeTab" @tab-change="goTab">
       <el-tab-pane label="压测计划" name="plans">
-        <div class="toolbar"><span>计划只描述受控请求步骤，不支持 Python 或动态表达式。</span><el-button v-if="canManagePlans" type="primary" @click="openPlan()">新建计划</el-button></div>
+        <div class="toolbar"><span>计划只描述受控请求步骤，不支持 Python 或动态表达式。</span><div><el-button v-if="canRead" @click="router.push({ name: 'PerfRuns' })">执行记录</el-button><el-button v-if="canManagePlans" type="primary" @click="openPlan()">新建计划</el-button></div></div>
+        <el-alert v-if="!executionEnabled" type="warning" :closable="false" show-icon class="execution-unavailable">{{ executionUnavailableReason }}</el-alert>
         <el-empty v-if="!loading.plans && plans.length === 0" description="暂无压测计划" />
         <el-table v-else v-loading="loading.plans" :data="plans" row-key="id">
           <el-table-column prop="name" label="名称" min-width="150" />
           <el-table-column label="目标" min-width="160"><template #default="{ row }">{{ targetName(row.target_id) }}</template></el-table-column>
           <el-table-column label="负载" min-width="180"><template #default="{ row }">{{ row.users }} users / 每秒启动 {{ row.spawn_rate }} users</template></el-table-column>
           <el-table-column label="步骤" width="90"><template #default="{ row }">{{ row.steps?.length || 0 }}</template></el-table-column>
-          <el-table-column v-if="canManagePlans || canDeletePlans" label="操作" width="160" fixed="right"><template #default="{ row }"><el-button v-if="canManagePlans" link type="primary" @click="openPlan(row)">编辑</el-button><el-button v-if="canDeletePlans" link type="danger" @click="removePlan(row)">删除</el-button></template></el-table-column>
+          <el-table-column v-if="canExecute || canManagePlans || canDeletePlans" label="操作" width="220" fixed="right"><template #default="{ row }"><el-tooltip v-if="canExecute && !executionEnabled" :content="executionUnavailableReason"><el-button link type="primary" disabled>执行</el-button></el-tooltip><el-button v-else-if="canExecute" link type="primary" @click="openRun(row)">执行</el-button><el-button v-if="canManagePlans" link type="primary" @click="openPlan(row)">编辑</el-button><el-button v-if="canDeletePlans" link type="danger" @click="removePlan(row)">删除</el-button></template></el-table-column>
         </el-table>
       </el-tab-pane>
 
@@ -49,7 +50,7 @@
         <el-form-item label="描述"><el-input v-model="planForm.description" type="textarea" :rows="2" maxlength="500" /></el-form-item>
         <el-form-item label="压测目标" prop="target_id"><el-select v-model="planForm.target_id" style="width:100%"><el-option v-for="target in targets" :key="target.id" :label="target.name" :value="target.id" /></el-select></el-form-item>
         <div class="form-grid"><el-form-item label="并发 users" prop="users"><el-input-number v-model="planForm.users" :min="1" :max="config.limits.max_users" /></el-form-item><el-form-item label="启动速率" prop="spawn_rate"><el-input-number v-model="planForm.spawn_rate" :min="1" :max="config.limits.max_spawn_rate" /><span class="input-suffix">users/秒</span></el-form-item><el-form-item label="时长（秒）" prop="duration_seconds"><el-input-number v-model="planForm.duration_seconds" :min="1" :max="config.limits.max_duration_seconds" /></el-form-item><el-form-item label="等待（秒）" prop="wait_seconds"><el-input-number v-model="planForm.wait_seconds" :min="0.1" :max="60" :step="0.1" /></el-form-item></div>
-        <el-alert type="info" :closable="false" class="step-help">users 表示并发虚拟用户；启动速率表示每秒启动的虚拟用户数，不代表每秒请求数。本批仅保存计划，不会执行。</el-alert>
+        <el-alert type="info" :closable="false" class="step-help">users 表示并发虚拟用户；启动速率表示每秒启动的虚拟用户数，不代表每秒请求数。保存计划不会自动执行，需在计划列表确认后创建运行。</el-alert>
         <div class="steps-title"><span>请求步骤</span><el-button plain size="small" :disabled="planForm.steps.length >= config.limits.max_steps" @click="addStep">添加步骤</el-button></div>
         <div v-for="(step, index) in planForm.steps" :key="index" class="step-card">
           <div class="step-heading">步骤 {{ index + 1 }}<el-button link type="danger" :disabled="planForm.steps.length === 1" @click="removeStep(index)">移除</el-button></div>
@@ -75,6 +76,11 @@
       <p class="expiry">过期时间：{{ formatTime(tokenDialog.expiresAt) }}</p><el-input :model-value="tokenDialog.token" readonly type="textarea" :rows="3" />
       <template #footer><el-button type="primary" @click="copyEnrollmentToken">复制并关闭</el-button><el-button @click="tokenDialog.visible = false">关闭并清除</el-button></template>
     </el-dialog>
+    <el-dialog v-model="runDialog.visible" title="确认执行压测" width="600px" :close-on-click-modal="false" @closed="resetRun">
+      <el-alert type="warning" :closable="false" show-icon>将向受控目标发起真实请求。Phase 1 每次仅运行一个节点。</el-alert>
+      <el-descriptions v-if="runDialog.plan" :column="1" border class="run-summary"><el-descriptions-item label="计划">{{ runDialog.plan.name }}</el-descriptions-item><el-descriptions-item label="负载">{{ runDialog.plan.users }} 个虚拟用户；每秒启动 {{ runDialog.plan.spawn_rate }} 个虚拟用户；{{ runDialog.plan.duration_seconds }} 秒</el-descriptions-item><el-descriptions-item label="节点"><el-radio-group v-model="runDialog.nodeId" @change="resetRunRequestId"><el-radio v-for="node in onlineNodes" :key="node.id" :label="node.id">{{ node.name }}（{{ performanceNodeStatusLabel(node.status) }}）</el-radio></el-radio-group><span v-if="onlineNodes.length === 0" class="empty-node">暂无可用在线节点</span></el-descriptions-item></el-descriptions>
+      <template #footer><el-button @click="runDialog.visible = false">取消</el-button><el-button type="danger" :disabled="!runDialog.nodeId" :loading="saving.run" @click="submitRun">确认执行</el-button></template>
+    </el-dialog>
   </div>
 </template>
 
@@ -86,18 +92,19 @@ import dayjs from 'dayjs'
 import { useAuthStore } from '@/stores/auth'
 import { useProjectStore } from '@/stores/project'
 import { getProject } from '@/api/projects'
-import { createPerformanceNode, createPerformancePlan, createPerformanceTarget, deletePerformancePlan, deletePerformanceTarget, getPerformanceConfig, getPerformanceNodes, getPerformancePlans, getPerformanceTargets, performanceErrorMessage, resetPerformanceNodeEnrollment, revokePerformanceNode, updatePerformanceNode, updatePerformancePlan, updatePerformanceTarget } from '@/api/performance'
+import { createPerformanceNode, createPerformancePlan, createPerformanceRun, createPerformanceTarget, deletePerformancePlan, deletePerformanceTarget, getPerformanceConfig, getPerformanceNodes, getPerformancePlans, getPerformanceTargets, performanceErrorMessage, resetPerformanceNodeEnrollment, revokePerformanceNode, updatePerformanceNode, updatePerformancePlan, updatePerformanceTarget } from '@/api/performance'
 import { buildPerformanceTargetPayload, copyEnrollmentTokenToClipboard, isPerformancePlatformAdmin, performanceNetworkModeLabel, performanceNodeStatusLabel, performancePlanPermissions, samePerformanceScope } from './performanceWorkspaceState'
+import { createPerformanceRequestId, executionUnavailableMessage, performanceExecutionPermissions } from './performanceExecutionState'
 
 const route = useRoute(); const router = useRouter(); const authStore = useAuthStore(); const projectStore = useProjectStore()
 const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
-const defaults = { heartbeat_interval_seconds: 5, limits: { max_users: 100, max_duration_seconds: 600, max_spawn_rate: 100, max_steps: 20 } }
+const defaults = { heartbeat_interval_seconds: 5, execution_enabled: false, controller_online: false, execution_unavailable_reason: '', limits: { max_users: 100, max_duration_seconds: 600, max_spawn_rate: 100, max_steps: 20 } }
 const config = reactive({ ...defaults, limits: { ...defaults.limits } })
 const activeTab = ref('plans')
 const projectId = computed(() => projectStore.currentProjectId)
 const detail = ref(null); const plans = ref([]); const nodes = ref([]); const targets = ref([])
-const loading = reactive({ plans: false, nodes: false, targets: false }); const saving = reactive({ plan: false, node: false, target: false })
-const planDialog = reactive({ visible: false, item: null }); const nodeDialog = reactive({ visible: false, item: null }); const targetDialog = reactive({ visible: false, item: null })
+const loading = reactive({ plans: false, nodes: false, targets: false }); const saving = reactive({ plan: false, node: false, target: false, run: false })
+const planDialog = reactive({ visible: false, item: null }); const nodeDialog = reactive({ visible: false, item: null }); const targetDialog = reactive({ visible: false, item: null }); const runDialog = reactive({ visible: false, plan: null, nodeId: null, requestId: '' })
 const tokenDialog = reactive({ visible: false, token: '', expiresAt: '' }); const planFormRef = ref(); const nodeFormRef = ref(); const targetFormRef = ref(); const stepErrors = ref([]); const nodeLabelsError = ref('')
 const planForm = reactive({ name: '', description: '', target_id: null, users: 1, spawn_rate: 1, duration_seconds: 30, wait_seconds: 1, steps: [] })
 const targetForm = reactive({ name: '', base_url: '', allowed_methods: ['GET'] }); const nodeForm = reactive({ name: '', network_mode: 'lan', labelsText: '{}' })
@@ -105,6 +112,12 @@ const currentMember = computed(() => detail.value?.members?.find((member) => mem
 const canManagePlans = computed(() => performancePlanPermissions(authStore.user, currentMember.value).canEdit)
 const canDeletePlans = computed(() => performancePlanPermissions(authStore.user, currentMember.value).canDelete)
 const canManageTargets = computed(() => isPerformancePlatformAdmin(authStore.user)); const canManageNodes = computed(() => isPerformancePlatformAdmin(authStore.user))
+const executionPermissions = computed(() => performanceExecutionPermissions(authStore.user, currentMember.value))
+const canExecute = computed(() => executionPermissions.value.canExecute); const canReport = computed(() => executionPermissions.value.canReport)
+const canRead = computed(() => isPerformancePlatformAdmin(authStore.user) || Boolean(currentMember.value))
+const executionEnabled = computed(() => config.execution_enabled === true && config.controller_online === true)
+const executionUnavailableReason = computed(() => executionUnavailableMessage(config))
+const onlineNodes = computed(() => nodes.value.filter((node) => node.status === 'online'))
 const planRules = { name: [{ required: true, message: '请输入计划名称', trigger: 'blur' }], target_id: [{ required: true, message: '请选择压测目标', trigger: 'change' }] }; const targetRules = { name: [{ required: true, message: '请输入目标名称', trigger: 'blur' }], base_url: [{ required: true, message: '请输入 HTTP(S) origin', trigger: 'blur' }], allowed_methods: [{ type: 'array', min: 1, message: '至少选择一种方法', trigger: 'change' }] }; const nodeRules = { name: [{ required: true, message: '请输入节点名称', trigger: 'blur' }], network_mode: [{ required: true, message: '请选择网络模式', trigger: 'change' }] }
 const selectedTargetMethods = computed(() => targets.value.find((item) => String(item.id) === String(planForm.target_id))?.allowed_methods || methods)
 let pollTimer; let epoch = 0
@@ -121,10 +134,11 @@ function invalidateProjectUi() {
   nodes.value = []
   targets.value = []
   Object.assign(loading, { plans: false, nodes: false, targets: false })
-  Object.assign(saving, { plan: false, node: false, target: false })
+  Object.assign(saving, { plan: false, node: false, target: false, run: false })
   planDialog.visible = false
   targetDialog.visible = false
   nodeDialog.visible = false
+  runDialog.visible = false
   tokenDialog.visible = false
   resetPlan()
   resetTarget()
@@ -141,9 +155,30 @@ async function loadAccess(requestProjectId, requestEpoch) {
 }
 async function loadConfig(requestProjectId, requestEpoch) { try { const data = dataOf(await getPerformanceConfig(requestProjectId)); if (requestEpoch !== epoch || String(projectId.value) !== String(requestProjectId)) return; Object.assign(config, defaults, data || {}); config.limits = { ...defaults.limits, ...(data?.limits || {}) } } catch (error) { if (requestEpoch === epoch) ElMessage.error(performanceErrorMessage(error, '加载性能配置失败')) } }
 async function loadList(kind, requestProjectId, requestEpoch) { loading[kind] = true; const call = { plans: getPerformancePlans, nodes: getPerformanceNodes, targets: getPerformanceTargets }[kind]; try { const result = listOf(await call(requestProjectId)); if (requestEpoch === epoch && String(projectId.value) === String(requestProjectId)) ({ plans, nodes, targets })[kind].value = result } catch (error) { if (requestEpoch === epoch) ElMessage.error(performanceErrorMessage(error, `加载${kind}失败`)) } finally { if (requestEpoch === epoch) loading[kind] = false } }
-async function refreshAll() { const requestProjectId = projectId.value; const requestEpoch = ++epoch; clearInterval(pollTimer); if (!requestProjectId) return; if (projectStore.currentProject?.project_type !== 'perf') { ElMessage.warning('请先从性能测试项目列表选择性能项目'); router.replace('/perf-testing/projects'); return }; await Promise.all([loadAccess(requestProjectId, requestEpoch), loadConfig(requestProjectId, requestEpoch), loadList('targets', requestProjectId, requestEpoch), loadList('plans', requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]); if (requestEpoch === epoch && String(projectId.value) === String(requestProjectId)) pollTimer = window.setInterval(() => loadList('nodes', requestProjectId, requestEpoch), Math.max(5000, Math.min(10000, config.heartbeat_interval_seconds * 1000))) }
+async function refreshAll() { const requestProjectId = projectId.value; const requestEpoch = ++epoch; clearInterval(pollTimer); if (!requestProjectId) return; if (projectStore.currentProject?.project_type !== 'perf') { ElMessage.warning('请先从性能测试项目列表选择性能项目'); router.replace('/perf-testing/projects'); return }; await Promise.all([loadAccess(requestProjectId, requestEpoch), loadConfig(requestProjectId, requestEpoch), loadList('targets', requestProjectId, requestEpoch), loadList('plans', requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]); if (requestEpoch === epoch && String(projectId.value) === String(requestProjectId)) pollTimer = window.setInterval(() => Promise.all([loadConfig(requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]), Math.max(5000, Math.min(10000, config.heartbeat_interval_seconds * 1000))) }
 function blankStep() { return { name: '', method: 'GET', path: '/', expected_status: 200, headersText: '{}', bodyText: '' } }; function addStep() { planForm.steps.push(blankStep()) }; function removeStep(index) { planForm.steps.splice(index, 1) }
 function resetPlan() { Object.assign(planForm, { name: '', description: '', target_id: null, users: 1, spawn_rate: 1, duration_seconds: 30, wait_seconds: 1, steps: [] }); planDialog.item = null; stepErrors.value = []; planFormRef.value?.clearValidate() }
+function resetRun() { Object.assign(runDialog, { plan: null, nodeId: null, requestId: '' }) }
+function resetRunRequestId() { if (runDialog.visible) runDialog.requestId = createPerformanceRequestId() }
+function openRun(plan) {
+  if (!executionEnabled.value) return
+  Object.assign(runDialog, { visible: true, plan, nodeId: onlineNodes.value[0]?.id || null, requestId: createPerformanceRequestId() })
+}
+async function submitRun() {
+  if (saving.run || !runDialog.plan || !runDialog.nodeId || !runDialog.requestId) return
+  const scope = captureScope(); const { plan, nodeId, requestId } = runDialog
+  saving.run = true
+  try {
+    const run = dataOf(await createPerformanceRun(scope.projectId, plan.id, { node_id: nodeId, request_id: requestId }))
+    if (!scopeIsCurrent(scope)) return
+    if (!run?.id) throw new Error('服务端未返回运行记录')
+    runDialog.visible = false
+    if (canReport.value) {
+      ElMessage.success('运行已创建')
+      await router.push({ name: 'PerfRunDetail', params: { runId: run.id } })
+    } else ElMessage.success('运行已创建；你没有查看执行详情的权限')
+  } catch (error) { if (scopeIsCurrent(scope)) ElMessage.error(performanceErrorMessage(error, '创建运行失败')) } finally { if (scopeIsCurrent(scope)) saving.run = false }
+}
 function openPlan(item) { resetPlan(); planDialog.item = item || null; Object.assign(planForm, item ? { ...item, steps: (item.steps || []).map((step) => ({ ...step, headersText: JSON.stringify(step.headers || {}, null, 2), bodyText: step.body == null ? '' : JSON.stringify(step.body, null, 2) })) } : { steps: [blankStep()] }); planDialog.visible = true }
 function stepsPayload() { stepErrors.value = []; let invalid = false; const result = planForm.steps.map((step, index) => { const errors = {}; let headers = {}; let body = null; try { headers = JSON.parse(step.headersText || '{}'); if (!headers || Array.isArray(headers) || typeof headers !== 'object') throw new Error() } catch { errors.headers = 'Headers 必须是 JSON 对象'; invalid = true } try { if (step.bodyText?.trim()) body = JSON.parse(step.bodyText) } catch { errors.body = 'Body 必须是合法 JSON'; invalid = true } if (!step.name?.trim()) { errors.headers ||= '请填写步骤名称'; invalid = true }; if (!/^\/(?!\/)/.test(step.path || '') || /\\|[\x00-\x1f]/.test(step.path || '')) { errors.body ||= '路径必须以单个 / 开头，且不能包含反斜线或控制字符'; invalid = true }; stepErrors.value[index] = errors; return { name: step.name?.trim(), method: step.method, path: step.path, expected_status: step.expected_status || 200, headers, body } }); return invalid ? null : result }
 async function savePlan() {
@@ -240,7 +275,7 @@ async function resetEnrollment(node) {
 async function revokeNode(node) {
   const scope = captureScope()
   try {
-    await ElMessageBox.confirm('吊销将使该节点的长期身份和未消费注册凭证失效。本批没有运行任务需要终止。', '吊销节点', { type: 'warning', confirmButtonText: '吊销' })
+    await ElMessageBox.confirm('吊销将使该节点的长期身份和未消费注册凭证失效；该节点正在运行的压测会被请求停止，尾统计可能不完整。', '吊销节点', { type: 'warning', confirmButtonText: '吊销' })
     if (!scopeIsCurrent(scope)) return
     await revokePerformanceNode(scope.projectId, node.id)
     if (!scopeIsCurrent(scope)) return
@@ -295,5 +330,5 @@ onBeforeUnmount(() => { ++epoch; invalidateProjectUi() })
 </script>
 
 <style scoped>
-.perf-workspace { max-width: 1280px; margin: 0 auto; padding: 4px 10px 28px; }.phase-notice { margin-bottom: 18px; }.toolbar { min-height: 44px; display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--app-text-muted); margin-bottom: 12px; }.method-tag { margin: 2px; }.input-suffix { margin-left: 8px; color: var(--app-text-muted); font-size: 12px; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }.step-help { margin: 0 0 14px; }.steps-title, .step-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }.step-card { border: 1px solid var(--app-border-light); border-radius: 8px; padding: 12px; margin-bottom: 12px; }.step-grid { display: grid; grid-template-columns: 1.5fr .8fr 1.5fr .8fr; gap: 8px; }.json-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }.json-grid :deep(.el-form-item) { margin-bottom: 0; }.expiry { color: var(--app-text-muted); font-size: 13px; } @media (max-width: 760px) { .toolbar, .form-grid, .step-grid, .json-grid { display: flex; flex-direction: column; align-items: stretch; }.toolbar { align-items: flex-start; }.step-grid { gap: 8px; } }
+.perf-workspace { max-width: 1280px; margin: 0 auto; padding: 4px 10px 28px; }.phase-notice, .execution-unavailable { margin-bottom: 18px; }.toolbar { min-height: 44px; display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--app-text-muted); margin-bottom: 12px; }.method-tag { margin: 2px; }.input-suffix { margin-left: 8px; color: var(--app-text-muted); font-size: 12px; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }.step-help { margin: 0 0 14px; }.steps-title, .step-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }.step-card { border: 1px solid var(--app-border-light); border-radius: 8px; padding: 12px; margin-bottom: 12px; }.step-grid { display: grid; grid-template-columns: 1.5fr .8fr 1.5fr .8fr; gap: 8px; }.json-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }.json-grid :deep(.el-form-item) { margin-bottom: 0; }.expiry, .empty-node { color: var(--app-text-muted); font-size: 13px; }.run-summary { margin-top: 16px; } @media (max-width: 760px) { .toolbar, .form-grid, .step-grid, .json-grid { display: flex; flex-direction: column; align-items: stretch; }.toolbar { align-items: flex-start; }.step-grid { gap: 8px; } }
 </style>

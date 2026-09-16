@@ -19,6 +19,7 @@ from .transport import AgentTransport
 class HeartbeatResult:
     interval_seconds: int
     lease_seconds: int
+    command: dict[str, Any]
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -60,13 +61,23 @@ class PerformanceNodeClient:
         self.store.save(identity)
         return identity
 
-    def heartbeat(self, identity: NodeIdentity | None = None) -> HeartbeatResult:
+    def heartbeat(
+        self,
+        identity: NodeIdentity | None = None,
+        run_report: dict[str, Any] | None = None,
+    ) -> HeartbeatResult:
         identity = identity or self.store.load()
         data = self.transport.post(
             self.config.endpoint("heartbeat"),
             {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
-             "engine_version": ENGINE_VERSION, "resources": self.resources()},
+             "engine_version": ENGINE_VERSION, "resources": self.resources(),
+             "run_report": run_report},
             token=identity.agent_token,
+            # A timeout after server commit is ambiguous. Reusing a strictly
+            # increasing report sequence inside transport retries can turn that
+            # ambiguity into a protocol conflict, so the outer loop retries with
+            # a newly persisted sequence instead.
+            retry_transient=False,
         )
         self._validate_common(data)
         if _node_id(data.get("node_id")) != identity.node_id:
@@ -74,13 +85,12 @@ class PerformanceNodeClient:
         if not isinstance(data.get("server_time"), str) or not data["server_time"]:
             raise ProtocolError("服务端 server_time 不符合协议")
         command = data.get("command")
-        if not isinstance(command, dict) or set(command) != {"type"} or command["type"] != "idle":
+        if not isinstance(command, dict) or command.get("type") not in {"idle", "prepare", "stop"}:
             raise AgentStopped("收到未知或不可执行命令，已停止")
-        if data.get("execution_enabled") is not False:
-            raise AgentStopped("服务端请求的执行能力未在本批客户端启用")
         return HeartbeatResult(
             interval_seconds=_positive_int(data.get("heartbeat_interval_seconds"), "heartbeat_interval_seconds"),
             lease_seconds=_positive_int(data.get("lease_seconds"), "lease_seconds"),
+            command=command,
         )
 
     @staticmethod
@@ -95,7 +105,7 @@ class PerformanceNodeClient:
         protocol_version = data.get("protocol_version")
         if isinstance(protocol_version, bool) or not isinstance(protocol_version, int) or protocol_version != PROTOCOL_VERSION:
             raise AgentStopped("服务端协议版本不匹配")
-        if data.get("execution_enabled") is not False:
-            raise AgentStopped("服务端执行能力状态不符合本批协议")
+        if not isinstance(data.get("execution_enabled"), bool):
+            raise AgentStopped("服务端执行能力状态不符合协议")
         _positive_int(data.get("heartbeat_interval_seconds"), "heartbeat_interval_seconds")
         _positive_int(data.get("lease_seconds"), "lease_seconds")

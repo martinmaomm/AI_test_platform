@@ -1,10 +1,13 @@
-PROTOCOL_VERSION = 1
-AGENT_VERSION = '0.1.0'
+PROTOCOL_VERSION = 2
+AGENT_VERSION = '0.2.0'
 ENGINE_VERSION = '2.43.3'
 
 HEARTBEAT_INTERVAL_SECONDS = 5
 NODE_OFFLINE_AFTER_SECONDS = 30
 ENROLLMENT_TTL_SECONDS = 15 * 60
+CONTROLLER_FRESH_SECONDS = 15
+COMMAND_LEASE_SECONDS = 15
+MAX_METRICS_SAMPLES = 400
 
 MAX_USERS = 100
 MAX_DURATION_SECONDS = 600
@@ -17,10 +20,20 @@ ALLOWED_HTTP_METHODS = (
 )
 
 
-def platform_config():
+def platform_config(*, controller_online=False, execution_available=False, unavailable_reason=''):
+    execution_enabled = bool(execution_available and controller_online)
+    if execution_enabled:
+        reason = ''
+    elif not execution_available:
+        reason = unavailable_reason or '性能执行配置不可用。'
+    else:
+        reason = '性能控制器未在线。'
     return {
-        'phase': 'node_access',
-        'execution_enabled': False,
+        'phase': 'execution',
+        'controller_online': bool(controller_online),
+        'execution_enabled': execution_enabled,
+        'execution_unavailable_reason': reason,
+        'max_nodes_per_run': 1,
         'protocol_version': PROTOCOL_VERSION,
         'engine_version': ENGINE_VERSION,
         'agent_version': AGENT_VERSION,

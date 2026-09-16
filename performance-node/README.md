@@ -1,18 +1,20 @@
-# 性能节点客户端（第一批）
+# 性能节点 Agent 0.2
 
-这是独立于 automation-platform 后端、Redis 与平台 `.env` 的性能节点客户端，当前版本为 `0.1.0`，节点协议为 `1`，候选引擎版本为 `2.43.3`。
+这是独立于 automation-platform 后端、Redis 与平台 `.env` 的性能节点客户端，当前版本为 `0.2.0`，节点协议为 `2`，固定引擎版本为 `2.43.3`。
 
 当前只支持：
 
 - 用一次性登记凭证注册节点；
-- 用长期节点身份发送主机 CPU/内存心跳；
-- 收到 `idle` 命令时保持空闲。
+- 用长期节点身份发送主机 CPU/内存心跳及递增执行报告；
+- 校验固定脚本、冻结快照和每轮 mTLS 身份后启动一个 Locust Worker；
+- 通过独立监督进程执行租约、总时限、停止和进程组回收；
+- 持久化活动及已结束运行，重复命令、Agent 重启均不会重放旧任务。
 
-当前**不能执行压测**，不包含 Worker、Locust 或任何目标请求功能。2026-09-16 已验证本机 Linux arm64 Docker 镜像构建、非 root 启动及独立 Agent 到本机临时 Django 的 HTTPS 接入；远程 Linux、公网连通性及 amd64 架构尚未验收。
+节点只执行平台固定模板，不执行用户 Python。Worker 仅连接本机 stunnel，stunnel 校验证书链和服务器名称后连接平台 Master；目标 HTTP 请求不继承 Agent 的代理或凭证环境。
 
 ## 安装与配置
 
-需要 Python 3.11+。依赖固定为 `requests==2.32.5` 与 `psutil==7.2.2`；下批如需引擎可安装 `.[engine]`（固定 `locust==2.43.3`），但本批源码不会导入 Locust 或 gevent。
+需要 Python 3.11+、Locust `2.43.3` 和 stunnel。Agent、Django、Celery 进程不会导入 Locust/gevent；只有独立 Worker 子进程加载执行引擎。
 
 ```bash
 cd performance-node
@@ -21,6 +23,8 @@ python -m venv .venv
 export PERFORMANCE_PLATFORM_URL='https://platform.example/platform'
 export PERFORMANCE_NODE_STATE_DIR="$HOME/.local/state/automation-platform-performance-node"
 export PERFORMANCE_NODE_ENROLLMENT_TOKEN_FILE='/secure/path/enrollment-token'
+# 可选；默认从 Agent 当前 PATH 解析 stunnel，再以绝对路径启动最小环境子进程。
+export PERFORMANCE_STUNNEL_BINARY='/absolute/path/to/stunnel'
 .venv/bin/python -m performance_node enroll
 .venv/bin/python -m performance_node run
 ```
@@ -31,7 +35,7 @@ export PERFORMANCE_NODE_ENROLLMENT_TOKEN_FILE='/secure/path/enrollment-token'
 
 ## Docker
 
-镜像以 UID `10001` 非 root 用户运行，只有独立命名卷持久化节点身份；没有特权权限、Docker socket 挂载、`env_file` 或平台 `.env` 依赖。先在宿主机以安全的环境注入方式提供平台 URL 和注册凭证，再执行登记（例如覆盖默认命令）：
+镜像固定安装 Locust `2.43.3` 与 stunnel4，以 UID `10001` 非 root 用户运行，只有独立命名卷持久化节点身份和执行状态；没有特权权限、Docker socket 挂载、`env_file` 或平台 `.env` 依赖。先在宿主机以安全的环境注入方式提供平台 URL 和注册凭证，再执行登记（例如覆盖默认命令）：
 
 ```bash
 cd performance-node

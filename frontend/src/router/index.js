@@ -157,11 +157,13 @@ const routes = [
   {
     path: '/perf-testing',
     component: () => import('@/layouts/MainLayout.vue'),
-    meta: { requiresAuth: true, layout: 'workspace', module: 'perf', title: '性能测试（建设中）' },
+    meta: { requiresAuth: true, layout: 'workspace', module: 'perf', title: '性能测试' },
     children: [
       { path: '', redirect: '/perf-testing/plans' },
       { path: 'workspace', redirect: '/perf-testing/plans' },
       { path: 'plans', name: 'PerfPlans', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '压测计划' } },
+      { path: 'runs', name: 'PerfRuns', component: () => import('@/views/perf-testing/PerfRunList.vue'), meta: { title: '执行记录' } },
+      { path: 'runs/:runId', name: 'PerfRunDetail', component: () => import('@/views/perf-testing/PerfRunDetail.vue'), meta: { title: '执行详情' } },
       { path: 'nodes', name: 'PerfNodes', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '节点管理' } },
       { path: 'targets', name: 'PerfTargets', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '压测目标' } }
     ]

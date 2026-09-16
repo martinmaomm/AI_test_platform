@@ -13,6 +13,7 @@ from .constants import (
     HEARTBEAT_INTERVAL_SECONDS, NODE_OFFLINE_AFTER_SECONDS, PROTOCOL_VERSION,
 )
 from .models import PerformanceNode
+from .run_services import execution_configuration, stop_runs_for_node_identity_change
 
 
 _DUMMY_DIGEST = '0' * 64
@@ -74,6 +75,9 @@ def issue_enrollment(node):
     locked = PerformanceNode.objects.select_for_update().get(pk=node.pk)
     token, digest = _new_credential(locked.pk)
     now = timezone.now()
+    stop_runs_for_node_identity_change(
+        locked, 'node_credentials_rotated', '节点身份已轮换，运行无法确认完整结束。', now,
+    )
     locked.enrollment_token_digest = digest
     locked.enrollment_expires_at = now + timedelta(seconds=ENROLLMENT_TTL_SECONDS)
     locked.enrollment_consumed_at = None
@@ -180,9 +184,38 @@ def record_heartbeat(node, credential, version_data, resources):
 
 
 @transaction.atomic
+def handle_agent_heartbeat(node, credential, version_data, resources, run_report):
+    """Keep credential revalidation, heartbeat and command dispatch atomic."""
+    ensure_supported_versions(version_data)
+    locked = PerformanceNode.objects.select_for_update().get(pk=node.pk)
+    if (
+        locked.revoked_at is not None
+        or not locked.agent_token_digest
+        or not hmac.compare_digest(locked.agent_token_digest, credential.digest)
+    ):
+        raise CredentialRejected
+    now = timezone.now()
+    locked.last_seen_at = now
+    locked.agent_version = version_data['agent_version']
+    locked.engine_version = version_data['engine_version']
+    locked.protocol_version = version_data['protocol_version']
+    locked.resources = resources
+    locked.save(update_fields=(
+        'last_seen_at', 'agent_version', 'engine_version', 'protocol_version',
+        'resources', 'updated_at',
+    ))
+    from .run_services import record_run_report_and_command
+    command = record_run_report_and_command(locked, run_report, now)
+    return now, command
+
+
+@transaction.atomic
 def revoke_node(node):
     locked = PerformanceNode.objects.select_for_update().get(pk=node.pk)
     now = timezone.now()
+    stop_runs_for_node_identity_change(
+        locked, 'node_revoked', '节点已吊销，运行无法确认完整结束。', now,
+    )
     if locked.revoked_at is None:
         locked.revoked_at = now
     locked.enrollment_token_digest = ''
@@ -205,11 +238,12 @@ def enrollment_response(node, token, serializer_class):
 
 
 def agent_enrollment_response(node, agent_token):
+    configuration = execution_configuration()
     return {
         'node_id': str(node.pk),
         'agent_token': agent_token,
         'heartbeat_interval_seconds': HEARTBEAT_INTERVAL_SECONDS,
         'lease_seconds': NODE_OFFLINE_AFTER_SECONDS,
         'protocol_version': PROTOCOL_VERSION,
-        'execution_enabled': False,
+        'execution_enabled': bool(configuration['available']),
     }

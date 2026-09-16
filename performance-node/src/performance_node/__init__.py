@@ -1,5 +1,5 @@
-"""Independent performance-node enrollment and heartbeat client."""
+"""Independent performance-node execution agent."""
 
-__version__ = "0.1.0"
-PROTOCOL_VERSION = 1
+__version__ = "0.2.0"
+PROTOCOL_VERSION = 2
 ENGINE_VERSION = "2.43.3"

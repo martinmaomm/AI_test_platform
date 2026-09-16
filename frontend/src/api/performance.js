@@ -23,6 +23,12 @@ export const deletePerformancePlan = (projectId, id) => remove(`${base(projectId
 
 export const getPerformanceNodes = (projectId) => get(`${base(projectId)}/nodes/`)
 
+// 执行接口只使用服务端公开的管理字段；运行命令和 TLS 材料不会经过前端。
+export const getPerformanceRuns = (projectId) => get(`${base(projectId)}/runs/`)
+export const getPerformanceRun = (projectId, runId) => get(`${base(projectId)}/runs/${runId}/`)
+export const createPerformanceRun = (projectId, planId, data) => post(`${base(projectId)}/plans/${planId}/runs/`, data)
+export const stopPerformanceRun = (projectId, runId) => post(`${base(projectId)}/runs/${runId}/stop/`, {})
+
 // 仅这两个显式响应会返回 enrollment_token；调用方必须只保留在临时弹窗状态中。
 export const createPerformanceNode = async (projectId, data) => {
   const response = await post(`${base(projectId)}/nodes/`, data)

@@ -85,6 +85,34 @@ class ProjectViewSet(viewsets.ModelViewSet):
         """Project metadata is managed by platform administrators only."""
         serializer.save()
 
+    def destroy(self, request, *args, **kwargs):
+        """Lock and reject active performance projects before cleanup starts."""
+        instance = self.get_object()
+        if instance.project_type != 'perf':
+            return super().destroy(request, *args, **kwargs)
+
+        with transaction.atomic():
+            queryset = self.filter_queryset(self.get_queryset()).select_for_update()
+            instance = get_object_or_404(queryset, pk=kwargs.get('pk'))
+            self.check_object_permissions(request, instance)
+            # Import lazily so ordinary project operations do not acquire a
+            # dependency on the performance application at module startup.
+            from performance_testing.models import PerformanceRun
+            if instance.performance_runs.filter(
+                status__in=PerformanceRun.ACTIVE_STATUSES,
+            ).exists():
+                message = '项目存在未结束的性能运行，请等待运行结束后再删除。'
+                return Response({
+                    'success': False,
+                    'message': message,
+                    'error': {
+                        'code': 'performance_run_active',
+                        'message': message,
+                    },
+                }, status=status.HTTP_409_CONFLICT)
+            self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
         page = int(request.query_params.get("page", 1))

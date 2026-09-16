@@ -76,7 +76,7 @@ class PerformanceManagementAPITests(TestCase):
         self.auth(self.editor)
         response = self.client.get(self.path('config/'))
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data['data']['phase'], 'node_access')
+        self.assertEqual(response.data['data']['phase'], 'execution')
         self.assertFalse(response.data['data']['execution_enabled'])
 
         self.auth(self.outsider)

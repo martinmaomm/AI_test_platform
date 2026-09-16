@@ -8,9 +8,10 @@ from .constants import HEARTBEAT_INTERVAL_SECONDS, NODE_OFFLINE_AFTER_SECONDS
 from .constants import PROTOCOL_VERSION
 from .parsers import LimitedJSONParser
 from .serializers import EnrollmentSerializer, HeartbeatSerializer
+from .run_services import RunReportRejected, execution_configuration
 from .services import (
     CredentialRejected, VersionMismatch, agent_enrollment_response,
-    consume_enrollment, record_heartbeat,
+    consume_enrollment, handle_agent_heartbeat,
 )
 
 
@@ -69,19 +70,26 @@ class AgentHeartbeatView(APIView):
             'engine_version': data['engine_version'],
         }
         try:
-            server_time = record_heartbeat(
+            server_time, command = handle_agent_heartbeat(
                 request.performance_node, request.auth, version_data, data['resources'],
+                data['run_report'],
             )
         except VersionMismatch:
             return _version_conflict()
         except CredentialRejected:
             return _unauthorized('节点身份凭证已失效。')
+        except RunReportRejected as exc:
+            return Response({
+                'success': False,
+                'error': {'code': 'run_report_rejected', 'message': str(exc)},
+            }, status=409)
+        configuration = execution_configuration()
         return _ok({
             'node_id': str(request.performance_node.pk),
             'server_time': server_time,
             'heartbeat_interval_seconds': HEARTBEAT_INTERVAL_SECONDS,
             'lease_seconds': NODE_OFFLINE_AFTER_SECONDS,
             'protocol_version': PROTOCOL_VERSION,
-            'command': {'type': 'idle'},
-            'execution_enabled': False,
+            'command': command,
+            'execution_enabled': bool(configuration['available']),
         })

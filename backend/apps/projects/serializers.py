@@ -63,15 +63,11 @@ ENVIRONMENT_CONFIG_KEYS = {
     Environment.EnvironmentCategory.WEB: {
         'base_url', 'variables',
     },
-    Environment.EnvironmentCategory.APP: {
-        'platform', 'device_name', 'app_package', 'app_activity',
-        'capabilities', 'appium_server_url', 'variables',
-    },
 }
 
 
 def normalize_environment_config(category, config):
-    """按环境类型裁剪配置，防止 API、WebUI、App 字段相互污染。"""
+    """按环境类型裁剪配置，防止 API 与 WebUI 字段相互污染。"""
 
     if not isinstance(config, dict):
         raise serializers.ValidationError({'config': '环境配置必须是对象'})
@@ -101,7 +97,6 @@ class EnvironmentSerializer(serializers.ModelSerializer):
     category_display = serializers.CharField(source='get_category_display', read_only=True)
     is_api_environment = serializers.BooleanField(read_only=True)
     is_web_environment = serializers.BooleanField(read_only=True)
-    is_app_environment = serializers.BooleanField(read_only=True)
     
     # 根据环境类型提供配置示例
     config_example = serializers.SerializerMethodField()
@@ -110,7 +105,7 @@ class EnvironmentSerializer(serializers.ModelSerializer):
         model = Environment
         fields = [
             'id', 'name', 'description', 'category', 'category_display',
-            'config', 'is_active', 'is_api_environment', 'is_web_environment', 'is_app_environment',
+            'config', 'is_active', 'is_api_environment', 'is_web_environment',
             'config_example', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']

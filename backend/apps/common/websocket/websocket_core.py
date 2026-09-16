@@ -39,11 +39,6 @@ class WebSocketConfig:
             'display_name': '场景生成',
             'description': 'API测试场景生成流式输出'
         },
-        'midscene_script_generation': {
-            'room_type': 'midscene_script_generation', 
-            'display_name': 'MidScene脚本生成',
-            'description': 'MidScene测试脚本生成流式输出'
-        },
         'webui_test_generation': {
             'room_type': 'webui_test_generation',
             'display_name': 'WebUI测试生成',

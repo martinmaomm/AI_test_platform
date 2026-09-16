@@ -76,7 +76,6 @@ from .generation_workspace import (
     evaluate_workspace_draft,
 )
 from .models import (
-    MidSceneScript,
     WebUIScriptGeneration,
     WebUITestCase,
     WebUITestCaseExecutionDetail,
@@ -132,7 +131,6 @@ from .tasks import (
     cancel_task,
     debug_webui_script_generation_task,
     execute_webui_test_suite_task,
-    generate_midscene_script_task,
     generate_webui_script_generation_task,
     repair_webui_script_generation_task,
     retry_webui_script_generation_from_trace_task,
@@ -943,102 +941,6 @@ class WebUIScriptGenerationSaveView(APIView):
                 },
             }
         )
-
-
-class GenerateMidSceneScriptView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    @project_access_required(EDIT, expected_project_type='app')
-    def post(self, request, project_id):
-        description = str(request.data.get('description') or '').strip()
-        screenshot_b64 = str(request.data.get('screenshot_b64') or '').strip()
-        if not description:
-            return response(kind='error', message='请输入测试场景描述', status_code=400)
-        project = get_project_for_user(
-            project_id,
-            request.user,
-            EDIT,
-            expected_project_type='app',
-        )
-        script = MidSceneScript.objects.create(
-            name=f"MidScene脚本_{timezone.now().strftime('%Y%m%d_%H%M%S')}",
-            description=description,
-            natural_language=description,
-            screenshot_b64=screenshot_b64,
-            created_by=request.user,
-            project=project,
-            status='pending',
-        )
-        task = generate_midscene_script_task.delay(
-            script_id=script.id,
-            user_id=request.user.id,
-            project_id=project.id,
-        )
-        return response(
-            kind='success',
-            data={'script_id': script.id, 'task_id': task.id, 'status': 'pending'},
-            message='MidScene 脚本生成任务已启动',
-        )
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-@project_access_required(REPORT, expected_project_type='app')
-def get_midscene_script(request, project_id, script_id):
-    script = get_object_or_404(MidSceneScript, id=script_id, project_id=project_id)
-    return response(
-        kind='success',
-        data={
-            'id': script.id,
-            'name': script.name,
-            'description': script.description,
-            'test_script_content': script.script_content,
-            'natural_language': script.natural_language,
-            'screenshot_b64': script.screenshot_b64,
-            'is_executed': script.is_executed,
-            'execution_result': script.execution_result,
-            'execution_logs': script.execution_logs,
-            'status': script.status,
-            'task_id': script.task_id,
-            'created_at': script.created_at.isoformat(),
-            'updated_at': script.updated_at.isoformat(),
-        },
-        message='获取 MidScene 脚本成功',
-    )
-
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-@project_access_required(READ, expected_project_type='app')
-def list_midscene_scripts(request, project_id):
-    queryset = MidSceneScript.objects.filter(project_id=project_id)
-    if request.GET.get('status'):
-        queryset = queryset.filter(status=request.GET['status'])
-    page = max(int(request.GET.get('page', 1)), 1)
-    page_size = min(max(int(request.GET.get('page_size', 10)), 1), 100)
-    total = queryset.count()
-    scripts = queryset[(page - 1) * page_size:page * page_size]
-    return response(
-        kind='success',
-        data={
-            'scripts': [
-                {
-                    'id': item.id,
-                    'name': item.name,
-                    'description': item.description,
-                    'status': item.status,
-                    'is_executed': item.is_executed,
-                    'created_at': item.created_at.isoformat(),
-                    'updated_at': item.updated_at.isoformat(),
-                }
-                for item in scripts
-            ],
-            'total': total,
-            'page': page,
-            'page_size': page_size,
-        },
-        message='获取 MidScene 脚本列表成功',
-    )
 
 
 class TaskStatusView(APIView):

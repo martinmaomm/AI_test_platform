@@ -132,7 +132,6 @@ class WebSocketConsumerFactory:
     
     _consumers = {
         'scenario_generation': StreamingConsumer,
-        'midscene_script_generation': StreamingConsumer,
         'webui_test_generation': StreamingConsumer,
         'webui_auto_test': StreamingConsumer,
         'task_status': TaskStatusConsumer,

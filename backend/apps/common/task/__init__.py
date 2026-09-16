@@ -4,7 +4,6 @@
 """
 from .celery_task_utils import (
     execute_async_task_with_progress,
-    execute_async_task_with_websocket,
     update_task_progress,
     update_task_success,
     build_error_result,
@@ -13,7 +12,6 @@ from .celery_task_utils import (
 
 __all__ = [
     'execute_async_task_with_progress',
-    'execute_async_task_with_websocket',
     'update_task_progress',
     'update_task_success',
     'build_error_result',

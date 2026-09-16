@@ -241,8 +241,5 @@ test("workspace uses the approved API scope and safe plain-text rendering", asyn
     routerSource,
     /name: 'ApiKnowledgeBase', component: \(\) => import\('\@\/views\/project\/KnowledgeBase\.vue'\)/,
   );
-  assert.match(
-    routerSource,
-    /name: 'AppKnowledgeBase', component: \(\) => import\('\@\/views\/project\/KnowledgeBase\.vue'\)/,
-  );
+  assert.doesNotMatch(routerSource, /AppKnowledgeBase|app-testing/);
 });

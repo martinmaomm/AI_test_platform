@@ -54,7 +54,9 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         # 按项目类型过滤
         project_type = self.request.query_params.get('project_type', '')
-        if project_type and project_type in ['api', 'web', 'app', 'perf']:
+        if project_type:
+            if project_type not in dict(Project.PROJECT_TYPE_CHOICES):
+                raise ValidationError({'project_type': '不支持的项目类型'})
             queryset = queryset.filter(project_type=project_type)
 
         # 搜索功能

@@ -15,7 +15,6 @@ from langchain_core.outputs import ChatGenerationChunk
 from openai import PermissionDeniedError
 from pydantic import BaseModel
 
-from ai_core.midscene_script_agent import MidSceneAgent
 from ai_core.model_manager import ModelManager
 from ai_core.models import LLMConfiguration
 
@@ -321,21 +320,3 @@ class ModelManagerStreamInvokeTests(SimpleTestCase):
         self.assertEqual(received, [('generation', 'partial ')])
         self.assertIs(raised.exception.__cause__, llm.error)
         llm.invoke.assert_not_called()
-
-
-class MidSceneStreamingFailureTests(SimpleTestCase):
-    def test_partial_stream_failure_does_not_start_a_second_model_request(self):
-        agent = MidSceneAgent.__new__(MidSceneAgent)
-        agent.enable_streaming = True
-        agent.streaming_callback = None
-        agent._send_websocket_message = Mock()
-        agent.generate_midscene_script = Mock(
-            side_effect=RuntimeError('provider stream interrupted')
-        )
-        agent._call_vision_model = Mock(return_value='must not be used')
-
-        with self.assertRaisesRegex(RuntimeError, 'provider stream interrupted'):
-            agent._stream_vision_response('generate script', 'script_generator')
-
-        agent.generate_midscene_script.assert_called_once()
-        agent._call_vision_model.assert_not_called()

@@ -237,45 +237,6 @@
           </el-form-item>
         </div>
 
-        <!-- App 配置 -->
-        <div v-if="environmentForm.category === 'app'">
-          <el-divider content-position="left">App 配置</el-divider>
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="平台" prop="config.platform">
-                <el-select v-model="environmentForm.config.platform" placeholder="选择平台">
-                  <el-option label="Android" value="android" />
-                  <el-option label="iOS" value="ios" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="设备名称" prop="config.device_name">
-                <el-input v-model="environmentForm.config.device_name" placeholder="如：Android Emulator" />
-              </el-form-item>
-            </el-col>
-          </el-row>
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="App包名" prop="config.app_package">
-                <el-input v-model="environmentForm.config.app_package" placeholder="如：com.example.app" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="启动Activity" prop="config.app_activity">
-                <el-input v-model="environmentForm.config.app_activity" placeholder="如：.MainActivity" />
-              </el-form-item>
-            </el-col>
-          </el-row>
-          <el-form-item label="Appium服务器URL" prop="config.appium_server_url">
-            <el-input v-model="environmentForm.config.appium_server_url" placeholder="如：http://localhost:4723" />
-          </el-form-item>
-          <el-form-item label="Capabilities" prop="config.capabilities">
-            <el-input v-model="environmentForm.config.capabilities" type="textarea" :rows="3"
-              placeholder="JSON格式的Appium capabilities，如：{'platformVersion': '11.0', 'automationName': 'UiAutomator2'}" />
-          </el-form-item>
-        </div>
-
       </el-form>
 
       <template #footer>
@@ -340,7 +301,6 @@ const normalizeEnvironmentCategory = (value) => {
   const category = String(value || '').trim().toLowerCase().replace(/[-_]/g, '')
   if (category === 'api') return 'api'
   if (['web', 'webui'].includes(category)) return 'web'
-  if (category === 'app') return 'app'
   return null
 }
 
@@ -358,8 +318,7 @@ const environmentCategory = computed(() => {
 const environmentCategoryLabel = computed(() => {
   const labelMap = {
     api: 'API测试',
-    web: 'WebUI测试',
-    app: 'App测试'
+    web: 'WebUI测试'
   }
   return labelMap[environmentCategory.value] || '项目'
 })
@@ -384,16 +343,6 @@ const getDefaultEnvironmentConfig = (category = environmentCategory.value || 'we
       headers: '{}',
       variables: '{}',
       timeout: 30
-    }
-  } else if (category === 'app') {
-    base.config = {
-      platform: 'android',
-      device_name: '',
-      app_package: '',
-      app_activity: '',
-      capabilities: '{}',
-      appium_server_url: 'http://localhost:4723',
-      variables: '{}'
     }
   } else {
     base.config = {
@@ -447,32 +396,7 @@ const environmentRules = {
     }
   ],
   'config.variables': [{ validator: validateJson, trigger: 'blur' }],
-  'config.headers': [{ validator: validateJson, trigger: 'blur' }],
-  'config.capabilities': [{ validator: validateJson, trigger: 'blur' }],
-  'config.app_package': [
-    {
-      validator: (rule, value, callback) => {
-        if (environmentForm.category === 'app' && (!value || !String(value).trim())) {
-          callback(new Error('App环境必须配置包名'))
-        } else {
-          callback()
-        }
-      },
-      trigger: 'blur'
-    }
-  ],
-  'config.app_activity': [
-    {
-      validator: (rule, value, callback) => {
-        if (environmentForm.category === 'app' && environmentForm.config.platform === 'android' && (!value || !String(value).trim())) {
-          callback(new Error('Android环境必须配置启动Activity'))
-        } else {
-          callback()
-        }
-      },
-      trigger: 'blur'
-    }
-  ]
+  'config.headers': [{ validator: validateJson, trigger: 'blur' }]
 }
 
 // 本地状态
@@ -639,18 +563,6 @@ const getEnvironmentConfigPayload = (category, config = {}) => {
     }
   }
 
-  if (category === 'app') {
-    return {
-      platform: config.platform || 'android',
-      device_name: config.device_name || '',
-      app_package: config.app_package || '',
-      app_activity: config.app_activity || '',
-      capabilities: parseJsonField(config.capabilities, {}),
-      appium_server_url: config.appium_server_url || 'http://localhost:4723',
-      variables
-    }
-  }
-
   return {
     base_url: String(config.base_url || '').trim(),
     variables
@@ -664,18 +576,6 @@ const getEnvironmentFormConfig = (category, config = {}) => {
       headers: stringifyJsonField(config.headers),
       variables: stringifyJsonField(config.variables),
       timeout: config.timeout || 30
-    }
-  }
-
-  if (category === 'app') {
-    return {
-      platform: config.platform || 'android',
-      device_name: config.device_name || '',
-      app_package: config.app_package || '',
-      app_activity: config.app_activity || '',
-      capabilities: stringifyJsonField(config.capabilities),
-      appium_server_url: config.appium_server_url || 'http://localhost:4723',
-      variables: stringifyJsonField(config.variables)
     }
   }
 
@@ -945,8 +845,7 @@ const formatDate = (dateStr) => {
 const getEnvironmentTypeTagType = (category) => {
   const typeMap = {
     'api': 'primary',
-    'web': 'success',
-    'app': 'warning'
+    'web': 'success'
   }
   return typeMap[category] || 'default'
 }

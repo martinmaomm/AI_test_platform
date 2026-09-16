@@ -15,9 +15,6 @@ WEBSOCKET_URL_PATTERNS = [
     # 场景生成流式输出WebSocket
     re_path(r'ws/scenario_generation-streaming/$', StreamingConsumer.as_asgi()),
     
-    # MidScene脚本生成流式输出WebSocket
-    re_path(r'ws/midscene_script_generation-streaming/$', StreamingConsumer.as_asgi()),
-    
     # WebUI测试流式输出WebSocket
     re_path(r'ws/webui_test_generation-streaming/$', StreamingConsumer.as_asgi()),
     

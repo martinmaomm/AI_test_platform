@@ -10,7 +10,6 @@ class Project(models.Model):
     PROJECT_TYPE_CHOICES = [
         ('api', _('API Testing')),
         ('web', _('Web Testing')),
-        ('app', _('App Testing')),
         ('perf', _('Performance Testing')),
     ]
 
@@ -89,11 +88,10 @@ class ProjectMember(models.Model):
 
 
 class Environment(models.Model):
-    """统一环境模型 - 支持API、WebUI、App测试"""
+    """API 与 WebUI 的项目环境配置。"""
     class EnvironmentCategory(models.TextChoices):
         API = 'api', _('API Testing')
         WEB = 'web', _('WebUI Testing')
-        APP = 'app', _('App Testing')
 
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='environments')
     name = models.CharField(_('environment name'), max_length=100)
@@ -123,10 +121,6 @@ class Environment(models.Model):
     def is_web_environment(self):
         return self.category == self.EnvironmentCategory.WEB
 
-    @property
-    def is_app_environment(self):
-        return self.category == self.EnvironmentCategory.APP
-
     def get_api_config(self):
         """获取API环境配置"""
         if not self.is_api_environment:
@@ -149,20 +143,6 @@ class Environment(models.Model):
             'variables': self.config.get('variables', {}),
         }
 
-    def get_app_config(self):
-        """获取App环境配置"""
-        if not self.is_app_environment:
-            return None
-        
-        return {
-            'platform': self.config.get('platform', 'android'),
-            'device_name': self.config.get('device_name', ''),
-            'app_package': self.config.get('app_package', ''),
-            'app_activity': self.config.get('app_activity', ''),
-            'capabilities': self.config.get('capabilities', {}),
-            'appium_server_url': self.config.get('appium_server_url', 'http://localhost:4723')
-        }
-
     def validate_config(self):
         """验证环境配置的完整性"""
         errors = {}
@@ -181,14 +161,6 @@ class Environment(models.Model):
             if self.config.get('page_load_timeout', 30) <= 0:
                 errors['page_load_timeout'] = '页面加载超时时间必须大于0'
                 
-        elif self.category == self.EnvironmentCategory.APP:
-            if not self.config.get('device_name'):
-                errors['device_name'] = 'App环境必须提供设备名称'
-            if not self.config.get('app_package'):
-                errors['app_package'] = 'App环境必须提供App包名'
-            if self.config.get('platform') == 'android' and not self.config.get('app_activity'):
-                errors['app_activity'] = 'Android环境必须提供App Activity'
-        
         return errors
 
     def get_config_example(self):
@@ -204,15 +176,6 @@ class Environment(models.Model):
             return {
                 "base_url": "https://web.xxx.com",
                 "variables": {"env": "test"}
-            }
-        elif self.category == self.EnvironmentCategory.APP:
-            return {
-                "platform": "android",
-                "device_name": "emulator-5554",
-                "app_package": "com.xxx.app",
-                "app_activity": ".MainActivity",
-                "capabilities": {"noReset": True},
-                "appium_server_url": "http://localhost:4723"
             }
         return {}
 

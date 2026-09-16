@@ -14,19 +14,14 @@ from typing import Any, Dict
 from celery import shared_task
 from celery.result import AsyncResult
 from django.conf import settings
-from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.utils import timezone
 
-from ai_core.midscene_script_agent import create_midscene_agent
 from common.task import (
     build_error_result,
     execute_async_task_with_progress,
-    execute_async_task_with_websocket,
     update_task_progress,
 )
-from projects.models import Project
-
 from .constants import WEBUI_BROWSER_ENGINE, normalize_webui_execution_options
 from .assertion_state import analyze_assertion_state, evaluation_status
 from .execution_diagnostics import friendly_failure_summary
@@ -34,7 +29,6 @@ from .execution_variables import (
     merge_execution_variables, pop_runtime_variables, pop_repair_runtime_variables,
 )
 from .models import (
-    MidSceneScript,
     WebUIScriptGeneration,
     WebUITestCaseExecutionDetail,
     WebUITestExecution,
@@ -42,7 +36,6 @@ from .models import (
 )
 from .project_access import EDIT, get_project_for_user
 
-User = get_user_model()
 logger = logging.getLogger(__name__)
 
 
@@ -894,81 +887,6 @@ def repair_webui_script_generation_task(self, generation_id: str, locked_revisio
         return build_error_result(self.request.id, message)
 
 
-@shared_task(bind=True, name='web_testing.generate_midscene_script')
-def generate_midscene_script_task(self, script_id: int, user_id: int, project_id: int):
-    return execute_async_task_with_websocket(
-        self,
-        'midscene_script_generation',
-        _execute_midscene_script_generation,
-        script_id,
-        user_id,
-        project_id,
-    )
-
-
-def _execute_midscene_script_generation(
-    task_instance,
-    script_id: int,
-    user_id: int,
-    project_id: int,
-) -> Dict[str, Any]:
-    """Keep the App automation generation flow isolated from Web UI scripts."""
-    script = None
-    try:
-        update_task_progress(task_instance, 10, '正在获取用户和项目信息...')
-        user = User.objects.get(id=user_id)
-        get_project_for_user(project_id, user, EDIT, expected_project_type='app')
-        script = MidSceneScript.objects.get(id=script_id, project_id=project_id)
-        script.task_id = task_instance.request.id
-        script.status = 'running'
-        script.save()
-
-        update_task_progress(task_instance, 40, '正在生成 MidScene 脚本...')
-        agent = create_midscene_agent(user=user, user_id=user_id, enable_streaming=True)
-        result = agent.run(
-            description=script.natural_language,
-            screenshot_b64=script.screenshot_b64,
-        )
-        if result.get('success'):
-            script.script_content = result['script']
-            script.status = 'completed'
-            script.is_executed = True
-            script.execution_result = {
-                'model_info': result.get('model_info', {}),
-                'model_type': result.get('model_type', 'unknown'),
-                'generated_at': timezone.now().isoformat(),
-            }
-            script.save()
-            update_task_progress(task_instance, 100, 'MidScene 脚本生成完成')
-            return {
-                'success': True,
-                'status': 'completed',
-                'message': 'MidScene 脚本生成成功',
-                'script_id': script_id,
-                'script': result['script'],
-            }
-        error = result.get('error', '未知错误')
-        script.status = 'failed'
-        script.execution_error = error
-        script.save()
-        return {
-            'success': False,
-            'status': 'completed',
-            'message': f'MidScene 脚本生成失败: {error}',
-            'error': error,
-            'script_id': script_id,
-        }
-    except (User.DoesNotExist, Project.DoesNotExist, MidSceneScript.DoesNotExist) as exc:
-        return build_error_result(None, f'资源不存在: {exc}')
-    except Exception as exc:
-        logger.error('MidScene 脚本生成任务异常: %s', exc, exc_info=True)
-        if script is not None:
-            script.status = 'failed'
-            script.execution_error = str(exc)
-            script.save()
-        return build_error_result(None, f'MidScene 脚本生成任务异常: {exc}')
-
-
 @shared_task(name='web_testing.cancel_task')
 def cancel_task(task_id: str) -> Dict[str, Any]:
     """Set cooperative cancellation and stop queued/running Celery work."""
@@ -980,10 +898,6 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
             status='stopped',
             error_message='任务已取消',
             end_time=now,
-        )
-        MidSceneScript.objects.filter(task_id=task_id).update(
-            status='cancelled',
-            completed_at=now,
         )
         return {'success': True, 'message': '任务已取消', 'task_id': task_id}
     except Exception as exc:

@@ -56,7 +56,7 @@ async function fetchDetail() {
     error.value = requestError?.response?.data?.message || requestError?.response?.data?.detail || requestError?.message || '请求失败，请重试。'
   } finally { if (version === requestVersion) loading.value = false }
 }
-const suiteType = type => ({ web: 'Web 测试', api: 'API 测试', app: 'App 测试' }[type] || type || '--')
+const suiteType = type => ({ web: 'Web 测试', api: 'API 测试' }[type] || type || '--')
 const statusText = status => ({ running: '执行中', pending: '等待中', cancelled: '已取消', passed: '通过', success: '通过', failed: '失败', error: '错误', incomplete: '验证未完成', skipped: '跳过' }[status] || status || '--')
 const formatDateTime = value => value ? dayjs(value).format('YYYY-MM-DD HH:mm:ss') : '--'
 watch(id, fetchDetail, { immediate: true })

@@ -13,7 +13,7 @@ from ..serializers import EnvironmentSerializer, EnvironmentCreateSerializer
 from common.api import response
 
 
-SUPPORTED_PROJECT_ENVIRONMENT_TYPES = {'api', 'web', 'app'}
+SUPPORTED_PROJECT_ENVIRONMENT_TYPES = {'api', 'web'}
 
 
 def get_project_environment_category(project):

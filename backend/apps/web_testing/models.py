@@ -667,7 +667,8 @@ class WebUIScriptAssistant(models.Model):
         ]
 
 
-# ============ MidScene脚本 ============
+# 历史存储模型：MidScene 接口、任务与页面已退役。
+# 保留表映射以避免本次代码清理隐式删除历史数据；不再提供运行入口。
 
 class MidSceneScript(models.Model):
     """MidScene脚本模型"""

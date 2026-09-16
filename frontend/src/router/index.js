@@ -84,14 +84,6 @@ const routes = [
     ]
   },
   {
-    path: '/app-testing/projects',
-    component: () => import('@/layouts/PortalLayout.vue'),
-    meta: { requiresAuth: true, layout: 'portal', title: 'App 测试项目列表' },
-    children: [
-      { path: '', name: 'AppProjectList', component: () => import('@/views/app-testing/AppProjectList.vue') }
-    ]
-  },
-  {
     path: '/perf-testing/projects',
     component: () => import('@/layouts/PortalLayout.vue'),
     meta: { requiresAuth: true, layout: 'portal', title: '性能专项测试项目列表' },
@@ -158,26 +150,6 @@ const routes = [
       { path: 'scheduled-tasks', name: 'WebScheduledTasks', component: () => import('@/views/scheduledTasks/ScheduledTasksPage.vue'), meta: { title: '定时任务' } },
       { path: 'notification-receivers', name: 'WebNotificationReceivers', component: () => import('@/views/project/NotificationReceivers.vue'), meta: { title: '通知接收管理' } },
       { path: 'knowledge-base', name: 'WebKnowledgeBase', component: () => import('@/views/project-knowledge/ProjectKnowledgeWorkspace.vue'), meta: { title: '项目知识库' } }
-    ]
-  },
-
-  // App测试管理
-  {
-    path: '/app-testing',
-    component: () => import('@/layouts/MainLayout.vue'),
-    meta: { requiresAuth: true, layout: 'workspace', module: 'app', title: 'App 自动化测试' },
-    children: [
-      { path: '', redirect: '/app-testing/pom-parser' },
-      { path: 'pom-parser', name: 'AppPomParser', component: () => import('@/views/app-testing/PomParser.vue'), meta: { title: 'POM智能解析' } },
-      { path: 'app-auto-test', name: 'AppAutoTest', component: () => import('@/views/app-testing/AppAutoTest.vue'), meta: { title: 'App自动测试' } },
-      { path: 'ui-agent', name: 'AppUiAgent', component: () => import('@/views/app-testing/UiAgent.vue'), meta: { title: 'UI智能体' } },
-      { path: 'test-cases', name: 'AppTestCases', component: () => import('@/views/app-testing/TestCases.vue'), meta: { title: '测试用例管理' } },
-      { path: 'test-executions', redirect: '/app-testing/test-runs' },
-      { path: 'test-runs', name: 'AppTestRuns', component: () => import('@/views/app-testing/TestRuns.vue'), meta: { title: '测试执行记录' } },
-      { path: 'scheduled-tasks', name: 'AppScheduledTasks', component: () => import('@/views/scheduledTasks/ScheduledTasksPage.vue'), meta: { title: '定时任务' } },
-      { path: 'environments', name: 'AppEnvironments', component: () => import('@/views/project/ProjectEnvironments.vue'), meta: { title: '环境管理' } },
-      { path: 'notification-receivers', name: 'AppNotificationReceivers', component: () => import('@/views/project/NotificationReceivers.vue'), meta: { title: '通知接收管理' } },
-      { path: 'knowledge-base', name: 'AppKnowledgeBase', component: () => import('@/views/project/KnowledgeBase.vue'), meta: { title: '知识库管理' } }
     ]
   },
 

@@ -30,10 +30,6 @@ urlpatterns = [
     path('script-generations/<uuid:generation_id>/repair/discard/', views.WebUIScriptGenerationRepairDiscardView.as_view(), name='script-generation-repair-discard'),
     path('script-generations/<uuid:generation_id>/save/', views.WebUIScriptGenerationSaveView.as_view(), name='script-generation-save'),
 
-    # App automation remains isolated from the Web UI flow.
-    path('midscene/generate/', views.GenerateMidSceneScriptView.as_view(), name='generate-midscene-script'),
-    path('midscene/scripts/', views.list_midscene_scripts, name='list-midscene-scripts'),
-    path('midscene/scripts/<int:script_id>/', views.get_midscene_script, name='get-midscene-script'),
     path('task-status/<str:task_id>/', views.TaskStatusView.as_view(), name='task-status'),
 
     # Business classification only.

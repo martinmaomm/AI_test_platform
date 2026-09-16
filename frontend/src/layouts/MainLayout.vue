@@ -259,20 +259,6 @@ const MENU_CONFIG = {
       }
     ]
   },
-  app: {
-    title: 'App 自动化测试',
-    items: [
-      { path: '/app-testing/pom-parser', label: 'POM智能解析' },
-      { path: '/app-testing/app-auto-test', label: 'App自动测试' },
-      { path: '/app-testing/ui-agent', label: 'UI智能体' },
-      { path: '/app-testing/test-cases', label: '测试用例管理' },
-      { path: '/app-testing/test-executions', label: '测试执行记录' },
-      { path: '/app-testing/scheduled-tasks', label: '定时任务' },
-      { path: '/app-testing/environments', label: '环境管理' },
-      { path: '/app-testing/knowledge-base', label: '知识库管理' },
-      { path: '/app-testing/notification-receivers', label: '通知接收管理' }
-    ]
-  },
   perf: {
     title: '性能专项测试',
     items: [
@@ -390,7 +376,6 @@ const currentModule = computed(() => {
   // 从路径推断模块（兜底，确保工作区路由总能正确显示菜单）
   if (route.path.startsWith('/api-testing')) return 'api'
   if (route.path.startsWith('/web-testing')) return 'web'
-  if (route.path.startsWith('/app-testing')) return 'app'
   if (route.path.startsWith('/perf-testing')) return 'perf'
   if (route.path.startsWith('/project')) return 'project'
   return null
@@ -425,7 +410,6 @@ const currentMenuName = computed(() => {
 const MODULE_PROJECT_LIST_PATH = {
   api: '/api-testing/projects',
   web: '/web-testing/projects',
-  app: '/app-testing/projects',
   perf: '/perf-testing/projects',
   project: '/project/project-list'
 }
@@ -449,7 +433,6 @@ const activeMenuIndex = computed(() => {
   // 模块基础路径 -> 默认子页
   if (p === '/api-testing') return '/api-testing/workspace'
   if (p === '/web-testing' || p === '/web-testing/create' || p.startsWith('/web-testing/create/')) return '/web-testing/create'
-  if (p === '/app-testing') return '/app-testing/pom-parser'
   if (p === '/perf-testing') return '/perf-testing/workspace'
   if (p === '/project') return '/project/project-list'
   return p

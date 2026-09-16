@@ -1,0 +1,42 @@
+{
+	admin off
+	persist_config off
+	auto_https disable_redirects
+	skip_install_trust
+	storage file_system {
+		root {$PERFORMANCE_GATEWAY_DATA}
+	}
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			read_body 20s
+			write 30s
+			idle 60s
+		}
+	}
+}
+
+https://{$PERFORMANCE_GATEWAY_DOMAIN}:{$PERFORMANCE_GATEWAY_PORT:18443} {
+	bind {$PERFORMANCE_GATEWAY_BIND:127.0.0.1}
+	tls internal
+	@agent {
+		method POST
+		path /api/v1/performance-agent/enroll/ /api/v1/performance-agent/heartbeat/
+	}
+	handle @agent {
+		request_body {
+			max_size 65536
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			header_up Host 127.0.0.1
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		respond "Not Found" 404
+	}
+}

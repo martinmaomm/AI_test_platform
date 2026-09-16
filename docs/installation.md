@@ -410,7 +410,7 @@ npm run build
 ## 12. 当前已知配置边界
 
 - `env.example` 为 `LLM_TIMEOUT_SECONDS` 写了 300 秒，而未设置该键时模型管理器代码默认 600 秒；显式 `.env` 值优先。
-- 仓库当前没有可直接投入生产的反向代理、TLS、静态站点或进程守护配置；部署这些基础设施前应先完成安全评审。
+- 仓库提供仅供性能节点接入的窄范围 HTTPS 入口参考，不是整个平台的生产发布方案；静态站点、全站反向代理、限流和进程守护仍需单独配置和安全评审。
 
 ## 13. 性能测试：节点接入与单节点执行
 
@@ -469,3 +469,9 @@ cd backend
 ```
 
 这不是远程 Linux/公网部署验收。远程上线还需验证 HTTPS 入口、端口可达、容器架构和实际网络断连行为。旧 `verify_performance_transport.py --confirm-local-load` 仅是底层传输原型，不代替平台链路验收。
+
+### 13.4 公网 Docker 节点
+
+无 VPN 的部署参考、Agent 专用 Caddy 入口、私有 CA 分发、Docker 登记与启动、临时目标和排障命令见[公网节点部署说明](../deploy/performance/README.md)。2026-09-16 已完成一台 Linux amd64 公网节点的低负载真实联调，证据与未覆盖边界见[公网节点验收记录](verification/2026-09-16-performance-public-node.md)。
+
+Mac 的网关和独立执行控制器目前没有开机自启；重启机器后，只启动后端/Celery 不足以恢复性能执行，还要按上述文档启动这两个进程。

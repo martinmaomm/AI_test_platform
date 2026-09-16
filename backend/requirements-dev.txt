@@ -1,0 +1,4 @@
+# 可选开发工具；常规部署仅安装 requirements.txt。
+-r requirements.txt
+
+black==25.12.0

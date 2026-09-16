@@ -51,6 +51,8 @@ python -m pip check
 
 建议将虚拟环境保留在 `backend/.venv`；启动 Django、Celery、Python Playwright 安装和测试时都使用同一环境。若 Python 3.13 在新机器上无法解析或编译某个依赖，先记录完整错误、Python/CPU/系统版本，再决定调整解释器或依赖版本；不要在生产机器上临时删改锁定条目来“装到能跑”。
 
+常规部署只执行 `python -m pip install -r requirements.txt`。需要使用 Black 的开发环境再额外执行 `python -m pip install -r requirements-dev.txt`；该文件会先包含运行依赖。`pytest`、`pytest-playwright` 和 Python `playwright` 仍属于当前运行依赖，不因 Black 的开发工具拆分而移除。
+
 > 目录迁移注意：根目录从 `aits_v2` 改为 `automation-platform` 后，现有虚拟环境中的解释器入口可能仍指向旧绝对路径；请重建虚拟环境或逐一检查入口。VSCode 与 Codex 也应重新打开新目录。目录改名不要求、也不应手动改动现有数据库名或 `DB_NAME`；继续使用同一数据库并按正常迁移流程核对即可。
 >
 > 旧版本升级还需同步本地 `.env`：环境变量已去掉 `AITS_` 前缀，例如 `LLM_TIMEOUT_SECONDS`、`API_BROWSER_DISCOVERY_ENABLED`，旧变量名不再读取。已有生成草稿的内部标记、API 规范元数据及绝对日志路径应先备份并核对，再做定向更新；不要对整个数据库做字符串替换，也不要把历史执行日志当作配置重写。Git 历史和历史验收文档保留当时的名称与路径。
@@ -87,7 +89,7 @@ test -f .env || cp env.example .env
 chmod 600 .env
 ```
 
-`env.example` 只是起始模板，**不能原样复制后直接运行**：其中“SQLite 默认”注释已过期，而且模板没有列出当前数据库连接所需的五个 `DB_*` 键。复制后必须手工补全以下 `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`；占位符必须替换为实际值，示例不提供真实主机、密码或密钥。
+`env.example` 是起始模板，已列出当前数据库连接所需的 `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`。复制后必须将这些安全占位符替换为目标实例的实际值；示例不提供真实主机、密码或密钥。
 
 ```dotenv
 # 本机开发示例；仅在可信测试网络使用
@@ -153,7 +155,7 @@ python manage.py createsuperuser
 | Celery 任务限制配置 | `CELERY_TASK_TIME_LIMIT`（源码，30 分钟） | 与业务总时限独立；当前 solo 池在主进程内执行，不能依赖此配置保证强制中断。仍需各流程的业务超时和执行器中止机制。 |
 | MCP JSON | Playwright MCP 的 `timeout` | 若未设置，预检代码赋值为 30；它是 MCP 调用设置，不是 LLM 或 Celery 总时限。 |
 
-不要把 `env.example` 中的每个键都视为已接入配置：`FILE_UPLOAD_MAX_MEMORY_SIZE` 和 `DATA_UPLOAD_MAX_MEMORY_SIZE` 当前在 `settings.py` 中固定为 10 MiB，未读取同名环境变量。前者是上传文件的内存存储阈值，后者是请求数据的内存限制，不能统称为所有模块的文件上传上限；例如项目知识库有自己的 50 MiB 文件校验。单改这两个 `.env` 键不会生效。
+`FILE_UPLOAD_MAX_MEMORY_SIZE` 和 `DATA_UPLOAD_MAX_MEMORY_SIZE` 当前均在 `settings.py` 中固定为 10 MiB，因此模板不提供对应环境变量。前者是上传文件转入内存存储的阈值，后者是请求数据的内存限制；两者不等价于统一的文件上传上限。例如项目知识库另有自己的 50 MiB 文件校验。
 
 ## 5. 前端安装、开发代理与生产边界
 
@@ -405,9 +407,7 @@ npm run build
 
 回退时先停止新服务，再按已评审方案恢复匹配的代码、数据库及必要文件。迁移是否可逆取决于实际 migration；反向迁移不能保证找回已删除数据。不要直接在新 Schema 上启动旧代码，也不要把删库、删媒体或清空 Redis 当作常规回退方式。历史模块文档中的回退版本只适用于其当次变更，不可作为所有版本通用命令。
 
-## 12. 当前文档与配置差异
+## 12. 当前已知配置边界
 
-- `backend/env.example` 仍写“SQLite 开发环境默认”，但当前 `backend/config/settings.py` 固定为 MySQL backend 并读取 `DB_NAME`、`DB_USER`、`DB_PASSWORD`、`DB_HOST`、`DB_PORT`；没有 `DB_ENGINE` 环境变量可切换引擎，`config/__init__.py` 以 PyMySQL 适配 MySQLdb。本指南以代码为准。
-- `env.example` 中的 `FILE_UPLOAD_MAX_MEMORY_SIZE` / `DATA_UPLOAD_MAX_MEMORY_SIZE` 目前不会被 settings 读取；代码固定为 10 MiB，其内存限制语义与各模块文件大小校验不同。
 - `env.example` 为 `LLM_TIMEOUT_SECONDS` 写了 300 秒，而未设置该键时模型管理器代码默认 600 秒；显式 `.env` 值优先。
 - 仓库当前没有可直接投入生产的反向代理、TLS、静态站点或进程守护配置；部署这些基础设施前应先完成安全评审。

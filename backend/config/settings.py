@@ -296,11 +296,6 @@ CSRF_COOKIE_HTTPONLY = False  # Allow JavaScript access to CSRF token
 CSRF_COOKIE_SAMESITE = 'Lax'  # Allow cross-site requests
 CSRF_USE_SESSIONS = False  # Use cookies instead of sessions for CSRF
 
-# CSRF exemption for API endpoints using JWT authentication
-CSRF_EXEMPT_URLS = [
-    r'^api/v1/.*$',  # Exempt all API v1 endpoints
-]
-
 # Session settings removed - using JWT only
 
 
@@ -337,9 +332,8 @@ LOGGING = {
     },
 }
 
-# Security settings（官方标准；实际 iframe 嵌入由移除 XFrameOptionsMiddleware 保证）
+# Security settings（XFrameOptionsMiddleware 仍在 MIDDLEWARE 中启用）
 X_FRAME_OPTIONS = 'SAMEORIGIN'
-SECURE_BROWSER_XSS_FILTER = False  # Disable XSS filter for development
 SECURE_CONTENT_TYPE_NOSNIFF = False  # Disable content type sniffing for development
 
 # Channels配置
@@ -366,8 +360,4 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,               # 旧的 refresh 是否作废
     "AUTH_HEADER_TYPES": ("Bearer",),               # 请求头格式: Authorization: Bearer <token>
     
-    # 黑名单配置
-    "BLACKLIST_TOKEN_CHECKS": [
-        "rest_framework_simplejwt.token_blacklist.blacklist_checks.check_blacklist",
-    ],
 }

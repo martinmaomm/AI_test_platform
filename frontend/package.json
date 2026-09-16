@@ -17,18 +17,12 @@
     "dayjs": "^1.11.10",
     "echarts": "^5.4.3",
     "element-plus": "^2.4.4",
-    "highlight.js": "^11.11.1",
-    "html2canvas": "^1.4.1",
-    "js-yaml": "^4.1.0",
-    "jspdf": "^2.5.2",
     "monaco-editor": "^0.45.0",
     "pinia": "^2.1.7",
     "pinia-plugin-persistedstate": "^3.2.0",
-    "sortablejs": "^1.15.7",
     "vue": "^3.3.8",
     "vue-echarts": "^6.6.1",
     "vue-router": "^4.2.5",
-    "vue3-grid-layout-next": "^1.0.7",
     "vuedraggable": "^4.1.0"
   },
   "devDependencies": {

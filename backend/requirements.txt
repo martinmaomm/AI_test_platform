@@ -10,7 +10,6 @@ backoff==2.2.1
 bcrypt==5.0.0
 bidict==0.23.1
 billiard==4.2.2
-black==25.12.0
 blinker==1.9.0
 brotli==1.2.0
 build==1.3.0
@@ -38,7 +37,6 @@ distro==1.9.0
 Django==4.2.25
 django-celery-beat==2.5.0
 django-cors-headers==4.3.1
-django-debug-toolbar==4.2.0
 django-filter==23.5
 django-redis==5.4.0
 django-timezone-field==7.1
@@ -48,14 +46,12 @@ dnspython==2.8.0
 docx2txt==0.8
 durationpy==0.10
 environs==9.5.0
-eventlet==0.40.4
 Faker==40.1.2
 filelock==3.19.1
 Flask==3.1.3
 flask-cors==6.0.2
 Flask-Login==0.6.3
 flatbuffers==25.9.23
-flower==2.0.1
 frozenlist==1.7.0
 fsspec==2025.9.0
 gevent==25.9.1
@@ -109,7 +105,6 @@ lazy-object-proxy==1.12.0
 locust==2.43.3
 loguru==0.7.3
 lxml==6.0.2
-mammoth==1.10.0
 markdown-it-py==4.0.0
 MarkupSafe==3.0.2
 marshmallow==3.26.1
@@ -147,13 +142,11 @@ platformdirs==4.5.1
 playwright==1.62.0
 pluggy==1.6.0
 posthog==5.4.0
-prance==25.4.8.0
 prometheus_client==0.23.1
 prompt_toolkit==3.0.52
 propcache==0.3.2
 protobuf==6.32.1
 psutil==7.2.2
-#psycopg2-binary==2.9.9
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pybase64==1.4.2
@@ -183,7 +176,6 @@ python-slugify==8.0.4
 python-socketio==5.16.1
 pytokens==0.3.0
 pytz==2025.2
-#pywin32==311
 PyYAML==6.0.1
 pyzmq==27.1.0
 redis==5.0.1
@@ -239,7 +231,6 @@ websocket-client==1.8.0
 websockets==15.0.1
 Werkzeug==3.1.6
 wheel==0.45.1
-#win32_setctime==1.2.0
 wsproto==1.3.2
 xxhash==3.5.0
 yarl==1.20.1

@@ -1,7 +1,7 @@
 from django.urls import path
 
 from .views import (
-    NodeDetailView, NodeEnrollmentView, NodeListCreateView, NodeRevokeView,
+    NodeDetailView, NodeEnrollmentView, NodeInstallationView, NodeListCreateView, NodeRevokeView,
     PerformanceConfigView, PlanDetailView, PlanListCreateView,
     TargetDetailView, TargetListCreateView,
 )
@@ -25,6 +25,7 @@ urlpatterns = [
     path('runs/<uuid:run_id>/', PerformanceRunDetailView.as_view(), name='run-detail'),
     path('nodes/', NodeListCreateView.as_view(), name='node-list'),
     path('nodes/<uuid:node_id>/', NodeDetailView.as_view(), name='node-detail'),
+    path('nodes/<uuid:node_id>/installation/', NodeInstallationView.as_view(), name='node-installation'),
     path('nodes/<uuid:node_id>/enrollment/', NodeEnrollmentView.as_view(), name='node-enrollment'),
     path('nodes/<uuid:node_id>/revoke/', NodeRevokeView.as_view(), name='node-revoke'),
 ]

@@ -264,16 +264,18 @@ class PerformancePlanSerializer(StrictModelSerializer):
 
 class PerformanceNodeSerializer(StrictModelSerializer):
     status = serializers.SerializerMethodField()
+    registered_at = serializers.DateTimeField(source='enrollment_consumed_at', read_only=True)
 
     class Meta:
         model = PerformanceNode
         fields = (
             'id', 'name', 'network_mode', 'labels', 'status', 'last_seen_at',
-            'agent_version', 'engine_version', 'protocol_version', 'resources', 'created_at',
+            'agent_version', 'engine_version', 'protocol_version', 'resources',
+            'registered_at', 'created_at',
         )
         read_only_fields = (
             'id', 'status', 'last_seen_at', 'agent_version', 'engine_version',
-            'protocol_version', 'resources', 'created_at',
+            'protocol_version', 'resources', 'registered_at', 'created_at',
         )
 
     def get_status(self, obj):

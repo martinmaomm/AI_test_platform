@@ -2,6 +2,52 @@
 
 这是第一版单节点的部署参考，不是整个平台的公网发布方案。节点主动连接平台，无需 VPN；不修改节点机器上的已有网站、代理或容器。
 
+## 推荐：从网页一键接入
+
+平台管理员进入性能项目的“节点管理”，点击“添加节点”，填写名称和网络位置。创建后按安装向导，将生成的完整命令复制到远程 Linux **root** 终端执行（其他用户先 `sudo -i`）。页面不需要填写 SSH 密码。
+
+- 第一版复用已经安装、可用的本地 Docker；缺少 Docker 或不支持的系统会给出明确提示，不静默安装/升级宿主机。
+- 安装器下载平台发布的固定版本镜像并校验归档 SHA256、镜像 ID 和系统架构；无需用户构建源码。
+- 命令包含15分钟有效的一次性注册凭证，过期需重新生成；有效期内不能公开分享。粘贴命令可能进入本机剪贴板、终端历史或短时进程参数，请勿录屏公开，使用后按本机策略清理。长期身份只保存在节点私有卷中，不进入运行容器环境变量。
+- 平台使用私有 CA 时，命令包含 **CA 公钥**，先验证 HTTPS 和安装器摘要再执行；不会关闭 TLS 校验，不含 CA 私钥。
+- 复制后安装向导保持打开，真实收到注册/心跳后才更新状态；关闭页面不影响远程安装，重新打开不会回显旧凭证。
+- 每个节点使用独立资源；重复执行先检查已有身份和归属，不覆盖别的项目/容器。不因网络失败自动重置身份。
+- 已注册但离线时先查看容器和网络；“重置身份”会作废原凭证，不是普通重启按钮。
+
+镜像初次下载可能较慢。下载完成但注册凭证已过期时，重新生成命令后复用已有校验通过的镜像；不要删除身份卷重装。
+
+### 管理员首次配置镜像发布
+
+一键命令依赖已发布镜像，不能只配置域名。先在对应架构构建（或从可信构建机导入）镜像，固定命名：
+
+```text
+automation-platform-performance-node:0.2.0-amd64
+automation-platform-performance-node:0.2.0-arm64
+```
+
+发布机需要能运行对应架构的镜像以核对安装包内的 Agent、Locust、协议和固定执行脚本。然后在仓库根目录执行（可以只发布一种架构）：
+
+```bash
+backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
+  --image amd64=automation-platform-performance-node:0.2.0-amd64 \
+  --image arm64=automation-platform-performance-node:0.2.0-arm64
+```
+
+生成目录默认 `backend/resource/performance-node/`，包含 manifest 和受控镜像归档，已被 Git 忽略。同版本已发布镜像拒绝直接覆盖，修改引擎后应按版本契约重新发布。这个目录只放可公开的发行资产，禁止放 `.env`、身份文件、数据库备份、CA 私钥和符号链接。
+
+后端实际 `.env` 增加（示例路径请替换）：
+
+```dotenv
+PERFORMANCE_NODE_PUBLIC_URL=https://load.example.com:18443
+PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node
+# 私有 CA 场景填公共证书；可信公共 CA 场景留空。
+PERFORMANCE_NODE_CA_CERT_FILE=/absolute/private/gateway/storage/pki/authorities/local/root.crt
+```
+
+启动 Caddy 时也设置同一个 `PERFORMANCE_NODE_RELEASE_DIR` 绝对路径；改完重启后端并按新环境启动网关。首次缺配置/镜像/安装器时，页面明确显示暂不可安装，而不是生成必然失败的命令。
+
+普通节点管理员只用网页向导。以下手动接入步骤保留用于维护和排障。
+
 ## 1. 两条独立连接
 
 | 节点访问地址 | 平台监听 | 用途 |
@@ -30,6 +76,7 @@ export PERFORMANCE_GATEWAY_DOMAIN=load.example.com
 export PERFORMANCE_GATEWAY_PORT=18443
 export PERFORMANCE_GATEWAY_BIND=192.168.31.205
 export PERFORMANCE_GATEWAY_DATA="$PWD/backend/temp/performance-gateway/storage"
+export PERFORMANCE_NODE_RELEASE_DIR="$PWD/backend/resource/performance-node"
 install -d -m 0700 backend/temp/performance-gateway/storage
 caddy validate --config deploy/performance/Caddyfile --adapter caddyfile
 caddy run --config deploy/performance/Caddyfile --adapter caddyfile
@@ -37,12 +84,14 @@ caddy run --config deploy/performance/Caddyfile --adapter caddyfile
 
 `validate` 和 `run` 都需要这些环境变量；缺少 `DATA` 会报 `root` 参数为空。已经存在的存储目录必须是专用私有目录，不要将其他宽权限目录直接挪来使用。
 
-入口只允许两个精确的 POST 路由：
+入口允许两个精确的 POST Agent 路由：
 
 - `/api/v1/performance-agent/enroll/`
 - `/api/v1/performance-agent/heartbeat/`
 
-其他路由和方法返回 404。请求体上限为 65536 字节，与后端一致；Caddy 管理 API、HTTP 重定向端口和访问日志均未开启。请求被代理至本机后端，不能通过这个入口打开平台管理网页。
+另外只开放 GET/HEAD `/api/v1/performance-agent/install/install.sh` 和严格限定版本/架构的 `install/artifacts/<版本>/linux-<amd64或arm64>.tar.gz`。大镜像由 Caddy 静态分发并支持 Range，不经过 Django/ASGI 缓冲；不提供目录浏览，不公开 manifest 或任意资源文件。
+
+其他路由和方法返回 404。Agent请求体上限为65536字节，与后端一致；Caddy管理API、HTTP重定向端口和访问日志均未开启，不能通过此入口打开平台管理网页。静态镜像下载写超时为15分钟；Agent上游响应头仍有独立20秒限制。
 
 这里用独立持久化私有 CA，由 Caddy 管理站点证书续签；不向 Mac 的全局信任库安装 CA。将以下**公钥证书文件**通过已验证主机身份的 SSH/SCP 复制到节点：
 
@@ -67,7 +116,7 @@ docker volume create automation-performance-state
 名字已存在时先检查归属，不要直接重建或删除。只读挂载到节点的文件：
 
 - `/opt/automation-performance-node/config/gateway-ca.crt`：上一步复制的 CA 公钥，0644。
-- `/opt/automation-performance-node/config/enrollment-token`：平台节点管理页面创建节点时的一次性凭证；0600，属主 UID/GID 为 `10001:10001`。
+- `/opt/automation-performance-node/config/enrollment-token`：管理员通过 `POST /api/v1/projects/<项目ID>/performance/nodes/` 创建节点时，响应中的 `enrollment_token`；0600，属主 UID/GID 为 `10001:10001`。网页向导已将这个步骤包含在命令内，不需要手工提取凭证。
 
 整个部署目录归 root 管理（0700）。登记凭证用受保护文件输入，不写在命令参数、Git、日志或容器环境里。令牌会过期，建议镜像构建、网络检查完成后再从平台取得。登记一次：
 

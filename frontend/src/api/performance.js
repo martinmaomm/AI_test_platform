@@ -22,6 +22,11 @@ export const updatePerformancePlan = (projectId, id, data) => patch(`${base(proj
 export const deletePerformancePlan = (projectId, id) => remove(`${base(projectId)}/plans/${id}/`)
 
 export const getPerformanceNodes = (projectId) => get(`${base(projectId)}/nodes/`)
+// 安装指导不包含一次性凭证或安装命令；敏感命令仅来自创建/重置响应。
+export const getPerformanceNodeInstallation = async (projectId, id) => {
+  const response = await get(`${base(projectId)}/nodes/${id}/installation/`)
+  return response?.data ?? response
+}
 
 // 执行接口只使用服务端公开的管理字段；运行命令和 TLS 材料不会经过前端。
 export const getPerformanceRuns = (projectId) => get(`${base(projectId)}/runs/`)

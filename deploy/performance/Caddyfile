@@ -11,7 +11,8 @@
 		timeouts {
 			read_header 10s
 			read_body 20s
-			write 30s
+			# 镜像静态下载可能超过 30 秒；Agent 上游仍有独立 20 秒响应头超时。
+			write 15m
 			idle 60s
 		}
 	}
@@ -20,6 +21,29 @@
 https://{$PERFORMANCE_GATEWAY_DOMAIN}:{$PERFORMANCE_GATEWAY_PORT:18443} {
 	bind {$PERFORMANCE_GATEWAY_BIND:127.0.0.1}
 	tls internal
+	@installer {
+		method GET HEAD
+		path /api/v1/performance-agent/install/install.sh
+	}
+	handle @installer {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up Host 127.0.0.1
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 20s
+			}
+		}
+	}
+	@node_image {
+		method GET HEAD
+		path_regexp node_image ^/api/v1/performance-agent/install/artifacts/[0-9]+\.[0-9]+\.[0-9]+/linux-(amd64|arm64)\.tar\.gz$
+	}
+	handle @node_image {
+		uri strip_prefix /api/v1/performance-agent/install/artifacts
+		root * {$PERFORMANCE_NODE_RELEASE_DIR:./backend/resource/performance-node}
+		header X-Content-Type-Options nosniff
+		file_server
+	}
 	@agent {
 		method POST
 		path /api/v1/performance-agent/enroll/ /api/v1/performance-agent/heartbeat/

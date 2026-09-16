@@ -20,7 +20,7 @@
       </el-tab-pane>
 
       <el-tab-pane label="节点管理" name="nodes">
-        <div class="toolbar"><span>每 {{ config.heartbeat_interval_seconds }} 秒轮询一次；在线 Agent 不等于 Worker 就绪。</span><el-button v-if="canManageNodes" type="primary" @click="openNode()">登记节点</el-button></div>
+        <div class="toolbar"><span>每 {{ config.heartbeat_interval_seconds }} 秒检查一次节点状态；在线 Agent 不等于 Worker 就绪或可发压。</span><el-button v-if="canManageNodes" type="primary" @click="openNode()">添加节点</el-button></div>
         <el-empty v-if="!loading.nodes && nodes.length === 0" description="暂无节点" />
         <el-table v-else v-loading="loading.nodes" :data="nodes" row-key="id">
           <el-table-column prop="name" label="名称" min-width="150" />
@@ -28,7 +28,7 @@
           <el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="nodeType(row.status)">{{ performanceNodeStatusLabel(row.status) }}</el-tag></template></el-table-column>
           <el-table-column prop="last_seen_at" label="最后心跳" min-width="170"><template #default="{ row }">{{ formatTime(row.last_seen_at) }}</template></el-table-column>
           <el-table-column label="版本" min-width="160"><template #default="{ row }">Agent {{ row.agent_version || '-' }} / 引擎 {{ row.engine_version || '-' }}</template></el-table-column>
-          <el-table-column v-if="canManageNodes" label="操作" width="220" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openNode(row)">编辑</el-button><el-button link type="warning" @click="resetEnrollment(row)">重置凭证</el-button><el-button link type="danger" @click="revokeNode(row)">吊销</el-button></template></el-table-column>
+          <el-table-column v-if="canManageNodes" label="操作" width="310" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openInstallation(row)">安装指导</el-button><el-button link type="primary" @click="openNode(row)">编辑</el-button><el-button link type="warning" @click="resetEnrollment(row)">重置身份</el-button><el-button link type="danger" @click="revokeNode(row)">吊销</el-button></template></el-table-column>
         </el-table>
       </el-tab-pane>
 
@@ -66,15 +66,14 @@
       <template #footer><el-button @click="targetDialog.visible = false">取消</el-button><el-button type="primary" :loading="saving.target" @click="saveTarget">保存</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="nodeDialog.visible" :title="nodeDialog.item ? '编辑节点' : '登记节点'" width="560px" :close-on-click-modal="false" @closed="resetNode">
-      <el-form ref="nodeFormRef" :model="nodeForm" :rules="nodeRules" label-width="100px"><el-form-item label="名称" prop="name"><el-input v-model="nodeForm.name" /></el-form-item><el-form-item label="网络模式" prop="network_mode"><el-radio-group v-model="nodeForm.network_mode"><el-radio label="lan">LAN</el-radio><el-radio label="public">Public</el-radio></el-radio-group></el-form-item><el-form-item label="标签 JSON" :error="nodeLabelsError"><el-input v-model="nodeForm.labelsText" type="textarea" :rows="3" placeholder='例如 {"region":"shanghai"}' /></el-form-item></el-form>
-      <template #footer><el-button @click="nodeDialog.visible = false">取消</el-button><el-button type="primary" :loading="saving.node" @click="saveNode">保存</el-button></template>
+    <el-dialog v-model="nodeDialog.visible" :title="nodeDialog.item ? '编辑节点' : '添加节点'" width="580px" :close-on-click-modal="false" @closed="resetNode">
+      <el-form ref="nodeFormRef" :model="nodeForm" :rules="nodeRules" label-width="100px"><el-form-item label="节点名称" prop="name"><el-input v-model="nodeForm.name" placeholder="例如：上海压测机" /></el-form-item><el-form-item label="网络位置" prop="network_mode"><el-radio-group v-model="nodeForm.network_mode"><el-radio label="lan">内网：仅记录节点网络位置</el-radio><el-radio label="public">公网：仅记录节点网络位置</el-radio></el-radio-group></el-form-item><el-alert type="info" :closable="false">创建后会提供一条安装命令；无需在平台填写服务器地址或手动拼接参数。节点能连接平台不代表一定能访问测试目标。</el-alert><el-collapse class="advanced-options"><el-collapse-item title="高级选项"><el-form-item label="标签" :error="nodeLabelsError"><el-input v-model="nodeForm.labelsText" type="textarea" :rows="3" placeholder='例如 {"region":"shanghai"}' /></el-form-item></el-collapse-item></el-collapse></el-form>
+      <template #footer><el-button @click="nodeDialog.visible = false">取消</el-button><el-button type="primary" :loading="saving.node" @click="saveNode">{{ nodeDialog.item ? '保存' : '创建并查看安装命令' }}</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="tokenDialog.visible" title="一次性注册凭证" width="640px" :close-on-click-modal="false" @closed="clearEnrollmentToken">
-      <el-alert type="warning" :closable="false">请立即复制给节点管理员。关闭此窗口后凭证将从页面内存清除，且不会再次显示。</el-alert>
-      <p class="expiry">过期时间：{{ formatTime(tokenDialog.expiresAt) }}</p><el-input :model-value="tokenDialog.token" readonly type="textarea" :rows="3" />
-      <template #footer><el-button type="primary" @click="copyEnrollmentToken">复制并关闭</el-button><el-button @click="tokenDialog.visible = false">关闭并清除</el-button></template>
+    <el-dialog v-model="installationDialog.visible" title="节点安装向导" width="680px" :close-on-click-modal="false" @closed="clearInstallationGuide">
+      <template v-if="installationNode"><el-alert :type="installationStage.key === 'online' ? 'success' : ['offline', 'revoked'].includes(installationStage.key) ? 'warning' : 'info'" :closable="false" show-icon>{{ installationStage.text }}</el-alert><el-descriptions :column="1" border class="installation-summary"><el-descriptions-item label="节点">{{ installationNode.name }}</el-descriptions-item><el-descriptions-item label="归属项目">{{ projectStore.currentProject?.name || detail?.name || '-' }}</el-descriptions-item><el-descriptions-item label="状态">{{ performanceNodeStatusLabel(installationNode.status) }}</el-descriptions-item><el-descriptions-item label="平台地址">{{ installationInfo?.platform_url || '-' }}</el-descriptions-item><el-descriptions-item label="支持架构">{{ installationArchitectureText(installationInfo?.supported_architectures) }}</el-descriptions-item></el-descriptions><el-alert class="installation-requirements" type="info" :closable="false">需要 Linux 主机、Docker 和 root 权限。安装器会处理镜像、证书和平台参数；节点主动连接平台，无需开放节点入站端口。</el-alert><ul v-if="installationInfo?.requirements?.length" class="installation-requirement-list"><li v-for="requirement in installationInfo.requirements" :key="requirement">{{ requirement }}</li></ul><el-alert v-if="installationInfo?.available === false" type="warning" :closable="false">{{ installationInfo.reason || '当前无法生成安装命令，请检查平台安装配置。' }}</el-alert><template v-if="installationDialog.installation?.command && !installationCommandIsExpired"><p class="expiry">凭证 {{ formatTime(installationDialog.installation.expires_at || installationDialog.expiresAt) }} 前有效且敏感，请只在目标节点终端执行。</p><el-input :model-value="installationDialog.installation.command" readonly type="textarea" :rows="4" /><el-button class="copy-command" type="primary" @click="copyInstallationCommand">复制安装命令</el-button></template><template v-else-if="installationDialog.loaded && installationAvailable && canRegenerateInstallation(installationNode, installationDialog.installation, installationCommandIsExpired)"><el-alert type="warning" :closable="false">{{ installationCommandIsExpired ? '安装命令已过期，请重新生成。' : '安装命令未保存在网页中。' }}重新生成会使旧注册凭证和旧节点身份失效。</el-alert><el-button type="warning" :loading="saving.node" @click="regenerateInstallation(installationNode)">重新生成安装命令</el-button></template><template v-else-if="installationStage.key === 'offline'"><el-alert type="warning" :closable="false">请先在原节点检查容器日志、网络和平台地址；不要默认重装或重置身份。</el-alert></template></template>
+      <template #footer><el-button @click="installationDialog.visible = false">关闭</el-button></template>
     </el-dialog>
     <el-dialog v-model="runDialog.visible" title="确认执行压测" width="600px" :close-on-click-modal="false" @closed="resetRun">
       <el-alert type="warning" :closable="false" show-icon>将向受控目标发起真实请求。Phase 1 每次仅运行一个节点。</el-alert>
@@ -92,8 +91,10 @@ import dayjs from 'dayjs'
 import { useAuthStore } from '@/stores/auth'
 import { useProjectStore } from '@/stores/project'
 import { getProject } from '@/api/projects'
-import { createPerformanceNode, createPerformancePlan, createPerformanceRun, createPerformanceTarget, deletePerformancePlan, deletePerformanceTarget, getPerformanceConfig, getPerformanceNodes, getPerformancePlans, getPerformanceTargets, performanceErrorMessage, resetPerformanceNodeEnrollment, revokePerformanceNode, updatePerformanceNode, updatePerformancePlan, updatePerformanceTarget } from '@/api/performance'
-import { buildPerformanceTargetPayload, copyEnrollmentTokenToClipboard, isPerformancePlatformAdmin, performanceNetworkModeLabel, performanceNodeStatusLabel, performancePlanPermissions, samePerformanceScope } from './performanceWorkspaceState'
+import { createPerformanceNode, createPerformancePlan, createPerformanceRun, createPerformanceTarget, deletePerformancePlan, deletePerformanceTarget, getPerformanceConfig, getPerformanceNodeInstallation, getPerformanceNodes, getPerformancePlans, getPerformanceTargets, performanceErrorMessage, resetPerformanceNodeEnrollment, revokePerformanceNode, updatePerformanceNode, updatePerformancePlan, updatePerformanceTarget } from '@/api/performance'
+import { copyText } from '@/utils/reportLinks'
+import { canRegenerateInstallation, installationArchitectureText, installationCommandExpired, performanceInstallationStage } from '@/utils/performanceInstallation'
+import { buildPerformanceTargetPayload, isPerformancePlatformAdmin, performanceNetworkModeLabel, performanceNodeStatusLabel, performancePlanPermissions, samePerformanceScope } from './performanceWorkspaceState'
 import { createPerformanceRequestId, executionUnavailableMessage, performanceExecutionPermissions } from './performanceExecutionState'
 
 const route = useRoute(); const router = useRouter(); const authStore = useAuthStore(); const projectStore = useProjectStore()
@@ -105,7 +106,7 @@ const projectId = computed(() => projectStore.currentProjectId)
 const detail = ref(null); const plans = ref([]); const nodes = ref([]); const targets = ref([])
 const loading = reactive({ plans: false, nodes: false, targets: false }); const saving = reactive({ plan: false, node: false, target: false, run: false })
 const planDialog = reactive({ visible: false, item: null }); const nodeDialog = reactive({ visible: false, item: null }); const targetDialog = reactive({ visible: false, item: null }); const runDialog = reactive({ visible: false, plan: null, nodeId: null, requestId: '' })
-const tokenDialog = reactive({ visible: false, token: '', expiresAt: '' }); const planFormRef = ref(); const nodeFormRef = ref(); const targetFormRef = ref(); const stepErrors = ref([]); const nodeLabelsError = ref('')
+const installationDialog = reactive({ visible: false, node: null, installation: null, expiresAt: '', loaded: false }); const planFormRef = ref(); const nodeFormRef = ref(); const targetFormRef = ref(); const stepErrors = ref([]); const nodeLabelsError = ref('')
 const planForm = reactive({ name: '', description: '', target_id: null, users: 1, spawn_rate: 1, duration_seconds: 30, wait_seconds: 1, steps: [] })
 const targetForm = reactive({ name: '', base_url: '', allowed_methods: ['GET'] }); const nodeForm = reactive({ name: '', network_mode: 'lan', labelsText: '{}' })
 const currentMember = computed(() => detail.value?.members?.find((member) => member.username === authStore.user?.username))
@@ -118,9 +119,15 @@ const canRead = computed(() => isPerformancePlatformAdmin(authStore.user) || Boo
 const executionEnabled = computed(() => config.execution_enabled === true && config.controller_online === true)
 const executionUnavailableReason = computed(() => executionUnavailableMessage(config))
 const onlineNodes = computed(() => nodes.value.filter((node) => node.status === 'online'))
+const installationNode = computed(() => nodes.value.find((node) => String(node.id) === String(installationDialog.node?.id)) || installationDialog.node)
+const installationInfo = computed(() => installationDialog.installation || config.installation || null)
+const installationAvailable = computed(() => installationInfo.value?.available === true)
+const installationClock = ref(Date.now())
+const installationCommandIsExpired = computed(() => installationCommandExpired(installationDialog.installation, installationClock.value))
+const installationStage = computed(() => performanceInstallationStage(installationNode.value, installationDialog.installation))
 const planRules = { name: [{ required: true, message: '请输入计划名称', trigger: 'blur' }], target_id: [{ required: true, message: '请选择压测目标', trigger: 'change' }] }; const targetRules = { name: [{ required: true, message: '请输入目标名称', trigger: 'blur' }], base_url: [{ required: true, message: '请输入 HTTP(S) origin', trigger: 'blur' }], allowed_methods: [{ type: 'array', min: 1, message: '至少选择一种方法', trigger: 'change' }] }; const nodeRules = { name: [{ required: true, message: '请输入节点名称', trigger: 'blur' }], network_mode: [{ required: true, message: '请选择网络模式', trigger: 'change' }] }
 const selectedTargetMethods = computed(() => targets.value.find((item) => String(item.id) === String(planForm.target_id))?.allowed_methods || methods)
-let pollTimer; let epoch = 0
+let pollTimer; let epoch = 0; let installationRequestNonce = 0
 const dataOf = (response) => response?.data ?? response; const listOf = (response) => { const data = dataOf(response); return data?.items || (Array.isArray(data) ? data : []) }
 const formatTime = (value) => value ? dayjs(value).format('YYYY-MM-DD HH:mm:ss') : '-'; const targetName = (id) => targets.value.find((item) => String(item.id) === String(id))?.name || `目标 #${id}`; const nodeType = (status) => ({ online: 'success', offline: 'info', pending: 'warning', revoked: 'danger' }[status] || 'info')
 const syncActiveTab = () => { activeTab.value = ({ PerfNodes: 'nodes', PerfTargets: 'targets' }[route.name] || 'plans') }
@@ -129,6 +136,9 @@ const captureScope = () => ({ projectId: projectId.value, epoch })
 const scopeIsCurrent = (scope) => samePerformanceScope(scope, { projectId: projectId.value, epoch })
 function invalidateProjectUi() {
   clearInterval(pollTimer)
+  Object.assign(config, defaults)
+  config.limits = { ...defaults.limits }
+  delete config.installation
   detail.value = null
   plans.value = []
   nodes.value = []
@@ -139,11 +149,11 @@ function invalidateProjectUi() {
   targetDialog.visible = false
   nodeDialog.visible = false
   runDialog.visible = false
-  tokenDialog.visible = false
+  installationDialog.visible = false
   resetPlan()
   resetTarget()
   resetNode()
-  clearEnrollmentToken()
+  clearInstallationGuide()
 }
 async function loadAccess(requestProjectId, requestEpoch) {
   try {
@@ -153,9 +163,9 @@ async function loadAccess(requestProjectId, requestEpoch) {
     if (requestEpoch === epoch) detail.value = null
   }
 }
-async function loadConfig(requestProjectId, requestEpoch) { try { const data = dataOf(await getPerformanceConfig(requestProjectId)); if (requestEpoch !== epoch || String(projectId.value) !== String(requestProjectId)) return; Object.assign(config, defaults, data || {}); config.limits = { ...defaults.limits, ...(data?.limits || {}) } } catch (error) { if (requestEpoch === epoch) ElMessage.error(performanceErrorMessage(error, '加载性能配置失败')) } }
+async function loadConfig(requestProjectId, requestEpoch) { try { const data = dataOf(await getPerformanceConfig(requestProjectId)); if (requestEpoch !== epoch || String(projectId.value) !== String(requestProjectId)) return; delete config.installation; Object.assign(config, defaults, data || {}); config.limits = { ...defaults.limits, ...(data?.limits || {}) } } catch (error) { if (requestEpoch === epoch) ElMessage.error(performanceErrorMessage(error, '加载性能配置失败')) } }
 async function loadList(kind, requestProjectId, requestEpoch) { loading[kind] = true; const call = { plans: getPerformancePlans, nodes: getPerformanceNodes, targets: getPerformanceTargets }[kind]; try { const result = listOf(await call(requestProjectId)); if (requestEpoch === epoch && String(projectId.value) === String(requestProjectId)) ({ plans, nodes, targets })[kind].value = result } catch (error) { if (requestEpoch === epoch) ElMessage.error(performanceErrorMessage(error, `加载${kind}失败`)) } finally { if (requestEpoch === epoch) loading[kind] = false } }
-async function refreshAll() { const requestProjectId = projectId.value; const requestEpoch = ++epoch; clearInterval(pollTimer); if (!requestProjectId) return; if (projectStore.currentProject?.project_type !== 'perf') { ElMessage.warning('请先从性能测试项目列表选择性能项目'); router.replace('/perf-testing/projects'); return }; await Promise.all([loadAccess(requestProjectId, requestEpoch), loadConfig(requestProjectId, requestEpoch), loadList('targets', requestProjectId, requestEpoch), loadList('plans', requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]); if (requestEpoch === epoch && String(projectId.value) === String(requestProjectId)) pollTimer = window.setInterval(() => Promise.all([loadConfig(requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]), Math.max(5000, Math.min(10000, config.heartbeat_interval_seconds * 1000))) }
+async function refreshAll() { const requestProjectId = projectId.value; const requestEpoch = ++epoch; clearInterval(pollTimer); if (!requestProjectId) return; if (projectStore.currentProject?.project_type !== 'perf') { ElMessage.warning('请先从性能测试项目列表选择性能项目'); router.replace('/perf-testing/projects'); return }; await Promise.all([loadAccess(requestProjectId, requestEpoch), loadConfig(requestProjectId, requestEpoch), loadList('targets', requestProjectId, requestEpoch), loadList('plans', requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]); if (requestEpoch === epoch && String(projectId.value) === String(requestProjectId)) pollTimer = window.setInterval(() => { installationClock.value = Date.now(); return Promise.all([loadConfig(requestProjectId, requestEpoch), loadList('nodes', requestProjectId, requestEpoch)]) }, Math.max(5000, Math.min(10000, config.heartbeat_interval_seconds * 1000))) }
 function blankStep() { return { name: '', method: 'GET', path: '/', expected_status: 200, headersText: '{}', bodyText: '' } }; function addStep() { planForm.steps.push(blankStep()) }; function removeStep(index) { planForm.steps.splice(index, 1) }
 function resetPlan() { Object.assign(planForm, { name: '', description: '', target_id: null, users: 1, spawn_rate: 1, duration_seconds: 30, wait_seconds: 1, steps: [] }); planDialog.item = null; stepErrors.value = []; planFormRef.value?.clearValidate() }
 function resetRun() { Object.assign(runDialog, { plan: null, nodeId: null, requestId: '' }) }
@@ -248,28 +258,74 @@ async function saveNode() {
     if (!scopeIsCurrent(scope)) return
     ElMessage.success(isNewNode ? '节点已登记' : '节点已保存')
     nodeDialog.visible = false
-    if (isNewNode && result?.enrollment_token) showEnrollment(result)
+    if (isNewNode && result?.node) showInstallation(result)
     await loadList('nodes', scope.projectId, scope.epoch)
   } catch (error) {
     if (scopeIsCurrent(scope)) ElMessage.error(performanceErrorMessage(error, '保存节点失败'))
   } finally { if (scopeIsCurrent(scope)) saving.node = false }
 }
-function showEnrollment(result) { tokenDialog.token = result.enrollment_token; tokenDialog.expiresAt = result.expires_at; tokenDialog.visible = true }; function clearEnrollmentToken() { tokenDialog.token = ''; tokenDialog.expiresAt = '' }
+const hasInstallationCommand = (result) => result?.installation?.available === true && Boolean(result.installation.command)
+function showInstallation(result) { installationRequestNonce += 1; installationClock.value = Date.now(); Object.assign(installationDialog, { visible: true, node: result.node, installation: result.installation || null, expiresAt: result.expires_at || '', loaded: true }) }
+function clearInstallationGuide() { installationRequestNonce += 1; Object.assign(installationDialog, { node: null, installation: null, expiresAt: '', loaded: false }) }
+async function openInstallation(node) {
+  const scope = captureScope()
+  const requestNonce = ++installationRequestNonce
+  Object.assign(installationDialog, { visible: true, node, installation: null, expiresAt: '', loaded: false })
+  try {
+    const result = await getPerformanceNodeInstallation(scope.projectId, node.id)
+    if (!scopeIsCurrent(scope) || !installationDialog.visible || installationRequestNonce !== requestNonce || String(installationDialog.node?.id) !== String(node.id)) return
+    Object.assign(installationDialog, { node: result?.node || node, installation: result?.installation || null, loaded: true })
+  } catch (error) {
+    if (scopeIsCurrent(scope)) ElMessage.error(performanceErrorMessage(error, '加载安装指导失败'))
+  }
+}
+async function copyInstallationCommand() {
+  const command = installationDialog.installation?.command
+  if (!command) return
+  if (installationCommandIsExpired.value) { ElMessage.warning('安装命令已过期，请重新生成'); return }
+  try {
+    await copyText(command)
+    ElMessage.success('安装命令已复制')
+  } catch {
+    ElMessage.warning('无法自动复制，请手动复制命令')
+  }
+}
 const isCancelled = (error) => ['cancel', 'close'].includes(error)
 
 async function resetEnrollment(node) {
+  if (saving.node) return
   const scope = captureScope()
   try {
     await ElMessageBox.confirm('重置会立即使旧注册凭证和旧长期身份失效，原客户端必须重新注册。', '重置注册凭证', { type: 'warning', confirmButtonText: '重置' })
     if (!scopeIsCurrent(scope)) return
+    saving.node = true
     const result = await resetPerformanceNodeEnrollment(scope.projectId, node.id)
     if (!scopeIsCurrent(scope)) return
-    showEnrollment(result)
-    ElMessage.success('已生成新的注册凭证')
+    showInstallation(result)
+    ElMessage.success(hasInstallationCommand(result) ? '已生成新的安装命令' : '已生成新的注册凭证')
     await loadList('nodes', scope.projectId, scope.epoch)
   } catch (error) {
     if (scopeIsCurrent(scope) && !isCancelled(error)) ElMessage.error(performanceErrorMessage(error, '重置凭证失败'))
-  }
+  } finally { if (scopeIsCurrent(scope)) saving.node = false }
+}
+
+async function regenerateInstallation(node) {
+  if (saving.node) return
+  const scope = captureScope()
+  const dialogNonce = installationRequestNonce
+  try {
+    await ElMessageBox.confirm('重新生成会立即使旧注册凭证和旧长期身份失效，原客户端必须重新注册。', '重新生成安装命令', { type: 'warning', confirmButtonText: '重新生成' })
+    if (!scopeIsCurrent(scope) || !installationDialog.visible || installationRequestNonce !== dialogNonce) return
+    saving.node = true
+    const result = await resetPerformanceNodeEnrollment(scope.projectId, node.id)
+    if (!scopeIsCurrent(scope) || !installationDialog.visible || installationRequestNonce !== dialogNonce) return
+    installationClock.value = Date.now()
+    Object.assign(installationDialog, { node: result.node, installation: result.installation || null, expiresAt: result.expires_at || '', loaded: true })
+    ElMessage.success(hasInstallationCommand(result) ? '已生成新的安装命令' : '已生成新的注册凭证')
+    await loadList('nodes', scope.projectId, scope.epoch)
+  } catch (error) {
+    if (scopeIsCurrent(scope) && !isCancelled(error)) ElMessage.error(performanceErrorMessage(error, '重新生成安装命令失败'))
+  } finally { if (scopeIsCurrent(scope)) saving.node = false }
 }
 
 async function revokeNode(node) {
@@ -314,15 +370,6 @@ async function removePlan(plan) {
   }
 }
 
-async function copyEnrollmentToken() {
-  try {
-    await copyEnrollmentTokenToClipboard(tokenDialog.token, navigator.clipboard.writeText.bind(navigator.clipboard))
-    ElMessage.success('凭证已复制')
-    tokenDialog.visible = false
-  } catch {
-    ElMessage.warning('无法自动复制，请手动复制后关闭')
-  }
-}
 watch(projectId, () => { invalidateProjectUi(); refreshAll() })
 watch(() => route.name, syncActiveTab, { immediate: true })
 onMounted(refreshAll)
@@ -330,5 +377,5 @@ onBeforeUnmount(() => { ++epoch; invalidateProjectUi() })
 </script>
 
 <style scoped>
-.perf-workspace { max-width: 1280px; margin: 0 auto; padding: 4px 10px 28px; }.phase-notice, .execution-unavailable { margin-bottom: 18px; }.toolbar { min-height: 44px; display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--app-text-muted); margin-bottom: 12px; }.method-tag { margin: 2px; }.input-suffix { margin-left: 8px; color: var(--app-text-muted); font-size: 12px; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }.step-help { margin: 0 0 14px; }.steps-title, .step-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }.step-card { border: 1px solid var(--app-border-light); border-radius: 8px; padding: 12px; margin-bottom: 12px; }.step-grid { display: grid; grid-template-columns: 1.5fr .8fr 1.5fr .8fr; gap: 8px; }.json-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }.json-grid :deep(.el-form-item) { margin-bottom: 0; }.expiry, .empty-node { color: var(--app-text-muted); font-size: 13px; }.run-summary { margin-top: 16px; } @media (max-width: 760px) { .toolbar, .form-grid, .step-grid, .json-grid { display: flex; flex-direction: column; align-items: stretch; }.toolbar { align-items: flex-start; }.step-grid { gap: 8px; } }
+.perf-workspace { max-width: 1280px; margin: 0 auto; padding: 4px 10px 28px; }.phase-notice, .execution-unavailable { margin-bottom: 18px; }.toolbar { min-height: 44px; display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--app-text-muted); margin-bottom: 12px; }.method-tag { margin: 2px; }.input-suffix { margin-left: 8px; color: var(--app-text-muted); font-size: 12px; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }.step-help { margin: 0 0 14px; }.steps-title, .step-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }.step-card { border: 1px solid var(--app-border-light); border-radius: 8px; padding: 12px; margin-bottom: 12px; }.step-grid { display: grid; grid-template-columns: 1.5fr .8fr 1.5fr .8fr; gap: 8px; }.json-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }.json-grid :deep(.el-form-item) { margin-bottom: 0; }.advanced-options { margin-top: 12px; }.installation-summary, .installation-requirements { margin-top: 16px; }.installation-requirement-list { margin: 10px 0; padding-left: 20px; color: var(--app-text-muted); }.copy-command { margin-top: 12px; }.expiry, .empty-node { color: var(--app-text-muted); font-size: 13px; }.run-summary { margin-top: 16px; } @media (max-width: 760px) { .toolbar, .form-grid, .step-grid, .json-grid { display: flex; flex-direction: column; align-items: stretch; }.toolbar { align-items: flex-start; }.step-grid { gap: 8px; } }
 </style>

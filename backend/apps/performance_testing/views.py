@@ -12,6 +12,7 @@ from projects.access import DELETE, EDIT, READ, get_project_for_user
 from users.permissions import is_platform_admin
 
 from .constants import platform_config
+from .installation import installation_metadata
 from .models import PerformanceNode, PerformancePlan, PerformanceTarget
 from .parsers import LimitedJSONParser
 from .serializers import (
@@ -64,11 +65,13 @@ class PerformanceConfigView(ManagementAPIView):
     def get(self, request, project_id):
         _project(request, project_id, READ)
         execution = controller_execution_status()
-        return _ok(platform_config(
+        payload = platform_config(
             controller_online=execution['controller_online'],
             execution_available=execution['available'],
             unavailable_reason=execution['reason'],
-        ))
+        )
+        payload['installation'] = installation_metadata()
+        return _ok(payload)
 
 
 class TargetListCreateView(ManagementAPIView):
@@ -181,6 +184,7 @@ class NodeListCreateView(ManagementAPIView):
         serializer.is_valid(raise_exception=True)
         node, token = create_node_with_enrollment(project, serializer.validated_data)
         payload = enrollment_response(node, token, PerformanceNodeSerializer)
+        payload['installation'] = installation_metadata(node=node, enrollment_token=token)
         return _ok(payload, status.HTTP_201_CREATED)
 
 
@@ -204,7 +208,21 @@ class NodeEnrollmentView(ManagementAPIView):
         project = _admin_project(request, project_id)
         node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
         node, token = issue_enrollment(node)
-        return _ok(enrollment_response(node, token, PerformanceNodeSerializer))
+        payload = enrollment_response(node, token, PerformanceNodeSerializer)
+        payload['installation'] = installation_metadata(node=node, enrollment_token=token)
+        return _ok(payload)
+
+
+class NodeInstallationView(ManagementAPIView):
+    def get(self, request, project_id, node_id):
+        project = _admin_project(request, project_id)
+        node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
+        return _ok({
+            'node': PerformanceNodeSerializer(
+                node, context={'current_time': timezone.now()},
+            ).data,
+            'installation': installation_metadata(node=node),
+        })
 
 
 class NodeRevokeView(ManagementAPIView):

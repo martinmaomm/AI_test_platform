@@ -21,6 +21,15 @@ def main():
     auth = {'accessToken': f'fixture.{payload}.fixture', 'refreshToken': '', 'user': user}
     lists = {'targets': [], 'plans': [], 'nodes': []}
     runtime = {'enabled': False, 'run': None}
+    installation = {
+        'available': True,
+        'reason': '',
+        'platform_url': 'https://platform.fixture.test',
+        'supported_architectures': ['amd64', 'arm64'],
+        'agent_version': '0.2.0',
+        'expires_at': None,
+        'requirements': ['Linux', 'Docker', 'root 权限'],
+    }
     mutations = []
     errors = []
 
@@ -47,7 +56,12 @@ def main():
             if kind == 'config':
                 data = {'execution_enabled': runtime['enabled'], 'controller_online': runtime['enabled'],
                         'phase': 'execution', 'heartbeat_interval_seconds': 5,
-                        'execution_unavailable_reason': '' if runtime['enabled'] else '控制器尚未启动（本机模拟）'}
+                        'execution_unavailable_reason': '' if runtime['enabled'] else '控制器尚未启动（本机模拟）',
+                        'installation': installation}
+            elif kind == 'nodes' and len(segments) == 3 and segments[2] == 'installation':
+                node = next(item for item in lists['nodes'] if str(item['id']) == segments[1])
+                # GET installation is intentionally non-sensitive: no enrollment token or command.
+                data = {'node': node, 'installation': installation}
             elif kind == 'plans' and len(segments) == 3 and segments[2] == 'runs':
                 mutations.append(('runs', request.method, request.post_data_json))
                 runtime['run'] = {
@@ -78,8 +92,10 @@ def main():
                     data = row
                     if kind == 'nodes':
                         row['status'] = 'pending'
-                        data = {'node': row, 'enrollment_token': 'ui-fixture-not-a-real-token',
-                                'expires_at': '2026-09-16T23:59:00Z'}
+                        data = {'node': row, 'expires_at': '2099-09-16T23:59:00Z',
+                                'installation': {**installation,
+                                                 'expires_at': '2099-09-16T23:59:00Z',
+                                                 'command': 'mock-installer-command --from-platform'}}
         route.fulfill(status=200, content_type='application/json', body=json.dumps({'success': True, 'data': data}))
 
     with sync_playwright() as playwright:
@@ -88,7 +104,10 @@ def main():
         context.route('**/*', fulfill)
         context.add_init_script('localStorage.setItem("auth-store", ' + json.dumps(json.dumps(auth)) + ');'
                                 'localStorage.setItem("project-store", ' + json.dumps(json.dumps({'currentProject': project})) + ');'
-                                'Object.defineProperty(crypto, "randomUUID", {value: undefined});')
+                                'Object.defineProperty(crypto, "randomUUID", {value: undefined});'
+                                'Object.defineProperty(navigator, "clipboard", {value: undefined, configurable: true});'
+                                'window.__copyFallbackCalls = 0;'
+                                'document.execCommand = (command) => { window.__copyFallbackCalls += command === "copy" ? 1 : 0; return true; };')
         page = context.new_page()
         page.on('pageerror', lambda error: errors.append(str(error)))
         try:
@@ -111,23 +130,36 @@ def main():
             dialog.get_by_role('button', name='保存', exact=True).click()
             expect(page.get_by_role('cell', name='单用户样本计划', exact=True)).to_be_visible()
             page.get_by_role('tab', name='节点管理', exact=True).click()
-            page.get_by_role('button', name='登记节点', exact=True).click()
+            page.get_by_role('button', name='添加节点', exact=True).click()
             dialog = page.get_by_role('dialog')
-            dialog.locator('.el-form-item').filter(has_text='名称').locator('input').fill('本机验收节点')
-            dialog.get_by_role('button', name='保存', exact=True).click()
-            token_dialog = page.get_by_role('dialog', name='一次性注册凭证', exact=True)
-            expect(token_dialog).to_be_visible()
-            expect(token_dialog.locator('textarea')).to_have_value('ui-fixture-not-a-real-token')
-            token_dialog.get_by_role('button', name='关闭并清除', exact=True).click()
-            expect(token_dialog).not_to_be_visible()
-            assert not any('ui-fixture-not-a-real-token' in value for value in page.evaluate('Object.values(localStorage)'))
+            dialog.locator('.el-form-item').filter(has_text='节点名称').locator('input').fill('本机验收节点')
+            dialog.get_by_role('button', name='创建并查看安装命令', exact=True).click()
+            guide = page.get_by_role('dialog', name='节点安装向导', exact=True)
+            expect(guide).to_be_visible()
+            expect(guide.locator('textarea')).to_have_value('mock-installer-command --from-platform')
+            guide.get_by_role('button', name='复制安装命令', exact=True).click()
+            expect(guide).to_be_visible()  # Copy must not close the guide.
+            assert page.evaluate('window.__copyFallbackCalls') == 1
+            guide.get_by_role('button', name='关闭', exact=True).click()
+            expect(guide).not_to_be_visible()
+            assert not any('mock-installer-command' in value for value in page.evaluate('Object.values(localStorage)'))
+            page.get_by_role('button', name='安装指导', exact=True).click()
+            guide = page.get_by_role('dialog', name='节点安装向导', exact=True)
+            expect(guide).to_be_visible()
+            expect(guide.locator('textarea')).to_have_count(0)
+            assert 'mock-installer-command' not in guide.inner_text()
+            lists['nodes'][0]['registered_at'] = '2026-09-16T10:00:00Z'
+            expect(guide.get_by_text('节点已注册，等待首次心跳。', exact=True)).to_be_visible(timeout=12000)
+            expect(guide.get_by_role('button', name='重新生成安装命令', exact=True)).to_have_count(0)
+            lists['nodes'][0].update(status='online', agent_version='0.2.0', engine_version='2.43.3')
+            expect(guide.get_by_text('节点已在线，可保留此页查看安装条件。', exact=True)).to_be_visible(timeout=12000)
+            guide.get_by_role('button', name='关闭', exact=True).click()
             assert [item[0] for item in mutations] == ['targets', 'plans', 'nodes'], mutations
             assert mutations[1][2]['spawn_rate'] == 1
             assert mutations[1][2]['steps'][0]['path'] == '/probe'
             page.get_by_role('tab', name='压测计划', exact=True).click()
             expect(page.get_by_role('button', name='执行', exact=True)).to_be_disabled()
             runtime['enabled'] = True
-            lists['nodes'][0].update(status='online', agent_version='0.2.0', engine_version='2.43.3')
             # Config polling must discover the controller without a browser reload.
             expect(page.get_by_role('button', name='执行', exact=True)).to_be_enabled(timeout=12000)
             page.get_by_role('button', name='执行', exact=True).click()

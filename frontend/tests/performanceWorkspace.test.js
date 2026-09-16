@@ -4,13 +4,18 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import {
   buildPerformanceTargetPayload,
-  copyEnrollmentTokenToClipboard,
   isPerformancePlatformAdmin,
   performanceNetworkModeLabel,
   performanceNodeStatusLabel,
   performancePlanPermissions,
   samePerformanceScope,
 } from '../src/views/perf-testing/performanceWorkspaceState.js'
+import {
+  canRegenerateInstallation,
+  installationArchitectureText,
+  installationCommandExpired,
+  performanceInstallationStage,
+} from '../src/utils/performanceInstallation.js'
 import {
   canStopPerformanceRun,
   completedWithFailures,
@@ -40,11 +45,12 @@ test('performance workspace exposes plan, run, node and target routes', async ()
   assert.equal(existsSync(new URL('../src/views/perf-testing/PerfWorkspacePlaceholder.vue', import.meta.url)), false)
 })
 
-test('performance API keeps management responses in response.data and enrollment tokens explicit', async () => {
+test('performance API keeps management responses in response.data and installation commands explicit', async () => {
   const source = await read('../src/api/performance.js')
   assert.match(source, /const get = async .*\.data/)
   assert.match(source, /createPerformanceNode[\s\S]*response\?\.data \?\? response/)
   assert.match(source, /resetPerformanceNodeEnrollment[\s\S]*response\?\.data \?\? response/)
+  assert.match(source, /getPerformanceNodeInstallation[\s\S]*nodes\/\$\{id\}\/installation/)
   assert.match(source, /performanceErrorMessage/)
 })
 
@@ -53,7 +59,20 @@ test('workspace creates one-node execution requests and explains virtual-user st
   assert.match(source, /在线 Agent 不等于 Worker 就绪/)
   assert.match(source, /启动速率表示每秒启动的虚拟用户数，不代表每秒请求数/)
   assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/)
-  assert.match(source, /clearEnrollmentToken\(\).*tokenDialog\.token = ''/s)
+  assert.match(source, /节点安装向导/)
+  assert.match(source, /getPerformanceNodeInstallation/)
+  assert.match(source, /copyText\(command\)/)
+  assert.match(source, /v-if="canManageNodes" label="操作"/)
+  assert.match(source, /installationRequestNonce/)
+  assert.match(source, /installationClock\.value = Date\.now\(\)/)
+  assert.match(source, /installationAvailable && canRegenerateInstallation/)
+  assert.match(source, /安装命令已过期，请重新生成/)
+  assert.match(source, /需要 Linux 主机、Docker 和 root 权限/)
+  assert.match(source, /重新生成会立即使旧注册凭证和旧长期身份失效/)
+  assert.match(source, /不要默认重装或重置身份/)
+  assert.match(source, /window\.setInterval\(\(\) => \{ installationClock\.value = Date\.now\(\); return Promise\.all\(\[loadConfig\(requestProjectId, requestEpoch\), loadList\('nodes'/)
+  assert.match(source, /Promise\.all\(\[loadAccess\(requestProjectId, requestEpoch\), loadConfig\(requestProjectId, requestEpoch\), loadList\('targets', requestProjectId, requestEpoch\), loadList\('plans', requestProjectId, requestEpoch\), loadList\('nodes', requestProjectId, requestEpoch\)\]\)/)
+  assert.match(source, /await ElMessageBox\.confirm\([\s\S]*?if \(!scopeIsCurrent\(scope\) \|\| !installationDialog\.visible \|\| installationRequestNonce !== dialogNonce\) return[\s\S]*?resetPerformanceNodeEnrollment/)
   assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/)
   assert.match(source, /createPerformanceRun\(scope\.projectId, plan\.id, \{ node_id: nodeId, request_id: requestId \}\)/)
   assert.match(source, /execution_unavailable_reason/)
@@ -91,11 +110,19 @@ test('target mutation payload strips read-only fields and scope guards reject sw
   assert.equal(samePerformanceScope({ projectId: 1, epoch: 4 }, { projectId: 1, epoch: 5 }), false)
 })
 
-test('clipboard failure is observable so the token dialog can stay open for manual copying', async () => {
-  const copied = []
-  await copyEnrollmentTokenToClipboard('one-time-token', async (value) => copied.push(value))
-  assert.deepEqual(copied, ['one-time-token'])
-  await assert.rejects(copyEnrollmentTokenToClipboard('one-time-token', async () => { throw new Error('blocked') }))
+test('installation presentation follows actual node state without retaining a command', () => {
+  assert.deepEqual(performanceInstallationStage({ status: 'pending' }, { command: 'docker compose up' }), { key: 'installing', text: '请在节点终端执行下方命令，等待节点注册并发送心跳。' })
+  assert.deepEqual(performanceInstallationStage({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: 'docker compose up' }), { key: 'registered', text: '节点已注册，等待首次心跳。' })
+  assert.deepEqual(performanceInstallationStage({ status: 'offline', registered_at: '2026-09-16T00:00:00Z' }, null), { key: 'offline', text: '节点曾注册但当前离线，请先检查 Docker 容器、网络和平台地址。' })
+  assert.deepEqual(performanceInstallationStage({ status: 'online' }, null), { key: 'online', text: '节点已在线，可保留此页查看安装条件。' })
+  assert.deepEqual(performanceInstallationStage({ status: 'revoked' }, null), { key: 'revoked', text: '节点已吊销，不能安装或重新注册；如需恢复，请新建节点。' })
+  assert.equal(canRegenerateInstallation({ status: 'pending' }, { command: null }), true)
+  assert.equal(canRegenerateInstallation({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: null }), false)
+  assert.equal(canRegenerateInstallation({ status: 'offline', registered_at: 'yes' }, { command: null }), false)
+  assert.equal(installationCommandExpired({ expires_at: '2026-09-16T00:00:00Z' }, Date.parse('2026-09-16T00:00:01Z')), true)
+  assert.equal(canRegenerateInstallation({ status: 'pending' }, { command: 'old command' }, true), true)
+  assert.equal(installationArchitectureText(['amd64', 'arm64']), 'x86_64（amd64）、ARM64（arm64）')
+  assert.equal(installationArchitectureText([]), '未配置或未发布')
 })
 
 test('performance API errors prefer a nested field-specific validation detail', () => {

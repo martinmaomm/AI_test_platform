@@ -472,6 +472,8 @@ cd backend
 
 ### 13.4 公网 Docker 节点
 
+日常接入优先使用项目“节点管理 → 添加节点 → 安装向导”：复制一条命令到远程Linux root终端，安装后页面自动显示真实注册/在线状态。需提前配置平台安装入口、发布固定架构镜像和可信CA；详见下方部署说明的“从网页一键接入”部分。不托管SSH密码，不静默升级远程Docker。真实接入、幂等与运行验证见[一键接入验收](verification/2026-09-16-performance-one-click.md)。
+
 无 VPN 的部署参考、Agent 专用 Caddy 入口、私有 CA 分发、Docker 登记与启动、临时目标和排障命令见[公网节点部署说明](../deploy/performance/README.md)。2026-09-16 已完成一台 Linux amd64 公网节点的低负载真实联调，证据与未覆盖边界见[公网节点验收记录](verification/2026-09-16-performance-public-node.md)。
 
 Mac 的网关和独立执行控制器目前没有开机自启；重启机器后，只启动后端/Celery 不足以恢复性能执行，还要按上述文档启动这两个进程。

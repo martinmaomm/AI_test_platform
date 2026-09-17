@@ -80,6 +80,16 @@ class ReleaseFixtureMixin:
             json.dumps(self.manifest), encoding='utf-8',
         )
 
+    def enable_registry_transport(self):
+        for index, (architecture, image) in enumerate(
+            self.manifest['images'].items(), start=5,
+        ):
+            image['registry_ref'] = (
+                f'docker.io/automationplatform/performance-node-{architecture}'
+                f'@sha256:{str(index) * 64}'
+            )
+        self.write_manifest()
+
     @contextmanager
     def release_environment(self, **changes):
         environment = {
@@ -200,6 +210,37 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
             with self.subTest(label=label):
                 self.manifest = json.loads(json.dumps(original))
                 mutate()
+                self.write_manifest()
+                with self.release_environment():
+                    metadata = installation_metadata()
+                self.assertFalse(metadata['available'], metadata)
+                self.assertNotIn('command', metadata)
+
+    def test_registry_ref_is_strictly_pinned_and_manifest_digest_can_differ(self):
+        self.enable_registry_transport()
+        with self.release_environment():
+            configuration = load_release_configuration()
+        self.assertEqual(
+            configuration.architectures[0].registry_ref,
+            'docker.io/automationplatform/performance-node-amd64@'
+            + 'sha256:' + '5' * 64,
+        )
+
+        invalid_references = (
+            None,
+            '',
+            'ghcr.io/automationplatform/performance-node@' + 'sha256:' + '1' * 64,
+            'docker.io/user:password/performance-node@' + 'sha256:' + '1' * 64,
+            'docker.io/automationplatform/performance-node:latest',
+            'docker.io/AutomationPlatform/performance-node@' + 'sha256:' + '1' * 64,
+            'docker.io/automationplatform/team/performance-node@' + 'sha256:' + '1' * 64,
+            'docker.io/automationplatform/performance-node@sha256:' + 'A' * 64,
+            'docker.io/automationplatform/performance-node@sha256:' + '1' * 63,
+            'docker.io/automationplatform/performance-node@sha256:' + '1' * 64 + '?x=1',
+        )
+        for registry_ref in invalid_references:
+            with self.subTest(registry_ref=registry_ref):
+                self.manifest['images']['amd64']['registry_ref'] = registry_ref
                 self.write_manifest()
                 with self.release_environment():
                     metadata = installation_metadata()
@@ -334,6 +375,36 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         self.assertEqual(
             subprocess.run(
                 ['bash', '-n', '-c', command], capture_output=True, text=True, check=False,
+            ).returncode,
+            0,
+        )
+
+    def test_bootstrap_registry_transport_skips_archive_probe_at_runtime(self):
+        self.enable_registry_transport()
+        node = type('Node', (), {
+            'pk': '00000000-0000-0000-0000-000000000001',
+            'enrollment_expires_at': timezone.now() + timedelta(minutes=15),
+        })()
+        with self.release_environment():
+            metadata = installation_metadata(node=node, enrollment_token='one-time-token')
+        bootstrap_script = shlex.split(metadata['command'])[2]
+
+        amd64_ref = self.manifest['images']['amd64']['registry_ref']
+        arm64_ref = self.manifest['images']['arm64']['registry_ref']
+        self.assertIn(f'registry_ref={amd64_ref}', bootstrap_script)
+        self.assertIn(f'registry_ref={arm64_ref}', bootstrap_script)
+        self.assertIn('if [ -z "$registry_ref" ]; then', bootstrap_script)
+        self.assertIn('if [ -n "$registry_ref" ]; then', bootstrap_script)
+        self.assertIn('installer_arguments+=(--registry-ref "$registry_ref")', bootstrap_script)
+        probe_position = bootstrap_script.index('--range 0-0')
+        guard_position = bootstrap_script.index('if [ -z "$registry_ref" ]; then')
+        installer_position = bootstrap_script.index('installer_arguments=(')
+        self.assertLess(guard_position, probe_position)
+        self.assertLess(probe_position, installer_position)
+        self.assertEqual(
+            subprocess.run(
+                ['bash', '-n', '-c', metadata['command']],
+                capture_output=True, text=True, check=False,
             ).returncode,
             0,
         )

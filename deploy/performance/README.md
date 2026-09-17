@@ -7,7 +7,7 @@
 平台管理员进入性能项目的“节点管理”，点击“添加节点”，填写名称和网络位置。创建后按安装向导，将生成的完整命令复制到远程 Linux **root** 终端执行（其他用户先 `sudo -i`）。页面不需要填写 SSH 密码。
 
 - 第一版复用已经安装、可用的本地 Docker；缺少 Docker 或不支持的系统会给出明确提示，不静默安装/升级宿主机。
-- 安装器下载平台发布的固定版本镜像并校验归档 SHA256、镜像 ID 和系统架构；无需用户构建源码。
+- 已发布到 Docker Hub 时，安装器直接拉取固定 `sha256` 摘要的镜像，显示分层下载进度，并校验镜像 ID 和系统架构；无需用户构建源码。未配置仓库发行时仍支持原有 HTTPS 归档方式。
 - 命令包含15分钟有效的一次性注册凭证，过期需重新生成；有效期内不能公开分享。粘贴命令可能进入本机剪贴板、终端历史或短时进程参数，请勿录屏公开，使用后按本机策略清理。长期身份只保存在节点私有卷中，不进入运行容器环境变量。
 - 平台使用私有 CA 时，命令包含 **CA 公钥**，先验证 HTTPS 和安装器摘要再执行；不会关闭 TLS 校验，不含 CA 私钥。
 - 复制后安装向导保持打开，真实收到注册/心跳后才更新状态；关闭页面不影响远程安装，重新打开不会回显旧凭证。
@@ -37,6 +37,39 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 ```
 
 生成目录默认 `backend/resource/performance-node/`，包含 manifest 和受控镜像归档，已被 Git 忽略。同版本已发布镜像拒绝直接覆盖，修改引擎后应按版本契约重新发布。这个目录只放可公开的发行资产，禁止放 `.env`、身份文件、数据库备份、CA 私钥和符号链接。
+
+#### 推荐：公开 Docker Hub 发行（仅限测试使用）
+
+只发布 `performance-node/` 的独立客户端，不发布平台镜像或整个项目目录。Docker 构建上下文已使用白名单，仅允许节点 Python 源码、包配置、README 和 Dockerfile；不包含平台 `.env`、身份卷、日志、数据库和私钥。
+
+1. 在发布机执行 `docker login`，在 Docker 官方网页登录。仓库命名使用 **Docker ID**，不能用邮箱；不要把密码或 Token 发到聊天、放进脚本或提交到 Git。
+2. 在 Docker Hub 创建公开仓库，建议名为 `performance-node`，简介填写：**仅限测试使用 / For authorized testing only. Not for production.** 仓库完整介绍可使用 [DOCKERHUB.md](DOCKERHUB.md)。
+3. 在项目根目录构建所需架构：
+
+   ```bash
+   docker buildx build --platform linux/amd64 --provenance=false --load \
+     -t automation-platform-performance-node:0.2.0-amd64 performance-node
+   docker buildx build --platform linux/arm64 --provenance=false --load \
+     -t automation-platform-performance-node:0.2.0-arm64 performance-node
+   ```
+
+4. 把下方 `YOUR_DOCKER_ID` 替换成真实 Docker ID，显式启用公开发布：
+
+   ```bash
+   backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
+     --image amd64=automation-platform-performance-node:0.2.0-amd64 \
+     --image arm64=automation-platform-performance-node:0.2.0-arm64 \
+     --output backend/resource/performance-node-dockerhub \
+     --registry docker.io/YOUR_DOCKER_ID/performance-node
+   ```
+
+归档进入公开发行路径及推送仓库之前，会校验运行时版本并检查镜像的**所有层**（包括后来删除的文件）、私钥、访问令牌、本地平台敏感配置值及应用文件白名单。发现问题时拒绝发布，不打印匹配到的敏感值。多阶段构建还会剔除第三方依赖的测试目录（其中可能包含公开测试私钥样本），这些内容不会进入最终镜像的历史层。此检查是定向泄漏防护，不代替完整安全审计或依赖漏洞扫描。使用新的发行目录，不覆盖旧的同版本归档。
+
+发布工具验证远端摘要、架构与配置，并以未登录身份确认可拉取后，才把 `registry_ref` 写入 manifest。安装命令按架构选择固定摘要，**不使用 `latest`，不因仓库失败自动降级或关闭 TLS**。平台公共 CA 只用于平台控制连接，不传给 Docker Hub。Docker Hub 在目标网络不可达或限流时仍可能下载失败，并不能保证所有网络都提速。
+
+发布成功后，将下方 `PERFORMANCE_NODE_RELEASE_DIR` 改为新发行目录的绝对路径并重启后端。若还需使用归档下载，Caddy 同样切换到该目录；只用仓库拉取时无需从平台下载大归档。已复制的旧安装命令包含旧安装器摘要，改版后应从网页重新生成。
+
+已有节点继续使用原身份和镜像，不会自动升级。若一个尚未注册的节点已经创建了旧镜像专属的网络/卷，改用新镜像时安装器会拒绝覆盖：确认它没有运行任务后，吊销旧节点并创建新节点；旧机器资源需按归属单独清理，切勿删除不明身份卷。
 
 后端实际 `.env` 增加（示例路径请替换）：
 

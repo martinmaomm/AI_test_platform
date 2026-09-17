@@ -29,7 +29,7 @@ die() {
 
 usage() {
     cat >&2 <<'EOF'
-用法：install-node.sh --platform URL --node-id UUID --token-file PATH [--ca-file PATH] --image-ref REF --image-id sha256:ID --image-config-id sha256:ID --archive-url HTTPSURL --archive-sha256 HEX --archive-size BYTES
+用法：install-node.sh --platform URL --node-id UUID --token-file PATH [--ca-file PATH] --image-ref REF --image-id sha256:ID --image-config-id sha256:ID [--registry-ref docker.io/OWNER/REPOSITORY@sha256:DIGEST] --archive-url HTTPSURL --archive-sha256 HEX --archive-size BYTES
 EOF
 }
 
@@ -49,6 +49,8 @@ ca_file=""
 image_ref=""
 image_id=""
 image_config_id=""
+registry_ref=""
+registry_digest=""
 archive_url=""
 archive_sha256=""
 archive_size=""
@@ -59,6 +61,7 @@ seen_ca_file=0
 seen_image_ref=0
 seen_image_id=0
 seen_image_config_id=0
+seen_registry_ref=0
 seen_archive_url=0
 seen_archive_sha256=0
 seen_archive_size=0
@@ -112,6 +115,13 @@ while (( $# > 0 )); do
             (( seen_image_config_id == 0 )) || die "参数 --image-config-id 不能重复"
             image_config_id="$2"
             seen_image_config_id=1
+            shift 2
+            ;;
+        --registry-ref)
+            require_value "$1" "$#"
+            (( seen_registry_ref == 0 )) || die "参数 --registry-ref 不能重复"
+            registry_ref="$2"
+            seen_registry_ref=1
             shift 2
             ;;
         --archive-url)
@@ -218,6 +228,15 @@ image_config_id="$(tr '[:upper:]' '[:lower:]' <<<"$image_config_id")"
 archive_sha256="$(tr '[:upper:]' '[:lower:]' <<<"$archive_sha256")"
 [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "--image-id 必须是 sha256: 加 64 位十六进制摘要"
 [[ "$image_config_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "--image-config-id 必须是 sha256: 加 64 位十六进制摘要"
+if (( seen_registry_ref )); then
+    [[ "$registry_ref" =~ ^docker\.io/[a-z0-9]([a-z0-9-]{0,37}[a-z0-9])?/[a-z0-9]([a-z0-9._-]*[a-z0-9])?@sha256:[0-9a-f]{64}$ ]] || \
+        die "--registry-ref 必须是固定摘要格式 docker.io/<dockerid>/<repository>@sha256:<64位小写十六进制>"
+    registry_digest="${registry_ref##*@}"
+fi
+allowed_image_ids="固定 index ID ${image_id} 及 config ID ${image_config_id}"
+if (( seen_registry_ref )); then
+    allowed_image_ids+="及 registry digest ${registry_digest}"
+fi
 [[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--archive-sha256 必须是 64 位十六进制摘要"
 [[ "$archive_size" =~ ^[1-9][0-9]*$ ]] || die "--archive-size 必须是正整数字节数"
 
@@ -423,12 +442,27 @@ else
     log "已创建节点专用身份卷：${identity_volume}"
 fi
 
-verify_local_image() {
+# The local tag is shared by all nodes of this architecture. Serialize installer
+# checks/pull/load/tag operations so one node can never overwrite another node's
+# conflicting tag between the preflight check and the tag operation.
+image_lock_file="${LOCK_DIR}/image-${host_arch}.lock"
+[[ ! -L "$image_lock_file" ]] || die "镜像锁文件不能是符号链接：${image_lock_file}"
+if [[ -e "$image_lock_file" ]]; then
+    [[ -f "$image_lock_file" ]] || die "镜像锁文件必须是普通文件：${image_lock_file}"
+    [[ "$(stat -c '%a' -- "$image_lock_file")" == "600" && "$(stat -c '%u' -- "$image_lock_file")" == "0" ]] || \
+        die "镜像锁文件权限或属主不安全：${image_lock_file}"
+fi
+exec 8>>"$image_lock_file"
+chmod 0600 -- "$image_lock_file"
+flock 8
+
+verify_image_reference() {
+    local reference="$1"
     local actual_image_id image_platform image_os image_arch_raw image_arch
-    actual_image_id="$(docker image inspect --format '{{.Id}}' "$image_ref" 2>/dev/null)" || return 1
+    actual_image_id="$(docker image inspect --format '{{.Id}}' "$reference" 2>/dev/null)" || return 1
     image_id_is_allowed "$actual_image_id" || \
-        die "镜像引用 ${image_ref} 已指向 ${actual_image_id}，与固定 index ID ${image_id} 及 config ID ${image_config_id} 均不一致；不会覆盖或升级"
-    image_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image_ref")" || die "无法检查镜像平台"
+        die "镜像引用 ${reference} 已指向 ${actual_image_id}，与${allowed_image_ids}均不一致；不会覆盖或升级"
+    image_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$reference")" || die "无法检查镜像平台"
     image_os="${image_platform%%/*}"
     image_arch_raw="${image_platform#*/}"
     [[ "$image_os" == "linux" ]] || die "固定镜像 OS 为 ${image_os}，不是 Linux"
@@ -440,14 +474,47 @@ verify_local_image() {
 image_id_is_allowed() {
     local candidate
     candidate="$(tr '[:upper:]' '[:lower:]' <<<"$1")"
-    [[ "$candidate" == "$image_id" || "$candidate" == "$image_config_id" ]]
+    if [[ "$candidate" == "$image_id" || "$candidate" == "$image_config_id" ]]; then
+        return 0
+    fi
+    (( seen_registry_ref )) && [[ "$candidate" == "$registry_digest" ]]
 }
 
 image_ready=0
 if docker image inspect "$image_ref" >/dev/null 2>&1; then
-    verify_local_image
+    verify_image_reference "$image_ref"
     image_ready=1
-    log "本地镜像 ref、固定 ID 和 Linux/${host_arch} 平台核验通过，跳过归档下载与 docker load"
+    log "本地镜像 ref、固定 ID 和 Linux/${host_arch} 平台核验通过，跳过归档下载与 docker load，也无需 registry 拉取"
+fi
+
+if (( image_ready == 0 && seen_registry_ref )); then
+    registry_image_ready=0
+    if docker image inspect "$registry_ref" >/dev/null 2>&1; then
+        verify_image_reference "$registry_ref"
+        registry_image_ready=1
+        log "本地 Docker Hub 摘要镜像核验通过，跳过重复拉取"
+    fi
+    if (( registry_image_ready == 0 )); then
+        log "正在从 Docker Hub 拉取固定摘要镜像；拉取进度由 Docker 直接显示"
+        if ! docker pull --platform "linux/${host_arch}" "$registry_ref"; then
+            die "Docker Hub 固定摘要镜像拉取失败；未回退平台归档，也未启动或登记节点"
+        fi
+        verify_image_reference "$registry_ref" || \
+            die "Docker Hub 拉取后未找到固定摘要镜像；未启动或登记节点"
+    fi
+
+    # Recheck immediately before tagging so an existing wrong local tag is never replaced.
+    if docker image inspect "$image_ref" >/dev/null 2>&1; then
+        verify_image_reference "$image_ref"
+        log "本地固定 tag 已由并行安装准备并通过校验，跳过重复 tag"
+    else
+        docker image tag "$registry_ref" "$image_ref" || \
+            die "无法将已校验的 Docker Hub 镜像标记为固定本地引用；未启动或登记节点"
+        verify_image_reference "$image_ref" || \
+            die "Docker Hub 镜像标记后未找到固定本地引用；未启动或登记节点"
+        log "Docker Hub 固定摘要镜像已核验并标记为 ${image_ref}"
+    fi
+    image_ready=1
 fi
 
 if (( image_ready == 0 )); then
@@ -520,8 +587,9 @@ if (( image_ready == 0 )); then
 
     log "镜像归档大小与 SHA256 校验通过，正在载入 Docker"
     docker load --input "$archive_final" >/dev/null || die "docker load 失败；未启动或登记节点"
-    verify_local_image || die "归档载入后未找到固定镜像引用 ${image_ref}"
+    verify_image_reference "$image_ref" || die "归档载入后未找到固定镜像引用 ${image_ref}"
 fi
+flock -u 8
 
 common_labels=(
     --label "${OWNER_LABEL}=${OWNER_VALUE}"
@@ -660,7 +728,7 @@ if resource_exists container "$runtime_container"; then
     runtime_image_id="$(docker container inspect --format '{{.Image}}' "$runtime_container")"
     [[ "$runtime_image_ref" == "$image_ref" ]] || die "已有运行容器镜像引用与固定 image ref 不一致；不会强行升级或重建"
     image_id_is_allowed "$runtime_image_id" || \
-        die "已有运行容器镜像 ID 与固定 index/config ID 均不一致；不会强行升级或重建"
+        die "已有运行容器镜像 ID 与${allowed_image_ids}均不一致；不会强行升级或重建"
     runtime_status="$(docker container inspect --format '{{.State.Status}}' "$runtime_container")"
     case "$runtime_status" in
         running)

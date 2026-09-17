@@ -19,6 +19,8 @@ INSTALLER = REPO_ROOT / "deploy" / "performance" / "install-node.sh"
 IMAGE_REF = "automation-platform-performance-node:0.2.0-amd64"
 IMAGE_ID = "sha256:e8d384d6bb0c3a7fc0a9585e3c5dac926bc27cd65550267906e1de43d5a2e1c6"
 IMAGE_CONFIG_ID = "sha256:" + "c1" * 32
+REGISTRY_REF = "docker.io/automationplatform/performance-node@sha256:" + "b7" * 32
+REGISTRY_DIGEST = REGISTRY_REF.rsplit("@", 1)[1]
 PLATFORM = "https://load.example.test:18443"
 ARCHIVE_URL = PLATFORM + "/downloads/performance-node-amd64.tar.gz"
 
@@ -41,6 +43,7 @@ def load_state():
     if state_path.exists():
         return json.loads(state_path.read_text())
     return {"networks": {}, "volumes": {}, "containers": {}, "image_loaded": False,
+            "registry_image_loaded": False,
             "identity": "missing", "enroll_calls": 0, "commands": []}
 
 def save_state(value):
@@ -187,18 +190,48 @@ elif name == "docker":
         save_state(state)
         print(args[-1])
     elif args[:2] == ["image", "inspect"]:
-        if not state.get("image_loaded") and os.environ.get("FAKE_PRELOAD_IMAGE") != "1":
+        reference = args[-1]
+        is_registry = reference == os.environ["FAKE_REGISTRY_REF"]
+        available = (
+            state.get("registry_image_loaded") or os.environ.get("FAKE_PRELOAD_REGISTRY_IMAGE") == "1"
+        ) if is_registry else (
+            state.get("image_loaded") or os.environ.get("FAKE_PRELOAD_IMAGE") == "1"
+        )
+        if not available:
             raise SystemExit(1)
         if "--format" not in args:
             print("[]")
         else:
             template = args[args.index("--format") + 1]
             if template == "{{.Id}}":
-                print(os.environ["FAKE_IMAGE_ID"])
+                if is_registry:
+                    print(os.environ.get("FAKE_REGISTRY_IMAGE_ID", os.environ["FAKE_IMAGE_CONFIG_ID"]))
+                else:
+                    print(state.get("tagged_image_id", os.environ["FAKE_IMAGE_ID"]))
             elif template == "{{.Os}}/{{.Architecture}}":
-                print("linux/amd64")
+                if is_registry:
+                    print(os.environ.get("FAKE_REGISTRY_IMAGE_PLATFORM", "linux/amd64"))
+                else:
+                    print(os.environ.get("FAKE_IMAGE_PLATFORM", "linux/amd64"))
             else:
                 fail("unsupported image inspect template")
+    elif args[0] == "pull":
+        if os.environ.get("FAKE_DOCKER_PULL_FAIL") == "1":
+            print("pull failed", file=sys.stderr)
+            raise SystemExit(1)
+        if args != ["pull", "--platform", "linux/amd64", os.environ["FAKE_REGISTRY_REF"]]:
+            fail("unexpected docker pull arguments: " + repr(args))
+        state["registry_image_loaded"] = True
+        save_state(state)
+        print("pulled fixed digest")
+    elif args[:2] == ["image", "tag"]:
+        if args[2:] != [os.environ["FAKE_REGISTRY_REF"], os.environ["FAKE_IMAGE_REF"]]:
+            fail("unexpected docker image tag arguments: " + repr(args))
+        state["image_loaded"] = True
+        state["tagged_image_id"] = os.environ.get(
+            "FAKE_REGISTRY_IMAGE_ID", os.environ["FAKE_IMAGE_CONFIG_ID"],
+        )
+        save_state(state)
     elif args[0] == "load":
         state["image_loaded"] = True
         save_state(state)
@@ -222,7 +255,8 @@ elif name == "docker":
             raise SystemExit(42)
         state["containers"][container_name] = {
             "labels": labels_from(args), "image_ref": os.environ["FAKE_IMAGE_REF"],
-            "image_id": os.environ["FAKE_IMAGE_ID"], "status": "running",
+            "image_id": state.get("tagged_image_id", os.environ["FAKE_IMAGE_ID"]),
+            "status": "running",
         }
         save_state(state)
         print("container-id")
@@ -290,10 +324,12 @@ class InstallerHarness:
             "FAKE_IMAGE_REF": IMAGE_REF,
             "FAKE_IMAGE_ID": IMAGE_ID,
             "FAKE_IMAGE_CONFIG_ID": IMAGE_CONFIG_ID,
+            "FAKE_REGISTRY_REF": REGISTRY_REF,
         }
 
-    def command(self, *, archive_sha: str | None = None) -> list[str]:
-        return [
+    def command(self, *, archive_sha: str | None = None,
+                registry_ref: str | None = None) -> list[str]:
+        command = [
             "/bin/bash", str(self.installer),
             "--platform", PLATFORM,
             "--node-id", self.node_id,
@@ -306,14 +342,18 @@ class InstallerHarness:
             "--archive-sha256", archive_sha or self.archive_sha,
             "--archive-size", str(self.archive_size),
         ]
+        if registry_ref is not None:
+            command.extend(("--registry-ref", registry_ref))
+        return command
 
     def run(self, *, extra_env: dict[str, str] | None = None,
-            archive_sha: str | None = None) -> subprocess.CompletedProcess[str]:
+            archive_sha: str | None = None,
+            registry_ref: str | None = None) -> subprocess.CompletedProcess[str]:
         environment = self.env
         if extra_env:
             environment.update(extra_env)
         return subprocess.run(
-            self.command(archive_sha=archive_sha), env=environment,
+            self.command(archive_sha=archive_sha, registry_ref=registry_ref), env=environment,
             text=True, capture_output=True, timeout=20,
         )
 
@@ -434,6 +474,153 @@ class InstallNodeTests(unittest.TestCase):
         self.assertIn("跳过归档下载与 docker load", completed.stdout)
         archive = self.root / "nodes" / harness.node_id / f"image-{harness.archive_sha}.tar.gz"
         self.assertFalse(archive.exists())
+
+    def test_classic_registry_install_accepts_config_id_distinct_from_manifest_digest(self) -> None:
+        harness = self.harness()
+        completed = harness.run(
+            registry_ref=REGISTRY_REF,
+            extra_env={"FAKE_CURL_MODE": "offline"},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = harness.state()
+        self.assertEqual(state["enroll_calls"], 1)
+        self.assertFalse(harness.token.exists())
+        self.assertNotIn("curl_commands", state)
+        self.assertIn(
+            ["pull", "--platform", "linux/amd64", REGISTRY_REF],
+            state["commands"],
+        )
+        self.assertIn(["image", "tag", REGISTRY_REF, IMAGE_REF], state["commands"])
+        self.assertNotEqual(IMAGE_CONFIG_ID, REGISTRY_DIGEST)
+        self.assertEqual(state["tagged_image_id"], IMAGE_CONFIG_ID)
+        fixed_config = (self.root / "nodes" / harness.node_id / "installation.conf").read_text()
+        self.assertNotIn("registry_ref", fixed_config)
+        self.assertIn(f"archive_url={ARCHIVE_URL}\n", fixed_config)
+
+    def test_containerd_registry_install_accepts_child_digest_distinct_from_index_id(self) -> None:
+        harness = self.harness()
+        self.assertNotEqual(IMAGE_ID, REGISTRY_DIGEST)
+        completed = harness.run(
+            registry_ref=REGISTRY_REF,
+            extra_env={"FAKE_REGISTRY_IMAGE_ID": REGISTRY_DIGEST},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = harness.state()
+        self.assertEqual(state["enroll_calls"], 1)
+        self.assertEqual(state["tagged_image_id"], REGISTRY_DIGEST)
+        self.assertEqual(state["containers"][harness.prefix]["image_id"], REGISTRY_DIGEST)
+
+    def test_registry_pull_failure_does_not_fall_back_or_enroll(self) -> None:
+        harness = self.harness()
+        completed = harness.run(
+            registry_ref=REGISTRY_REF,
+            extra_env={
+                "FAKE_DOCKER_PULL_FAIL": "1",
+                "FAKE_CURL_MODE": "offline",
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        state = harness.state()
+        self.assertEqual(state["enroll_calls"], 0)
+        self.assertFalse(state["image_loaded"])
+        self.assertNotIn("curl_commands", state)
+        self.assertFalse(any(command and command[0] == "load" for command in state["commands"]))
+        self.assertTrue(harness.token.exists())
+        self.assertIn("未回退平台归档", completed.stderr)
+
+    def test_registry_image_with_wrong_id_or_platform_never_enrolls_or_tags(self) -> None:
+        cases = (
+            ({"FAKE_REGISTRY_IMAGE_ID": "sha256:" + "f4" * 32}, "固定 index ID"),
+            ({"FAKE_REGISTRY_IMAGE_PLATFORM": "linux/arm64"}, "架构"),
+        )
+        for environment, expected_message in cases:
+            with self.subTest(environment=environment), tempfile.TemporaryDirectory() as folder:
+                harness = InstallerHarness(Path(folder))
+                completed = harness.run(registry_ref=REGISTRY_REF, extra_env=environment)
+
+                self.assertNotEqual(completed.returncode, 0)
+                state = harness.state()
+                self.assertEqual(state["enroll_calls"], 0)
+                self.assertFalse(state["image_loaded"])
+                self.assertFalse(any(command[:2] == ["image", "tag"] for command in state["commands"]))
+                self.assertTrue(harness.token.exists())
+                self.assertIn(expected_message, completed.stderr)
+
+    def test_registry_never_overwrites_an_existing_wrong_local_tag(self) -> None:
+        harness = self.harness()
+        wrong_id = "sha256:" + "f5" * 32
+        completed = harness.run(
+            registry_ref=REGISTRY_REF,
+            extra_env={"FAKE_PRELOAD_IMAGE": "1", "FAKE_IMAGE_ID": wrong_id},
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        state = harness.state()
+        self.assertEqual(state["enroll_calls"], 0)
+        self.assertFalse(any(command and command[0] == "pull" for command in state["commands"]))
+        self.assertFalse(any(command[:2] == ["image", "tag"] for command in state["commands"]))
+        self.assertIn("不会覆盖或升级", completed.stderr)
+
+    def test_registry_rerun_reuses_local_tag_and_does_not_register_twice(self) -> None:
+        harness = self.harness()
+        first = harness.run(registry_ref=REGISTRY_REF)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_pull_count = sum(
+            command and command[0] == "pull" for command in harness.state()["commands"]
+        )
+        harness.write_token("SECOND-UNUSED-TOKEN")
+
+        second = harness.run(
+            registry_ref=REGISTRY_REF,
+            extra_env={"FAKE_DOCKER_PULL_FAIL": "1", "FAKE_CURL_MODE": "offline"},
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        state = harness.state()
+        self.assertEqual(state["enroll_calls"], 1)
+        self.assertEqual(
+            sum(command and command[0] == "pull" for command in state["commands"]),
+            first_pull_count,
+        )
+        self.assertFalse(harness.token.exists())
+        self.assertIn("跳过 enroll", second.stdout)
+
+    def test_existing_archive_install_can_resume_with_registry_transport(self) -> None:
+        harness = self.harness()
+        first = harness.run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        original_config = (
+            self.root / "nodes" / harness.node_id / "installation.conf"
+        ).read_text()
+        harness.write_token("TRANSPORT-CHANGE-MUST-NOT-BE-CONSUMED")
+
+        second = harness.run(
+            registry_ref=REGISTRY_REF,
+            extra_env={"FAKE_DOCKER_PULL_FAIL": "1", "FAKE_CURL_MODE": "offline"},
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(harness.state()["enroll_calls"], 1)
+        self.assertEqual(
+            (self.root / "nodes" / harness.node_id / "installation.conf").read_text(),
+            original_config,
+        )
+
+    def test_registry_ref_rejects_unpinned_digest_and_external_host(self) -> None:
+        invalid_references = (
+            "docker.io/automationplatform/performance-node:latest",
+            "ghcr.io/automationplatform/performance-node@" + IMAGE_ID,
+            "docker.io/automationplatform/performance-node@sha256:" + "A" * 64,
+            "docker.io/automationplatform/performance-node@sha256:" + "e8" * 31,
+        )
+        for registry_ref in invalid_references:
+            with self.subTest(registry_ref=registry_ref), tempfile.TemporaryDirectory() as folder:
+                harness = InstallerHarness(Path(folder))
+                completed = harness.run(registry_ref=registry_ref)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertTrue(harness.token.exists())
+                self.assertRegex(completed.stderr, r"--registry-ref|摘要")
 
     def test_stopped_owned_runtime_is_started_without_reenroll(self) -> None:
         harness = self.harness()

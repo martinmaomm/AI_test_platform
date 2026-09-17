@@ -34,6 +34,12 @@ _MAX_INSTALLER_BYTES = 2 * 1024 * 1024
 _MAX_CA_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 _IMAGE_ID_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
+_REGISTRY_REF_RE = re.compile(
+    r'^docker\.io/'
+    r'[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?/'
+    r'[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?'
+    r'@sha256:[0-9a-f]{64}$'
+)
 _CERTIFICATE_RE = re.compile(
     r'-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\r\n]+\s+-----END CERTIFICATE-----'
 )
@@ -52,6 +58,7 @@ class ArchitectureRelease:
     image_ref: str
     image_id: str
     image_config_id: str
+    registry_ref: str | None
 
 
 @dataclass(frozen=True)
@@ -251,11 +258,15 @@ def _load_architectures(release_directory, manifest):
         if architecture not in images:
             continue
         image = images[architecture]
-        expected_fields = {
+        required_fields = {
             'filename', 'sha256', 'size_bytes', 'image_ref', 'image_id',
             'image_config_id',
         }
-        if not isinstance(image, dict) or set(image) != expected_fields:
+        if (
+            not isinstance(image, dict)
+            or not required_fields.issubset(image)
+            or not set(image).issubset(required_fields | {'registry_ref'})
+        ):
             raise ReleaseConfigurationError(f'{architecture} 发行条目不符合固定格式。')
         expected_filename = f'{AGENT_VERSION}/linux-{architecture}.tar.gz'
         filename = image['filename']
@@ -272,6 +283,7 @@ def _load_architectures(release_directory, manifest):
         image_ref = image['image_ref']
         image_id = image['image_id']
         image_config_id = image['image_config_id']
+        registry_ref = image.get('registry_ref')
         if not isinstance(sha256, str) or not _SHA256_RE.fullmatch(sha256):
             raise ReleaseConfigurationError(f'{architecture} 发行文件 SHA256 无效。')
         if type(size_bytes) is not int or size_bytes <= 0:
@@ -286,6 +298,14 @@ def _load_architectures(release_directory, manifest):
             or not _IMAGE_ID_RE.fullmatch(image_config_id)
         ):
             raise ReleaseConfigurationError(f'{architecture} 镜像配置 ID 无效。')
+        if 'registry_ref' in image:
+            if (
+                not isinstance(registry_ref, str)
+                or not _REGISTRY_REF_RE.fullmatch(registry_ref)
+            ):
+                raise ReleaseConfigurationError(
+                    f'{architecture} Docker Hub 镜像引用无效。'
+                )
 
         archive_path = release_directory.joinpath(*PurePosixPath(filename).parts)
         _reject_symlink_components(
@@ -306,6 +326,7 @@ def _load_architectures(release_directory, manifest):
             image_ref=image_ref,
             image_id=image_id,
             image_config_id=image_config_id,
+            registry_ref=registry_ref,
         ))
     return tuple(releases)
 
@@ -441,6 +462,7 @@ def _bootstrap_command(configuration, *, node_id, enrollment_token):
             f'    image_ref={shlex.quote(release.image_ref)}',
             f'    image_id={shlex.quote(release.image_id)}',
             f'    image_config_id={shlex.quote(release.image_config_id)}',
+            f'    registry_ref={shlex.quote(release.registry_ref or "")}',
             f'    archive_url={shlex.quote(_archive_url(configuration, release))}',
             f'    archive_sha256={shlex.quote(release.sha256)}',
             f'    archive_size={shlex.quote(str(release.size_bytes))}',
@@ -449,10 +471,12 @@ def _bootstrap_command(configuration, *, node_id, enrollment_token):
     lines.extend((
         "  *) printf '当前 CPU 架构尚未发布：%s\\n' \"$selected_architecture\" >&2; exit 1 ;;",
         'esac',
-        '# 仅取一个字节验证所选发行文件可通过严格 TLS 到达，完整下载由安装器完成。',
-        'if ! curl "${curl_arguments[@]}" --range 0-0 --max-filesize 1 --output /dev/null "$archive_url"; then',
-        "  printf '%s\\n' '发行镜像不可达：请检查 Caddy 发行路径、TLS 信任和网络连通性。' >&2",
-        '  exit 1',
+        '# registry_ref 是固定镜像的可选运输源；仅离线归档模式探测平台归档。',
+        'if [ -z "$registry_ref" ]; then',
+        '  if ! curl "${curl_arguments[@]}" --range 0-0 --max-filesize 1 --output /dev/null "$archive_url"; then',
+        "    printf '%s\\n' '发行镜像不可达：请检查 Caddy 发行路径、TLS 信任和网络连通性。' >&2",
+        '    exit 1',
+        '  fi',
         'fi',
         'installer_arguments=(',
         f'  --platform {shlex.quote(configuration.platform_url)}',
@@ -469,6 +493,9 @@ def _bootstrap_command(configuration, *, node_id, enrollment_token):
         '  --archive-sha256 "$archive_sha256"',
         '  --archive-size "$archive_size"',
         ')',
+        'if [ -n "$registry_ref" ]; then',
+        '  installer_arguments+=(--registry-ref "$registry_ref")',
+        'fi',
         'bash "$installer_file" "${installer_arguments[@]}"',
     ))
     return f'bash -c {shlex.quote(chr(10).join(lines))}'

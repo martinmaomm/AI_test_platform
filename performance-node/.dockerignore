@@ -1,4 +1,13 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-tests/
+# Only the standalone node package is permitted in the public image context.
+*
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!README.md
+!src/
+src/*
+!src/performance_node/
+src/performance_node/*
+!src/performance_node/*.py
+**/__pycache__/
+**/*.pyc

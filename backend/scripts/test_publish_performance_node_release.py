@@ -3,11 +3,14 @@ import importlib.util
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import tarfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 spec = importlib.util.spec_from_file_location('publisher', Path(__file__).with_name('publish_performance_node_release.py'))
 publisher = importlib.util.module_from_spec(spec)
@@ -33,6 +36,18 @@ class ReleaseTests(unittest.TestCase):
         return {'architecture': info['Architecture'], 'os': info['Os'],
                 'config': info['Config'],
                 'rootfs': {'type': info['RootFS']['Type'], 'diff_ids': info['RootFS']['Layers']}}
+
+    def remote_manifest(self, config_id=None, digest=None):
+        return json.dumps({
+            'Descriptor': {
+                'digest': digest or 'sha256:' + 'b' * 64,
+                'platform': {'os': 'linux', 'architecture': 'amd64'},
+            },
+            'SchemaV2Manifest': {'config': {'digest': config_id or self.info()['Id']}},
+        })
+
+    def registry_ref(self):
+        return f'docker.io/example/performance-node:{publisher.__version__}-amd64-' + 'c' * 12
 
     def write_archive(self, path, document, config_layout='classic'):
         content = json.dumps(document, separators=(',', ':')).encode()
@@ -86,14 +101,49 @@ class ReleaseTests(unittest.TestCase):
                       'sha256': publisher.sha256(archive), 'size_bytes': archive.stat().st_size}
             manifest = {**self.versions(), 'release': publisher.__version__, 'images': {'amd64': record}}
             inspected = self.info()
-            with patch.object(publisher, 'inspect_image', return_value=(inspected, self.versions())), patch.object(publisher, 'archive_config_id', return_value='sha256:' + 'c' * 64) as archive_check, patch.object(publisher.subprocess, 'Popen') as export:
+            with patch.object(publisher, 'inspect_image', return_value=(inspected, self.versions())), \
+                    patch.object(publisher, 'archive_config_id', return_value='sha256:' + 'c' * 64) as archive_check, \
+                    patch.object(publisher, 'audit_release_archive') as audit, \
+                    patch.object(publisher.subprocess, 'Popen') as export:
                 publisher.publish_image(root, 'amd64', self.ref(), manifest)
                 self.assertEqual(record['image_config_id'], 'sha256:' + 'c' * 64)
                 archive_check.assert_called_once_with(archive, self.ref(), inspected)
+                audit.assert_called_once_with(archive)
                 export.assert_not_called()
                 archive.write_bytes(b'changed')
                 with self.assertRaises(ValueError): publisher.publish_image(root, 'amd64', self.ref(), manifest)
                 export.assert_not_called()
+
+    def test_failed_archive_audit_never_replaces_public_tar_or_adds_image_record(self):
+        class SavedImage:
+            stdout = io.BytesIO(b'fixture image bytes')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            manifest = {}
+            destination = root / f'{publisher.__version__}/linux-amd64.tar.gz'
+            with patch.object(publisher, 'inspect_image', return_value=(self.info(), self.versions())), \
+                    patch.object(publisher, 'archive_config_id', return_value='sha256:' + 'c' * 64), \
+                    patch.object(publisher, 'audit_release_archive',
+                                 side_effect=ValueError('sensitive archive fixture')) as audit, \
+                    patch.object(publisher.subprocess, 'Popen', return_value=SavedImage()), \
+                    patch.object(publisher.os, 'replace') as replace:
+                with self.assertRaisesRegex(ValueError, 'sensitive archive'):
+                    publisher.publish_image(root, 'amd64', self.ref(), manifest)
+            audit.assert_called_once()
+            replace.assert_not_called()
+            self.assertFalse(destination.exists())
+            self.assertNotIn('amd64', manifest.get('images', {}))
 
     def test_archive_config_digest_covers_classic_and_oci_layouts(self):
         for config_layout in ('classic', 'oci'):
@@ -138,6 +188,166 @@ class ReleaseTests(unittest.TestCase):
                     publisher.main(['--output', str(root), '--image', 'amd64=' + self.ref(), '--image', 'arm64=fixture'])
             manifest = json.loads((root / 'manifest.json').read_text())
             self.assertEqual(set(manifest['images']), {'amd64'})
+
+    def test_registry_repository_requires_explicit_docker_hub_namespace(self):
+        self.assertEqual(publisher.registry_repository('docker.io/example/performance-node'),
+                         'docker.io/example/performance-node')
+        for invalid in ('example/performance-node', 'docker.io/example',
+                        'ghcr.io/example/performance-node', 'docker.io/Example/repo',
+                        'docker.io/example/nested/repo'):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    publisher.registry_repository(invalid)
+
+    def test_registry_push_uses_inspected_image_id_and_records_verified_digest(self):
+        archive = Path('/fixture/verified.tar.gz')
+        audit = Mock(return_value={'layers': 1})
+        missing = subprocess.CalledProcessError(
+            1, ['docker', 'manifest', 'inspect'], output=b'manifest unknown',
+        )
+        outputs = [
+            missing,  # collision preflight: tag does not exist
+            b'',      # docker image tag
+            b'',      # docker image push
+            self.remote_manifest('sha256:' + 'c' * 64).encode(),  # authenticated remote inspect
+            json.dumps([{'Endpoints': {'docker': {'Host': 'unix:///fixture/docker.sock'}}}]).encode(),
+            # Docker context for the anonymous client
+            self.remote_manifest('sha256:' + 'c' * 64).encode(),  # anonymous remote inspect
+            b'',      # anonymous pull
+            json.dumps([{**self.info(), 'Id': 'sha256:' + 'b' * 64}]).encode(),  # containerd manifest ID
+        ]
+        with patch.dict(os.environ, {'DOCKER_CONTEXT': 'must-not-leak',
+                                     'DOCKER_AUTH_CONFIG': 'must-not-leak'}, clear=False), \
+                patch.object(publisher.importlib, 'import_module',
+                          return_value=SimpleNamespace(audit_archive=audit)), \
+                patch.object(publisher.subprocess, 'check_output', side_effect=outputs) as docker:
+            registry_ref = publisher.publish_registry_image(
+                archive, 'amd64', self.info(), 'sha256:' + 'c' * 64,
+                'docker.io/example/performance-node',
+            )
+        self.assertEqual(registry_ref, 'docker.io/example/performance-node@sha256:' + 'b' * 64)
+        audit.assert_called_once_with(archive)
+        self.assertIn(call(['docker', 'image', 'tag', self.info()['Id'], self.registry_ref()],
+                           stderr=subprocess.PIPE), docker.call_args_list)
+        self.assertIn(call(['docker', 'image', 'push', '--platform', 'linux/amd64', self.registry_ref()],
+                           stderr=subprocess.PIPE), docker.call_args_list)
+        anonymous_manifest_call = docker.call_args_list[5]
+        self.assertIn('DOCKER_CONFIG', anonymous_manifest_call.kwargs['env'])
+        self.assertEqual(anonymous_manifest_call.kwargs['env']['DOCKER_HOST'], 'unix:///fixture/docker.sock')
+        self.assertNotIn('DOCKER_CONTEXT', anonymous_manifest_call.kwargs['env'])
+        self.assertNotIn('DOCKER_AUTH_CONFIG', anonymous_manifest_call.kwargs['env'])
+        self.assertNotIn('DOCKER_CONFIG', docker.call_args_list[1].kwargs)
+        self.assertEqual(
+            docker.call_args_list[6].args[0],
+            ['docker', 'image', 'pull', 'docker.io/example/performance-node@sha256:' + 'b' * 64],
+        )
+
+    def test_registry_conflict_push_and_anonymous_pull_failures_do_not_return_reference(self):
+        archive = Path('/fixture/verified.tar.gz')
+        audit_module = SimpleNamespace(audit_archive=Mock())
+        cases = {
+            'conflict': [self.remote_manifest('sha256:' + 'd' * 64).encode()],
+            'push': [
+                subprocess.CalledProcessError(1, ['docker', 'manifest', 'inspect'], output=b'manifest unknown'),
+                b'', subprocess.CalledProcessError(1, ['docker', 'image', 'push'], output=b'push failed'),
+            ],
+            'anonymous_pull': [
+                subprocess.CalledProcessError(1, ['docker', 'manifest', 'inspect'], output=b'manifest unknown'),
+                b'', b'', self.remote_manifest('sha256:' + 'c' * 64).encode(),
+                json.dumps([{'Endpoints': {'docker': {'Host': 'unix:///fixture/docker.sock'}}}]).encode(),
+                self.remote_manifest('sha256:' + 'c' * 64).encode(),
+                subprocess.CalledProcessError(1, ['docker', 'image', 'pull'], output=b'pull denied'),
+            ],
+            'remote_digest': [
+                subprocess.CalledProcessError(1, ['docker', 'manifest', 'inspect'], output=b'manifest unknown'),
+                b'', b'', self.remote_manifest('sha256:' + 'd' * 64).encode(),
+            ],
+        }
+        for name, outputs in cases.items():
+            with self.subTest(name=name), \
+                    patch.object(publisher.importlib, 'import_module', return_value=audit_module), \
+                    patch.object(publisher.subprocess, 'check_output', side_effect=outputs) as docker:
+                with self.assertRaises(ValueError):
+                    publisher.publish_registry_image(
+                        archive, 'amd64', self.info(), 'sha256:' + 'c' * 64,
+                        'docker.io/example/performance-node',
+                    )
+                if name == 'conflict':
+                    self.assertEqual(docker.call_count, 1)
+
+    def test_anonymous_image_accepts_containerd_manifest_or_classic_config_id(self):
+        for local_id in ('sha256:' + 'b' * 64, 'sha256:' + 'c' * 64):
+            with self.subTest(local_id=local_id), \
+                    patch.object(publisher.subprocess, 'check_output', side_effect=[
+                        b'', json.dumps([{**self.info(), 'Id': local_id}]).encode(),
+                    ]) as docker:
+                publisher._anonymous_remote_image(
+                    'docker.io/example/performance-node@sha256:' + 'b' * 64,
+                    'sha256:' + 'b' * 64, 'sha256:' + 'c' * 64, 'amd64',
+                    {'DOCKER_CONFIG': '/empty', 'DOCKER_HOST': 'unix:///fixture/docker.sock'},
+                )
+            self.assertEqual(
+                docker.call_args_list[0].args[0],
+                ['docker', 'image', 'pull', 'docker.io/example/performance-node@sha256:' + 'b' * 64],
+            )
+
+    def test_preflight_denied_is_not_treated_as_missing_tag(self):
+        denied = subprocess.CalledProcessError(
+            1, ['docker', 'manifest', 'inspect'], output=b'unauthorized: access denied',
+        )
+        with patch.object(publisher.subprocess, 'check_output', side_effect=denied):
+            with self.assertRaisesRegex(ValueError, '未授权或仓库不可见'):
+                publisher.remote_manifest(self.registry_ref(), absent_ok=True)
+
+    def test_preflight_missing_manifest_is_classified_from_docker_stderr(self):
+        missing = subprocess.CalledProcessError(
+            1, ['docker', 'manifest', 'inspect'], stderr=b'no such manifest: fixture',
+        )
+        with patch.object(publisher.subprocess, 'check_output', side_effect=missing):
+            self.assertIsNone(publisher.remote_manifest(self.registry_ref(), absent_ok=True))
+
+    def test_remote_manifest_invalid_top_level_and_digest_are_value_errors(self):
+        invalid_documents = [[], {'Descriptor': {'digest': 1, 'platform': {
+            'os': 'linux', 'architecture': 'amd64',
+        }}, 'SchemaV2Manifest': {'config': {'digest': 'sha256:' + 'c' * 64}}}]
+        for document in invalid_documents:
+            with self.subTest(document=document), \
+                    patch.object(publisher.subprocess, 'check_output', return_value=json.dumps(document).encode()):
+                with self.assertRaises(ValueError):
+                    publisher.remote_manifest(self.registry_ref())
+
+    def test_audit_failure_prevents_all_registry_commands(self):
+        audit = Mock(side_effect=ValueError('sensitive archive fixture'))
+        with patch.object(publisher.importlib, 'import_module',
+                          return_value=SimpleNamespace(audit_archive=audit)), \
+                patch.object(publisher.subprocess, 'check_output') as docker:
+            with self.assertRaisesRegex(ValueError, 'sensitive archive'):
+                publisher.publish_registry_image(
+                    Path('/fixture/verified.tar.gz'), 'amd64', self.info(),
+                    'sha256:' + 'c' * 64, 'docker.io/example/performance-node',
+                )
+        docker.assert_not_called()
+
+    def test_registry_failure_keeps_existing_tar_manifest_and_registry_reference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            record = {
+                'filename': f'{publisher.__version__}/linux-amd64.tar.gz',
+                'sha256': 'd' * 64, 'size_bytes': 1, 'image_ref': self.ref(),
+                'image_id': self.info()['Id'], 'image_config_id': 'sha256:' + 'c' * 64,
+                'registry_ref': 'docker.io/example/performance-node@sha256:' + 'b' * 64,
+            }
+            manifest = {**self.versions(), 'release': publisher.__version__, 'images': {'amd64': record}}
+            (root / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+            with patch.object(publisher, 'publish_image'), \
+                    patch.object(publisher, 'publish_registry_image', side_effect=ValueError('push denied')):
+                with self.assertRaisesRegex(ValueError, 'push denied'):
+                    publisher.main([
+                        '--output', str(root), '--image', 'amd64=' + self.ref(),
+                        '--registry', 'docker.io/example/performance-node',
+                    ])
+            persisted = json.loads((root / 'manifest.json').read_text())
+            self.assertEqual(persisted['images']['amd64'], record)
 
 
 if __name__ == '__main__':

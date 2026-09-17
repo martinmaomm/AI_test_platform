@@ -152,9 +152,22 @@ elif name == "docker":
             fail("unsupported inspect template")
 
     if args[:2] == ["context", "show"]:
+        if os.environ.get("FAKE_CONTEXT_SHOW_UNSUPPORTED") == "1":
+            fail("docker context: 'show' is not a docker command")
         print("default")
     elif args[:2] == ["context", "inspect"]:
-        print(os.environ.get("FAKE_DOCKER_ENDPOINT", "unix:///var/run/docker.sock"))
+        template = args[args.index("--format") + 1]
+        current_context = os.environ.get("DOCKER_CONTEXT") or os.environ.get("FAKE_CURRENT_CONTEXT", "default")
+        if template == "{{.Name}}":
+            if os.environ.get("FAKE_CONTEXT_INSPECT_FAILURE") == "name":
+                fail("cannot inspect current context")
+            print(current_context)
+        else:
+            if os.environ.get("FAKE_CONTEXT_INSPECT_FAILURE") == "endpoint":
+                fail("cannot inspect context endpoint")
+            if args[2] != current_context:
+                fail("installer inspected a different context")
+            print(os.environ.get("FAKE_DOCKER_ENDPOINT", "unix:///var/run/docker.sock"))
     elif args[0] == "info":
         if os.environ.get("FAKE_DOCKER_UNAVAILABLE") == "1":
             raise SystemExit(1)
@@ -270,6 +283,8 @@ class InstallerHarness:
         return {
             **os.environ,
             "PATH": f"{self.bin_dir}:/usr/bin:/bin",
+            "DOCKER_CONTEXT": "",
+            "DOCKER_HOST": "",
             "FAKE_STATE": str(self.state_path),
             "FAKE_ARCHIVE": str(self.archive),
             "FAKE_IMAGE_REF": IMAGE_REF,
@@ -492,6 +507,51 @@ class InstallNodeTests(unittest.TestCase):
         self.assertFalse(state["networks"])
         self.assertFalse(state["volumes"])
         self.assertTrue(harness.token.exists())
+
+    def test_legacy_docker_without_context_show_installs_using_current_context(self) -> None:
+        harness = self.harness()
+        completed = harness.run(extra_env={
+            "FAKE_CONTEXT_SHOW_UNSUPPORTED": "1",
+            "FAKE_CURRENT_CONTEXT": "local-node",
+            "FAKE_DOCKER_ENDPOINT": "unix:///run/docker-local.sock",
+        })
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = harness.state()
+        self.assertEqual(state["enroll_calls"], 1)
+        self.assertEqual(state["containers"][harness.prefix]["status"], "running")
+        self.assertNotIn(["context", "show"], state["commands"])
+        self.assertTrue(any(args[:3] == ["context", "inspect", "local-node"] for args in state["commands"]))
+
+    def test_legacy_docker_still_rejects_remote_context_and_host_overrides(self) -> None:
+        for environment in (
+            {"DOCKER_CONTEXT": "remote-node", "FAKE_DOCKER_ENDPOINT": "ssh://remote.example"},
+            {"DOCKER_HOST": "tcp://remote.example:2375"},
+        ):
+            with self.subTest(environment=environment), tempfile.TemporaryDirectory() as folder:
+                harness = InstallerHarness(Path(folder))
+                completed = harness.run(extra_env={"FAKE_CONTEXT_SHOW_UNSUPPORTED": "1", **environment})
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("拒绝远程", completed.stderr)
+                state = harness.state()
+                self.assertFalse(state["networks"])
+                self.assertFalse(state["volumes"])
+                self.assertFalse(state["containers"])
+                self.assertNotIn("curl_commands", state)
+                self.assertTrue(harness.token.exists())
+
+    def test_context_inspection_failure_does_not_fall_back_to_default(self) -> None:
+        for failure in ("name", "endpoint"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                harness = InstallerHarness(Path(folder))
+                completed = harness.run(extra_env={"FAKE_CONTEXT_INSPECT_FAILURE": failure})
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("Docker context", completed.stderr)
+                state = harness.state()
+                self.assertFalse(state["networks"])
+                self.assertFalse(state["volumes"])
+                self.assertFalse(state["containers"])
+                self.assertNotIn("curl_commands", state)
+                self.assertTrue(harness.token.exists())
 
     def test_offline_partial_is_preserved_and_resumed(self) -> None:
         harness = self.harness()

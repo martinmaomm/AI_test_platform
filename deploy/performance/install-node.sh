@@ -249,7 +249,9 @@ normalize_arch() {
 host_arch="$(normalize_arch "$(uname -m)")" || die "仅支持 Linux amd64/arm64，当前架构为 $(uname -m)"
 log "宿主机架构：${host_arch}"
 
-docker_context="$(docker context show 2>/dev/null)" || die "无法读取 Docker context；请确认 Docker CLI 配置和权限"
+# With no name, inspect resolves the active context (including DOCKER_CONTEXT).
+# Unlike `context show`, this also works on Docker 20.10 shipped by some NAS systems.
+docker_context="$(docker context inspect --format '{{.Name}}' 2>/dev/null)" || die "无法读取 Docker context；请确认 Docker CLI 配置和权限"
 docker_endpoint="$(docker context inspect "$docker_context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)" || \
     die "无法检查 Docker context ${docker_context}"
 [[ "$docker_endpoint" == unix://* ]] || die "拒绝远程 Docker context（${docker_context}: ${docker_endpoint}）；必须使用本机 unix socket"

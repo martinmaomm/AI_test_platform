@@ -22,7 +22,7 @@ export const updatePerformancePlan = (projectId, id, data) => patch(`${base(proj
 export const deletePerformancePlan = (projectId, id) => remove(`${base(projectId)}/plans/${id}/`)
 
 export const getPerformanceNodes = (projectId) => get(`${base(projectId)}/nodes/`)
-// 安装指导不包含一次性凭证或安装命令；敏感命令仅来自创建/重置响应。
+// 安装指导不包含一次性凭证或安装命令；敏感命令仅来自创建/重新生成响应。
 export const getPerformanceNodeInstallation = async (projectId, id) => {
   const response = await get(`${base(projectId)}/nodes/${id}/installation/`)
   return response?.data ?? response
@@ -42,9 +42,10 @@ export const createPerformanceNode = async (projectId, data) => {
 
 export const updatePerformanceNode = (projectId, id, data) => patch(`${base(projectId)}/nodes/${id}/`, data)
 
-export const resetPerformanceNodeEnrollment = async (projectId, id) => {
+export const regeneratePerformanceNodeInstallation = async (projectId, id) => {
   const response = await post(`${base(projectId)}/nodes/${id}/enrollment/`, {})
   return response?.data ?? response
 }
 
-export const revokePerformanceNode = (projectId, id) => post(`${base(projectId)}/nodes/${id}/revoke/`, {})
+export const revokePerformanceNode = (projectId, id, data = {}) => post(`${base(projectId)}/nodes/${id}/revoke/`, data)
+export const deletePerformanceNode = (projectId, id) => remove(`${base(projectId)}/nodes/${id}/`)

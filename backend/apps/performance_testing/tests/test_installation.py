@@ -372,10 +372,9 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         return self.client.post(self.root_url + 'nodes/', {
             'name': 'safe node name; $(ignored)',
             'network_mode': 'public',
-            'labels': {},
         }, format='json')
 
-    def test_create_reset_get_and_registered_at_contract(self):
+    def test_create_get_and_registered_at_contract(self):
         created = self.create_node()
         self.assertEqual(created.status_code, 201, created.data)
         data = created.data['data']
@@ -410,17 +409,10 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         self.authenticate(self.admin)
         detail = self.client.get(self.root_url + f'nodes/{node_id}/')
         self.assertIsNotNone(detail.data['data']['registered_at'])
-        rotated = self.client.post(
+        reissue = self.client.post(
             self.root_url + f'nodes/{node_id}/enrollment/', {}, format='json',
         )
-        self.assertEqual(rotated.status_code, 200, rotated.data)
-        self.assertIn('node', rotated.data['data'])
-        self.assertIn('expires_at', rotated.data['data'])
-        self.assertIn('installation', rotated.data['data'])
-        self.assertIn(
-            rotated.data['data']['enrollment_token'],
-            rotated.data['data']['installation']['command'],
-        )
+        self.assertEqual(reissue.status_code, 409, reissue.data)
 
     def test_installation_get_requires_platform_admin_and_project_visibility(self):
         created = self.create_node()

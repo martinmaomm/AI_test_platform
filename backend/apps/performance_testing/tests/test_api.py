@@ -1,11 +1,16 @@
 from datetime import timedelta
+import uuid
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from performance_testing.constants import AGENT_VERSION, ENGINE_VERSION, PROTOCOL_VERSION
-from performance_testing.models import PerformanceNode, PerformancePlan, PerformanceTarget
+from performance_testing.models import (
+    PerformanceNode, PerformancePlan, PerformanceRun, PerformanceTarget,
+)
+from performance_testing.services import revoke_node as revoke_node_service
 from projects.models import Project, ProjectMember
 from users.models import User
 
@@ -206,17 +211,19 @@ class PerformanceManagementAPITests(TestCase):
     def test_nodes_are_admin_managed_member_read_only_and_never_leak_digests(self):
         self.auth(self.editor)
         self.assertEqual(self.client.post(self.path('nodes/'), {
-            'name': 'node', 'network_mode': 'lan', 'labels': {},
+            'name': 'node', 'network_mode': 'lan',
         }, format='json').status_code, 403)
 
         self.auth(self.admin)
         created = self.client.post(self.path('nodes/'), {
-            'name': 'node', 'network_mode': 'lan', 'labels': {'region': 'local'},
+            'name': 'node', 'network_mode': 'lan',
         }, format='json')
         self.assertEqual(created.status_code, 201, created.data)
         self.assertIn('enrollment_token', created.data['data'])
         node_payload = created.data['data']['node']
         self.assertEqual(node_payload['status'], 'pending')
+        self.assertEqual(node_payload['active_run_count'], 0)
+        self.assertNotIn('labels', node_payload)
         self.assertFalse(any('token' in key or 'digest' in key for key in node_payload))
 
         self.auth(self.viewer)
@@ -225,6 +232,149 @@ class PerformanceManagementAPITests(TestCase):
         self.assertFalse(any(
             'token' in key or 'digest' in key for key in listed.data['data']['items'][0]
         ))
+
+        self.auth(self.admin)
+        labels_rejected = self.client.post(self.path('nodes/'), {
+            'name': 'legacy-labels', 'network_mode': 'lan', 'labels': {'region': 'local'},
+        }, format='json')
+        self.assertEqual(labels_rejected.status_code, 400, labels_rejected.data)
+
+    def test_node_active_run_count_is_annotated_for_lists_and_edit_response(self):
+        first = PerformanceNode.objects.create(
+            project=self.project, name='first', network_mode='lan',
+        )
+        second = PerformanceNode.objects.create(
+            project=self.project, name='second', network_mode='lan',
+        )
+        PerformanceRun.objects.create(
+            project=self.project, node=first, created_by=self.admin,
+            request_id=uuid.uuid4(), status=PerformanceRun.Status.RUNNING,
+            snapshot={}, snapshot_sha256='0' * 64,
+        )
+        PerformanceRun.objects.create(
+            project=self.project, node=first, created_by=self.admin,
+            request_id=uuid.uuid4(), status=PerformanceRun.Status.COMPLETED,
+            snapshot={}, snapshot_sha256='0' * 64, finished_at=timezone.now(),
+        )
+
+        self.auth(self.viewer)
+        with self.assertNumQueries(3):
+            listed = self.client.get(self.path('nodes/'))
+        counts = {
+            item['id']: item['active_run_count']
+            for item in listed.data['data']['items']
+        }
+        self.assertEqual(counts[str(first.pk)], 1)
+        self.assertEqual(counts[str(second.pk)], 0)
+
+        self.auth(self.admin)
+        edited = self.client.patch(
+            self.path(f'nodes/{first.pk}/'), {'name': 'first-edited'}, format='json',
+        )
+        self.assertEqual(edited.status_code, 200, edited.data)
+        self.assertEqual(edited.data['data']['active_run_count'], 1)
+
+    def test_soft_delete_requires_admin_and_revoked_node_and_preserves_history(self):
+        node = PerformanceNode.objects.create(
+            project=self.project, name='historical-node', network_mode='lan',
+            revoked_at=timezone.now(),
+        )
+        run = PerformanceRun.objects.create(
+            project=self.project, node=node, created_by=self.admin,
+            request_id=uuid.uuid4(), status=PerformanceRun.Status.COMPLETED,
+            snapshot={'plan_name': 'historical-plan'}, snapshot_sha256='a' * 64,
+            finished_at=timezone.now(),
+        )
+
+        self.auth(self.editor)
+        self.assertEqual(
+            self.client.delete(self.path(f'nodes/{node.pk}/')).status_code, 403,
+        )
+        self.auth(self.outsider)
+        self.assertEqual(
+            self.client.delete(self.path(f'nodes/{node.pk}/')).status_code, 404,
+        )
+        self.auth(self.admin)
+        cross_project_path = (
+            f'/api/v1/projects/{self.other_project.pk}/performance/nodes/{node.pk}/'
+        )
+        self.assertEqual(self.client.delete(cross_project_path).status_code, 404)
+
+        deleted = self.client.delete(self.path(f'nodes/{node.pk}/'))
+        self.assertEqual(deleted.status_code, 200, deleted.data)
+        self.assertEqual(deleted.data, {'success': True, 'data': {'id': node.pk}})
+        node.refresh_from_db()
+        self.assertIsNotNone(node.deleted_at)
+        self.assertEqual(self.client.get(self.path(f'nodes/{node.pk}/')).status_code, 404)
+        listed = self.client.get(self.path('nodes/'))
+        self.assertNotIn(str(node.pk), {item['id'] for item in listed.data['data']['items']})
+        self.assertEqual(self.client.patch(
+            self.path(f'nodes/{node.pk}/'), {'name': 'hidden'}, format='json',
+        ).status_code, 404)
+        self.assertEqual(self.client.get(
+            self.path(f'nodes/{node.pk}/installation/'),
+        ).status_code, 404)
+        self.assertEqual(self.client.post(
+            self.path(f'nodes/{node.pk}/enrollment/'), {}, format='json',
+        ).status_code, 404)
+        self.assertEqual(self.client.post(
+            self.path(f'nodes/{node.pk}/revoke/'), {}, format='json',
+        ).status_code, 404)
+
+        detail = self.client.get(self.path(f'runs/{run.pk}/'))
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data['data']['node_name'], 'historical-node')
+        self.assertEqual(PerformanceRun.objects.get(pk=run.pk).node_id, node.pk)
+
+    def test_soft_delete_rejects_unrevoked_and_every_active_status(self):
+        unrevoked = PerformanceNode.objects.create(
+            project=self.project, name='unrevoked', network_mode='lan',
+        )
+        self.auth(self.admin)
+        rejected = self.client.delete(self.path(f'nodes/{unrevoked.pk}/'))
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        unrevoked.refresh_from_db()
+        self.assertIsNone(unrevoked.deleted_at)
+
+        for run_status in PerformanceRun.ACTIVE_STATUSES:
+            with self.subTest(run_status=run_status):
+                node = PerformanceNode.objects.create(
+                    project=self.project, name=f'active-{run_status}', network_mode='lan',
+                    revoked_at=timezone.now(),
+                )
+                PerformanceRun.objects.create(
+                    project=self.project, node=node, created_by=self.admin,
+                    request_id=uuid.uuid4(), status=run_status,
+                    snapshot={}, snapshot_sha256='0' * 64,
+                )
+                response = self.client.delete(self.path(f'nodes/{node.pk}/'))
+                self.assertEqual(response.status_code, 409, response.data)
+                node.refresh_from_db()
+                self.assertIsNone(node.deleted_at)
+
+    def test_revoke_maps_soft_delete_between_visibility_check_and_lock_to_404(self):
+        node = PerformanceNode.objects.create(
+            project=self.project, name='delete-race', network_mode='lan',
+        )
+
+        def soft_delete_before_service_lock(candidate, confirm_stop=False):
+            PerformanceNode.objects.filter(pk=candidate.pk).update(
+                deleted_at=timezone.now(),
+            )
+            return revoke_node_service(candidate, confirm_stop=confirm_stop)
+
+        self.auth(self.admin)
+        with patch(
+            'performance_testing.views.revoke_node',
+            side_effect=soft_delete_before_service_lock,
+        ):
+            response = self.client.post(
+                self.path(f'nodes/{node.pk}/revoke/'), {}, format='json',
+            )
+        self.assertEqual(response.status_code, 404, response.data)
+        node.refresh_from_db()
+        self.assertIsNotNone(node.deleted_at)
+        self.assertIsNone(node.revoked_at)
 
     def test_node_status_is_derived_from_server_time(self):
         node = PerformanceNode.objects.create(
@@ -265,7 +415,7 @@ class PerformanceAgentProtocolTests(TestCase):
         self.management_root = f'/api/v1/projects/{self.project.pk}/performance/'
         self.client.force_authenticate(user=self.admin)
         created = self.client.post(self.management_root + 'nodes/', {
-            'name': 'agent', 'network_mode': 'lan', 'labels': {},
+            'name': 'agent', 'network_mode': 'lan',
         }, format='json')
         self.node_id = created.data['data']['node']['id']
         self.enrollment_token = created.data['data']['enrollment_token']
@@ -296,7 +446,11 @@ class PerformanceAgentProtocolTests(TestCase):
             HTTP_AUTHORIZATION=f'Node {agent_token}',
         )
 
-    def test_enrollment_is_one_time_and_only_hashes_are_stored(self):
+    @patch(
+        'performance_testing.services.execution_configuration',
+        return_value={'available': False},
+    )
+    def test_enrollment_is_one_time_and_only_hashes_are_stored(self, _):
         enrolled = self.enroll()
         self.assertEqual(enrolled.status_code, 200, enrolled.data)
         self.assertEqual(set(enrolled.data), {'success', 'data'})
@@ -316,7 +470,7 @@ class PerformanceAgentProtocolTests(TestCase):
 
         self.client.force_authenticate(user=self.admin)
         second = self.client.post(self.management_root + 'nodes/', {
-            'name': 'second', 'network_mode': 'public', 'labels': {},
+            'name': 'second', 'network_mode': 'public',
         }, format='json')
         second_token = second.data['data']['enrollment_token']
         self.client.force_authenticate(user=None)
@@ -364,17 +518,44 @@ class PerformanceAgentProtocolTests(TestCase):
         self.assertEqual(response.status_code, 400, response.data)
         self.assertIsNone(PerformanceNode.objects.get(pk=self.node_id).last_seen_at)
 
-    def test_rotation_and_revoke_immediately_invalidate_agent_identity(self):
-        old_agent_token = self.enroll().data['data']['agent_token']
+    def test_registered_node_cannot_reissue_enrollment_even_before_first_heartbeat(self):
+        agent_token = self.enroll().data['data']['agent_token']
+        node = PerformanceNode.objects.get(pk=self.node_id)
+        self.assertIsNone(node.last_seen_at)
+        original_digest = node.agent_token_digest
+
         self.client.force_authenticate(user=self.admin)
-        rotated = self.client.post(
+        rejected = self.client.post(
             self.management_root + f'nodes/{self.node_id}/enrollment/', {}, format='json',
         )
-        self.assertEqual(rotated.status_code, 200, rotated.data)
-        self.client.force_authenticate(user=None)
-        self.assertEqual(self.heartbeat(old_agent_token).status_code, 401)
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        node.refresh_from_db()
+        self.assertEqual(node.agent_token_digest, original_digest)
+        self.assertIsNone(node.last_seen_at)
 
-        new_agent_token = self.enroll(rotated.data['data']['enrollment_token']).data['data']['agent_token']
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.heartbeat(agent_token).status_code, 200)
+
+    def test_expired_unregistered_node_can_reissue_and_old_token_is_invalid(self):
+        PerformanceNode.objects.filter(pk=self.node_id).update(
+            enrollment_expires_at=timezone.now() - timedelta(seconds=1),
+        )
+        old_token = self.enrollment_token
+        self.client.force_authenticate(user=self.admin)
+        reissued = self.client.post(
+            self.management_root + f'nodes/{self.node_id}/enrollment/', {}, format='json',
+        )
+        self.assertEqual(reissued.status_code, 200, reissued.data)
+        new_token = reissued.data['data']['enrollment_token']
+        self.assertNotEqual(new_token, old_token)
+
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.enroll(old_token).status_code, 401)
+        self.assertEqual(self.enroll(new_token).status_code, 200)
+
+    def test_revoke_immediately_invalidates_agent_identity_and_cannot_revive(self):
+        agent_token = self.enroll().data['data']['agent_token']
+
         self.client.force_authenticate(user=self.admin)
         first = self.client.post(
             self.management_root + f'nodes/{self.node_id}/revoke/', {}, format='json',
@@ -385,8 +566,32 @@ class PerformanceAgentProtocolTests(TestCase):
         self.assertEqual(first.status_code, 200, first.data)
         self.assertEqual(second.status_code, 200, second.data)
         self.assertEqual(second.data['data']['status'], 'revoked')
+        self.assertEqual(self.client.post(
+            self.management_root + f'nodes/{self.node_id}/enrollment/', {}, format='json',
+        ).status_code, 409)
+        self.assertEqual(self.client.patch(
+            self.management_root + f'nodes/{self.node_id}/', {'name': 'revived'}, format='json',
+        ).status_code, 409)
+        self.assertEqual(self.client.get(
+            self.management_root + f'nodes/{self.node_id}/installation/',
+        ).status_code, 409)
         self.client.force_authenticate(user=None)
-        self.assertEqual(self.heartbeat(new_agent_token).status_code, 401)
+        self.assertEqual(self.heartbeat(agent_token).status_code, 401)
+
+    def test_deleted_node_rejects_enrollment_and_agent_authentication(self):
+        agent_token = self.enroll().data['data']['agent_token']
+        PerformanceNode.objects.filter(pk=self.node_id).update(deleted_at=timezone.now())
+        self.assertEqual(self.heartbeat(agent_token).status_code, 401)
+
+        self.client.force_authenticate(user=self.admin)
+        pending = self.client.post(self.management_root + 'nodes/', {
+            'name': 'pending-deleted', 'network_mode': 'lan',
+        }, format='json')
+        pending_id = pending.data['data']['node']['id']
+        pending_token = pending.data['data']['enrollment_token']
+        PerformanceNode.objects.filter(pk=pending_id).update(deleted_at=timezone.now())
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.enroll(pending_token).status_code, 401)
 
     def test_user_jwt_scheme_is_not_accepted_as_node_identity(self):
         response = self.client.post(

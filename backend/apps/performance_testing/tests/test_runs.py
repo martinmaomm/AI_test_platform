@@ -164,6 +164,14 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(rejected.status_code, 400, rejected.data)
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_new_run_rejects_deleted_node_even_with_valid_plan_and_version(self, _):
+        PerformanceNode.objects.filter(pk=self.node.pk).update(deleted_at=timezone.now())
+        rejected = self._create()
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+        self.assertIn('性能节点不存在', rejected.data['error']['message'])
+        self.assertFalse(PerformanceRun.objects.exists())
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_new_run_requires_fresh_controller(self, _):
         PerformanceControllerState.objects.filter(pk=1).update(
             heartbeat_at=timezone.now() - timedelta(seconds=16),
@@ -337,33 +345,56 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(self.node.last_seen_at, before)
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
-    def test_rotation_and_revoke_stop_dispatched_runs_before_terminal_state(self, _):
+    def test_revoke_requires_strict_confirmation_and_has_no_preconfirmation_mutation(self, _):
         run = PerformanceRun.objects.get(pk=self._create().data['data']['id'])
         run.status = PerformanceRun.Status.RUNNING
         run.save(update_fields=('status',))
+        original_agent_digest = self.node.agent_token_digest
+        original_last_seen_at = self.node.last_seen_at
         self.client.force_authenticate(self.admin)
-        rotated = self.client.post(
-            self._path(f'nodes/{self.node.pk}/enrollment/'), {}, format='json',
+        rejected = self.client.post(
+            self._path(f'nodes/{self.node.pk}/revoke/'), {}, format='json',
         )
-        self.assertEqual(rotated.status_code, 200, rotated.data)
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        self.assertEqual(rejected.data['error']['code'], 'node_has_active_runs')
+        self.assertEqual(rejected.data['error']['count'], 1)
+        self.node.refresh_from_db()
+        run.refresh_from_db()
+        self.assertIsNone(self.node.revoked_at)
+        self.assertEqual(self.node.agent_token_digest, original_agent_digest)
+        self.assertEqual(self.node.last_seen_at, original_last_seen_at)
+        self.assertEqual(run.status, PerformanceRun.Status.RUNNING)
+        self.assertEqual(run.reason_code, '')
+        self.assertEqual(run.node_command, {})
+        self.assertIsNone(run.stop_requested_at)
+
+        for payload in (
+            {'confirm_stop': 'true'},
+            {'confirm_stop': 1},
+            {'confirm_stop': True, 'unexpected': False},
+        ):
+            with self.subTest(payload=payload):
+                invalid = self.client.post(
+                    self._path(f'nodes/{self.node.pk}/revoke/'), payload, format='json',
+                )
+                self.assertEqual(invalid.status_code, 400, invalid.data)
+        self.node.refresh_from_db()
+        run.refresh_from_db()
+        self.assertIsNone(self.node.revoked_at)
+        self.assertEqual(run.status, PerformanceRun.Status.RUNNING)
+
+        revoked = self.client.post(
+            self._path(f'nodes/{self.node.pk}/revoke/'),
+            {'confirm_stop': True}, format='json',
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.data)
+        self.assertEqual(revoked.data['data']['active_run_count'], 1)
         run.refresh_from_db()
         self.assertEqual(run.status, PerformanceRun.Status.STOPPING)
-        self.assertEqual(run.reason_code, 'node_credentials_rotated')
+        self.assertEqual(run.reason_code, 'node_revoked')
         self.assertEqual(run.node_command['type'], 'stop')
         self.assertIsNotNone(run.stop_requested_at)
         self.assertIsNone(run.finished_at)
-
-        second, _ = self._node('node-revoke')
-        run2 = PerformanceRun.objects.create(
-            project=self.project, plan=self.plan, node=second, created_by=self.admin,
-            request_id=uuid.uuid4(), status=PerformanceRun.Status.PREPARING,
-            snapshot={}, snapshot_sha256='0' * 64,
-        )
-        revoked = self.client.post(self._path(f'nodes/{second.pk}/revoke/'), {}, format='json')
-        self.assertEqual(revoked.status_code, 200, revoked.data)
-        run2.refresh_from_db()
-        self.assertEqual(run2.status, PerformanceRun.Status.STOPPING)
-        self.assertEqual(run2.reason_code, 'node_revoked')
 
         queued_node, _ = self._node('node-queued')
         queued = PerformanceRun.objects.create(
@@ -371,9 +402,11 @@ class PerformanceRunContractTests(TestCase):
             request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='0' * 64,
         )
         revoked = self.client.post(
-            self._path(f'nodes/{queued_node.pk}/revoke/'), {}, format='json',
+            self._path(f'nodes/{queued_node.pk}/revoke/'),
+            {'confirm_stop': True}, format='json',
         )
         self.assertEqual(revoked.status_code, 200, revoked.data)
+        self.assertEqual(revoked.data['data']['active_run_count'], 0)
         queued.refresh_from_db()
         self.assertEqual(queued.status, PerformanceRun.Status.INCOMPLETE)
         self.assertIsNotNone(queued.finished_at)

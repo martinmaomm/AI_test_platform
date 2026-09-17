@@ -11,9 +11,14 @@ import {
   samePerformanceScope,
 } from '../src/views/perf-testing/performanceWorkspaceState.js'
 import {
+  activeRunConflictCount,
+  canDeletePerformanceNode,
   canRegenerateInstallation,
+  canUseInstallationCommand,
   installationArchitectureText,
   installationCommandExpired,
+  nodeHasActiveRuns,
+  performanceNodeActiveRunCount,
   performanceInstallationStage,
 } from '../src/utils/performanceInstallation.js'
 import {
@@ -45,12 +50,15 @@ test('performance workspace exposes plan, run, node and target routes', async ()
   assert.equal(existsSync(new URL('../src/views/perf-testing/PerfWorkspacePlaceholder.vue', import.meta.url)), false)
 })
 
-test('performance API keeps management responses in response.data and installation commands explicit', async () => {
+test('performance API keeps management responses in response.data and node lifecycle calls explicit', async () => {
   const source = await read('../src/api/performance.js')
   assert.match(source, /const get = async .*\.data/)
   assert.match(source, /createPerformanceNode[\s\S]*response\?\.data \?\? response/)
-  assert.match(source, /resetPerformanceNodeEnrollment[\s\S]*response\?\.data \?\? response/)
+  assert.match(source, /regeneratePerformanceNodeInstallation[\s\S]*response\?\.data \?\? response/)
   assert.match(source, /getPerformanceNodeInstallation[\s\S]*nodes\/\$\{id\}\/installation/)
+  assert.ok(source.includes('revokePerformanceNode = (projectId, id, data = {}) => post(`${base(projectId)}/nodes/${id}/revoke/`, data)'))
+  assert.ok(source.includes('deletePerformanceNode = (projectId, id) => remove(`${base(projectId)}/nodes/${id}/`)'))
+  assert.doesNotMatch(source, /resetPerformanceNodeEnrollment/)
   assert.match(source, /performanceErrorMessage/)
 })
 
@@ -61,6 +69,7 @@ test('workspace creates one-node execution requests and explains virtual-user st
   assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/)
   assert.match(source, /节点安装向导/)
   assert.match(source, /getPerformanceNodeInstallation/)
+  assert.match(source, /canUseInstallationCommand\(installationNode\.value, installationDialog\.installation, installationCommandIsExpired\.value\)/)
   assert.match(source, /copyText\(command\)/)
   assert.match(source, /v-if="canManageNodes" label="操作"/)
   assert.match(source, /installationRequestNonce/)
@@ -68,17 +77,23 @@ test('workspace creates one-node execution requests and explains virtual-user st
   assert.match(source, /installationAvailable && canRegenerateInstallation/)
   assert.match(source, /安装命令已过期，请重新生成/)
   assert.match(source, /需要 Linux 主机、Docker 和 root 权限/)
-  assert.match(source, /重新生成会立即使旧注册凭证和旧长期身份失效/)
-  assert.match(source, /不要默认重装或重置身份/)
+  assert.match(source, /安装未完成可重新生成命令重试，节点不会自动作废/)
+  assert.match(source, /请检查原容器与网络；身份数据丢失请吊销后新建/)
   assert.match(source, /window\.setInterval\(\(\) => \{ installationClock\.value = Date\.now\(\); return Promise\.all\(\[loadConfig\(requestProjectId, requestEpoch\), loadList\('nodes'/)
   assert.match(source, /Promise\.all\(\[loadAccess\(requestProjectId, requestEpoch\), loadConfig\(requestProjectId, requestEpoch\), loadList\('targets', requestProjectId, requestEpoch\), loadList\('plans', requestProjectId, requestEpoch\), loadList\('nodes', requestProjectId, requestEpoch\)\]\)/)
-  assert.match(source, /await ElMessageBox\.confirm\([\s\S]*?if \(!scopeIsCurrent\(scope\) \|\| !installationDialog\.visible \|\| installationRequestNonce !== dialogNonce\) return[\s\S]*?resetPerformanceNodeEnrollment/)
+  assert.match(source, /if \(!canRegenerateInstallation\(node, installationDialog\.installation, installationCommandIsExpired\.value\)\) return[\s\S]*?regeneratePerformanceNodeInstallation/)
   assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/)
   assert.match(source, /createPerformanceRun\(scope\.projectId, plan\.id, \{ node_id: nodeId, request_id: requestId \}\)/)
   assert.match(source, /execution_unavailable_reason/)
   assert.match(source, /每次仅运行一个节点/)
   assert.match(source, /保存计划不会自动执行，需在计划列表确认后创建运行/)
-  assert.match(source, /正在运行的压测会被请求停止，尾统计可能不完整/)
+  assert.match(source, /运行任务（含停止中）。吊销将请求停止，报告可能不完整/)
+  assert.match(source, /activeRunConflictCount\(error\)/)
+  assert.match(source, /revokePerformanceNode\(scope\.projectId, node\.id, \{ confirm_stop: true \}\)/)
+  assert.match(source, /从节点列表移除，保留历史执行记录和报告；不会卸载远程容器/)
+  assert.match(source, /row\.status === 'revoked'/)
+  assert.match(source, /canDeletePerformanceNode\(row\)/)
+  assert.doesNotMatch(source, /重置身份|resetEnrollment|labelsText|nodeLabelsError|advanced-options/)
   assert.doesNotMatch(source, /本批仅保存计划，不会执行|本批没有运行任务需要终止/)
   assert.match(source, /requestEpoch === epoch && String\(projectId\.value\) === String\(requestProjectId\)/)
   assert.match(source, /clearInterval\(pollTimer\)/)
@@ -121,8 +136,32 @@ test('installation presentation follows actual node state without retaining a co
   assert.equal(canRegenerateInstallation({ status: 'offline', registered_at: 'yes' }, { command: null }), false)
   assert.equal(installationCommandExpired({ expires_at: '2026-09-16T00:00:00Z' }, Date.parse('2026-09-16T00:00:01Z')), true)
   assert.equal(canRegenerateInstallation({ status: 'pending' }, { command: 'old command' }, true), true)
+  assert.equal(canUseInstallationCommand({ status: 'pending', registered_at: null }, { command: 'docker compose up' }), true)
+  assert.equal(canUseInstallationCommand({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: 'docker compose up' }), false)
+  assert.equal(canUseInstallationCommand({ status: 'revoked' }, { command: 'docker compose up' }), false)
+  assert.equal(canUseInstallationCommand({ status: 'pending', registered_at: null }, { command: 'docker compose up' }, true), false)
   assert.equal(installationArchitectureText(['amd64', 'arm64']), 'x86_64（amd64）、ARM64（arm64）')
   assert.equal(installationArchitectureText([]), '未配置或未发布')
+})
+
+test('node lifecycle helpers restrict regeneration and deletion to safe states', () => {
+  assert.equal(canRegenerateInstallation({ status: 'pending', registered_at: null }, { command: null }), true)
+  assert.equal(canRegenerateInstallation({ status: 'offline', registered_at: null }, { command: null }), false)
+  assert.equal(canRegenerateInstallation({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: null }), false)
+
+  assert.equal(performanceNodeActiveRunCount({ active_run_count: '2' }), 2)
+  assert.equal(performanceNodeActiveRunCount({ active_run_count: -1 }), 0)
+  assert.equal(nodeHasActiveRuns({ active_run_count: 1 }), true)
+  assert.equal(canDeletePerformanceNode({ status: 'revoked', active_run_count: 0 }), true)
+  assert.equal(canDeletePerformanceNode({ status: 'revoked' }), false)
+  assert.equal(canDeletePerformanceNode({ status: 'revoked', active_run_count: 1 }), false)
+  assert.equal(canDeletePerformanceNode({ status: 'offline', active_run_count: 0 }), false)
+})
+
+test('active-run revoke conflicts require a separate explicit confirmation path', () => {
+  assert.equal(activeRunConflictCount({ response: { status: 409, data: { error: { code: 'node_has_active_runs', count: 3 } } } }), 3)
+  assert.equal(activeRunConflictCount({ response: { status: 409, data: { error: { code: 'other', count: 3 } } } }), null)
+  assert.equal(activeRunConflictCount({ response: { status: 500, data: { error: { code: 'node_has_active_runs', count: 3 } } } }), null)
 })
 
 test('performance API errors prefer a nested field-specific validation detail', () => {

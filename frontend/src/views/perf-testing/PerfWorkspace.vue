@@ -28,7 +28,7 @@
           <el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="nodeType(row.status)">{{ performanceNodeStatusLabel(row.status) }}</el-tag></template></el-table-column>
           <el-table-column prop="last_seen_at" label="最后心跳" min-width="170"><template #default="{ row }">{{ formatTime(row.last_seen_at) }}</template></el-table-column>
           <el-table-column label="版本" min-width="160"><template #default="{ row }">Agent {{ row.agent_version || '-' }} / 引擎 {{ row.engine_version || '-' }}</template></el-table-column>
-          <el-table-column v-if="canManageNodes" label="操作" width="310" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openInstallation(row)">安装指导</el-button><el-button link type="primary" @click="openNode(row)">编辑</el-button><el-button link type="warning" @click="resetEnrollment(row)">重置身份</el-button><el-button link type="danger" @click="revokeNode(row)">吊销</el-button></template></el-table-column>
+          <el-table-column v-if="canManageNodes" label="操作" width="250" fixed="right"><template #default="{ row }"><template v-if="row.status === 'revoked'"><el-tooltip v-if="!canDeletePerformanceNode(row)" content="节点仍有运行任务（含停止中），不可删除"><el-button link type="danger" disabled>删除</el-button></el-tooltip><el-button v-else link type="danger" @click="removeNode(row)">删除</el-button></template><template v-else><el-button link type="primary" @click="openInstallation(row)">安装指导</el-button><el-button link type="primary" @click="openNode(row)">编辑</el-button><el-button link type="danger" @click="revokeNode(row)">吊销</el-button></template></template></el-table-column>
         </el-table>
       </el-tab-pane>
 
@@ -67,12 +67,12 @@
     </el-dialog>
 
     <el-dialog v-model="nodeDialog.visible" :title="nodeDialog.item ? '编辑节点' : '添加节点'" width="580px" :close-on-click-modal="false" @closed="resetNode">
-      <el-form ref="nodeFormRef" :model="nodeForm" :rules="nodeRules" label-width="100px"><el-form-item label="节点名称" prop="name"><el-input v-model="nodeForm.name" placeholder="例如：上海压测机" /></el-form-item><el-form-item label="网络位置" prop="network_mode"><el-radio-group v-model="nodeForm.network_mode"><el-radio label="lan">内网：仅记录节点网络位置</el-radio><el-radio label="public">公网：仅记录节点网络位置</el-radio></el-radio-group></el-form-item><el-alert type="info" :closable="false">创建后会提供一条安装命令；无需在平台填写服务器地址或手动拼接参数。节点能连接平台不代表一定能访问测试目标。</el-alert><el-collapse class="advanced-options"><el-collapse-item title="高级选项"><el-form-item label="标签" :error="nodeLabelsError"><el-input v-model="nodeForm.labelsText" type="textarea" :rows="3" placeholder='例如 {"region":"shanghai"}' /></el-form-item></el-collapse-item></el-collapse></el-form>
+      <el-form ref="nodeFormRef" :model="nodeForm" :rules="nodeRules" label-width="100px"><el-form-item label="节点名称" prop="name"><el-input v-model="nodeForm.name" placeholder="例如：上海压测机" /></el-form-item><el-form-item label="网络位置" prop="network_mode"><el-radio-group v-model="nodeForm.network_mode"><el-radio label="lan">内网：仅记录节点网络位置</el-radio><el-radio label="public">公网：仅记录节点网络位置</el-radio></el-radio-group></el-form-item><el-alert v-if="!nodeDialog.item" type="info" :closable="false">创建后会提供一条安装命令；无需在平台填写服务器地址或手动拼接参数。节点能连接平台不代表一定能访问测试目标。</el-alert></el-form>
       <template #footer><el-button @click="nodeDialog.visible = false">取消</el-button><el-button type="primary" :loading="saving.node" @click="saveNode">{{ nodeDialog.item ? '保存' : '创建并查看安装命令' }}</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="installationDialog.visible" title="节点安装向导" width="680px" :close-on-click-modal="false" @closed="clearInstallationGuide">
-      <template v-if="installationNode"><el-alert :type="installationStage.key === 'online' ? 'success' : ['offline', 'revoked'].includes(installationStage.key) ? 'warning' : 'info'" :closable="false" show-icon>{{ installationStage.text }}</el-alert><el-descriptions :column="1" border class="installation-summary"><el-descriptions-item label="节点">{{ installationNode.name }}</el-descriptions-item><el-descriptions-item label="归属项目">{{ projectStore.currentProject?.name || detail?.name || '-' }}</el-descriptions-item><el-descriptions-item label="状态">{{ performanceNodeStatusLabel(installationNode.status) }}</el-descriptions-item><el-descriptions-item label="平台地址">{{ installationInfo?.platform_url || '-' }}</el-descriptions-item><el-descriptions-item label="支持架构">{{ installationArchitectureText(installationInfo?.supported_architectures) }}</el-descriptions-item></el-descriptions><el-alert class="installation-requirements" type="info" :closable="false">需要 Linux 主机、Docker 和 root 权限。安装器会处理镜像、证书和平台参数；节点主动连接平台，无需开放节点入站端口。</el-alert><ul v-if="installationInfo?.requirements?.length" class="installation-requirement-list"><li v-for="requirement in installationInfo.requirements" :key="requirement">{{ requirement }}</li></ul><el-alert v-if="installationInfo?.available === false" type="warning" :closable="false">{{ installationInfo.reason || '当前无法生成安装命令，请检查平台安装配置。' }}</el-alert><template v-if="installationDialog.installation?.command && !installationCommandIsExpired"><p class="expiry">凭证 {{ formatTime(installationDialog.installation.expires_at || installationDialog.expiresAt) }} 前有效且敏感，请只在目标节点终端执行。</p><el-input :model-value="installationDialog.installation.command" readonly type="textarea" :rows="4" /><el-button class="copy-command" type="primary" @click="copyInstallationCommand">复制安装命令</el-button></template><template v-else-if="installationDialog.loaded && installationAvailable && canRegenerateInstallation(installationNode, installationDialog.installation, installationCommandIsExpired)"><el-alert type="warning" :closable="false">{{ installationCommandIsExpired ? '安装命令已过期，请重新生成。' : '安装命令未保存在网页中。' }}重新生成会使旧注册凭证和旧节点身份失效。</el-alert><el-button type="warning" :loading="saving.node" @click="regenerateInstallation(installationNode)">重新生成安装命令</el-button></template><template v-else-if="installationStage.key === 'offline'"><el-alert type="warning" :closable="false">请先在原节点检查容器日志、网络和平台地址；不要默认重装或重置身份。</el-alert></template></template>
+      <template v-if="installationNode"><el-alert :type="installationStage.key === 'online' ? 'success' : ['offline', 'revoked'].includes(installationStage.key) ? 'warning' : 'info'" :closable="false" show-icon>{{ installationStage.text }}</el-alert><el-descriptions :column="1" border class="installation-summary"><el-descriptions-item label="节点">{{ installationNode.name }}</el-descriptions-item><el-descriptions-item label="归属项目">{{ projectStore.currentProject?.name || detail?.name || '-' }}</el-descriptions-item><el-descriptions-item label="状态">{{ performanceNodeStatusLabel(installationNode.status) }}</el-descriptions-item><el-descriptions-item label="平台地址">{{ installationInfo?.platform_url || '-' }}</el-descriptions-item><el-descriptions-item label="支持架构">{{ installationArchitectureText(installationInfo?.supported_architectures) }}</el-descriptions-item></el-descriptions><el-alert class="installation-requirements" type="info" :closable="false">需要 Linux 主机、Docker 和 root 权限。安装器会处理镜像、证书和平台参数；节点主动连接平台，无需开放节点入站端口。</el-alert><ul v-if="installationInfo?.requirements?.length" class="installation-requirement-list"><li v-for="requirement in installationInfo.requirements" :key="requirement">{{ requirement }}</li></ul><el-alert v-if="installationInfo?.available === false" type="warning" :closable="false">{{ installationInfo.reason || '当前无法生成安装命令，请检查平台安装配置。' }}</el-alert><template v-if="canUseInstallationCommand(installationNode, installationDialog.installation, installationCommandIsExpired)"><p class="expiry">凭证 {{ formatTime(installationDialog.installation.expires_at || installationDialog.expiresAt) }} 前有效且敏感，请只在目标节点终端执行。</p><el-input :model-value="installationDialog.installation.command" readonly type="textarea" :rows="4" /><el-button class="copy-command" type="primary" @click="copyInstallationCommand">复制安装命令</el-button></template><template v-else-if="installationDialog.loaded && installationAvailable && canRegenerateInstallation(installationNode, installationDialog.installation, installationCommandIsExpired)"><el-alert type="warning" :closable="false">{{ installationCommandIsExpired ? '安装命令已过期，请重新生成。' : '安装命令未保存在网页中。' }}安装未完成可重新生成命令重试，节点不会自动作废。</el-alert><el-button type="warning" :loading="saving.node" @click="regenerateInstallation(installationNode)">重新生成安装命令</el-button></template><template v-else-if="installationStage.key === 'offline'"><el-alert type="warning" :closable="false">请检查原容器与网络；身份数据丢失请吊销后新建。</el-alert></template></template>
       <template #footer><el-button @click="installationDialog.visible = false">关闭</el-button></template>
     </el-dialog>
     <el-dialog v-model="runDialog.visible" title="确认执行压测" width="600px" :close-on-click-modal="false" @closed="resetRun">
@@ -91,9 +91,9 @@ import dayjs from 'dayjs'
 import { useAuthStore } from '@/stores/auth'
 import { useProjectStore } from '@/stores/project'
 import { getProject } from '@/api/projects'
-import { createPerformanceNode, createPerformancePlan, createPerformanceRun, createPerformanceTarget, deletePerformancePlan, deletePerformanceTarget, getPerformanceConfig, getPerformanceNodeInstallation, getPerformanceNodes, getPerformancePlans, getPerformanceTargets, performanceErrorMessage, resetPerformanceNodeEnrollment, revokePerformanceNode, updatePerformanceNode, updatePerformancePlan, updatePerformanceTarget } from '@/api/performance'
+import { createPerformanceNode, createPerformancePlan, createPerformanceRun, createPerformanceTarget, deletePerformanceNode, deletePerformancePlan, deletePerformanceTarget, getPerformanceConfig, getPerformanceNodeInstallation, getPerformanceNodes, getPerformancePlans, getPerformanceTargets, performanceErrorMessage, regeneratePerformanceNodeInstallation, revokePerformanceNode, updatePerformanceNode, updatePerformancePlan, updatePerformanceTarget } from '@/api/performance'
 import { copyText } from '@/utils/reportLinks'
-import { canRegenerateInstallation, installationArchitectureText, installationCommandExpired, performanceInstallationStage } from '@/utils/performanceInstallation'
+import { activeRunConflictCount, canDeletePerformanceNode, canRegenerateInstallation, canUseInstallationCommand, installationArchitectureText, installationCommandExpired, nodeHasActiveRuns, performanceInstallationStage, performanceNodeActiveRunCount } from '@/utils/performanceInstallation'
 import { buildPerformanceTargetPayload, isPerformancePlatformAdmin, performanceNetworkModeLabel, performanceNodeStatusLabel, performancePlanPermissions, samePerformanceScope } from './performanceWorkspaceState'
 import { createPerformanceRequestId, executionUnavailableMessage, performanceExecutionPermissions } from './performanceExecutionState'
 
@@ -106,9 +106,9 @@ const projectId = computed(() => projectStore.currentProjectId)
 const detail = ref(null); const plans = ref([]); const nodes = ref([]); const targets = ref([])
 const loading = reactive({ plans: false, nodes: false, targets: false }); const saving = reactive({ plan: false, node: false, target: false, run: false })
 const planDialog = reactive({ visible: false, item: null }); const nodeDialog = reactive({ visible: false, item: null }); const targetDialog = reactive({ visible: false, item: null }); const runDialog = reactive({ visible: false, plan: null, nodeId: null, requestId: '' })
-const installationDialog = reactive({ visible: false, node: null, installation: null, expiresAt: '', loaded: false }); const planFormRef = ref(); const nodeFormRef = ref(); const targetFormRef = ref(); const stepErrors = ref([]); const nodeLabelsError = ref('')
+const installationDialog = reactive({ visible: false, node: null, installation: null, expiresAt: '', loaded: false }); const planFormRef = ref(); const nodeFormRef = ref(); const targetFormRef = ref(); const stepErrors = ref([])
 const planForm = reactive({ name: '', description: '', target_id: null, users: 1, spawn_rate: 1, duration_seconds: 30, wait_seconds: 1, steps: [] })
-const targetForm = reactive({ name: '', base_url: '', allowed_methods: ['GET'] }); const nodeForm = reactive({ name: '', network_mode: 'lan', labelsText: '{}' })
+const targetForm = reactive({ name: '', base_url: '', allowed_methods: ['GET'] }); const nodeForm = reactive({ name: '', network_mode: 'lan' })
 const currentMember = computed(() => detail.value?.members?.find((member) => member.username === authStore.user?.username))
 const canManagePlans = computed(() => performancePlanPermissions(authStore.user, currentMember.value).canEdit)
 const canDeletePlans = computed(() => performancePlanPermissions(authStore.user, currentMember.value).canDelete)
@@ -235,21 +235,15 @@ async function saveTarget() {
     if (scopeIsCurrent(scope)) ElMessage.error(performanceErrorMessage(error, '保存目标失败'))
   } finally { if (scopeIsCurrent(scope)) saving.target = false }
 }
-function resetNode() { Object.assign(nodeForm, { name: '', network_mode: 'lan', labelsText: '{}' }); nodeDialog.item = null; nodeLabelsError.value = ''; nodeFormRef.value?.clearValidate() }; function openNode(item) { resetNode(); if (item) Object.assign(nodeForm, { name: item.name, network_mode: item.network_mode, labelsText: JSON.stringify(item.labels || {}, null, 2) }); nodeDialog.item = item || null; nodeDialog.visible = true }
+function resetNode() { Object.assign(nodeForm, { name: '', network_mode: 'lan' }); nodeDialog.item = null; nodeFormRef.value?.clearValidate() }; function openNode(item) { resetNode(); if (item) Object.assign(nodeForm, { name: item.name, network_mode: item.network_mode }); nodeDialog.item = item || null; nodeDialog.visible = true }
 async function saveNode() {
   if (saving.node) return
   const scope = captureScope()
   const valid = await nodeFormRef.value?.validate().catch(() => false)
   if (!scopeIsCurrent(scope)) return
   if (!valid) return
-  let labels
-  try {
-    labels = JSON.parse(nodeForm.labelsText || '{}')
-    if (!labels || Array.isArray(labels) || typeof labels !== 'object') throw new Error()
-  } catch { nodeLabelsError.value = '标签必须是 JSON 对象'; return }
-  nodeLabelsError.value = ''
   const isNewNode = !nodeDialog.item
-  const payload = { name: nodeForm.name.trim(), network_mode: nodeForm.network_mode, labels }
+  const payload = { name: nodeForm.name.trim(), network_mode: nodeForm.network_mode }
   saving.node = true
   try {
     const result = isNewNode
@@ -281,8 +275,10 @@ async function openInstallation(node) {
 }
 async function copyInstallationCommand() {
   const command = installationDialog.installation?.command
-  if (!command) return
-  if (installationCommandIsExpired.value) { ElMessage.warning('安装命令已过期，请重新生成'); return }
+  if (!canUseInstallationCommand(installationNode.value, installationDialog.installation, installationCommandIsExpired.value)) {
+    ElMessage.warning('安装命令已不可用，请刷新节点状态后确认')
+    return
+  }
   try {
     await copyText(command)
     ElMessage.success('安装命令已复制')
@@ -292,32 +288,14 @@ async function copyInstallationCommand() {
 }
 const isCancelled = (error) => ['cancel', 'close'].includes(error)
 
-async function resetEnrollment(node) {
-  if (saving.node) return
-  const scope = captureScope()
-  try {
-    await ElMessageBox.confirm('重置会立即使旧注册凭证和旧长期身份失效，原客户端必须重新注册。', '重置注册凭证', { type: 'warning', confirmButtonText: '重置' })
-    if (!scopeIsCurrent(scope)) return
-    saving.node = true
-    const result = await resetPerformanceNodeEnrollment(scope.projectId, node.id)
-    if (!scopeIsCurrent(scope)) return
-    showInstallation(result)
-    ElMessage.success(hasInstallationCommand(result) ? '已生成新的安装命令' : '已生成新的注册凭证')
-    await loadList('nodes', scope.projectId, scope.epoch)
-  } catch (error) {
-    if (scopeIsCurrent(scope) && !isCancelled(error)) ElMessage.error(performanceErrorMessage(error, '重置凭证失败'))
-  } finally { if (scopeIsCurrent(scope)) saving.node = false }
-}
-
 async function regenerateInstallation(node) {
   if (saving.node) return
   const scope = captureScope()
   const dialogNonce = installationRequestNonce
+  if (!canRegenerateInstallation(node, installationDialog.installation, installationCommandIsExpired.value)) return
   try {
-    await ElMessageBox.confirm('重新生成会立即使旧注册凭证和旧长期身份失效，原客户端必须重新注册。', '重新生成安装命令', { type: 'warning', confirmButtonText: '重新生成' })
-    if (!scopeIsCurrent(scope) || !installationDialog.visible || installationRequestNonce !== dialogNonce) return
     saving.node = true
-    const result = await resetPerformanceNodeEnrollment(scope.projectId, node.id)
+    const result = await regeneratePerformanceNodeInstallation(scope.projectId, node.id)
     if (!scopeIsCurrent(scope) || !installationDialog.visible || installationRequestNonce !== dialogNonce) return
     installationClock.value = Date.now()
     Object.assign(installationDialog, { node: result.node, installation: result.installation || null, expiresAt: result.expires_at || '', loaded: true })
@@ -329,17 +307,47 @@ async function regenerateInstallation(node) {
 }
 
 async function revokeNode(node) {
+  if (saving.node) return
   const scope = captureScope()
+  const activeRunCount = performanceNodeActiveRunCount(node)
   try {
-    await ElMessageBox.confirm('吊销将使该节点的长期身份和未消费注册凭证失效；该节点正在运行的压测会被请求停止，尾统计可能不完整。', '吊销节点', { type: 'warning', confirmButtonText: '吊销' })
+    const message = nodeHasActiveRuns(node)
+      ? `节点当前有 ${activeRunCount} 个运行任务（含停止中）。吊销将请求停止，报告可能不完整。`
+      : '吊销将使该节点的长期身份和未消费注册凭证失效。'
+    await ElMessageBox.confirm(message, '吊销节点', { type: 'warning', confirmButtonText: '吊销' })
     if (!scopeIsCurrent(scope)) return
-    await revokePerformanceNode(scope.projectId, node.id)
+    saving.node = true
+    try {
+      await revokePerformanceNode(scope.projectId, node.id, nodeHasActiveRuns(node) ? { confirm_stop: true } : {})
+    } catch (error) {
+      const conflictCount = activeRunConflictCount(error)
+      if (conflictCount === null) throw error
+      await ElMessageBox.confirm(`节点当前有 ${conflictCount} 个运行任务（含停止中）。确认吊销将请求停止，报告可能不完整。`, '运行任务确认', { type: 'warning', confirmButtonText: '确认吊销' })
+      if (!scopeIsCurrent(scope)) return
+      await revokePerformanceNode(scope.projectId, node.id, { confirm_stop: true })
+    }
     if (!scopeIsCurrent(scope)) return
     ElMessage.success('节点已吊销')
     await loadList('nodes', scope.projectId, scope.epoch)
   } catch (error) {
     if (scopeIsCurrent(scope) && !isCancelled(error)) ElMessage.error(performanceErrorMessage(error, '吊销节点失败'))
-  }
+  } finally { if (scopeIsCurrent(scope)) saving.node = false }
+}
+
+async function removeNode(node) {
+  if (!canDeletePerformanceNode(node) || saving.node) return
+  const scope = captureScope()
+  try {
+    await ElMessageBox.confirm('从节点列表移除，保留历史执行记录和报告；不会卸载远程容器。', '删除节点', { type: 'warning', confirmButtonText: '删除' })
+    if (!scopeIsCurrent(scope)) return
+    saving.node = true
+    await deletePerformanceNode(scope.projectId, node.id)
+    if (!scopeIsCurrent(scope)) return
+    ElMessage.success('节点已从列表移除')
+    await loadList('nodes', scope.projectId, scope.epoch)
+  } catch (error) {
+    if (scopeIsCurrent(scope) && !isCancelled(error)) ElMessage.error(performanceErrorMessage(error, '删除节点失败'))
+  } finally { if (scopeIsCurrent(scope)) saving.node = false }
 }
 
 async function removeTarget(target) {
@@ -377,5 +385,5 @@ onBeforeUnmount(() => { ++epoch; invalidateProjectUi() })
 </script>
 
 <style scoped>
-.perf-workspace { max-width: 1280px; margin: 0 auto; padding: 4px 10px 28px; }.phase-notice, .execution-unavailable { margin-bottom: 18px; }.toolbar { min-height: 44px; display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--app-text-muted); margin-bottom: 12px; }.method-tag { margin: 2px; }.input-suffix { margin-left: 8px; color: var(--app-text-muted); font-size: 12px; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }.step-help { margin: 0 0 14px; }.steps-title, .step-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }.step-card { border: 1px solid var(--app-border-light); border-radius: 8px; padding: 12px; margin-bottom: 12px; }.step-grid { display: grid; grid-template-columns: 1.5fr .8fr 1.5fr .8fr; gap: 8px; }.json-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }.json-grid :deep(.el-form-item) { margin-bottom: 0; }.advanced-options { margin-top: 12px; }.installation-summary, .installation-requirements { margin-top: 16px; }.installation-requirement-list { margin: 10px 0; padding-left: 20px; color: var(--app-text-muted); }.copy-command { margin-top: 12px; }.expiry, .empty-node { color: var(--app-text-muted); font-size: 13px; }.run-summary { margin-top: 16px; } @media (max-width: 760px) { .toolbar, .form-grid, .step-grid, .json-grid { display: flex; flex-direction: column; align-items: stretch; }.toolbar { align-items: flex-start; }.step-grid { gap: 8px; } }
+.perf-workspace { max-width: 1280px; margin: 0 auto; padding: 4px 10px 28px; }.phase-notice, .execution-unavailable { margin-bottom: 18px; }.toolbar { min-height: 44px; display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--app-text-muted); margin-bottom: 12px; }.method-tag { margin: 2px; }.input-suffix { margin-left: 8px; color: var(--app-text-muted); font-size: 12px; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }.step-help { margin: 0 0 14px; }.steps-title, .step-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }.step-card { border: 1px solid var(--app-border-light); border-radius: 8px; padding: 12px; margin-bottom: 12px; }.step-grid { display: grid; grid-template-columns: 1.5fr .8fr 1.5fr .8fr; gap: 8px; }.json-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }.json-grid :deep(.el-form-item) { margin-bottom: 0; }.installation-summary, .installation-requirements { margin-top: 16px; }.installation-requirement-list { margin: 10px 0; padding-left: 20px; color: var(--app-text-muted); }.copy-command { margin-top: 12px; }.expiry, .empty-node { color: var(--app-text-muted); font-size: 13px; }.run-summary { margin-top: 16px; } @media (max-width: 760px) { .toolbar, .form-grid, .step-grid, .json-grid { display: flex; flex-direction: column; align-items: stretch; }.toolbar { align-items: flex-start; }.step-grid { gap: 8px; } }
 </style>

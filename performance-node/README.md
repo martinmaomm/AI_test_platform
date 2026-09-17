@@ -31,7 +31,7 @@ export PERFORMANCE_STUNNEL_BINARY='/absolute/path/to/stunnel'
 
 `PERFORMANCE_NODE_ENROLLMENT_TOKEN` 也可直接由运行环境注入；不能同时设置它和 `PERFORMANCE_NODE_ENROLLMENT_TOKEN_FILE`。CLI 没有凭证参数。可选的 `PERFORMANCE_NODE_CA_BUNDLE` 必须指向私有 CA 文件；客户端始终校验证书，不能关闭验证。
 
-平台地址必须是具有主机名、非 0 端口且没有用户信息、查询或片段的 HTTPS URL，可保留部署子路径。客户端拒绝重定向。状态保存在 `PERFORMANCE_NODE_STATE_DIR/identity.json`，目录权限为 `0700`、文件权限为 `0600`，采用原子写入。新目录会以 `0700` 创建；已有宽权限目录会被拒绝，绝不会被客户端 chmod 或改所有权，请改用专用目录。已有身份时 `enroll` 会停止，绝不自动重新登记；请由管理员重置节点凭证后按受控流程处理本地状态。
+平台地址必须是具有主机名、非 0 端口且没有用户信息、查询或片段的 HTTPS URL，可保留部署子路径。客户端拒绝重定向。状态保存在 `PERFORMANCE_NODE_STATE_DIR/identity.json`，目录权限为 `0700`、文件权限为 `0600`，采用原子写入。新目录会以 `0700` 创建；已有宽权限目录会被拒绝，绝不会被客户端 chmod 或改所有权，请改用专用目录。已有身份时 `enroll` 会停止，绝不自动重新登记；正常离线请保留身份卷并检查原容器与网络。尚未注册可重新生成安装命令；已注册的身份丢失则由管理员吊销旧节点并新建，不支持重置原身份。平台删除节点不会卸载本机容器或删除身份卷。
 
 ## Docker
 

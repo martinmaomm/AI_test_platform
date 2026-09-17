@@ -24,7 +24,9 @@ class StrictSerializer(serializers.Serializer):
         if isinstance(data, dict):
             unknown = sorted(set(data) - set(self.fields))
             if unknown:
-                raise serializers.ValidationError('请求包含不支持的字段。')
+                raise serializers.ValidationError({
+                    'non_field_errors': ['请求包含不支持的字段。'],
+                })
         return super().to_internal_value(data)
 
 
@@ -33,7 +35,9 @@ class StrictModelSerializer(serializers.ModelSerializer):
         if isinstance(data, dict):
             unknown = sorted(set(data) - set(self.fields))
             if unknown:
-                raise serializers.ValidationError('请求包含不支持的字段。')
+                raise serializers.ValidationError({
+                    'non_field_errors': ['请求包含不支持的字段。'],
+                })
         return super().to_internal_value(data)
 
 
@@ -265,16 +269,17 @@ class PerformancePlanSerializer(StrictModelSerializer):
 class PerformanceNodeSerializer(StrictModelSerializer):
     status = serializers.SerializerMethodField()
     registered_at = serializers.DateTimeField(source='enrollment_consumed_at', read_only=True)
+    active_run_count = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = PerformanceNode
         fields = (
-            'id', 'name', 'network_mode', 'labels', 'status', 'last_seen_at',
+            'id', 'name', 'network_mode', 'status', 'active_run_count', 'last_seen_at',
             'agent_version', 'engine_version', 'protocol_version', 'resources',
             'registered_at', 'created_at',
         )
         read_only_fields = (
-            'id', 'status', 'last_seen_at', 'agent_version', 'engine_version',
+            'id', 'status', 'active_run_count', 'last_seen_at', 'agent_version', 'engine_version',
             'protocol_version', 'resources', 'registered_at', 'created_at',
         )
 
@@ -286,21 +291,6 @@ class PerformanceNodeSerializer(StrictModelSerializer):
         if not value or _CONTROL_RE.search(value):
             raise serializers.ValidationError('名称不能为空或包含控制字符。')
         return value
-
-    def validate_labels(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError('labels 必须是对象。')
-        if len(value) > 20:
-            raise serializers.ValidationError('labels 最多包含 20 项。')
-        normalized = {}
-        for key, item in value.items():
-            if not isinstance(key, str) or not isinstance(item, str):
-                raise serializers.ValidationError('label 名称和值必须是字符串。')
-            if not key or len(key) > 64 or len(item) > 200 or _CONTROL_RE.search(key) or _CONTROL_RE.search(item):
-                raise serializers.ValidationError('label 名称或值无效。')
-            normalized[key] = item
-        return normalized
-
 
 class AgentVersionSerializer(StrictSerializer):
     protocol_version = StrictIntegerField()
@@ -346,6 +336,17 @@ class RunReportSerializer(StrictSerializer):
 class PerformanceRunCreateSerializer(StrictSerializer):
     node_id = serializers.UUIDField()
     request_id = serializers.UUIDField()
+
+
+class StrictBooleanField(serializers.BooleanField):
+    def to_internal_value(self, data):
+        if not isinstance(data, bool):
+            self.fail('invalid')
+        return data
+
+
+class NodeRevokeSerializer(StrictSerializer):
+    confirm_stop = StrictBooleanField(required=False, default=False)
 
 
 class PerformanceRunListSerializer(serializers.ModelSerializer):

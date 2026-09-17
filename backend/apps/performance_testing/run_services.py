@@ -151,7 +151,8 @@ def _snapshot_for(run_id, plan, node):
 
 def _node_is_compatible(node, now):
     return bool(
-        node.revoked_at is None
+        node.deleted_at is None
+        and node.revoked_at is None
         and node.status_at(now) == 'online'
         and node.protocol_version == PROTOCOL_VERSION
         and node.agent_version == AGENT_VERSION
@@ -183,7 +184,7 @@ def create_run(project, plan_id, node_id, request_id, created_by):
     if plan is None:
         raise RunValidationRejected('性能计划不存在。')
     node = PerformanceNode.objects.select_for_update().filter(
-        pk=node_id, project=locked_project,
+        pk=node_id, project=locked_project, deleted_at__isnull=True,
     ).first()
     if node is None:
         raise RunValidationRejected('性能节点不存在。')

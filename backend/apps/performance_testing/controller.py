@@ -164,7 +164,7 @@ class PerformanceController:
             self.begin_reap('incomplete' if run.started_at else 'failed', 'engine_exited', '执行进程异常结束，未收到完整最终统计')
             return
         if run.node.revoked_at or not run.node.agent_token_digest or run.node.status_at() != 'online':
-            identity_changed = run.reason_code in ('node_revoked', 'node_credentials_rotated')
+            identity_changed = run.reason_code == 'node_revoked'
             self.begin_reap('incomplete' if run.started_at else 'failed',
                             run.reason_code if identity_changed else 'node_unavailable',
                             run.reason if identity_changed else '节点已离线或身份已失效，运行已停止')
@@ -229,8 +229,8 @@ class PerformanceController:
         with self.owned_run(run.pk) as (_, locked):
             if locked.status not in ACTIVE:
                 raise RuntimeError('运行已终止，禁止下发准备指令')
-            if locked.reason_code in ('node_revoked', 'node_credentials_rotated'):
-                return  # Identity rotation wins over a concurrently finishing prepare.
+            if locked.reason_code == 'node_revoked':
+                return  # Revocation wins over a concurrently finishing prepare.
             locked.node_command = command
             locked.save(update_fields=['node_command'])
 

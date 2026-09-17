@@ -62,6 +62,36 @@ def main():
                 node = next(item for item in lists['nodes'] if str(item['id']) == segments[1])
                 # GET installation is intentionally non-sensitive: no enrollment token or command.
                 data = {'node': node, 'installation': installation}
+            elif kind == 'nodes' and len(segments) >= 2:
+                node = next(item for item in lists['nodes'] if str(item['id']) == segments[1])
+                body = request.post_data_json if request.method in ('POST', 'PATCH') else None
+                action = segments[2] if len(segments) > 2 else request.method.lower()
+                mutations.append((f'node_{action}', request.method, body))
+                if action == 'enrollment':
+                    assert not node.get('registered_at') and node['status'] == 'pending'
+                    data = {'node': node, 'installation': {**installation,
+                            'expires_at': '2099-09-16T23:59:00Z', 'command': 'mock-regenerated-command'}}
+                elif action == 'patch':
+                    assert set(body) == {'name', 'network_mode'}
+                    node.update(body)
+                    data = node
+                elif action == 'revoke':
+                    # Simulate a run starting after the row was fetched: confirmation must come from the user.
+                    if runtime.pop('race_on_revoke', False):
+                        node['active_run_count'] = 1
+                    if node.get('active_run_count', 0) and not body.get('confirm_stop'):
+                        route.fulfill(status=409, content_type='application/json', body=json.dumps({
+                            'success': False, 'error': {'code': 'node_has_active_runs',
+                                                       'message': '仍有 1 个未结束的测试，是否请求停止并吊销？', 'count': 1}}))
+                        return
+                    node['status'] = 'revoked'
+                    data = node
+                elif action == 'delete':
+                    assert node['status'] == 'revoked' and node.get('active_run_count', 0) == 0
+                    lists['nodes'].remove(node)
+                    data = {'id': node['id']}
+                else:
+                    raise AssertionError(f'Unexpected node action: {action}')
             elif kind == 'plans' and len(segments) == 3 and segments[2] == 'runs':
                 mutations.append(('runs', request.method, request.post_data_json))
                 runtime['run'] = {
@@ -92,6 +122,7 @@ def main():
                     data = row
                     if kind == 'nodes':
                         row['status'] = 'pending'
+                        row['active_run_count'] = 0
                         data = {'node': row, 'expires_at': '2099-09-16T23:59:00Z',
                                 'installation': {**installation,
                                                  'expires_at': '2099-09-16T23:59:00Z',
@@ -180,6 +211,55 @@ def main():
             import uuid
             uuid.UUID(mutations[3][2]['request_id'])
             assert [item[0] for item in mutations] == ['targets', 'plans', 'nodes', 'runs', 'stop']
+
+            # Lifecycle UI checks below are fully stubbed: no remote container or real load is touched.
+            page.goto('http://127.0.0.1:5173/perf-testing/nodes')
+            row = page.get_by_role('row').filter(has=page.get_by_role('cell', name='本机验收节点', exact=True))
+            expect(row.get_by_role('button', name='重置身份', exact=True)).to_have_count(0)
+            expect(row.get_by_role('button', name='删除', exact=True)).to_have_count(0)
+            row.get_by_role('button', name='编辑', exact=True).click()
+            edit = page.get_by_role('dialog', name='编辑节点', exact=True)
+            expect(edit.get_by_text('高级选项', exact=True)).to_have_count(0)
+            assert '创建后会提供一条安装命令' not in edit.inner_text()
+            edit.locator('.el-form-item').filter(has_text='节点名称').locator('input').fill('本机验收节点-已修改')
+            edit.get_by_role('button', name='保存', exact=True).click()
+            row = page.get_by_role('row').filter(has=page.get_by_role('cell', name='本机验收节点-已修改', exact=True))
+            expect(row).to_be_visible()
+
+            # An expired or lost command on an unregistered node can be regenerated, without identity reset.
+            lists['nodes'][0].update(status='pending', registered_at=None)
+            row.get_by_role('button', name='安装指导', exact=True).click()
+            guide = page.get_by_role('dialog', name='节点安装向导', exact=True)
+            guide.get_by_role('button', name='重新生成安装命令', exact=True).click()
+            # Element Plus keeps the closing box visible briefly while the next confirmation opens.
+            message = page.locator('.el-message-box:visible').last
+            expect(guide.locator('textarea')).to_have_value('mock-regenerated-command')
+            guide.get_by_role('button', name='关闭', exact=True).click()
+
+            # A stale zero-active count must not bypass the second confirmation on HTTP 409.
+            runtime['race_on_revoke'] = True
+            row.get_by_role('button', name='吊销', exact=True).click()
+            message.locator('.el-message-box__btns button').last.click()
+            expect(message).to_contain_text('停止')
+            assert [entry[2] for entry in mutations if entry[0] == 'node_revoke'] == [{}]
+            message.locator('.el-message-box__btns button').first.click()  # Cancel, no implicit retry.
+            expect(message).not_to_be_visible()
+            assert lists['nodes'][0]['status'] != 'revoked'
+            assert [entry[2] for entry in mutations if entry[0] == 'node_revoke'] == [{}]
+            page.reload()  # Fetch the now-known nonzero count for the next explicit attempt.
+            row.get_by_role('button', name='吊销', exact=True).click()
+            expect(message).to_contain_text('停止')
+            message.locator('.el-message-box__btns button').last.click()
+            expect(row.get_by_role('button', name='删除', exact=True)).to_be_disabled(timeout=10000)
+            expect(row.get_by_role('button', name='安装指导', exact=True)).to_have_count(0)
+            expect(row.get_by_role('button', name='编辑', exact=True)).to_have_count(0)
+            assert [entry[2] for entry in mutations if entry[0] == 'node_revoke'][-1] == {'confirm_stop': True}
+            lists['nodes'][0]['active_run_count'] = 0
+            expect(row.get_by_role('button', name='删除', exact=True)).to_be_enabled(timeout=12000)
+            row.get_by_role('button', name='删除', exact=True).click()
+            expect(message).to_contain_text('保留历史')
+            message.locator('.el-message-box__btns button').last.click()
+            expect(page.get_by_text('暂无节点', exact=True)).to_be_visible()
             assert not errors, errors
             with tempfile.NamedTemporaryFile(prefix='performance-ui-', suffix='.png', delete=False) as image:
                 page.screenshot(path=image.name, full_page=True)

@@ -8,11 +8,13 @@ from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 
+from projects.models import Project
+
 from .constants import (
     AGENT_VERSION, ENGINE_VERSION, ENROLLMENT_TTL_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS, NODE_OFFLINE_AFTER_SECONDS, PROTOCOL_VERSION,
 )
-from .models import PerformanceNode
+from .models import PerformanceNode, PerformanceRun
 from .run_services import execution_configuration, stop_runs_for_node_identity_change
 
 
@@ -25,6 +27,16 @@ class CredentialRejected(Exception):
 
 class VersionMismatch(Exception):
     pass
+
+
+class EnrollmentRejected(Exception):
+    pass
+
+
+class NodeHasActiveRuns(Exception):
+    def __init__(self, count):
+        self.count = count
+        super().__init__(f'节点存在 {count} 个活跃运行。')
 
 
 @dataclass(frozen=True)
@@ -73,25 +85,18 @@ def ensure_supported_versions(data):
 @transaction.atomic
 def issue_enrollment(node):
     locked = PerformanceNode.objects.select_for_update().get(pk=node.pk)
+    if locked.deleted_at is not None:
+        raise EnrollmentRejected('节点已删除，不能重新签发安装凭证。')
+    if locked.revoked_at is not None:
+        raise EnrollmentRejected('节点已吊销，不能重新签发安装凭证。')
+    if locked.enrollment_consumed_at is not None or locked.agent_token_digest:
+        raise EnrollmentRejected('节点已注册，不能重新签发安装凭证。')
     token, digest = _new_credential(locked.pk)
     now = timezone.now()
-    stop_runs_for_node_identity_change(
-        locked, 'node_credentials_rotated', '节点身份已轮换，运行无法确认完整结束。', now,
-    )
     locked.enrollment_token_digest = digest
     locked.enrollment_expires_at = now + timedelta(seconds=ENROLLMENT_TTL_SECONDS)
-    locked.enrollment_consumed_at = None
-    locked.agent_token_digest = ''
-    locked.revoked_at = None
-    locked.last_seen_at = None
-    locked.agent_version = ''
-    locked.engine_version = ''
-    locked.protocol_version = None
-    locked.resources = {}
     locked.save(update_fields=(
-        'enrollment_token_digest', 'enrollment_expires_at', 'enrollment_consumed_at',
-        'agent_token_digest', 'revoked_at', 'last_seen_at', 'agent_version',
-        'engine_version', 'protocol_version', 'resources', 'updated_at',
+        'enrollment_token_digest', 'enrollment_expires_at', 'updated_at',
     ))
     return locked, token
 
@@ -106,7 +111,9 @@ def create_node_with_enrollment(project, validated_data):
 def consume_enrollment(raw_token, version_data):
     ensure_supported_versions(version_data)
     node_id, secret = _parse_credential(raw_token)
-    node = PerformanceNode.objects.select_for_update().filter(pk=node_id).first()
+    node = PerformanceNode.objects.select_for_update().filter(
+        pk=node_id, deleted_at__isnull=True,
+    ).first()
     digest_matches = _matches(getattr(node, 'enrollment_token_digest', ''), secret)
     if node is None or not digest_matches:
         raise CredentialRejected
@@ -129,6 +136,7 @@ def consume_enrollment(raw_token, version_data):
         enrollment_consumed_at__isnull=True,
         enrollment_expires_at__gt=now,
         revoked_at__isnull=True,
+        deleted_at__isnull=True,
     ).update(
         enrollment_token_digest='',
         enrollment_expires_at=None,
@@ -149,7 +157,7 @@ def consume_enrollment(raw_token, version_data):
 
 def authenticate_agent_token(raw_token):
     node_id, secret = _parse_credential(raw_token)
-    node = PerformanceNode.objects.filter(pk=node_id).first()
+    node = PerformanceNode.objects.filter(pk=node_id, deleted_at__isnull=True).first()
     digest_matches = _matches(getattr(node, 'agent_token_digest', ''), secret)
     if (
         node is None
@@ -165,11 +173,12 @@ def record_heartbeat(node, credential, version_data, resources):
     ensure_supported_versions(version_data)
     now = timezone.now()
     # Bind the update to the digest authenticated for this request. A revoke or
-    # rotation racing after authentication therefore cannot renew last_seen_at.
+    # soft deletion racing after authentication therefore cannot renew last_seen_at.
     updated = PerformanceNode.objects.filter(
         pk=node.pk,
         agent_token_digest=credential.digest,
         revoked_at__isnull=True,
+        deleted_at__isnull=True,
     ).update(
         last_seen_at=now,
         agent_version=version_data['agent_version'],
@@ -187,9 +196,12 @@ def record_heartbeat(node, credential, version_data, resources):
 def handle_agent_heartbeat(node, credential, version_data, resources, run_report):
     """Keep credential revalidation, heartbeat and command dispatch atomic."""
     ensure_supported_versions(version_data)
-    locked = PerformanceNode.objects.select_for_update().get(pk=node.pk)
+    locked = PerformanceNode.objects.select_for_update().filter(
+        pk=node.pk, deleted_at__isnull=True,
+    ).first()
     if (
-        locked.revoked_at is not None
+        locked is None
+        or locked.revoked_at is not None
         or not locked.agent_token_digest
         or not hmac.compare_digest(locked.agent_token_digest, credential.digest)
     ):
@@ -210,12 +222,25 @@ def handle_agent_heartbeat(node, credential, version_data, resources, run_report
 
 
 @transaction.atomic
-def revoke_node(node):
-    locked = PerformanceNode.objects.select_for_update().get(pk=node.pk)
+def revoke_node(node, confirm_stop=False):
+    # Match create_run's project -> node lock order so checking active runs and
+    # revoking the identity cannot race a newly-created run.
+    Project.objects.select_for_update().get(pk=node.project_id)
+    locked = PerformanceNode.objects.select_for_update().filter(
+        pk=node.pk, project_id=node.project_id, deleted_at__isnull=True,
+    ).first()
+    if locked is None:
+        raise PerformanceNode.DoesNotExist
+    active_run_count = PerformanceRun.objects.filter(
+        node=locked, status__in=PerformanceRun.ACTIVE_STATUSES,
+    ).count()
+    if active_run_count and not confirm_stop:
+        raise NodeHasActiveRuns(active_run_count)
     now = timezone.now()
-    stop_runs_for_node_identity_change(
-        locked, 'node_revoked', '节点已吊销，运行无法确认完整结束。', now,
-    )
+    if active_run_count:
+        stop_runs_for_node_identity_change(
+            locked, 'node_revoked', '节点已吊销，运行无法确认完整结束。', now,
+        )
     if locked.revoked_at is None:
         locked.revoked_at = now
     locked.enrollment_token_digest = ''

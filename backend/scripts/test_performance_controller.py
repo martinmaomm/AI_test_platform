@@ -98,11 +98,11 @@ class ControllerIsolationTests(TestCase):
         for key in ('DB_PASSWORD', 'PERFORMANCE_NODE_TOKEN', 'HTTPS_PROXY', 'OPENAI_API_KEY'):
             self.assertNotIn(key, environment)
 
-    def test_node_identity_change_retains_specific_reason_during_recovery(self):
+    def test_node_revocation_retains_specific_reason_during_recovery(self):
         run = self.run_record()
         self.attach(run)
-        PerformanceRun.objects.filter(pk=run.pk).update(reason_code='node_credentials_rotated', reason='身份轮换')
+        PerformanceRun.objects.filter(pk=run.pk).update(reason_code='node_revoked', reason='节点已吊销')
         self.controller.directory = Path(self.temporary.name)
         with patch('performance_testing.controller.read_json', return_value=None), patch.object(self.controller, 'begin_reap') as reap:
             self.controller.tick()
-        reap.assert_called_once_with('failed', 'node_credentials_rotated', '身份轮换')
+        reap.assert_called_once_with('failed', 'node_revoked', '节点已吊销')

@@ -1,5 +1,7 @@
 from django.db import transaction
+from django.db.models import Count, Q
 from django.db.models.deletion import RestrictedError
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
@@ -9,17 +11,20 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from projects.access import DELETE, EDIT, READ, get_project_for_user
+from projects.models import Project
 from users.permissions import is_platform_admin
 
 from .constants import platform_config
 from .installation import installation_metadata
-from .models import PerformanceNode, PerformancePlan, PerformanceTarget
+from .models import PerformanceNode, PerformancePlan, PerformanceRun, PerformanceTarget
 from .parsers import LimitedJSONParser
 from .serializers import (
-    PerformanceNodeSerializer, PerformancePlanSerializer, PerformanceTargetSerializer,
+    NodeRevokeSerializer, PerformanceNodeSerializer, PerformancePlanSerializer,
+    PerformanceTargetSerializer,
 )
 from .services import (
-    create_node_with_enrollment, enrollment_response, issue_enrollment, revoke_node,
+    EnrollmentRejected, NodeHasActiveRuns, create_node_with_enrollment,
+    enrollment_response, issue_enrollment, revoke_node,
 )
 from .run_services import controller_execution_status
 
@@ -41,11 +46,28 @@ def _project(request, project_id, capability=READ):
     )
 
 
-def _admin_project(request, project_id):
-    project = _project(request, project_id, READ)
+def _admin_project(request, project_id, capability=READ):
+    project = _project(request, project_id, capability)
     if not is_platform_admin(request.user):
         raise PermissionDenied('仅平台管理员可以管理性能节点或目标。')
     return project
+
+
+def _visible_nodes(project):
+    return PerformanceNode.objects.filter(
+        project=project, deleted_at__isnull=True,
+    ).annotate(
+        active_run_count=Count(
+            'runs', filter=Q(runs__status__in=PerformanceRun.ACTIVE_STATUSES),
+        ),
+    )
+
+
+def _serialized_node(project, node_id):
+    node = get_object_or_404(_visible_nodes(project), pk=node_id)
+    return PerformanceNodeSerializer(
+        node, context={'current_time': timezone.now()},
+    ).data
 
 
 def _lock_target(project, raw_target_id):
@@ -174,7 +196,7 @@ class PlanDetailView(ManagementAPIView):
 class NodeListCreateView(ManagementAPIView):
     def get(self, request, project_id):
         project = _project(request, project_id, READ)
-        rows = PerformanceNode.objects.filter(project=project)
+        rows = _visible_nodes(project)
         context = {'current_time': timezone.now()}
         return _ok({'items': PerformanceNodeSerializer(rows, many=True, context=context).data})
 
@@ -183,6 +205,7 @@ class NodeListCreateView(ManagementAPIView):
         serializer = PerformanceNodeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         node, token = create_node_with_enrollment(project, serializer.validated_data)
+        node = get_object_or_404(_visible_nodes(project), pk=node.pk)
         payload = enrollment_response(node, token, PerformanceNodeSerializer)
         payload['installation'] = installation_metadata(node=node, enrollment_token=token)
         return _ok(payload, status.HTTP_201_CREATED)
@@ -191,23 +214,53 @@ class NodeListCreateView(ManagementAPIView):
 class NodeDetailView(ManagementAPIView):
     def get(self, request, project_id, node_id):
         project = _project(request, project_id, READ)
-        node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
-        return _ok(PerformanceNodeSerializer(node, context={'current_time': timezone.now()}).data)
+        return _ok(_serialized_node(project, node_id))
 
     def patch(self, request, project_id, node_id):
         project = _admin_project(request, project_id)
-        node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
-        serializer = PerformanceNodeSerializer(node, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        node = serializer.save()
-        return _ok(PerformanceNodeSerializer(node, context={'current_time': timezone.now()}).data)
+        with transaction.atomic():
+            node = get_object_or_404(
+                PerformanceNode.objects.select_for_update(),
+                pk=node_id, project=project, deleted_at__isnull=True,
+            )
+            if node.revoked_at is not None:
+                return _conflict('已吊销节点不能编辑。')
+            serializer = PerformanceNodeSerializer(node, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            node = serializer.save()
+        return _ok(_serialized_node(project, node.pk))
+
+    def delete(self, request, project_id, node_id):
+        project = _admin_project(request, project_id, DELETE)
+        with transaction.atomic():
+            # Match create_run's project -> node lock order. New runs cannot pass
+            # their node check between the active-run check and soft deletion.
+            locked_project = Project.objects.select_for_update().get(pk=project.pk)
+            node = get_object_or_404(
+                PerformanceNode.objects.select_for_update(),
+                pk=node_id, project=locked_project, deleted_at__isnull=True,
+            )
+            if node.revoked_at is None:
+                return _conflict('节点必须先吊销才能删除。')
+            active_run_count = PerformanceRun.objects.filter(
+                node=node, status__in=PerformanceRun.ACTIVE_STATUSES,
+            ).count()
+            if active_run_count:
+                return _conflict(f'节点仍有 {active_run_count} 个未结束运行，不能删除。')
+            node.deleted_at = timezone.now()
+            node.save(update_fields=('deleted_at', 'updated_at'))
+        return _ok({'id': node.pk})
 
 
 class NodeEnrollmentView(ManagementAPIView):
     def post(self, request, project_id, node_id):
         project = _admin_project(request, project_id)
-        node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
-        node, token = issue_enrollment(node)
+        node = get_object_or_404(_visible_nodes(project), pk=node_id)
+        try:
+            node, token = issue_enrollment(node)
+        except EnrollmentRejected as exc:
+            return _conflict(str(exc))
+        node = get_object_or_404(_visible_nodes(project), pk=node.pk)
         payload = enrollment_response(node, token, PerformanceNodeSerializer)
         payload['installation'] = installation_metadata(node=node, enrollment_token=token)
         return _ok(payload)
@@ -216,7 +269,9 @@ class NodeEnrollmentView(ManagementAPIView):
 class NodeInstallationView(ManagementAPIView):
     def get(self, request, project_id, node_id):
         project = _admin_project(request, project_id)
-        node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
+        node = get_object_or_404(_visible_nodes(project), pk=node_id)
+        if node.revoked_at is not None:
+            return _conflict('已吊销节点不能安装。')
         return _ok({
             'node': PerformanceNodeSerializer(
                 node, context={'current_time': timezone.now()},
@@ -228,6 +283,20 @@ class NodeInstallationView(ManagementAPIView):
 class NodeRevokeView(ManagementAPIView):
     def post(self, request, project_id, node_id):
         project = _admin_project(request, project_id)
-        node = get_object_or_404(PerformanceNode, pk=node_id, project=project)
-        node = revoke_node(node)
-        return _ok(PerformanceNodeSerializer(node, context={'current_time': timezone.now()}).data)
+        serializer = NodeRevokeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node = get_object_or_404(_visible_nodes(project), pk=node_id)
+        try:
+            node = revoke_node(node, confirm_stop=serializer.validated_data['confirm_stop'])
+        except PerformanceNode.DoesNotExist as exc:
+            raise Http404('性能节点不存在。') from exc
+        except NodeHasActiveRuns as exc:
+            return Response({
+                'success': False,
+                'error': {
+                    'code': 'node_has_active_runs',
+                    'message': f'节点存在 {exc.count} 个活跃运行，请确认停止后再吊销。',
+                    'count': exc.count,
+                },
+            }, status=status.HTTP_409_CONFLICT)
+        return _ok(_serialized_node(project, node.pk))

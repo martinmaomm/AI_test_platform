@@ -12,9 +12,31 @@ export const installationCommandExpired = (installation, now = Date.now()) => {
   return Boolean(expiry && Number.isFinite(Date.parse(expiry)) && Date.parse(expiry) <= now)
 }
 
-export const canRegenerateInstallation = (node, installation, expired = false) => (
-  node?.status === 'pending' && !node?.registered_at && (!installation?.command || expired)
+export const isUnregisteredPerformanceNode = (node) => (
+  node?.status === 'pending' && !node?.registered_at
 )
+
+export const canRegenerateInstallation = (node, installation, expired = false) => (
+  isUnregisteredPerformanceNode(node) && (!installation?.command || expired)
+)
+
+export const canUseInstallationCommand = (node, installation, expired = false) => (
+  isUnregisteredPerformanceNode(node) && Boolean(installation?.command) && !expired
+)
+
+export const performanceNodeActiveRunCount = (node) => Math.max(0, Number(node?.active_run_count) || 0)
+
+export const canDeletePerformanceNode = (node) => (
+  node?.status === 'revoked' && node?.active_run_count === 0
+)
+
+export const nodeHasActiveRuns = (node) => performanceNodeActiveRunCount(node) > 0
+
+export const activeRunConflictCount = (error) => {
+  const data = error?.response?.data
+  if (error?.response?.status !== 409 || data?.error?.code !== 'node_has_active_runs') return null
+  return Math.max(0, Number(data.error.count) || 0)
+}
 
 export const installationArchitectureText = (architectures) => {
   const names = { amd64: 'x86_64（amd64）', arm64: 'ARM64（arm64）' }

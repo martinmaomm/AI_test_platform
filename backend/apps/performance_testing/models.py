@@ -80,7 +80,6 @@ class PerformanceNode(models.Model):
     )
     name = models.CharField(max_length=200)
     network_mode = models.CharField(max_length=10, choices=NetworkMode.choices)
-    labels = models.JSONField(default=dict, blank=True)
 
     enrollment_token_digest = models.CharField(max_length=64, blank=True, default='', editable=False)
     enrollment_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
@@ -93,6 +92,7 @@ class PerformanceNode(models.Model):
     engine_version = models.CharField(max_length=32, blank=True, default='', editable=False)
     protocol_version = models.PositiveIntegerField(null=True, blank=True, editable=False)
     resources = models.JSONField(default=dict, blank=True, editable=False)
+    deleted_at = models.DateTimeField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

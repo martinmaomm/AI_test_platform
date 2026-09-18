@@ -62,10 +62,11 @@ test('performance API keeps management responses in response.data and node lifec
   assert.match(source, /performanceErrorMessage/)
 })
 
-test('workspace creates one-node execution requests and explains virtual-user startup wording', async () => {
+test('workspace creates one-node execution requests and delegates plan editing to the scoped drawer', async () => {
   const source = await read('../src/views/perf-testing/PerfWorkspace.vue')
-  assert.match(source, /在线 Agent 不等于 Worker 就绪/)
-  assert.match(source, /启动速率表示每秒启动的虚拟用户数，不代表每秒请求数/)
+  assert.match(source, /PerformancePlanEditor/)
+  assert.doesNotMatch(source, /<el-tabs/)
+  assert.doesNotMatch(source, /phase-notice/)
   assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/)
   assert.match(source, /节点安装向导/)
   assert.match(source, /getPerformanceNodeInstallation/)
@@ -90,13 +91,13 @@ test('workspace creates one-node execution requests and explains virtual-user st
   assert.match(source, /旧版已注册节点/)
   assert.match(source, /不要按新版命名猜测/)
   assert.match(source, /window\.setInterval\(\(\) => \{ installationClock\.value = Date\.now\(\); return Promise\.all\(\[loadConfig\(requestProjectId, requestEpoch\), loadList\('nodes'/)
-  assert.match(source, /Promise\.all\(\[loadAccess\(requestProjectId, requestEpoch\), loadConfig\(requestProjectId, requestEpoch\), loadList\('targets', requestProjectId, requestEpoch\), loadList\('plans', requestProjectId, requestEpoch\), loadList\('nodes', requestProjectId, requestEpoch\)\]\)/)
+  assert.match(source, /loadAccess\(requestProjectId, requestEpoch\)/)
+  assert.match(source, /preservePlanDraft \? Promise\.resolve\(\) : loadList\('plans', requestProjectId, requestEpoch\)/)
   assert.match(source, /if \(!canRegenerateInstallation\(node, installationDialog\.installation, installationCommandIsExpired\.value\)\) return[\s\S]*?regeneratePerformanceNodeInstallation/)
   assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/)
   assert.match(source, /createPerformanceRun\(scope\.projectId, plan\.id, \{ node_id: nodeId, request_id: requestId \}\)/)
   assert.match(source, /execution_unavailable_reason/)
   assert.match(source, /每次仅运行一个节点/)
-  assert.match(source, /保存计划不会自动执行，需在计划列表确认后创建运行/)
   assert.match(source, /运行任务（含停止中）。吊销将请求停止，报告可能不完整/)
   assert.match(source, /activeRunConflictCount\(error\)/)
   assert.match(source, /revokePerformanceNode\(scope\.projectId, node\.id, \{ confirm_stop: true \}\)/)
@@ -111,8 +112,9 @@ test('workspace creates one-node execution requests and explains virtual-user st
   assert.match(source, /projectStore\.currentProject\?\.project_type !== 'perf'/)
   assert.match(source, /if \(saving\.plan\) return/)
   assert.match(source, /if \(saving\.node\) return/)
-  assert.match(source, /Headers 必须是 JSON 对象/)
-  assert.match(source, /Body 必须是合法 JSON/)
+  assert.match(source, /onActivated\(activate\)/)
+  assert.match(source, /onDeactivated\(deactivate\)/)
+  assert.match(source, /preservePlanDraft: planDialog\.visible/)
 })
 
 test('only the backend platform-admin definition can manage nodes and targets', () => {

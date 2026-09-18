@@ -164,6 +164,12 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(rejected.status_code, 400, rejected.data)
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_agent_020_remains_execution_compatible(self, _):
+        PerformanceNode.objects.filter(pk=self.node.pk).update(agent_version='0.2.0')
+        created = self._create()
+        self.assertEqual(created.status_code, 201, created.data)
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_new_run_rejects_deleted_node_even_with_valid_plan_and_version(self, _):
         PerformanceNode.objects.filter(pk=self.node.pk).update(deleted_at=timezone.now())
         rejected = self._create()

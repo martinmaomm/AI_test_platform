@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone as datetime_timezone
 import hashlib
@@ -9,7 +8,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import subprocess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -64,6 +62,10 @@ class ReleaseFixtureMixin:
                 'image_ref': f'automation-platform-performance-node:{AGENT_VERSION}-{architecture}',
                 'image_id': f"sha256:{str(index) * 64}",
                 'image_config_id': f"sha256:{str(index + 2) * 64}",
+                'registry_ref': (
+                    f'docker.io/automationplatform/performance-node-{architecture}'
+                    f'@sha256:{str(index + 4) * 64}'
+                ),
             }
         self.manifest = {
             'release': AGENT_VERSION,
@@ -71,6 +73,9 @@ class ReleaseFixtureMixin:
             'agent_version': AGENT_VERSION,
             'engine_version': ENGINE_VERSION,
             'runtime_sha256': hashlib.sha256(self.runtime_path.read_bytes()).hexdigest(),
+            'registry_index_ref': (
+                'docker.io/automationplatform/performance-node@sha256:' + '9' * 64
+            ),
             'images': images,
         }
         self.write_manifest()
@@ -161,7 +166,7 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         hashed_paths = [call.args[0] for call in sha256_file.call_args_list]
         self.assertEqual(hashed_paths, [self.runtime_path.resolve()])
 
-    def test_missing_configuration_or_installer_is_explicitly_unavailable(self):
+    def test_missing_configuration_is_unavailable_but_web_command_does_not_need_installer(self):
         with override_settings(BASE_DIR=self.backend_directory), patch.dict(os.environ, {}, clear=True):
             missing_environment = installation_metadata()
         self.assertFalse(missing_environment['available'])
@@ -171,8 +176,7 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         self.installer_path.unlink()
         with self.release_environment():
             missing_installer = installation_metadata()
-        self.assertFalse(missing_installer['available'])
-        self.assertIn('安装脚本', missing_installer['reason'])
+        self.assertTrue(missing_installer['available'])
         self.assertNotIn('command', missing_installer)
 
     def test_public_url_rejects_non_https_credentials_query_fragment_and_injection(self):
@@ -247,6 +251,32 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
                 self.assertFalse(metadata['available'], metadata)
                 self.assertNotIn('command', metadata)
 
+    def test_registry_index_ref_is_required_and_strictly_pinned(self):
+        expected = self.manifest['registry_index_ref']
+        with self.release_environment():
+            self.assertEqual(load_release_configuration().registry_index_ref, expected)
+
+        invalid_references = (
+            None,
+            '',
+            'ghcr.io/automationplatform/performance-node@sha256:' + '1' * 64,
+            'docker.io/automationplatform/performance-node:0.2.1',
+            'docker.io/automationplatform/performance-node@sha256:' + 'A' * 64,
+            'docker.io/automationplatform/performance-node@sha256:' + '1' * 63,
+        )
+        for registry_index_ref in invalid_references:
+            with self.subTest(registry_index_ref=registry_index_ref):
+                if registry_index_ref is None:
+                    self.manifest.pop('registry_index_ref', None)
+                else:
+                    self.manifest['registry_index_ref'] = registry_index_ref
+                self.write_manifest()
+                with self.release_environment():
+                    metadata = installation_metadata()
+                self.assertFalse(metadata['available'], metadata)
+                self.assertNotIn('command', metadata)
+                self.manifest['registry_index_ref'] = expected
+
     def test_release_archive_symlink_is_rejected(self):
         archive = self.release_directory / AGENT_VERSION / 'linux-amd64.tar.gz'
         outside = self.root / 'outside.tar.gz'
@@ -290,7 +320,7 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         self.assertFalse(metadata['available'])
         self.assertIn('顶层', metadata['reason'])
 
-    def test_private_key_ca_is_rejected_and_public_ca_is_embedded(self):
+    def test_private_key_ca_is_rejected_and_public_ca_digest_is_pinned(self):
         ca_path = self.root / 'platform-ca.pem'
         ca_path.write_text(
             '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n',
@@ -311,9 +341,12 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
             accepted = installation_metadata(node=node, enrollment_token='one-time-token')
         command = accepted['command']
         self.assertTrue(accepted['available'])
-        self.assertIn('--ca-file', command)
-        self.assertIn('base64 --decode', command)
-        self.assertIn(base64.b64encode(certificate).decode('ascii'), command)
+        arguments = shlex.split(command)
+        digest_position = arguments.index('--ca-sha256')
+        self.assertEqual(
+            arguments[digest_position + 1], hashlib.sha256(certificate).hexdigest(),
+        )
+        self.assertNotIn(certificate.decode('ascii').strip(), command)
 
     def test_leaf_and_expired_certificates_are_not_accepted_as_public_ca(self):
         ca_path = self.root / 'platform-ca.pem'
@@ -336,7 +369,16 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
                 self.assertFalse(metadata['available'])
                 self.assertIn(expected_reason, metadata['reason'])
 
-    def test_bootstrap_is_one_safe_command_with_pinned_downloads_and_no_system_ca_override(self):
+    def test_ca_larger_than_agent_limit_is_rejected(self):
+        ca_path = self.root / 'oversized-platform-ca.pem'
+        ca_path.write_bytes(b'X' * (64 * 1024 + 1))
+        with self.release_environment(PERFORMANCE_NODE_CA_CERT_FILE=str(ca_path)):
+            metadata = installation_metadata()
+        self.assertFalse(metadata['available'])
+        self.assertIn('文件过大', metadata['reason'])
+        self.assertNotIn('command', metadata)
+
+    def test_web_install_is_one_safe_docker_run_with_fixed_index_and_hardening(self):
         token = "node.$(touch /tmp/must-not-run)'"
         node = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000001',
@@ -345,69 +387,74 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         with self.release_environment():
             metadata = installation_metadata(node=node, enrollment_token=token)
         command = metadata['command']
-        bootstrap_script = shlex.split(command)[2]
+        arguments = shlex.split(command)
 
         self.assertTrue(metadata['available'])
-        self.assertTrue(command.startswith('bash -c '))
-        self.assertIn('umask 077', bootstrap_script)
-        self.assertIn('mktemp -d', bootstrap_script)
-        self.assertIn('chmod 0700', bootstrap_script)
-        self.assertIn('chmod 0600', bootstrap_script)
-        self.assertIn('trap cleanup', bootstrap_script)
-        self.assertIn("--proto '=https'", bootstrap_script)
-        self.assertIn('--max-time 120', bootstrap_script)
-        self.assertNotIn('--location', bootstrap_script)
-        self.assertIn('sha256sum --check --status', bootstrap_script)
-        self.assertIn('下载安装脚本失败', bootstrap_script)
-        self.assertIn('安装脚本 SHA256 校验失败', bootstrap_script)
-        self.assertIn('发行镜像不可达', bootstrap_script)
-        self.assertIn('--range 0-0', bootstrap_script)
-        self.assertIn('--token-file', bootstrap_script)
-        self.assertIn('--image-config-id', bootstrap_script)
-        self.assertIn(self.manifest['images']['amd64']['image_config_id'], bootstrap_script)
-        self.assertIn(self.manifest['images']['arm64']['image_config_id'], bootstrap_script)
-        self.assertNotIn('--ca-file', bootstrap_script)
-        self.assertNotIn('curl -k', bootstrap_script)
-        self.assertNotIn('| bash', bootstrap_script)
-        self.assertNotIn('PERFORMANCE_NODE_ENROLLMENT_TOKEN=', bootstrap_script)
-        self.assertNotIn('?token=', bootstrap_script)
-        self.assertEqual(bootstrap_script.count(token), 1)
-        self.assertEqual(
-            subprocess.run(
-                ['bash', '-n', '-c', command], capture_output=True, text=True, check=False,
-            ).returncode,
-            0,
+        self.assertNotIn('\n', command)
+        self.assertEqual(arguments[:4], ['docker', 'run', '-d', '--name'])
+        self.assertEqual(metadata['container_name'], arguments[4])
+        self.assertRegex(
+            metadata['container_name'],
+            r'^performance-node-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$',
         )
+        expected_options = [
+            '--restart', 'unless-stopped', '--init', '--read-only',
+            '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
+            '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+            '--memory', '512m', '--cpus', '1', '--pids-limit', '128',
+            '--stop-timeout', '25', '--log-opt', 'max-size=10m',
+            '--log-opt', 'max-file=3', '--mount',
+        ]
+        self.assertEqual(arguments[5:5 + len(expected_options)], expected_options)
+        mount = arguments[5 + len(expected_options)]
+        self.assertRegex(
+            mount,
+            r'^type=volume,src=performance-node-[0-9a-f-]{36}-identity,dst=/var/lib/performance-node$',
+        )
+        self.assertEqual(
+            mount,
+            'type=volume,src=performance-node-00000000-0000-0000-0000-000000000001-identity,'
+            'dst=/var/lib/performance-node',
+        )
+        image_position = 6 + len(expected_options)
+        self.assertEqual(arguments[image_position], self.manifest['registry_index_ref'])
+        self.assertEqual(arguments[image_position + 1:], [
+            'start', '--server', 'https://platform.example.test/base',
+            '--node-id', str(node.pk), '--token', token,
+        ])
+        for forbidden in ('bash', 'curl', 'base64', 'sh', '&&'):
+            self.assertNotIn(forbidden, arguments)
+        self.assertNotIn('--privileged', arguments)
+        self.assertNotIn('--network', arguments)
+        self.assertNotIn('/var/run/docker.sock', command)
 
-    def test_bootstrap_registry_transport_skips_archive_probe_at_runtime(self):
-        self.enable_registry_transport()
+    def test_regenerated_command_reuses_node_owned_container_and_identity_volume(self):
         node = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000001',
             'enrollment_expires_at': timezone.now() + timedelta(minutes=15),
         })()
         with self.release_environment():
-            metadata = installation_metadata(node=node, enrollment_token='one-time-token')
-        bootstrap_script = shlex.split(metadata['command'])[2]
-
-        amd64_ref = self.manifest['images']['amd64']['registry_ref']
-        arm64_ref = self.manifest['images']['arm64']['registry_ref']
-        self.assertIn(f'registry_ref={amd64_ref}', bootstrap_script)
-        self.assertIn(f'registry_ref={arm64_ref}', bootstrap_script)
-        self.assertIn('if [ -z "$registry_ref" ]; then', bootstrap_script)
-        self.assertIn('if [ -n "$registry_ref" ]; then', bootstrap_script)
-        self.assertIn('installer_arguments+=(--registry-ref "$registry_ref")', bootstrap_script)
-        probe_position = bootstrap_script.index('--range 0-0')
-        guard_position = bootstrap_script.index('if [ -z "$registry_ref" ]; then')
-        installer_position = bootstrap_script.index('installer_arguments=(')
-        self.assertLess(guard_position, probe_position)
-        self.assertLess(probe_position, installer_position)
+            first = installation_metadata(node=node, enrollment_token='first-token')
+            second = installation_metadata(node=node, enrollment_token='second-token')
+        first_arguments = shlex.split(first['command'])
+        second_arguments = shlex.split(second['command'])
+        self.assertEqual(first['container_name'], second['container_name'])
         self.assertEqual(
-            subprocess.run(
-                ['bash', '-n', '-c', metadata['command']],
-                capture_output=True, text=True, check=False,
-            ).returncode,
-            0,
+            first_arguments[first_arguments.index('--mount') + 1],
+            second_arguments[second_arguments.index('--mount') + 1],
         )
+        self.assertNotEqual(first['command'], second['command'])
+
+    def test_noncanonical_node_id_cannot_generate_a_command(self):
+        node = type('Node', (), {
+            'pk': '00000000-0000-0000-0000-00000000000A',
+            'enrollment_expires_at': timezone.now() + timedelta(minutes=15),
+        })()
+        with self.release_environment():
+            metadata = installation_metadata(node=node, enrollment_token='one-time-token')
+        self.assertFalse(metadata['available'])
+        self.assertIn('规范 UUID', metadata['reason'])
+        self.assertNotIn('command', metadata)
 
 
 class InstallationAPITests(ReleaseFixtureMixin, TestCase):
@@ -456,9 +503,12 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         self.assertTrue(data['installation']['available'])
         self.assertIsInstance(data['installation']['requirements'], list)
         self.assertIn('command', data['installation'])
+        self.assertIn('container_name', data['installation'])
         token = data['enrollment_token']
         node_id = data['node']['id']
-        self.assertIn(token, data['installation']['command'])
+        command_arguments = shlex.split(data['installation']['command'])
+        self.assertEqual(command_arguments[command_arguments.index('--token') + 1], token)
+        self.assertIn(self.manifest['registry_index_ref'], command_arguments)
         self.assertNotIn('safe node name', data['installation']['command'])
 
         installation_url = self.root_url + f'nodes/{node_id}/installation/'
@@ -466,7 +516,14 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         self.assertEqual(fetched.status_code, 200, fetched.data)
         self.assertEqual(set(fetched.data['data']), {'node', 'installation'})
         self.assertNotIn('command', fetched.data['data']['installation'])
+        self.assertEqual(
+            fetched.data['data']['installation']['container_name'],
+            f'performance-node-{node_id}',
+        )
         self.assertNotIn(token, json.dumps(fetched.data, default=str))
+
+        listed = self.client.get(self.root_url + 'nodes/')
+        self.assertNotIn(token, json.dumps(listed.data, default=str))
 
         self.client.force_authenticate(user=None)
         enrolled = self.client.post('/api/v1/performance-agent/enroll/', {
@@ -506,7 +563,22 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         installation = response.data['data']['installation']
         self.assertTrue(installation['available'])
         self.assertNotIn('command', installation)
+        self.assertNotIn('container_name', installation)
         self.assertNotIn(token, json.dumps(response.data, default=str))
+
+    def test_registered_020_node_does_not_guess_the_legacy_container_name(self):
+        created = self.create_node()
+        node_id = created.data['data']['node']['id']
+        PerformanceNode.objects.filter(pk=node_id).update(
+            agent_version='0.2.0', enrollment_consumed_at=timezone.now(),
+        )
+        response = self.client.get(
+            self.root_url + f'nodes/{node_id}/installation/',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        installation = response.data['data']['installation']
+        self.assertNotIn('command', installation)
+        self.assertNotIn('container_name', installation)
 
     def test_public_installer_is_raw_no_store_and_rejects_queries(self):
         self.client.force_authenticate(user=None)
@@ -528,6 +600,64 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         self.assertEqual(response['Cache-Control'], 'no-store')
         self.assertIn('暂不可用', response.content.decode('utf-8'))
         self.assertNotIn(str(self.root), response.content.decode('utf-8'))
+
+    def test_public_ca_is_no_store_query_free_and_independent_of_manifest(self):
+        certificate = self.first_system_ca_certificate()
+        ca_path = self.root / 'platform-ca.pem'
+        ca_path.write_bytes(certificate)
+        (self.release_directory / 'manifest.json').write_text('{broken', encoding='utf-8')
+        path = '/api/v1/performance-agent/install/ca.pem'
+        pem_accept = 'application/x-pem-file'
+        self.client.force_authenticate(user=None)
+        with patch.dict(
+            os.environ, {'PERFORMANCE_NODE_CA_CERT_FILE': str(ca_path)}, clear=False,
+        ):
+            response = self.client.get(path, HTTP_ACCEPT=pem_accept)
+            head = self.client.head(path, HTTP_ACCEPT=pem_accept)
+            rejected = self.client.get(
+                path + '?token=must-not-appear', HTTP_ACCEPT=pem_accept,
+            )
+            post = self.client.post(path, {}, format='json', HTTP_ACCEPT=pem_accept)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, certificate)
+        self.assertEqual(response['Content-Type'], 'application/x-pem-file')
+        self.assertEqual(response['Cache-Control'], 'no-store')
+        self.assertEqual(response['X-Content-Type-Options'], 'nosniff')
+        self.assertEqual(head.status_code, 200)
+        self.assertEqual(head.content, b'')
+        self.assertEqual(head['Cache-Control'], 'no-store')
+        self.assertEqual(rejected.status_code, 400)
+        self.assertNotIn(b'must-not-appear', rejected.content)
+        self.assertEqual(post.status_code, 405)
+
+    def test_public_ca_returns_404_for_public_trust_and_fails_closed_on_private_key(self):
+        path = '/api/v1/performance-agent/install/ca.pem'
+        pem_accept = 'application/x-pem-file'
+        self.client.force_authenticate(user=None)
+        response = self.client.get(path, HTTP_ACCEPT=pem_accept)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response['Cache-Control'], 'no-store')
+
+        ca_path = self.root / 'platform-ca.pem'
+        ca_path.write_text(
+            '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n',
+            encoding='ascii',
+        )
+        with patch.dict(
+            os.environ, {'PERFORMANCE_NODE_CA_CERT_FILE': str(ca_path)}, clear=False,
+        ):
+            rejected = self.client.get(path, HTTP_ACCEPT=pem_accept)
+        self.assertEqual(rejected.status_code, 503)
+        self.assertIn(b'PRIVATE KEY', rejected.content)
+
+        ca_path.write_bytes(b'X' * (64 * 1024 + 1))
+        with patch.dict(
+            os.environ, {'PERFORMANCE_NODE_CA_CERT_FILE': str(ca_path)}, clear=False,
+        ):
+            oversized = self.client.get(path, HTTP_ACCEPT=pem_accept)
+        self.assertEqual(oversized.status_code, 503)
+        self.assertIn('文件过大', oversized.content.decode('utf-8'))
 
     def test_registered_at_is_read_only(self):
         created = self.create_node()

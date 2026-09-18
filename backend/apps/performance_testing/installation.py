@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
 import re
 import shlex
 import stat
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone as datetime_timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from cryptography import x509
 from django.conf import settings
@@ -24,14 +24,14 @@ from .constants import AGENT_VERSION, ENGINE_VERSION, PROTOCOL_VERSION
 SUPPORTED_ARCHITECTURES = ('amd64', 'arm64')
 INSTALLATION_REQUIREMENTS = (
     'Linux（x86_64/amd64 或 aarch64/arm64）',
-    '使用 root 用户执行；非 root 请先通过 sudo -i 切换为 root',
-    '已安装 bash、curl、base64、sha256sum、mktemp、chmod、rm、uname',
-    '可通过 HTTPS 访问平台地址和发行镜像地址',
+    '使用 root 用户或具备 Docker 操作权限的用户执行',
+    '已安装 Docker，且可拉取固定摘要的 Docker Hub 镜像',
+    '可通过 HTTPS 访问平台地址',
 )
 
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_INSTALLER_BYTES = 2 * 1024 * 1024
-_MAX_CA_BYTES = 1024 * 1024
+_MAX_CA_BYTES = 64 * 1024
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 _IMAGE_ID_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
 _REGISTRY_REF_RE = re.compile(
@@ -66,13 +66,9 @@ class ReleaseConfiguration:
     platform_url: str
     release: str
     agent_version: str
-    installer_sha256: str
+    registry_index_ref: str
     architectures: tuple[ArchitectureRelease, ...]
     ca_certificate: bytes | None
-
-    @property
-    def installer_url(self):
-        return f'{self.platform_url}/api/v1/performance-agent/install/install.sh'
 
 
 def _repo_root():
@@ -224,7 +220,7 @@ def _load_manifest(release_directory):
         raise ReleaseConfigurationError('发行 manifest.json 顶层必须是对象。')
     required = {
         'release', 'protocol_version', 'agent_version', 'engine_version',
-        'runtime_sha256', 'images',
+        'runtime_sha256', 'registry_index_ref', 'images',
     }
     if set(manifest) != required:
         raise ReleaseConfigurationError('发行 manifest.json 字段不符合固定格式。')
@@ -243,6 +239,12 @@ def _load_manifest(release_directory):
         raise ReleaseConfigurationError('发行 manifest.json 的 runtime_sha256 无效。')
     if runtime_sha256 != _sha256_file(runtime_path):
         raise ReleaseConfigurationError('发行包固定运行时哈希与当前平台不匹配。')
+    registry_index_ref = manifest['registry_index_ref']
+    if (
+        not isinstance(registry_index_ref, str)
+        or not _REGISTRY_REF_RE.fullmatch(registry_index_ref)
+    ):
+        raise ReleaseConfigurationError('发行 manifest.json 的 multi-arch Docker Hub 镜像引用无效。')
     return manifest
 
 
@@ -250,8 +252,8 @@ def _load_architectures(release_directory, manifest):
     images = manifest['images']
     if not isinstance(images, dict) or not images:
         raise ReleaseConfigurationError('发行 manifest.json 未包含已发布架构。')
-    if not set(images).issubset(SUPPORTED_ARCHITECTURES):
-        raise ReleaseConfigurationError('发行 manifest.json 包含不支持的架构。')
+    if set(images) != set(SUPPORTED_ARCHITECTURES):
+        raise ReleaseConfigurationError('发行 manifest.json 必须完整包含 amd64 和 arm64。')
 
     releases = []
     for architecture in SUPPORTED_ARCHITECTURES:
@@ -260,12 +262,11 @@ def _load_architectures(release_directory, manifest):
         image = images[architecture]
         required_fields = {
             'filename', 'sha256', 'size_bytes', 'image_ref', 'image_id',
-            'image_config_id',
+            'image_config_id', 'registry_ref',
         }
         if (
             not isinstance(image, dict)
-            or not required_fields.issubset(image)
-            or not set(image).issubset(required_fields | {'registry_ref'})
+            or set(image) != required_fields
         ):
             raise ReleaseConfigurationError(f'{architecture} 发行条目不符合固定格式。')
         expected_filename = f'{AGENT_VERSION}/linux-{architecture}.tar.gz'
@@ -283,7 +284,7 @@ def _load_architectures(release_directory, manifest):
         image_ref = image['image_ref']
         image_id = image['image_id']
         image_config_id = image['image_config_id']
-        registry_ref = image.get('registry_ref')
+        registry_ref = image['registry_ref']
         if not isinstance(sha256, str) or not _SHA256_RE.fullmatch(sha256):
             raise ReleaseConfigurationError(f'{architecture} 发行文件 SHA256 无效。')
         if type(size_bytes) is not int or size_bytes <= 0:
@@ -298,14 +299,13 @@ def _load_architectures(release_directory, manifest):
             or not _IMAGE_ID_RE.fullmatch(image_config_id)
         ):
             raise ReleaseConfigurationError(f'{architecture} 镜像配置 ID 无效。')
-        if 'registry_ref' in image:
-            if (
-                not isinstance(registry_ref, str)
-                or not _REGISTRY_REF_RE.fullmatch(registry_ref)
-            ):
-                raise ReleaseConfigurationError(
-                    f'{architecture} Docker Hub 镜像引用无效。'
-                )
+        if (
+            not isinstance(registry_ref, str)
+            or not _REGISTRY_REF_RE.fullmatch(registry_ref)
+        ):
+            raise ReleaseConfigurationError(
+                f'{architecture} Docker Hub 镜像引用无效。'
+            )
 
         archive_path = release_directory.joinpath(*PurePosixPath(filename).parts)
         _reject_symlink_components(
@@ -377,132 +377,87 @@ def installer_script_bytes():
     )
 
 
+def ca_certificate_bytes():
+    """Return only the configured, fully validated public CA PEM bytes."""
+    return _load_ca_certificate(os.environ.get('PERFORMANCE_NODE_CA_CERT_FILE', ''))
+
+
 def load_release_configuration():
     platform_url = _validated_public_url(os.environ.get('PERFORMANCE_NODE_PUBLIC_URL', ''))
     release_directory = _release_directory(os.environ.get('PERFORMANCE_NODE_RELEASE_DIR', ''))
     manifest = _load_manifest(release_directory)
     architectures = _load_architectures(release_directory, manifest)
-    installer = installer_script_bytes()
-    if not installer:
-        raise ReleaseConfigurationError('通用安装脚本为空。')
-    ca_certificate = _load_ca_certificate(os.environ.get('PERFORMANCE_NODE_CA_CERT_FILE', ''))
+    ca_certificate = ca_certificate_bytes()
     return ReleaseConfiguration(
         platform_url=platform_url,
         release=manifest['release'],
         agent_version=manifest['agent_version'],
-        installer_sha256=hashlib.sha256(installer).hexdigest(),
+        registry_index_ref=manifest['registry_index_ref'],
         architectures=architectures,
         ca_certificate=ca_certificate,
     )
 
 
-def _archive_url(configuration, release):
-    filename = quote(release.filename, safe='/')
+def _node_resource_names(node_id):
+    raw_node_id = str(node_id)
+    try:
+        canonical_node_id = str(uuid.UUID(raw_node_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ReleaseConfigurationError('节点 ID 必须是规范 UUID。') from exc
+    if raw_node_id != canonical_node_id:
+        raise ReleaseConfigurationError('节点 ID 必须是规范 UUID。')
     return (
-        f'{configuration.platform_url}/api/v1/performance-agent/install/artifacts/'
-        f'{filename}'
+        f'performance-node-{canonical_node_id}',
+        f'performance-node-{canonical_node_id}-identity',
     )
 
 
-def _bootstrap_command(configuration, *, node_id, enrollment_token):
-    lines = [
-        'set -euo pipefail',
-        'if [ "${EUID:-$(id -u)}" -ne 0 ]; then',
-        "  printf '%s\\n' '性能节点安装必须由 root 执行；请先运行 sudo -i，再重新粘贴本命令。' >&2",
-        '  exit 1',
-        'fi',
-        'for required_command in bash curl base64 sha256sum mktemp chmod rm uname; do',
-        '  if ! command -v "$required_command" >/dev/null 2>&1; then',
-        "    printf '缺少必需命令：%s\\n' \"$required_command\" >&2",
-        '    exit 1',
-        '  fi',
-        'done',
-        'umask 077',
-        'temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/performance-node-install.XXXXXX")"',
-        'chmod 0700 "$temporary_directory"',
-        'cleanup() { rm -rf -- "$temporary_directory"; }',
-        'trap cleanup EXIT HUP INT TERM',
-        'token_file="$temporary_directory/enrollment-token"',
-        f"printf '%s' {shlex.quote(enrollment_token)} >\"$token_file\"",
-        'chmod 0600 "$token_file"',
+def _known_container_name(node):
+    agent_version = getattr(node, 'agent_version', '')
+    if agent_version and agent_version != AGENT_VERSION:
+        return None
+    container_name, _ = _node_resource_names(node.pk)
+    return container_name
+
+
+def _docker_command(configuration, *, node_id, enrollment_token):
+    container_name, identity_volume = _node_resource_names(node_id)
+    arguments = [
+        'docker', 'run', '-d', '--name', container_name,
+        '--restart', 'unless-stopped', '--init', '--read-only',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+        '--memory', '512m', '--cpus', '1', '--pids-limit', '128',
+        '--stop-timeout', '25', '--log-opt', 'max-size=10m',
+        '--log-opt', 'max-file=3', '--mount',
+        f'type=volume,src={identity_volume},dst=/var/lib/performance-node',
+        configuration.registry_index_ref,
+        'start', '--server', configuration.platform_url,
+        '--node-id', str(node_id), '--token', enrollment_token,
     ]
     if configuration.ca_certificate is not None:
-        encoded_ca = base64.b64encode(configuration.ca_certificate).decode('ascii')
-        lines.extend((
-            'ca_file="$temporary_directory/platform-ca.pem"',
-            f"printf '%s' {shlex.quote(encoded_ca)} | base64 --decode >\"$ca_file\"",
-            'chmod 0600 "$ca_file"',
-            "curl_arguments=(--fail --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --cacert \"$ca_file\")",
+        arguments.extend((
+            '--ca-sha256', hashlib.sha256(configuration.ca_certificate).hexdigest(),
         ))
-    else:
-        lines.append(
-            "curl_arguments=(--fail --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120)"
-        )
-    lines.extend((
-        'installer_file="$temporary_directory/install-node.sh"',
-        f'if ! curl "${{curl_arguments[@]}}" --output "$installer_file" {shlex.quote(configuration.installer_url)}; then',
-        "  printf '%s\\n' '下载安装脚本失败：请检查平台地址、TLS 信任和网络连通性。' >&2",
-        '  exit 1',
-        'fi',
-        f"if ! printf '%s  %s\\n' {shlex.quote(configuration.installer_sha256)} \"$installer_file\" | sha256sum --check --status; then",
-        "  printf '%s\\n' '安装脚本 SHA256 校验失败，已拒绝执行。' >&2",
-        '  exit 1',
-        'fi',
-        'chmod 0700 "$installer_file"',
-        'case "$(uname -m)" in',
-        '  x86_64) selected_architecture=amd64 ;;',
-        '  aarch64|arm64) selected_architecture=arm64 ;;',
-        "  *) printf '不支持的 CPU 架构：%s\\n' \"$(uname -m)\" >&2; exit 1 ;;",
-        'esac',
-        'case "$selected_architecture" in',
-    ))
-    for release in configuration.architectures:
-        lines.extend((
-            f'  {release.architecture})',
-            f'    image_ref={shlex.quote(release.image_ref)}',
-            f'    image_id={shlex.quote(release.image_id)}',
-            f'    image_config_id={shlex.quote(release.image_config_id)}',
-            f'    registry_ref={shlex.quote(release.registry_ref or "")}',
-            f'    archive_url={shlex.quote(_archive_url(configuration, release))}',
-            f'    archive_sha256={shlex.quote(release.sha256)}',
-            f'    archive_size={shlex.quote(str(release.size_bytes))}',
-            '    ;;',
-        ))
-    lines.extend((
-        "  *) printf '当前 CPU 架构尚未发布：%s\\n' \"$selected_architecture\" >&2; exit 1 ;;",
-        'esac',
-        '# registry_ref 是固定镜像的可选运输源；仅离线归档模式探测平台归档。',
-        'if [ -z "$registry_ref" ]; then',
-        '  if ! curl "${curl_arguments[@]}" --range 0-0 --max-filesize 1 --output /dev/null "$archive_url"; then',
-        "    printf '%s\\n' '发行镜像不可达：请检查 Caddy 发行路径、TLS 信任和网络连通性。' >&2",
-        '    exit 1',
-        '  fi',
-        'fi',
-        'installer_arguments=(',
-        f'  --platform {shlex.quote(configuration.platform_url)}',
-        f'  --node-id {shlex.quote(str(node_id))}',
-        '  --token-file "$token_file"',
-    ))
-    if configuration.ca_certificate is not None:
-        lines.append('  --ca-file "$ca_file"')
-    lines.extend((
-        '  --image-ref "$image_ref"',
-        '  --image-id "$image_id"',
-        '  --image-config-id "$image_config_id"',
-        '  --archive-url "$archive_url"',
-        '  --archive-sha256 "$archive_sha256"',
-        '  --archive-size "$archive_size"',
-        ')',
-        'if [ -n "$registry_ref" ]; then',
-        '  installer_arguments+=(--registry-ref "$registry_ref")',
-        'fi',
-        'bash "$installer_file" "${installer_arguments[@]}"',
-    ))
-    return f'bash -c {shlex.quote(chr(10).join(lines))}'
+    return shlex.join(arguments)
 
 
 def installation_metadata(*, node=None, enrollment_token=None):
     expires_at = getattr(node, 'enrollment_expires_at', None)
+    container_name = None
+    if node is not None:
+        try:
+            container_name = _known_container_name(node)
+        except ReleaseConfigurationError as exc:
+            return {
+                'available': False,
+                'reason': str(exc),
+                'platform_url': '',
+                'supported_architectures': [],
+                'agent_version': AGENT_VERSION,
+                'expires_at': expires_at,
+                'requirements': list(INSTALLATION_REQUIREMENTS),
+            }
     try:
         configuration = load_release_configuration()
     except ReleaseConfigurationError as exc:
@@ -511,7 +466,7 @@ def installation_metadata(*, node=None, enrollment_token=None):
             platform_url = _validated_public_url(os.environ.get('PERFORMANCE_NODE_PUBLIC_URL', ''))
         except ReleaseConfigurationError:
             pass
-        return {
+        metadata = {
             'available': False,
             'reason': str(exc),
             'platform_url': platform_url,
@@ -520,6 +475,9 @@ def installation_metadata(*, node=None, enrollment_token=None):
             'expires_at': expires_at,
             'requirements': list(INSTALLATION_REQUIREMENTS),
         }
+        if container_name is not None:
+            metadata['container_name'] = container_name
+        return metadata
 
     metadata = {
         'available': True,
@@ -532,13 +490,15 @@ def installation_metadata(*, node=None, enrollment_token=None):
         'expires_at': expires_at,
         'requirements': list(INSTALLATION_REQUIREMENTS),
     }
+    if container_name is not None:
+        metadata['container_name'] = container_name
     if enrollment_token is None:
         return metadata
     if node is None or expires_at is None or expires_at <= timezone.now():
         metadata['available'] = False
         metadata['reason'] = '一次性注册凭证已过期，请重新签发后再安装。'
         return metadata
-    metadata['command'] = _bootstrap_command(
+    metadata['command'] = _docker_command(
         configuration, node_id=node.pk, enrollment_token=enrollment_token,
     )
     return metadata

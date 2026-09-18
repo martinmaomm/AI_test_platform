@@ -23,3 +23,7 @@ class RetryExhausted(NodeError):
 
 class AgentStopped(NodeError):
     """A fail-closed condition that must end the run loop."""
+
+
+class RequestRejected(AgentStopped):
+    """The server definitively rejected an HTTP request before success."""

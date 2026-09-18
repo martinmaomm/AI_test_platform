@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from .errors import AgentStopped, ProtocolError, RetryExhausted
+from .errors import ProtocolError, RequestRejected, RetryExhausted
 
 MAX_ATTEMPTS = 3
 
@@ -58,16 +58,16 @@ class AgentTransport:
                 self.sleep(2**attempt)
                 continue
             if response.is_redirect:
-                raise AgentStopped("服务端重定向被拒绝")
+                raise RequestRejected("服务端重定向被拒绝")
             if response.status_code in {401, 403, 409}:
-                raise AgentStopped(f"身份或协议被服务端拒绝（HTTP {response.status_code}）")
+                raise RequestRejected(f"身份或协议被服务端拒绝（HTTP {response.status_code}）")
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == attempts - 1:
                     raise RetryExhausted(f"服务暂时不可用（HTTP {response.status_code}）")
                 self.sleep(2**attempt)
                 continue
             if response.status_code < 200 or response.status_code >= 300:
-                raise AgentStopped(f"服务端拒绝请求（HTTP {response.status_code}）")
+                raise RequestRejected(f"服务端拒绝请求（HTTP {response.status_code}）")
             return _unwrap(response)
         raise AssertionError("unreachable")
 

@@ -4,15 +4,15 @@
 
 ## 推荐：从网页一键接入
 
-平台管理员进入性能项目的“节点管理”，点击“添加节点”，填写名称和网络位置。创建后按安装向导，将生成的完整命令复制到远程 Linux **root** 终端执行（其他用户先 `sudo -i`）。页面不需要填写 SSH 密码。
+平台管理员进入性能项目的“节点管理”，点击“添加节点”，填写名称和网络位置。创建后复制网页提供的**一条 `docker run` 命令**，在已有 Docker 的 Linux 终端执行。需要 root 或 Docker 操作权限；页面不需要填写 SSH 密码。
 
 - 第一版复用已经安装、可用的本地 Docker；缺少 Docker 或不支持的系统会给出明确提示，不静默安装/升级宿主机。
-- 已发布到 Docker Hub 时，安装器直接拉取固定 `sha256` 摘要的镜像，显示分层下载进度，并校验镜像 ID 和系统架构；无需用户构建源码。未配置仓库发行时仍支持原有 HTTPS 归档方式。
-- 命令包含15分钟有效的一次性注册凭证，过期需重新生成；有效期内不能公开分享。粘贴命令可能进入本机剪贴板、终端历史或短时进程参数，请勿录屏公开，使用后按本机策略清理。长期身份只保存在节点私有卷中，不进入运行容器环境变量。
-- 平台使用私有 CA 时，命令包含 **CA 公钥**，先验证 HTTPS 和安装器摘要再执行；不会关闭 TLS 校验，不含 CA 私钥。
+- 命令引用 Docker Hub 多架构索引的固定 `sha256` 摘要，Docker 自动选择 amd64/arm64 并显示分层下载进度。不再从平台下载长安装脚本，也不在网页内拼接架构判断、整段证书或归档下载逻辑。
+- 镜像内 `start` 自动完成首次注册和持续运行。命令含15分钟有效的一次性注册令牌，消费后失效；令牌会出现在终端历史及 `docker inspect` 的容器参数中，请勿公开分享命令或检查输出。长期身份只保存在节点私有卷中，不进入容器参数、环境或日志。
+- 私有 CA 场景只传 **CA 公共证书的 SHA256 指纹**，不传服务器私钥。容器先无认证取回固定端点的公开 CA，核对指纹与证书合法性，再以严格 HTTPS 发送注册及心跳请求；指纹错误时不会发送令牌。公共 CA 场景使用系统信任。
 - 复制后安装向导保持打开，真实收到注册/心跳后才更新状态；关闭页面不影响远程安装，重新打开不会回显旧凭证。
-- 每个节点使用独立资源；重复执行先检查已有身份和归属，不覆盖别的项目/容器。不因网络失败自动重置身份。
-- 未完成注册时，可在安装指导中重新生成安装命令；旧命令随即失效。安装失败不会自动作废节点。
+- 每个节点使用 UUID 命名的独立容器和身份卷。重复执行 `docker run` 遇到同名容器会由 Docker 拒绝，不自动覆盖或删除。已有节点重启请使用安装指导中的 `docker restart <容器名>`，不要再次安装。
+- 未完成注册时，可重新生成安装命令；旧令牌随即失效。若旧命令已创建失败容器，先确认这是该节点且尚未注册，再移除该失败容器（**不删除身份卷**）并执行新命令。同一令牌的失败注册不会因自动重启重复提交；注册结果不确定时先检查平台状态，已注册但身份丢失需吊销后新建节点。
 - 已注册但离线时先查看原容器和网络，保留身份卷后重启即可继续使用原身份；不提供“重置身份”。若身份文件丢失，请吊销原节点并新建节点。
 - 吊销不可恢复。有未结束的测试时，必须确认请求停止；停止收尾期间报告可能不完整。只有已吊销且全部测试结束的节点才能删除。
 - 删除只将节点移出管理列表，历史执行记录和报告保留；平台不会代替用户卸载远程容器或删除身份卷。
@@ -21,26 +21,27 @@
 
 ### 管理员首次配置镜像发布
 
-一键命令依赖已发布镜像，不能只配置域名。先在对应架构构建（或从可信构建机导入）镜像，固定命名：
+网页 Docker 命令依赖已发布的双架构镜像索引，不能只配置域名。先在对应架构构建（或从可信构建机导入）镜像，固定命名：
 
 ```text
-automation-platform-performance-node:0.2.0-amd64
-automation-platform-performance-node:0.2.0-arm64
+automation-platform-performance-node:0.2.1-amd64
+automation-platform-performance-node:0.2.1-arm64
 ```
 
-发布机需要能运行对应架构的镜像以核对安装包内的 Agent、Locust、协议和固定执行脚本。然后在仓库根目录执行（可以只发布一种架构）：
+发布机需要能运行对应架构的镜像以核对安装包内的 Agent、Locust、协议和固定执行脚本。以下命令只生成归档，供审计或手工部署使用，**不能单独启用网页安装命令**；网页发行继续执行下一节的双架构公开发布：
 
 ```bash
 backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
-  --image amd64=automation-platform-performance-node:0.2.0-amd64 \
-  --image arm64=automation-platform-performance-node:0.2.0-arm64
+  --image amd64=automation-platform-performance-node:0.2.1-amd64 \
+  --image arm64=automation-platform-performance-node:0.2.1-arm64 \
+  --output backend/resource/performance-node-dockerhub-0.2.1
 ```
 
 生成目录默认 `backend/resource/performance-node/`，包含 manifest 和受控镜像归档，已被 Git 忽略。同版本已发布镜像拒绝直接覆盖，修改引擎后应按版本契约重新发布。这个目录只放可公开的发行资产，禁止放 `.env`、身份文件、数据库备份、CA 私钥和符号链接。
 
 #### 推荐：公开 Docker Hub 发行（仅限测试使用）
 
-当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。已发布 `0.2.0` 的 Linux amd64、arm64 镜像；平台安装器自动选取架构并固定摘要，节点机器无需登录 Docker Hub。最新验收范围见 [分发验收](../../docs/verification/2026-09-17-performance-dockerhub.md)。
+当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。新单条命令使用 `0.2.1` 的多架构索引，节点机器无需登录 Docker Hub。原 `0.2.0` 镜像和已安装节点不被自动升级；设计见 [单条 Docker 接入](../../docs/plans/2026-09-18-performance-direct-docker-install.md)。
 
 只发布 `performance-node/` 的独立客户端，不发布平台镜像或整个项目目录。Docker 构建上下文已使用白名单，仅允许节点 Python 源码、包配置、README 和 Dockerfile；不包含平台 `.env`、身份卷、日志、数据库和私钥。
 
@@ -50,39 +51,39 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
    ```bash
    docker buildx build --platform linux/amd64 --provenance=false --load \
-     -t automation-platform-performance-node:0.2.0-amd64 performance-node
+     -t automation-platform-performance-node:0.2.1-amd64 performance-node
    docker buildx build --platform linux/arm64 --provenance=false --load \
-     -t automation-platform-performance-node:0.2.0-arm64 performance-node
+     -t automation-platform-performance-node:0.2.1-arm64 performance-node
    ```
 
 4. 把下方 `YOUR_DOCKER_ID` 替换成真实 Docker ID，显式启用公开发布：
 
    ```bash
    backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
-     --image amd64=automation-platform-performance-node:0.2.0-amd64 \
-     --image arm64=automation-platform-performance-node:0.2.0-arm64 \
-     --output backend/resource/performance-node-dockerhub \
-     --registry docker.io/YOUR_DOCKER_ID/performance-node
+     --image amd64=automation-platform-performance-node:0.2.1-amd64 \
+     --image arm64=automation-platform-performance-node:0.2.1-arm64 \
+     --output backend/resource/performance-node-dockerhub-0.2.1 \
+     --registry docker.io/YOUR_DOCKER_ID/performance-node --publish-index
    ```
 
 归档进入公开发行路径及推送仓库之前，会校验运行时版本并检查镜像的**所有层**（包括后来删除的文件）、私钥、访问令牌、本地平台敏感配置值及应用文件白名单。发现问题时拒绝发布，不打印匹配到的敏感值。多阶段构建还会剔除第三方依赖的测试目录（其中可能包含公开测试私钥样本），这些内容不会进入最终镜像的历史层。此检查是定向泄漏防护，不代替完整安全审计或依赖漏洞扫描。使用新的发行目录，不覆盖旧的同版本归档。
 
-发布工具验证远端摘要、架构与配置，并以未登录身份确认可拉取后，才把 `registry_ref` 写入 manifest。安装命令按架构选择固定摘要，**不使用 `latest`，不因仓库失败自动降级或关闭 TLS**。平台公共 CA 只用于平台控制连接，不传给 Docker Hub。Docker Hub 在目标网络不可达或限流时仍可能下载失败，并不能保证所有网络都提速。
+发布工具验证各架构远端摘要、配置与匿名拉取后写入 `registry_ref`；`--publish-index` 将两种已验证的镜像组成固定索引，验证索引及其两个平台均可匿名拉取后，才写入顶层 `registry_index_ref`。网页仅生成该索引的 Docker 命令，**不使用 `latest`，不因仓库失败自动降级或关闭 TLS**。平台公共 CA 只用于平台控制连接，不传给 Docker Hub。Docker Hub 在目标网络不可达或限流时仍可能下载失败，并不能保证所有网络都提速。
 
-发布成功后，将下方 `PERFORMANCE_NODE_RELEASE_DIR` 改为新发行目录的绝对路径并重启后端。若还需使用归档下载，Caddy 同样切换到该目录；只用仓库拉取时无需从平台下载大归档。已复制的旧安装命令包含旧安装器摘要，改版后应从网页重新生成。
+发布成功后，将下方 `PERFORMANCE_NODE_RELEASE_DIR` 改为新发行目录的绝对路径并重启后端。Caddy 使用更新后的白名单，允许 GET/HEAD 公共 CA 路径；若保留手工归档下载，Caddy 的发行目录也同步更新。改版后从网页重新生成命令，不使用之前复制的长 Shell 命令。
 
-已有节点继续使用原身份和镜像，不会自动升级。若一个尚未注册的节点已经创建了旧镜像专属的网络/卷，改用新镜像时安装器会拒绝覆盖：确认它没有运行任务后，吊销旧节点并创建新节点；旧机器资源需按归属单独清理，切勿删除不明身份卷。
+已有节点继续使用原身份和镜像，不会自动升级。新命令不接管旧安装器的容器、网络和身份卷。若尚未注册的节点在旧安装器中途失败，先确认机器上的实际容器状态，避免新旧容器竞争同一节点的注册；需要重新开始时吊销旧节点并新建，旧机器资源按归属单独清理，切勿删除不明身份卷。
 
 后端实际 `.env` 增加（示例路径请替换）：
 
 ```dotenv
 PERFORMANCE_NODE_PUBLIC_URL=https://load.example.com:18443
-PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node
+PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node-dockerhub-0.2.1
 # 私有 CA 场景填公共证书；可信公共 CA 场景留空。
 PERFORMANCE_NODE_CA_CERT_FILE=/absolute/private/gateway/storage/pki/authorities/local/root.crt
 ```
 
-启动 Caddy 时也设置同一个 `PERFORMANCE_NODE_RELEASE_DIR` 绝对路径；改完重启后端并按新环境启动网关。首次缺配置/镜像/安装器时，页面明确显示暂不可安装，而不是生成必然失败的命令。
+启动 Caddy 时也设置同一个 `PERFORMANCE_NODE_RELEASE_DIR` 绝对路径；改完重启后端并按新环境启动网关。首次缺配置/双架构索引时，页面明确显示暂不可安装，而不是回退旧长脚本。
 
 普通节点管理员只用网页向导。以下手动接入步骤保留用于维护和排障。
 
@@ -127,7 +128,7 @@ caddy run --config deploy/performance/Caddyfile --adapter caddyfile
 - `/api/v1/performance-agent/enroll/`
 - `/api/v1/performance-agent/heartbeat/`
 
-另外只开放 GET/HEAD `/api/v1/performance-agent/install/install.sh` 和严格限定版本/架构的 `install/artifacts/<版本>/linux-<amd64或arm64>.tar.gz`。大镜像由 Caddy 静态分发并支持 Range，不经过 Django/ASGI 缓冲；不提供目录浏览，不公开 manifest 或任意资源文件。
+另外只开放 GET/HEAD `/api/v1/performance-agent/install/ca.pem`（公开 CA）、保留的 `install/install.sh`，以及严格限定版本/架构的 `install/artifacts/<版本>/linux-<amd64或arm64>.tar.gz`。网页 Docker 命令只使用 CA 端点；归档仍可由 Caddy 静态分发并支持 Range，不经过 Django/ASGI 缓冲。不提供目录浏览，不公开 manifest 或任意资源文件。
 
 其他路由和方法返回 404。Agent请求体上限为65536字节，与后端一致；Caddy管理API、HTTP重定向端口和访问日志均未开启，不能通过此入口打开平台管理网页。静态镜像下载写超时为15分钟；Agent上游响应头仍有独立20秒限制。
 
@@ -146,7 +147,7 @@ backend/temp/performance-gateway/storage/pki/authorities/local/root.crt
 只传输 `performance-node/` 源码，在目标架构机器构建：
 
 ```bash
-docker build -t automation-platform-performance-node:0.2.0 /opt/automation-performance-node/source
+docker build -t automation-platform-performance-node:0.2.1 /opt/automation-performance-node/source
 docker network create automation-performance-net
 docker volume create automation-performance-state
 ```
@@ -170,7 +171,7 @@ docker run --rm --name automation-performance-enroll \
   --mount type=volume,src=automation-performance-state,dst=/var/lib/performance-node \
   --mount type=bind,src=/opt/automation-performance-node/config/gateway-ca.crt,dst=/run/gateway-ca.crt,readonly \
   --mount type=bind,src=/opt/automation-performance-node/config/enrollment-token,dst=/run/enrollment-token,readonly \
-  automation-platform-performance-node:0.2.0 enroll
+  automation-platform-performance-node:0.2.1 enroll
 ```
 
 确认“节点注册成功”后删除**本轮已消费的一次性凭证文件**，不删除 volume/identity.json。启动常驻 Agent：
@@ -187,7 +188,7 @@ docker run -d --name automation-performance-node \
   -e PERFORMANCE_NODE_CA_BUNDLE=/run/gateway-ca.crt \
   --mount type=volume,src=automation-performance-state,dst=/var/lib/performance-node \
   --mount type=bind,src=/opt/automation-performance-node/config/gateway-ca.crt,dst=/run/gateway-ca.crt,readonly \
-  automation-platform-performance-node:0.2.0 run
+  automation-platform-performance-node:0.2.1 run
 ```
 
 这里 1 CPU/512MiB 仅作为低负载联调限制，不代表正式压测容量配置。身份目录由镜像初始化为 UID10001、0700；身份文件为0600。运行容器不含一次性登记凭证，不挂载 Docker socket 或平台目录。重启容器使用同一 volume，不再次执行 enroll。镜像升级必须与平台 Agent 协议、Locust 版本和固定脚本摘要一致。
@@ -203,7 +204,7 @@ docker run -d --name automation-performance-fixture \
   --memory 64m --cpus 0.25 --pids-limit 64 \
   --log-opt max-size=5m --log-opt max-file=2 \
   --mount type=bind,src=/opt/automation-performance-node/smoke_fixture.py,dst=/app/smoke_fixture.py,readonly \
-  --entrypoint python automation-platform-performance-node:0.2.0 /app/smoke_fixture.py
+  --entrypoint python automation-platform-performance-node:0.2.1 /app/smoke_fixture.py
 ```
 
 在平台创建专用性能项目，目标为 `http://performance-fixture.test:8080`，仅允许 GET；计划为 1 用户、生成速率1、时长5秒、等待1秒，步骤 `GET /probe`，预期200。域名只在节点 Docker 网络解析，不是可从 Mac 浏览器打开的网站。

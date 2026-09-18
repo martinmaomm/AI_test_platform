@@ -12,7 +12,8 @@ from django.utils import timezone
 from projects.models import Project
 
 from .constants import (
-    AGENT_VERSION, CONTROLLER_FRESH_SECONDS, ENGINE_VERSION, PROTOCOL_VERSION,
+    CONTROLLER_FRESH_SECONDS, ENGINE_VERSION, PROTOCOL_VERSION,
+    SUPPORTED_AGENT_VERSIONS,
 )
 from .models import (
     PerformanceControllerState, PerformanceNode, PerformancePlan, PerformanceRun,
@@ -155,7 +156,7 @@ def _node_is_compatible(node, now):
         and node.revoked_at is None
         and node.status_at(now) == 'online'
         and node.protocol_version == PROTOCOL_VERSION
-        and node.agent_version == AGENT_VERSION
+        and node.agent_version in SUPPORTED_AGENT_VERSIONS
         and node.engine_version == ENGINE_VERSION
     )
 

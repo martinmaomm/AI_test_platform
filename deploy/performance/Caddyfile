@@ -23,7 +23,7 @@ https://{$PERFORMANCE_GATEWAY_DOMAIN}:{$PERFORMANCE_GATEWAY_PORT:18443} {
 	tls internal
 	@installer {
 		method GET HEAD
-		path /api/v1/performance-agent/install/install.sh
+		path /api/v1/performance-agent/install/install.sh /api/v1/performance-agent/install/ca.pem
 	}
 	handle @installer {
 		reverse_proxy 127.0.0.1:8000 {

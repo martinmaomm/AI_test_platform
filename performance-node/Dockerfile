@@ -2,7 +2,7 @@ FROM python:3.13-slim AS runtime-base
 
 LABEL org.opencontainers.image.title="AI test platform performance node" \
       org.opencontainers.image.description="仅限测试使用 / For authorized testing only. Not for production." \
-      org.opencontainers.image.version="0.2.0"
+      org.opencontainers.image.version="0.2.1"
 
 WORKDIR /app
 RUN apt-get update && \
@@ -34,5 +34,6 @@ COPY src/performance_node/*.py ./src/performance_node/
 USER nodeagent
 ENV PERFORMANCE_NODE_STATE_DIR=/var/lib/performance-node
 ENV PERFORMANCE_STUNNEL_BINARY=/usr/bin/stunnel4
+VOLUME ["/var/lib/performance-node"]
 ENTRYPOINT ["python", "-m", "performance_node"]
 CMD ["run"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "performance-node"
-version = "0.2.0"
+version = "0.2.1"
 description = "Independent performance node execution agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = [
     "requests==2.32.5",
     "psutil==7.2.2",
     "locust==2.43.3",
+    "cryptography==46.0.1",
 ]
 
 [tool.setuptools]

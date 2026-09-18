@@ -1,5 +1,7 @@
 # 性能节点 Docker Hub 分发验收（2026-09-17～18）
 
+> 本文保留 0.2.0 分发的历史证据；后续 0.2.1 单条 Docker 命令与双架构索引的当前验收见 [2026-09-18 记录](2026-09-18-performance-direct-docker.md)。
+
 ## 当前结论
 
 2026-09-18 已将 Linux amd64、arm64 镜像发布到公开仓库 [martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)，简介和完整说明均标注“仅限测试使用”。发布前重新执行定向全层审计，发布后验证远端摘要、架构、配置及未登录拉取。平台已切换到新发行目录，后端、Celery 和节点网关重启后检查正常。

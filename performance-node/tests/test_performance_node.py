@@ -258,6 +258,42 @@ class ClientTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_first_successful_heartbeat_is_logged_once(self):
+        class Store:
+            def load(self):
+                return NodeIdentity(NODE_ID, TOKEN)
+
+        class Result:
+            interval_seconds = 1
+            command = {"type": "idle"}
+
+        class Client:
+            store = Store()
+
+            def heartbeat(self, _identity, _run_report):
+                return Result()
+
+        class Executor:
+            def report_for_heartbeat(self):
+                return None
+
+            def handle_command(self, _command):
+                pass
+
+            def shutdown(self):
+                pass
+
+            def close(self):
+                pass
+
+        with self.assertLogs("performance_node.runner", level="INFO") as captured:
+            self.assertEqual(run_forever(
+                Client(), threading.Event(), lambda _seconds: True, executor=Executor(),
+            ), 0)
+        combined = "\n".join(captured.output)
+        self.assertEqual(combined.count("节点首次心跳成功"), 1)
+        self.assertNotIn(TOKEN, combined)
+
     def test_unknown_command_stops_loop_and_sigterm_handler_sets_event(self):
         event = threading.Event()
         registered = {}

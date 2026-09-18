@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'performance-node/src'))
@@ -31,6 +32,7 @@ _REGISTRY_RE = re.compile(
     r'[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?'
 )
 _IMAGE_ID_RE = re.compile(r'sha256:[0-9a-f]{64}')
+_PROBE_LABEL = 'com.automation-platform.release-probe'
 
 
 def sha256(path):
@@ -75,6 +77,27 @@ def archive_config_id(path, reference, inspected):
         return 'sha256:' + digest
 
 
+def _cleanup_probe_container(name, owner):
+    inspection = subprocess.run([
+        'docker', 'container', 'inspect', '--format',
+        '{{index .Config.Labels "' + _PROBE_LABEL + '"}}', name,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+    if inspection.returncode:
+        detail = (inspection.stdout + inspection.stderr).lower()
+        if 'no such container' in detail:
+            return False
+        raise ValueError('无法确认固定镜像运行时检查容器是否存在')
+    if inspection.stdout.strip() != owner:
+        raise ValueError('固定镜像运行时检查容器归属不匹配；拒绝清理')
+    removal = subprocess.run(
+        ['docker', 'container', 'rm', '--force', '--volumes', name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+    )
+    if removal.returncode:
+        raise ValueError('固定镜像运行时检查容器清理失败')
+    return True
+
+
 def inspect_image(architecture, reference):
     expected_ref = f'automation-platform-performance-node:{__version__}-{architecture}'
     if architecture not in ('amd64', 'arm64') or reference != expected_ref:
@@ -107,11 +130,26 @@ def inspect_image(architecture, reference):
         '"engine_version":importlib.metadata.version("locust"),'
         '"runtime_sha256":hashlib.sha256((pathlib.Path(n.__file__).parent/"locust_runtime.py").read_bytes()).hexdigest()}))'
     )
-    raw = subprocess.check_output([
-        'docker', 'run', '--rm', '--network', 'none', '--read-only',
-        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '--memory', '128m', '--pids-limit', '32', '--entrypoint', 'python', info['Id'], '-c', probe,
-    ], timeout=60, stderr=subprocess.PIPE)
+    probe_name = 'performance-release-probe-' + uuid.uuid4().hex
+    probe_owner = str(uuid.uuid4())
+    probe_error = None
+    try:
+        raw = subprocess.check_output([
+            'docker', 'run', '--name', probe_name,
+            '--platform', f'linux/{architecture}',
+            '--label', f'{_PROBE_LABEL}={probe_owner}',
+            '--network', 'none', '--read-only',
+            '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+            '--memory', '128m', '--pids-limit', '32', '--entrypoint', 'python', info['Id'], '-c', probe,
+        ], timeout=60, stderr=subprocess.PIPE)
+    except (OSError, subprocess.SubprocessError) as exc:
+        probe_error = exc
+    try:
+        _cleanup_probe_container(probe_name, probe_owner)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise ValueError('固定镜像运行时检查容器清理失败；清理状态未确认') from exc
+    if probe_error is not None:
+        raise ValueError('固定镜像运行时检查失败或超时；检查容器已清理或未创建') from probe_error
     actual = json.loads(raw)
     expected = {'agent_version': __version__, 'protocol_version': PROTOCOL_VERSION,
                 'engine_version': ENGINE_VERSION, 'runtime_sha256': sha256(RUNTIME)}
@@ -268,6 +306,116 @@ def publish_registry_image(archive, architecture, inspected, image_config_id, re
     return f'{registry}@{verified["digest"]}'
 
 
+def remote_index(reference, *, environment=None, absent_ok=False):
+    """Read an exact two-platform index, not a mutable local manifest cache."""
+    try:
+        raw = subprocess.check_output([
+            'docker', 'buildx', 'imagetools', 'inspect', '--format', '{{json .Manifest}}', reference,
+        ], env=environment, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as exc:
+        detail = _docker_error(exc).lower()
+        if absent_ok and any(marker in detail for marker in ('not found', 'no such manifest', 'manifest unknown')):
+            if not any(marker in detail for marker in ('unauthorized', 'denied', '403', '401')):
+                return None
+        raise ValueError('无法确认 Docker Hub 多架构索引；拒绝在未知状态下继续') from exc
+    try:
+        document = json.loads(raw)
+        digest = document['digest']
+        entries = document['manifests']
+        if (document.get('schemaVersion') != 2
+                or document.get('mediaType') not in {
+                    'application/vnd.oci.image.index.v1+json',
+                    'application/vnd.docker.distribution.manifest.list.v2+json',
+                }
+                or not isinstance(digest, str) or not _IMAGE_ID_RE.fullmatch(digest)
+                or not isinstance(entries, list) or len(entries) != 2):
+            raise ValueError
+        members = {}
+        for entry in entries:
+            architecture = entry['platform']['architecture']
+            member_digest = entry['digest']
+            if (entry['platform']['os'] != 'linux' or architecture not in ('amd64', 'arm64')
+                    or architecture in members
+                    or not isinstance(member_digest, str) or not _IMAGE_ID_RE.fullmatch(member_digest)):
+                raise ValueError
+            members[architecture] = member_digest
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError('Docker Hub 多架构索引格式或平台范围无效') from exc
+    return {'digest': digest, 'members': members}
+
+
+def publish_registry_index(manifest, registry):
+    """Bind both audited architecture images to one immutable, public reference."""
+    images = manifest.get('images', {})
+    if set(images) != {'amd64', 'arm64'}:
+        raise ValueError('一条 Docker 命令发行必须同时包含 amd64 和 arm64')
+    expected = {}
+    references = []
+    for architecture in ('amd64', 'arm64'):
+        record = images[architecture]
+        reference = record.get('registry_ref', '')
+        prefix = registry + '@'
+        if not reference.startswith(prefix) or not _IMAGE_ID_RE.fullmatch(reference[len(prefix):]):
+            raise ValueError('多架构索引只能引用本仓库已核验的固定摘要')
+        digest = reference[len(prefix):]
+        verified = remote_manifest(reference)
+        if verified != {'digest': digest, 'config_id': record['image_config_id'],
+                        'os': 'linux', 'architecture': architecture}:
+            raise ValueError('多架构索引成员与已审计镜像不一致')
+        expected[architecture] = digest
+        references.append(reference)
+    identifier = hashlib.sha256('\n'.join(references).encode()).hexdigest()[:16]
+    tag = f'{registry}:{__version__}-multi-{identifier}'
+    existing = remote_index(tag, absent_ok=True)
+    if existing is not None and existing['members'] != expected:
+        raise ValueError('Docker Hub 已有同名索引但镜像不同；拒绝覆盖')
+    if existing is None:
+        try:
+            subprocess.check_output([
+                'docker', 'buildx', 'imagetools', 'create', '--tag', tag, *references,
+            ], stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as exc:
+            raise ValueError('Docker Hub 多架构索引发布失败') from exc
+    verified = remote_index(tag)
+    if verified['members'] != expected:
+        raise ValueError('Docker Hub 多架构索引发布后核验失败')
+    immutable = f'{registry}@{verified["digest"]}'
+    with tempfile.TemporaryDirectory(prefix='performance-node-index-') as temporary:
+        # Homebrew discovers buildx through cliPluginsExtraDirs. Preserve only
+        # plugin search paths: never copy auths, credsStore or credential helpers.
+        original_config = Path(os.environ.get('DOCKER_CONFIG') or Path.home() / '.docker') / 'config.json'
+        if original_config.exists():
+            plugin_directories = json.loads(original_config.read_text()).get('cliPluginsExtraDirs', [])
+            if (not isinstance(plugin_directories, list)
+                    or any(not isinstance(item, str) or not Path(item).is_absolute()
+                           for item in plugin_directories)):
+                raise ValueError('Docker 插件目录配置无效，无法安全执行匿名验证')
+            (Path(temporary) / 'config.json').write_text(json.dumps({
+                'cliPluginsExtraDirs': plugin_directories,
+            }), encoding='utf-8')
+        environment = dict(os.environ)
+        environment.pop('DOCKER_CONTEXT', None)
+        environment.pop('DOCKER_AUTH_CONFIG', None)
+        environment.update(DOCKER_CONFIG=temporary, DOCKER_HOST=current_docker_host())
+        if remote_index(immutable, environment=environment) != verified:
+            raise ValueError('Docker Hub 多架构索引无法匿名读取或摘要不匹配')
+        for architecture in ('amd64', 'arm64'):
+            try:
+                subprocess.check_output([
+                    'docker', 'image', 'pull', '--platform', f'linux/{architecture}', immutable,
+                ], env=environment, stderr=subprocess.PIPE)
+                raw = subprocess.check_output([
+                    'docker', 'image', 'inspect', '--platform', f'linux/{architecture}', immutable,
+                ], env=environment, stderr=subprocess.PIPE)
+                info = json.loads(raw)[0]
+            except (subprocess.CalledProcessError, ValueError, IndexError, TypeError) as exc:
+                raise ValueError('Docker Hub 多架构索引无法匿名拉取或检查') from exc
+            if (info.get('Id') not in {verified['digest'], expected[architecture], images[architecture]['image_config_id']}
+                    or info.get('Os') != 'linux' or info.get('Architecture') != architecture):
+                raise ValueError('Docker Hub 索引拉取结果不是预期架构或内容')
+    return immutable
+
+
 def publish_image(root, architecture, reference, manifest):
     inspected, versions = inspect_image(architecture, reference)
     image_id = inspected['Id']
@@ -279,14 +427,17 @@ def publish_image(root, architecture, reference, manifest):
     destination = root / filename
     private_directory_check(destination.parent)
     previous = manifest.setdefault('images', {}).get(architecture)
+    if previous and previous.get('image_id') != image_id:
+        raise ValueError('同版本镜像记录与本次镜像 ID 不匹配；拒绝替换')
     if destination.exists():
-        if destination.is_symlink() or not previous or previous.get('image_id') != image_id:
+        if destination.is_symlink() or not previous:
             raise ValueError('同版本镜像已存在且不匹配；拒绝覆盖，请先规划新版本发布')
         if sha256(destination) != previous.get('sha256') or destination.stat().st_size != previous.get('size_bytes'):
             raise ValueError('已发布镜像与 manifest 不符；拒绝继续')
         config_id = archive_config_id(destination, reference, inspected)
+        if previous.get('image_config_id') != config_id:
+            raise ValueError('同版本镜像记录与归档配置摘要不匹配；拒绝替换')
         audit_release_archive(destination)
-        previous['image_config_id'] = config_id
         return
     descriptor, temporary_name = tempfile.mkstemp(prefix='.image-', dir=destination.parent)
     temporary = Path(temporary_name)
@@ -300,6 +451,8 @@ def publish_image(root, architecture, reference, manifest):
             output.flush()
             os.fsync(output.fileno())
         config_id = archive_config_id(temporary, reference, inspected)
+        if previous and previous.get('image_config_id') != config_id:
+            raise ValueError('同版本镜像记录与归档配置摘要不匹配；拒绝替换')
         # The temporary name is not a public release filename.  Do not expose
         # the archive through Caddy until the all-layer secret audit passes.
         audit_release_archive(temporary)
@@ -312,8 +465,11 @@ def publish_image(root, architecture, reference, manifest):
         'size_bytes': destination.stat().st_size,
         'image_ref': reference, 'image_id': image_id, 'image_config_id': config_id,
     }
-    if previous and previous.get('registry_ref'):
-        record['registry_ref'] = previous['registry_ref']
+    if previous:
+        if previous.get('registry_ref'):
+            record['registry_ref'] = previous['registry_ref']
+    else:
+        manifest.pop('registry_index_ref', None)
     manifest['images'][architecture] = record
 
 
@@ -337,9 +493,14 @@ def main(argv=None):
     parser.add_argument('--image', action='append', required=True, metavar='ARCH=REFERENCE')
     parser.add_argument('--registry', metavar='docker.io/DOCKERID/REPO',
                         help='明确指定时才向公开 Docker Hub 仓库推送')
+    parser.add_argument('--publish-index', action='store_true',
+                        help='同时发布并匿名验证两种架构索引，供单条 docker run 使用')
     parser.add_argument('--output', type=Path, default=ROOT / 'backend/resource/performance-node')
     options = parser.parse_args(argv)
     registry = registry_repository(options.registry) if options.registry else None
+    if options.publish_index and (not registry or len(options.image) != 2
+                                 or {item.partition('=')[0] for item in options.image} != {'amd64', 'arm64'}):
+        raise ValueError('--publish-index 必须同时指定 --registry 及两种架构 --image')
     root = options.output.absolute()
     private_directory_check(root)
     manifest_path = root / 'manifest.json'
@@ -369,6 +530,9 @@ def main(argv=None):
                 # record (and any prior registry_ref) intact.
                 record['registry_ref'] = registry_ref
                 write_manifest(root, manifest, manifest_path)
+        if options.publish_index:
+            manifest['registry_index_ref'] = publish_registry_index(manifest, registry)
+            write_manifest(root, manifest, manifest_path)
     print(json.dumps({'release': manifest['release'], 'architectures': sorted(manifest['images']),
                       'manifest': str(manifest_path)}, ensure_ascii=False))
 

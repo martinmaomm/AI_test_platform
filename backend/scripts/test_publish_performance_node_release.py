@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import tarfile
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -62,10 +63,12 @@ class ReleaseTests(unittest.TestCase):
         return digest
 
     def test_verified_image(self):
-        with patch.object(publisher.subprocess, 'check_output', side_effect=[json.dumps([self.info()]), json.dumps(self.versions())]):
+        with patch.object(publisher.subprocess, 'check_output', side_effect=[json.dumps([self.info()]), json.dumps(self.versions())]), \
+                patch.object(publisher, '_cleanup_probe_container', return_value=True) as cleanup:
             inspected, versions = publisher.inspect_image('amd64', self.ref())
         self.assertEqual(inspected, self.info())
         self.assertEqual(versions, self.versions())
+        cleanup.assert_called_once()
 
     def test_arbitrary_image_is_not_executed(self):
         with patch.object(publisher.subprocess, 'check_output') as command:
@@ -87,8 +90,55 @@ class ReleaseTests(unittest.TestCase):
 
     def test_runtime_drift_rejected(self):
         versions = {**self.versions(), 'runtime_sha256': 'b' * 64}
-        with patch.object(publisher.subprocess, 'check_output', side_effect=[json.dumps([self.info()]), json.dumps(versions)]):
+        with patch.object(publisher.subprocess, 'check_output', side_effect=[json.dumps([self.info()]), json.dumps(versions)]), \
+                patch.object(publisher, '_cleanup_probe_container', return_value=True):
             with self.assertRaises(ValueError): publisher.inspect_image('amd64', self.ref())
+
+    def test_runtime_timeout_cleans_only_named_probe_and_has_explicit_platform(self):
+        name_uuid = uuid.UUID('11111111-1111-4111-8111-111111111111')
+        owner_uuid = uuid.UUID('22222222-2222-4222-8222-222222222222')
+        with patch.object(publisher.subprocess, 'check_output', side_effect=[
+            json.dumps([self.info()]), subprocess.TimeoutExpired('docker', 60),
+        ]) as docker, patch.object(publisher.uuid, 'uuid4', side_effect=[name_uuid, owner_uuid]), \
+                patch.object(publisher.subprocess, 'run', side_effect=[
+                    subprocess.CompletedProcess([], 0, stdout=str(owner_uuid) + '\n', stderr=''),
+                    subprocess.CompletedProcess([], 0, stdout='', stderr=''),
+                ]) as cleanup:
+            with self.assertRaisesRegex(ValueError, '运行时检查失败或超时'):
+                publisher.inspect_image('amd64', self.ref())
+        command = docker.call_args_list[1].args[0]
+        self.assertEqual(command[command.index('--platform') + 1], 'linux/amd64')
+        name = command[command.index('--name') + 1]
+        self.assertEqual(name, 'performance-release-probe-' + name_uuid.hex)
+        self.assertEqual(command[command.index('--label') + 1],
+                         publisher._PROBE_LABEL + '=' + str(owner_uuid))
+        self.assertEqual(cleanup.call_args_list[0].args[0], [
+            'docker', 'container', 'inspect', '--format',
+            '{{index .Config.Labels "' + publisher._PROBE_LABEL + '"}}', name,
+        ])
+        self.assertEqual(cleanup.call_args_list[1].args[0],
+                         ['docker', 'container', 'rm', '--force', '--volumes', name])
+
+    def test_runtime_cleanup_failure_is_not_reported_as_cleaned(self):
+        owner_uuid = uuid.UUID('22222222-2222-4222-8222-222222222222')
+        with patch.object(publisher.subprocess, 'check_output', side_effect=[
+            json.dumps([self.info()]), subprocess.TimeoutExpired('docker', 60),
+        ]), patch.object(publisher.uuid, 'uuid4', side_effect=[
+            uuid.UUID('11111111-1111-4111-8111-111111111111'), owner_uuid,
+        ]), patch.object(publisher.subprocess, 'run', side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=str(owner_uuid) + '\n', stderr=''),
+            subprocess.CompletedProcess([], 1, stdout='', stderr='busy'),
+        ]):
+            with self.assertRaisesRegex(ValueError, '清理失败；清理状态未确认') as raised:
+                publisher.inspect_image('amd64', self.ref())
+        self.assertNotIn('已清理', str(raised.exception))
+
+    def test_runtime_cleanup_refuses_foreign_container(self):
+        with patch.object(publisher.subprocess, 'run', return_value=
+                          subprocess.CompletedProcess([], 0, stdout='another-owner\n', stderr='')) as docker:
+            with self.assertRaisesRegex(ValueError, '归属不匹配'):
+                publisher._cleanup_probe_container('probe-name', 'expected-owner')
+        self.assertEqual(docker.call_count, 1)
 
     def test_existing_matching_archive_reused_and_tampering_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -98,6 +148,7 @@ class ReleaseTests(unittest.TestCase):
             archive.parent.mkdir()
             archive.write_bytes(b'fixture archive')
             record = {'image_id': 'sha256:' + 'a' * 64, 'filename': filename,
+                      'image_config_id': 'sha256:' + 'c' * 64,
                       'sha256': publisher.sha256(archive), 'size_bytes': archive.stat().st_size}
             manifest = {**self.versions(), 'release': publisher.__version__, 'images': {'amd64': record}}
             inspected = self.info()
@@ -113,6 +164,82 @@ class ReleaseTests(unittest.TestCase):
                 archive.write_bytes(b'changed')
                 with self.assertRaises(ValueError): publisher.publish_image(root, 'amd64', self.ref(), manifest)
                 export.assert_not_called()
+
+    def test_missing_archive_resumes_only_the_same_recorded_image_and_config(self):
+        class SavedImage:
+            stdout = io.BytesIO(b'fixture image bytes')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            filename = f'{publisher.__version__}/linux-amd64.tar.gz'
+            registry_ref = 'docker.io/example/performance-node@sha256:' + 'b' * 64
+            index_ref = 'docker.io/example/performance-node@sha256:' + 'f' * 64
+            previous = {
+                'filename': filename, 'sha256': 'd' * 64, 'size_bytes': 1,
+                'image_ref': self.ref(), 'image_id': self.info()['Id'],
+                'image_config_id': 'sha256:' + 'c' * 64, 'registry_ref': registry_ref,
+            }
+            manifest = {**self.versions(), 'release': publisher.__version__,
+                        'registry_index_ref': index_ref, 'images': {'amd64': previous}}
+            with patch.object(publisher, 'inspect_image', return_value=(self.info(), self.versions())), \
+                    patch.object(publisher, 'archive_config_id', return_value='sha256:' + 'c' * 64), \
+                    patch.object(publisher, 'audit_release_archive'), \
+                    patch.object(publisher.subprocess, 'Popen', return_value=SavedImage()):
+                publisher.publish_image(root, 'amd64', self.ref(), manifest)
+            self.assertTrue((root / filename).is_file())
+            self.assertEqual(manifest['images']['amd64']['registry_ref'], registry_ref)
+            self.assertEqual(manifest['registry_index_ref'], index_ref)
+
+    def test_missing_archive_rejects_different_recorded_image_or_config(self):
+        class SavedImage:
+            stdout = io.BytesIO(b'fixture image bytes')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def wait():
+                return 0
+
+        for mismatch in ('image_id', 'image_config_id'):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                filename = f'{publisher.__version__}/linux-amd64.tar.gz'
+                previous = {
+                    'filename': filename, 'sha256': 'd' * 64, 'size_bytes': 1,
+                    'image_ref': self.ref(), 'image_id': self.info()['Id'],
+                    'image_config_id': 'sha256:' + 'c' * 64,
+                    'registry_ref': 'docker.io/example/performance-node@sha256:' + 'b' * 64,
+                }
+                manifest = {**self.versions(), 'release': publisher.__version__,
+                            'registry_index_ref': 'docker.io/example/performance-node@sha256:' + 'f' * 64,
+                            'images': {'amd64': previous}}
+                inspected = self.info()
+                if mismatch == 'image_id':
+                    inspected['Id'] = 'sha256:' + 'e' * 64
+                with patch.object(publisher, 'inspect_image', return_value=(inspected, self.versions())), \
+                        patch.object(publisher, 'archive_config_id', return_value='sha256:' + 'e' * 64), \
+                        patch.object(publisher.subprocess, 'Popen', return_value=SavedImage()) as export:
+                    with self.assertRaisesRegex(ValueError, '拒绝替换'):
+                        publisher.publish_image(root, 'amd64', self.ref(), manifest)
+                self.assertIs(manifest['images']['amd64'], previous)
+                self.assertIn('registry_index_ref', manifest)
+                self.assertFalse((root / filename).exists())
+                if mismatch == 'image_id':
+                    export.assert_not_called()
 
     def test_failed_archive_audit_never_replaces_public_tar_or_adds_image_record(self):
         class SavedImage:
@@ -348,6 +475,123 @@ class ReleaseTests(unittest.TestCase):
                     ])
             persisted = json.loads((root / 'manifest.json').read_text())
             self.assertEqual(persisted['images']['amd64'], record)
+
+
+class MultiarchIndexTests(unittest.TestCase):
+    registry = 'docker.io/example/performance-node'
+
+    def setUp(self):
+        self.members = {'amd64': 'sha256:' + 'a' * 64, 'arm64': 'sha256:' + 'b' * 64}
+        self.index = {'digest': 'sha256:' + 'f' * 64, 'members': self.members}
+        self.manifest = {'images': {
+            arch: {'registry_ref': self.registry + '@' + digest,
+                   'image_config_id': 'sha256:' + str(i) * 64}
+            for i, (arch, digest) in enumerate(self.members.items(), start=1)
+        }}
+
+    def index_document(self):
+        return {'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json',
+                'digest': self.index['digest'], 'manifests': [
+                    {'platform': {'os': 'linux', 'architecture': arch}, 'digest': digest}
+                    for arch, digest in self.members.items()
+                ]}
+
+    def test_read_index_and_reject_missing_duplicate_or_foreign_platforms(self):
+        with patch.object(publisher.subprocess, 'check_output', return_value=json.dumps(self.index_document())):
+            self.assertEqual(publisher.remote_index('fixture'), self.index)
+        for failure in ('missing', 'duplicate', 'foreign', 'digest', 'single_image'):
+            doc = self.index_document()
+            if failure == 'missing': doc['manifests'].pop()
+            if failure == 'duplicate': doc['manifests'][1]['platform']['architecture'] = 'amd64'
+            if failure == 'foreign': doc['manifests'][1]['platform']['os'] = 'windows'
+            if failure == 'digest': doc['digest'] = 'mutable-tag'
+            if failure == 'single_image': doc['mediaType'] = 'application/vnd.oci.image.manifest.v1+json'
+            with self.subTest(failure=failure), patch.object(publisher.subprocess, 'check_output', return_value=json.dumps(doc)):
+                with self.assertRaises(ValueError): publisher.remote_index('fixture')
+
+    def test_permission_and_network_errors_are_not_an_absent_tag(self):
+        for error in (b'403 denied not found', b'connection timed out'):
+            with patch.object(publisher.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(1, [], stderr=error)):
+                with self.assertRaises(ValueError): publisher.remote_index('fixture', absent_ok=True)
+        with patch.object(publisher.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(1, [], stderr=b'manifest unknown')):
+            self.assertIsNone(publisher.remote_index('fixture', absent_ok=True))
+
+    def remote_member(self, reference):
+        arch = next(arch for arch, record in self.manifest['images'].items() if record['registry_ref'] == reference)
+        return {'digest': self.members[arch], 'config_id': self.manifest['images'][arch]['image_config_id'],
+                'os': 'linux', 'architecture': arch}
+
+    def docker_command(self, command, **kwargs):
+        if command[:3] in (['docker', 'image', 'pull'], ['docker', 'image', 'inspect']):
+            environment = kwargs['env']
+            self.assertNotIn('DOCKER_AUTH_CONFIG', environment)
+            self.assertNotIn('DOCKER_CONTEXT', environment)
+            config = Path(environment['DOCKER_CONFIG']) / 'config.json'
+            if config.exists():
+                self.assertLessEqual(set(json.loads(config.read_text())), {'cliPluginsExtraDirs'})
+        if command[:3] == ['docker', 'image', 'inspect']:
+            arch = command[4].split('/')[1]
+            return json.dumps([{'Id': self.manifest['images'][arch]['image_config_id'],
+                                'Os': 'linux', 'Architecture': arch}]).encode()
+        return b''
+
+    def test_publish_checks_both_anonymous_platform_pulls(self):
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', side_effect=[None, self.index, self.index]), \
+                patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
+                patch.object(publisher.subprocess, 'check_output', side_effect=self.docker_command) as docker:
+            result = publisher.publish_registry_index(self.manifest, self.registry)
+        self.assertEqual(result, self.registry + '@' + self.index['digest'])
+        commands = [item.args[0] for item in docker.call_args_list]
+        self.assertEqual(commands[0][:4], ['docker', 'buildx', 'imagetools', 'create'])
+        for arch in self.members:
+            self.assertIn(['docker', 'image', 'pull', '--platform', 'linux/' + arch, result], commands)
+
+    def test_existing_conflicting_index_never_overwritten(self):
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', return_value={**self.index, 'members': {}}), \
+                patch.object(publisher.subprocess, 'check_output') as docker:
+            with self.assertRaisesRegex(ValueError, '拒绝覆盖'):
+                publisher.publish_registry_index(self.manifest, self.registry)
+        docker.assert_not_called()
+
+    def test_anonymous_wrong_architecture_never_returns_index(self):
+        def wrong_platform(command, **kwargs):
+            if command[:3] == ['docker', 'image', 'inspect']:
+                return json.dumps([{'Id': self.index['digest'], 'Os': 'linux', 'Architecture': 'wrong'}]).encode()
+            return self.docker_command(command, **kwargs)
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', return_value=self.index), \
+                patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
+                patch.object(publisher.subprocess, 'check_output', side_effect=wrong_platform):
+            with self.assertRaisesRegex(ValueError, '不是预期架构'):
+                publisher.publish_registry_index(self.manifest, self.registry)
+
+    def test_anonymous_index_mismatch_never_attempts_pull(self):
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', side_effect=[self.index, self.index, {**self.index, 'digest': 'sha256:' + '0' * 64}]), \
+                patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
+                patch.object(publisher.subprocess, 'check_output') as docker:
+            with self.assertRaisesRegex(ValueError, '摘要不匹配'):
+                publisher.publish_registry_index(self.manifest, self.registry)
+        docker.assert_not_called()
+
+    def test_index_requires_two_images_in_same_repository(self):
+        for mode in ('one', 'foreign'):
+            with self.subTest(mode=mode):
+                images = {key: dict(value) for key, value in self.manifest['images'].items()}
+                if mode == 'one': images.pop('arm64')
+                else: images['amd64']['registry_ref'] = 'docker.io/other/repo@' + self.members['amd64']
+                with patch.object(publisher.subprocess, 'check_output') as docker:
+                    with self.assertRaises(ValueError):
+                        publisher.publish_registry_index({'images': images}, self.registry)
+                    docker.assert_not_called()
+
+    def test_index_cli_rejects_partial_architectures_before_any_publish(self):
+        with patch.object(publisher, 'publish_image') as publish:
+            with self.assertRaises(ValueError):
+                publisher.main(['--publish-index', '--registry', self.registry, '--image', 'amd64=fixture'])
+            publish.assert_not_called()
 
 
 if __name__ == '__main__':

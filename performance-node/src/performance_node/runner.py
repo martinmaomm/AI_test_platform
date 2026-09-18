@@ -34,12 +34,16 @@ def run_forever(
     identity = client.store.load()
     executor = executor or RunExecutor(client.config, identity.node_id)
     interval = 5
+    first_heartbeat_succeeded = False
     try:
         while not stop_event.is_set():
             try:
                 report = executor.report_for_heartbeat()
                 result = client.heartbeat(identity, report)
                 interval = result.interval_seconds
+                if not first_heartbeat_succeeded:
+                    logger.info("平台 TLS 证书已校验，节点首次心跳成功")
+                    first_heartbeat_succeeded = True
                 if stop_event.is_set():
                     break
                 executor.handle_command(result.command)

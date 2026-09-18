@@ -500,6 +500,19 @@ class PerformanceAgentProtocolTests(TestCase):
         self.assertEqual(node.resources, {'cpu_percent': 12.5, 'memory_percent': 34.5})
         self.assertEqual(node.status_at(), 'online')
 
+    def test_agent_020_can_still_enroll_heartbeat_and_receive_commands(self):
+        enrolled = self.enroll(agent_version='0.2.0')
+        self.assertEqual(enrolled.status_code, 200, enrolled.data)
+        agent_token = enrolled.data['data']['agent_token']
+
+        heartbeat = self.heartbeat(agent_token, agent_version='0.2.0')
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.data)
+        self.assertEqual(heartbeat.data['data']['command'], {'type': 'idle'})
+        node = PerformanceNode.objects.get(pk=self.node_id)
+        self.assertEqual(node.agent_version, '0.2.0')
+        self.assertEqual(node.protocol_version, PROTOCOL_VERSION)
+        self.assertEqual(node.engine_version, ENGINE_VERSION)
+
     def test_resources_are_strict_bounded_and_finite(self):
         agent_token = self.enroll().data['data']['agent_token']
         for resources in (

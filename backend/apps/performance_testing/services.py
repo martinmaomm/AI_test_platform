@@ -11,8 +11,9 @@ from django.utils import timezone
 from projects.models import Project
 
 from .constants import (
-    AGENT_VERSION, ENGINE_VERSION, ENROLLMENT_TTL_SECONDS,
+    ENGINE_VERSION, ENROLLMENT_TTL_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS, NODE_OFFLINE_AFTER_SECONDS, PROTOCOL_VERSION,
+    SUPPORTED_AGENT_VERSIONS,
 )
 from .models import PerformanceNode, PerformanceRun
 from .run_services import execution_configuration, stop_runs_for_node_identity_change
@@ -76,7 +77,7 @@ def _parse_credential(raw):
 def ensure_supported_versions(data):
     if (
         data.get('protocol_version') != PROTOCOL_VERSION
-        or data.get('agent_version') != AGENT_VERSION
+        or data.get('agent_version') not in SUPPORTED_AGENT_VERSIONS
         or data.get('engine_version') != ENGINE_VERSION
     ):
         raise VersionMismatch

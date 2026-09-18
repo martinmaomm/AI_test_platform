@@ -43,16 +43,25 @@ class PerformanceNodeClient:
         self.store = StateStore(config.state_dir)
         self.transport = transport or AgentTransport(config.ca_bundle)
 
-    def enroll(self, enrollment_token: str) -> NodeIdentity:
+    def enroll(
+        self,
+        enrollment_token: str,
+        *,
+        expected_node_id: str | None = None,
+        retry_transient: bool = True,
+    ) -> NodeIdentity:
         if self.store.exists():
             raise AgentStopped("已有节点身份；不会自动重新注册")
         data = self.transport.post(
             self.config.endpoint("enroll"),
             {"enrollment_token": enrollment_token, "protocol_version": PROTOCOL_VERSION,
              "agent_version": __version__, "engine_version": ENGINE_VERSION},
+            retry_transient=retry_transient,
         )
         self._validate_common(data)
         node_id = _node_id(data.get("node_id"))
+        if expected_node_id is not None and node_id != expected_node_id:
+            raise ProtocolError("注册响应的节点身份与安装命令不一致")
         token = data.get("agent_token")
         try:
             identity = NodeIdentity(node_id=node_id, agent_token=token)

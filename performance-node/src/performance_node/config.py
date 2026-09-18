@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from .errors import ConfigurationError
+
+_HEX_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def platform_base_url(value: str) -> str:
@@ -59,6 +63,32 @@ def enrollment_token_from_env() -> str:
     raise ConfigurationError("缺少注册凭证环境变量或凭证文件")
 
 
+def node_id(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ConfigurationError("--node-id 必须是有效 UUID") from exc
+
+
+def enrollment_token(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 4096
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ConfigurationError("--token 格式无效")
+    return value
+
+
+def ca_sha256(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not _HEX_SHA256.fullmatch(value):
+        raise ConfigurationError("--ca-sha256 必须是 64 位十六进制 SHA256")
+    return value.lower()
+
+
 @dataclass(frozen=True)
 class NodeConfig:
     platform_url: str
@@ -75,6 +105,16 @@ class NodeConfig:
             platform_url=platform_base_url(_required_env("PERFORMANCE_PLATFORM_URL")),
             state_dir=Path(_required_env("PERFORMANCE_NODE_STATE_DIR")),
             ca_bundle=ca_file or True,
+            stunnel_binary=os.environ.get("PERFORMANCE_STUNNEL_BINARY", "stunnel"),
+        )
+
+    @classmethod
+    def from_start(cls, server: str, ca_bundle: str | bool = True) -> "NodeConfig":
+        """Build start-mode config without inheriting legacy CA configuration."""
+        return cls(
+            platform_url=platform_base_url(server),
+            state_dir=Path(_required_env("PERFORMANCE_NODE_STATE_DIR")),
+            ca_bundle=ca_bundle,
             stunnel_binary=os.environ.get("PERFORMANCE_STUNNEL_BINARY", "stunnel"),
         )
 

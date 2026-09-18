@@ -26,6 +26,7 @@ backend/media/
 # 已发布的性能节点镜像由发布工具生成，不进入源码仓库。
 backend/resource/performance-node/
 backend/resource/performance-node-dockerhub/
+backend/resource/performance-node-dockerhub-*/
 
 # 2.1 Python 全局编译缓存 (强烈建议全局拦截，而不仅限 backend 根目录)
 __pycache__/

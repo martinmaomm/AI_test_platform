@@ -1,6 +1,9 @@
 PROTOCOL_VERSION = 2
-AGENT_VERSION = '0.2.1'
-SUPPORTED_AGENT_VERSIONS = ('0.2.0', AGENT_VERSION)
+AGENT_VERSION = '0.3.0'
+# Old agents may keep heartbeating so the management UI can show an upgrade
+# prompt.  Execution compatibility is checked separately and only 0.3.0 may
+# receive schema-v2 work.
+SUPPORTED_AGENT_VERSIONS = ('0.2.0', '0.2.1', AGENT_VERSION)
 ENGINE_VERSION = '2.43.3'
 
 HEARTBEAT_INTERVAL_SECONDS = 5
@@ -15,6 +18,8 @@ MAX_DURATION_SECONDS = 600
 MAX_SPAWN_RATE = 100
 MAX_STEPS = 20
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_FAILURE_SAMPLES = 20
+MAX_FAILURE_VALUE_BYTES = 2048
 
 ALLOWED_HTTP_METHODS = (
     'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS',

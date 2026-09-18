@@ -20,6 +20,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import PerformanceControllerState, PerformanceRun
+from .constants import MAX_FAILURE_SAMPLES, MAX_FAILURE_VALUE_BYTES
 from .pki import create_run_certificates, private_write
 from .runtime_settings import NODE_SOURCE, RuntimeSettings
 from performance_node.locust_runtime import canonical_sha256, validate_snapshot
@@ -29,6 +30,45 @@ ACTIVE = ('preparing', 'running', 'stopping')
 TERMINAL = ('completed', 'failed', 'cancelled', 'incomplete')
 LEASE_SECONDS = 15
 REAP_SECONDS = 25
+
+
+def _bounded_evidence_value(value):
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    except (TypeError, ValueError):
+        encoded = json.dumps(str(value), ensure_ascii=False)
+    raw = encoded.encode('utf-8')
+    if len(raw) <= MAX_FAILURE_VALUE_BYTES:
+        return value
+    return raw[:MAX_FAILURE_VALUE_BYTES].decode('utf-8', errors='ignore') + '…'
+
+
+def bounded_metrics(metrics):
+    """Defend the reporting database even if a local engine file is malformed."""
+    result = dict(metrics)
+    samples = result.get('failure_samples')
+    normalized = []
+    required = {
+        'step_index', 'step_name', 'phase', 'check', 'comparator', 'expected',
+        'actual', 'error_type', 'message',
+    }
+    if isinstance(samples, list):
+        for sample in samples[:MAX_FAILURE_SAMPLES]:
+            if not isinstance(sample, dict) or set(sample) != required:
+                continue
+            normalized.append({
+                'step_index': sample['step_index'] if type(sample['step_index']) is int else 0,
+                'step_name': str(sample['step_name'])[:200],
+                'phase': sample['phase'] if sample['phase'] in ('setup', 'main') else 'main',
+                'check': str(sample['check'])[:512],
+                'comparator': str(sample['comparator'])[:32],
+                'expected': _bounded_evidence_value(sample['expected']),
+                'actual': _bounded_evidence_value(sample['actual']),
+                'error_type': str(sample['error_type'])[:64],
+                'message': str(sample['message'])[:500],
+            })
+    result['failure_samples'] = normalized
+    return result
 
 
 def read_json(path):
@@ -237,6 +277,7 @@ class PerformanceController:
     def record_metrics(self, run, metrics):
         if not isinstance(metrics, dict) or type(metrics.get('requests')) is not int:
             return
+        metrics = bounded_metrics(metrics)
         with self.owned_run(run.pk) as (_, locked):
             if locked.status in ACTIVE:
                 self._record_metrics(locked, metrics)

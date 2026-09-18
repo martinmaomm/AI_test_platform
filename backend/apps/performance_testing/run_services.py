@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from copy import deepcopy
 from datetime import timedelta
+import hashlib
+import json
 from pathlib import Path
 
 from django.conf import settings
@@ -12,8 +14,7 @@ from django.utils import timezone
 from projects.models import Project
 
 from .constants import (
-    CONTROLLER_FRESH_SECONDS, ENGINE_VERSION, PROTOCOL_VERSION,
-    SUPPORTED_AGENT_VERSIONS,
+    AGENT_VERSION, CONTROLLER_FRESH_SECONDS, ENGINE_VERSION, PROTOCOL_VERSION,
 )
 from .models import (
     PerformanceControllerState, PerformanceNode, PerformancePlan, PerformanceRun,
@@ -102,7 +103,32 @@ def _load_snapshot_contract():
     return module.canonical_sha256, module.validate_snapshot
 
 
-def _snapshot_for(run_id, plan, node):
+def validation_key_for(plan, node):
+    """Fingerprint request/data and the exact node capability used to validate it."""
+    target = plan.target
+    payload = {
+        'contract': 2,
+        'plan_id': plan.pk,
+        'target_id': target.pk,
+        'base_url': target.base_url,
+        'allowed_methods': deepcopy(target.allowed_methods),
+        'variables': deepcopy(plan.variables),
+        'unique_variables': deepcopy(plan.unique_variables),
+        'steps': deepcopy(plan.steps),
+        'node': {
+            'id': str(node.pk),
+            'protocol_version': node.protocol_version,
+            'agent_version': node.agent_version,
+            'engine_version': node.engine_version,
+        },
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False,
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _snapshot_for(run_id, plan, node, mode):
     target = plan.target
     if plan.project_id != target.project_id or plan.project_id != node.project_id:
         raise RunValidationRejected('计划、目标与节点不属于同一项目。')
@@ -123,22 +149,30 @@ def _snapshot_for(run_id, plan, node):
         'spawn_rate': plan.spawn_rate,
         'duration_seconds': plan.duration_seconds,
         'wait_seconds': plan.wait_seconds,
+        'variables': deepcopy(plan.variables),
+        'unique_variables': deepcopy(plan.unique_variables),
         'steps': deepcopy(plan.steps),
     }, context={'project': plan.project})
     if not target_validator.is_valid() or not plan_validator.is_valid():
         raise RunValidationRejected('计划或目标不再满足完整管理契约。')
     snapshot = {
-        'schema_version': 1,
+        'schema_version': 2,
         'run_id': str(run_id),
         'node_id': str(node.pk),
         'engine_version': ENGINE_VERSION,
         'plan_name': plan.name,
         'base_url': target.base_url,
         'allowed_methods': deepcopy(target.allowed_methods),
-        'users': plan.users,
-        'spawn_rate': plan.spawn_rate,
-        'duration_seconds': plan.duration_seconds,
+        'mode': mode,
+        'validation_key': validation_key_for(plan, node),
+        'users': 1 if mode == PerformanceRun.Mode.VALIDATION else plan.users,
+        'spawn_rate': 1 if mode == PerformanceRun.Mode.VALIDATION else plan.spawn_rate,
+        # Validation is exactly one round; this is only its bounded wall-clock
+        # budget so a short load duration cannot truncate setup/login.
+        'duration_seconds': 120 if mode == PerformanceRun.Mode.VALIDATION else plan.duration_seconds,
         'wait_seconds': plan.wait_seconds,
+        'variables': deepcopy(plan.variables),
+        'unique_variables': deepcopy(plan.unique_variables),
         'steps': deepcopy(plan.steps),
     }
     canonical_sha256, validate_snapshot = _load_snapshot_contract()
@@ -156,20 +190,47 @@ def _node_is_compatible(node, now):
         and node.revoked_at is None
         and node.status_at(now) == 'online'
         and node.protocol_version == PROTOCOL_VERSION
-        and node.agent_version in SUPPORTED_AGENT_VERSIONS
+        and node.agent_version == AGENT_VERSION
         and node.engine_version == ENGINE_VERSION
     )
 
 
+def _has_matching_validation(plan, node, validation_key):
+    candidates = PerformanceRun.objects.select_for_update().filter(
+        plan=plan,
+        node=node,
+        mode=PerformanceRun.Mode.VALIDATION,
+        status=PerformanceRun.Status.COMPLETED,
+        validation_key=validation_key,
+    ).order_by('-finished_at', '-created_at')
+    expected_main = sum(
+        isinstance(step, dict) and step.get('phase') == 'main'
+        for step in (plan.steps or [])
+    )
+    for run in candidates:
+        metrics = run.latest_metrics or {}
+        if (
+            metrics.get('complete') is True
+            and metrics.get('validation_complete') is True
+            and metrics.get('validation_passed') is True
+            and type(metrics.get('requests')) is int
+            and metrics['requests'] > 0
+            and metrics.get('main_steps_completed') == expected_main
+            and metrics.get('main_steps_total') == expected_main
+        ):
+            return True
+    return False
+
+
 @transaction.atomic
-def create_run(project, plan_id, node_id, request_id, created_by):
+def create_run(project, plan_id, node_id, request_id, created_by, mode='load'):
     # Serialize idempotency decisions per project on databases with row locks.
     locked_project = Project.objects.select_for_update().get(pk=project.pk)
     existing = PerformanceRun.objects.select_related('node').filter(
         project=locked_project, request_id=request_id,
     ).first()
     if existing is not None:
-        if existing.plan_id == plan_id and existing.node_id == node_id:
+        if existing.plan_id == plan_id and existing.node_id == node_id and existing.mode == mode:
             return existing, False
         raise RunConflict('同一 request_id 已用于不同运行参数。')
 
@@ -191,7 +252,16 @@ def create_run(project, plan_id, node_id, request_id, created_by):
         raise RunValidationRejected('性能节点不存在。')
     now = timezone.now()
     if not _node_is_compatible(node, now):
-        raise RunValidationRejected('节点必须在线、未吊销且版本完全匹配。')
+        raise RunValidationRejected('节点必须在线、未吊销且具备 Agent 0.3.0 schema-v2 执行能力。')
+
+    try:
+        current_validation_key = validation_key_for(plan, node)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RunValidationRejected('计划或节点验证指纹无法生成。') from exc
+    if mode == PerformanceRun.Mode.LOAD and not _has_matching_validation(
+        plan, node, current_validation_key,
+    ):
+        raise RunValidationRejected('所选节点没有与当前计划、目标和节点能力匹配的成功验证。')
 
     run = PerformanceRun(
         project=locked_project,
@@ -199,8 +269,10 @@ def create_run(project, plan_id, node_id, request_id, created_by):
         node=node,
         created_by=created_by,
         request_id=request_id,
+        mode=mode,
+        validation_key=current_validation_key,
     )
-    snapshot, digest = _snapshot_for(run.pk, plan, node)
+    snapshot, digest = _snapshot_for(run.pk, plan, node, mode)
     run.snapshot = snapshot
     run.snapshot_sha256 = digest
     run.save(force_insert=True)

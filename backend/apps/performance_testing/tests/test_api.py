@@ -71,9 +71,14 @@ class PerformanceManagementAPITests(TestCase):
             'spawn_rate': 1,
             'duration_seconds': 30,
             'wait_seconds': 1,
+            'variables': {},
+            'unique_variables': [],
             'steps': [{
-                'name': 'list', 'method': 'GET', 'path': '/items',
-                'expected_status': 200, 'headers': {}, 'body': None,
+                'name': 'list', 'phase': 'main', 'method': 'GET', 'path': '/items',
+                'query': {}, 'headers': {}, 'body_type': 'none', 'body': None,
+                'extract': [], 'assertions': [
+                    {'check': 'status_code', 'comparator': 'eq', 'expected': 200},
+                ],
             }],
         }
 
@@ -206,6 +211,48 @@ class PerformanceManagementAPITests(TestCase):
             payload = self.valid_plan(own_target)
             mutation(payload)
             response = self.client.post(self.path('plans/'), payload, format='json')
+            self.assertEqual(response.status_code, 400, response.data)
+
+    def test_v2_plan_data_flow_body_types_and_assertions_are_strict(self):
+        target = self.create_target(methods=['GET', 'POST'])
+        self.auth(self.editor)
+        payload = self.valid_plan(target)
+        payload['variables'] = {'username': 'fixture'}
+        payload['unique_variables'] = [{'name': 'new_name', 'prefix': 'load_'}]
+        payload['steps'] = [
+            {'name': 'login', 'phase': 'setup', 'method': 'POST', 'path': '/login',
+             'query': {}, 'headers': {}, 'body_type': 'form',
+             'body': {'username': '${username}'},
+             'extract': [{'name': 'token', 'check': 'body.token'}],
+             'assertions': [{'check': 'status_code', 'comparator': 'eq', 'expected': 200}]},
+            {'name': 'list', 'phase': 'main', 'method': 'GET', 'path': '/items/${new_name}',
+             'query': {'page': 1}, 'headers': {'Authorization': 'Bearer ${token}'},
+             'body_type': 'none', 'body': None, 'extract': [],
+             'assertions': [
+                 {'check': 'body.data', 'comparator': 'type', 'expected': 'list'},
+                 {'check': 'body.data', 'comparator': 'length_gt', 'expected': 0},
+             ]},
+        ]
+        accepted = self.client.post(self.path('plans/'), payload, format='json')
+        self.assertEqual(accepted.status_code, 201, accepted.data)
+
+        for mutation in (
+            lambda item: item['steps'][0]['body'].update(value='${new_name}'),
+            lambda item: item['steps'].insert(0, item['steps'].pop()),
+            lambda item: item['steps'][1]['headers'].update(Bad='${missing}'),
+            lambda item: item['steps'][1]['assertions'][0].update(expected=[]),
+            lambda item: item['steps'][1].update(body_type='raw', body={'bad': True}),
+            lambda item: item['steps'][1].update(path='/items/../secret'),
+        ):
+            candidate = self.valid_plan(target)
+            candidate.update(variables={'username': 'fixture'},
+                             unique_variables=[{'name': 'new_name', 'prefix': 'load_'}],
+                             steps=[dict(step) for step in payload['steps']])
+            # Deep copy through JSON keeps each mutation isolated.
+            import json
+            candidate = json.loads(json.dumps(candidate))
+            mutation(candidate)
+            response = self.client.post(self.path('plans/'), candidate, format='json')
             self.assertEqual(response.status_code, 400, response.data)
 
     def test_nodes_are_admin_managed_member_read_only_and_never_leak_digests(self):

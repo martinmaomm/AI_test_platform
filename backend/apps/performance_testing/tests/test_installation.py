@@ -277,6 +277,25 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
                 self.assertNotIn('command', metadata)
                 self.manifest['registry_index_ref'] = expected
 
+    def test_existing_node_metadata_exposes_pinned_image_and_upgrade_without_command(self):
+        old = type('Node', (), {
+            'pk': '00000000-0000-0000-0000-000000000001',
+            'agent_version': '0.2.1', 'enrollment_expires_at': None,
+        })()
+        current = type('Node', (), {
+            'pk': '00000000-0000-0000-0000-000000000002',
+            'agent_version': AGENT_VERSION, 'enrollment_expires_at': None,
+        })()
+        with self.release_environment():
+            old_metadata = installation_metadata(node=old)
+            current_metadata = installation_metadata(node=current)
+        self.assertEqual(old_metadata['image_ref'], self.manifest['registry_index_ref'])
+        self.assertTrue(old_metadata['upgrade_required'])
+        self.assertNotIn('command', old_metadata)
+        self.assertEqual(current_metadata['image_ref'], self.manifest['registry_index_ref'])
+        self.assertFalse(current_metadata['upgrade_required'])
+        self.assertNotIn('command', current_metadata)
+
     def test_release_archive_symlink_is_rejected(self):
         archive = self.release_directory / AGENT_VERSION / 'linux-amd64.tar.gz'
         outside = self.root / 'outside.tar.gz'

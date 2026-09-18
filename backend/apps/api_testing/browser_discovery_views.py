@@ -57,7 +57,7 @@ def _editable_project(project_id: int, user) -> Project:
 
 
 def _owned_task(project_id: int, task_id, user, *, lock: bool = False) -> BrowserDiscoveryTask:
-    query = BrowserDiscoveryTask.objects.select_related('project')
+    query = BrowserDiscoveryTask.objects.select_related('project').filter(project__project_type='api')
     if lock:
         query = query.select_for_update()
     try:
@@ -74,7 +74,9 @@ class BrowserDiscoveryConfigView(APIView):
 
     def get(self, request, project_id):
         try:
-            _editable_project(project_id, request.user)
+            project = _editable_project(project_id, request.user)
+            if project.project_type != 'api':
+                return _problem(LookupError('API 项目不存在。'), 404)
             models = usable_llm_configurations().order_by('-created_at')
             return response(kind='success', data={
                 'enabled': browser_discovery_enabled(),
@@ -96,7 +98,9 @@ class BrowserDiscoveryCollectionView(APIView):
 
     def get(self, request, project_id):
         try:
-            _editable_project(project_id, request.user)
+            project = _editable_project(project_id, request.user)
+            if project.project_type != 'api':
+                return _problem(LookupError('API 项目不存在。'), 404)
             tasks = BrowserDiscoveryTask.objects.filter(
                 project_id=project_id, owner=request.user,
             ).prefetch_related(task_handoff_prefetch()).order_by('-created_at', '-id')

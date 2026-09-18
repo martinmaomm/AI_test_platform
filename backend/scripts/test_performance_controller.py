@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
-from performance_testing.controller import PerformanceController, child_environment
+from performance_testing.controller import PerformanceController, bounded_metrics, child_environment
 from performance_testing.models import PerformanceControllerState, PerformanceNode, PerformanceRun
 from performance_testing.runtime_settings import RuntimeSettings
 from projects.models import Project
@@ -97,6 +97,22 @@ class ControllerIsolationTests(TestCase):
             environment = child_environment()
         for key in ('DB_PASSWORD', 'PERFORMANCE_NODE_TOKEN', 'HTTPS_PROXY', 'OPENAI_API_KEY'):
             self.assertNotIn(key, environment)
+
+    def test_failure_evidence_is_bounded_and_malformed_samples_are_discarded(self):
+        sample = {
+            'step_index': 1, 'step_name': 'main', 'phase': 'main', 'check': 'body.data',
+            'comparator': 'eq', 'expected': 'x' * 5000, 'actual': {'missing': True},
+            'error_type': 'assertion_failed', 'message': 'm' * 1000,
+        }
+        metrics = bounded_metrics({
+            'requests': 1,
+            'failure_samples': [sample] * 30 + [{'unexpected': True}],
+        })
+        self.assertEqual(len(metrics['failure_samples']), 20)
+        self.assertLessEqual(len(metrics['failure_samples'][0]['message']), 500)
+        self.assertLessEqual(
+            len(str(metrics['failure_samples'][0]['expected']).encode('utf-8')), 2051,
+        )
 
     def test_node_revocation_retains_specific_reason_during_recovery(self):
         run = self.run_record()

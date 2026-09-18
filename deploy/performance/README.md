@@ -24,24 +24,24 @@
 网页 Docker 命令依赖已发布的双架构镜像索引，不能只配置域名。先在对应架构构建（或从可信构建机导入）镜像，固定命名：
 
 ```text
-automation-platform-performance-node:0.2.1-amd64
-automation-platform-performance-node:0.2.1-arm64
+automation-platform-performance-node:0.3.0-amd64
+automation-platform-performance-node:0.3.0-arm64
 ```
 
 发布机需要能运行对应架构的镜像以核对安装包内的 Agent、Locust、协议和固定执行脚本。以下命令只生成归档，供审计或手工部署使用，**不能单独启用网页安装命令**；网页发行继续执行下一节的双架构公开发布：
 
 ```bash
 backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
-  --image amd64=automation-platform-performance-node:0.2.1-amd64 \
-  --image arm64=automation-platform-performance-node:0.2.1-arm64 \
-  --output backend/resource/performance-node-dockerhub-0.2.1
+  --image amd64=automation-platform-performance-node:0.3.0-amd64 \
+  --image arm64=automation-platform-performance-node:0.3.0-arm64 \
+  --output backend/resource/performance-node-dockerhub-0.3.0
 ```
 
 生成目录默认 `backend/resource/performance-node/`，包含 manifest 和受控镜像归档，已被 Git 忽略。同版本已发布镜像拒绝直接覆盖，修改引擎后应按版本契约重新发布。这个目录只放可公开的发行资产，禁止放 `.env`、身份文件、数据库备份、CA 私钥和符号链接。
 
 #### 推荐：公开 Docker Hub 发行（仅限测试使用）
 
-当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。新单条命令使用 `0.2.1` 的多架构索引，节点机器无需登录 Docker Hub。原 `0.2.0` 镜像和已安装节点不被自动升级；设计见 [单条 Docker 接入](../../docs/plans/2026-09-18-performance-direct-docker-install.md)。
+当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。新单条命令使用 `0.3.0` 的多架构索引，节点机器无需登录 Docker Hub。原 `0.2.x` 镜像和已安装节点不被自动升级；旧节点需手动升级至 0.3.0 才能执行新版断言计划；设计见 [单条 Docker 接入](../../docs/plans/2026-09-18-performance-direct-docker-install.md)。
 
 只发布 `performance-node/` 的独立客户端，不发布平台镜像或整个项目目录。Docker 构建上下文已使用白名单，仅允许节点 Python 源码、包配置、README 和 Dockerfile；不包含平台 `.env`、身份卷、日志、数据库和私钥。
 
@@ -51,18 +51,18 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
    ```bash
    docker buildx build --platform linux/amd64 --provenance=false --load \
-     -t automation-platform-performance-node:0.2.1-amd64 performance-node
+     -t automation-platform-performance-node:0.3.0-amd64 performance-node
    docker buildx build --platform linux/arm64 --provenance=false --load \
-     -t automation-platform-performance-node:0.2.1-arm64 performance-node
+     -t automation-platform-performance-node:0.3.0-arm64 performance-node
    ```
 
 4. 把下方 `YOUR_DOCKER_ID` 替换成真实 Docker ID，显式启用公开发布：
 
    ```bash
    backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
-     --image amd64=automation-platform-performance-node:0.2.1-amd64 \
-     --image arm64=automation-platform-performance-node:0.2.1-arm64 \
-     --output backend/resource/performance-node-dockerhub-0.2.1 \
+     --image amd64=automation-platform-performance-node:0.3.0-amd64 \
+     --image arm64=automation-platform-performance-node:0.3.0-arm64 \
+     --output backend/resource/performance-node-dockerhub-0.3.0 \
      --registry docker.io/YOUR_DOCKER_ID/performance-node --publish-index
    ```
 
@@ -78,7 +78,7 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
 ```dotenv
 PERFORMANCE_NODE_PUBLIC_URL=https://load.example.com:18443
-PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node-dockerhub-0.2.1
+PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node-dockerhub-0.3.0
 # 私有 CA 场景填公共证书；可信公共 CA 场景留空。
 PERFORMANCE_NODE_CA_CERT_FILE=/absolute/private/gateway/storage/pki/authorities/local/root.crt
 ```
@@ -147,7 +147,7 @@ backend/temp/performance-gateway/storage/pki/authorities/local/root.crt
 只传输 `performance-node/` 源码，在目标架构机器构建：
 
 ```bash
-docker build -t automation-platform-performance-node:0.2.1 /opt/automation-performance-node/source
+docker build -t automation-platform-performance-node:0.3.0 /opt/automation-performance-node/source
 docker network create automation-performance-net
 docker volume create automation-performance-state
 ```
@@ -171,7 +171,7 @@ docker run --rm --name automation-performance-enroll \
   --mount type=volume,src=automation-performance-state,dst=/var/lib/performance-node \
   --mount type=bind,src=/opt/automation-performance-node/config/gateway-ca.crt,dst=/run/gateway-ca.crt,readonly \
   --mount type=bind,src=/opt/automation-performance-node/config/enrollment-token,dst=/run/enrollment-token,readonly \
-  automation-platform-performance-node:0.2.1 enroll
+  automation-platform-performance-node:0.3.0 enroll
 ```
 
 确认“节点注册成功”后删除**本轮已消费的一次性凭证文件**，不删除 volume/identity.json。启动常驻 Agent：
@@ -188,7 +188,7 @@ docker run -d --name automation-performance-node \
   -e PERFORMANCE_NODE_CA_BUNDLE=/run/gateway-ca.crt \
   --mount type=volume,src=automation-performance-state,dst=/var/lib/performance-node \
   --mount type=bind,src=/opt/automation-performance-node/config/gateway-ca.crt,dst=/run/gateway-ca.crt,readonly \
-  automation-platform-performance-node:0.2.1 run
+  automation-platform-performance-node:0.3.0 run
 ```
 
 这里 1 CPU/512MiB 仅作为低负载联调限制，不代表正式压测容量配置。身份目录由镜像初始化为 UID10001、0700；身份文件为0600。运行容器不含一次性登记凭证，不挂载 Docker socket 或平台目录。重启容器使用同一 volume，不再次执行 enroll。镜像升级必须与平台 Agent 协议、Locust 版本和固定脚本摘要一致。
@@ -204,7 +204,7 @@ docker run -d --name automation-performance-fixture \
   --memory 64m --cpus 0.25 --pids-limit 64 \
   --log-opt max-size=5m --log-opt max-file=2 \
   --mount type=bind,src=/opt/automation-performance-node/smoke_fixture.py,dst=/app/smoke_fixture.py,readonly \
-  --entrypoint python automation-platform-performance-node:0.2.1 /app/smoke_fixture.py
+  --entrypoint python automation-platform-performance-node:0.3.0 /app/smoke_fixture.py
 ```
 
 在平台创建专用性能项目，目标为 `http://performance-fixture.test:8080`，仅允许 GET；计划为 1 用户、生成速率1、时长5秒、等待1秒，步骤 `GET /probe`，预期200。域名只在节点 Docker 网络解析，不是可从 Mac 浏览器打开的网站。

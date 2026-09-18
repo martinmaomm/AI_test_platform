@@ -264,6 +264,7 @@ const MENU_CONFIG = {
     title: '性能测试',
     items: [
       { path: '/perf-testing/plans', label: '压测计划' },
+      { path: '/perf-testing/discovery', label: '网页探索' },
       { path: '/perf-testing/runs', label: '执行记录' },
       { path: '/perf-testing/nodes', label: '节点管理' },
       { path: '/perf-testing/targets', label: '压测目标' }

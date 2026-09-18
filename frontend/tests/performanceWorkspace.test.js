@@ -1,7 +1,7 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import test from "node:test";
+import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import {
   buildPerformanceTargetPayload,
   isPerformancePlatformAdmin,
@@ -9,7 +9,7 @@ import {
   performanceNodeStatusLabel,
   performancePlanPermissions,
   samePerformanceScope,
-} from '../src/views/perf-testing/performanceWorkspaceState.js'
+} from "../src/views/perf-testing/performanceWorkspaceState.js";
 import {
   activeRunConflictCount,
   canDeletePerformanceNode,
@@ -20,7 +20,8 @@ import {
   nodeHasActiveRuns,
   performanceNodeActiveRunCount,
   performanceInstallationStage,
-} from '../src/utils/performanceInstallation.js'
+  requiresPerformanceNodeUpgrade,
+} from "../src/utils/performanceInstallation.js";
 import {
   canStopPerformanceRun,
   completedWithFailures,
@@ -33,230 +34,616 @@ import {
   performanceRunStatusLabel,
   samePerformanceRunScope,
   sampleMetrics,
-} from '../src/views/perf-testing/performanceExecutionState.js'
-import { performanceErrorMessage } from '../src/api/performanceError.js'
+} from "../src/views/perf-testing/performanceExecutionState.js";
+import { performanceErrorMessage } from "../src/api/performanceError.js";
 
-const read = (path) => readFile(new URL(path, import.meta.url), 'utf8')
+const read = (path) => readFile(new URL(path, import.meta.url), "utf8");
 
-test('performance workspace exposes plan, run, node and target routes', async () => {
+test("node upgrade guidance uses the actual configuration and installation response fields", async () => {
+  assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.2.1"}, "0.3.0"), true);
+  assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.3.0"}, "0.3.0"), false);
+  assert.equal(requiresPerformanceNodeUpgrade({status: "pending", agent_version: ""}, "0.3.0"), false);
+  assert.equal(requiresPerformanceNodeUpgrade({status: "revoked", agent_version: "0.2.1"}, "0.3.0"), false);
+  assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.2.1"}, undefined), false);
+  const source = await read("../src/views/perf-testing/PerfWorkspace.vue");
+  assert.match(source, /requiresPerformanceNodeUpgrade\(row, config\.agent_version\)/);
+  assert.match(source, /installationInfo\?\.upgrade_required/);
+  assert.match(source, /copyUpgradeImage\(\s*installationInfo\.image_ref/);
+  assert.doesNotMatch(source, /installation_metadata/);
+});
+
+test("performance workspace exposes plan, run, node and target routes", async () => {
   const [router, layout, tabs] = await Promise.all([
-    read('../src/router/index.js'), read('../src/layouts/MainLayout.vue'), read('../src/stores/tabs.js')
-  ])
-  for (const path of ['/perf-testing/plans', '/perf-testing/runs', '/perf-testing/nodes', '/perf-testing/targets']) {
-    assert.ok(`${router}${layout}${tabs}`.includes(path), `missing ${path}`)
+    read("../src/router/index.js"),
+    read("../src/layouts/MainLayout.vue"),
+    read("../src/stores/tabs.js"),
+  ]);
+  for (const path of [
+    "/perf-testing/plans",
+    "/perf-testing/runs",
+    "/perf-testing/nodes",
+    "/perf-testing/targets",
+  ]) {
+    assert.ok(`${router}${layout}${tabs}`.includes(path), `missing ${path}`);
   }
-  assert.doesNotMatch(router, /PerfScheduledTasks|PerfEnvironments|PerfNotificationReceivers|PerfWorkspacePlaceholder/)
-  assert.doesNotMatch(layout, /perf-testing\/(scheduled-tasks|environments|notification-receivers)/)
-  assert.equal(existsSync(new URL('../src/views/perf-testing/PerfWorkspacePlaceholder.vue', import.meta.url)), false)
-})
+  assert.doesNotMatch(
+    router,
+    /PerfScheduledTasks|PerfEnvironments|PerfNotificationReceivers|PerfWorkspacePlaceholder/,
+  );
+  assert.doesNotMatch(
+    layout,
+    /perf-testing\/(scheduled-tasks|environments|notification-receivers)/,
+  );
+  assert.equal(
+    existsSync(
+      new URL(
+        "../src/views/perf-testing/PerfWorkspacePlaceholder.vue",
+        import.meta.url,
+      ),
+    ),
+    false,
+  );
+});
 
-test('performance API keeps management responses in response.data and node lifecycle calls explicit', async () => {
-  const source = await read('../src/api/performance.js')
-  assert.match(source, /const get = async .*\.data/)
-  assert.match(source, /createPerformanceNode[\s\S]*response\?\.data \?\? response/)
-  assert.match(source, /regeneratePerformanceNodeInstallation[\s\S]*response\?\.data \?\? response/)
-  assert.match(source, /getPerformanceNodeInstallation[\s\S]*nodes\/\$\{id\}\/installation/)
-  assert.ok(source.includes('revokePerformanceNode = (projectId, id, data = {}) => post(`${base(projectId)}/nodes/${id}/revoke/`, data)'))
-  assert.ok(source.includes('deletePerformanceNode = (projectId, id) => remove(`${base(projectId)}/nodes/${id}/`)'))
-  assert.doesNotMatch(source, /resetPerformanceNodeEnrollment/)
-  assert.match(source, /performanceErrorMessage/)
-})
+test("performance API keeps management responses in response.data and node lifecycle calls explicit", async () => {
+  const source = await read("../src/api/performance.js");
+  assert.match(source, /const get = async .*\.data/);
+  assert.match(
+    source,
+    /createPerformanceNode[\s\S]*response\?\.data \?\? response/,
+  );
+  assert.match(
+    source,
+    /regeneratePerformanceNodeInstallation[\s\S]*response\?\.data \?\? response/,
+  );
+  assert.match(
+    source,
+    /getPerformanceNodeInstallation[\s\S]*nodes\/\$\{id\}\/installation/,
+  );
+  assert.ok(
+    source.includes(
+      "revokePerformanceNode = (projectId, id, data = {}) => post(`${base(projectId)}/nodes/${id}/revoke/`, data)",
+    ),
+  );
+  assert.ok(
+    source.includes(
+      "deletePerformanceNode = (projectId, id) => remove(`${base(projectId)}/nodes/${id}/`)",
+    ),
+  );
+  assert.doesNotMatch(source, /resetPerformanceNodeEnrollment/);
+  assert.match(source, /performanceErrorMessage/);
+});
 
-test('workspace creates one-node execution requests and delegates plan editing to the scoped drawer', async () => {
-  const source = await read('../src/views/perf-testing/PerfWorkspace.vue')
-  assert.match(source, /PerformancePlanEditor/)
-  assert.doesNotMatch(source, /<el-tabs/)
-  assert.doesNotMatch(source, /phase-notice/)
-  assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/)
-  assert.match(source, /节点安装向导/)
-  assert.match(source, /getPerformanceNodeInstallation/)
-  assert.match(source, /canUseInstallationCommand\(installationNode\.value, installationDialog\.installation, installationCommandIsExpired\.value\)/)
-  assert.match(source, /copyText\(command\)/)
-  assert.match(source, /v-if="canManageNodes" label="操作"/)
-  assert.match(source, /installationRequestNonce/)
-  assert.match(source, /installationClock\.value = Date\.now\(\)/)
-  assert.match(source, /installationAvailable && canRegenerateInstallation/)
-  assert.match(source, /安装命令已过期。若此前已执行过命令/)
-  assert.match(source, /root 或 Docker 操作权限/)
-  assert.match(source, /一条单行 docker run 命令/)
-  assert.match(source, /终端历史和 docker inspect/)
-  assert.match(source, /docker logs \{\{ installationDialog\.installation\.container_name \}\}/)
-  assert.match(source, /长期身份保存在独立 Docker volume/)
-  assert.match(source, /是否在线以平台收到真实 heartbeat 为准/)
-  assert.match(source, /安装未完成可重新生成命令重试，节点不会自动作废/)
-  assert.match(source, /docker rm -f \{\{ installationInfo\?\.container_name \}\}/)
-  assert.match(source, /不要删除身份 volume/)
-  assert.match(source, /docker restart \{\{ installationInfo\.container_name \}\}/)
-  assert.match(source, /不要重复执行 docker run/)
-  assert.match(source, /旧版已注册节点/)
-  assert.match(source, /不要按新版命名猜测/)
-  assert.match(source, /window\.setInterval\(\(\) => \{ installationClock\.value = Date\.now\(\); return Promise\.all\(\[loadConfig\(requestProjectId, requestEpoch\), loadList\('nodes'/)
-  assert.match(source, /loadAccess\(requestProjectId, requestEpoch\)/)
-  assert.match(source, /preservePlanDraft \? Promise\.resolve\(\) : loadList\('plans', requestProjectId, requestEpoch\)/)
-  assert.match(source, /if \(!canRegenerateInstallation\(node, installationDialog\.installation, installationCommandIsExpired\.value\)\) return[\s\S]*?regeneratePerformanceNodeInstallation/)
-  assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/)
-  assert.match(source, /createPerformanceRun\(scope\.projectId, plan\.id, \{ node_id: nodeId, request_id: requestId \}\)/)
-  assert.match(source, /execution_unavailable_reason/)
-  assert.match(source, /每次仅运行一个节点/)
-  assert.match(source, /运行任务（含停止中）。吊销将请求停止，报告可能不完整/)
-  assert.match(source, /activeRunConflictCount\(error\)/)
-  assert.match(source, /revokePerformanceNode\(scope\.projectId, node\.id, \{ confirm_stop: true \}\)/)
-  assert.match(source, /从节点列表移除，保留历史执行记录和报告；不会卸载远程容器/)
-  assert.match(source, /row\.status === 'revoked'/)
-  assert.match(source, /canDeletePerformanceNode\(row\)/)
-  assert.doesNotMatch(source, /重置身份|resetEnrollment|labelsText|nodeLabelsError|advanced-options/)
-  assert.doesNotMatch(source, /本批仅保存计划，不会执行|本批没有运行任务需要终止/)
-  assert.match(source, /requestEpoch === epoch && String\(projectId\.value\) === String\(requestProjectId\)/)
-  assert.match(source, /clearInterval\(pollTimer\)/)
-  assert.match(source, /Math\.max\(5000, Math\.min\(10000/)
-  assert.match(source, /projectStore\.currentProject\?\.project_type !== 'perf'/)
-  assert.match(source, /if \(saving\.plan\) return/)
-  assert.match(source, /if \(saving\.node\) return/)
-  assert.match(source, /onActivated\(activate\)/)
-  assert.match(source, /onDeactivated\(deactivate\)/)
-  assert.match(source, /preservePlanDraft: planDialog\.visible/)
-})
+test("workspace creates one-node execution requests and delegates plan editing to the scoped drawer", async () => {
+  const source = await read("../src/views/perf-testing/PerfWorkspace.vue");
+  assert.match(source, /PerformancePlanEditor/);
+  assert.doesNotMatch(source, /<el-tabs/);
+  assert.doesNotMatch(source, /phase-notice/);
+  assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/);
+  assert.match(source, /节点安装向导/);
+  assert.match(source, /getPerformanceNodeInstallation/);
+  assert.match(
+    source,
+    /canUseInstallationCommand\(\s*installationNode\.value,\s*installationDialog\.installation,\s*installationCommandIsExpired\.value,?\s*\)/,
+  );
+  assert.match(source, /copyText\(command\)/);
+  assert.match(source, /v-if="canManageNodes"\s+label="操作"/);
+  assert.match(source, /installationRequestNonce/);
+  assert.match(source, /installationClock\.value = Date\.now\(\)/);
+  assert.match(source, /installationAvailable\s+&&\s+canRegenerateInstallation/);
+  assert.match(source, /安装命令已过期。若此前已执行过命令/);
+  assert.match(source, /root 或 Docker\s+操作权限/);
+  assert.match(source, /一条单行 docker run 命令/);
+  assert.match(source, /终端历史和 docker inspect/);
+  assert.match(
+    source,
+    /docker logs \{\{ installationInfo\.container_name \}\}/,
+  );
+  assert.match(source, /长期身份保存在独立 Docker volume/);
+  assert.match(source, /是否在线以平台收到真实 heartbeat 为准/);
+  assert.match(source, /安装未完成可重新生成命令重试，节点不会自动作废/);
+  assert.match(
+    source,
+    /docker rm -f \{\{ installationInfo\?\.container_name \}\}/,
+  );
+  assert.match(source, /不要删除身份\s+volume/);
+  assert.match(
+    source,
+    /docker restart \{\{ installationInfo\.container_name \}\}/,
+  );
+  assert.match(source, /不要重复执行 docker run/);
+  assert.match(source, /旧版已注册节点/);
+  assert.match(source, /不要按新版命名猜测/);
+  assert.match(
+    source,
+    /window\.setInterval\(\s*\(\) => \{\s*installationClock\.value = Date\.now\(\);\s*return Promise\.all\(\s*\[\s*loadConfig\(requestProjectId, requestEpoch\),\s*loadList\("nodes"/,
+  );
+  assert.match(source, /loadAccess\(requestProjectId, requestEpoch\)/);
+  assert.match(
+    source,
+    /preservePlanDraft\s*\?\s*Promise\.resolve\(\)\s*:\s*loadList\("plans", requestProjectId, requestEpoch\)/,
+  );
+  assert.match(
+    source,
+    /if\s*\(\s*!canRegenerateInstallation\(\s*node,\s*installationDialog\.installation,\s*installationCommandIsExpired\.value,?\s*\)\s*\)\s*return[\s\S]*?regeneratePerformanceNodeInstallation/,
+  );
+  assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/);
+  assert.match(
+    source,
+    /createPerformanceRun\(scope\.projectId, plan\.id, \{\s*node_id: nodeId,\s*request_id: requestId,\s*mode: runDialog\.mode \|\| "load",?\s*\}\)/,
+  );
+  assert.match(source, /openRun\(row, ['"]validation['"]\)/);
+  assert.match(source, /execution_unavailable_reason/);
+  assert.match(source, /每次仅运行一个节点/);
+  assert.match(source, /运行任务（含停止中）。吊销将请求停止，报告可能不完整/);
+  assert.match(source, /activeRunConflictCount\(error\)/);
+  assert.match(
+    source,
+    /revokePerformanceNode\(scope\.projectId, node\.id, \{\s*confirm_stop: true,?\s*\}\)/,
+  );
+  assert.match(
+    source,
+    /从节点列表移除，保留历史执行记录和报告；不会卸载远程容器/,
+  );
+  assert.match(source, /row\.status === 'revoked'/);
+  assert.match(source, /canDeletePerformanceNode\(row\)/);
+  assert.doesNotMatch(
+    source,
+    /重置身份|resetEnrollment|labelsText|nodeLabelsError|advanced-options/,
+  );
+  assert.doesNotMatch(
+    source,
+    /本批仅保存计划，不会执行|本批没有运行任务需要终止/,
+  );
+  assert.match(
+    source,
+    /requestEpoch === epoch\s*&&\s*String\(projectId\.value\) === String\(requestProjectId\)/,
+  );
+  assert.match(source, /clearInterval\(pollTimer\)/);
+  assert.match(source, /Math\.max\(5000, Math\.min\(10000/);
+  assert.match(
+    source,
+    /projectStore\.currentProject\?\.project_type !== ['"]perf['"]/,
+  );
+  assert.match(source, /if \(saving\.plan\) return/);
+  assert.match(source, /if \(saving\.node\) return/);
+  assert.match(source, /onActivated\(activate\)/);
+  assert.match(source, /onDeactivated\(deactivate\)/);
+  assert.match(source, /preservePlanDraft: planDialog\.visible/);
+});
 
-test('only the backend platform-admin definition can manage nodes and targets', () => {
-  assert.equal(isPerformancePlatformAdmin({ is_staff: true }), true)
-  assert.equal(isPerformancePlatformAdmin({ is_superuser: true }), true)
-  assert.equal(isPerformancePlatformAdmin({ role: 'admin', is_staff: false, is_superuser: false }), false)
-  assert.equal(isPerformancePlatformAdmin({ owner_username: 'owner' }), false)
+test("only the backend platform-admin definition can manage nodes and targets", () => {
+  assert.equal(isPerformancePlatformAdmin({ is_staff: true }), true);
+  assert.equal(isPerformancePlatformAdmin({ is_superuser: true }), true);
+  assert.equal(
+    isPerformancePlatformAdmin({
+      role: "admin",
+      is_staff: false,
+      is_superuser: false,
+    }),
+    false,
+  );
+  assert.equal(isPerformancePlatformAdmin({ owner_username: "owner" }), false);
 
-  const memberAdmin = { role: 'admin', can_edit: true, can_delete: true }
-  assert.deepEqual(performancePlanPermissions({ role: 'user' }, memberAdmin), { canEdit: true, canDelete: true })
-  assert.deepEqual(performancePlanPermissions({ role: 'user' }, { can_edit: true, can_delete: false }), { canEdit: true, canDelete: false })
-})
+  const memberAdmin = { role: "admin", can_edit: true, can_delete: true };
+  assert.deepEqual(performancePlanPermissions({ role: "user" }, memberAdmin), {
+    canEdit: true,
+    canDelete: true,
+  });
+  assert.deepEqual(
+    performancePlanPermissions(
+      { role: "user" },
+      { can_edit: true, can_delete: false },
+    ),
+    { canEdit: true, canDelete: false },
+  );
+});
 
-test('target mutation payload strips read-only fields and scope guards reject switched projects', () => {
-  assert.deepEqual(buildPerformanceTargetPayload({
-    id: 7, name: ' target ', base_url: ' https://example.test/ ', allowed_methods: ['GET'], created_at: 'old', updated_at: 'old'
-  }), { name: 'target', base_url: 'https://example.test/', allowed_methods: ['GET'] })
-  assert.equal(samePerformanceScope({ projectId: 1, epoch: 4 }, { projectId: '1', epoch: 4 }), true)
-  assert.equal(samePerformanceScope({ projectId: 1, epoch: 4 }, { projectId: 2, epoch: 4 }), false)
-  assert.equal(samePerformanceScope({ projectId: 1, epoch: 4 }, { projectId: 1, epoch: 5 }), false)
-})
+test("target mutation payload strips read-only fields and scope guards reject switched projects", () => {
+  assert.deepEqual(
+    buildPerformanceTargetPayload({
+      id: 7,
+      name: " target ",
+      base_url: " https://example.test/ ",
+      allowed_methods: ["GET"],
+      created_at: "old",
+      updated_at: "old",
+    }),
+    {
+      name: "target",
+      base_url: "https://example.test/",
+      allowed_methods: ["GET"],
+    },
+  );
+  assert.equal(
+    samePerformanceScope(
+      { projectId: 1, epoch: 4 },
+      { projectId: "1", epoch: 4 },
+    ),
+    true,
+  );
+  assert.equal(
+    samePerformanceScope(
+      { projectId: 1, epoch: 4 },
+      { projectId: 2, epoch: 4 },
+    ),
+    false,
+  );
+  assert.equal(
+    samePerformanceScope(
+      { projectId: 1, epoch: 4 },
+      { projectId: 1, epoch: 5 },
+    ),
+    false,
+  );
+});
 
-test('installation presentation follows actual node state without retaining a command', () => {
-  assert.deepEqual(performanceInstallationStage({ status: 'pending' }, { command: 'docker run image' }), { key: 'installing', text: '请在节点终端执行下方单行 docker run 命令，等待节点注册并发送 heartbeat。' })
-  assert.deepEqual(performanceInstallationStage({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: 'docker compose up' }), { key: 'registered', text: '节点已注册，等待首次心跳。' })
-  assert.deepEqual(performanceInstallationStage({ status: 'offline', registered_at: '2026-09-16T00:00:00Z' }, null), { key: 'offline', text: '节点曾注册但当前离线，请先检查 Docker 容器、网络和平台地址。' })
-  assert.deepEqual(performanceInstallationStage({ status: 'online' }, null), { key: 'online', text: '节点已通过真实 heartbeat 在线，可保留此页查看安装条件。' })
-  assert.deepEqual(performanceInstallationStage({ status: 'revoked' }, null), { key: 'revoked', text: '节点已吊销，不能安装或重新注册；如需恢复，请新建节点。' })
-  assert.equal(canRegenerateInstallation({ status: 'pending' }, { command: null }), true)
-  assert.equal(canRegenerateInstallation({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: null }), false)
-  assert.equal(canRegenerateInstallation({ status: 'offline', registered_at: 'yes' }, { command: null }), false)
-  assert.equal(installationCommandExpired({ expires_at: '2026-09-16T00:00:00Z' }, Date.parse('2026-09-16T00:00:01Z')), true)
-  assert.equal(canRegenerateInstallation({ status: 'pending' }, { command: 'old command' }, true), true)
-  assert.equal(canUseInstallationCommand({ status: 'pending', registered_at: null }, { command: 'docker compose up' }), true)
-  assert.equal(canUseInstallationCommand({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: 'docker compose up' }), false)
-  assert.equal(canUseInstallationCommand({ status: 'revoked' }, { command: 'docker compose up' }), false)
-  assert.equal(canUseInstallationCommand({ status: 'pending', registered_at: null }, { command: 'docker compose up' }, true), false)
-  assert.equal(installationArchitectureText(['amd64', 'arm64']), 'x86_64（amd64）、ARM64（arm64）')
-  assert.equal(installationArchitectureText([]), '未配置或未发布')
-})
+test("installation presentation follows actual node state without retaining a command", () => {
+  assert.deepEqual(
+    performanceInstallationStage(
+      { status: "pending" },
+      { command: "docker run image" },
+    ),
+    {
+      key: "installing",
+      text: "请在节点终端执行下方单行 docker run 命令，等待节点注册并发送 heartbeat。",
+    },
+  );
+  assert.deepEqual(
+    performanceInstallationStage(
+      { status: "pending", registered_at: "2026-09-16T00:00:00Z" },
+      { command: "docker compose up" },
+    ),
+    { key: "registered", text: "节点已注册，等待首次心跳。" },
+  );
+  assert.deepEqual(
+    performanceInstallationStage(
+      { status: "offline", registered_at: "2026-09-16T00:00:00Z" },
+      null,
+    ),
+    {
+      key: "offline",
+      text: "节点曾注册但当前离线，请先检查 Docker 容器、网络和平台地址。",
+    },
+  );
+  assert.deepEqual(performanceInstallationStage({ status: "online" }, null), {
+    key: "online",
+    text: "节点已通过真实 heartbeat 在线，可保留此页查看安装条件。",
+  });
+  assert.deepEqual(performanceInstallationStage({ status: "revoked" }, null), {
+    key: "revoked",
+    text: "节点已吊销，不能安装或重新注册；如需恢复，请新建节点。",
+  });
+  assert.equal(
+    canRegenerateInstallation({ status: "pending" }, { command: null }),
+    true,
+  );
+  assert.equal(
+    canRegenerateInstallation(
+      { status: "pending", registered_at: "2026-09-16T00:00:00Z" },
+      { command: null },
+    ),
+    false,
+  );
+  assert.equal(
+    canRegenerateInstallation(
+      { status: "offline", registered_at: "yes" },
+      { command: null },
+    ),
+    false,
+  );
+  assert.equal(
+    installationCommandExpired(
+      { expires_at: "2026-09-16T00:00:00Z" },
+      Date.parse("2026-09-16T00:00:01Z"),
+    ),
+    true,
+  );
+  assert.equal(
+    canRegenerateInstallation(
+      { status: "pending" },
+      { command: "old command" },
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    canUseInstallationCommand(
+      { status: "pending", registered_at: null },
+      { command: "docker compose up" },
+    ),
+    true,
+  );
+  assert.equal(
+    canUseInstallationCommand(
+      { status: "pending", registered_at: "2026-09-16T00:00:00Z" },
+      { command: "docker compose up" },
+    ),
+    false,
+  );
+  assert.equal(
+    canUseInstallationCommand(
+      { status: "revoked" },
+      { command: "docker compose up" },
+    ),
+    false,
+  );
+  assert.equal(
+    canUseInstallationCommand(
+      { status: "pending", registered_at: null },
+      { command: "docker compose up" },
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    installationArchitectureText(["amd64", "arm64"]),
+    "x86_64（amd64）、ARM64（arm64）",
+  );
+  assert.equal(installationArchitectureText([]), "未配置或未发布");
+});
 
-test('node lifecycle helpers restrict regeneration and deletion to safe states', () => {
-  assert.equal(canRegenerateInstallation({ status: 'pending', registered_at: null }, { command: null }), true)
-  assert.equal(canRegenerateInstallation({ status: 'offline', registered_at: null }, { command: null }), false)
-  assert.equal(canRegenerateInstallation({ status: 'pending', registered_at: '2026-09-16T00:00:00Z' }, { command: null }), false)
+test("node lifecycle helpers restrict regeneration and deletion to safe states", () => {
+  assert.equal(
+    canRegenerateInstallation(
+      { status: "pending", registered_at: null },
+      { command: null },
+    ),
+    true,
+  );
+  assert.equal(
+    canRegenerateInstallation(
+      { status: "offline", registered_at: null },
+      { command: null },
+    ),
+    false,
+  );
+  assert.equal(
+    canRegenerateInstallation(
+      { status: "pending", registered_at: "2026-09-16T00:00:00Z" },
+      { command: null },
+    ),
+    false,
+  );
 
-  assert.equal(performanceNodeActiveRunCount({ active_run_count: '2' }), 2)
-  assert.equal(performanceNodeActiveRunCount({ active_run_count: -1 }), 0)
-  assert.equal(nodeHasActiveRuns({ active_run_count: 1 }), true)
-  assert.equal(canDeletePerformanceNode({ status: 'revoked', active_run_count: 0 }), true)
-  assert.equal(canDeletePerformanceNode({ status: 'revoked' }), false)
-  assert.equal(canDeletePerformanceNode({ status: 'revoked', active_run_count: 1 }), false)
-  assert.equal(canDeletePerformanceNode({ status: 'offline', active_run_count: 0 }), false)
-})
+  assert.equal(performanceNodeActiveRunCount({ active_run_count: "2" }), 2);
+  assert.equal(performanceNodeActiveRunCount({ active_run_count: -1 }), 0);
+  assert.equal(nodeHasActiveRuns({ active_run_count: 1 }), true);
+  assert.equal(
+    canDeletePerformanceNode({ status: "revoked", active_run_count: 0 }),
+    true,
+  );
+  assert.equal(canDeletePerformanceNode({ status: "revoked" }), false);
+  assert.equal(
+    canDeletePerformanceNode({ status: "revoked", active_run_count: 1 }),
+    false,
+  );
+  assert.equal(
+    canDeletePerformanceNode({ status: "offline", active_run_count: 0 }),
+    false,
+  );
+});
 
-test('active-run revoke conflicts require a separate explicit confirmation path', () => {
-  assert.equal(activeRunConflictCount({ response: { status: 409, data: { error: { code: 'node_has_active_runs', count: 3 } } } }), 3)
-  assert.equal(activeRunConflictCount({ response: { status: 409, data: { error: { code: 'other', count: 3 } } } }), null)
-  assert.equal(activeRunConflictCount({ response: { status: 500, data: { error: { code: 'node_has_active_runs', count: 3 } } } }), null)
-})
+test("active-run revoke conflicts require a separate explicit confirmation path", () => {
+  assert.equal(
+    activeRunConflictCount({
+      response: {
+        status: 409,
+        data: { error: { code: "node_has_active_runs", count: 3 } },
+      },
+    }),
+    3,
+  );
+  assert.equal(
+    activeRunConflictCount({
+      response: { status: 409, data: { error: { code: "other", count: 3 } } },
+    }),
+    null,
+  );
+  assert.equal(
+    activeRunConflictCount({
+      response: {
+        status: 500,
+        data: { error: { code: "node_has_active_runs", count: 3 } },
+      },
+    }),
+    null,
+  );
+});
 
-test('performance API errors prefer a nested field-specific validation detail', () => {
-  assert.equal(performanceErrorMessage({ response: { data: {
-    message: '数据验证失败', error: { details: { steps: [{ path: ['必须以单个 / 开头'] }] } }
-  } } }), 'steps.path: 必须以单个 / 开头')
-  assert.equal(performanceErrorMessage({ response: { data: { error: { details: { name: ['不能为空'] } } } } }), 'name: 不能为空')
-  assert.equal(performanceErrorMessage({ response: { data: { message: '普通错误' } } }), '普通错误')
-})
+test("performance API errors prefer a nested field-specific validation detail", () => {
+  assert.equal(
+    performanceErrorMessage({
+      response: {
+        data: {
+          message: "数据验证失败",
+          error: { details: { steps: [{ path: ["必须以单个 / 开头"] }] } },
+        },
+      },
+    }),
+    "steps.path: 必须以单个 / 开头",
+  );
+  assert.equal(
+    performanceErrorMessage({
+      response: { data: { error: { details: { name: ["不能为空"] } } } },
+    }),
+    "name: 不能为空",
+  );
+  assert.equal(
+    performanceErrorMessage({ response: { data: { message: "普通错误" } } }),
+    "普通错误",
+  );
+});
 
-test('node statuses and network modes are Chinese display labels without changing backend values', () => {
-  assert.equal(performanceNodeStatusLabel('pending'), '待注册')
-  assert.equal(performanceNodeStatusLabel('online'), '在线')
-  assert.equal(performanceNodeStatusLabel('offline'), '离线')
-  assert.equal(performanceNodeStatusLabel('revoked'), '已吊销')
-  assert.equal(performanceNetworkModeLabel('lan'), '内网')
-  assert.equal(performanceNetworkModeLabel('public'), '公网')
-  assert.equal(performanceNodeStatusLabel('future-value'), 'future-value')
-})
+test("node statuses and network modes are Chinese display labels without changing backend values", () => {
+  assert.equal(performanceNodeStatusLabel("pending"), "待注册");
+  assert.equal(performanceNodeStatusLabel("online"), "在线");
+  assert.equal(performanceNodeStatusLabel("offline"), "离线");
+  assert.equal(performanceNodeStatusLabel("revoked"), "已吊销");
+  assert.equal(performanceNetworkModeLabel("lan"), "内网");
+  assert.equal(performanceNetworkModeLabel("public"), "公网");
+  assert.equal(performanceNodeStatusLabel("future-value"), "future-value");
+});
 
-test('execution permissions remain project-capability based and status text stays Chinese', () => {
-  assert.deepEqual(performanceExecutionPermissions({ role: 'admin' }, { can_execute_tests: false, can_view_reports: false }), { canExecute: false, canReport: false })
-  assert.deepEqual(performanceExecutionPermissions({ is_staff: true }, { can_execute_tests: false, can_view_reports: false }), { canExecute: true, canReport: true })
-  assert.deepEqual(performanceExecutionPermissions({ role: 'user' }, { can_execute_tests: true, can_view_reports: false }), { canExecute: true, canReport: false })
-  assert.equal(performanceRunStatusLabel('running'), '执行中')
-  assert.equal(performanceRunStatusLabel('incomplete'), '执行不完整')
-  assert.equal(canStopPerformanceRun('running'), true)
-  assert.equal(canStopPerformanceRun('stopping'), false)
-})
+test("execution permissions remain project-capability based and status text stays Chinese", () => {
+  assert.deepEqual(
+    performanceExecutionPermissions(
+      { role: "admin" },
+      { can_execute_tests: false, can_view_reports: false },
+    ),
+    { canExecute: false, canReport: false },
+  );
+  assert.deepEqual(
+    performanceExecutionPermissions(
+      { is_staff: true },
+      { can_execute_tests: false, can_view_reports: false },
+    ),
+    { canExecute: true, canReport: true },
+  );
+  assert.deepEqual(
+    performanceExecutionPermissions(
+      { role: "user" },
+      { can_execute_tests: true, can_view_reports: false },
+    ),
+    { canExecute: true, canReport: false },
+  );
+  assert.equal(performanceRunStatusLabel("running"), "执行中");
+  assert.equal(performanceRunStatusLabel("incomplete"), "执行不完整");
+  assert.equal(canStopPerformanceRun("running"), true);
+  assert.equal(canStopPerformanceRun("stopping"), false);
+});
 
-test('execution metrics use the fixed nested sample contract and preserve limits', () => {
-  const samples = Array.from({ length: 401 }, (_, index) => ({ timestamp: `t${index}`, metrics: { rps: index, failures: index % 2, p95: index + 1 } }))
-  assert.equal(metricSamples(samples).length, 400)
-  assert.deepEqual(sampleMetrics(metricSamples(samples)[0]), { rps: 1, failures: 1, p95: 2 })
-  assert.deepEqual(metricEntries({ entries: [{ name: 'GET /health', method: 'GET', requests: 2, failures: 0, avg_response_time: 3, p95: 4, p99: 5 }] }), [{ name: 'GET /health', method: 'GET', requests: 2, failures: 0, avg_response_time: 3, p95: 4, p99: 5 }])
-  assert.equal(formatErrorRate(0.125), '12.50%')
-  assert.equal(completedWithFailures({ status: 'completed', latest_metrics: { failures: 1 } }), true)
-})
+test("execution metrics use the fixed nested sample contract and preserve limits", () => {
+  const samples = Array.from({ length: 401 }, (_, index) => ({
+    timestamp: `t${index}`,
+    metrics: { rps: index, failures: index % 2, p95: index + 1 },
+  }));
+  assert.equal(metricSamples(samples).length, 400);
+  assert.deepEqual(sampleMetrics(metricSamples(samples)[0]), {
+    rps: 1,
+    failures: 1,
+    p95: 2,
+  });
+  assert.deepEqual(
+    metricEntries({
+      entries: [
+        {
+          name: "GET /health",
+          method: "GET",
+          requests: 2,
+          failures: 0,
+          avg_response_time: 3,
+          p95: 4,
+          p99: 5,
+        },
+      ],
+    }),
+    [
+      {
+        name: "GET /health",
+        method: "GET",
+        requests: 2,
+        failures: 0,
+        avg_response_time: 3,
+        p95: 4,
+        p99: 5,
+      },
+    ],
+  );
+  assert.equal(formatErrorRate(0.125), "12.50%");
+  assert.equal(
+    completedWithFailures({
+      status: "completed",
+      latest_metrics: { failures: 1 },
+    }),
+    true,
+  );
+});
 
-test('request id is generated once by the caller and can be reused after a retry', () => {
-  let calls = 0
-  const id = createPerformanceRequestId({ randomUUID: () => { calls += 1; return '123e4567-e89b-12d3-a456-426614174000' } })
-  assert.equal(id, '123e4567-e89b-12d3-a456-426614174000')
-  assert.equal(calls, 1)
-})
-
-test('request id uses cryptographic getRandomValues UUIDv4 fallback without Math.random', () => {
+test("request id is generated once by the caller and can be reused after a retry", () => {
+  let calls = 0;
   const id = createPerformanceRequestId({
-    getRandomValues: (bytes) => { for (let index = 0; index < bytes.length; index += 1) bytes[index] = index; return bytes }
-  })
-  assert.match(id, /^00010203-0405-4607-8809-0a0b0c0d0e0f$/)
-  assert.throws(() => createPerformanceRequestId({}), /安全随机数/)
-})
+    randomUUID: () => {
+      calls += 1;
+      return "123e4567-e89b-12d3-a456-426614174000";
+    },
+  });
+  assert.equal(id, "123e4567-e89b-12d3-a456-426614174000");
+  assert.equal(calls, 1);
+});
 
-test('run screens poll only active runs, use nested samples, and do not expose private commands', async () => {
+test("request id uses cryptographic getRandomValues UUIDv4 fallback without Math.random", () => {
+  const id = createPerformanceRequestId({
+    getRandomValues: (bytes) => {
+      for (let index = 0; index < bytes.length; index += 1)
+        bytes[index] = index;
+      return bytes;
+    },
+  });
+  assert.match(id, /^00010203-0405-4607-8809-0a0b0c0d0e0f$/);
+  assert.throws(() => createPerformanceRequestId({}), /安全随机数/);
+});
+
+test("run screens poll only active runs, use nested samples, and do not expose private commands", async () => {
   const [list, detail] = await Promise.all([
-    read('../src/views/perf-testing/PerfRunList.vue'), read('../src/views/perf-testing/PerfRunDetail.vue')
-  ])
-  assert.match(list, /getPerformanceRuns/)
-  assert.match(list, /v-if="canReport"[\s\S]*PerfRunDetail/)
-  assert.match(detail, /isPerformanceRunActive/)
-  assert.match(detail, /window\.setTimeout\(loadRun, delay\)/)
-  assert.match(detail, /sampleMetrics\(item\)\.rps/)
-  assert.match(detail, /await stopPerformanceRun\(scope\.projectId, scope\.runId\)/)
-  assert.match(detail, /pollFailures\.value <= 3/)
-  assert.match(detail, /yAxisIndex: 2/)
-  assert.doesNotMatch(`${list}${detail}`, /node_command|handshake_token|cert_pem|key_pem/)
-})
+    read("../src/views/perf-testing/PerfRunList.vue"),
+    read("../src/views/perf-testing/PerfRunDetail.vue"),
+  ]);
+  assert.match(list, /getPerformanceRuns/);
+  assert.match(list, /v-if="canReport"[\s\S]*PerfRunDetail/);
+  assert.match(detail, /isPerformanceRunActive/);
+  assert.match(detail, /window\.setTimeout\(loadRun, delay\)/);
+  assert.match(detail, /sampleMetrics\(item\)\.rps/);
+  assert.match(
+    detail,
+    /await stopPerformanceRun\(scope\.projectId, scope\.runId\)/,
+  );
+  assert.match(detail, /pollFailures\.value <= 3/);
+  assert.match(detail, /yAxisIndex: 2/);
+  assert.doesNotMatch(
+    `${list}${detail}`,
+    /node_command|handshake_token|cert_pem|key_pem/,
+  );
+});
 
-test('execution presentation rounds measurements and rejects stale stop scopes', async () => {
-  const workspace = await read('../src/views/perf-testing/PerfWorkspace.vue')
-  assert.equal(formatMetric(12.345), '12.35')
-  assert.equal(formatMetric('bad'), '-')
-  assert.equal(samePerformanceRunScope({ projectId: 1, runId: 'a', scopeEpoch: 2 }, { projectId: '1', runId: 'a', scopeEpoch: 2 }), true)
-  assert.equal(samePerformanceRunScope({ projectId: 1, runId: 'a', scopeEpoch: 2 }, { projectId: 1, runId: 'b', scopeEpoch: 2 }), false)
-  assert.match(workspace, /@change="resetRunRequestId"/)
-  assert.match(workspace, /Promise\.all\(\[loadConfig\(requestProjectId, requestEpoch\), loadList\('nodes'/)
-})
+test("execution presentation rounds measurements and rejects stale stop scopes", async () => {
+  const workspace = await read("../src/views/perf-testing/PerfWorkspace.vue");
+  assert.equal(formatMetric(12.345), "12.35");
+  assert.equal(formatMetric("bad"), "-");
+  assert.equal(
+    samePerformanceRunScope(
+      { projectId: 1, runId: "a", scopeEpoch: 2 },
+      { projectId: "1", runId: "a", scopeEpoch: 2 },
+    ),
+    true,
+  );
+  assert.equal(
+    samePerformanceRunScope(
+      { projectId: 1, runId: "a", scopeEpoch: 2 },
+      { projectId: 1, runId: "b", scopeEpoch: 2 },
+    ),
+    false,
+  );
+  assert.match(workspace, /@change="resetRunRequestId"/);
+  assert.match(
+    workspace,
+    /Promise\.all\(\s*\[\s*loadConfig\(requestProjectId, requestEpoch\),\s*loadList\(\s*"nodes"/,
+  );
+});
 
-test('run detail separates route scope from polling requests so a delayed confirmation can still stop', async () => {
-  const detail = await read('../src/views/perf-testing/PerfRunDetail.vue')
-  assert.match(detail, /let scopeEpoch = 0; let requestEpoch = 0/)
-  assert.match(detail, /const scope = currentScope\(\); const currentRequestEpoch = \+\+requestEpoch/)
-  assert.match(detail, /scopeEpoch \+= 1; stopPolling\(\);[\s\S]*stopping\.value = false/)
-  assert.match(detail, /if \(scopeIsCurrent\(scope\)\) stopping\.value = false/)
-})
+test("run detail separates route scope from polling requests so a delayed confirmation can still stop", async () => {
+  const detail = await read("../src/views/perf-testing/PerfRunDetail.vue");
+  assert.match(detail, /let scopeEpoch = 0;\s*let requestEpoch = 0/);
+  assert.match(
+    detail,
+    /const scope = currentScope\(\);\s*const currentRequestEpoch = \+\+requestEpoch/,
+  );
+  assert.match(
+    detail,
+    /scopeEpoch \+= 1;\s*stopPolling\(\);[\s\S]*stopping\.value = false/,
+  );
+  assert.match(
+    detail,
+    /if \(scopeIsCurrent\(scope\)\) stopping\.value = false/,
+  );
+});

@@ -1,170 +1,248 @@
-let sequence = 0
+let sequence = 0;
+const nextId = (kind) => `perf-${kind}-${++sequence}`;
+const text = (value) => (value == null ? "" : String(value));
+const headerToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const controlCharacter = /[\x00-\x1f\x7f]/;
 const dangerousHeader =
-  /^(host|content-length|transfer-encoding|connection|proxy-authorization|proxy-connection)$/i
-const headerToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
-const controlCharacter = /[\x00-\x1f\x7f]/
-const nextId = (kind) => `perf-${kind}-${++sequence}`
-const asString = (value) => (value == null ? '' : String(value))
+  /^(host|content-length|transfer-encoding|connection|proxy-authorization|proxy-connection)$/i;
 
-export const createKeyValueRow = (key = '', value = '') => ({
-  id: nextId('row'),
-  key: asString(key),
-  value: asString(value),
-})
-export const parsePathAndQuery = (value = '/') => {
-  const question = value.indexOf('?')
-  const path = question < 0 ? value : value.slice(0, question)
-  const queryText = question < 0 ? '' : value.slice(question + 1)
+export const createKeyValueRow = (key = "", value = "") => ({
+  id: nextId("row"),
+  key: text(key),
+  value: text(value),
+});
+export const parsePathAndQuery = (value = "/") => {
+  const [path, queryText = ""] = String(value).split(/\?(.*)/s);
   return {
-    path: path || '/',
+    path: path || "/",
     query: [...new URLSearchParams(queryText)].map(([key, item]) =>
       createKeyValueRow(key, item),
     ),
-  }
-}
+  };
+};
 export const joinPathAndQuery = (path, rows = []) => {
   const query = rows
-    .filter((row) => row.key !== '' || row.value !== '')
+    .filter((row) => row.key !== "" || row.value !== "")
     .map(
       (row) =>
         `${encodeURIComponent(row.key)}=${encodeURIComponent(row.value)}`,
     )
-    .join('&')
-  return query ? `${path}?${query}` : path
-}
+    .join("&");
+  return query ? `${path}?${query}` : path;
+};
+export const jsonErrorMessage = (source, error) => {
+  const position = Number(error?.message?.match(/position (\d+)/)?.[1]);
+  const before = source.slice(
+    0,
+    Number.isInteger(position) ? position : source.length,
+  );
+  return `JSON 第 ${before.split("\n").length} 行，第 ${before.length - before.lastIndexOf("\n")} 列：${error?.message || "语法无效"}`;
+};
+const checkJson = (value, depth = 0) => {
+  if (depth > 10) throw new Error("JSON 嵌套不能超过 10 层。");
+  if (typeof value === "number" && !Number.isFinite(value))
+    throw new Error("JSON 数值必须是有限数值。");
+  if (value && typeof value === "object")
+    Object.values(value).forEach((item) => checkJson(item, depth + 1));
+  return value;
+};
+export const formatJsonText = (source) =>
+  JSON.stringify(checkJson(JSON.parse(source)), null, 2);
+const jsonText = (value) =>
+  JSON.stringify(value === undefined ? null : value, null, 2);
+const parseJsonValue = (source, label) => {
+  if (!String(source).trim())
+    return {
+      error: `${label}不能为空；请输入合法 JSON 值（例如 200、"200"、true、null）。`,
+    };
+  try {
+    return { value: checkJson(JSON.parse(source)) };
+  } catch (error) {
+    return { error: jsonErrorMessage(source, error) };
+  }
+};
+const rowsToObject = (rows, label, header = false) => {
+  const result = {};
+  const keys = new Set();
+  for (const row of rows || []) {
+    const key = text(row.key).trim();
+    const value = text(row.value);
+    if (!key && !value) continue;
+    if (!key) return { error: `${label}参数名不能为空。` };
+    if (
+      header &&
+      (!headerToken.test(key) ||
+        controlCharacter.test(key) ||
+        controlCharacter.test(value))
+    )
+      return { error: `Header “${key}” 格式无效或包含控制字符。` };
+    if (header && dangerousHeader.test(key))
+      return { error: `Header “${key}” 由 HTTP 客户端控制，不能设置。` };
+    if (header && keys.has(key.toLowerCase()))
+      return { error: `${label} “${key}” 重复。` };
+    keys.add(key.toLowerCase());
+    if (!header && Object.hasOwn(result, key))
+      result[key] = Array.isArray(result[key])
+        ? [...result[key], value]
+        : [result[key], value];
+    else result[key] = value;
+  }
+  return { value: result };
+};
+export const createAssertion = (assertion = {}) => ({
+  id: nextId("assertion"),
+  check: assertion.check || "status_code",
+  comparator: assertion.comparator || "eq",
+  expectedText: Object.hasOwn(assertion, "expectedText")
+    ? assertion.expectedText
+    : jsonText(Object.hasOwn(assertion, "expected") ? assertion.expected : 200),
+});
+export const createExtract = (extract = {}) => ({
+  id: nextId("extract"),
+  name: extract.name || "",
+  check: extract.check || "",
+});
 export const createPlanStep = (step = {}) => {
-  const parsed = parsePathAndQuery(step.path || '/')
+  const parsed = parsePathAndQuery(step.path || "/");
+  const hasAssertions = Array.isArray(step.assertions);
+  const assertions = hasAssertions
+    ? step.assertions
+    : [
+        {
+          check: "status_code",
+          comparator: "eq",
+          expected: step.expected_status ?? 200,
+        },
+      ];
+  const query = Object.entries(step.query || {}).flatMap(([key, value]) =>
+    Array.isArray(value)
+      ? value.map((item) => createKeyValueRow(key, item))
+      : [createKeyValueRow(key, value)],
+  );
   return {
-    ui_id: nextId('step'),
-    name: step.name || '',
-    method: step.method || 'GET',
+    ui_id: nextId("step"),
+    name: step.name || "",
+    phase: step.phase === "setup" ? "setup" : "main",
+    method: step.method || "GET",
     path: parsed.path,
-    query: parsed.query,
-    expected_status: step.expected_status ?? 200,
+    query: query.length ? query : parsed.query,
     headers: Object.entries(step.headers || {}).map(([key, value]) =>
       createKeyValueRow(key, value),
     ),
-    bodyMode: step.body == null ? 'none' : 'json',
-    bodyText: step.body == null ? '' : JSON.stringify(step.body, null, 2),
-  }
-}
+    bodyType: step.body_type || (step.body == null ? "none" : "json"),
+    bodyText: step.body_type === 'raw' ? text(step.body) : step.body_type === 'json' ? jsonText(step.body) : step.body == null ? "" : jsonText(step.body),
+    extract: (step.extract || []).map(createExtract),
+    assertions: assertions.map(createAssertion),
+  };
+};
 export const clonePlanStep = (step) => ({
-  ...createPlanStep({
-    name: step.name,
-    method: step.method,
-    path: joinPathAndQuery(step.path, step.query),
-    expected_status: step.expected_status,
-  }),
+  ...createPlanStep({ ...step, path: joinPathAndQuery(step.path, step.query) }),
   query: step.query.map((row) => createKeyValueRow(row.key, row.value)),
   headers: step.headers.map((row) => createKeyValueRow(row.key, row.value)),
-  bodyMode: step.bodyMode,
+  extract: step.extract.map(createExtract),
+  assertions: step.assertions.map(createAssertion),
+  bodyType: step.bodyType,
   bodyText: step.bodyText,
-})
-const lineColumn = (text, position) => {
-  const before = text.slice(0, position)
-  return {
-    line: before.split('\n').length,
-    column: before.length - before.lastIndexOf('\n'),
-  }
-}
-export const jsonErrorMessage = (text, error) => {
-  const position = Number(error?.message?.match(/position (\d+)/)?.[1])
-  if (Number.isInteger(position)) {
-    const { line, column } = lineColumn(text, position)
-    return `JSON 第 ${line} 行，第 ${column} 列：${error.message}`
-  }
-  const { line, column } = lineColumn(text, text.length)
-  return `JSON 第 ${line} 行，第 ${column} 列：${error?.message || '语法无效'}`
-}
-const checkJsonValue = (value, depth = 0) => {
-  if (depth > 10) throw new Error('JSON 嵌套不能超过 10 层。')
-  if (typeof value === 'number' && !Number.isFinite(value))
-    throw new Error('JSON 数值不能超出有限数值范围。')
-  if (value && typeof value === 'object')
-    Object.values(value).forEach((item) => checkJsonValue(item, depth + 1))
-  return value
-}
-export const formatJsonText = (text) =>
-  JSON.stringify(checkJsonValue(JSON.parse(text)), null, 2)
-const headersPayload = (rows) => {
-  const headers = {}
-  const names = new Set()
-  for (const row of rows) {
-    const key = row.key.trim()
-    const value = asString(row.value)
-    if (!key && !value) continue
-    if (!key) return { error: 'Header 名称不能为空。' }
-    if (key.length > 128 || value.length > 4096)
-      return { error: 'Header 名称最多 128 字符，值最多 4096 字符。' }
-    if (!headerToken.test(key))
-      return { error: `Header 名称 “${key}” 不是合法 HTTP token。` }
-    if (controlCharacter.test(key) || controlCharacter.test(value))
-      return { error: `Header “${key}” 不能包含换行或控制字符。` }
-    if (dangerousHeader.test(key))
-      return { error: `Header “${key}” 由请求客户端控制，不能设置。` }
-    const folded = key.toLowerCase()
-    if (names.has(folded)) return { error: `Header “${key}” 重复。` }
-    names.add(folded)
-    Object.defineProperty(headers, key, {
-      value,
-      enumerable: true,
-      configurable: true,
-      writable: true,
-    })
-  }
-  if (names.size > 50) return { error: 'Headers 最多包含 50 项。' }
-  return { value: headers }
-}
+});
 export const serializePlanSteps = (steps, allowedMethods = []) => {
-  const errors = []
-  const result = steps.map((step, index) => {
-    const current = {}
-    const headerResult = headersPayload(step.headers)
-    if (!step.name?.trim()) current.name = '请填写步骤名称。'
-    else if (step.name.trim().length > 200 || controlCharacter.test(step.name))
-      current.name = '步骤名称最多 200 字符，不能含控制字符。'
+  const errors = [];
+  let mainSeen = false;
+  let seenMain = false;
+  const value = steps.map((step, index) => {
+    const current = {};
+    const headers = rowsToObject(step.headers, "Header", true);
+    const query = rowsToObject(step.query, "Query 参数");
+    if (!text(step.name).trim()) current.name = "请填写步骤名称。";
+    if (!["setup", "main"].includes(step.phase))
+      current.phase = "步骤阶段必须是 setup 或 main。";
+    if (step.phase === "main") {
+      seenMain = true;
+      mainSeen = true;
+    } else if (mainSeen) current.phase = "准备步骤必须位于所有 main 步骤之前。";
     if (!allowedMethods.includes(step.method))
-      current.method = '该请求方法未获当前压测目标批准。'
+      current.method = "该请求方法未获当前压测目标批准。";
     if (
-      !Number.isInteger(step.expected_status) ||
-      step.expected_status < 100 ||
-      step.expected_status > 599
+      !/^\/(?!\/)/.test(step.path || "") ||
+      /\\|[\s#]|[\x00-\x1f\x7f]/.test(step.path || "") ||
+      step.path?.includes("?")
     )
-      current.status = '预期 HTTP 状态码必须是 100 到 599 的整数。'
-    if (step.path.includes('?'))
-      current.path = '路径中的 Query 请在下方 Query 参数区域编辑。'
-    else if (
-      !/^\/(?!\/)/.test(step.path || '') ||
-      /\\|[\s#]|[\x00-\x1f\x7f]/.test(step.path || '')
-    )
-      current.path =
-        '路径必须以单个 / 开头，且不能包含空格、#、反斜线或控制字符。'
-    else if (joinPathAndQuery(step.path, step.query).length > 2048)
-      current.path = '路径与 Query 合计不能超过 2048 字符。'
-    if (step.query.find((row) => !row.key && row.value))
-      current.query = 'Query 参数名不能为空。'
-    if (headerResult.error) current.headers = headerResult.error
-    let body = null
-    if (step.bodyMode === 'json') {
-      try {
-        body = checkJsonValue(JSON.parse(step.bodyText))
-      } catch (error) {
-        current.body = jsonErrorMessage(step.bodyText, error)
-      }
+      current.path = "路径必须以单个 / 开头，且 Query 请在下方区域编辑。";
+    if (headers.error) current.headers = headers.error;
+    if (query.error) current.query = query.error;
+    let body = null;
+    if (!["none", "json", "form", "raw"].includes(step.bodyType))
+      current.body = "请求体类型必须是 none、json、form 或 raw。";
+    else if (step.bodyType === "json" || step.bodyType === "form") {
+      const parsed = parseJsonValue(
+        step.bodyText,
+        step.bodyType === "json" ? "JSON 请求体" : "Form 请求体",
+      );
+      if (
+        parsed.error ||
+        (step.bodyType === "form" &&
+          (!parsed.value ||
+            Array.isArray(parsed.value) ||
+            typeof parsed.value !== "object"))
+      )
+        current.body = parsed.error || "Form 请求体必须是 JSON 对象。";
+      else body = parsed.value;
+    } else if (step.bodyType === "raw") {
+      if (!text(step.bodyText)) current.body = "Raw 请求体不能为空。";
+      else body = step.bodyText;
     }
-    if (Object.keys(current).length) errors[index] = current
+    const assertions = (step.assertions || [])
+      .map((assertion, assertionIndex) => {
+        const parsed = parseJsonValue(
+          assertion.expectedText,
+          `第 ${assertionIndex + 1} 条断言 expected`,
+        );
+        if (
+          !text(assertion.check).trim() ||
+          !text(assertion.comparator).trim() ||
+          parsed.error
+        ) {
+          current.assertions =
+            parsed.error ||
+            `第 ${assertionIndex + 1} 条断言的检查字段和比较器不能为空。`;
+          return null;
+        }
+        return {
+          check: assertion.check.trim(),
+          comparator: assertion.comparator.trim(),
+          expected: parsed.value,
+        };
+      })
+      .filter(Boolean);
+    if (!step.assertions?.length)
+      current.assertions = "每个步骤至少需要一条可执行断言。";
+    const extract = (step.extract || [])
+      .map((item, extractIndex) => {
+        if (!text(item.name).trim() || !text(item.check).trim()) {
+          current.extract = `第 ${extractIndex + 1} 条提取的变量名和路径不能为空。`;
+          return null;
+        }
+        return { name: item.name.trim(), check: item.check.trim() };
+      })
+      .filter(Boolean);
+    if (Object.keys(current).length) errors[index] = current;
     return {
-      name: step.name.trim(),
+      name: text(step.name).trim(),
+      phase: step.phase,
       method: step.method,
-      path: joinPathAndQuery(step.path, step.query),
-      expected_status: step.expected_status,
-      headers: headerResult.value || {},
+      path: step.path,
+      query: query.value || {},
+      headers: headers.value || {},
+      body_type: step.bodyType,
       body,
-    }
-  })
-  return { value: errors.length ? null : result, errors }
-}
+      extract,
+      assertions,
+    };
+  });
+  if (!seenMain)
+    errors[0] = { ...(errors[0] || {}), phase: "至少需要一个 main 步骤。" };
+  return { value: errors.length ? null : value, errors };
+};
 export const previewStepUrl = (target, step) =>
   target?.base_url
-    ? `${target.base_url.replace(/\/$/, '')}${joinPathAndQuery(step.path || '/', step.query)}`
-    : '请选择压测目标后预览最终 URL'
+    ? `${target.base_url.replace(/\/$/, "")}${joinPathAndQuery(step.path || "/", step.query)}`
+    : "请选择压测目标后预览最终 URL";

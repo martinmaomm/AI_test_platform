@@ -32,6 +32,10 @@ export const canDeletePerformanceNode = (node) => (
 
 export const nodeHasActiveRuns = (node) => performanceNodeActiveRunCount(node) > 0
 
+export const requiresPerformanceNodeUpgrade = (node, expectedVersion) => Boolean(
+  node?.status !== 'revoked' && node?.agent_version && expectedVersion && node.agent_version !== expectedVersion
+)
+
 export const activeRunConflictCount = (error) => {
   const data = error?.response?.data
   if (error?.response?.status !== 409 || data?.error?.code !== 'node_has_active_runs') return null

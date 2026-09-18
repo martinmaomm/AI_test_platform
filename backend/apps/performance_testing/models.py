@@ -42,6 +42,8 @@ class PerformancePlan(models.Model):
     spawn_rate = models.FloatField(default=1)
     duration_seconds = models.PositiveIntegerField(default=30)
     wait_seconds = models.FloatField(default=1)
+    variables = models.JSONField(default=dict)
+    unique_variables = models.JSONField(default=list)
     steps = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -111,6 +113,10 @@ class PerformanceNode(models.Model):
 
 
 class PerformanceRun(models.Model):
+    class Mode(models.TextChoices):
+        VALIDATION = 'validation', 'Validation'
+        LOAD = 'load', 'Load'
+
     class Status(models.TextChoices):
         QUEUED = 'queued', 'Queued'
         PREPARING = 'preparing', 'Preparing'
@@ -144,6 +150,8 @@ class PerformanceRun(models.Model):
         related_name='created_performance_runs',
     )
     request_id = models.UUIDField()
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.LOAD)
+    validation_key = models.CharField(max_length=64, blank=True, default='', db_index=True)
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.QUEUED,
     )

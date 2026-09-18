@@ -25,20 +25,27 @@ from performance_node.locust_runtime import canonical_sha256, validate_snapshot
 
 def make_snapshot(run_id: str, node_id: str) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "node_id": node_id,
         "engine_version": "2.43.3",
         "plan_name": "fixture",
         "base_url": "https://target.example",
         "allowed_methods": ["GET"],
+        "mode": "validation",
+        "validation_key": "a" * 64,
         "users": 1,
         "spawn_rate": 1,
         "duration_seconds": 5,
         "wait_seconds": 0.1,
+        "variables": {},
+        "unique_variables": [],
         "steps": [{
-            "name": "health", "method": "GET", "path": "/health",
-            "expected_status": 200, "headers": {}, "body": None,
+            "name": "health", "phase": "main", "method": "GET", "path": "/health",
+            "query": {}, "headers": {}, "body_type": "none", "body": None,
+            "extract": [], "assertions": [
+                {"check": "status_code", "comparator": "eq", "expected": 200},
+            ],
         }],
     }
 

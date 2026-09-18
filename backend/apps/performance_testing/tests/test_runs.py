@@ -59,10 +59,12 @@ class PerformanceRunContractTests(TestCase):
         self.plan = PerformancePlan.objects.create(
             project=self.project, target=self.target, name='frozen plan', users=2,
             spawn_rate=1.5, duration_seconds=5, wait_seconds=.5,
+            variables={}, unique_variables=[],
             steps=[{
-                'name': 'list', 'method': 'GET', 'path': '/items?limit=1',
-                'expected_status': 200, 'headers': {'Accept': 'application/json'},
-                'body': None,
+                'name': 'list', 'phase': 'main', 'method': 'GET', 'path': '/items',
+                'query': {'limit': 1}, 'headers': {'Accept': 'application/json'},
+                'body_type': 'none', 'body': None, 'extract': [],
+                'assertions': [{'check': 'status_code', 'comparator': 'eq', 'expected': 200}],
             }],
         )
         self.node, self.agent_token = self._node('node-one')
@@ -94,11 +96,12 @@ class PerformanceRunContractTests(TestCase):
     def _path(self, suffix):
         return f'/api/v1/projects/{self.project.pk}/performance/{suffix}'
 
-    def _create(self, request_id=None, node=None):
+    def _create(self, request_id=None, node=None, mode='validation'):
         self.client.force_authenticate(self.executor)
         return self.client.post(
             self._path(f'plans/{self.plan.pk}/runs/'),
-            {'node_id': str((node or self.node).pk), 'request_id': str(request_id or uuid.uuid4())},
+            {'node_id': str((node or self.node).pk),
+             'request_id': str(request_id or uuid.uuid4()), 'mode': mode},
             format='json',
         )
 
@@ -115,9 +118,14 @@ class PerformanceRunContractTests(TestCase):
         run = PerformanceRun.objects.get(pk=created.data['data']['id'])
         self.assertEqual(set(run.snapshot), {
             'schema_version', 'run_id', 'node_id', 'engine_version', 'plan_name',
-            'base_url', 'allowed_methods', 'users', 'spawn_rate', 'duration_seconds',
-            'wait_seconds', 'steps',
+            'base_url', 'allowed_methods', 'mode', 'validation_key', 'users',
+            'spawn_rate', 'duration_seconds', 'wait_seconds', 'variables',
+            'unique_variables', 'steps',
         })
+        self.assertEqual(run.snapshot['schema_version'], 2)
+        self.assertEqual((run.snapshot['users'], run.snapshot['spawn_rate']), (1, 1))
+        self.assertEqual(run.snapshot['duration_seconds'], 120)
+        self.assertEqual(created.data['data']['validation_status'], 'pending')
         self.assertEqual(run.snapshot['run_id'], str(run.pk))
         self.assertEqual(len(run.snapshot_sha256), 64)
         run.node_command = {
@@ -149,6 +157,69 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(conflict.status_code, 409, conflict.data)
         self.assertEqual(PerformanceRun.objects.count(), 1)
 
+        mode_conflict = self._create(request_id, mode='load')
+        self.assertEqual(mode_conflict.status_code, 409, mode_conflict.data)
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_load_requires_matching_successful_real_validation_and_edits_make_it_stale(self, _):
+        self.client.force_authenticate(self.executor)
+        no_validation = self.client.post(
+            self._path(f'plans/{self.plan.pk}/runs/'),
+            {'node_id': str(self.node.pk), 'request_id': str(uuid.uuid4())},
+            format='json',
+        )
+        self.assertEqual(no_validation.status_code, 400, no_validation.data)
+        self.assertEqual(no_validation.data['error']['code'], 'run_validation_failed')
+
+        invalid_mode = self.client.post(
+            self._path(f'plans/{self.plan.pk}/runs/'),
+            {'node_id': str(self.node.pk), 'request_id': str(uuid.uuid4()), 'mode': 'smoke'},
+            format='json',
+        )
+        self.assertEqual(invalid_mode.status_code, 400, invalid_mode.data)
+
+        validation_response = self._create(mode='validation')
+        validation = PerformanceRun.objects.get(pk=validation_response.data['data']['id'])
+        validation.status = PerformanceRun.Status.COMPLETED
+        validation.finished_at = timezone.now()
+        validation.latest_metrics = {
+            'complete': True, 'requests': 1, 'failures': 0,
+            'validation_complete': True, 'validation_passed': True,
+            'main_steps_completed': 1, 'main_steps_total': 1,
+        }
+        validation.save(update_fields=('status', 'finished_at', 'latest_metrics'))
+        passed = self.client.get(self._path(f'runs/{validation.pk}/'))
+        self.assertEqual(passed.data['data']['validation_status'], 'passed')
+
+        allowed = self._create(mode='load')
+        self.assertEqual(allowed.status_code, 201, allowed.data)
+        load = PerformanceRun.objects.get(pk=allowed.data['data']['id'])
+        self.assertEqual((load.snapshot['users'], load.snapshot['spawn_rate']), (2, 1.5))
+        self.assertEqual(load.snapshot['duration_seconds'], 5)
+        self.assertEqual(allowed.data['data']['validation_status'], 'not_applicable')
+
+        self.plan.variables = {'changed': True}
+        self.plan.save(update_fields=('variables',))
+        stale = self.client.get(self._path(f'runs/{validation.pk}/'))
+        self.assertEqual(stale.data['data']['validation_status'], 'stale')
+        rejected = self._create(mode='load')
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_validation_must_include_real_requests_and_all_main_steps(self, _):
+        validation = PerformanceRun.objects.get(pk=self._create().data['data']['id'])
+        validation.status = PerformanceRun.Status.COMPLETED
+        validation.latest_metrics = {
+            'complete': True, 'requests': 0, 'validation_complete': True,
+            'validation_passed': True, 'main_steps_completed': 1, 'main_steps_total': 1,
+        }
+        validation.save(update_fields=('status', 'latest_metrics'))
+        self.assertEqual(self._create(mode='load').status_code, 400)
+        validation.latest_metrics['requests'] = 1
+        validation.latest_metrics['main_steps_completed'] = 0
+        validation.save(update_fields=('latest_metrics',))
+        self.assertEqual(self._create(mode='load').status_code, 400)
+
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_create_rechecks_template_security_and_node_version(self, _):
         self.plan.steps[0]['headers'] = {'Host': 'evil.example.test'}
@@ -164,10 +235,11 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(rejected.status_code, 400, rejected.data)
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
-    def test_agent_020_remains_execution_compatible(self, _):
+    def test_agent_020_heartbeat_compatibility_does_not_grant_schema2_execution(self, _):
         PerformanceNode.objects.filter(pk=self.node.pk).update(agent_version='0.2.0')
         created = self._create()
-        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.status_code, 400, created.data)
+        self.assertIn('0.3.0', created.data['error']['message'])
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_new_run_rejects_deleted_node_even_with_valid_plan_and_version(self, _):
@@ -226,7 +298,8 @@ class PerformanceRunContractTests(TestCase):
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_execute_without_report_never_receives_detail_fields(self, _):
         request_id = uuid.uuid4()
-        payload = {'node_id': str(self.node.pk), 'request_id': str(request_id)}
+        payload = {'node_id': str(self.node.pk), 'request_id': str(request_id),
+                   'mode': 'validation'}
         self.client.force_authenticate(self.execute_only)
         created = self.client.post(
             self._path(f'plans/{self.plan.pk}/runs/'), payload, format='json',

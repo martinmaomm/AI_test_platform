@@ -14,7 +14,6 @@ import socket
 import sys
 import tempfile
 import threading
-from urllib.parse import parse_qsl, urlsplit
 from unittest.mock import patch
 from wsgiref.simple_server import make_server
 
@@ -160,6 +159,11 @@ def verify_browser(origin, fixture, output):
             input_of('plan-name').fill('可重复编辑的隔离计划')
             input_of('step-name').fill('列表查询')
             input_of('step-path').fill('/products')
+            input_of('plan-variables').fill('{"page_size":10,"enabled":true}')
+            unique = page.get_by_test_id('plan-unique-variables')
+            unique.get_by_role('button', name='添加唯一变量').click()
+            unique.locator('input').nth(0).fill('iteration_name')
+            unique.locator('input').nth(1).fill('fixture_')
             add_row('step-query-rows', 'tag', '手机 配件')
             add_row('step-query-rows', 'tag', 'a+b')
             add_row('step-query-rows', 'empty', '')
@@ -190,7 +194,7 @@ def verify_browser(origin, fixture, output):
             assert json.loads(input_of('step-body-json').input_value())['count'] == 0
             page.get_by_test_id('plan-step-list').locator('button').first.click()
             expect(input_of('step-body-json')).to_have_value('{')
-            editor().get_by_role('button', name='删除', exact=True).click()
+            editor().locator('.steps .heading').get_by_role('button', name='删除', exact=True).click()
             expect(input_of('step-name')).to_have_value('列表查询')
             expect(page.get_by_test_id('plan-step-list').locator('button')).to_have_count(1)
 
@@ -203,12 +207,18 @@ def verify_browser(origin, fixture, output):
             assert saved.value.status == 201, saved.value.text()
             saved_plan = saved.value.json()['data']
             step = saved_plan['steps'][0]
-            assert set(step) == {'name', 'method', 'path', 'expected_status', 'headers', 'body'}
-            assert parse_qsl(urlsplit(step['path']).query, keep_blank_values=True) == [
-                ('tag', '手机 配件'), ('tag', 'a+b'), ('empty', ''),
-            ]
+            assert set(step) == {
+                'name', 'phase', 'method', 'path', 'query', 'headers',
+                'body_type', 'body', 'extract', 'assertions',
+            }
+            assert step['path'] == '/products'
+            assert step['query'] == {'tag': ['手机 配件', 'a+b'], 'empty': ''}
             assert step['body'] == {'count': 0, 'enabled': False, 'items': [1, 2]}
-            assert step['headers'] == {'X-Test': 'fixture-only'} and type(step['expected_status']) is int
+            assert step['body_type'] == 'json' and step['phase'] == 'main'
+            assert step['headers'] == {'X-Test': 'fixture-only'}
+            assert step['assertions'] == [{'check': 'status_code', 'comparator': 'eq', 'expected': 200}]
+            assert saved_plan['variables'] == {'page_size': 10, 'enabled': True}
+            assert saved_plan['unique_variables'] == [{'name': 'iteration_name', 'prefix': 'fixture_'}]
             assert saved_plan['target_id'] == target_id
             expect(editor()).not_to_be_visible()
             page.get_by_role('button', name='编辑', exact=True).click()
@@ -303,7 +313,7 @@ def main():
             plan = PerformancePlan.objects.get(pk=result.pop('plan_id'))
             # Validate the exact saved payload with the real node contract;
             # no run row, node row, Worker or target request is created.
-            snapshot, digest = _snapshot_for(uuid.uuid4(), plan, PerformanceNode(project=plan.project))
+            snapshot, digest = _snapshot_for(uuid.uuid4(), plan, PerformanceNode(project=plan.project), 'load')
             assert snapshot['steps'] == plan.steps
             assert digest
             assert not PerformanceRun.objects.exists() and not attempted_runs

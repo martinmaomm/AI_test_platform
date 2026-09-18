@@ -9,7 +9,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from ai_core.models import LLMConfiguration
-from projects.models import Project
+from projects.models import Project, ProjectMember
 
 from .browser_discovery import _refresh_dependency_candidates, origin_state_file
 from .browser_discovery_views import BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView
@@ -21,6 +21,10 @@ class BrowserDiscoverySourceHandoffTests(TestCase):
         self.owner = get_user_model().objects.create_user(username='source-handoff-owner', password='fixture-only')
         self.project = Project.objects.create(
             name='Browser source handoff', project_type='api', owner=self.owner, created_by=self.owner,
+        )
+        ProjectMember.objects.create(
+            project=self.project, user=self.owner, role='editor', can_edit=True,
+            can_delete=True, can_execute_tests=True, can_view_reports=True,
         )
         self.model = LLMConfiguration.objects.create(
             model_type='llm', provider='offline', model_name='source-handoff-offline', created_by=self.owner,

@@ -172,6 +172,7 @@ const routes = [
       { path: '', redirect: '/perf-testing/plans' },
       { path: 'workspace', redirect: '/perf-testing/plans' },
       { path: 'plans', name: 'PerfPlans', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '压测计划' } },
+      { path: 'discovery', name: 'PerfDiscovery', component: () => import('@/views/perf-testing/PerfDiscovery.vue'), meta: { title: '网页探索', cache: false } },
       { path: 'runs', name: 'PerfRuns', component: () => import('@/views/perf-testing/PerfRunList.vue'), meta: { title: '执行记录' } },
       { path: 'runs/:runId', name: 'PerfRunDetail', component: () => import('@/views/perf-testing/PerfRunDetail.vue'), meta: { title: '执行详情' } },
       { path: 'nodes', name: 'PerfNodes', component: () => import('@/views/perf-testing/PerfWorkspace.vue'), meta: { title: '节点管理' } },

@@ -487,6 +487,13 @@ def installation_metadata(*, node=None, enrollment_token=None):
             release.architecture for release in configuration.architectures
         ],
         'agent_version': configuration.agent_version,
+        # Public immutable image reference; existing nodes need it for a manual
+        # image-only upgrade, without issuing a second enrollment credential.
+        'image_ref': configuration.registry_index_ref,
+        'upgrade_required': bool(
+            node is not None and getattr(node, 'agent_version', '')
+            and node.agent_version != configuration.agent_version
+        ),
         'expires_at': expires_at,
         'requirements': list(INSTALLATION_REQUIREMENTS),
     }

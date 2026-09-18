@@ -1,7 +1,7 @@
 import json
 import math
 import re
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import URLValidator
@@ -15,6 +15,16 @@ from .models import PerformanceNode, PerformancePlan, PerformanceRun, Performanc
 
 
 _CONTROL_RE = re.compile(r'[\x00-\x1f\x7f]')
+_VARIABLE_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$')
+_VARIABLE_REF_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]{0,63})\}')
+_SELECTOR_RE = re.compile(
+    r'^(?:status_code|text|headers\.[!#$%&\'*+.^_`|~0-9A-Za-z-]{1,128}'
+    r'|body(?:\.[A-Za-z_][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]*)\])*)$'
+)
+_FORBIDDEN_HEADERS = {
+    'host', 'content-length', 'transfer-encoding', 'connection',
+    'proxy-authorization', 'proxy-connection',
+}
 
 
 class StrictSerializer(serializers.Serializer):
@@ -156,13 +166,84 @@ class PerformanceTargetSerializer(StrictModelSerializer):
         return attrs
 
 
+class PlanExtractSerializer(StrictSerializer):
+    name = serializers.CharField(max_length=64)
+    check = serializers.CharField(max_length=512)
+
+    def validate_name(self, value):
+        if not _VARIABLE_NAME_RE.fullmatch(value):
+            raise serializers.ValidationError('变量名只能使用字母、数字和下划线，且不能以数字开头。')
+        return value
+
+    def validate_check(self, value):
+        if not _SELECTOR_RE.fullmatch(value):
+            raise serializers.ValidationError('提取选择器不受支持。')
+        return value
+
+
+class PlanAssertionSerializer(StrictSerializer):
+    check = serializers.CharField(max_length=512)
+    comparator = serializers.ChoiceField(choices=(
+        'eq', 'ne', 'contains', 'not_contains', 'gt', 'ge', 'lt', 'le',
+        'type', 'length', 'length_gt', 'exists',
+    ))
+    expected = serializers.JSONField(allow_null=True)
+
+    def validate_check(self, value):
+        if not _SELECTOR_RE.fullmatch(value):
+            raise serializers.ValidationError('断言选择器不受支持。')
+        return value
+
+    def validate(self, attrs):
+        expected = attrs.get('expected')
+        comparator = attrs.get('comparator')
+        _validate_json_value(expected)
+        if comparator == 'type' and (
+            not isinstance(expected, str) or expected not in {
+                'null', 'boolean', 'number', 'string', 'object', 'list',
+            }
+        ):
+            raise serializers.ValidationError({'expected': 'type 断言的 expected 类型名称无效。'})
+        if comparator in {'length', 'length_gt'} and (
+            isinstance(expected, bool) or not isinstance(expected, int) or expected < 0
+        ):
+            raise serializers.ValidationError({'expected': '长度断言的 expected 必须是非负整数。'})
+        if comparator in {'gt', 'ge', 'lt', 'le'} and (
+            isinstance(expected, bool) or not isinstance(expected, (int, float))
+            or not math.isfinite(expected)
+        ):
+            raise serializers.ValidationError({'expected': '数值比较的 expected 必须是有限数值。'})
+        if comparator == 'exists' and not isinstance(expected, bool):
+            raise serializers.ValidationError({'expected': 'exists 断言的 expected 必须是布尔值。'})
+        return attrs
+
+
+class UniqueVariableSerializer(StrictSerializer):
+    name = serializers.CharField(max_length=64)
+    prefix = serializers.CharField(max_length=200, allow_blank=True, default='')
+
+    def validate_name(self, value):
+        if not _VARIABLE_NAME_RE.fullmatch(value):
+            raise serializers.ValidationError('变量名只能使用字母、数字和下划线，且不能以数字开头。')
+        return value
+
+    def validate_prefix(self, value):
+        if _CONTROL_RE.search(value):
+            raise serializers.ValidationError('唯一值前缀不能包含控制字符。')
+        return value
+
+
 class PlanStepSerializer(StrictSerializer):
     name = serializers.CharField(max_length=200)
+    phase = serializers.ChoiceField(choices=('setup', 'main'))
     method = serializers.ChoiceField(choices=ALLOWED_HTTP_METHODS)
     path = serializers.CharField(max_length=2048)
-    expected_status = StrictIntegerField(min_value=100, max_value=599, default=200)
+    query = serializers.DictField(default=dict)
     headers = serializers.DictField(default=dict)
-    body = serializers.JSONField(allow_null=True, default=None)
+    body_type = serializers.ChoiceField(choices=('none', 'json', 'form', 'raw'))
+    body = serializers.JSONField(allow_null=True)
+    extract = PlanExtractSerializer(many=True, default=list)
+    assertions = PlanAssertionSerializer(many=True, allow_empty=False)
 
     def validate_name(self, value):
         value = value.strip()
@@ -177,8 +258,26 @@ class PlanStepSerializer(StrictSerializer):
         ):
             raise serializers.ValidationError('path 必须以单个 / 开头，且不能包含绝对 URL、反斜线或控制字符。')
         parsed = urlsplit(value)
-        if parsed.scheme or parsed.netloc:
-            raise serializers.ValidationError('path 不能是绝对 URL。')
+        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or '?' in value or '#' in value:
+            raise serializers.ValidationError('path 不能是绝对 URL，也不能包含查询或片段。')
+        if any(unquote(segment).casefold() in {'.', '..'} for segment in value.split('/')):
+            raise serializers.ValidationError('path 不能包含相对目录段。')
+        return value
+
+    def validate_query(self, value):
+        if len(value) > 100:
+            raise serializers.ValidationError('query 最多包含 100 项。')
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 256 or _CONTROL_RE.search(key):
+                raise serializers.ValidationError('query 参数名无效。')
+            values = item if isinstance(item, list) else [item]
+            if not values or any(
+                isinstance(part, (dict, list)) or part is not None and not isinstance(part, (str, bool, int, float))
+                for part in values
+            ):
+                raise serializers.ValidationError('query 参数值必须是 JSON 标量或非空标量数组。')
+            for part in values:
+                _validate_json_value(part)
         return value
 
     def validate_headers(self, value):
@@ -188,7 +287,11 @@ class PlanStepSerializer(StrictSerializer):
         for key, item in value.items():
             if not isinstance(key, str) or not isinstance(item, str):
                 raise serializers.ValidationError('header 名称和值必须是字符串。')
-            if not key or len(key) > 128 or len(item) > 4096 or _CONTROL_RE.search(key) or _CONTROL_RE.search(item):
+            if (
+                not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", key)
+                or key.lower() in _FORBIDDEN_HEADERS or len(item) > 4096
+                or _CONTROL_RE.search(item)
+            ):
                 raise serializers.ValidationError('header 名称或值无效。')
             normalized[key] = item
         return normalized
@@ -196,6 +299,19 @@ class PlanStepSerializer(StrictSerializer):
     def validate_body(self, value):
         _validate_json_value(value)
         return value
+
+    def validate(self, attrs):
+        body_type = attrs.get('body_type')
+        body = attrs.get('body')
+        if body_type == 'none' and body is not None:
+            raise serializers.ValidationError({'body': 'body_type=none 时 body 必须为 null。'})
+        if body_type == 'form' and not isinstance(body, dict):
+            raise serializers.ValidationError({'body': 'form 请求体必须是 JSON 对象。'})
+        if body_type == 'raw' and not isinstance(body, str):
+            raise serializers.ValidationError({'body': 'raw 请求体必须是字符串。'})
+        if body_type == 'form':
+            self.validate_query(body)
+        return attrs
 
 
 class PerformancePlanSerializer(StrictModelSerializer):
@@ -206,13 +322,16 @@ class PerformancePlanSerializer(StrictModelSerializer):
     spawn_rate = StrictFloatField(min_value=0.000001, max_value=MAX_SPAWN_RATE, default=1)
     duration_seconds = StrictIntegerField(min_value=1, max_value=MAX_DURATION_SECONDS, default=30)
     wait_seconds = StrictFloatField(min_value=0.1, max_value=60, default=1)
+    variables = serializers.DictField(default=dict)
+    unique_variables = UniqueVariableSerializer(many=True, default=list)
     steps = PlanStepSerializer(many=True, allow_empty=False)
 
     class Meta:
         model = PerformancePlan
         fields = (
             'id', 'name', 'description', 'target_id', 'users', 'spawn_rate',
-            'duration_seconds', 'wait_seconds', 'steps', 'created_at', 'updated_at',
+            'duration_seconds', 'wait_seconds', 'variables', 'unique_variables',
+            'steps', 'created_at', 'updated_at',
         )
         read_only_fields = ('id', 'created_at', 'updated_at')
 
@@ -241,9 +360,86 @@ class PerformancePlanSerializer(StrictModelSerializer):
             raise serializers.ValidationError(f'步骤最多 {MAX_STEPS} 项。')
         return value
 
+    def validate_variables(self, value):
+        if len(value) > 100:
+            raise serializers.ValidationError('variables 最多包含 100 项。')
+        for key, item in value.items():
+            if not isinstance(key, str) or not _VARIABLE_NAME_RE.fullmatch(key):
+                raise serializers.ValidationError('variables 的变量名无效。')
+            _validate_json_value(item)
+        return value
+
+    @staticmethod
+    def _references(value):
+        if isinstance(value, str):
+            return set(_VARIABLE_REF_RE.findall(value))
+        if isinstance(value, list):
+            result = set()
+            for item in value:
+                result.update(PerformancePlanSerializer._references(item))
+            return result
+        if isinstance(value, dict):
+            result = set()
+            for key, item in value.items():
+                result.update(_VARIABLE_REF_RE.findall(key))
+                result.update(PerformancePlanSerializer._references(item))
+            return result
+        return set()
+
+    def _validate_data_flow(self, variables, unique_variables, steps):
+        fixed = set(variables)
+        unique = [item['name'] for item in unique_variables]
+        if len(unique) != len(set(unique)):
+            raise serializers.ValidationError({'unique_variables': '唯一变量名不能重复。'})
+        if fixed.intersection(unique):
+            raise serializers.ValidationError({'unique_variables': '固定变量与唯一变量不能同名。'})
+        extracted = set()
+        setup_available = set(fixed)
+        setup_outputs = set()
+        main_available = None
+        main_seen = False
+        main_count = 0
+        for index, step in enumerate(steps):
+            phase = step['phase']
+            if phase == 'setup' and main_seen:
+                raise serializers.ValidationError({'steps': '所有 setup 步骤必须位于 main 步骤之前。'})
+            if phase == 'main':
+                main_seen = True
+                main_count += 1
+                if main_available is None:
+                    main_available = fixed | set(unique) | setup_outputs
+                available = main_available
+            else:
+                available = setup_available
+            request_values = {
+                'path': step['path'], 'query': step['query'], 'headers': step['headers'],
+                'body': step['body'],
+            }
+            undefined = sorted(self._references(request_values) - available)
+            if undefined:
+                raise serializers.ValidationError({
+                    'steps': f'第 {index + 1} 步引用了尚未定义的变量：{", ".join(undefined)}。',
+                })
+            names = [item['name'] for item in step['extract']]
+            if len(names) != len(set(names)) or (set(names) & (fixed | set(unique) | extracted)):
+                raise serializers.ValidationError({'steps': f'第 {index + 1} 步提取变量名重复或已被占用。'})
+            extracted.update(names)
+            if phase == 'setup':
+                setup_available.update(names)
+                setup_outputs.update(names)
+            else:
+                main_available.update(names)
+        if not main_count:
+            raise serializers.ValidationError({'steps': '计划至少需要一个 main 步骤。'})
+
     def validate(self, attrs):
         target = attrs.get('target') or (self.instance.target if self.instance else None)
         steps = attrs.get('steps') or (self.instance.steps if self.instance else [])
+        variables = attrs.get('variables', getattr(self.instance, 'variables', {}))
+        unique_variables = attrs.get(
+            'unique_variables', getattr(self.instance, 'unique_variables', []),
+        )
+        self._validate_data_flow(variables, unique_variables, steps)
         if target is not None:
             disallowed = sorted({step['method'] for step in steps} - set(target.allowed_methods or []))
             if disallowed:
@@ -258,6 +454,8 @@ class PerformancePlanSerializer(StrictModelSerializer):
             'spawn_rate': attrs.get('spawn_rate', getattr(self.instance, 'spawn_rate', 1)),
             'duration_seconds': attrs.get('duration_seconds', getattr(self.instance, 'duration_seconds', 30)),
             'wait_seconds': attrs.get('wait_seconds', getattr(self.instance, 'wait_seconds', 1)),
+            'variables': variables,
+            'unique_variables': unique_variables,
             'steps': steps,
         }
         encoded = json.dumps(candidate, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
@@ -336,6 +534,7 @@ class RunReportSerializer(StrictSerializer):
 class PerformanceRunCreateSerializer(StrictSerializer):
     node_id = serializers.UUIDField()
     request_id = serializers.UUIDField()
+    mode = serializers.ChoiceField(choices=('validation', 'load'), default='load')
 
 
 class StrictBooleanField(serializers.BooleanField):
@@ -352,11 +551,13 @@ class NodeRevokeSerializer(StrictSerializer):
 class PerformanceRunListSerializer(serializers.ModelSerializer):
     plan_name = serializers.SerializerMethodField()
     node_name = serializers.SerializerMethodField()
+    validation_status = serializers.SerializerMethodField()
 
     class Meta:
         model = PerformanceRun
         fields = (
-            'id', 'plan_id', 'plan_name', 'node_id', 'node_name', 'status',
+            'id', 'plan_id', 'plan_name', 'node_id', 'node_name', 'mode',
+            'status', 'validation_status',
             'created_at', 'started_at', 'finished_at', 'reason_code', 'reason',
             'latest_metrics',
         )
@@ -367,6 +568,22 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
 
     def get_node_name(self, obj):
         return obj.node.name
+
+    def get_validation_status(self, obj):
+        if obj.mode != PerformanceRun.Mode.VALIDATION:
+            return 'not_applicable'
+        if obj.status not in PerformanceRun.TERMINAL_STATUSES:
+            return 'pending'
+        if obj.status != PerformanceRun.Status.COMPLETED or not (obj.latest_metrics or {}).get('validation_passed'):
+            return 'failed'
+        if obj.plan_id is None:
+            return 'stale'
+        from .run_services import validation_key_for
+        try:
+            current = validation_key_for(obj.plan, obj.node)
+        except (TypeError, ValueError):
+            return 'stale'
+        return 'passed' if current == obj.validation_key else 'stale'
 
 
 class PerformanceRunDetailSerializer(PerformanceRunListSerializer):

@@ -56,6 +56,7 @@ class PerformanceRunCreateView(RunAPIView):
         try:
             run, created = create_run(
                 project, pk, data['node_id'], data['request_id'], request.user,
+                data['mode'],
             )
         except RunConflict as exc:
             return _error('idempotency_conflict', str(exc), status.HTTP_409_CONFLICT)

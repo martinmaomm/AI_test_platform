@@ -40,6 +40,8 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
 #### 推荐：公开 Docker Hub 发行（仅限测试使用）
 
+当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。已发布 `0.2.0` 的 Linux amd64、arm64 镜像；平台安装器自动选取架构并固定摘要，节点机器无需登录 Docker Hub。最新验收范围见 [分发验收](../../docs/verification/2026-09-17-performance-dockerhub.md)。
+
 只发布 `performance-node/` 的独立客户端，不发布平台镜像或整个项目目录。Docker 构建上下文已使用白名单，仅允许节点 Python 源码、包配置、README 和 Dockerfile；不包含平台 `.env`、身份卷、日志、数据库和私钥。
 
 1. 在发布机执行 `docker login`，在 Docker 官方网页登录。仓库命名使用 **Docker ID**，不能用邮箱；不要把密码或 Token 发到聊天、放进脚本或提交到 Git。

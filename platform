@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+PLATFORM_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PLATFORM_PYTHON="$PLATFORM_ROOT/backend/.venv/bin/python"
+
+if [ ! -x "$PLATFORM_PYTHON" ]; then
+    echo "错误：未找到可执行的 backend/.venv/bin/python，请先完成后端虚拟环境安装。" >&2
+    exit 1
+fi
+
+exec "$PLATFORM_PYTHON" "$PLATFORM_ROOT/backend/platform_services.py" "$@"

@@ -184,7 +184,7 @@ npm run build
 # 产物：frontend/dist/
 ```
 
-当前仓库没有现成的 Docker / Compose 或生产反向代理、进程守护配置。生产部署还需配置 HTTPS、`/api/v1` 的 HTTP 反向代理、`/ws` 的 Upgrade/WebSocket 转发、`dist/` 托管和 SPA 路由回退，以及合适的 `ALLOWED_HOSTS`、`FRONTEND_BASE_URL`、CORS/CSRF 来源。使用 Django 管理后台时还需 `collectstatic` 和 `/static/` 托管；不要公开挂载日志或整个媒体目录。这些不是 `npm run build` 自动完成的内容。
+仓库提供性能节点 Docker 交付、节点专用 Caddy 网关和本地统一服务入口，但还不是整个平台的生产部署方案。生产部署还需配置网站 HTTPS、`/api/v1` 的 HTTP 反向代理、`/ws` 的 Upgrade/WebSocket 转发、`dist/` 托管和 SPA 路由回退，以及合适的 `ALLOWED_HOSTS`、`FRONTEND_BASE_URL`、CORS/CSRF 来源。使用 Django 管理后台时还需 `collectstatic` 和 `/static/` 托管；不要公开挂载日志或整个媒体目录。这些不是 `npm run build` 自动完成的内容。
 
 生产反向代理若直接托管 `MEDIA_ROOT`，必须先拒绝执行截图子目录，再配置其余公开媒体；不能依赖 Django 的开发 media guard。Nginx 至少应使用大小写不敏感的精确目录边界，且 deny 规则必须位于通用 `/media/` alias 之前：
 
@@ -261,7 +261,40 @@ Linux 还可能需要浏览器共享库。在相应机器上为对应版本执�
 
 ## 7. 启动顺序与可选 Beat
 
-以下命令会启动本地/目标环境服务，应在 `.env`、数据库、Redis、迁移和浏览器目录准备完毕后执行。不同终端都先进入 `backend` 并激活同一 `.venv`。
+以下命令会启动本地/目标环境服务，应在 `.env`、数据库、Redis、迁移和浏览器目录准备完毕后执行。
+
+### 7.1 统一启动、查看和停止（macOS / Linux）
+
+在仓库根目录运行，无须先激活虚拟环境：
+
+```bash
+./platform start                 # 后台启动整套服务
+./platform status                # 进程状态及健康检查
+./platform restart controller    # 只重启性能控制器
+./platform restart backend celery
+./platform logs controller --lines 80
+./platform stop                  # 优雅停止整套托管服务
+```
+
+管理范围：`backend`（ASGI）、`celery`（solo worker）、`controller`（性能控制器）、`caddy`（节点 HTTPS 网关）。重复启动不会创建第二份实例。默认只启动已启用的服务：控制器遵循 `PERFORMANCE_EXECUTION_ENABLED`，本机 Caddy 在设置 `PERFORMANCE_NODE_PUBLIC_URL` 后启用，也可用 `PLATFORM_CADDY_ENABLED=false` 明确关闭。
+
+- 前端仍在 `frontend` 执行 `npm run dev`，不由此入口管理。
+- MySQL、Redis、远程节点容器不由此入口启停；Beat 不自动启动，避免意外派发计划任务。
+- 程序从 `backend/.env` 加载配置。修改后重启对应服务；Caddy 的域名、监听地址和证书存储现在也应保存在 `.env`，不能只依赖旧终端的临时 `export`。
+- 健康检查不运行测试：后端检查 HTTP 响应，Celery 检查队列心跳，控制器检查数据库中的租约/心跳，Caddy 使用原 CA 验证本机 HTTPS 入口。忙碌的 solo worker 可能暂时无法回复心跳，应结合进程和日志判断，不会据此自动重启它。
+- 管理器运行期间，子服务异常退出会有限退避重启：10 分钟内最多 5 次，达到上限后需手动启动或重启。普通服务至少等待 2 秒、控制器至少等待 20 秒，之后逐次增加。手动停止不会被自动拉起；健康探针失败不会单独触发重启。恢复控制器不会自动重跑已中断压测，原控制器的租约与异常收尾规则仍保留。
+- 停止采用优雅退出，Celery 正在运行的任务可能需要等待；不要为了快速停止而直接删除状态文件或全局杀 Python 进程。
+- 管理器脱离终端运行，但不等于开机自启；机器重启后仍需 `./platform start`。此版本不替代生产环境的系统服务管理。
+
+首次从旧手动启动方式切换时，应先确认没有活动任务，停止旧服务，再运行 `./platform start`。管理器发现同项目已有手动进程或端口冲突会拒绝重复启动，不会擅自接管或终止其他服务。不要同时使用本入口与下面的独立命令启动同一服务。
+
+状态文件位于 Git 忽略的 `backend/temp/platform-services/`；控制文件不存储 `.env`、密码或节点凭据。控制台日志位于 `backend/logs/services/`，业务原有的 `django.log`、`celery.log` 仍保留。`./platform logs` 显示的是实际日志，可能含开发调试数据，不要公开。
+
+服务控制台日志在下次启动该服务时检查大小，超过 20 MiB 会轮转，最多保留 5 份旧文件；不是实时硬上限。长时间运行或日志量较大时仍需监控磁盘并配置正式日志管理。
+
+### 7.2 独立启动（排障备用）
+
+以下是未使用统一入口时的备用方式。不同终端都先进入 `backend` 并激活同一 `.venv`。
 
 1. 启动 ASGI 后端（HTTP 与 WebSocket）：
 
@@ -440,7 +473,7 @@ python manage.py migrate performance_testing
 
 ### 13.1 启动执行控制器
 
-控制器与 Django 使用同一套后端依赖和数据库，单独运行；不在 Django 请求或 Celery 中运行 Locust。先安装系统 `stunnel`（macOS 可用 `brew install stunnel`，Debian/Ubuntu 为 `stunnel4`），并确认后端 Locust 固定为 `2.43.3`。
+控制器与 Django 使用同一套后端依赖和数据库，作为独立进程运行，可由第 7.1 节的 `./platform start` 统一管理；不在 Django 请求或 Celery 中运行 Locust。先安装系统 `stunnel`（macOS 可用 `brew install stunnel`，Debian/Ubuntu 为 `stunnel4`），并确认后端 Locust 固定为 `2.43.3`。
 
 在实际 `backend/.env` 中设置以下参数，示例地址须替换：
 
@@ -456,9 +489,9 @@ PERFORMANCE_STUNNEL_BINARY=stunnel
 `PUBLIC_HOST` 是节点实际可达的加密 RPC 地址；`SERVER_NAME` 是节点要核对的证书名称，一般与前者一致。二者只填主机名/IP，不填 `https://`。`BIND_HOST` 默认回环；需要其他机器连接时才显式调整监听、防火墙/NAT。只有 TLS 入口可暴露，原生 Locust RPC 始终是随机回环端口。每轮签发临时 CA 与节点证书，不需要用户手工复制这些运行证书；节点注册仍须使用可信 HTTPS 平台入口。
 
 ```bash
-cd backend
-source .venv/bin/activate
-python manage.py run_performance_controller
+# 仓库根目录；已使用统一入口时不要再手动启动第二份控制器
+./platform start controller
+./platform status
 ```
 
 仅启动一个控制器；第二个实例会拒绝争用租约。修改配置后重启控制器和后端。控制器默认关闭，未配置或未启动时页面会提示并禁止提交运行，不影响 UI/API 自动化。私有运行目录默认 `backend/temp/performance-runtime/`，目录权限必须 `0700`，不要映射到静态站点；正常结束会清理临时私钥，崩溃遗留文件仍须按私有运行数据管理。

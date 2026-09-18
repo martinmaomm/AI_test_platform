@@ -191,6 +191,17 @@ automation-platform/
 
 ## 安装与运行
 
+已完成依赖、`.env` 和数据库初始化后，在仓库根目录使用统一入口：
+
+```bash
+./platform start              # 后台启动后端、Celery，以及已启用的控制器和 Caddy
+./platform status             # 查看状态与健康检查
+./platform restart controller # 单独重启指定服务
+./platform stop               # 优雅停止托管服务
+```
+
+无需手工激活虚拟环境；前端仍单独执行 `npm run dev`。首次切换须先停止原手动实例，详见 [统一服务管理](docs/installation.md#71-统一启动查看和停止macos--linux)。
+
 请从 [安装与配置指南](docs/installation.md) 开始，文档包含：
 
 1. Python venv、Node.js、MySQL / MariaDB 和 Redis 准备。

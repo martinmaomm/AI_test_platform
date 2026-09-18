@@ -47,7 +47,8 @@ test("browser discovery reads the established envelope and only enables configur
 
 test("browser discovery creation requires explicit test-write confirmation and valid bounded input", () => {
   const form = { target_url: "https://example.test/login", description: "登录后查看订单", api_origin: "", model_id: 8, allow_test_data_writes: true, exploration_timeout_seconds: 120 };
-  assert.deepEqual(buildBrowserDiscoveryPayload(form, config), { ...form, api_origin: null });
+  assert.deepEqual(buildBrowserDiscoveryPayload(form, config), { ...form, api_origin: null, auto_approve_origins: true });
+  assert.equal(buildBrowserDiscoveryPayload({ ...form, auto_approve_origins: false }, config).auto_approve_origins, false);
   assert.throws(() => buildBrowserDiscoveryPayload({ ...form, allow_test_data_writes: false }, config), /明确确认/);
   assert.throws(() => buildBrowserDiscoveryPayload({ ...form, api_origin: "https://api.example.test/v1" }, config), /API origin/);
   assert.throws(() => buildBrowserDiscoveryPayload({ ...form, exploration_timeout_seconds: BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS - 1 }, config), /不能少于/);
@@ -80,6 +81,7 @@ test("browser discovery form snapshots only become clean after the current value
     exploration_timeout_seconds: 120,
   };
   const submitted = browserDiscoveryFormSnapshot(initial);
+  assert.notEqual(submitted, browserDiscoveryFormSnapshot({ ...initial, auto_approve_origins: false }));
   assert.equal(submitted, browserDiscoveryFormSnapshot({ ...initial }));
   assert.notEqual(
     submitted,

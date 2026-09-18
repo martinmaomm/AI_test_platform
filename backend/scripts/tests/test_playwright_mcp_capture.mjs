@@ -11,11 +11,14 @@ import { gzipSync } from 'node:zlib';
 
 import {
   NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV,
+  NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS_ENV,
   NETWORK_CAPTURE_AUTO_ORIGIN_ENV,
   NETWORK_CAPTURE_DIR_ENV,
   NETWORK_CAPTURE_ENV,
   NETWORK_CAPTURE_TARGET_URL_ENV,
   NetworkCapture,
+  authenticationHeadersForStorage,
+  installChromiumDurableResponseRetention,
   installPlaywrightMcpNetworkCapture,
   readNetworkCaptureConfig,
 } from '../playwright_mcp_capture.mjs';
@@ -154,6 +157,128 @@ test('capture is disabled unless the task switch is exactly enabled', () => {
   assert.deepEqual(readNetworkCaptureConfig({}), { enabled: false });
 });
 
+test('unsupported durable retention preserves browser initialization and emits only a safe diagnostic', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-retention-fallback-'));
+  const originalError = console.error;
+  const diagnostics = [];
+  try {
+    const core = path.join(root, 'node_modules/playwright-core');
+    const modulePath = path.join(core, 'lib/server/chromium/crNetworkManager.js');
+    fs.mkdirSync(path.dirname(modulePath), { recursive: true });
+    fs.writeFileSync(path.join(root, 'package.json'), '{}');
+    fs.writeFileSync(path.join(core, 'package.json'), '{"name":"playwright-core"}');
+    fs.writeFileSync(modulePath, `exports.CRNetworkManager = class {
+      async addSession(session) {
+        await session.send('Network.enable', {existingOption: true});
+        return session.send('Runtime.enable', {});
+      }
+    };`);
+    console.error = (...args) => diagnostics.push(args.join(' '));
+    const limits = { maxBodyBytes: 8192, maxTotalBodyBytes: 65536 };
+    assert.equal(installChromiumDurableResponseRetention(root, { limits }), true);
+    const { CRNetworkManager } = createRequire(path.join(root, 'package.json'))(modulePath);
+    const calls = [];
+    const session = {
+      async send(method, params) {
+        calls.push({ method, params });
+        if (params?.enableDurableMessages) throw new Error('unsupported parameter; secret-cookie=must-not-log');
+        return 'initialized';
+      },
+    };
+    const originalSend = session.send;
+    const manager = new CRNetworkManager();
+    assert.equal(await manager.addSession(session), 'initialized');
+    assert.equal(session.send, originalSend);
+    assert.deepEqual(calls, [
+      { method: 'Network.enable', params: { existingOption: true, maxTotalBufferSize: 65536, maxResourceBufferSize: 8192, enableDurableMessages: true } },
+      { method: 'Network.enable', params: { existingOption: true } },
+      { method: 'Runtime.enable', params: {} },
+    ]);
+    await manager.addSession(session);
+    assert.equal(diagnostics.length, 1, 'repeated unsupported targets do not flood logs');
+    assert.match(diagnostics[0], /durable_response_retention_unavailable/);
+    assert.doesNotMatch(diagnostics.join('\n'), /secret-cookie|must-not-log/);
+
+    const failedSession = { async send() { throw new Error('target already closed'); } };
+    const failedSend = failedSession.send;
+    await assert.rejects(manager.addSession(failedSession), /target already closed/);
+    assert.equal(failedSession.send, failedSend, 'failed initialization also restores the original session');
+  } finally {
+    console.error = originalError;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('authentication metadata only retains allowlisted schemes and hashes', () => {
+  const stored = authenticationHeadersForStorage({
+    authorization: 'Bearer safe-token',
+    'proxy-authorization': 'Basic c2FmZQ==',
+    'x-api-key': 'key-only-secret',
+  });
+  assert.deepEqual(stored.map(({ name, scheme }) => ({ name, scheme })), [
+    { name: 'authorization', scheme: 'Bearer' },
+    { name: 'proxy-authorization', scheme: 'Basic' },
+    { name: 'x-api-key', scheme: 'x-api-key' },
+  ]);
+  assert.ok(stored.every((item) => /^[a-f0-9]{64}$/.test(item.value_sha256)));
+
+  for (const value of ['token-without-scheme', 'BearerTokenWithoutSpace', 'Private secret-value', 'Bearer']) {
+    const [hint] = authenticationHeadersForStorage({ authorization: value });
+    assert.equal(hint.scheme, 'unknown');
+    assert.doesNotMatch(JSON.stringify(hint), new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+});
+
+test('response body is read before size and request-body work, with safe failure diagnostics', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-body-read-'));
+  try {
+    const origin = 'http://entry.test:8080';
+    const capture = new NetworkCapture({
+      directory: root, allowedOrigins: new Set([origin]),
+      limits: { maxRequests: 10, maxBodyBytes: 1024, maxTotalBodyBytes: 65536, bodyTimeoutMs: 100 },
+    });
+    const page = fakePage(`${origin}/app`);
+    const calls = [];
+    const request = fakeRequest({
+      url: `${origin}/api/login`, page, method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': '11' },
+    });
+    request.response = async () => ({
+      status: () => 200,
+      statusText: () => 'OK',
+      headers: () => ({ 'content-type': 'application/json', 'content-length': '11' }),
+      body: async () => { calls.push('response.body'); return Buffer.from('{"ok":true}'); },
+    });
+    request.sizes = async () => { calls.push('request.sizes'); return { responseBodySize: 11, requestBodySize: 11 }; };
+    request.postDataBuffer = () => { calls.push('request.postDataBuffer'); return Buffer.from('{"user":1}'); };
+    capture.recordRequest(request);
+    await capture.onRequestFinished(request);
+    assert.deepEqual(calls, ['response.body', 'request.sizes', 'request.postDataBuffer']);
+    let network = readJsonLines(path.join(root, 'network.jsonl'));
+    assert.ok(network.findIndex((item) => item.event === 'request_body') < network.findIndex((item) => item.event === 'response'));
+
+    const failed = fakeRequest({ url: `${origin}/api/session`, page });
+    failed.response = async () => ({
+      status: () => 200,
+      statusText: () => 'OK',
+      headers: () => ({ 'content-type': 'application/json' }),
+      body: async () => { throw new Error('Target page has been closed; do-not-persist-this-secret'); },
+    });
+    failed.sizes = async () => ({ responseBodySize: 0, requestBodySize: 0 });
+    failed.postDataBuffer = () => null;
+    capture.recordRequest(failed);
+    await capture.onRequestFinished(failed);
+    network = readJsonLines(path.join(root, 'network.jsonl'));
+    const failedRequest = network.find((item) => item.event === 'request' && item.path === '/api/session');
+    const terminal = network.find((item) => item.event === 'response' && item.request_id === failedRequest.request_id);
+    assert.equal(terminal.reason, 'body_read_failed');
+    assert.deepEqual(terminal.body_read_diagnostic, { stage: 'response_body', kind: 'target_closed' });
+    assert.doesNotMatch(JSON.stringify(network), /do-not-persist-this-secret/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('document navigation requires exact origin approval, including popup and redirect destinations', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-navigation-'));
   let capture;
@@ -253,6 +378,87 @@ test('automatic origin mode requires an HTTP entry URL', () => {
   }
 });
 
+test('automatic approval resolves foreign fetches and page navigations without pending while controls stay authoritative', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-auto-approve-'));
+  try {
+    const entryOrigin = 'http://entry.test:8080';
+    const foreignOrigin = 'http://foreign.test:7070';
+    const config = readNetworkCaptureConfig({
+      [NETWORK_CAPTURE_ENV]: '1',
+      [NETWORK_CAPTURE_DIR_ENV]: tempRoot,
+      [NETWORK_CAPTURE_AUTO_ORIGIN_ENV]: '1',
+      [NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS_ENV]: '1',
+      [NETWORK_CAPTURE_TARGET_URL_ENV]: `${entryOrigin}/app`,
+    });
+    assert.equal(config.autoOrigin, true);
+    assert.equal(config.autoApproveOrigins, true);
+    const capture = new NetworkCapture({
+      ...config,
+      limits: { maxRequests: 100, maxBodyBytes: 1024, maxTotalBodyBytes: 65536, bodyTimeoutMs: 100 },
+    });
+    const context = new FakeContext();
+    await capture.attachContext(context);
+    const page = fakePage(`${entryOrigin}/app`);
+    context.emit('page', page);
+
+    const request = fakeRequest({ url: `${foreignOrigin}/api/items`, page });
+    const route = new FakeRoute(context, request);
+    context.emit('request', request);
+    await context.routeHandler(route);
+    assert.equal(route.continued, 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(tempRoot, 'origin-state.json'), 'utf8')).pending, []);
+
+    const navigationOrigin = 'http://navigation.test:6060';
+    const navigationRequest = fakeRequest({
+      url: `${navigationOrigin}/next`, page, resourceType: 'document',
+    });
+    const navigationRoute = new FakeRoute(context, navigationRequest);
+    await context.routeHandler(navigationRoute);
+    assert.equal(navigationRoute.continued, 1);
+
+    const rejectedOrigin = 'http://rejected.test:5050';
+    fs.writeFileSync(path.join(tempRoot, 'origin-control.json'), JSON.stringify({
+      version: 1, approved_origins: [], rejected_origins: [rejectedOrigin], cancelled: false,
+    }));
+    const rejectedRequest = fakeRequest({ url: `${rejectedOrigin}/blocked`, page });
+    const rejectedRoute = new FakeRoute(context, rejectedRequest);
+    context.emit('request', rejectedRequest);
+    await context.routeHandler(rejectedRoute);
+    assert.equal(rejectedRoute.aborted, 1);
+
+    fs.writeFileSync(path.join(tempRoot, 'origin-control.json'), JSON.stringify({
+      version: 1, approved_origins: [], rejected_origins: [], cancelled: true,
+    }));
+    const cancelledRequest = fakeRequest({ url: 'http://cancelled.test:4040/blocked', page });
+    const cancelledRoute = new FakeRoute(context, cancelledRequest);
+    context.emit('request', cancelledRequest);
+    await context.routeHandler(cancelledRoute);
+    assert.equal(cancelledRoute.aborted, 1);
+
+    fs.writeFileSync(path.join(tempRoot, 'origin-control.json'), JSON.stringify({
+      version: 1, approved_origins: [], rejected_origins: [], cancelled: false,
+    }));
+    while (capture.resolvedOrigins.size < 32) {
+      capture.resolvedOrigins.add(`http://resolved-${capture.resolvedOrigins.size}.test`);
+    }
+    const overBudgetRequest = fakeRequest({ url: 'http://over-budget.test:3030/blocked', page });
+    const overBudgetRoute = new FakeRoute(context, overBudgetRequest);
+    context.emit('request', overBudgetRequest);
+    await context.routeHandler(overBudgetRoute);
+    assert.equal(overBudgetRoute.aborted, 1);
+
+    const network = readJsonLines(path.join(tempRoot, 'network.jsonl'));
+    assert.ok(network.some((event) => event.event === 'origin_resolved' && event.origin === foreignOrigin));
+    assert.ok(network.some((event) => event.event === 'origin_resolved' && event.origin === navigationOrigin));
+    assert.equal(network.some((event) => event.event === 'origin_pending'), false);
+    assert.ok(network.some((event) => event.reason === 'origin_rejected'));
+    assert.ok(network.some((event) => event.reason === 'origin_cancelled'));
+    assert.ok(network.some((event) => event.reason === 'origin_state_limit_reached'));
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('automatic origin mode authorizes main-page same-host API calls and gates foreign origins without secrets', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-auto-origin-'));
   let capture;
@@ -261,7 +467,7 @@ test('automatic origin mode authorizes main-page same-host API calls and gates f
     const sameHostOrigin = 'http://entry.test:9090';
     const foreignOrigin = 'http://foreign.test:7070';
     capture = new NetworkCapture({
-      directory: tempRoot, allowedOrigins: new Set(), autoOrigin: true,
+      directory: tempRoot, allowedOrigins: new Set(), autoOrigin: true, autoApproveOrigins: false,
       targetOrigin: entryOrigin, targetHostname: 'entry.test',
       limits: { maxRequests: 100, maxBodyBytes: 1024, maxTotalBodyBytes: 65536, bodyTimeoutMs: 100 },
     });
@@ -572,6 +778,176 @@ test('real Chrome 307 cross-origin redirect is sent but retained as redacted met
   }
 });
 
+test('real Chrome auto-approves one foreign fetch and page navigation without replay or pending state', { timeout: 60000 }, async (t) => {
+  if (!fs.existsSync(chromePath)) t.skip('Google Chrome is unavailable');
+  let packageRoot;
+  try {
+    packageRoot = resolvePlaywrightMcpPackageRoot();
+  } catch {
+    t.skip('the Playwright MCP package is unavailable from npm exec PATH');
+    return;
+  }
+  const fixture = await startFixture({ includeUnapprovedStartupRequests: false });
+  const foreignOrigin = fixture.otherOrigin.replace('127.0.0.1', 'localhost');
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-mcp-auto-approve-live-'));
+  let browser;
+  try {
+    const requireFromPackage = createRequire(path.join(packageRoot, 'package.json'));
+    browser = await requireFromPackage('playwright').chromium.launch({ executablePath: chromePath, headless: true });
+    const capture = new NetworkCapture({
+      directory: tempRoot, allowedOrigins: new Set(), autoOrigin: true, autoApproveOrigins: true,
+      targetOrigin: fixture.origin, targetHostname: '127.0.0.1',
+      limits: { maxRequests: 100, maxBodyBytes: 8192, maxTotalBodyBytes: 65536, bodyTimeoutMs: 1000 },
+    });
+    capture.attachBrowser(browser);
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(fixture.origin);
+    const fetched = await page.evaluate(async (url) => (await fetch(url)).json(), `${foreignOrigin}/api/auto`);
+    assert.deepEqual(fetched, { other: true });
+    await page.evaluate((url) => { window.location.href = url; }, `${foreignOrigin}/navigation`);
+    await page.waitForURL(`${foreignOrigin}/navigation`);
+    await browser.close();
+    browser = null;
+
+    assert.equal(fixture.otherRequests.filter((item) => item === 'GET /api/auto').length, 1);
+    assert.equal(fixture.otherRequests.filter((item) => item === 'GET /navigation').length, 1);
+    const state = JSON.parse(fs.readFileSync(path.join(tempRoot, 'origin-state.json'), 'utf8'));
+    assert.deepEqual(state.pending, []);
+    assert.ok(state.resolved_origins.includes(foreignOrigin));
+    const network = readJsonLines(path.join(tempRoot, 'network.jsonl'));
+    assert.equal(network.some((event) => event.event === 'origin_pending'), false);
+    assert.ok(network.some((event) => event.event === 'origin_resolved' && event.origin === foreignOrigin));
+    assert.ok(network.some((event) => event.event === 'request' && event.origin === foreignOrigin && event.path === '/api/auto'));
+  } finally {
+    await browser?.close();
+    await new Promise((resolve) => fixture.server.close(resolve));
+    await new Promise((resolve) => fixture.otherServer.close(resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('real Chrome preserves login JSON across immediate reload, navigation and popup startup without replay', { timeout: 60000 }, async (t) => {
+  if (!fs.existsSync(chromePath)) { t.skip('Google Chrome is unavailable'); return; }
+  let packageRoot;
+  try { packageRoot = resolvePlaywrightMcpPackageRoot(); }
+  catch { t.skip('Playwright MCP package is unavailable'); return; }
+  const received = [];
+  let origin;
+  let foreignOrigin;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const run = url.searchParams.get('run');
+    received.push({ method: req.method, path: url.pathname, run });
+    const cors = {
+      'access-control-allow-origin': origin,
+      'access-control-allow-methods': 'POST, OPTIONS',
+      'access-control-allow-headers': 'content-type',
+    };
+    if (req.method === 'OPTIONS') return response(res, 204, 'text/plain', '', cors);
+    if (url.pathname === '/api/login') {
+      req.resume();
+      req.on('end', () => response(res, 200, 'application/json', JSON.stringify({ ok: true, run }), cors));
+      return;
+    }
+    if (url.pathname === '/home') return response(res, 200, 'text/html', '<!doctype html><title>Logged in</title>');
+    if (url.pathname === '/opener') {
+      return response(res, 200, 'text/html', `<a id="open" target="_blank" href="/case?mode=cross_navigate&run=${run}">login</a>`);
+    }
+    if (url.pathname !== '/case') return response(res, 404, 'text/plain', 'missing');
+    const mode = url.searchParams.get('mode');
+    const apiOrigin = mode.startsWith('cross_') ? foreignOrigin : origin;
+    const action = mode.endsWith('_reload') ? 'location.reload()'
+      : mode.endsWith('_navigate') ? `location.href = ${JSON.stringify(`${apiOrigin}/home?run=${run}`)}`
+        : 'window.loginDone = true';
+    return response(res, 200, 'text/html', `<!doctype html><title>Login</title><script>
+      (async () => {
+        const key = ${JSON.stringify(`login-${run}`)};
+        if (sessionStorage.getItem(key)) { window.loginDone = true; return; }
+        const result = await fetch(${JSON.stringify(`${apiOrigin}/api/login?run=${run}`)}, {
+          method: 'POST', headers: {'content-type': 'application/json'},
+          body: JSON.stringify({user: 'fixture', password: 'fake'})
+        });
+        const body = await result.json();
+        if (!body.ok) throw new Error('fixture login failed');
+        sessionStorage.setItem(key, '1');
+        ${action};
+      })().catch(() => { document.title = 'Login failed'; });
+    </script>`);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  origin = `http://127.0.0.1:${server.address().port}`;
+  foreignOrigin = `http://localhost:${server.address().port}`;
+  const limits = { maxRequests: 30, maxBodyBytes: 8192, maxTotalBodyBytes: 65536, bodyTimeoutMs: 2000 };
+  let browser;
+  try {
+    const requireFromPackage = createRequire(path.join(packageRoot, 'package.json'));
+    assert.equal(installChromiumDurableResponseRetention(packageRoot, { limits }), true);
+    browser = await requireFromPackage('playwright').chromium.launch({ executablePath: chromePath, headless: true });
+    for (const mode of ['same_stay', 'cross_stay', 'same_reload', 'cross_reload', 'same_navigate', 'cross_navigate', 'popup']) {
+      await t.test(mode, async () => {
+        for (let iteration = 1; iteration <= 3; iteration += 1) {
+          const run = `${mode}-${iteration}`;
+          const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-login-navigation-'));
+          const context = await browser.newContext();
+          try {
+            const capture = new NetworkCapture({
+              directory: root, allowedOrigins: new Set(), autoOrigin: true, autoApproveOrigins: true,
+              targetOrigin: origin, targetHostname: '127.0.0.1',
+              limits,
+            });
+            await capture.attachContext(context);
+            let page = await context.newPage();
+            if (mode === 'popup') {
+              await page.goto(`${origin}/opener?run=${run}`);
+              const popup = context.waitForEvent('page');
+              await page.locator('#open').click();
+              page = await popup;
+            } else {
+              // The initial page immediately submits login and may navigate before goto completes.
+              await page.goto(`${origin}/case?mode=${mode}&run=${run}`).catch((error) => {
+                if (!/interrupted|ERR_ABORTED/.test(error.message)) throw error;
+              });
+            }
+            if (mode.endsWith('_navigate') || mode === 'popup') {
+              await page.waitForURL(`**/home?run=${run}`);
+            } else {
+              await page.waitForFunction(() => window.loginDone === true);
+            }
+            const deadline = Date.now() + 3000;
+            let login;
+            let terminals;
+            do {
+              const events = readJsonLines(path.join(root, 'network.jsonl'));
+              login = events.find((event) => event.event === 'request' && event.path === '/api/login');
+              terminals = events.filter((event) => ['response', 'failure'].includes(event.event) && event.request_id === login?.request_id);
+              if (terminals.length) break;
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            } while (Date.now() < deadline);
+            assert.ok(login, `${run}: login request recorded`);
+            assert.equal(terminals.length, 1, `${run}: exactly one terminal`);
+            assert.equal(terminals[0].capture_status, 'captured', `${run}: ${JSON.stringify(terminals[0].body_read_diagnostic)}`);
+            assert.deepEqual(terminals[0].body.value, { ok: true, run });
+            const requestBody = readJsonLines(path.join(root, 'network.jsonl')).find((event) => event.event === 'request_body' && event.request_id === login.request_id);
+            assert.equal(requestBody?.capture_status, 'captured');
+            assert.deepEqual(requestBody.body.value, { user: 'fixture', password: 'fake' });
+            const loginRequests = received.filter((item) => item.method !== 'OPTIONS' && item.path === '/api/login' && item.run === run);
+            assert.deepEqual(loginRequests, [{ method: 'POST', path: '/api/login', run }], `${run}: no login replay or supplemental request`);
+            const state = JSON.parse(fs.readFileSync(path.join(root, 'origin-state.json'), 'utf8'));
+            assert.deepEqual(state.pending, []);
+          } finally {
+            await context.close();
+            fs.rmSync(root, { recursive: true, force: true });
+          }
+        }
+      });
+    }
+  } finally {
+    await browser?.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('same toolHandler browser captures navigation, login, CRUD, popup and redirect', { timeout: 60000 }, async (t) => {
   if (!fs.existsSync(chromePath)) t.skip('Google Chrome is unavailable');
   let packageRoot;
@@ -629,6 +1005,9 @@ test('same toolHandler browser captures navigation, login, CRUD, popup and redir
       const request = capturedRequests.find((event) => event.path === requestPath);
       return terminal.find((event) => event.request_id === request?.request_id);
     };
+    const login = terminalForPath('/api/login');
+    assert.equal(login?.capture_status, 'captured');
+    assert.equal(login?.body?.value?.ok, true);
     const gzipSmall = terminalForPath('/api/gzip-small');
     assert.equal(gzipSmall?.capture_status, 'captured');
     assert.equal(gzipSmall?.body?.value?.gzip, 'small');

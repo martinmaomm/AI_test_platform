@@ -13,6 +13,7 @@ export const NETWORK_CAPTURE_MAX_BODY_BYTES_ENV = 'MCP_NETWORK_CAPTURE_MAX_BODY_
 export const NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES_ENV = 'MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES';
 export const NETWORK_CAPTURE_BODY_TIMEOUT_MS_ENV = 'MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS';
 export const NETWORK_CAPTURE_AUTO_ORIGIN_ENV = 'MCP_NETWORK_CAPTURE_AUTO_ORIGIN';
+export const NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS_ENV = 'MCP_NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS';
 export const NETWORK_CAPTURE_TARGET_URL_ENV = 'MCP_NETWORK_CAPTURE_TARGET_URL';
 
 const DEFAULT_LIMITS = Object.freeze({
@@ -25,6 +26,15 @@ const STATIC_RESOURCE_TYPES = new Set(['stylesheet', 'image', 'font', 'media', '
 const SENSITIVE_HEADERS = new Set([
   'authorization', 'cookie', 'proxy-authorization', 'set-cookie',
   'x-api-key', 'x-auth-token', 'x-access-token', 'x-session-token', 'x-csrf-token', 'x-xsrf-token',
+]);
+const SAFE_AUTHENTICATION_SCHEMES = new Map([
+  ['basic', 'Basic'],
+  ['bearer', 'Bearer'],
+  ['digest', 'Digest'],
+  ['negotiate', 'Negotiate'],
+  ['oauth', 'OAuth'],
+  ['scram-sha-1', 'SCRAM-SHA-1'],
+  ['scram-sha-256', 'SCRAM-SHA-256'],
 ]);
 const BODY_CONTENT_TYPES = /^(application\/(?:json|[^;]+\+json)|application\/x-www-form-urlencoded|text\/plain)(?:;|$)/i;
 const BINARY_CONTENT_TYPES = /^(application\/(?:octet-stream|pdf|zip|gzip)|audio\/|video\/|image\/|font\/)/i;
@@ -46,6 +56,7 @@ const MAX_CLOSE_AUTHORIZED_DRAIN_MS = 2000;
 const PATCHED_BROWSER = Symbol.for('automation.playwrightMcpCapture.browserPatched');
 const PATCHED_TOOL = Symbol.for('automation.playwrightMcpCapture.toolPatched');
 const PATCHED_LAUNCH = Symbol.for('automation.playwrightMcpCapture.launchPatched');
+const PATCHED_CHROMIUM_NETWORK_MANAGER = Symbol.for('automation.playwrightMcpCapture.chromiumNetworkManagerPatched');
 
 function positiveInteger(value, fallback) {
   if (value === undefined || value === '') return fallback;
@@ -124,7 +135,15 @@ function boundedQuery(searchParams) {
   return { pairs, truncated };
 }
 
-function authenticationHeadersForStorage(headers) {
+function safeAuthenticationScheme(value) {
+  // A scheme is only observable when it is followed by credentials.  Never
+  // copy an arbitrary first token: token-only credentials would otherwise be
+  // persisted verbatim as a supposed scheme.
+  const match = String(value).match(/^\s*([A-Za-z][A-Za-z0-9_-]*)\s+/);
+  return match ? (SAFE_AUTHENTICATION_SCHEMES.get(match[1].toLowerCase()) || 'unknown') : 'unknown';
+}
+
+export function authenticationHeadersForStorage(headers) {
   const output = [];
   for (const [rawName, rawValue] of Object.entries(headers || {})) {
     const name = rawName.toLowerCase();
@@ -132,11 +151,34 @@ function authenticationHeadersForStorage(headers) {
     const value = String(rawValue);
     output.push({
       name,
-      scheme: name === 'authorization' ? (value.split(/\s+/, 1)[0] || 'unknown') : name,
+      scheme: ['authorization', 'proxy-authorization'].includes(name) ? safeAuthenticationScheme(value) : name,
       value_sha256: crypto.createHash('sha256').update(value).digest('hex'),
     });
   }
   return output;
+}
+
+function bodyReadDiagnostic(error, stage) {
+  const name = String(error?.name || '').toLowerCase();
+  const message = String(error?.message || '').toLowerCase();
+  let kind = 'unknown';
+  if (message === 'body_read_timeout' || name.includes('timeout')) {
+    kind = 'timeout';
+  } else if (
+    name.includes('targetclosed')
+    || /(?:target|page|context|browser).*(?:closed|closing)/.test(message)
+  ) {
+    kind = 'target_closed';
+  } else if (
+    message.includes('response body is unavailable')
+    || message.includes('no resource with given identifier')
+    || message.includes('could not load body for this request')
+  ) {
+    kind = 'body_unavailable';
+  } else if (name.includes('protocol') || message.includes('protocol error')) {
+    kind = 'protocol_error';
+  }
+  return { stage, kind };
 }
 
 function rawAuthenticationHeaders(headers) {
@@ -228,6 +270,7 @@ function bodyFromBuffer(buffer, contentTypeValue) {
 export function readNetworkCaptureConfig(env = process.env) {
   if (env[NETWORK_CAPTURE_ENV] !== '1') return { enabled: false };
   const autoOrigin = env[NETWORK_CAPTURE_AUTO_ORIGIN_ENV] === '1';
+  const autoApproveOrigins = env[NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS_ENV] === '1';
   const targetUrl = safeUrl(env[NETWORK_CAPTURE_TARGET_URL_ENV]);
   const config = {
     enabled: true,
@@ -249,6 +292,7 @@ export function readNetworkCaptureConfig(env = process.env) {
   return {
     ...config,
     autoOrigin: true,
+    autoApproveOrigins,
     targetOrigin: targetUrl.origin,
     targetHostname: targetUrl.hostname,
   };
@@ -804,6 +848,10 @@ export class NetworkCapture {
       await this.rejectAutoRequest(route, request, candidate, 'origin_cancelled', { persist: false });
       return;
     }
+    if (control.rejected.has(candidate.origin)) {
+      await this.rejectAutoRequest(route, request, candidate, 'origin_rejected');
+      return;
+    }
     if (candidate.hostnameMatchesEntry || this.resolvedOrigins.has(candidate.origin)) {
       if (!this.markOriginResolved(candidate)) {
         await this.rejectAutoRequest(route, request, candidate, 'origin_state_limit_reached');
@@ -823,8 +871,18 @@ export class NetworkCapture {
       await route.continue();
       return;
     }
-    if (control.rejected.has(candidate.origin) || this.rejectedOrigins.has(candidate.origin)) {
+    if (this.rejectedOrigins.has(candidate.origin)) {
       await this.rejectAutoRequest(route, request, candidate, 'origin_rejected');
+      return;
+    }
+
+    if (this.config.autoApproveOrigins) {
+      if (!this.markOriginResolved(candidate)) {
+        await this.rejectAutoRequest(route, request, candidate, 'origin_state_limit_reached');
+        return;
+      }
+      this.recordRequest(request, { authorized: true });
+      await route.continue();
       return;
     }
 
@@ -854,13 +912,16 @@ export class NetworkCapture {
   async navigationAllowed(route, request, url) {
     const control = this.config.autoOrigin ? this.readOriginControl() : { approved: new Set() };
     if (control.cancelled) return false;
+    if (control.rejected?.has(url.origin)) return false;
     if (url.origin === this.config.targetOrigin || this.config.allowedOrigins.has(url.origin)
       || control.approved.has(url.origin)) return true;
+    if (this.rejectedOrigins?.has(url.origin)) return false;
     const candidate = { origin: url.origin, method: request.method(), path: url.pathname };
     // API calls to another port may be auto-discovered, but that does not grant
     // authority to navigate a tab or submit a document form to that origin.
-    if (!this.config.autoOrigin || control.rejected?.has(url.origin)
-      || this.pendingRoutes.size >= MAX_PENDING_ORIGIN_ROUTES || !this.markOriginPending(candidate)) return false;
+    if (!this.config.autoOrigin) return false;
+    if (this.config.autoApproveOrigins) return this.markOriginResolved(candidate);
+    if (this.pendingRoutes.size >= MAX_PENDING_ORIGIN_ROUTES || !this.markOriginPending(candidate)) return false;
     const decision = await this.waitForOriginDecision(route, request, candidate);
     if (decision.released) return null;
     if (decision.kind !== 'approved') return false;
@@ -939,12 +1000,12 @@ export class NetworkCapture {
     const contentTypeValue = contentType(data.headers);
     if (!BODY_CONTENT_TYPES.test(contentTypeValue) || !length) return;
     const result = await this.readBody(
-      () => Promise.resolve(request.postDataBuffer()), length, contentTypeValue, declaredLength === null,
+      () => Promise.resolve(request.postDataBuffer()), length, contentTypeValue, declaredLength === null, 'request_body',
     );
     this.writeNetwork({ event: 'request_body', request_id: data.requestId, ...result });
   }
 
-  async readBody(read, declaredLength, contentTypeValue, postReadOnly = false) {
+  async readBody(read, declaredLength, contentTypeValue, postReadOnly = false, readStage = 'body') {
     const { maxBodyBytes, maxTotalBodyBytes, bodyTimeoutMs } = this.config.limits;
     const hasDeclaredLength = declaredLength !== null;
     if (hasDeclaredLength && declaredLength > maxBodyBytes) return { capture_status: 'not_captured', reason: 'body_limit_exceeded', declared_bytes: declaredLength };
@@ -977,7 +1038,12 @@ export class NetworkCapture {
         body: { ...body, bytes: buffer.length, truncated: false },
       };
     } catch (error) {
-      return { capture_status: 'not_captured', reason: error?.message === 'body_read_timeout' ? 'body_read_timeout' : 'body_read_failed' };
+      const diagnostic = bodyReadDiagnostic(error, readStage);
+      return {
+        capture_status: 'not_captured',
+        reason: diagnostic.kind === 'timeout' ? 'body_read_timeout' : 'body_read_failed',
+        body_read_diagnostic: diagnostic,
+      };
     } finally {
       if (hasDeclaredLength) this.reservedBodyBytes -= declaredLength;
     }
@@ -1028,6 +1094,22 @@ export class NetworkCapture {
       return;
     }
     const declaredLength = contentLength(headers);
+    let result;
+    if (declaredLength !== null && declaredLength > this.config.limits.maxBodyBytes) {
+      result = { capture_status: 'not_captured', reason: 'response_body_size_limit_exceeded' };
+    } else if (
+      declaredLength !== null
+      && this.reservedBodyBytes + declaredLength > this.config.limits.maxTotalBodyBytes
+    ) {
+      result = { capture_status: 'not_captured', reason: 'total_body_limit_exceeded' };
+    } else {
+      // Read the response body as soon as requestfinished fires.  Waiting on
+      // sizes and request-body processing first made the response more likely
+      // to disappear during a subsequent navigation or browser shutdown.
+      result = await this.readBody(
+        () => response.body(), declaredLength, responseType, declaredLength === null, 'response_body',
+      );
+    }
     let observedResponseBytes = null;
     let observedRequestBytes = null;
     try {
@@ -1035,19 +1117,10 @@ export class NetworkCapture {
       observedResponseBytes = Number.isSafeInteger(sizes.responseBodySize) && sizes.responseBodySize >= 0 ? sizes.responseBodySize : null;
       observedRequestBytes = Number.isSafeInteger(sizes.requestBodySize) && sizes.requestBodySize >= 0 ? sizes.requestBodySize : null;
     } catch {
-      // The terminal response stays usable; the body result below identifies its limit mode.
+      // The terminal response stays usable; an unknown request size falls
+      // back to bounded post-read enforcement.
     }
     await this.captureRequestBody(request, data, observedRequestBytes);
-    const preReadBytes = declaredLength ?? observedResponseBytes;
-    if (preReadBytes !== null && preReadBytes > this.config.limits.maxBodyBytes) {
-      this.writeTerminal(data, { ...base, capture_status: 'not_captured', reason: 'response_body_size_limit_exceeded', response_body_size: observedResponseBytes });
-      return;
-    }
-    if (preReadBytes !== null && this.reservedBodyBytes + preReadBytes > this.config.limits.maxTotalBodyBytes) {
-      this.writeTerminal(data, { ...base, capture_status: 'not_captured', reason: 'total_body_limit_exceeded', response_body_size: observedResponseBytes });
-      return;
-    }
-    const result = await this.readBody(() => response.body(), preReadBytes, responseType, declaredLength === null);
     this.writeTerminal(data, { ...base, response_body_size: observedResponseBytes, ...result });
   }
 
@@ -1149,12 +1222,72 @@ export async function installToolActionCapture(packageRoot, capture) {
   for (const [Tool, toolName] of mappings) wrapExecute(Tool, toolName, capture);
 }
 
+export function installChromiumDurableResponseRetention(packageRoot, config) {
+  const requireFromPackage = createRequire(path.join(packageRoot, 'package.json'));
+  let CRNetworkManager;
+  try {
+    const playwrightCoreRoot = path.dirname(requireFromPackage.resolve('playwright-core/package.json'));
+    ({ CRNetworkManager } = requireFromPackage(path.join(
+      playwrightCoreRoot, 'lib/server/chromium/crNetworkManager.js',
+    )));
+  } catch {
+    console.error('[network-capture] durable_response_retention_unavailable: playwright_chromium_network_hook_unavailable');
+    return false;
+  }
+  const prototype = CRNetworkManager?.prototype;
+  if (!prototype?.addSession) {
+    console.error('[network-capture] durable_response_retention_unavailable: playwright_chromium_network_hook_unavailable');
+    return false;
+  }
+  if (prototype.addSession[PATCHED_CHROMIUM_NETWORK_MANAGER]) return true;
+
+  // Playwright calls Network.enable while it creates every Chromium target
+  // session.  Supplying the durable buffer there retains response bodies in
+  // the browser process across renderer navigation, before a page or popup can
+  // issue its first request.  The existing response.body() path still applies
+  // authorization, content-type and storage limits before persisting a body.
+  const originalAddSession = prototype.addSession;
+  const maxResourceBufferSize = config.limits.maxBodyBytes;
+  const maxTotalBufferSize = Math.max(config.limits.maxTotalBodyBytes, maxResourceBufferSize);
+  let capabilityFailureReported = false;
+  async function durableAddSession(session, ...args) {
+    const originalSend = session.send;
+    session.send = function capturedNetworkEnable(method, params) {
+      if (method !== 'Network.enable') return originalSend.call(this, method, params);
+      return originalSend.call(this, method, {
+        ...(params || {}),
+        maxTotalBufferSize,
+        maxResourceBufferSize,
+        enableDurableMessages: true,
+      }).catch(() => {
+        if (!capabilityFailureReported) {
+          capabilityFailureReported = true;
+          console.error('[network-capture] durable_response_retention_unavailable: chromium_network_enable_rejected');
+        }
+        // Keep capture usable on Chromium versions without durable messages.
+        // The diagnostic above is deliberately fixed text: protocol error
+        // messages are not copied into public artifacts.
+        return originalSend.call(this, method, params);
+      });
+    };
+    try {
+      return await originalAddSession.call(this, session, ...args);
+    } finally {
+      session.send = originalSend;
+    }
+  }
+  Object.defineProperty(durableAddSession, PATCHED_CHROMIUM_NETWORK_MANAGER, { value: true });
+  prototype.addSession = durableAddSession;
+  return true;
+}
+
 export async function installPlaywrightMcpNetworkCapture(packageRoot, env = process.env) {
   const config = readNetworkCaptureConfig(env);
   if (!config.enabled) return null;
   const capture = new NetworkCapture(config);
   const requireFromPackage = createRequire(path.join(packageRoot, 'package.json'));
   const playwright = requireFromPackage('playwright');
+  installChromiumDurableResponseRetention(packageRoot, config);
   for (const browserType of [playwright.chromium, playwright.firefox, playwright.webkit]) {
     const prototype = Object.getPrototypeOf(browserType);
     if (prototype.launch[PATCHED_LAUNCH]) continue;
@@ -1170,7 +1303,9 @@ export async function installPlaywrightMcpNetworkCapture(packageRoot, env = proc
   await installToolActionCapture(packageRoot, capture);
   capture.writeNetwork({
     event: 'capture_started', capture_status: 'enabled', allowed_origins: [...config.allowedOrigins], limits: config.limits,
-    ...(config.autoOrigin ? { auto_origin: true, target_origin: config.targetOrigin } : {}),
+    ...(config.autoOrigin ? {
+      auto_origin: true, auto_approve_origins: config.autoApproveOrigins, target_origin: config.targetOrigin,
+    } : {}),
   });
   return capture;
 }

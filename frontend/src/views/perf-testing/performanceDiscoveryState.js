@@ -9,6 +9,7 @@ export const buildPerformanceDiscoveryCreatePayload = (form) => ({
   description: text(form.description),
   model_id: form.model_id,
   api_origin: text(form.api_origin) || null,
+  auto_approve_origins: form.auto_approve_origins !== false,
   allow_test_data_writes: form.allow_test_data_writes === true,
   exploration_timeout_seconds: form.exploration_timeout_seconds,
 });
@@ -31,4 +32,20 @@ export const publicDiscoverySamplePreview = (record) => {
       body: response.body,
     },
   };
+};
+
+export const discoveryCaptureIssue = (record) => {
+  const summary = record?.public_summary || {};
+  const reason = summary.capture_reason;
+  if (!["body_read_failed", "body_read_timeout"].includes(reason)) return "";
+  const diagnostic = summary.capture_diagnostic || {};
+  const stage = diagnostic.stage === "request_body" ? "请求体" : "响应体";
+  const kinds = {
+    timeout: "读取超时",
+    target_closed: "页面或浏览器已关闭",
+    body_unavailable: "浏览器中的响应内容已不可读取",
+    protocol_error: "浏览器通信异常",
+  };
+  const detail = kinds[diagnostic.kind] || (reason === "body_read_timeout" ? "读取超时" : "现有记录未包含底层原因");
+  return `${stage}采集失败：${detail}。此样本不能导入计划。`;
 };

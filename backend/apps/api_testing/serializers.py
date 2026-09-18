@@ -65,6 +65,7 @@ class BrowserDiscoveryCreateSerializer(serializers.Serializer):
     api_origin = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=500)
     model_id = serializers.IntegerField(min_value=1)
     allow_test_data_writes = serializers.BooleanField()
+    auto_approve_origins = serializers.BooleanField(required=False, default=True)
     exploration_timeout_seconds = serializers.IntegerField(required=False, min_value=1)
 
     def validate_description(self, value):
@@ -74,6 +75,13 @@ class BrowserDiscoveryCreateSerializer(serializers.Serializer):
 
 
 class BrowserDiscoveryRecordSerializer(serializers.ModelSerializer):
+    public_summary = serializers.SerializerMethodField()
+
+    def get_public_summary(self, obj):
+        # Import lazily to keep the model serializer dependency one-way.
+        from .browser_discovery import sanitize_public_summary
+        return sanitize_public_summary(obj.public_summary)
+
     class Meta:
         model = BrowserDiscoveryRecord
         fields = [

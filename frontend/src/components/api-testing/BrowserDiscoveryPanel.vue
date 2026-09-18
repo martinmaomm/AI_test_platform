@@ -22,7 +22,8 @@
         <el-form label-position="top" class="create-form">
           <el-form-item label="完整页面 URL" required><el-input v-model="form.target_url" aria-label="完整页面 URL" placeholder="https://example.test/login" :disabled="disabled || creating" /></el-form-item>
           <el-alert title="默认自动识别页面实际发起的接口来源，无需手动填写接口地址。" type="info" :closable="false" show-icon />
-          <p class="origin-safety-hint">自动确认仅覆盖页面直接发起的 fetch/XHR；HTTP 重定向和跨站登录暂不支持，可能由浏览器自动跟随，请只用于可信测试站点。</p>
+          <el-form-item label="跨域请求"><el-switch v-model="form.auto_approve_origins" aria-label="自动允许跨域请求" active-text="自动允许跨域请求" :disabled="disabled || creating" /><span v-if="!form.auto_approve_origins" class="origin-safety-hint">关闭后，发现新的跨域来源时需手动确认。</span></el-form-item>
+          <p class="origin-safety-hint">支持页面直接发起的 fetch/XHR 与页面跳转；HTTP 重定向和复杂跨站登录仍可能由浏览器自动跟随，请只用于可信测试站点。</p>
           <el-collapse class="advanced-settings">
             <el-collapse-item title="高级设置" name="advanced">
               <el-form-item label="手动 API origin（可选）"><el-input v-model="form.api_origin" aria-label="手动 API origin（可选）" placeholder="https://api.example.test；填写后按此来源探索" :disabled="disabled || creating" /></el-form-item>
@@ -30,7 +31,7 @@
           </el-collapse>
           <el-form-item label="探索目标说明" required><el-input v-model="form.description" aria-label="探索目标说明" type="textarea" :rows="3" :maxlength="BROWSER_DISCOVERY_MAX_DESCRIPTION_LENGTH" show-word-limit placeholder="描述要探索的业务步骤、范围和待确认目标" :disabled="disabled || creating" /></el-form-item>
           <el-form-item label="LLM 模型" required><el-select v-model="form.model_id" aria-label="LLM 模型" placeholder="选择已启用模型" style="width:100%" :disabled="disabled || creating"><el-option v-for="model in models" :key="model.id" :value="model.id" :label="modelLabel(model)" /></el-select></el-form-item>
-          <el-form-item label="探索总时限（秒）" required><el-input-number :key="`browser-discovery-timeout-${disabled || creating}`" v-model="form.exploration_timeout_seconds" aria-label="探索总时限（秒）" :min="BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS" :max="timeoutMaximum" :step="30" :disabled="disabled || creating" /></el-form-item>
+          <el-form-item label="探索时限（秒，不含来源确认等待）" required><el-input-number :key="`browser-discovery-timeout-${disabled || creating}`" v-model="form.exploration_timeout_seconds" aria-label="探索总时限（秒）" :min="BROWSER_DISCOVERY_MIN_TIMEOUT_SECONDS" :max="timeoutMaximum" :step="30" :disabled="disabled || creating" /></el-form-item>
           <el-form-item><el-checkbox v-model="form.allow_test_data_writes" aria-label="允许测试数据写入" :disabled="disabled || creating">我确认允许在上述授权测试范围内修改测试数据</el-checkbox></el-form-item>
           <el-button type="primary" :loading="creating" :disabled="disabled" @click="submit">开始探索</el-button>
           <ActionHelpTooltip label="开始探索" content="调用所选 AI，通过浏览器执行描述中的页面操作并记录真实接口。可能新增、修改或删除测试数据；完成后还需选择样本进入工作区生成用例，不会直接保存测试用例。" />
@@ -75,6 +76,7 @@
         <el-descriptions :column="2" size="small" border>
           <el-descriptions-item label="目标页面" :span="2">{{ task.target_url || "—" }}</el-descriptions-item>
           <el-descriptions-item label="接口来源">{{ originSummary(task) }}</el-descriptions-item>
+          <el-descriptions-item label="跨域请求">{{ task.auto_approve_origins ? "自动允许" : "逐次确认" }}</el-descriptions-item>
           <el-descriptions-item label="来源状态">{{ originStateLabel(task) }}</el-descriptions-item>
           <el-descriptions-item label="已采集 / 有效">{{ evidenceCounts(task).collected }} / {{ evidenceCounts(task).usable }}</el-descriptions-item>
           <el-descriptions-item label="当前动作">{{ task.current_action || task.phase || "—" }}</el-descriptions-item>
@@ -98,7 +100,7 @@
           </div>
         </el-alert>
         <p v-if="task.description" class="description">{{ task.description }}</p>
-        <el-alert v-if="originResolution.state === 'awaiting_confirmation'" title="发现跨主机接口的当前直接请求，需确认后才会发送该请求；未确认不会保存正文或认证信息。" type="warning" :closable="false" show-icon />
+        <el-alert v-if="originResolution.state === 'awaiting_confirmation'" title="发现跨主机接口的当前直接请求，需确认后才会发送；探索计时已暂停，累计等待确认最多 300 秒。未确认不会保存正文或认证信息。" type="warning" :closable="false" show-icon />
         <ActionHelpTooltip v-if="originResolution.state === 'awaiting_confirmation'" label="允许或拒绝接口来源" content="请核对接口地址是否属于本次测试范围。允许后可能向该地址发送请求和认证信息并采集样本；拒绝会阻止未授权来源的请求，不会撤回已经发生的页面操作。" />
         <div v-if="originResolution.state === 'awaiting_confirmation'" class="origin-candidates">
           <div v-for="candidate in originResolution.pending" :key="`${candidate.origin}:${candidate.method}:${candidate.path}`" class="origin-candidate">
@@ -203,7 +205,7 @@ const createFormCard = ref(null);
 const selectedRecordIds = ref([]);
 const enabled = computed(() => props.config?.enabled === true);
 const models = computed(() => Array.isArray(props.config?.models) ? props.config.models : []);
-const defaultForm = () => ({ target_url: "", description: "", api_origin: "", model_id: models.value[0]?.id ?? null, allow_test_data_writes: false, exploration_timeout_seconds: browserDiscoveryTimeoutDefault(props.config) });
+const defaultForm = () => ({ target_url: "", description: "", api_origin: "", auto_approve_origins: true, model_id: models.value[0]?.id ?? null, allow_test_data_writes: false, exploration_timeout_seconds: browserDiscoveryTimeoutDefault(props.config) });
 const form = ref(defaultForm());
 const formSnapshot = ref(browserDiscoveryFormSnapshot(form.value));
 const formDirty = computed(() => browserDiscoveryFormSnapshot(form.value) !== formSnapshot.value);

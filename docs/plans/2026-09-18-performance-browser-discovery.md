@@ -55,7 +55,7 @@
 性能专用前缀 `/projects/<id>/performance/discovery/`：
 
 - GET config/：模型、开关与 limits，返回既有探索配置 data。
-- GET/POST tasks/：列表/创建；创建字段沿用 API 探索 target_url、description、model_id、api_origin(可选)、allow_test_data_writes、exploration_timeout_seconds。
+- GET/POST tasks/：列表/创建；创建字段沿用 API 探索 target_url、description、model_id、api_origin(可选)、allow_test_data_writes、exploration_timeout_seconds，并增加 auto_approve_origins（默认 true，可关闭以逐次确认跨域来源）。
 - GET/DELETE tasks/<uuid>/：详情/删除。
 - GET tasks/<uuid>/records/：采集记录。
 - POST tasks/<uuid>/cancel/、retry/、origin/：沿用明确取消、可重试原因和 origin 选择能力。

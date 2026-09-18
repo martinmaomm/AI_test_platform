@@ -4,7 +4,8 @@ import tempfile
 import uuid
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from django.contrib.auth import get_user_model
 from django.db.models.deletion import ProtectedError
@@ -16,14 +17,14 @@ from ai_core.models import LLMConfiguration
 from projects.models import Project, ProjectMember
 from .browser_discovery import (
     _selection,
-    _response_scalar_values, expire_stale_discovery, handoff_to_workspace,
+    _response_scalar_values, discovery_limits, expire_stale_discovery, handoff_to_workspace,
     ingest_trace, origin_control_file, origin_resolution, origin_state_file,
     read_origin_state, selectable_origins, sync_auto_origin, task_trace_file,
     serialize_task,
 )
-from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryDetailView, BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView
+from .browser_discovery_views import BrowserDiscoveryCollectionView, BrowserDiscoveryDetailView, BrowserDiscoveryHandoffView, BrowserDiscoveryOriginsView, BrowserDiscoveryRecordsView
 from .models import APIEndpoint, APISpecification, APIWorkspace, BrowserDiscoveryHandoff, BrowserDiscoveryRecord, BrowserDiscoveryTask, default_api_workspace_draft
-from .tasks import _claim_browser_discovery, _finish_browser_discovery
+from .tasks import _claim_browser_discovery, _finish_browser_discovery, run_browser_discovery_async
 from .workspace_service import endpoint_specs, generation_endpoint_specs
 from .workspace_service import WorkspaceValidationError
 from .workspace_views import APIWorkspaceCollectionView, APIWorkspaceDetailView, APIWorkspaceMessagesView
@@ -171,7 +172,7 @@ class BrowserDiscoveryContractsTests(TestCase):
             trace.parent.mkdir(parents=True)
             events = [
                 self.event('capture_started', capture_status='enabled'),
-                self.event('request', request_id='create', request_sequence=1, method='POST', origin='https://api.example.test', path='/items', url='https://api.example.test/items', query=[{'name': 'tag', 'value': 'first'}, {'name': 'tag', 'value': 'second'}], resource_type='fetch', capture_status='pending', authentication_headers=[{'name': 'Authorization', 'scheme': 'Bearer', 'value_sha256': 'abc'}]),
+                self.event('request', request_id='create', request_sequence=1, method='POST', origin='https://api.example.test', path='/items', url='https://api.example.test/items', query=[{'name': 'tag', 'value': 'first'}, {'name': 'tag', 'value': 'second'}], resource_type='fetch', capture_status='pending', authentication_headers=[{'name': 'Authorization', 'scheme': 'Bearer', 'value_sha256': 'a' * 64}]),
                 self.event('request_body', request_id='create', capture_status='captured', body={'kind': 'json', 'value': {'name': 'run-item'}, 'bytes': 19, 'truncated': False}),
                 self.event('response', request_id='create', status=201, capture_status='captured', body={'kind': 'json', 'value': {'id': 'item-123'}, 'bytes': 17, 'truncated': False}),
                 self.event('request', request_id='update', request_sequence=2, method='PATCH', origin='https://api.example.test', path='/items/item-123', url='https://api.example.test/items/item-123', query=[], resource_type='fetch', capture_status='pending'),
@@ -190,7 +191,7 @@ class BrowserDiscoveryContractsTests(TestCase):
             self.assertEqual(records[0].request_id, 'create')
             self.assertEqual(records[0].resource_type, 'fetch')
             self.assertEqual(records[0].public_summary['observed_request']['query'][1]['value'], 'second')
-            self.assertEqual(records[0].public_summary['observed_request']['auth_hints'][0]['value_hash'], 'abc')
+            self.assertEqual(records[0].public_summary['observed_request']['auth_hints'][0]['value_hash'], 'a' * 64)
             self.assertNotIn('observed_request', records[2].public_summary)
             self.assertFalse(records[2].is_eligible)
             self.assertFalse(records[3].is_eligible)
@@ -236,6 +237,102 @@ class BrowserDiscoveryContractsTests(TestCase):
             draft['teststeps'][1]['request']['url'] = '/items/item-123'
             with self.assertRaises(WorkspaceValidationError):
                 prepare_candidate(draft, endpoints=endpoints, target_url='https://api.example.test', variables={})
+
+    def test_legacy_auth_hints_are_sanitized_for_records_api_and_handoff(self):
+        task = self.task(status=BrowserDiscoveryTask.Status.COMPLETED)
+        task.source_version = task.version
+        task.save(update_fields=['source_version', 'updated_at'])
+        secret_scheme = 'credential-without-space-must-not-leak'
+        secret_hash = 'this-is-not-a-hash-and-must-not-leak'
+        record = BrowserDiscoveryRecord.objects.create(
+            task=task, sequence=1, request_id='legacy-auth', origin=task.api_origin,
+            method='GET', path='/profile', resource_type='fetch', status_code=200,
+            content_type='application/json', is_eligible=True,
+            public_summary={
+                'sequence': 1, 'request_id': 'legacy-auth', 'method': 'GET',
+                'origin': task.api_origin, 'path': '/profile', 'resource_type': 'fetch',
+                'status_code': 200, 'content_type': 'application/json',
+                'capture_complete': True, 'source_authorized': True,
+                'capture_diagnostic': {'stage': 'response_body', 'kind': secret_scheme},
+                'observed_request': {'auth_hints': [
+                    {'name': 'authorization', 'scheme': secret_scheme, 'value_hash': secret_hash},
+                    {'name': secret_scheme, 'scheme': secret_scheme, 'value_hash': secret_hash},
+                ]},
+                'observed_response': {'auth_hints': [
+                    {'name': 'set-cookie', 'scheme': secret_scheme, 'value_hash': 'b' * 64},
+                ], 'body': {'ok': True}},
+            },
+        )
+
+        request = self.factory.get('/')
+        force_authenticate(request, self.owner)
+        reply = BrowserDiscoveryRecordsView.as_view()(
+            request, project_id=self.project.id, task_id=task.id,
+        )
+        self.assertEqual(reply.status_code, 200, reply.data)
+        summary = reply.data['data']['items'][0]['public_summary']
+        self.assertEqual(summary['observed_request']['auth_hints'], [{
+            'name': 'authorization', 'scheme': 'unknown', 'value_hash': '',
+        }])
+        self.assertEqual(summary['observed_response']['auth_hints'], [{
+            'name': 'set-cookie', 'scheme': 'set-cookie', 'value_hash': 'b' * 64,
+        }])
+        self.assertNotIn('capture_diagnostic', summary)
+        self.assertNotIn(secret_scheme, json.dumps(reply.data))
+        self.assertNotIn(secret_hash, json.dumps(reply.data))
+
+        handoff, created = handoff_to_workspace(
+            task=task, owner=self.owner, version=task.version, record_ids=[record.id],
+        )
+        self.assertTrue(created)
+        published = handoff.spec.metadata['browser_capture']['observed_samples'][0]
+        self.assertEqual(published['observed_request']['auth_hints'][0]['scheme'], 'unknown')
+        self.assertNotIn(secret_scheme, json.dumps(handoff.spec.metadata))
+        self.assertNotIn(secret_hash, json.dumps(handoff.spec.metadata))
+
+    def test_body_read_failure_keeps_only_allowlisted_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory, override_settings(BASE_DIR=directory):
+            task = self.task()
+            trace = task_trace_file(task)
+            trace.parent.mkdir(parents=True)
+            events = [
+                self.event(
+                    'request', request_id='login', request_sequence=1, method='POST',
+                    origin=task.api_origin, path='/login', url=task.api_origin + '/login',
+                    resource_type='fetch', capture_status='pending',
+                ),
+                self.event(
+                    'response', request_id='login', status=200, capture_status='not_captured',
+                    reason='body_read_failed',
+                    body_read_diagnostic={'stage': 'response_body', 'kind': 'target_closed', 'message': 'secret'},
+                ),
+                self.event(
+                    'request', request_id='submit', request_sequence=2, method='POST',
+                    origin=task.api_origin, path='/submit', url=task.api_origin + '/submit',
+                    resource_type='fetch', capture_status='pending',
+                    request_headers={'content-type': 'application/json', 'content-length': '10'},
+                    authentication_headers={'authorization': 'legacy-opaque-token'},
+                ),
+                self.event(
+                    'request_body', request_id='submit', capture_status='not_captured', reason='body_read_failed',
+                    body_read_diagnostic={'stage': 'request_body', 'kind': 'protocol_error', 'message': 'secret'},
+                ),
+                self.event('response', request_id='submit', status=200, capture_status='captured'),
+            ]
+            trace.write_text('\n'.join(json.dumps(item) for item in events) + '\n', encoding='utf-8')
+            result = ingest_trace(task)
+            self.assertEqual(result['ingested'], 2)
+            summary = task.records.get(request_id='login').public_summary
+            self.assertEqual(summary['capture_reason'], 'body_read_failed')
+            self.assertEqual(summary['capture_diagnostic'], {'stage': 'response_body', 'kind': 'target_closed'})
+            self.assertNotIn('secret', json.dumps(summary))
+            request_summary = task.records.get(request_id='submit').public_summary
+            self.assertEqual(request_summary['capture_reason'], 'body_read_failed')
+            self.assertEqual(request_summary['capture_diagnostic'], {'stage': 'request_body', 'kind': 'protocol_error'})
+            self.assertRegex(
+                request_summary['observed_request']['auth_hints'][0]['value_hash'], r'^[0-9a-f]{64}$',
+            )
+            self.assertNotIn('secret', json.dumps(request_summary))
 
     @override_settings(API_BROWSER_DISCOVERY_ENABLED=True)
     def test_atomic_claim_rejects_duplicate_delivery_and_revalidates_owner_permissions(self):
@@ -410,6 +507,55 @@ class BrowserDiscoveryContractsTests(TestCase):
         queued = BrowserDiscoveryTask.objects.latest('created_at')
         self.assertEqual(queued.error_code, 'queue_unavailable')
         self.assertNotIn('secret', queued.error_message)
+        self.assertIs(queued.limits['auto_approve_origins'], True)
+        self.assertIs(serialize_task(queued)['auto_approve_origins'], True)
+
+        with patch(
+            'api_testing.browser_discovery.resolve_browser_discovery_mcp_config',
+            return_value={'mcpServers': {'playwright': {}}},
+        ), patch('api_testing.tasks.run_browser_discovery_async.apply_async'):
+            manual_confirmation = self.factory.post('/', {
+                **payload, 'auto_approve_origins': False,
+            }, format='json')
+            force_authenticate(manual_confirmation, user=self.owner)
+            manual_reply = BrowserDiscoveryCollectionView.as_view()(
+                manual_confirmation, project_id=self.project.id,
+            )
+        self.assertEqual(manual_reply.status_code, 202, manual_reply.data)
+        manual_task = BrowserDiscoveryTask.objects.latest('created_at')
+        self.assertIs(manual_task.limits['auto_approve_origins'], False)
+        self.assertIs(serialize_task(manual_task)['auto_approve_origins'], False)
+
+    def test_legacy_task_serializes_auto_approval_as_disabled(self):
+        legacy = self.task()
+        self.assertNotIn('auto_approve_origins', legacy.limits)
+        self.assertIs(serialize_task(legacy)['auto_approve_origins'], False)
+
+    def test_api_worker_passes_persisted_auto_approval_to_runner(self):
+        limits = {
+            **discovery_limits(), 'origin_mode': 'auto', 'auto_approve_origins': True,
+        }
+        queued = self.task(api_origin='', status=BrowserDiscoveryTask.Status.QUEUED, limits=limits)
+        agent = AsyncMock(return_value={
+            'completed': False, 'error_code': 'NO_RECORDS',
+            'summary': 'offline mock', 'tool_calls': 0, 'model_calls': 1,
+        })
+        with tempfile.TemporaryDirectory() as directory, patch(
+            'ai_core.model_manager.get_llm_manager',
+            return_value=SimpleNamespace(current_llm=object()),
+        ), patch(
+            'api_testing.browser_discovery.resolve_browser_discovery_mcp_config',
+            return_value={'mcpServers': {'playwright': {'command': 'offline-mock'}}},
+        ), patch(
+            'api_testing.browser_discovery.task_trace_dir', return_value=Path(directory),
+        ), patch(
+            'api_testing.browser_discovery.task_trace_file', return_value=Path(directory) / 'network.jsonl',
+        ), patch(
+            'api_testing.browser_discovery_agent.run_browser_discovery', agent,
+        ), patch('api_testing.tasks._finish_browser_discovery'):
+            result = run_browser_discovery_async.run(str(queued.id), queued.version, queued.task_id)
+        self.assertEqual(result, {'status': 'finished'})
+        self.assertIs(agent.await_args.kwargs['auto_approve_origins'], True)
 
     def test_other_editor_cannot_list_owner_tasks(self):
         task = self.task()

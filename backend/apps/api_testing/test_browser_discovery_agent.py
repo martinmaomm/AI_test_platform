@@ -266,6 +266,7 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertEqual(env['MCP_NETWORK_CAPTURE_MAX_REQUESTS'], '30')
         self.assertEqual(env['MCP_NETWORK_CAPTURE_DIR'], str(Path(self.temp.name).resolve()))
         self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_ORIGIN'], '0')
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS'], '0')
         self.assertNotIn('env', original['mcpServers']['playwright'])
         self.assertNotIn('MCP_NETWORK_CAPTURE', str(original))
 
@@ -277,11 +278,30 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
     def test_empty_api_origin_enables_target_scoped_auto_collection(self):
         config = prepare_capture_config(
             self.options['mcp_config'], self.options['task_id'], self.options['trace_file'], '', {},
-            target_url=self.options['target_url'], auto_origin=True,
+            target_url=self.options['target_url'], auto_origin=True, auto_approve_origins=True,
         )
         self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_ALLOWED_ORIGINS'], '')
         self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_AUTO_ORIGIN'], '1')
+        self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS'], '1')
         self.assertEqual(config['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_TARGET_URL'], self.options['target_url'])
+
+    def test_auto_approved_runner_config_and_prompt_do_not_request_human_confirmation(self):
+        client, session = self.clients()
+        agent = SimpleNamespace(initialize=AsyncMock(), run=AsyncMock(return_value='完成'))
+        with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client) as client_factory, patch(
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', return_value=agent,
+        ):
+            result = asyncio.run(run_browser_discovery(
+                **{**self.options, 'api_origin': '', 'auto_approve_origins': True},
+            ))
+        self.assertTrue(result['completed'])
+        env = client_factory.call_args.args[0]['mcpServers']['playwright']['env']
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_ORIGIN'], '1')
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS'], '1')
+        prompt = agent.run.call_args.args[0]
+        self.assertIn('自动允许并采集', prompt)
+        self.assertNotIn('等待任务所有者确认', prompt)
+        session.call_tool.assert_awaited_once_with('playwright_close', {})
 
     def test_plain_model_final_text_does_not_require_json_or_script(self):
         client, session = self.clients()
@@ -343,6 +363,65 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertFalse(result['completed'])
         self.assertNotIn('SECRET', str(result))
         self.assertNotIn('API_KEY', str(result))
+
+    def _run_confirmation_wait(self, waits, *, cancel=False):
+        client, session = self.clients()
+        state = {'now': 0.0, 'pending': False, 'cancelled': False}
+        callbacks = []
+        checkpoints = []
+
+        async def checkpoint(payload):
+            checkpoints.append(payload)
+            if state['pending']:
+                # Simulate the human taking time to answer. The next monitor or
+                # gate poll sees the new time and decision, without a real wait.
+                state['now'] += waits.pop(0)
+                state['pending'] = False
+                state['cancelled'] = cancel
+            return True
+
+        async def run(*args, **kwargs):
+            while waits:
+                state['pending'] = True
+                await callbacks[0].on_chat_model_start({}, [])
+                state['now'] += 5
+            return '探索结束'
+
+        agent = SimpleNamespace(initialize=AsyncMock(), run=run)
+
+        def factory(**kwargs):
+            callbacks.extend(kwargs['callbacks'])
+            return agent
+
+        with patch('api_testing.browser_discovery_agent.MCPClient.from_dict', return_value=client), patch(
+            'api_testing.browser_discovery_agent.BrowserDiscoveryMCPAgent', side_effect=factory,
+        ), patch('api_testing.browser_discovery_agent.time', SimpleNamespace(monotonic=lambda: state['now'])):
+            result = asyncio.run(run_browser_discovery(
+                **self.options, checkpoint=checkpoint,
+                origin_pending=lambda: state['pending'], is_cancelled=lambda: state['cancelled'],
+            ))
+        session.call_tool.assert_awaited_once_with('playwright_close', {})
+        client.close_all_sessions.assert_awaited_once()
+        return result, checkpoints
+
+    def test_confirmation_wait_does_not_consume_exploration_budget(self):
+        result, checkpoints = self._run_confirmation_wait([188])
+        self.assertTrue(result['completed'], result)
+        self.assertEqual(result['elapsed_seconds'], 193)
+        self.assertEqual(result['origin_wait_seconds'], 188)
+        self.assertEqual(result['active_elapsed_seconds'], 5)
+        self.assertTrue(any('计时已暂停' in p['current_action'] for p in checkpoints))
+
+    def test_multiple_confirmation_waits_share_one_bounded_budget(self):
+        result, _ = self._run_confirmation_wait([180, 125])
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['error_code'], 'ORIGIN_CONFIRMATION_TIMEOUT')
+        self.assertEqual(result['origin_wait_seconds'], 305)
+
+    def test_cancel_during_confirmation_still_closes_browser(self):
+        result, _ = self._run_confirmation_wait([10], cancel=True)
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['error_code'], 'CANCELLED')
 
     def test_streaming_openai_overload_is_model_failure_not_mcp_other(self):
         client, _ = self.clients()

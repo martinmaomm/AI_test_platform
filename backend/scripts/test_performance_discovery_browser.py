@@ -77,6 +77,9 @@ def verify(origin, fixture, output):
             page.goto(origin + '/perf-testing/discovery')
             expect(page.get_by_text('新建网页探索', exact=True)).to_be_visible()
             form = page.locator('.el-form')
+            expect(form.get_by_role('spinbutton')).to_have_value('900')
+            origin_switch = form.get_by_role('switch', name='自动允许跨域请求', exact=True)
+            expect(origin_switch).to_be_checked()
             form.locator('.el-form-item').filter(has_text=re.compile('^目标页面')).locator('input').fill('https://fixture.invalid/app')
             form.locator('textarea').fill('探索列表查询，仅使用本轮测试数据。')
             form.locator('.el-checkbox').click()
@@ -84,7 +87,15 @@ def verify(origin, fixture, output):
                 form.get_by_role('button', name='开始探索', exact=True).click()
             assert created.value.status == 202, created.value.text()
             task = created.value.json()['data']
+            assert task['exploration_timeout_seconds'] == 900
+            assert task['auto_approve_origins'] is True
             assert task['version'] == 7
+            form.locator('.el-switch').click()
+            expect(origin_switch).not_to_be_checked()
+            with page.expect_response(lambda r: r.request.method == 'POST' and r.url.endswith('/discovery/tasks/')) as manual:
+                form.get_by_role('button', name='开始探索', exact=True).click()
+            assert manual.value.status == 202, manual.value.text()
+            assert manual.value.json()['data']['auto_approve_origins'] is False
             expect(page.get_by_text('已采集两种查询参数样本。', exact=False)).to_be_visible()
             # Selecting a table row, not just its action, must use the task ID.
             page.locator('.el-table__body tbody tr').first.click()
@@ -118,7 +129,8 @@ def verify(origin, fixture, output):
             expect(editor).not_to_be_visible()
             assert not external, external
             assert not errors, errors
-            return {'real_http_routes': True, 'task_version': 7, 'variant_selected': 'second-item',
+            return {'real_http_routes': True, 'default_timeout': 900, 'automatic_origins_default': True,
+                    'manual_origins_option_verified': True, 'task_version': 7, 'variant_selected': 'second-item',
                     'draft_in_url': False, 'draft_consumed_once': True, 'warnings_visible': True,
                     'saved_plan_id': plan['id'], 'page_errors': 0, 'model_calls': 0, 'pressure_runs': 0}
         except Exception:

@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildPerformanceDiscoveryCreatePayload,
+  discoveryCaptureIssue,
   publicDiscoverySamplePreview,
 } from "../src/views/perf-testing/performanceDiscoveryState.js";
 
-test("discovery create payload is the strict six-field contract", () => {
+test("discovery create payload defaults to automatic origin approval and excludes editor fields", () => {
   const payload = buildPerformanceDiscoveryCreatePayload({
     target_url: " https://example.test/catalog ",
     description: " 搜索商品 ",
@@ -22,11 +23,16 @@ test("discovery create payload is the strict six-field contract", () => {
     description: "搜索商品",
     model_id: 7,
     api_origin: null,
+    auto_approve_origins: true,
     allow_test_data_writes: true,
     exploration_timeout_seconds: 300,
   });
   assert.equal("target_id" in payload, false);
   assert.equal("version" in payload, false);
+  assert.equal(buildPerformanceDiscoveryCreatePayload({
+    target_url: "https://example.test", description: "探索", model_id: 7,
+    allow_test_data_writes: true, exploration_timeout_seconds: 900, auto_approve_origins: false,
+  }).auto_approve_origins, false);
 });
 
 test("sample preview retains server-public query, body and response variants", () => {
@@ -47,4 +53,15 @@ test("sample preview retains server-public query, body and response variants", (
   });
   assert.deepEqual(preview.json, { active: true });
   assert.deepEqual(preview.response.body, { items: [] });
+});
+
+test("capture failure distinguishes classified errors from missing historic diagnostics", () => {
+  assert.match(discoveryCaptureIssue({ public_summary: {
+    capture_reason: "body_read_failed",
+    capture_diagnostic: { stage: "response_body", kind: "body_unavailable" },
+  } }), /响应体采集失败：浏览器中的响应内容已不可读取/);
+  assert.match(discoveryCaptureIssue({ public_summary: {
+    capture_reason: "body_read_failed",
+  } }), /现有记录未包含底层原因/);
+  assert.equal(discoveryCaptureIssue({ public_summary: { capture_complete: true } }), "");
 });

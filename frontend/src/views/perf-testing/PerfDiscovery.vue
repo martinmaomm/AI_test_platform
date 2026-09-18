@@ -30,7 +30,10 @@
                 " /></el-select></el-form-item
           ><el-form-item label="API origin（可选）"
             ><el-input v-model="form.api_origin" /></el-form-item
-          ><el-form-item label="总时限（秒）"
+          ><el-form-item label="跨域请求"
+            ><el-switch v-model="form.auto_approve_origins" aria-label="自动允许跨域请求" active-text="自动允许跨域请求" />
+            <span v-if="!form.auto_approve_origins" class="preview-help">关闭后，发现新的跨域来源时需手动确认。</span></el-form-item
+          ><el-form-item label="探索时限（秒，不含来源确认等待）"
             ><el-input-number
               v-model="form.exploration_timeout_seconds"
               :min="60"
@@ -79,6 +82,7 @@
           ><el-descriptions-item label="当前动作">{{
             task.current_action || task.phase || "-"
           }}</el-descriptions-item
+          ><el-descriptions-item label="跨域请求" :span="2">{{ task.auto_approve_origins ? "自动允许" : "逐次确认" }}</el-descriptions-item
           ><el-descriptions-item label="诊断" :span="2">{{
             task.error_message || task.error || task.summary || "-"
           }}</el-descriptions-item></el-descriptions
@@ -121,7 +125,7 @@
           <el-button v-for="origin in task.origin_resolution.origins" :key="origin" :loading="loading.action" @click="resolve(origin, 'select')">{{ origin }}</el-button>
         </template>
         <el-alert v-if="originPending.length" type="warning" :closable="false"
-          >发现跨 origin 请求，确认前不会将其导入计划。</el-alert
+          >发现跨来源请求，确认后才会继续发送。探索计时已暂停，累计等待确认最多 300 秒。</el-alert
         >
         <div
           v-for="candidate in originPending"
@@ -165,6 +169,7 @@
                     （{{ record.exclusion_reason || "不可导入" }}）
                   </span>
                 </template>
+                <p v-if="discoveryCaptureIssue(record)" class="ineligible">{{ discoveryCaptureIssue(record) }}</p>
                 <p v-if="record.dependency_record_ids?.length" class="dependency-note">
                   候选依赖记录 ID：{{ record.dependency_record_ids.join("、") }}。确切数据依赖会自动纳入草稿；认证等不确定依赖需要人工确认。
                 </p>
@@ -206,6 +211,7 @@ import { performanceErrorMessage } from '@/api/performanceError';
 import { usePerformanceDiscovery } from "@/composables/usePerformanceDiscovery";
 import {
   buildPerformanceDiscoveryCreatePayload,
+  discoveryCaptureIssue,
   publicDiscoverySamplePreview,
 } from "./performanceDiscoveryState";
 const router = useRouter();
@@ -239,9 +245,10 @@ const form = reactive({
   description: "",
   model_id: null,
   api_origin: "",
+  auto_approve_origins: true,
   target_id: null,
   allow_test_data_writes: false,
-  exploration_timeout_seconds: 300,
+  exploration_timeout_seconds: 900,
 });
 const groups = computed(() => {
   const map = new Map();

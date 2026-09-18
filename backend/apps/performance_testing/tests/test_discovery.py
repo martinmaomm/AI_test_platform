@@ -20,6 +20,7 @@ from api_testing.models import (
 )
 from performance_testing.discovery import (
     _claim_performance_discovery,
+    clone_retry_task,
     run_performance_browser_discovery_async,
 )
 from performance_testing.models import PerformanceTarget
@@ -137,6 +138,8 @@ class PerformanceDiscoveryAPITests(TestCase):
         task = BrowserDiscoveryTask.objects.get(pk=created.data['data']['id'])
         self.assertEqual((task.project_id, task.owner_id), (self.project.id, self.owner.id))
         self.assertEqual(task.target_url, payload['target_url'])
+        self.assertIs(task.limits['auto_approve_origins'], True)
+        self.assertIs(created.data['data']['auto_approve_origins'], True)
         dispatch.assert_called_once_with(task)
 
         invalid = self.client.post(self.path('tasks/'), {
@@ -156,6 +159,61 @@ class PerformanceDiscoveryAPITests(TestCase):
         self.assertEqual(records.status_code, 200, records.data)
         self.assertEqual(set(records.data['data']), {'items', 'next_after', 'evidence_path'})
         self.assertEqual(records.data['data']['items'][0]['path'], '/health')
+
+        with patch(
+            'performance_testing.discovery_views.resolve_browser_discovery_mcp_config',
+            return_value={'mcpServers': {'playwright': {}}},
+        ), patch(
+            'performance_testing.discovery_views.dispatch_performance_discovery', return_value=True,
+        ):
+            manual_confirmation = self.client.post(self.path('tasks/'), {
+                **payload, 'auto_approve_origins': False,
+            }, format='json')
+        self.assertEqual(manual_confirmation.status_code, 202, manual_confirmation.data)
+        self.assertIs(manual_confirmation.data['data']['auto_approve_origins'], False)
+        self.assertIs(
+            BrowserDiscoveryTask.objects.get(pk=manual_confirmation.data['data']['id']).limits['auto_approve_origins'],
+            False,
+        )
+
+    def test_create_without_timeout_defaults_to_900_within_server_limit(self):
+        self.auth()
+        for maximum, expected in ((1800, 900), (120, 120)):
+            with self.subTest(maximum=maximum), override_settings(
+                API_BROWSER_DISCOVERY_TOTAL_TIMEOUT_SECONDS=maximum,
+            ), patch('performance_testing.discovery_views.resolve_browser_discovery_mcp_config'), patch(
+                'performance_testing.discovery_views.dispatch_performance_discovery', return_value=True,
+            ):
+                response = self.client.post(self.path('tasks/'), {
+                    'target_url': 'https://shop.example.test', 'description': '只读探索',
+                    'model_id': self.model.id, 'allow_test_data_writes': True,
+                }, format='json')
+                self.assertEqual(response.status_code, 202, response.data)
+                self.assertEqual(response.data['data']['exploration_timeout_seconds'], expected)
+
+    def test_checkpoint_uses_active_budget_and_keeps_heartbeat_after_confirmation_wait(self):
+        from api_testing.tasks import _browser_discovery_checkpoint
+
+        task = self.task(status=BrowserDiscoveryTask.Status.RUNNING, exploration_timeout_seconds=300)
+        with patch('api_testing.browser_discovery.ingest_trace'):
+            self.assertTrue(_browser_discovery_checkpoint(str(task.id), task.version, task.task_id, {
+                'elapsed_seconds': 450, 'active_elapsed_seconds': 250,
+                'origin_wait_seconds': 200, 'current_action': '观察页面内容',
+            }))
+            task.refresh_from_db()
+            self.assertIsNotNone(task.heartbeat_at)
+            self.assertEqual(task.error_code, '')
+            self.assertFalse(_browser_discovery_checkpoint(str(task.id), task.version, task.task_id, {
+                'elapsed_seconds': 501, 'active_elapsed_seconds': 301,
+            }))
+
+    def test_checkpoint_without_active_time_keeps_existing_deadline_guard(self):
+        from api_testing.tasks import _browser_discovery_checkpoint
+
+        task = self.task(status=BrowserDiscoveryTask.Status.RUNNING, exploration_timeout_seconds=300)
+        self.assertFalse(_browser_discovery_checkpoint(str(task.id), task.version, task.task_id, {
+            'elapsed_seconds': 301,
+        }))
 
     def test_project_type_and_owner_isolation_work_in_both_directions(self):
         performance_task = self.task(status=BrowserDiscoveryTask.Status.FAILED)
@@ -557,6 +615,8 @@ class PerformanceDiscoveryAPITests(TestCase):
 
     def test_worker_reuses_shared_agent_and_lifecycle_with_mock_model_and_mcp(self):
         queued = self.task(status=BrowserDiscoveryTask.Status.QUEUED)
+        queued.limits = {**queued.limits, 'auto_approve_origins': True}
+        queued.save(update_fields=['limits', 'updated_at'])
         agent = AsyncMock(return_value={
             'completed': False, 'error_code': 'NO_RECORDS',
             'summary': 'offline mock', 'tool_calls': 0, 'model_calls': 1,
@@ -586,6 +646,17 @@ class PerformanceDiscoveryAPITests(TestCase):
         options = agent.await_args.kwargs
         self.assertEqual(options['target_url'], queued.target_url)
         self.assertEqual(options['api_origin'], queued.api_origin)
+        self.assertIs(options['auto_approve_origins'], True)
         self.assertTrue(callable(options['checkpoint']))
         self.assertTrue(callable(options['is_cancelled']))
         finish.assert_called_once()
+
+    def test_retry_preserves_explicit_manual_origin_confirmation_setting(self):
+        original = self.task(status=BrowserDiscoveryTask.Status.FAILED)
+        original.limits = {**original.limits, 'auto_approve_origins': False}
+        original.save(update_fields=['limits', 'updated_at'])
+        retried = clone_retry_task(original)
+        self.assertIs(retried.limits['auto_approve_origins'], False)
+        original.refresh_from_db()
+        self.assertIs(original.limits['auto_approve_origins'], False)
+        self.assertEqual(original.limits['retry_task_id'], str(retried.id))

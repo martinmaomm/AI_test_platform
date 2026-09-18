@@ -39,6 +39,16 @@ from .workspace_service import WorkspaceConflict, WorkspaceValidationError, can_
 _PINNED_PLAYWRIGHT_PACKAGE = '@executeautomation/playwright-mcp-server@1.0.12'
 _SENSITIVE_KEY = re.compile(r'(?:authorization|cookie|token|secret|password|api[_-]?key|session)', re.I)
 _SAFE_HEADER = {'content-type', 'accept'}
+_AUTH_HINT_NAMES = {
+    'authorization', 'cookie', 'proxy-authorization', 'set-cookie',
+    'x-api-key', 'x-auth-token', 'x-access-token', 'x-session-token', 'x-csrf-token', 'x-xsrf-token',
+}
+_SAFE_AUTH_SCHEMES = {
+    'basic': 'Basic', 'bearer': 'Bearer', 'digest': 'Digest', 'negotiate': 'Negotiate', 'oauth': 'OAuth',
+    'scram-sha-1': 'SCRAM-SHA-1', 'scram-sha-256': 'SCRAM-SHA-256',
+}
+_BODY_READ_STAGES = {'request_body', 'response_body'}
+_BODY_READ_KINDS = {'timeout', 'target_closed', 'body_unavailable', 'protocol_error', 'unknown'}
 _SUPPORTED_REQUEST_TYPES = {'application/json', 'application/x-www-form-urlencoded'}
 _STATIC_RESOURCE_TYPES = {'stylesheet', 'image', 'font', 'media', 'manifest'}
 _ORIGIN_STATE_MAX_BYTES = 64 * 1024
@@ -306,6 +316,9 @@ def origin_resolution(task: BrowserDiscoveryTask, *, state: dict[str, Any] | Non
     state = state or read_origin_state(task)
     active = task.status in {BrowserDiscoveryTask.Status.RUNNING, BrowserDiscoveryTask.Status.FINALIZING} and not task.cancellation_requested
     mode = _origin_mode(task)
+    # Auto-approved runs should not create pending entries. Keep any anomalous
+    # collector pending state visible so the runner stops issuing actions and
+    # operators can diagnose it instead of silently hanging a routed request.
     pending = state['pending'] if active and mode == 'auto' else []
     selectable = selectable_origins(task, state=state) if mode == 'auto' else []
     if mode == 'manual':
@@ -374,23 +387,62 @@ def _header(value: Any, name: str) -> str:
 
 def _auth_hints(value: Any) -> list[dict[str, str]]:
     if isinstance(value, list):
-        return [
-            {
-                'name': str(item.get('name') or '')[:120],
-                'scheme': str(item.get('scheme') or '')[:80],
-                'value_hash': str(item.get('value_sha256') or '')[:64],
-            }
-            for item in value[:20] if isinstance(item, dict) and item.get('name')
-        ]
+        hints = []
+        for item in value[:20]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '').lower()
+            if name not in _AUTH_HINT_NAMES:
+                continue
+            digest = str(item.get('value_sha256') or item.get('value_hash') or '')
+            # Collector hashes are full SHA-256 values.  A legacy arbitrary
+            # string in this field must not become public merely because its
+            # key says "hash".
+            digest = digest.lower() if re.fullmatch(r'[0-9a-fA-F]{64}', digest) else ''
+            if name in {'authorization', 'proxy-authorization'}:
+                scheme = _SAFE_AUTH_SCHEMES.get(str(item.get('scheme') or '').lower(), 'unknown')
+            else:
+                scheme = name
+            hints.append({'name': name, 'scheme': scheme, 'value_hash': digest})
+        return hints
     if not isinstance(value, dict):
         return []
     hints = []
     for name, raw in value.items():
-        if not _SENSITIVE_KEY.search(str(name)):
+        normalized_name = str(name).lower()
+        if normalized_name not in _AUTH_HINT_NAMES:
             continue
-        digest = hashlib.sha256(str(raw).encode()).hexdigest()[:16] if raw not in (None, '') else ''
-        hints.append({'name': str(name)[:120], 'value_hash': digest})
+        digest = hashlib.sha256(str(raw).encode()).hexdigest() if raw not in (None, '') else ''
+        hints.append({'name': normalized_name, 'value_hash': digest})
     return hints
+
+
+def _body_read_diagnostic(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    stage = str(value.get('stage') or '')
+    kind = str(value.get('kind') or '')
+    if stage not in _BODY_READ_STAGES or kind not in _BODY_READ_KINDS:
+        return None
+    return {'stage': stage, 'kind': kind}
+
+
+def sanitize_public_summary(value: Any) -> dict[str, Any]:
+    """Return a public-safe copy, including summaries stored before scheme hardening."""
+    if not isinstance(value, dict):
+        return {}
+    summary = deepcopy(value)
+    for key in ('observed_request', 'observed_response'):
+        observed = summary.get(key)
+        if not isinstance(observed, dict):
+            continue
+        observed['auth_hints'] = _auth_hints(observed.get('auth_hints'))
+    diagnostic = _body_read_diagnostic(summary.get('capture_diagnostic'))
+    if diagnostic:
+        summary['capture_diagnostic'] = diagnostic
+    else:
+        summary.pop('capture_diagnostic', None)
+    return summary
 
 
 def _pairs(value: Any, fallback_query: str = '') -> list[dict[str, Any]]:
@@ -642,9 +694,15 @@ def _public_record(
         'content_type': content_type_base,
         'capture_complete': not incomplete,
         'source_authorized': source_authorized,
-        'capture_reason': str(terminal.get('reason') or '')[:200],
+        'capture_reason': str(terminal.get('reason') or request_body.get('reason') or '')[:200],
         'association': _redact(request.get('operation_association') or _lookup(raw, 'association', 'action') or {}),
     }
+    capture_diagnostic = (
+        _body_read_diagnostic(terminal.get('body_read_diagnostic'))
+        or _body_read_diagnostic(request_body.get('body_read_diagnostic'))
+    )
+    if capture_diagnostic:
+        summary['capture_diagnostic'] = capture_diagnostic
     # A collector-unresolved origin is intentionally metadata-only.  It must
     # not disclose a query/body sample just because a trace line names it.
     if source_authorized:
@@ -669,7 +727,7 @@ def _public_record(
         'origin': origin, 'method': method, 'path': path, 'resource_type': resource_type,
         'status_code': status_code, 'content_type': content_type_base, 'is_eligible': eligible,
         'exclusion_reason': exclusion, 'dependency_record_ids': dependency_ids,
-        'public_summary': summary, 'raw_line': raw_line,
+        'public_summary': sanitize_public_summary(summary), 'raw_line': raw_line,
     }
 
 
@@ -883,6 +941,9 @@ def serialize_task(task: BrowserDiscoveryTask) -> dict[str, Any]:
         'id': str(task.id), 'task_id': task.task_id, 'project_id': task.project_id, 'model_id': task.model_id,
         'target_url': task.target_url, 'description': task.description, 'api_origin': task.api_origin or None,
         'allow_test_data_writes': task.allow_test_data_writes, 'exploration_timeout_seconds': task.exploration_timeout_seconds,
+        'auto_approve_origins': bool(
+            isinstance(task.limits, dict) and task.limits.get('auto_approve_origins') is True
+        ),
         'limits': deepcopy(task.limits), 'status': task.status, 'version': task.version,
         'cancellation_requested': task.cancellation_requested, 'current_action': task.current_action,
         'tool_calls': task.tool_calls, 'model_calls': task.model_calls, 'request_count': task.request_count,
@@ -1101,7 +1162,7 @@ def handoff_to_workspace(*, task: BrowserDiscoveryTask, owner, version: int, rec
         records_by_id = {item.id: item for item in selected}
         observed_samples = []
         for item in selected:
-            sample = deepcopy(item.public_summary)
+            sample = sanitize_public_summary(item.public_summary)
             template = _path_template(item, records_by_id)
             if template:
                 sample['path_template'] = template

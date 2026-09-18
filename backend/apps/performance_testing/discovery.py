@@ -206,6 +206,7 @@ def run_performance_browser_discovery_async(self, discovery_id: str, version: in
             timeout_seconds=task.exploration_timeout_seconds,
             max_steps=task.limits['max_model_steps'],
             max_tool_calls=task.limits['max_tool_calls'],
+            auto_approve_origins=task.limits.get('auto_approve_origins') is True,
             capture_limits=capture_limits,
             checkpoint=lambda payload: _browser_discovery_checkpoint(discovery_id, version, task_id, payload),
             is_cancelled=lambda: _browser_discovery_cancelled(discovery_id, version, task_id),

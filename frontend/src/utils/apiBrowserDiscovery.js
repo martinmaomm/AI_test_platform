@@ -83,6 +83,7 @@ export const buildBrowserDiscoveryPayload = (form, config) => {
     target_url: targetUrl,
     description,
     api_origin: apiOrigin || null,
+    auto_approve_origins: form?.auto_approve_origins !== false,
     model_id: modelId,
     allow_test_data_writes: true,
     exploration_timeout_seconds: timeout,
@@ -94,6 +95,7 @@ export const browserDiscoveryFormSnapshot = (form) =>
     target_url: String(form?.target_url || "").trim(),
     description: String(form?.description || "").trim(),
     api_origin: String(form?.api_origin || "").trim(),
+    auto_approve_origins: form?.auto_approve_origins !== false,
     model_id: form?.model_id ?? null,
     allow_test_data_writes: form?.allow_test_data_writes === true,
     exploration_timeout_seconds: form?.exploration_timeout_seconds ?? null,
@@ -294,6 +296,7 @@ export const browserDiscoveryErrorCategory = (task) => {
   if (["no_records", "no_usable_records"].includes(code)) return "未采集到有效接口证据";
   if (code === "capture_incomplete") return "证据采集不完整";
   if (["TOTAL_TIMEOUT", "timeout"].includes(code)) return "探索超时";
+  if (code === "ORIGIN_CONFIRMATION_TIMEOUT") return "来源确认等待超时";
   if (["CANCELLED", "cancelled"].includes(code)) return "已取消";
   return `任务异常：${code}`;
 };

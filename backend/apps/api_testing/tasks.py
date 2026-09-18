@@ -84,14 +84,14 @@ def _browser_discovery_checkpoint(discovery_id: str, version: int, task_id: str,
         state = sync_auto_origin(task)
         resolution = origin_resolution(task, state=state)
         payload = payload if isinstance(payload, dict) else {}
-        elapsed = payload.get('elapsed_seconds')
+        elapsed = payload.get('active_elapsed_seconds', payload.get('elapsed_seconds'))
         if isinstance(elapsed, (int, float)) and elapsed > task.exploration_timeout_seconds:
             task.current_action = '探索总时限已到，正在停止'
             task.error_code = 'timeout'
             task.save(update_fields=['current_action', 'error_code', 'updated_at'])
             return False
         task.current_action = (
-            '正在等待确认跨来源请求' if resolution['state'] == 'awaiting_confirmation'
+            '正在等待确认跨来源请求（探索计时已暂停）' if resolution['state'] == 'awaiting_confirmation'
             else str(payload.get('current_action') or payload.get('phase') or '正在探索')[:500]
         )
         task.tool_calls = min(int(payload.get('tool_calls') or 0), int(task.limits.get('max_tool_calls', 100)))
@@ -242,6 +242,7 @@ def run_browser_discovery_async(self, discovery_id: str, version: int, task_id: 
             target_url=task.target_url, description=task.description, api_origin=task.api_origin,
             trace_file=str(task_trace_file(task)), timeout_seconds=task.exploration_timeout_seconds,
             max_steps=task.limits['max_model_steps'], max_tool_calls=task.limits['max_tool_calls'],
+            auto_approve_origins=task.limits.get('auto_approve_origins') is True,
             capture_limits=capture_limits,
             checkpoint=lambda payload: _browser_discovery_checkpoint(discovery_id, version, task_id, payload),
             is_cancelled=lambda: _browser_discovery_cancelled(discovery_id, version, task_id),

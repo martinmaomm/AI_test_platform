@@ -126,7 +126,11 @@ class BrowserDiscoveryCollectionView(APIView):
             api_origin_value = values.get('api_origin')
             api_origin = normalize_http_url(api_origin_value, label='api_origin', origin_only=True) if api_origin_value else ''
             model_id = validate_model_id(values['model_id'], owner=request.user)
-            limits = {**discovery_limits(), 'origin_mode': 'manual' if api_origin else 'auto'}
+            limits = {
+                **discovery_limits(),
+                'origin_mode': 'manual' if api_origin else 'auto',
+                'auto_approve_origins': values['auto_approve_origins'],
+            }
             requested_timeout = values.get('exploration_timeout_seconds', limits['timeout_seconds'])
             if not 60 <= requested_timeout <= limits['timeout_seconds']:
                 raise WorkspaceValidationError(f'exploration_timeout_seconds 必须在 60 到 {limits["timeout_seconds"]} 秒之间。')

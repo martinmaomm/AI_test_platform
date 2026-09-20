@@ -146,6 +146,7 @@
           <p>
             相同方法/路径会分组，仍可按参数或请求体变体选择。导入仅生成未保存的性能计划草稿。
           </p>
+          <p class="preview-help">请求 URL 显示采集到的实际接口地址，查询参数沿用脱敏结果。</p>
           <div v-for="group in groups" :key="group.key" class="group">
             <strong>{{ group.method }} {{ group.path }}</strong
             ><el-checkbox-group v-model="selected"
@@ -164,9 +165,15 @@
                 :name="record.id"
               >
                 <template #title>
-                  样本 #{{ record.sequence || record.id }} · {{ record.status_code || "—" }}
-                  <span v-if="record.is_eligible === false" class="ineligible">
-                    （{{ record.exclusion_reason || "不可导入" }}）
+                  <span class="sample-title">
+                    <span>样本 #{{ record.sequence || record.id }} · {{ record.status_code || "—" }}
+                      <span v-if="record.is_eligible === false" class="ineligible">
+                        （{{ record.exclusion_reason || "不可导入" }}）
+                      </span>
+                    </span>
+                    <span class="sample-request-url" data-testid="discovery-request-url">
+                      请求 URL：<code>{{ publicDiscoveryRequestUrl(record) || "未记录" }}</code>
+                    </span>
                   </span>
                 </template>
                 <p v-if="discoveryCaptureIssue(record)" class="ineligible">{{ discoveryCaptureIssue(record) }}</p>
@@ -219,6 +226,7 @@ import {
   buildPerformanceDiscoveryCreatePayload,
   discoveryCaptureIssue,
   performanceDiscoveryDraftTargetIssue,
+  publicDiscoveryRequestUrl,
   publicDiscoverySamplePreview,
 } from "./performanceDiscoveryState";
 const router = useRouter();
@@ -453,6 +461,25 @@ watch(
 }
 .sample-collapse {
   margin-top: 8px;
+}
+.sample-title {
+  min-width: 0;
+  padding: 8px 0;
+  line-height: 1.6;
+}
+.sample-request-url {
+  display: block;
+  color: var(--el-text-color-regular);
+  font-weight: normal;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.sample-request-url code {
+  font-family: monospace;
+}
+.sample-collapse :deep(.el-collapse-item__header) {
+  height: auto;
+  min-height: 48px;
 }
 .sample-preview {
   max-height: 300px;

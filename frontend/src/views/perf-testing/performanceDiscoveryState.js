@@ -63,6 +63,28 @@ export const publicDiscoverySamplePreview = (record) => {
   };
 };
 
+/** Build the display URL only from captured metadata and the public query. */
+export const publicDiscoveryRequestUrl = (record) => {
+  const requestOrigin = origin(record?.origin);
+  const path = record?.path;
+  if (!requestOrigin || typeof path !== "string" || !path.startsWith("/")) return "";
+  // Query and fragment text must never be recovered from a raw/legacy path.
+  const pathname = path.split(/[?#]/, 1)[0];
+  const summary = record?.public_summary || {};
+  const query = summary.source_authorized === false ? null : summary.observed_request?.query;
+  const pairs = Array.isArray(query)
+    ? query
+    : Object.entries(query && typeof query === "object" ? query : {}).map(([name, value]) => ({ name, value }));
+  const params = new URLSearchParams();
+  for (const pair of pairs) {
+    if (typeof pair?.name !== "string") continue;
+    const values = Array.isArray(pair.value) ? pair.value : [pair.value];
+    for (const value of values) params.append(pair.name, value == null ? "" : String(value));
+  }
+  const search = params.toString();
+  return `${requestOrigin}${pathname}${search ? `?${search}` : ""}`;
+};
+
 export const discoveryCaptureIssue = (record) => {
   const summary = record?.public_summary || {};
   const reason = summary.capture_reason;

@@ -4,6 +4,7 @@ import {
   buildPerformanceDiscoveryCreatePayload,
   discoveryCaptureIssue,
   performanceDiscoveryDraftTargetIssue,
+  publicDiscoveryRequestUrl,
   publicDiscoverySamplePreview,
 } from "../src/views/perf-testing/performanceDiscoveryState.js";
 
@@ -65,6 +66,38 @@ test("capture failure distinguishes classified errors from missing historic diag
     capture_reason: "body_read_failed",
   } }), /现有记录未包含底层原因/);
   assert.equal(discoveryCaptureIssue({ public_summary: { capture_complete: true } }), "");
+});
+
+test("sample URL uses its captured API origin and preserves repeated public query parameters", () => {
+  assert.equal(publicDiscoveryRequestUrl({
+    origin: "http://api.example.test:8107", path: "/search/products",
+    public_summary: { observed_request: { query: [
+      { name: "tag", value: "手机 配件" }, { name: "tag", value: "a+b" },
+      { name: "empty", value: "" }, { name: "token", value: "<redacted>" },
+    ] } },
+  }), "http://api.example.test:8107/search/products?tag=%E6%89%8B%E6%9C%BA+%E9%85%8D%E4%BB%B6&tag=a%2Bb&empty=&token=%3Credacted%3E");
+  assert.equal(publicDiscoveryRequestUrl({
+    origin: "https://api.example.test", path: "/login",
+  }), "https://api.example.test/login");
+});
+
+test("sample URL never falls back to the page URL or raw captured URL", () => {
+  assert.equal(publicDiscoveryRequestUrl({
+    path: "/login", target_url: "https://frontend.example.test", url: "https://api.example.test/?token=raw-secret",
+  }), "");
+  assert.equal(publicDiscoveryRequestUrl({ origin: "javascript:alert(1)", path: "/login" }), "");
+  assert.equal(publicDiscoveryRequestUrl({
+    origin: "https://user:secret@api.example.test", path: "/login?token=raw-secret#fragment",
+  }), "https://api.example.test/login");
+  assert.equal(publicDiscoveryRequestUrl({ origin: "https://api.example.test", path: "" }), "");
+  assert.equal(publicDiscoveryRequestUrl({
+    origin: "https://api.example.test", path: "/login",
+    public_summary: { source_authorized: false, observed_request: { query: [{ name: "token", value: "hidden-secret" }] } },
+  }), "https://api.example.test/login");
+  assert.equal(publicDiscoveryRequestUrl({
+    origin: "https://api.example.test", path: "/items/a%2Fb",
+    public_summary: { observed_request: { query: { offset: 0, active: false } } },
+  }), "https://api.example.test/items/a%2Fb?offset=0&active=false");
 });
 
 test("draft target requires the confirmed API origin, normalized across paths and default ports", () => {

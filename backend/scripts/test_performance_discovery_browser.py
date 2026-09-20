@@ -80,7 +80,7 @@ def verify(origin, fixture, output):
             expect(form.get_by_role('spinbutton')).to_have_value('900')
             origin_switch = form.get_by_role('switch', name='自动允许跨域请求', exact=True)
             expect(origin_switch).to_be_checked()
-            form.locator('.el-form-item').filter(has_text=re.compile('^目标页面')).locator('input').fill('https://fixture.invalid/app')
+            form.locator('.el-form-item').filter(has_text=re.compile('^目标页面')).locator('input').fill('https://web.fixture.invalid/app')
             form.locator('textarea').fill('探索列表查询，仅使用本轮测试数据。')
             form.locator('.el-checkbox').click()
             with page.expect_response(lambda r: r.request.method == 'POST' and r.url.endswith('/discovery/tasks/')) as created:
@@ -102,6 +102,13 @@ def verify(origin, fixture, output):
             page.get_by_role('button', name='查看样本', exact=True).click()
             expect(page.locator('.group')).to_have_count(1)
             group = page.locator('.group')
+            urls = group.get_by_test_id('discovery-request-url')
+            expect(urls).to_have_count(2)
+            expect(urls.nth(0)).to_be_visible()
+            expect(urls.nth(0)).to_contain_text('https://fixture.invalid/items?keyword=first-item')
+            expect(urls.nth(1)).to_contain_text('https://fixture.invalid/items?keyword=second-item')
+            expect(group.locator('.sample-preview').first).not_to_be_visible()
+            group.screenshot(path=str(output / 'sample-request-urls.png'), animations='disabled')
             expect(group.get_by_role('checkbox')).to_have_count(2)
             group.locator('.el-checkbox').nth(0).click()
             group.locator('.el-checkbox').nth(1).click()
@@ -171,6 +178,7 @@ def verify(origin, fixture, output):
             assert not errors, errors
             return {'real_http_routes': True, 'default_timeout': 900, 'automatic_origins_default': True,
                     'manual_origins_option_verified': True, 'task_version': 7, 'variants_selected': ['first-item', 'second-item'],
+                    'sample_urls_visible_while_collapsed': True, 'api_url_distinct_from_page_url': True,
                     'origin_mismatch_explained_before_request': True, 'server_400_visible_at_button': True,
                     'selection_preserved_after_error': True, 'retry_succeeded': True,
                     'draft_in_url': False, 'draft_consumed_once': True, 'warnings_visible': True,

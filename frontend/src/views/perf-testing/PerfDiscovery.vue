@@ -194,8 +194,16 @@
                 :value="target.id"
                 :label="`${target.name} · ${target.base_url}`" /></el-select
             ><el-button
+              v-if="canEditTargets"
+              data-testid="discovery-edit-target"
+              :disabled="!selectedTarget || targetEditor.saving || loading.action"
+              @click="openTargetEditor"
+              >编辑来源</el-button
+            ><span v-else-if="selectedTarget" class="preview-help"
+              >仅平台管理员可以编辑压测目标来源。</span
+            ><el-button
               type="success"
-              :disabled="!selected.length || !form.target_id || !!targetError || !!draftTargetIssue || !['completed', 'partial'].includes(task.status) || task.origin_resolution?.state === 'awaiting_selection'"
+              :disabled="!selected.length || !form.target_id || targetEditor.visible || targetEditor.saving || !!targetError || !!draftTargetIssue || !['completed', 'partial'].includes(task.status) || task.origin_resolution?.state === 'awaiting_selection'"
               :loading="loading.action"
               @click="draft"
               >生成计划草稿</el-button
@@ -211,15 +219,64 @@
             {{ targetError }}
           </el-alert>
         </el-card>
+      <el-dialog
+        v-model="targetEditor.visible"
+        data-testid="discovery-target-editor"
+        title="编辑压测目标来源"
+        width="520px"
+        :close-on-click-modal="!targetEditor.saving"
+        :close-on-press-escape="!targetEditor.saving"
+        :show-close="!targetEditor.saving"
+        :before-close="beforeCloseTargetEditor"
+        @closed="closeTargetEditor"
+      >
+        <p>目标名称：{{ targetEditor.target?.name || "—" }}</p>
+        <el-form label-position="top">
+          <el-form-item label="压测目标来源" :error="targetEditor.urlIssue">
+            <el-input
+              v-model="targetEditor.baseUrl"
+              data-testid="discovery-target-url"
+              placeholder="例如：http://api.example.com:8107"
+              :disabled="targetEditor.saving"
+              @input="targetEditor.urlIssue = ''"
+            />
+          </el-form-item>
+          <el-button
+            data-testid="discovery-use-api-origin"
+            :disabled="!task?.api_origin || targetEditor.saving"
+            @click="useTaskApiOrigin"
+            >使用本次接口来源</el-button
+          >
+          <p class="preview-help">保存会更新该目标，引用该目标的计划后续将使用新地址。</p>
+          <el-alert
+            v-if="targetEditor.error"
+            data-testid="discovery-target-save-error"
+            type="error"
+            :closable="false"
+          >{{ targetEditor.error }}</el-alert>
+        </el-form>
+        <template #footer>
+          <el-button :disabled="targetEditor.saving" @click="targetEditor.visible = false">取消</el-button>
+          <el-button
+            type="primary"
+            data-testid="discovery-save-target"
+            :loading="targetEditor.saving"
+            :disabled="!!targetEditor.urlIssue"
+            @click="saveTargetEditor"
+            >保存</el-button
+          >
+        </template>
+      </el-dialog>
     </template>
   </section>
 </template>
 <script setup>
-import { computed, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { useAuthStore } from "@/stores/auth";
 import { useProjectStore } from "@/stores/project";
-import { getPerformanceTargets } from "@/api/performance";
+import { getPerformanceTargets, updatePerformanceTarget } from "@/api/performance";
 import { performanceErrorMessage } from '@/api/performanceError';
 import { usePerformanceDiscovery } from "@/composables/usePerformanceDiscovery";
 import {
@@ -229,8 +286,10 @@ import {
   publicDiscoveryRequestUrl,
   publicDiscoverySamplePreview,
 } from "./performanceDiscoveryState";
+import { isPerformancePlatformAdmin } from "./performanceWorkspaceState";
 const router = useRouter();
 const store = useProjectStore();
+const authStore = useAuthStore();
 const projectId = computed(() => store.currentProjectId);
 const {
   config,
@@ -255,6 +314,15 @@ const targets = reactive([]);
 const selected = ref([]);
 const targetError = ref("");
 const draftError = ref("");
+const targetEditor = reactive({
+  visible: false,
+  target: null,
+  baseUrl: "",
+  error: "",
+  saving: false,
+  request: 0,
+  urlIssue: "",
+});
 let targetRequestEpoch = 0;
 const form = reactive({
   target_url: "",
@@ -287,9 +355,83 @@ const originPending = computed(
 const selectedTarget = computed(() =>
   targets.find((item) => String(item.id) === String(form.target_id)),
 );
+const canEditTargets = computed(() =>
+  isPerformancePlatformAdmin(authStore.user),
+);
 const draftTargetIssue = computed(() =>
   performanceDiscoveryDraftTargetIssue(task.value, selectedTarget.value),
 );
+const targetEditorScopeIsCurrent = (scope) =>
+  targetEditor.visible &&
+  targetEditor.request === scope.request &&
+  String(projectId.value) === String(scope.projectId) &&
+  String(task.value?.id) === String(scope.taskId) &&
+  String(form.target_id) === String(scope.targetId);
+function closeTargetEditor() {
+  targetEditor.request += 1;
+  targetEditor.visible = false;
+  targetEditor.target = null;
+  targetEditor.baseUrl = "";
+  targetEditor.error = "";
+  targetEditor.urlIssue = "";
+  targetEditor.saving = false;
+}
+function beforeCloseTargetEditor(done) {
+  if (!targetEditor.saving) done();
+}
+function openTargetEditor() {
+  if (!canEditTargets.value || !selectedTarget.value || loading.action) return;
+  targetEditor.request += 1;
+  targetEditor.target = selectedTarget.value;
+  targetEditor.baseUrl = selectedTarget.value.base_url || "";
+  targetEditor.error = "";
+  targetEditor.urlIssue = "";
+  targetEditor.visible = true;
+}
+function useTaskApiOrigin() {
+  targetEditor.baseUrl = task.value?.api_origin || "";
+  targetEditor.error = "";
+  targetEditor.urlIssue = "";
+}
+function validateTargetEditorUrl() {
+  const value = targetEditor.baseUrl.trim();
+  try {
+    const parsed = new URL(value);
+    targetEditor.urlIssue = ["http:", "https:"].includes(parsed.protocol)
+      ? ""
+      : "请输入合法的 HTTP(S) 地址。";
+  } catch {
+    targetEditor.urlIssue = "请输入合法的 HTTP(S) 地址。";
+  }
+  return !targetEditor.urlIssue;
+}
+async function saveTargetEditor() {
+  if (targetEditor.saving || !canEditTargets.value || !validateTargetEditorUrl()) return;
+  const scope = {
+    projectId: projectId.value,
+    taskId: task.value?.id,
+    targetId: form.target_id,
+    request: targetEditor.request,
+  };
+  targetEditor.error = "";
+  targetEditor.saving = true;
+  try {
+    const response = await updatePerformanceTarget(scope.projectId, scope.targetId, {
+      base_url: targetEditor.baseUrl.trim(),
+    });
+    if (!targetEditorScopeIsCurrent(scope)) return;
+    const updated = response?.data ?? response;
+    const index = targets.findIndex((item) => String(item.id) === String(scope.targetId));
+    if (index >= 0 && updated?.id != null) targets.splice(index, 1, updated);
+    targetEditor.visible = false;
+    ElMessage.success("压测目标来源已更新");
+  } catch (error) {
+    if (targetEditorScopeIsCurrent(scope))
+      targetEditor.error = performanceErrorMessage(error, "保存压测目标来源失败，请重试。");
+  } finally {
+    if (targetEditorScopeIsCurrent(scope)) targetEditor.saving = false;
+  }
+}
 async function loadTargets() {
   const requestedProjectId = projectId.value;
   const requestEpoch = ++targetRequestEpoch;
@@ -329,6 +471,7 @@ async function create() {
 const samplePreview = (record) =>
   JSON.stringify(publicDiscoverySamplePreview(record), null, 2);
 function selectTask(row) {
+  closeTargetEditor();
   selected.value = [];
   form.target_id = null;
   draftError.value = "";
@@ -381,6 +524,7 @@ async function removeTask() {
   } catch {}
 }
 async function draft() {
+  if (targetEditor.visible || targetEditor.saving) return;
   const requestedProjectId = projectId.value;
   draftError.value = "";
   try {
@@ -407,17 +551,19 @@ async function draft() {
 }
 const projectStore = store;
 async function refreshPage() {
+  closeTargetEditor();
   selected.value = [];
   form.target_id = null;
   draftError.value = "";
   await Promise.all([refresh(), loadTargets()]);
 }
-watch(() => task.value?.id, () => { selected.value = []; form.target_id = null; draftError.value = ""; });
-watch(() => form.target_id, () => { draftError.value = ""; });
+watch(() => task.value?.id, () => { closeTargetEditor(); selected.value = []; form.target_id = null; draftError.value = ""; });
+watch(() => form.target_id, () => { closeTargetEditor(); draftError.value = ""; });
 watch(() => selected.value.join("|"), () => { draftError.value = ""; });
 watch(
   projectId,
   async () => {
+    closeTargetEditor();
     selected.value = [];
     form.model_id = null;
     form.target_id = null;
@@ -437,6 +583,7 @@ watch(
     if (!form.model_id && models?.length) form.model_id = models[0].id;
   },
 );
+onBeforeUnmount(closeTargetEditor);
 </script>
 <style scoped>
 .discovery {

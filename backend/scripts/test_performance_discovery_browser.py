@@ -103,18 +103,58 @@ def verify(origin, fixture, output):
             expect(page.locator('.group')).to_have_count(1)
             group = page.locator('.group')
             expect(group.get_by_role('checkbox')).to_have_count(2)
+            group.locator('.el-checkbox').nth(0).click()
             group.locator('.el-checkbox').nth(1).click()
             page.locator('.detail .actions .el-select').click()
+            page.get_by_role('option', name=re.compile('网页地址目标')).click()
+            draft_button = page.get_by_role('button', name='生成计划草稿', exact=True)
+            target_issue = page.get_by_test_id('discovery-draft-target-issue')
+            expect(target_issue).to_be_visible()
+            expect(target_issue).to_contain_text('https://web.fixture.invalid')
+            expect(target_issue).to_contain_text('https://fixture.invalid')
+            expect(draft_button).to_be_disabled()
+            assert not drafts, 'Mismatched origin must be explained before sending a draft request'
+            page.locator('.detail .actions .el-select').click()
             page.get_by_role('option', name=re.compile('本机样本目标')).click()
+            expect(target_issue).not_to_be_visible()
+            expect(draft_button).to_be_enabled()
+
+            # The server remains authoritative if target permissions change
+            # after the page loads. Exercise a real 400 without losing selection.
+            headers = {'Authorization': 'Bearer ' + fixture['auth']['accessToken']}
+            target_url = origin + base + f"/targets/{fixture['target_id']}/"
+            denied = context.request.patch(target_url, headers=headers, data={'allowed_methods': ['POST']})
+            assert denied.status == 200, denied.text()
+            with page.expect_response(lambda r: r.request.method == 'POST' and r.url.endswith('/draft/')) as rejected:
+                draft_button.click()
+            assert rejected.value.status == 400, rejected.value.text()
+            error_text = '所选性能目标未批准以下请求方法：GET。'
+            local_error = page.get_by_test_id('discovery-draft-error')
+            expect(local_error).to_be_visible()
+            expect(local_error).to_contain_text(error_text)
+            expect(page.locator('.el-message--error')).to_contain_text(error_text)
+            expect(page).to_have_url(origin + '/perf-testing/discovery')
+            expect(group.get_by_role('checkbox').nth(0)).to_be_checked()
+            expect(group.get_by_role('checkbox').nth(1)).to_be_checked()
+            expect(draft_button).to_be_enabled()
+            local_error.scroll_into_view_if_needed()
+            page.screenshot(path=str(output / 'draft-error-feedback.png'), full_page=True)
+
+            restored = context.request.patch(target_url, headers=headers, data={'allowed_methods': ['GET']})
+            assert restored.status == 200, restored.text()
             with page.expect_response(lambda r: r.request.method == 'POST' and r.url.endswith('/draft/')) as response:
-                page.get_by_role('button', name='生成计划草稿', exact=True).click()
+                draft_button.click()
             assert response.value.status == 200, response.value.text()
             assert drafts[-1]['version'] == 7
+            assert len(drafts[-1]['record_ids']) == 2
+            assert len(drafts) == 2, 'Only the rejected request and intentional retry were sent'
             expect(page).to_have_url(origin + '/perf-testing/plans')
             editor = page.get_by_test_id('performance-plan-editor')
             expect(editor).to_be_visible()
             # Neither request data nor credentials should be put into navigation URL.
             assert not page.url.partition('?')[2]
+            expect(page.get_by_test_id('step-query-rows').locator('input').nth(1)).to_have_value('first-item')
+            editor.get_by_role('button', name='2. GET /items 样本 2', exact=True).click()
             expect(page.get_by_test_id('step-query-rows').locator('input').nth(1)).to_have_value('second-item')
             expect(editor).to_contain_text('业务成功语义')
             page.screenshot(path=str(output / 'imported-draft.png'), full_page=True)
@@ -122,15 +162,17 @@ def verify(origin, fixture, output):
                 page.get_by_test_id('plan-save').click()
             assert saved.value.status == 201, saved.value.text()
             plan = saved.value.json()['data']
-            assert plan['steps'][0]['query']['keyword'] == 'second-item'
-            assert len(plan['steps']) == 1
+            assert [step['query']['keyword'] for step in plan['steps']] == ['first-item', 'second-item']
+            assert len(plan['steps']) == 2
             assert plan['steps'][0]['assertions'][0]['expected'] == 200
             page.reload()
             expect(editor).not_to_be_visible()
             assert not external, external
             assert not errors, errors
             return {'real_http_routes': True, 'default_timeout': 900, 'automatic_origins_default': True,
-                    'manual_origins_option_verified': True, 'task_version': 7, 'variant_selected': 'second-item',
+                    'manual_origins_option_verified': True, 'task_version': 7, 'variants_selected': ['first-item', 'second-item'],
+                    'origin_mismatch_explained_before_request': True, 'server_400_visible_at_button': True,
+                    'selection_preserved_after_error': True, 'retry_succeeded': True,
                     'draft_in_url': False, 'draft_consumed_once': True, 'warnings_visible': True,
                     'saved_plan_id': plan['id'], 'page_errors': 0, 'model_calls': 0, 'pressure_runs': 0}
         except Exception:
@@ -158,9 +200,14 @@ def main():
             created_by_id=fixture['auth']['user']['id'], model_type='llm', provider='openai',
             provider_name='隔离夹具', model_name='fixture-only', api_key='not-a-real-key', is_active=True,
         )
-        PerformanceTarget.objects.create(
+        target = PerformanceTarget.objects.create(
             project_id=fixture['project']['id'], name='本机样本目标',
             base_url='https://fixture.invalid', allowed_methods=['GET'],
+        )
+        fixture['target_id'] = target.id
+        PerformanceTarget.objects.create(
+            project_id=fixture['project']['id'], name='网页地址目标',
+            base_url='https://web.fixture.invalid', allowed_methods=['GET'],
         )
         with patch('performance_testing.discovery_views.dispatch_performance_discovery', side_effect=complete_capture), patch(
             'performance_testing.discovery_views.resolve_browser_discovery_mcp_config', return_value={},

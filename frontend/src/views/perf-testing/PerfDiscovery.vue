@@ -188,12 +188,18 @@
                 :label="`${target.name} · ${target.base_url}`" /></el-select
             ><el-button
               type="success"
-              :disabled="!selected.length || !form.target_id || !!targetError || !['completed', 'partial'].includes(task.status) || task.origin_resolution?.state === 'awaiting_selection'"
+              :disabled="!selected.length || !form.target_id || !!targetError || !!draftTargetIssue || !['completed', 'partial'].includes(task.status) || task.origin_resolution?.state === 'awaiting_selection'"
               :loading="loading.action"
               @click="draft"
               >生成计划草稿</el-button
             >
           </div></template
+          ><el-alert v-if="records.length && draftTargetIssue" data-testid="discovery-draft-target-issue" type="error" :closable="false" class="target-error">
+            {{ draftTargetIssue }}
+          </el-alert
+          ><el-alert v-if="records.length && draftError" data-testid="discovery-draft-error" type="error" :closable="false" class="target-error">
+            {{ draftError }}
+          </el-alert
           ><el-alert v-if="targetError" type="error" :closable="false" class="target-error">
             {{ targetError }}
           </el-alert>
@@ -212,6 +218,7 @@ import { usePerformanceDiscovery } from "@/composables/usePerformanceDiscovery";
 import {
   buildPerformanceDiscoveryCreatePayload,
   discoveryCaptureIssue,
+  performanceDiscoveryDraftTargetIssue,
   publicDiscoverySamplePreview,
 } from "./performanceDiscoveryState";
 const router = useRouter();
@@ -239,6 +246,7 @@ const {
 const targets = reactive([]);
 const selected = ref([]);
 const targetError = ref("");
+const draftError = ref("");
 let targetRequestEpoch = 0;
 const form = reactive({
   target_url: "",
@@ -267,6 +275,12 @@ const groups = computed(() => {
 });
 const originPending = computed(
   () => task.value?.origin_resolution?.pending || [],
+);
+const selectedTarget = computed(() =>
+  targets.find((item) => String(item.id) === String(form.target_id)),
+);
+const draftTargetIssue = computed(() =>
+  performanceDiscoveryDraftTargetIssue(task.value, selectedTarget.value),
 );
 async function loadTargets() {
   const requestedProjectId = projectId.value;
@@ -309,6 +323,7 @@ const samplePreview = (record) =>
 function selectTask(row) {
   selected.value = [];
   form.target_id = null;
+  draftError.value = "";
   select(row.id);
 }
 const statusLabel = (status) =>
@@ -359,6 +374,7 @@ async function removeTask() {
 }
 async function draft() {
   const requestedProjectId = projectId.value;
+  draftError.value = "";
   try {
     const result = await makeDraft({
       version: task.value.version,
@@ -376,24 +392,28 @@ async function draft() {
     await router.push({ name: "PerfPlans" });
     ElMessage.success("已生成未保存草稿，请在编辑器确认后保存");
   } catch (error) {
-    ElMessage.error(
-      error?.response?.data?.error?.message || error?.message || "生成草稿失败",
-    );
+    if (String(projectId.value) !== String(requestedProjectId)) return;
+    draftError.value = performanceErrorMessage(error, "生成草稿失败，请重试。");
+    ElMessage.error(draftError.value);
   }
 }
 const projectStore = store;
 async function refreshPage() {
   selected.value = [];
   form.target_id = null;
+  draftError.value = "";
   await Promise.all([refresh(), loadTargets()]);
 }
-watch(() => task.value?.id, () => { selected.value = []; form.target_id = null; });
+watch(() => task.value?.id, () => { selected.value = []; form.target_id = null; draftError.value = ""; });
+watch(() => form.target_id, () => { draftError.value = ""; });
+watch(() => selected.value.join("|"), () => { draftError.value = ""; });
 watch(
   projectId,
   async () => {
     selected.value = [];
     form.model_id = null;
     form.target_id = null;
+    draftError.value = "";
     try {
       await refresh();
       await loadTargets();

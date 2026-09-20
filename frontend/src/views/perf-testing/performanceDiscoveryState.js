@@ -1,5 +1,34 @@
 const text = (value) => (typeof value === "string" ? value.trim() : value);
 
+const origin = (value) => {
+  const raw = text(value);
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.origin : "";
+  } catch {
+    return "";
+  }
+};
+
+const originLabel = (value) => origin(value) || text(value) || "未确认";
+
+/**
+ * The server only permits a draft when the approved performance target and
+ * the confirmed discovery API endpoint are the same HTTP origin.
+ */
+export const performanceDiscoveryDraftTargetIssue = (task, target) => {
+  if (!target) return "请先选择已批准的压测目标。";
+  const taskOrigin = origin(task?.api_origin);
+  const targetOrigin = origin(target?.base_url);
+  const taskLabel = originLabel(task?.api_origin);
+  const targetLabel = originLabel(target?.base_url);
+  if (!taskOrigin || !targetOrigin || taskOrigin !== targetOrigin) {
+    return `探索任务接口来源：${taskLabel}；所选压测目标来源：${targetLabel}。请选择或配置同来源的压测目标。`;
+  }
+  return "";
+};
+
 /**
  * Keep the create request deliberately separate from the editor-only target_id.
  * The discovery create serializer is strict and accepts exactly these fields.

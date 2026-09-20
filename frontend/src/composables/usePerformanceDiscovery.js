@@ -158,7 +158,7 @@ export const usePerformanceDiscovery = (projectId) => {
       if (current(saved)) loading.action = false;
     }
   }
-  async function action(call, { retry = false, reload = true } = {}) {
+  async function action(call, { retry = false, reload = true, propagateError = false } = {}) {
     if (!task.value?.id || loading.action) return null;
     const saved = scope();
     const version = task.value.version;
@@ -175,6 +175,10 @@ export const usePerformanceDiscovery = (projectId) => {
       return result;
     } catch (error) {
       if (selectedScope(saved)) reportError(error, '任务操作失败，请刷新状态后重试。');
+      // A draft failure must reach its local UI so it can remain visible beside
+      // the selected samples. Ignore obsolete requests entirely: the user may
+      // already be looking at another task or project.
+      if (selectedScope(saved) && propagateError) throw error;
       return null;
     } finally {
       if (current(saved)) loading.action = false;
@@ -244,7 +248,10 @@ export const usePerformanceDiscovery = (projectId) => {
         resolvePerformanceDiscoveryOrigin(id, taskId, data),
       ),
     draft: (data) =>
-      action((id, taskId) => createPerformanceDiscoveryDraft(id, taskId, data), { reload: false }),
+      action((id, taskId) => createPerformanceDiscoveryDraft(id, taskId, data), {
+        reload: false,
+        propagateError: true,
+      }),
     dispose,
     hasActive: computed(() => active(task.value)),
   };

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildPerformanceDiscoveryCreatePayload,
   discoveryCaptureIssue,
+  performanceDiscoveryDraftTargetIssue,
   publicDiscoverySamplePreview,
 } from "../src/views/perf-testing/performanceDiscoveryState.js";
 
@@ -64,4 +65,23 @@ test("capture failure distinguishes classified errors from missing historic diag
     capture_reason: "body_read_failed",
   } }), /现有记录未包含底层原因/);
   assert.equal(discoveryCaptureIssue({ public_summary: { capture_complete: true } }), "");
+});
+
+test("draft target requires the confirmed API origin, normalized across paths and default ports", () => {
+  assert.equal(performanceDiscoveryDraftTargetIssue(
+    { api_origin: "http://api.example.test:80/v1" },
+    { base_url: "http://api.example.test/service" },
+  ), "");
+  assert.match(performanceDiscoveryDraftTargetIssue(
+    { api_origin: "https://api.example.test:8107" },
+    { base_url: "http://api.example.test:8107/" },
+  ), /探索任务接口来源：https:\/\/api\.example\.test:8107；所选压测目标来源：http:\/\/api\.example\.test:8107/);
+  assert.match(performanceDiscoveryDraftTargetIssue(
+    { api_origin: "" },
+    { base_url: "http://api.example.test" },
+  ), /探索任务接口来源：未确认/);
+  assert.match(performanceDiscoveryDraftTargetIssue(
+    { api_origin: "http://api.example.test" },
+    { base_url: "" },
+  ), /所选压测目标来源：未确认/);
 });

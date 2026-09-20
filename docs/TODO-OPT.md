@@ -118,4 +118,5 @@
 - 发现日期：2026-09-18；性能项目「柠檬商城」探索中，`POST /login` 返回 HTTP 200，但响应体记录为 `body_read_failed`。旧记录没有保存底层错误，无法确认是否为导航造成的响应缓存失效。
 - 2026-09-19：本机已复现网页读取 JSON 后立即导航导致正文不可用；仅提前调用 `response.body()` 无法解决。现已在 Playwright 自有 Chromium session 初始化时启用有界 durable response retention，正文跨页面导航保留，仍走原授权、类型、大小与持久化检查，不重放登录。7 类真实 Chrome 场景共 21 轮回归通过，详见 [验证记录](verification/2026-09-19-browser-login-response-retention.md)。
 - 后续验收：历史商城任务未保存精确底层错误与导航事件，真实任务触发原因仍不能完全确认；下一次获授权探索需确认实际登录响应体完整、认证依赖可用。适配依赖固定 Playwright Core 的 Chromium 网络初始化结构，升级 MCP / Playwright / Chrome 后须重跑真实浏览器回归；不支持时输出固定诊断并退回原采集方式，立即导航正文保留不再保证。
+- 2026-09-20 现场只读核验：新的商城探索已完成，20 条样本可用，其中登录样本 HTTP 200、`capture_complete=true` 且正文为 JSON 对象。实际登录正文采集已得到新任务验证；当前草稿失败另由接口来源与压测目标不匹配导致，见 [草稿反馈修复](verification/2026-09-20-performance-discovery-draft-feedback.md)。
 - 认证 scheme 仅保留白名单类型；旧数据库样本在读取和交接时再次脱敏。本轮未批量改写历史记录及已有日志，早期文件中的凭证内容不会自动消失；需要单独确定历史清理范围，不公开原始采集文件。

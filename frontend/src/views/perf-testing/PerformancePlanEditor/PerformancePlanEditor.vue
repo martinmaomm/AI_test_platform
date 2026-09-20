@@ -108,9 +108,18 @@
           <section>
             <h3>变量</h3>
             <el-form-item label="固定变量 JSON 值"
-              ><el-input
+              ><div id="plan-fixed-variables-help" class="variable-help">
+                <p>在这里统一填写多个请求步骤共用的参数。所有虚拟用户在每轮使用相同的固定值。</p>
+                <p>
+                  例如填写 <code>{"product_id":1001,"quantity":2}</code>，在请求的查询参数值中写
+                  <code v-pre>${product_id}</code>，执行时就会替换成 <code>1001</code>。
+                </p>
+                <p>不需要变量时保留 <code>{}</code>。探索草稿提示缺少变量时，按顶部列出的变量名在这里补齐。</p>
+              </div>
+              <el-input
                 v-model="form.variablesText"
                 data-testid="plan-variables"
+                aria-describedby="plan-fixed-variables-help"
                 type="textarea"
                 :rows="4"
                 placeholder='{"username":"测试账号"}'
@@ -121,6 +130,10 @@
             >
             <div data-testid="plan-unique-variables">
               <h4>每轮唯一变量</h4>
+              <p class="variable-help">
+                每个虚拟用户每轮生成一个新值，适合订单号等需要避免重复的数据。填写名称和可选前缀，再用
+                <code v-pre>${变量名}</code> 在主流程请求中引用；名称不能与固定变量或响应提取变量重复。
+              </p>
               <div
                 v-for="(item, index) in form.unique_variables"
                 :key="item.id"
@@ -623,6 +636,20 @@ const requestClose = () => {
 .error {
   color: var(--el-color-danger);
   font-size: 12px;
+}
+.variable-help {
+  width: 100%;
+  margin: 0 0 12px;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.variable-help p {
+  margin: 0 0 6px;
+}
+.variable-help code {
+  color: var(--app-text-primary);
 }
 .shell > footer {
   display: flex;

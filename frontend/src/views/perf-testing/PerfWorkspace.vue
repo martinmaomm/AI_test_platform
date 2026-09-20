@@ -495,7 +495,7 @@
     >
       <el-alert type="warning" :closable="false" show-icon
         >将向受控目标发起真实请求。当前每次仅运行一个节点；单用户验证与正式压测使用相同断言。旧版节点必须手动升级至
-        Agent 0.3.0 后才能执行 v2。</el-alert
+        Agent {{ config.agent_version || '当前版本' }}，与平台执行模板保持一致。</el-alert
       >
       <el-descriptions
         v-if="runDialog.plan"

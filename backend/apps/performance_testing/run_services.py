@@ -252,7 +252,7 @@ def create_run(project, plan_id, node_id, request_id, created_by, mode='load'):
         raise RunValidationRejected('性能节点不存在。')
     now = timezone.now()
     if not _node_is_compatible(node, now):
-        raise RunValidationRejected('节点必须在线、未吊销且具备 Agent 0.3.0 schema-v2 执行能力。')
+        raise RunValidationRejected(f'节点必须在线、未吊销且已升级至 Agent {AGENT_VERSION}，与当前执行模板保持一致。')
 
     try:
         current_validation_key = validation_key_for(plan, node)

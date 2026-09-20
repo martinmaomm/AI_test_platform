@@ -552,6 +552,7 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
     plan_name = serializers.SerializerMethodField()
     node_name = serializers.SerializerMethodField()
     validation_status = serializers.SerializerMethodField()
+    latest_metrics = serializers.SerializerMethodField()
 
     class Meta:
         model = PerformanceRun
@@ -568,6 +569,10 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
 
     def get_node_name(self, obj):
         return obj.node.name
+
+    def get_latest_metrics(self, obj):
+        # Response bodies belong only to the REPORT-protected detail endpoint.
+        return {key: value for key, value in (obj.latest_metrics or {}).items() if key != 'validation_steps'}
 
     def get_validation_status(self, obj):
         if obj.mode != PerformanceRun.Mode.VALIDATION:
@@ -587,5 +592,13 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
 
 
 class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
+    validation_steps = serializers.SerializerMethodField()
+
+    def get_validation_steps(self, obj):
+        if obj.mode != PerformanceRun.Mode.VALIDATION:
+            return []
+        from .controller import bounded_validation_steps
+        return bounded_validation_steps((obj.latest_metrics or {}).get('validation_steps', []), obj.snapshot)
+
     class Meta(PerformanceRunListSerializer.Meta):
-        fields = PerformanceRunListSerializer.Meta.fields + ('metrics_samples', 'snapshot')
+        fields = PerformanceRunListSerializer.Meta.fields + ('metrics_samples', 'snapshot', 'validation_steps')

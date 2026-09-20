@@ -23,6 +23,33 @@ AVAILABLE = {'enabled': True, 'available': True, 'reason': ''}
 
 
 class PerformanceRunContractTests(TestCase):
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_validation_details_require_report_permission_and_are_absent_from_lists(self, _):
+        created = self._create()
+        self.assertEqual(created.status_code, 201, created.data)
+        run = PerformanceRun.objects.get(pk=created.data['data']['id'])
+        run.latest_metrics = {'requests': 1, 'validation_steps': [{
+            'step_index': 1, 'step_name': 'fixture', 'phase': 'main', 'method': 'GET',
+            'status': 'failed', 'response': {'status_code': 200,
+                'body': {'content': '{"data":[],"token":"must-not-escape"}', 'truncated': False}},
+        }]}
+        run.save(update_fields=['latest_metrics'])
+        detail_path = self._path(f'runs/{run.pk}/')
+        self.client.force_authenticate(self.reader)
+        listing = self.client.get(self._path('runs/'))
+        self.assertEqual(listing.status_code, 200)
+        self.assertNotIn('validation_steps', listing.data['data']['items'][0]['latest_metrics'])
+        self.assertNotIn('must-not-escape', str(listing.data))
+        self.assertEqual(self.client.get(detail_path).status_code, 403)
+        self.client.force_authenticate(self.executor)
+        detail = self.client.get(detail_path)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data['data']['validation_steps'][0]['status'], 'failed')
+        self.assertNotIn('must-not-escape', str(detail.data['data']['validation_steps']))
+        run.latest_metrics = {'requests': 1}
+        run.save(update_fields=['latest_metrics'])
+        self.assertEqual(self.client.get(detail_path).data['data']['validation_steps'], [])
+
     def setUp(self):
         self.client = APIClient()
         self.admin = User.objects.create_user(
@@ -239,7 +266,14 @@ class PerformanceRunContractTests(TestCase):
         PerformanceNode.objects.filter(pk=self.node.pk).update(agent_version='0.2.0')
         created = self._create()
         self.assertEqual(created.status_code, 400, created.data)
-        self.assertIn('0.3.0', created.data['error']['message'])
+        self.assertIn(AGENT_VERSION, created.data['error']['message'])
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_agent_030_must_upgrade_before_receiving_the_new_fixed_template(self, _):
+        PerformanceNode.objects.filter(pk=self.node.pk).update(agent_version='0.3.0')
+        created = self._create()
+        self.assertEqual(created.status_code, 400, created.data)
+        self.assertIn(AGENT_VERSION, created.data['error']['message'])
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_new_run_rejects_deleted_node_even_with_valid_plan_and_version(self, _):

@@ -59,6 +59,12 @@
           formatTime(run.finished_at)
         }}</el-descriptions-item>
       </el-descriptions>
+      <PerformanceValidationSteps
+        v-if="run.mode === 'validation'"
+        :key="run.id"
+        :steps="run.validation_steps || []"
+        :run-status="run.status"
+      />
       <div class="metrics">
         <div v-for="item in metricCards" :key="item.label" class="metric-card">
           <span>{{ item.label }}</span
@@ -119,7 +125,7 @@
           ></el-descriptions
         ></template
       >
-      <template v-if="failureEvidence.length"
+      <template v-if="failureEvidence.length && !run.validation_steps?.length"
         ><h3>断言失败证据</h3>
         <el-table :data="failureEvidence"
           ><el-table-column
@@ -156,6 +162,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import PerformanceValidationSteps from './PerformanceValidationSteps.vue';
 import { useRoute, useRouter } from "vue-router";
 import dayjs from "dayjs";
 import VChart from "vue-echarts";

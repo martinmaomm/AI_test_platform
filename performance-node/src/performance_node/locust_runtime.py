@@ -6,7 +6,7 @@ import json
 import math
 import re
 import uuid
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 
 ENGINE_VERSION = '2.43.3'
@@ -421,6 +421,243 @@ def add_failure_samples(failures, seen, items):
             failures.append(item)
 
 
+# This file is the standalone, byte-checked worker template. Keep diagnostics
+# stdlib-only and sanitize before they enter Locust's reporting transport.
+REDACTED = '<redacted>'
+EVIDENCE_SECRET = re.compile(r'authorization|cookie|token|secret|password|passwd|pwd|api[_-]?key|private[_-]?key|session|credential|csrf|xsrf|otp|密码|口令|密钥', re.I)
+EVIDENCE_ASSIGNMENT = re.compile(
+    r'''(?i)((?:["']?)(?:authorization|cookie|token|secret|password|passwd|pwd|api[_-]?key|private[_-]?key|session|credential|csrf|xsrf|otp|密码|口令|密钥)[\w-]*["']?\s*[:：=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&,;<>]+)''')
+
+
+def evidence_secrets(value, key='', found=None, depth=0):
+    found = set() if found is None else found
+    if depth > 12:
+        return found
+    if isinstance(value, dict):
+        for name, item in value.items():
+            evidence_secrets(item, key if EVIDENCE_SECRET.search(key) else str(name), found, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            evidence_secrets(item, key, found, depth + 1)
+    elif EVIDENCE_SECRET.search(key) and value is not None and str(value):
+        text = str(value)
+        found.add(text)
+        if key.lower() in ('authorization', 'proxy-authorization'):
+            found.add(text.partition(' ')[2] or text)
+        if 'cookie' in key.lower():
+            for part in text.split(';'):
+                name, separator, item = part.strip().partition('=')
+                if separator and name.lower() not in ('path', 'domain', 'samesite', 'expires', 'max-age') and item:
+                    found.add(item)
+    if isinstance(value, str):
+        if value.lstrip().startswith(('{', '[')):
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError, RecursionError):
+                pass
+            else:
+                if isinstance(parsed, (dict, list)):
+                    evidence_secrets(parsed, key, found, depth + 1)
+        for match in EVIDENCE_ASSIGNMENT.finditer(value):
+            secret = match.group(2).strip('"\'')
+            if secret:
+                found.add(secret)
+        for match in re.finditer(r'(?i)\b(?:Bearer|Basic)\s+([A-Za-z0-9._~+/=-]+)', value):
+            found.add(match.group(1))
+    return found
+
+
+def redact_evidence(value, secrets=(), key='', depth=0):
+    if value is MISSING:
+        return {'missing': True}
+    if EVIDENCE_SECRET.search(key):
+        return REDACTED
+    if depth > 12:
+        return '[嵌套内容已截断]'
+    if isinstance(value, dict):
+        result = {str(name)[:256]: redact_evidence(item, secrets, str(name), depth + 1)
+                  for name, item in list(value.items())[:200]}
+        if len(value) > 200:
+            result['…'] = '[对象内容已截断]'
+        return result
+    if isinstance(value, list):
+        result = [redact_evidence(item, secrets, depth=depth + 1) for item in value[:200]]
+        return result + (['[列表内容已截断]'] if len(value) > 200 else [])
+    if isinstance(value, str):
+        text = value
+        if text.lstrip().startswith(('{', '[')):
+            try:
+                parsed = json.loads(text)
+            except (ValueError, TypeError, RecursionError):
+                pass
+            else:
+                if isinstance(parsed, (dict, list)):
+                    return json.dumps(redact_evidence(parsed, secrets, depth=depth + 1), ensure_ascii=False, indent=2)
+        for secret in sorted(secrets, key=len, reverse=True):
+            if secret and secret != REDACTED:
+                for variant in {secret, quote(secret, safe=''), quote(secret, safe='').replace('%20', '+')}:
+                    text = text.replace(variant, REDACTED)
+        text = EVIDENCE_ASSIGNMENT.sub(
+            lambda match: match.group(1) + (json.dumps(REDACTED) if match.group(2).startswith('"') else REDACTED), text)
+        text = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+', REDACTED, text)
+        text = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b', REDACTED, text)
+        return text
+    if value is not None and str(value) in secrets:
+        return REDACTED
+    return value
+
+
+def evidence_preview(value, secrets=(), key='', limit=8192, *, typed=False):
+    safe = redact_evidence(value, secrets, key)
+    text = safe if isinstance(safe, str) and not typed else json.dumps(safe, ensure_ascii=False, indent=2, default=str)
+    encoded = text.encode('utf-8')
+    return {'content': encoded[:limit].decode('utf-8', errors='ignore'),
+            'truncated': len(encoded) > limit or any(marker in text for marker in
+                ('[嵌套内容已截断]', '[对象内容已截断]', '[列表内容已截断]'))}
+
+
+def normalize_validation_steps(value, secrets=()):
+    """Allow only the report contract; cap 20 steps and every displayed value."""
+    if not isinstance(value, list):
+        return []
+    def text(item, limit=256):
+        return str(redact_evidence(item, secrets)).encode('utf-8')[:limit].decode('utf-8', errors='ignore')
+    def preview(item, limit=8192):
+        if not isinstance(item, dict) or not isinstance(item.get('content'), str):
+            return {'content': '', 'truncated': False}
+        result = evidence_preview(str(item.get('content', '')), secrets, limit=limit)
+        result['truncated'] |= item.get('truncated') is True
+        return result
+    def state(item):
+        return item if item in ('pending', 'running', 'passed', 'failed', 'skipped') else 'pending'
+    result = []
+    seen = set()
+    for item in value[:20]:
+        if (not isinstance(item, dict) or type(item.get('step_index')) is not int
+                or not 1 <= item['step_index'] <= 20 or item['step_index'] in seen):
+            continue
+        seen.add(item['step_index'])
+        row = {key: text(item.get(key, ''), limit) for key, limit in
+               (('step_name', 200), ('method', 10), ('message', 500))}
+        elapsed = item.get('elapsed_ms')
+        row.update(step_index=item['step_index'], phase='setup' if item.get('phase') == 'setup' else 'main',
+                   status=state(item.get('status')), elapsed_ms=round(elapsed, 2) if type(elapsed) in (int, float) and 0 <= elapsed <= 86400000 else None,
+                   request=None, response=None, assertions=[], extractions=[])
+        request = item.get('request')
+        if isinstance(request, dict):
+            row['request'] = {'url': text(request.get('url', ''), 4096),
+                              'headers': preview(request.get('headers'), 2048),
+                              'body': preview(request.get('body')),
+                              'body_type': text(request.get('body_type', ''), 10)}
+        response = item.get('response')
+        if isinstance(response, dict):
+            status = response.get('status_code')
+            row['response'] = {'status_code': status if type(status) is int and 100 <= status <= 599 else None,
+                               'headers': preview(response.get('headers'), 2048),
+                               'body': preview(response.get('body')),
+                               'incomplete': response.get('incomplete') is True}
+        for kind in ('assertions', 'extractions'):
+            checks = item.get(kind)
+            if not isinstance(checks, list):
+                continue
+            for index, check in enumerate(checks[:50], 1):
+                if not isinstance(check, dict):
+                    continue
+                normalized = {'index': index, 'check': text(check.get('check', ''), 512),
+                              'status': state(check.get('status')), 'message': text(check.get('message', ''), 200)}
+                if kind == 'assertions':
+                    normalized.update(comparator=text(check.get('comparator', ''), 32),
+                                      error_type=text(check.get('error_type', ''), 64),
+                                      expected=preview(check.get('expected'), 384), actual=preview(check.get('actual'), 384))
+                else:
+                    normalized.update(name=text(check.get('name', ''), 64), value=preview(check.get('value'), 384))
+                row[kind].append(normalized)
+        # Preserve every check/status even on a worst-case 50+50-check step.
+        if len(json.dumps(row, ensure_ascii=False).encode('utf-8')) > 48 * 1024:
+            for payload in (row['request'], row['response']):
+                if payload:
+                    for key in ('headers', 'body'):
+                        payload[key] = preview(payload[key], 1024)
+            for check in row['assertions'] + row['extractions']:
+                check['check'] = text(check['check'], 128)
+                check['message'] = text(check['message'], 64)
+                for key in ('expected', 'actual', 'value'):
+                    if key in check:
+                        check[key] = preview(check[key], 64)
+        result.append(row)
+    return result
+
+
+class ValidationTrace:
+    def __init__(self, snapshot):
+        self.enabled = snapshot['mode'] == 'validation'
+        self.secrets = evidence_secrets(snapshot.get('variables', {}))
+        self.steps = []
+        if self.enabled:
+            for index, step in enumerate(snapshot['steps'], 1):
+                self.steps.append({'step_index': index, 'step_name': step['name'], 'phase': step['phase'],
+                                   'method': step['method'], 'status': 'pending', 'message': '',
+                                   'elapsed_ms': None, 'request': None, 'response': None,
+                                   'assertions': [], 'extractions': []})
+
+    def learn(self, *values):
+        for value in values:
+            evidence_secrets(value, found=self.secrets)
+
+    def request(self, index, step, url, headers, body):
+        if not self.enabled:
+            return
+        self.learn(headers, body)
+        row = self.steps[index - 1]
+        row.update(status='running', request={'url': redact_evidence(url, self.secrets),
+            'headers': evidence_preview(headers, self.secrets, limit=2048),
+            'body': evidence_preview(body, self.secrets), 'body_type': step['body_type']})
+
+    def finish_step(self, index, step, response=None, *, failures=(), extracted=None, elapsed=None, incomplete=False):
+        if not self.enabled:
+            return
+        row = self.steps[index - 1]
+        row.update(status='failed' if failures else 'passed', elapsed_ms=elapsed,
+                   message='；'.join(dict.fromkeys(
+                       f'{item["message"]}（{item["check"]}）' if item.get('check') else item['message']
+                       for item in failures)))
+        if response is not None:
+            self.learn(response.get('headers', {}), response.get('body', {}), extracted or {})
+            row['response'] = {'status_code': response['status_code'],
+                'headers': evidence_preview(response['headers'], self.secrets, limit=2048),
+                'body': evidence_preview(response['body'] if response['body'] is not MISSING else response['text'], self.secrets),
+                'incomplete': incomplete}
+        evaluable = response is not None and not incomplete
+        row['assertions'] = []
+        for assertion in step['assertions']:
+            actual = select_value(response, assertion['check']) if evaluable else MISSING
+            passed, error = compare_value(actual, assertion['comparator'], assertion['expected']) if evaluable else (False, '')
+            expected_key = assertion['check'] if assertion['comparator'] in ('eq', 'ne', 'contains', 'not_contains') else ''
+            row['assertions'].append({**assertion, 'expected': evidence_preview(assertion['expected'], self.secrets, expected_key, 384, typed=True),
+                'actual': evidence_preview(actual, self.secrets, assertion['check'], 384, typed=True) if evaluable else evidence_preview(MISSING),
+                'status': ('passed' if passed else 'failed') if evaluable else 'skipped',
+                'error_type': error if evaluable and not passed else '',
+                'message': ('响应断言未通过' if not passed else '') if evaluable else '请求未获得完整响应，未检查断言'})
+        assertions_passed = evaluable and all(item['status'] == 'passed' for item in row['assertions'])
+        for item in step['extract']:
+            actual = select_value(response, item['check']) if assertions_passed else MISSING
+            status = 'skipped' if not assertions_passed else ('failed' if actual is MISSING else 'passed')
+            row['extractions'].append({**item, 'status': status,
+                'value': evidence_preview(actual, self.secrets, item['name'] if EVIDENCE_SECRET.search(item['name']) else item['check'], 384, typed=True),
+                'message': ('本步骤未通过，提取值未交给后续步骤' if failures and status == 'passed'
+                            else '提取字段不存在' if status == 'failed'
+                            else '断言未通过或未取得响应，未提取' if status == 'skipped' else '')})
+
+    def finish(self):
+        failed = next((row['step_index'] for row in self.steps if row['status'] == 'failed'), None)
+        for row in self.steps:
+            if row['status'] == 'pending':
+                row.update(status='skipped', message=f'第 {failed} 步失败，后续步骤未执行' if failed else '本轮未执行该步骤')
+
+    def report(self):
+        return normalize_validation_steps(self.steps, self.secrets) if self.enabled else []
+
+
 def main():
     # Locust/gevent stay process-local; importing this frozen contract is stdlib-only.
     from gevent import monkey
@@ -458,11 +695,18 @@ def main():
         raise ValueError('运行握手凭证无效')
     failures = []
     failure_keys = set()
+    trace = ValidationTrace(snapshot)
     validation = {'finished': False, 'passed': False, 'main_steps_completed': 0,
                   'main_steps_total': sum(step['phase'] == 'main' for step in snapshot['steps'])}
     user_sequence = [0]
 
     def add_failures(items):
+        if trace.enabled:
+            items = [{**item,
+                      'actual': redact_evidence(item.get('actual'), trace.secrets, item.get('check', '')),
+                      'expected': redact_evidence(item.get('expected'), trace.secrets,
+                          item.get('check', '') if item.get('comparator') in ('eq', 'ne', 'contains', 'not_contains') else '')}
+                     for item in items]
         add_failure_samples(failures, failure_keys, items)
 
     class RequestUser(HttpUser):
@@ -490,6 +734,7 @@ def main():
                 return
             validation['finished'] = True
             validation['passed'] = bool(passed)
+            trace.finish()
             runner = self.environment.runner
             if hasattr(runner, '_send_stats'):
                 runner._send_stats()
@@ -517,6 +762,7 @@ def main():
                     'check': 'variables', 'comparator': 'exists', 'expected': True,
                     'actual': {'missing': True}, 'error_type': error_type, 'message': message}
                 add_failures([sample])
+                trace.finish_step(step_index, step, failures=[sample])
                 self.environment.events.request.fire(
                     request_type=step['method'], name=f'{step_index}. {step["name"]}',
                     response_time=0, response_length=0, exception=ValueError(message),
@@ -530,6 +776,10 @@ def main():
                 request_options['json'] = body
             elif step['body_type'] in ('form', 'raw'):
                 request_options['data'] = body
+            if trace.enabled:
+                trace.learn(variables, query, headers, body)
+                query_string = urlencode({key: value for key, value in query.items() if value is not None}, doseq=True)
+                trace.request(step_index, step, self.host + path + ('?' + query_string if query_string else ''), headers, body)
             started = time.perf_counter()
             try:
                 with self.client.request(step['method'], self.host + path,
@@ -567,6 +817,11 @@ def main():
                         response_body = MISSING
                     response = {'status_code': status_code, 'headers': dict(result.headers),
                                 'text': text, 'body': response_body}
+                    if trace.enabled:
+                        trace.learn(response['headers'], response_body)
+                        prepared = getattr(result, 'request', None)
+                        if prepared is not None:
+                            trace.request(step_index, step, prepared.url, dict(prepared.headers), body)
                     step_failures = [network_failure] if network_failure else assertion_failures(step, step_index, response)
                     extracted = {}
                     if not step_failures:
@@ -579,6 +834,8 @@ def main():
                                     'error_type': 'extraction_missing', 'message': '响应提取字段不存在'})
                             else:
                                 extracted[item['name']] = actual
+                    trace.finish_step(step_index, step, response, failures=step_failures, extracted=extracted,
+                                      elapsed=network_elapsed, incomplete=network_failure is not None)
                     if step_failures:
                         add_failures(step_failures)
                         result.failure('; '.join(item['message'] for item in step_failures)[:1024])
@@ -586,9 +843,11 @@ def main():
                     result.success()
                     return True, extracted
             except RequestException:
-                add_failures([{'step_index': step_index, 'step_name': step['name'], 'phase': step['phase'],
+                failed = {'step_index': step_index, 'step_name': step['name'], 'phase': step['phase'],
                     'check': 'network', 'comparator': 'eq', 'expected': 'success', 'actual': 'request_failed',
-                    'error_type': 'network_error', 'message': '请求失败或超时'}])
+                    'error_type': 'network_error', 'message': '请求失败或超时'}
+                add_failures([failed])
+                trace.finish_step(step_index, step, failures=[failed], elapsed=(time.perf_counter() - started) * 1000)
                 return False, {}
 
         @task
@@ -629,6 +888,8 @@ def main():
             data.update(platform_final=runner.state == 'stopped',
                         platform_failure_samples=failures[:MAX_FAILURE_SAMPLES],
                         platform_validation=dict(validation))
+            if trace.enabled:
+                data['platform_validation_steps'] = trace.report()
         environment.events.report_to_master.add_listener(worker_report)
         environment.events.test_stop.add_listener(lambda **_: runner._send_stats())
         runner.send_message('platform_hello', hello)
@@ -644,6 +905,7 @@ def main():
     final_reports = set()
     invalid = [False]
     master_validation = dict(validation)
+    master_steps = trace.report()
     started_at = None
     reason = 'completed'
 
@@ -659,6 +921,8 @@ def main():
             reported_validation = data.get('platform_validation')
             if type(reported_validation) is dict and reported_validation.get('finished'):
                 master_validation.update(reported_validation)
+            if trace.enabled and isinstance(data.get('platform_validation_steps'), list):
+                master_steps[:] = normalize_validation_steps(data['platform_validation_steps'])
             if data.get('platform_final') and started_at is not None:
                 final_reports.add(client_id)
 
@@ -696,7 +960,8 @@ def main():
             result.update(validation_complete=bool(master_validation['finished']),
                           validation_passed=bool(master_validation['finished'] and master_validation['passed']),
                           main_steps_completed=master_validation['main_steps_completed'],
-                          main_steps_total=master_validation['main_steps_total'])
+                          main_steps_total=master_validation['main_steps_total'],
+                          validation_steps=master_steps)
         return result
 
     deadline = time.monotonic() + 60

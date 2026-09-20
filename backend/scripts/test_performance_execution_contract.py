@@ -229,6 +229,18 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
                     self.assertTrue(validation_run.latest_metrics['validation_passed'])
                     self.assertEqual(validation_run.latest_metrics['main_steps_completed'], 1)
                     self.assertEqual(validation_detail['validation_status'], 'passed')
+                    details = validation_detail['validation_steps']
+                    self.assertEqual([step['status'] for step in details], ['passed', 'passed'])
+                    self.assertEqual(details[0]['phase'], 'setup')
+                    self.assertEqual(details[1]['response']['status_code'], 200)
+                    self.assertTrue(json.loads(details[1]['response']['body']['content'])['ok'])
+                    self.assertEqual(len(details[1]['assertions']), 4)
+                    self.assertEqual(details[0]['extractions'][0]['status'], 'passed')
+                    self.assertIn('/business?name=', details[1]['request']['url'])
+                    serialized_details = json.dumps(details)
+                    for secret in ('fixture-password', 'fixture-token', 'fixture_session=ready'):
+                        self.assertNotIn(secret, serialized_details)
+                    self.assertTrue(all('validation_steps' not in sample['metrics'] for sample in validation_run.metrics_samples))
 
                     load_run, load_observed, _ = execute('load')
                     self.assertEqual(load_run.latest_metrics['failures'], 0)
@@ -238,6 +250,7 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
                     self.assertEqual(len({row['path'] for row in main_rows}), len(main_rows))
                     self.assertTrue(all(row['authorization'] == 'Bearer fixture-token' for row in main_rows))
                     self.assertTrue(all('fixture_session=ready' in row['cookie'] for row in main_rows))
+                    self.assertNotIn('validation_steps', load_run.latest_metrics)
 
                     stopped_run, stopped_observed, _ = execute('load', stop_early=True)
                     self.assertEqual(stopped_run.status, 'cancelled')
@@ -245,6 +258,7 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
 
                     plan.steps[1]['assertions'][0]['expected'] = 201
                     plan.steps[1]['assertions'][2]['expected'] = 99
+                    plan.steps.append({**plan.steps[1], 'name': 'must skip after failure'})
                     plan.save(update_fields=['steps'])
                     stale = api.get(base + f'runs/{validation_run.pk}/')
                     self.assertEqual(stale.json()['data']['validation_status'], 'stale')
@@ -255,6 +269,14 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
                     self.assertFalse(failed_run.latest_metrics['validation_passed'])
                     self.assertEqual(len(failed_run.latest_metrics['failure_samples']), 2)
                     self.assertEqual(failed_detail['validation_status'], 'failed')
+                    details = failed_detail['validation_steps']
+                    self.assertEqual([step['status'] for step in details], ['passed', 'failed', 'skipped'])
+                    self.assertEqual([check['status'] for check in details[1]['assertions']],
+                                     ['failed', 'passed', 'failed', 'passed'])
+                    self.assertEqual(details[1]['assertions'][0]['expected']['content'], '201')
+                    self.assertEqual(details[1]['assertions'][0]['actual']['content'], '200')
+                    self.assertTrue(json.loads(details[1]['response']['body']['content'])['ok'])
+                    self.assertIn('第 2 步失败', details[2]['message'])
 
                     blocked = api.post(base + f'plans/{plan.pk}/runs/', {
                         'node_id': identity.node_id, 'request_id': str(uuid.uuid4()), 'mode': 'load',

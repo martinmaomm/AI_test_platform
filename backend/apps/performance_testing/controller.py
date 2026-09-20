@@ -23,7 +23,9 @@ from .models import PerformanceControllerState, PerformanceRun
 from .constants import MAX_FAILURE_SAMPLES, MAX_FAILURE_VALUE_BYTES
 from .pki import create_run_certificates, private_write
 from .runtime_settings import NODE_SOURCE, RuntimeSettings
-from performance_node.locust_runtime import canonical_sha256, validate_snapshot
+from performance_node.locust_runtime import (
+    canonical_sha256, evidence_secrets, normalize_validation_steps, validate_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 ACTIVE = ('preparing', 'running', 'stopping')
@@ -43,7 +45,12 @@ def _bounded_evidence_value(value):
     return raw[:MAX_FAILURE_VALUE_BYTES].decode('utf-8', errors='ignore') + '…'
 
 
-def bounded_metrics(metrics):
+def bounded_validation_steps(value, snapshot=None):
+    secrets = evidence_secrets((snapshot or {}).get('variables', {}))
+    return normalize_validation_steps(value, secrets)
+
+
+def bounded_metrics(metrics, snapshot=None, mode=None):
     """Defend the reporting database even if a local engine file is malformed."""
     result = dict(metrics)
     samples = result.get('failure_samples')
@@ -68,6 +75,9 @@ def bounded_metrics(metrics):
                 'message': str(sample['message'])[:500],
             })
     result['failure_samples'] = normalized
+    details = result.pop('validation_steps', None)
+    if mode != 'load' and isinstance(details, list):
+        result['validation_steps'] = bounded_validation_steps(details, snapshot)
     return result
 
 
@@ -277,7 +287,7 @@ class PerformanceController:
     def record_metrics(self, run, metrics):
         if not isinstance(metrics, dict) or type(metrics.get('requests')) is not int:
             return
-        metrics = bounded_metrics(metrics)
+        metrics = bounded_metrics(metrics, run.snapshot, run.mode)
         with self.owned_run(run.pk) as (_, locked):
             if locked.status in ACTIVE:
                 self._record_metrics(locked, metrics)
@@ -285,7 +295,8 @@ class PerformanceController:
     def _record_metrics(self, run, metrics):
         history = list(run.metrics_samples or [])
         if time.monotonic() - self.last_sample >= 2 or metrics.get('complete'):
-            history.append({'timestamp': timezone.now().isoformat(), 'metrics': metrics})
+            history.append({'timestamp': timezone.now().isoformat(),
+                            'metrics': {key: value for key, value in metrics.items() if key != 'validation_steps'}})
             history = history[-400:]
             self.last_sample = time.monotonic()
         updates = {'latest_metrics': metrics, 'metrics_samples': history}

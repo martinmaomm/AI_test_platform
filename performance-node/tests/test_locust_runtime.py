@@ -1,5 +1,6 @@
 """The fixed template is safe to import before creating isolated engine processes."""
 import copy
+import json
 import subprocess
 import sys
 import unittest
@@ -8,6 +9,7 @@ import uuid
 from performance_node.locust_runtime import (
     MISSING, add_failure_samples, assertion_failures, canonical_sha256, compare_value,
     resolve_path, resolve_value, select_value, validate_snapshot,
+    ValidationTrace, evidence_preview, normalize_validation_steps,
 )
 
 
@@ -134,3 +136,102 @@ class FixedRuntimeTests(unittest.TestCase):
             }
             with self.subTest(expected=expected), self.assertRaises(ValueError):
                 validate_snapshot(value)
+
+    def test_validation_trace_records_all_assertions_and_skips_dependent_steps(self):
+        value = snapshot()
+        first = value['steps'][0]
+        first['assertions'] += [{'check': 'body.items', 'comparator': 'length_gt', 'expected': 0}]
+        value['steps'].append(copy.deepcopy(first))
+        trace = ValidationTrace(value)
+        trace.request(1, first, 'http://fixture.invalid/ok?page=1', {}, None)
+        response = {'status_code': 200, 'headers': {'Content-Type': 'application/json'},
+                    'body': {'items': []}, 'text': '{"items":[]}'}
+        trace.finish_step(1, first, response, failures=assertion_failures(first, 1, response), elapsed=12.5)
+        trace.finish()
+        rows = trace.report()
+        self.assertEqual([row['status'] for row in rows], ['failed', 'skipped'])
+        self.assertEqual([row['status'] for row in rows[0]['assertions']], ['passed', 'failed'])
+        self.assertEqual(rows[0]['assertions'][1]['actual']['content'], '[]')
+        self.assertEqual(json.loads(rows[0]['response']['body']['content']), {'items': []})
+        self.assertEqual(rows[0]['elapsed_ms'], 12.5)
+        self.assertIn('第 1 步失败', rows[1]['message'])
+
+    def test_validation_trace_redacts_credentials_in_all_diagnostic_locations(self):
+        value = snapshot()
+        value['variables']['password'] = 'sample-password'
+        step = value['steps'][0]
+        step['extract'] = [{'name': 'token', 'check': 'body.token'}]
+        step['assertions'].append({'check': 'body.token', 'comparator': 'type', 'expected': 'string'})
+        trace = ValidationTrace(value)
+        trace.request(1, step, 'http://fixture.invalid/ok?password=sample-password',
+                      {'Authorization': 'Bearer sample-token', 'Cookie': 'sid=cookie-value'},
+                      {'password': 'sample-password', 'echo': 'sample-password'})
+        response = {'status_code': 200, 'headers': {'Set-Cookie': 'sid=cookie-value; Path=/'},
+                    'body': {'token': 'sample-token', 'echo': 'sample-token', 'ok': True}, 'text': ''}
+        trace.finish_step(1, step, response, extracted={'token': 'sample-token'})
+        rows = trace.report()
+        serialized = json.dumps(rows)
+        for secret in ('sample-password', 'sample-token', 'cookie-value'):
+            self.assertNotIn(secret, serialized)
+        self.assertIn('<redacted>', serialized)
+        self.assertEqual(rows[0]['assertions'][1]['status'], 'passed')
+        self.assertEqual(rows[0]['assertions'][1]['expected']['content'], '"string"')
+        self.assertEqual(rows[0]['extractions'][0]['value']['content'], '"<redacted>"')
+        self.assertTrue(json.loads(rows[0]['response']['body']['content'])['ok'])
+
+    def test_validation_trace_reports_uncommitted_extractions_and_incomplete_response(self):
+        value = snapshot()
+        step = value['steps'][0]
+        step['extract'] = [{'name': 'found', 'check': 'body.id'}, {'name': 'absent', 'check': 'body.absent'}]
+        response = {'status_code': 200, 'headers': {}, 'body': {'id': 4}, 'text': ''}
+        trace = ValidationTrace(value)
+        trace.finish_step(1, step, response, failures=[{'message': '响应提取字段不存在'}], extracted={'found': 4})
+        extracts = trace.report()[0]['extractions']
+        self.assertEqual([item['status'] for item in extracts], ['passed', 'failed'])
+        self.assertIn('未交给后续步骤', extracts[0]['message'])
+        trace = ValidationTrace(value)
+        trace.finish_step(1, step, {**response, 'body': MISSING, 'text': 'partial'},
+                          failures=[{'message': '读取响应失败或超时'}], incomplete=True)
+        row = trace.report()[0]
+        self.assertTrue(row['response']['incomplete'])
+        self.assertEqual(row['assertions'][0]['status'], 'skipped')
+        self.assertEqual(row['response']['body']['content'], 'partial')
+
+    def test_validation_evidence_is_bounded_and_formal_load_collects_no_step_trace(self):
+        self.assertTrue(evidence_preview('汉' * 9000)['truncated'])
+        self.assertTrue(evidence_preview(list(range(250)))['truncated'])
+        self.assertLessEqual(len(evidence_preview('汉' * 9000)['content'].encode()), 8192)
+        value = snapshot()
+        step = value['steps'][0]
+        step['assertions'] *= 50
+        step['extract'] = [{'name': f'x{i}', 'check': 'body'} for i in range(50)]
+        trace = ValidationTrace(value)
+        response = {'status_code': 200, 'headers': {}, 'body': {'data': 'x' * 65536}, 'text': ''}
+        trace.request(1, step, 'http://fixture.invalid/ok', {}, response['body'])
+        trace.finish_step(1, step, response)
+        rows = normalize_validation_steps([{**trace.report()[0], 'step_index': i + 1} for i in range(25)])
+        self.assertEqual(len(rows), 20)
+        self.assertLess(len(json.dumps(rows).encode()), 1024 * 1024)
+        self.assertEqual(normalize_validation_steps([None, {'secret': 'bad'}]), [])
+        value['mode'] = 'load'
+        trace = ValidationTrace(value)
+        trace.request(1, step, 'http://fixture.invalid/ok', {}, response['body'])
+        trace.finish_step(1, step, response)
+        self.assertEqual(trace.report(), [])
+
+    def test_numeric_and_raw_credentials_do_not_corrupt_report_metadata(self):
+        value = snapshot()
+        value['variables']['password'] = 1
+        step = value['steps'][0]
+        trace = ValidationTrace(value)
+        trace.request(1, step, 'http://fixture.invalid/ok', {}, '{"password":"raw-secret"}')
+        response = {'status_code': 200, 'headers': {},
+                    'body': {'echo_numeric': 1, 'echo_raw': 'raw-secret'}, 'text': ''}
+        trace.finish_step(1, step, response, elapsed=1)
+        row = trace.report()[0]
+        self.assertEqual(row['step_index'], 1)
+        self.assertEqual(row['elapsed_ms'], 1)
+        self.assertEqual(row['response']['status_code'], 200)
+        self.assertEqual(json.loads(row['response']['body']['content']),
+                         {'echo_numeric': '<redacted>', 'echo_raw': '<redacted>'})
+        self.assertNotIn('raw-secret', json.dumps(row))

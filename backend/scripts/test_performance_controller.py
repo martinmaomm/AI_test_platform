@@ -114,6 +114,25 @@ class ControllerIsolationTests(TestCase):
             len(str(metrics['failure_samples'][0]['expected']).encode('utf-8')), 2051,
         )
 
+    def test_validation_details_are_not_repeated_in_trend_history_or_load_runs(self):
+        run = self.run_record()
+        run.mode = 'validation'
+        run.save(update_fields=['mode'])
+        self.attach(run)
+        step = {'step_index': 1, 'step_name': 'fixture', 'phase': 'main', 'method': 'GET',
+                'status': 'passed', 'response': {'status_code': 200,
+                    'body': {'content': '{"ok": true}', 'truncated': False}}}
+        self.controller.record_metrics(run, {'requests': 1, 'started': True, 'complete': True,
+                                            'validation_steps': [step]})
+        run.refresh_from_db()
+        self.assertEqual(run.latest_metrics['validation_steps'][0]['status'], 'passed')
+        self.assertNotIn('validation_steps', run.metrics_samples[-1]['metrics'])
+        run.mode = 'load'
+        run.save(update_fields=['mode'])
+        self.controller.record_metrics(run, {'requests': 2, 'validation_steps': [step]})
+        run.refresh_from_db()
+        self.assertNotIn('validation_steps', run.latest_metrics)
+
     def test_node_revocation_retains_specific_reason_during_recovery(self):
         run = self.run_record()
         self.attach(run)

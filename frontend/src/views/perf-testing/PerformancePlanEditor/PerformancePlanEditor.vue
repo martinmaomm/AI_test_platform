@@ -84,25 +84,30 @@
           </section>
           <section>
             <h3>负载配置</h3>
+            <p class="load-note">正式压测按以下参数运行。单用户验证固定为 1 个用户执行 1 轮，完成即结束，执行时限为 120 秒。</p>
             <div class="grid">
               <el-form-item label="虚拟用户数" prop="users"
                 ><el-input-number
                   v-model="form.users"
                   :min="1"
-                  :max="limits.max_users" /></el-form-item
+                  :max="limits.max_users" />
+                <p class="load-help">希望同时模拟多少个用户。每个用户独立执行请求步骤，例如填 10 表示目标为 10 个虚拟用户并发运行。</p></el-form-item
               ><el-form-item label="每秒启动用户数" prop="spawn_rate"
                 ><el-input-number
                   v-model="form.spawn_rate"
                   :min="0.000001"
-                  :max="limits.max_spawn_rate" /></el-form-item
+                  :max="limits.max_spawn_rate" />
+                <p class="load-help">每秒新增多少个用户，直到达到目标用户数。例如 10 个用户、每秒启动 2 个，约需 5 秒启动完毕。它控制用户启动速度，实际每秒请求数还取决于接口耗时和每轮等待。</p></el-form-item
               ><el-form-item label="持续时间（秒）" prop="duration_seconds"
                 ><el-input-number
                   v-model="form.duration_seconds"
                   :min="1"
-                  :max="limits.max_duration_seconds" /></el-form-item
+                  :max="limits.max_duration_seconds" />
+                <p class="load-help">从开始启动用户起计时，包含用户逐步启动的时间。例如填 60 表示约运行 1 分钟，到时开始停止运行并汇总结果。</p></el-form-item
               ><el-form-item label="每轮等待（秒）" prop="wait_seconds"
                 ><el-input-number v-model="form.wait_seconds" :min="0"
-              /></el-form-item>
+              />
+                <p class="load-help">每个用户完成一轮主流程后，等待多久再开始下一轮。例如填 1 表示每轮后等待 1 秒；同一轮的步骤按顺序连续执行。等待越长，通常请求频率越低。</p></el-form-item>
             </div>
           </section>
           <section>
@@ -637,13 +642,18 @@ const requestClose = () => {
   color: var(--el-color-danger);
   font-size: 12px;
 }
-.variable-help {
+.variable-help,
+.load-note,
+.load-help {
   width: 100%;
   margin: 0 0 12px;
   color: var(--app-text-secondary);
   font-size: 13px;
   line-height: 1.7;
   overflow-wrap: anywhere;
+}
+.load-help {
+  margin: 8px 0 0;
 }
 .variable-help p {
   margin: 0 0 6px;

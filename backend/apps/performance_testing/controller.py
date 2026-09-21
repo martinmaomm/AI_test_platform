@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 
-from django.db import transaction
+from django.db import InterfaceError, OperationalError, transaction
 from django.utils import timezone
 
 from .models import PerformanceControllerState, PerformanceRun
@@ -32,6 +32,10 @@ ACTIVE = ('preparing', 'running', 'stopping')
 TERMINAL = ('completed', 'failed', 'cancelled', 'incomplete')
 LEASE_SECONDS = 15
 REAP_SECONDS = 25
+
+
+class ControllerLeaseLost(RuntimeError):
+    """The controller must stop its processes before attempting a new claim."""
 
 
 def _bounded_evidence_value(value):
@@ -160,13 +164,13 @@ class PerformanceController:
             state = PerformanceControllerState.objects.select_for_update().get(pk=1)
             if (state.owner_id != self.owner or not state.lease_until
                     or state.lease_until <= timezone.now() or state.current_run_id != run_id):
-                raise RuntimeError('控制器运行租约已失效')
+                raise ControllerLeaseLost('控制器运行租约已失效')
             yield state, PerformanceRun.objects.select_for_update().get(pk=run_id)
 
     def tick(self):
         if not self.renew():
             self.stop_process()
-            raise RuntimeError('控制器租约已被其他实例接管')
+            raise ControllerLeaseLost('控制器租约已过期或已被其他实例接管')
         if self.current is None:
             if self.shutting_down:
                 return
@@ -184,6 +188,10 @@ class PerformanceController:
                 self.current = run.pk
             try:
                 self.prepare(run)
+            except (InterfaceError, OperationalError, ControllerLeaseLost):
+                # Connection/ownership loss requires retiring this controller,
+                # not another database write through begin_reap().
+                raise
             except Exception:
                 logger.exception('性能运行准备失败，run_id=%s', run.pk)
                 self.begin_reap('failed', 'prepare_failed', '准备压测进程或 TLS 失败，请检查控制器日志')

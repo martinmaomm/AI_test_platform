@@ -14,6 +14,7 @@ import collections
 import dataclasses
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -36,9 +37,8 @@ DEFAULT_STATE_DIR = BACKEND_DIR / "temp" / "platform-services"
 DEFAULT_LOG_DIR = BACKEND_DIR / "logs" / "services"
 CORE_SERVICES = ("backend", "celery", "controller", "caddy")
 STOP_ORDER = ("controller", "celery", "caddy", "backend")
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_MESSAGE_BYTES = 64 * 1024
-CREATE_TIME_TOLERANCE = 0.02
 LOG_ROTATE_BYTES = 20 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 
@@ -182,17 +182,50 @@ def _external_command_matches(name: str, spec: Mapping[str, Any], actual_cwd: st
     return commands_match and (actual_cwd == expected_cwd or name == "caddy")
 
 
-def _process_values(process: psutil.Process) -> tuple[float, str, list[str]] | None:
+@functools.lru_cache(maxsize=1)
+def _boot_identity() -> str:
+    """Distinguish persisted process identities across machine reboots."""
+    if sys.platform == "darwin":
+        value = subprocess.check_output(
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL,
+        ).strip()
+    elif sys.platform.startswith("linux"):
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    else:
+        raise ServiceError("稳定进程身份核验仅支持 macOS / Linux")
+    if not value:
+        raise ServiceError("无法读取本次系统启动标识，已拒绝纳管")
+    return value
+
+
+def _process_identity(process: psutil.Process) -> dict[str, Any]:
+    # psutil 7.2.2 (pinned in requirements.txt) uses the unadjusted kernel
+    # start time in _get_ident() on macOS/Linux, including for its own PID-reuse
+    # checks. Public create_time() is wall-clock adjusted and may differ between
+    # Python processes after NTP updates. Keep this private API in one adapter;
+    # a dependency change must not reinterpret existing persisted identities.
+    pid, started = process._get_ident()
+    return {
+        "pid": pid,
+        "start_time": started,
+        "boot_id": _boot_identity(),
+        "source": f"psutil-{psutil.__version__}",
+    }
+
+
+def _process_values(process: psutil.Process) -> tuple[dict[str, Any], str, list[str]] | None:
     try:
-        return process.create_time(), str(Path(process.cwd()).resolve()), process.cmdline()
+        values = _process_identity(process), str(Path(process.cwd()).resolve()), process.cmdline()
+        return values if process.is_running() else None
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
         return None
 
 
 def _record_matches_process(record: Mapping[str, Any], spec: Mapping[str, Any]) -> bool:
     pid = record.get("pid")
-    created = record.get("create_time")
-    if not isinstance(pid, int) or not isinstance(created, (int, float)):
+    identity = record.get("process_identity")
+    if not isinstance(pid, int) or not isinstance(identity, dict):
         return False
     try:
         process = psutil.Process(pid)
@@ -201,13 +234,13 @@ def _record_matches_process(record: Mapping[str, Any], spec: Mapping[str, Any]) 
     values = _process_values(process)
     if not values:
         return False
-    actual_created, actual_cwd, actual_command = values
+    actual_identity, actual_cwd, actual_command = values
     expected_cwd = str(Path(str(spec["cwd"])).resolve())
     actual_fingerprint = command_fingerprint(actual_command, actual_cwd)
     observed_fingerprint = record.get("observed_command_fingerprint") or record.get("command_fingerprint")
     observed_cwd = str(record.get("observed_cwd") or expected_cwd)
     return (
-        abs(actual_created - float(created)) <= CREATE_TIME_TOLERANCE
+        actual_identity == identity
         and actual_cwd == observed_cwd == expected_cwd
         and canonical_command(actual_command, actual_cwd)
         == canonical_command([str(item) for item in spec["command"]], expected_cwd)
@@ -223,7 +256,7 @@ def _new_record(name: str, spec: Mapping[str, Any]) -> dict[str, Any]:
         "name": name,
         "desired": False,
         "pid": None,
-        "create_time": None,
+        "process_identity": None,
         "cwd": cwd,
         "command_fingerprint": command_fingerprint(spec["command"], cwd),
         "observed_command_fingerprint": None,
@@ -268,7 +301,7 @@ class SupervisorEngine:
             old = old_records.get(name) if isinstance(old_records, dict) else None
             if isinstance(old, dict):
                 for key in (
-                    "desired", "pid", "create_time", "started_at", "state", "detail",
+                    "desired", "pid", "process_identity", "started_at", "state", "detail",
                     "restart_attempts", "next_restart_at", "restart_blocked",
                     "observed_command_fingerprint", "observed_cwd",
                 ):
@@ -308,7 +341,7 @@ class SupervisorEngine:
                 record["detail"] = "已核验并接管原管理器子进程"
             else:
                 record["pid"] = None
-                record["create_time"] = None
+                record["process_identity"] = None
                 if record.get("desired"):
                     record["state"] = "waiting_restart"
                     record["detail"] = "旧进程身份失效，等待受控重启"
@@ -357,7 +390,7 @@ class SupervisorEngine:
                 pass
         record = self.records[name]
         record["pid"] = None
-        record["create_time"] = None
+        record["process_identity"] = None
         record["observed_command_fingerprint"] = None
         record["observed_cwd"] = None
 
@@ -400,22 +433,22 @@ class SupervisorEngine:
             return
 
     @staticmethod
-    def _capture_identity(pid: int, spec: Mapping[str, Any], timeout: float = 1.0) -> tuple[float, str, str]:
+    def _capture_identity(pid: int, spec: Mapping[str, Any], timeout: float = 1.0) -> tuple[dict[str, Any], str, str]:
         deadline = time.monotonic() + timeout
-        last: tuple[float, str, list[str]] | None = None
+        last: tuple[dict[str, Any], str, list[str]] | None = None
         while time.monotonic() < deadline:
             try:
                 last = _process_values(psutil.Process(pid))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 last = None
             if last:
-                created, actual_cwd, actual_command = last
+                identity, actual_cwd, actual_command = last
                 expected_cwd = str(Path(str(spec["cwd"])).resolve())
                 if (
                     actual_cwd == expected_cwd
                     and canonical_command(actual_command, actual_cwd) == canonical_command(spec["command"], expected_cwd)
                 ):
-                    return created, actual_cwd, command_fingerprint(actual_command, actual_cwd)
+                    return identity, actual_cwd, command_fingerprint(actual_command, actual_cwd)
             time.sleep(0.01)
         raise ServiceError("启动后无法核验实际进程身份，已拒绝纳管")
 
@@ -557,7 +590,7 @@ class SupervisorEngine:
                 start_new_session=True,
                 close_fds=True,
             )
-            created, observed_cwd, observed_fingerprint = self._capture_identity(process.pid, spec)
+            identity, observed_cwd, observed_fingerprint = self._capture_identity(process.pid, spec)
         except Exception as exc:
             if "process" in locals() and process.poll() is None:
                 try:
@@ -580,7 +613,7 @@ class SupervisorEngine:
             {
                 "desired": True,
                 "pid": process.pid,
-                "create_time": created,
+                "process_identity": identity,
                 "observed_cwd": observed_cwd,
                 "observed_command_fingerprint": observed_fingerprint,
                 "started_at": now,
@@ -853,7 +886,7 @@ class ManagerServer:
             raise ServiceError("已有平台服务管理器正在运行") from exc
         identity = {
             "pid": os.getpid(),
-            "create_time": psutil.Process().create_time(),
+            "process_identity": _process_identity(psutil.Process()),
             "cwd": str(PROJECT_ROOT),
             "script": str(Path(__file__).resolve()),
         }
@@ -992,8 +1025,8 @@ def _manager_identity_valid(state: Mapping[str, Any]) -> bool:
     if not isinstance(manager, dict):
         return False
     pid = manager.get("pid")
-    created = manager.get("create_time")
-    if not isinstance(pid, int) or not isinstance(created, (int, float)):
+    identity = manager.get("process_identity")
+    if state.get("version") != STATE_VERSION or not isinstance(pid, int) or not isinstance(identity, dict):
         return False
     try:
         process = psutil.Process(pid)
@@ -1002,10 +1035,10 @@ def _manager_identity_valid(state: Mapping[str, Any]) -> bool:
         return False
     if not values:
         return False
-    actual_created, actual_cwd, command = values
+    actual_identity, actual_cwd, command = values
     expected = canonical_command([sys.executable, str(Path(__file__).resolve()), "--manager"], str(PROJECT_ROOT))
     return (
-        abs(actual_created - float(created)) <= CREATE_TIME_TOLERANCE
+        actual_identity == identity
         and actual_cwd == str(PROJECT_ROOT)
         and canonical_command(command, actual_cwd) == expected
     )

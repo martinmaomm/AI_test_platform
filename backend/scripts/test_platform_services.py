@@ -25,8 +25,11 @@ from platform_services import (  # noqa: E402
     ManagerServer,
     RuntimePaths,
     STOP_ORDER,
+    STATE_VERSION,
     SupervisorEngine,
     _default_names,
+    _manager_identity_valid,
+    _process_identity,
     _print_status,
     canonical_command,
 )
@@ -175,9 +178,11 @@ class PlatformServiceTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         self.external.append(unrelated)
+        identity = _process_identity(psutil.Process(unrelated.pid))
+        identity["start_time"] -= 10
         engine.records["backend"].update(
             pid=unrelated.pid,
-            create_time=psutil.Process(unrelated.pid).create_time() - 10,
+            process_identity=identity,
             desired=True,
             state="running",
         )
@@ -234,6 +239,111 @@ class PlatformServiceTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(original_pid, result["pid"])
         self.assertEqual(original_pid, successor.status()["services"]["backend"]["pid"])
+
+    def test_clock_adjustment_preserves_ownership_handover_and_stop(self):
+        specs = {"backend": self.spec("backend")}
+        for offset in (-3600, -1, 1, 3600):
+            with self.subTest(offset=offset):
+                first = self.engine(specs)
+                original_pid = first.start(["backend"])["backend"]["pid"]
+                original_wall_time = psutil.Process(original_pid).create_time()
+                with patch.object(psutil._psplatform, "adjust_proc_create_time", side_effect=lambda value: value + offset):
+                    self.assertNotEqual(original_wall_time, psutil.Process(original_pid).create_time())
+                    first.tick()
+                    self.assertEqual("running", first.status()["services"]["backend"]["state"])
+                    successor = self.engine(specs)
+                    self.assertEqual(original_pid, successor.start(["backend"])["backend"]["pid"])
+                    self.assertEqual([], successor.records["backend"]["restart_attempts"])
+                    self.assertTrue(successor.stop(["backend"])["backend"]["ok"])
+                    # The original test engine still owns Popen and must reap
+                    # the exited child before pid_exists stops seeing a zombie.
+                    first.process_handles["backend"].wait(timeout=2)
+                    self.assertFalse(psutil.pid_exists(original_pid))
+
+    def test_unexpected_exit_still_restarts_after_clock_adjustment(self):
+        options = EngineOptions(minimum_restart_delay=0.01, max_restart_delay=0.02)
+        engine = self.engine({"backend": self.spec("backend")}, options=options)
+        pid = engine.start(["backend"])["backend"]["pid"]
+        with patch.object(psutil._psplatform, "adjust_proc_create_time", side_effect=lambda value: value + 1):
+            engine.process_handles["backend"].terminate()
+            engine.process_handles["backend"].wait(timeout=2)
+
+            def recovered():
+                engine.tick()
+                return engine._running("backend") and engine.records["backend"]["pid"] != pid
+
+            self.assertTrue(self.wait_until(recovered), engine.records["backend"])
+            self.assertEqual(1, len(engine.records["backend"]["restart_attempts"]))
+
+    def test_identity_survives_a_fresh_python_interpreter(self):
+        engine = self.engine({"backend": self.spec("backend")})
+        pid = engine.start(["backend"])["backend"]["pid"]
+        code = (
+            "import json,sys,psutil; from platform_services import _process_identity; "
+            "psutil._psplatform.adjust_proc_create_time = lambda value: value + 1; "
+            "print(json.dumps(_process_identity(psutil.Process(int(sys.argv[1])))))"
+        )
+        observed = json.loads(subprocess.check_output(
+            [sys.executable, "-c", code, str(pid)], cwd=BACKEND, text=True, timeout=5,
+        ))
+        self.assertEqual(engine.records["backend"]["process_identity"], observed)
+
+    def test_same_command_with_different_identity_is_never_adopted_or_stopped(self):
+        for field, value in (("start_time", None), ("boot_id", "another-boot"), ("source", "another-version")):
+            with self.subTest(field=field):
+                specs = {"backend": self.spec("backend")}
+                first = self.engine(specs)
+                pid = first.start(["backend"])["backend"]["pid"]
+                handle = first.process_handles["backend"]
+                self.external.append(handle)
+                identity = first.records["backend"]["process_identity"]
+                # Even a reused PID with the exact same cwd/argv and a start
+                # difference below the former 20 ms tolerance must be rejected.
+                identity[field] = identity[field] - 0.001 if value is None else value
+                first.save()
+                successor = self.engine(specs)
+                self.assertIsNone(successor.records["backend"]["pid"])
+                self.assertEqual("unmanaged", successor.status()["services"]["backend"]["state"])
+                self.assertFalse(successor.start(["backend"])["backend"]["ok"])
+                first.stop(["backend"])
+                successor.stop(["backend"])
+                self.assertIsNone(handle.poll())
+                self.assertTrue(psutil.pid_exists(pid))
+                handle.terminate()
+                handle.wait(timeout=2)
+
+    def test_legacy_wall_clock_state_does_not_grant_ownership(self):
+        specs = {"backend": self.spec("backend")}
+        first = self.engine(specs)
+        pid = first.start(["backend"])["backend"]["pid"]
+        state = json.loads(self.paths.state_file.read_text(encoding="utf-8"))
+        state["version"] = 1
+        record = state["services"]["backend"]
+        record.pop("process_identity")
+        record["create_time"] = psutil.Process(pid).create_time()
+        self.paths.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        successor = self.engine(specs)
+
+        self.assertEqual("unmanaged", successor.status()["services"]["backend"]["state"])
+        self.assertFalse(successor.start(["backend"])["backend"]["ok"])
+        successor.stop(["backend"])
+        self.assertTrue(first._running("backend"))
+
+    def test_manager_identity_ignores_wall_clock_but_rejects_other_processes(self):
+        state = {"version": STATE_VERSION, "manager": {
+            "pid": os.getpid(), "process_identity": _process_identity(psutil.Process()),
+        }}
+        with patch.object(psutil.Process, "cwd", return_value=str(BACKEND.parent)), patch.object(
+            psutil.Process, "cmdline", return_value=[sys.executable, str(BACKEND / "platform_services.py"), "--manager"],
+        ), patch.object(psutil._psplatform, "adjust_proc_create_time", side_effect=lambda value: value + 1):
+            self.assertTrue(_manager_identity_valid(state))
+            with patch.object(psutil.Process, "cmdline", return_value=[sys.executable, "unrelated.py"]):
+                self.assertFalse(_manager_identity_valid(state))
+            state["manager"]["process_identity"]["start_time"] -= 0.001
+            self.assertFalse(_manager_identity_valid(state))
+            state["manager"] = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
+            self.assertFalse(_manager_identity_valid(state))
 
     def test_fallback_port_check_distinguishes_live_listener_from_time_wait(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

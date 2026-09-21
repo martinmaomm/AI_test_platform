@@ -9,7 +9,7 @@ import uuid
 from performance_node.locust_runtime import (
     MISSING, add_failure_samples, assertion_failures, canonical_sha256, compare_value,
     resolve_path, resolve_value, select_value, validate_snapshot,
-    ValidationTrace, evidence_preview, normalize_validation_steps,
+    ValidationTrace, evidence_preview, format_evidence, evidence_secrets, normalize_validation_steps,
 )
 
 
@@ -156,12 +156,13 @@ class FixedRuntimeTests(unittest.TestCase):
         self.assertEqual(rows[0]['elapsed_ms'], 12.5)
         self.assertIn('第 1 步失败', rows[1]['message'])
 
-    def test_validation_trace_redacts_credentials_in_all_diagnostic_locations(self):
+    def test_validation_trace_preserves_credentials_in_all_detail_locations(self):
         value = snapshot()
         value['variables']['password'] = 'sample-password'
         step = value['steps'][0]
         step['extract'] = [{'name': 'token', 'check': 'body.token'}]
         step['assertions'].append({'check': 'body.token', 'comparator': 'type', 'expected': 'string'})
+        step['assertions'].append({'check': 'body.token', 'comparator': 'eq', 'expected': 'sample-token'})
         trace = ValidationTrace(value)
         trace.request(1, step, 'http://fixture.invalid/ok?password=sample-password',
                       {'Authorization': 'Bearer sample-token', 'Cookie': 'sid=cookie-value'},
@@ -172,11 +173,16 @@ class FixedRuntimeTests(unittest.TestCase):
         rows = trace.report()
         serialized = json.dumps(rows)
         for secret in ('sample-password', 'sample-token', 'cookie-value'):
-            self.assertNotIn(secret, serialized)
-        self.assertIn('<redacted>', serialized)
+            self.assertIn(secret, serialized)
+        self.assertNotIn('<redacted>', serialized)
         self.assertEqual(rows[0]['assertions'][1]['status'], 'passed')
         self.assertEqual(rows[0]['assertions'][1]['expected']['content'], '"string"')
-        self.assertEqual(rows[0]['extractions'][0]['value']['content'], '"<redacted>"')
+        self.assertEqual(rows[0]['extractions'][0]['value']['content'], '"sample-token"')
+        self.assertEqual(rows[0]['request']['url'], 'http://fixture.invalid/ok?password=sample-password')
+        self.assertEqual(json.loads(rows[0]['request']['headers']['content'])['Cookie'], 'sid=cookie-value')
+        self.assertEqual(json.loads(rows[0]['response']['headers']['content'])['Set-Cookie'], 'sid=cookie-value; Path=/')
+        self.assertEqual(rows[0]['assertions'][2]['expected']['content'], '"sample-token"')
+        self.assertEqual(rows[0]['assertions'][2]['actual']['content'], '"sample-token"')
         self.assertTrue(json.loads(rows[0]['response']['body']['content'])['ok'])
 
     def test_validation_trace_reports_uncommitted_extractions_and_incomplete_response(self):
@@ -196,6 +202,19 @@ class FixedRuntimeTests(unittest.TestCase):
         self.assertTrue(row['response']['incomplete'])
         self.assertEqual(row['assertions'][0]['status'], 'skipped')
         self.assertEqual(row['response']['body']['content'], 'partial')
+
+    def test_detail_text_is_preserved_while_shared_failure_summary_stays_redacted(self):
+        value = {'password': 'fixture-password', 'Authorization': 'Bearer fixture-token',
+                 'Cookie': 'sid=fixture-cookie', 'nested': [{'token': 'fixture-token'}]}
+        secrets = evidence_secrets(value)
+        self.assertEqual(json.loads(evidence_preview(value)['content']), value)
+        for raw in ('password=fixture-password&token=fixture-token',
+                    'Authorization: Bearer fixture-token', '{"token":"fixture-token"}',
+                    'https://fixture.invalid/?password=a%2Bb%20c', 'Basic Zml4dHVyZQ=='):
+            self.assertEqual(evidence_preview(raw)['content'], raw)
+        summary = format_evidence(value, secrets, redact=True)
+        for secret in ('fixture-password', 'fixture-token', 'fixture-cookie'):
+            self.assertNotIn(secret, json.dumps(summary))
 
     def test_validation_evidence_is_bounded_and_formal_load_collects_no_step_trace(self):
         self.assertTrue(evidence_preview('汉' * 9000)['truncated'])
@@ -233,5 +252,6 @@ class FixedRuntimeTests(unittest.TestCase):
         self.assertEqual(row['elapsed_ms'], 1)
         self.assertEqual(row['response']['status_code'], 200)
         self.assertEqual(json.loads(row['response']['body']['content']),
-                         {'echo_numeric': '<redacted>', 'echo_raw': '<redacted>'})
-        self.assertNotIn('raw-secret', json.dumps(row))
+                         {'echo_numeric': 1, 'echo_raw': 'raw-secret'})
+        self.assertEqual(row['request']['body']['content'], '{"password":"raw-secret"}')
+        self.assertIn('raw-secret', json.dumps(row))

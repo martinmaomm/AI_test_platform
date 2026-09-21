@@ -2,7 +2,7 @@ FROM python:3.13-slim AS runtime-base
 
 LABEL org.opencontainers.image.title="AI test platform performance node" \
       org.opencontainers.image.description="仅限测试使用 / For authorized testing only. Not for production." \
-      org.opencontainers.image.version="0.3.1"
+      org.opencontainers.image.version="0.3.2"
 
 WORKDIR /app
 RUN apt-get update && \

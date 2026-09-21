@@ -1,8 +1,8 @@
 PROTOCOL_VERSION = 2
-AGENT_VERSION = '0.3.1'
+AGENT_VERSION = '0.3.2'
 # Old agents may keep heartbeating so the management UI can show an upgrade
 # prompt. Execution compatibility requires the matching fixed runtime version.
-SUPPORTED_AGENT_VERSIONS = ('0.2.0', '0.2.1', '0.3.0', AGENT_VERSION)
+SUPPORTED_AGENT_VERSIONS = ('0.2.0', '0.2.1', '0.3.0', '0.3.1', AGENT_VERSION)
 ENGINE_VERSION = '2.43.3'
 
 HEARTBEAT_INTERVAL_SECONDS = 5

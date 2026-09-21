@@ -24,7 +24,7 @@ from .constants import MAX_FAILURE_SAMPLES, MAX_FAILURE_VALUE_BYTES
 from .pki import create_run_certificates, private_write
 from .runtime_settings import NODE_SOURCE, RuntimeSettings
 from performance_node.locust_runtime import (
-    canonical_sha256, evidence_secrets, normalize_validation_steps, validate_snapshot,
+    canonical_sha256, normalize_validation_steps, validate_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,8 +50,7 @@ def _bounded_evidence_value(value):
 
 
 def bounded_validation_steps(value, snapshot=None):
-    secrets = evidence_secrets((snapshot or {}).get('variables', {}))
-    return normalize_validation_steps(value, secrets)
+    return normalize_validation_steps(value)
 
 
 def bounded_metrics(metrics, snapshot=None, mode=None):

@@ -31,7 +31,7 @@ class PerformanceRunContractTests(TestCase):
         run.latest_metrics = {'requests': 1, 'validation_steps': [{
             'step_index': 1, 'step_name': 'fixture', 'phase': 'main', 'method': 'GET',
             'status': 'failed', 'response': {'status_code': 200,
-                'body': {'content': '{"data":[],"token":"must-not-escape"}', 'truncated': False}},
+                'body': {'content': '{"data":[],"token":"fixture-detail-token"}', 'truncated': False}},
         }]}
         run.save(update_fields=['latest_metrics'])
         detail_path = self._path(f'runs/{run.pk}/')
@@ -39,13 +39,13 @@ class PerformanceRunContractTests(TestCase):
         listing = self.client.get(self._path('runs/'))
         self.assertEqual(listing.status_code, 200)
         self.assertNotIn('validation_steps', listing.data['data']['items'][0]['latest_metrics'])
-        self.assertNotIn('must-not-escape', str(listing.data))
+        self.assertNotIn('fixture-detail-token', str(listing.data))
         self.assertEqual(self.client.get(detail_path).status_code, 403)
         self.client.force_authenticate(self.executor)
         detail = self.client.get(detail_path)
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.data['data']['validation_steps'][0]['status'], 'failed')
-        self.assertNotIn('must-not-escape', str(detail.data['data']['validation_steps']))
+        self.assertIn('fixture-detail-token', str(detail.data['data']['validation_steps']))
         run.latest_metrics = {'requests': 1}
         run.save(update_fields=['latest_metrics'])
         self.assertEqual(self.client.get(detail_path).data['data']['validation_steps'], [])
@@ -269,8 +269,8 @@ class PerformanceRunContractTests(TestCase):
         self.assertIn(AGENT_VERSION, created.data['error']['message'])
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
-    def test_agent_030_must_upgrade_before_receiving_the_new_fixed_template(self, _):
-        PerformanceNode.objects.filter(pk=self.node.pk).update(agent_version='0.3.0')
+    def test_agent_031_must_upgrade_before_receiving_the_new_fixed_template(self, _):
+        PerformanceNode.objects.filter(pk=self.node.pk).update(agent_version='0.3.1')
         created = self._create()
         self.assertEqual(created.status_code, 400, created.data)
         self.assertIn(AGENT_VERSION, created.data['error']['message'])

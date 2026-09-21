@@ -22,6 +22,7 @@ def seed(fixture):
                 'headers': {}, 'body_type': 'none', 'body': None, 'extract': [],
                 'assertions': [{'check': 'status_code', 'comparator': 'eq', 'expected': 200}]}
     steps = [step('获取登录令牌', 'setup'), step('查询购物车'), step('依赖购物车的后续步骤')]
+    steps[0].update(method='POST', body_type='json')
     steps[0]['extract'] = [{'name': 'token', 'check': 'body.token'}]
     steps[1]['assertions'] += [
         {'check': 'body.items', 'comparator': 'length_gt', 'expected': 0},
@@ -29,8 +30,9 @@ def seed(fixture):
     ]
     snapshot = {'mode': 'validation', 'plan_name': '验证明细隔离样本', 'variables': {}, 'steps': steps}
     trace = ValidationTrace(snapshot)
-    first = {'status_code': 200, 'headers': {}, 'body': {'token': 'fixture-private-token'}, 'text': ''}
-    trace.request(1, steps[0], 'https://fixture.invalid/login', {}, None)
+    first = {'status_code': 200, 'headers': {'Set-Cookie': 'fixture_session=browser-cookie; Path=/'}, 'body': {'token': 'fixture-private-token'}, 'text': ''}
+    trace.request(1, steps[0], 'https://fixture.invalid/login?token=fixture-query-token',
+                  {'Cookie': 'fixture_session=request-cookie'}, {'password': 'fixture-password'})
     trace.finish_step(1, steps[0], first, extracted={'token': 'fixture-private-token'}, elapsed=12)
     response = {'status_code': 200, 'headers': {'Content-Type': 'application/json'},
                 'body': {'items': [], 'count': '3', 'diagnostic': '库存不足',
@@ -91,12 +93,17 @@ def verify(origin, fixture):
             expect(failed_step.get_by_test_id('validation-response')).to_contain_text('内容过长，已截断展示')
             expect(failed_step.get_by_test_id('validation-request-url')).to_contain_text('https://fixture.invalid/items?page=1')
             assert not page.evaluate('window.evidenceExecuted === true')
-            assert 'fixture-private-token' not in details.inner_text()
+            expect(failed_step).to_contain_text('Bearer fixture-private-token')
             details.screenshot(path=str(output / 'failed-step.png'), animations='disabled')
             titles.nth(2).click()
             expect(details.get_by_text('第 2 步失败，后续步骤未执行', exact=True)).to_be_visible()
             titles.nth(0).click()
-            expect(page.get_by_test_id('validation-extractions')).to_contain_text('<redacted>')
+            expect(page.get_by_test_id('validation-extractions')).to_contain_text('fixture-private-token')
+            login = details.locator('.el-collapse-item').nth(0)
+            for original in ('fixture-password', 'fixture-query-token', 'fixture_session=request-cookie',
+                             'fixture_session=browser-cookie; Path=/'):
+                expect(login).to_contain_text(original)
+            details.screenshot(path=str(output / 'raw-details.png'), animations='disabled')
             page.goto(origin + '/perf-testing/runs/' + fixture['legacy'])
             expect(page.get_by_test_id('validation-details-unavailable')).to_contain_text('历史缺失响应无法补回')
             expect(page.get_by_text('断言失败证据', exact=True)).to_be_visible()
@@ -105,7 +112,7 @@ def verify(origin, fixture):
             expect(page.get_by_test_id('validation-step-details')).not_to_be_visible()
             assert not errors and not external, (errors, external)
             print(json.dumps({'browser': 'real Vue/Django/Chrome', 'assertion_details': True,
-                'response_and_truncation': True, 'skipped_steps': True, 'redacted_extractions': True,
+                'response_and_truncation': True, 'skipped_steps': True, 'original_credentials': True,
                 'legacy_record_hint': True, 'load_mode_unchanged': True, 'page_errors': 0}, ensure_ascii=False))
         except Exception:
             page.screenshot(path=str(output / 'failure.png'), full_page=True)

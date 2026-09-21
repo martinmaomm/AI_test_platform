@@ -1,7 +1,7 @@
 <template>
   <section class="validation-details" data-testid="validation-step-details">
     <h3>单用户验证 · 步骤明细</h3>
-    <p class="help">按顺序执行准备步骤和一轮主流程，失败后跳过后续步骤。展开查看请求、响应及逐条断言；密码、令牌和 Cookie 已脱敏。</p>
+    <p class="help">按顺序执行准备步骤和一轮主流程，失败后跳过后续步骤。展开查看请求、响应及逐条断言；密码、令牌和 Cookie 按原值显示，用于排查脚本问题。历史记录中已脱敏的值无法恢复，更新节点后重新验证可获取原值。</p>
     <el-alert v-if="!steps.length" :closable="false" type="info" data-testid="validation-details-unavailable">
       {{ active ? "正在等待节点上报步骤明细。" : "本次记录没有逐步请求和响应明细。若执行未进入请求阶段，请先检查上方执行原因；历史缺失响应无法补回，请在平台和节点更新后重新验证。已有失败证据仍显示在下方。" }}
     </el-alert>

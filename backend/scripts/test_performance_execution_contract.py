@@ -239,7 +239,10 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
                     self.assertIn('/business?name=', details[1]['request']['url'])
                     serialized_details = json.dumps(details)
                     for secret in ('fixture-password', 'fixture-token', 'fixture_session=ready'):
-                        self.assertNotIn(secret, serialized_details)
+                        self.assertIn(secret, serialized_details)
+                    self.assertEqual(json.loads(details[0]['request']['body']['content'])['password'], 'fixture-password')
+                    self.assertEqual(json.loads(details[1]['request']['headers']['content'])['Authorization'], 'Bearer fixture-token')
+                    self.assertEqual(details[0]['extractions'][0]['value']['content'], '"fixture-token"')
                     self.assertTrue(all('validation_steps' not in sample['metrics'] for sample in validation_run.metrics_samples))
 
                     load_run, load_observed, _ = execute('load')

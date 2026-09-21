@@ -422,7 +422,8 @@ def add_failure_samples(failures, seen, items):
 
 
 # This file is the standalone, byte-checked worker template. Keep diagnostics
-# stdlib-only and sanitize before they enter Locust's reporting transport.
+# stdlib-only. Step details preserve original values; shared failure summaries
+# remain redacted before entering Locust's reporting transport.
 REDACTED = '<redacted>'
 EVIDENCE_SECRET = re.compile(r'authorization|cookie|token|secret|password|passwd|pwd|api[_-]?key|private[_-]?key|session|credential|csrf|xsrf|otp|密码|口令|密钥', re.I)
 EVIDENCE_ASSIGNMENT = re.compile(
@@ -467,23 +468,23 @@ def evidence_secrets(value, key='', found=None, depth=0):
     return found
 
 
-def redact_evidence(value, secrets=(), key='', depth=0):
+def format_evidence(value, secrets=(), key='', depth=0, *, redact=False):
     if value is MISSING:
         return {'missing': True}
-    if EVIDENCE_SECRET.search(key):
+    if redact and EVIDENCE_SECRET.search(key):
         return REDACTED
     if depth > 12:
         return '[嵌套内容已截断]'
     if isinstance(value, dict):
-        result = {str(name)[:256]: redact_evidence(item, secrets, str(name), depth + 1)
+        result = {str(name)[:256]: format_evidence(item, secrets, str(name), depth + 1, redact=redact)
                   for name, item in list(value.items())[:200]}
         if len(value) > 200:
             result['…'] = '[对象内容已截断]'
         return result
     if isinstance(value, list):
-        result = [redact_evidence(item, secrets, depth=depth + 1) for item in value[:200]]
+        result = [format_evidence(item, secrets, depth=depth + 1, redact=redact) for item in value[:200]]
         return result + (['[列表内容已截断]'] if len(value) > 200 else [])
-    if isinstance(value, str):
+    if redact and isinstance(value, str):
         text = value
         if text.lstrip().startswith(('{', '[')):
             try:
@@ -492,7 +493,7 @@ def redact_evidence(value, secrets=(), key='', depth=0):
                 pass
             else:
                 if isinstance(parsed, (dict, list)):
-                    return json.dumps(redact_evidence(parsed, secrets, depth=depth + 1), ensure_ascii=False, indent=2)
+                    return json.dumps(format_evidence(parsed, secrets, depth=depth + 1, redact=True), ensure_ascii=False, indent=2)
         for secret in sorted(secrets, key=len, reverse=True):
             if secret and secret != REDACTED:
                 for variant in {secret, quote(secret, safe=''), quote(secret, safe='').replace('%20', '+')}:
@@ -502,13 +503,13 @@ def redact_evidence(value, secrets=(), key='', depth=0):
         text = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+', REDACTED, text)
         text = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b', REDACTED, text)
         return text
-    if value is not None and str(value) in secrets:
+    if redact and value is not None and str(value) in secrets:
         return REDACTED
     return value
 
 
-def evidence_preview(value, secrets=(), key='', limit=8192, *, typed=False):
-    safe = redact_evidence(value, secrets, key)
+def evidence_preview(value, limit=8192, *, typed=False):
+    safe = format_evidence(value)
     text = safe if isinstance(safe, str) and not typed else json.dumps(safe, ensure_ascii=False, indent=2, default=str)
     encoded = text.encode('utf-8')
     return {'content': encoded[:limit].decode('utf-8', errors='ignore'),
@@ -516,16 +517,16 @@ def evidence_preview(value, secrets=(), key='', limit=8192, *, typed=False):
                 ('[嵌套内容已截断]', '[对象内容已截断]', '[列表内容已截断]'))}
 
 
-def normalize_validation_steps(value, secrets=()):
+def normalize_validation_steps(value):
     """Allow only the report contract; cap 20 steps and every displayed value."""
     if not isinstance(value, list):
         return []
     def text(item, limit=256):
-        return str(redact_evidence(item, secrets)).encode('utf-8')[:limit].decode('utf-8', errors='ignore')
+        return str(format_evidence(item)).encode('utf-8')[:limit].decode('utf-8', errors='ignore')
     def preview(item, limit=8192):
         if not isinstance(item, dict) or not isinstance(item.get('content'), str):
             return {'content': '', 'truncated': False}
-        result = evidence_preview(str(item.get('content', '')), secrets, limit=limit)
+        result = evidence_preview(str(item.get('content', '')), limit=limit)
         result['truncated'] |= item.get('truncated') is True
         return result
     def state(item):
@@ -609,9 +610,9 @@ class ValidationTrace:
             return
         self.learn(headers, body)
         row = self.steps[index - 1]
-        row.update(status='running', request={'url': redact_evidence(url, self.secrets),
-            'headers': evidence_preview(headers, self.secrets, limit=2048),
-            'body': evidence_preview(body, self.secrets), 'body_type': step['body_type']})
+        row.update(status='running', request={'url': url,
+            'headers': evidence_preview(headers, limit=2048),
+            'body': evidence_preview(body), 'body_type': step['body_type']})
 
     def finish_step(self, index, step, response=None, *, failures=(), extracted=None, elapsed=None, incomplete=False):
         if not self.enabled:
@@ -624,17 +625,16 @@ class ValidationTrace:
         if response is not None:
             self.learn(response.get('headers', {}), response.get('body', {}), extracted or {})
             row['response'] = {'status_code': response['status_code'],
-                'headers': evidence_preview(response['headers'], self.secrets, limit=2048),
-                'body': evidence_preview(response['body'] if response['body'] is not MISSING else response['text'], self.secrets),
+                'headers': evidence_preview(response['headers'], limit=2048),
+                'body': evidence_preview(response['body'] if response['body'] is not MISSING else response['text']),
                 'incomplete': incomplete}
         evaluable = response is not None and not incomplete
         row['assertions'] = []
         for assertion in step['assertions']:
             actual = select_value(response, assertion['check']) if evaluable else MISSING
             passed, error = compare_value(actual, assertion['comparator'], assertion['expected']) if evaluable else (False, '')
-            expected_key = assertion['check'] if assertion['comparator'] in ('eq', 'ne', 'contains', 'not_contains') else ''
-            row['assertions'].append({**assertion, 'expected': evidence_preview(assertion['expected'], self.secrets, expected_key, 384, typed=True),
-                'actual': evidence_preview(actual, self.secrets, assertion['check'], 384, typed=True) if evaluable else evidence_preview(MISSING),
+            row['assertions'].append({**assertion, 'expected': evidence_preview(assertion['expected'], 384, typed=True),
+                'actual': evidence_preview(actual, 384, typed=True) if evaluable else evidence_preview(MISSING),
                 'status': ('passed' if passed else 'failed') if evaluable else 'skipped',
                 'error_type': error if evaluable and not passed else '',
                 'message': ('响应断言未通过' if not passed else '') if evaluable else '请求未获得完整响应，未检查断言'})
@@ -643,7 +643,7 @@ class ValidationTrace:
             actual = select_value(response, item['check']) if assertions_passed else MISSING
             status = 'skipped' if not assertions_passed else ('failed' if actual is MISSING else 'passed')
             row['extractions'].append({**item, 'status': status,
-                'value': evidence_preview(actual, self.secrets, item['name'] if EVIDENCE_SECRET.search(item['name']) else item['check'], 384, typed=True),
+                'value': evidence_preview(actual, 384, typed=True),
                 'message': ('本步骤未通过，提取值未交给后续步骤' if failures and status == 'passed'
                             else '提取字段不存在' if status == 'failed'
                             else '断言未通过或未取得响应，未提取' if status == 'skipped' else '')})
@@ -655,7 +655,7 @@ class ValidationTrace:
                 row.update(status='skipped', message=f'第 {failed} 步失败，后续步骤未执行' if failed else '本轮未执行该步骤')
 
     def report(self):
-        return normalize_validation_steps(self.steps, self.secrets) if self.enabled else []
+        return normalize_validation_steps(self.steps) if self.enabled else []
 
 
 def main():
@@ -703,9 +703,9 @@ def main():
     def add_failures(items):
         if trace.enabled:
             items = [{**item,
-                      'actual': redact_evidence(item.get('actual'), trace.secrets, item.get('check', '')),
-                      'expected': redact_evidence(item.get('expected'), trace.secrets,
-                          item.get('check', '') if item.get('comparator') in ('eq', 'ne', 'contains', 'not_contains') else '')}
+                      'actual': format_evidence(item.get('actual'), trace.secrets, item.get('check', ''), redact=True),
+                      'expected': format_evidence(item.get('expected'), trace.secrets,
+                          item.get('check', '') if item.get('comparator') in ('eq', 'ne', 'contains', 'not_contains') else '', redact=True)}
                      for item in items]
         add_failure_samples(failures, failure_keys, items)
 

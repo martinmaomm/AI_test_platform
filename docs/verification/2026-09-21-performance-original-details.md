@@ -38,3 +38,16 @@ cd .. && backend/.venv/bin/python backend/scripts/test_performance_validation_br
 固定运行模板已变化，节点源码、包版本、镜像标签和后端契约同步提升至 0.3.2；管理协议与快照协议仍为 2。旧节点可继续发送心跳，新平台在执行前明确提示升级，不放宽固定模板逐字节校验。
 
 改动在 `codex/validation-raw-details` 隔离工作树中完成。当前现场仍运行配套的 0.3.1 平台与节点，尚未切换；需要发布两种架构的 0.3.2 镜像、合入并切换本机平台发行目录，再升级空闲节点并重新验证。公共发布及现场节点升级完成前，不能将本机夹具验证视为现场生效。
+
+## 本地安装包准备
+
+功能提交为 `c3678b4`。通过已核实的本机 Colima Docker 端点构建 amd64、arm64 镜像；未修改其他容器。分别使用 `publish_performance_node_release.py --image ARCH=automation-platform-performance-node:0.3.2-ARCH --output backend/resource/performance-node-dockerhub-0.3.2` 生成本地归档，未传 `--registry` 或 `--publish-index`，没有执行公共推送。
+
+两种架构均通过非 root 镜像配置、隔离容器中的 Agent/Locust 版本和模板哈希校验、归档配置一致性及所有镜像层审计。归档与清单保存在 Git 忽略的 `backend/resource/performance-node-dockerhub-0.3.2/` 中。
+
+- Agent：0.3.2；Locust：2.43.3；协议：2。
+- 固定运行时 SHA-256：`a4c74ee52140e1e7a9c13abd71c8597d9e1dd8c173381200f19382492f9969ae`。
+- amd64：85,092,993 字节；归档 SHA-256 `f80ff20f8853fb2d8a7d63beb01c7ffbe268d85a270688a617408d9c0ab8c54e`。
+- arm64：84,366,220 字节；归档 SHA-256 `3a97bd129baae3fe771e18446b5435406200251ddaabe7b56cf3ca24fac111ca`。
+
+后续公共发行应复用上述已验证的镜像和归档，再进行匿名拉取、索引及平台入口验证。切换平台前确认无活动任务，保留现有 0.3.1 发行目录作为回退；升级远端节点时保留原身份卷，不重新注册。当前主工作区仍只保留原有三个未跟踪的浏览器 ZIP，本次未提交这些文件。

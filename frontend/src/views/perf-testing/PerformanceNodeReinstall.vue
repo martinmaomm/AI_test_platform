@@ -13,8 +13,7 @@
     </el-descriptions>
     <ol class="reinstall-steps">
       <li>
-        在 Docker 或 Unraid
-        中停止并删除旧节点容器。不必删除旧身份卷；新版确认正常后，旧镜像可按需清理。
+        在 Docker 中停止并删除旧节点容器。不必删除旧身份卷；新版确认正常后，旧镜像可按需清理。
       </li>
       <li>勾选确认后生成新版安装命令，复制到节点主机执行。</li>
     </ol>

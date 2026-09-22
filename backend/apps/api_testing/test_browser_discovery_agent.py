@@ -267,8 +267,12 @@ class BrowserDiscoveryAgentTests(SimpleTestCase):
         self.assertEqual(env['MCP_NETWORK_CAPTURE_DIR'], str(Path(self.temp.name).resolve()))
         self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_ORIGIN'], '0')
         self.assertEqual(env['MCP_NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS'], '0')
+        self.assertEqual(env['MCP_NETWORK_CAPTURE_ALL_HEADERS'], '0')
         self.assertNotIn('env', original['mcpServers']['playwright'])
         self.assertNotIn('MCP_NETWORK_CAPTURE', str(original))
+        full = prepare_capture_config(original, self.options['task_id'], self.options['trace_file'],
+                                      'https://api.example.test', {'capture_all_headers': True})
+        self.assertEqual(full['mcpServers']['playwright']['env']['MCP_NETWORK_CAPTURE_ALL_HEADERS'], '1')
 
     def test_unsupported_package_fails_without_silently_using_another_browser(self):
         with self.assertRaisesRegex(ValueError, '固定'):

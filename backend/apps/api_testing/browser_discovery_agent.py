@@ -303,6 +303,7 @@ def prepare_capture_config(
         'MCP_NETWORK_CAPTURE_MAX_BODY_BYTES': str(limits.get('max_body_bytes', 65536)),
         'MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES': str(limits.get('max_total_body_bytes', 10485760)),
         'MCP_NETWORK_CAPTURE_BODY_TIMEOUT_MS': str(limits.get('body_timeout_ms', 3000)),
+        'MCP_NETWORK_CAPTURE_ALL_HEADERS': '1' if limits.get('capture_all_headers') is True else '0',
     })
     return {'mcpServers': {'playwright': entry}}
 

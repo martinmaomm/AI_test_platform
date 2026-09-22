@@ -15,6 +15,7 @@ export const NETWORK_CAPTURE_BODY_TIMEOUT_MS_ENV = 'MCP_NETWORK_CAPTURE_BODY_TIM
 export const NETWORK_CAPTURE_AUTO_ORIGIN_ENV = 'MCP_NETWORK_CAPTURE_AUTO_ORIGIN';
 export const NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS_ENV = 'MCP_NETWORK_CAPTURE_AUTO_APPROVE_ORIGINS';
 export const NETWORK_CAPTURE_TARGET_URL_ENV = 'MCP_NETWORK_CAPTURE_TARGET_URL';
+export const NETWORK_CAPTURE_ALL_HEADERS_ENV = 'MCP_NETWORK_CAPTURE_ALL_HEADERS';
 
 const DEFAULT_LIMITS = Object.freeze({
   maxRequests: 500,
@@ -101,13 +102,15 @@ function safeUrl(value) {
   }
 }
 
-function headersForStorage(headers) {
+function headersForStorage(headers, captureAll = false) {
   const allowed = new Set(['content-type', 'content-length', 'accept', 'location']);
   const output = {};
   for (const [rawName, rawValue] of Object.entries(headers || {})) {
     const name = rawName.toLowerCase();
-    if (SENSITIVE_HEADERS.has(name) || !allowed.has(name)) continue;
-    output[name] = boundedString(rawValue).value;
+    if (!captureAll && (SENSITIVE_HEADERS.has(name) || !allowed.has(name))) continue;
+    // Full evidence is bounded by the task's total storage budget, not silently
+    // shortened per header (which would change signatures and long cookies).
+    output[name] = captureAll ? String(rawValue) : boundedString(rawValue).value;
   }
   return output;
 }
@@ -276,6 +279,7 @@ export function readNetworkCaptureConfig(env = process.env) {
     enabled: true,
     directory: requiredAbsoluteDirectory(env[NETWORK_CAPTURE_DIR_ENV], NETWORK_CAPTURE_DIR_ENV),
     allowedOrigins: parseAllowedOrigins(env[NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV]),
+    captureAllHeaders: env[NETWORK_CAPTURE_ALL_HEADERS_ENV] === '1',
     ...(targetUrl ? { targetOrigin: targetUrl.origin, targetHostname: targetUrl.hostname } : {}),
     limits: {
       maxRequests: positiveInteger(env[NETWORK_CAPTURE_MAX_REQUESTS_ENV], DEFAULT_LIMITS.maxRequests),
@@ -512,6 +516,7 @@ export class NetworkCapture {
   writeNetwork(event) { this.write(this.networkPath, event); }
 
   writeRawHeaders(requestId, direction, headers) {
+    if (this.config.captureAllHeaders) return; // Already retained in the task evidence.
     const authenticationHeaders = rawAuthenticationHeaders(headers);
     if (Object.keys(authenticationHeaders).length === 0) return;
     this.write(this.rawNetworkPath, {
@@ -817,7 +822,8 @@ export class NetworkCapture {
     Object.assign(base, {
       url: rawUrl.value, url_truncated: rawUrl.truncated,
       query: query.pairs, query_truncated: query.truncated,
-      request_headers: headersForStorage(headers),
+      request_headers: headersForStorage(headers, this.config.captureAllHeaders),
+      ...(this.config.captureAllHeaders ? { headers_complete: false } : {}),
       authentication_headers: authenticationHeadersForStorage(headers),
       capture_status: reason ? 'metadata_only' : 'pending',
       ...(reason ? { reason } : {}),
@@ -1080,9 +1086,24 @@ export class NetworkCapture {
       return;
     }
     const responseType = contentType(headers);
+    // Start these reads alongside the body, after origin/redirect checks. The
+    // synchronous headers() view can omit browser-added Cookie and other fields.
+    const completeHeaders = this.config.captureAllHeaders
+      ? Promise.all([request, response].map(async (message) => {
+        try {
+          const [all, entries] = await withTimeout(
+            Promise.all([message.allHeaders(), message.headersArray()]),
+            this.config.limits.bodyTimeoutMs,
+          );
+          return { headers: headersForStorage(all, true), entries, complete: true };
+        } catch {
+          return { complete: false };
+        }
+      }))
+      : null;
     const base = {
       event: 'response', request_id: data.requestId, status: response.status(), status_text: response.statusText(),
-      response_headers: headersForStorage(headers), capture_status: 'metadata_only',
+      response_headers: headersForStorage(headers, this.config.captureAllHeaders), capture_status: 'metadata_only',
       authentication_headers: data.authorized ? authenticationHeadersForStorage(headers) : [],
       redirect_from_request_id: this.requestData(request.redirectedFrom?.())?.requestId || null,
       redirect_to_request_id: this.requestData(request.redirectedTo?.())?.requestId || null,
@@ -1090,6 +1111,7 @@ export class NetworkCapture {
     this.writeRawHeaders(data.requestId, 'response', headers);
     const reason = excludedReason(data.resourceType, responseType);
     if (reason) {
+      await this.completeHeaders(data, base, completeHeaders);
       this.writeTerminal(data, { ...base, reason });
       return;
     }
@@ -1121,7 +1143,29 @@ export class NetworkCapture {
       // back to bounded post-read enforcement.
     }
     await this.captureRequestBody(request, data, observedRequestBytes);
+    await this.completeHeaders(data, base, completeHeaders);
     this.writeTerminal(data, { ...base, response_body_size: observedResponseBytes, ...result });
+  }
+
+  async completeHeaders(data, responseEvent, pending) {
+    if (!pending) return;
+    const [request, response] = await pending;
+    // Publish the enriched request before its terminal response so checkpoints
+    // never treat the partial synchronous header view as a complete sample.
+    this.writeNetwork({
+      event: 'request_headers', request_id: data.requestId,
+      headers_complete: request.complete,
+      ...(request.complete ? {
+        request_headers: request.headers, request_headers_array: request.entries,
+        authentication_headers: authenticationHeadersForStorage(request.headers),
+      } : {}),
+    });
+    responseEvent.headers_complete = response.complete;
+    if (response.complete) {
+      responseEvent.response_headers = response.headers;
+      responseEvent.response_headers_array = response.entries;
+      responseEvent.authentication_headers = authenticationHeadersForStorage(response.headers);
+    }
   }
 
   unresolvedExternalRedirect(requestUrl, headers) {

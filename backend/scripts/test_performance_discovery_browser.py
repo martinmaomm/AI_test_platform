@@ -38,8 +38,13 @@ def complete_capture(task):
                 'source_authorized': True, 'capture_complete': True,
                 'method': 'GET', 'path': '/items', 'origin': task.api_origin,
                 'observed_request': {'query': [{'name': 'keyword', 'value': keyword}],
-                                     'headers': {}, 'auth_hints': [], 'json': None, 'form': []},
-                'observed_response': {'headers': {}, 'auth_hints': [],
+                                     'url': f'{task.api_origin}/items?keyword={keyword}',
+                                     'headers': {'accept-language': 'zh-CN,zh;q=0.9', 'x-tenant-id': 'fixture-tenant',
+                                                 'cookie': 'session=fixture-cookie', 'host': 'fixture.invalid',
+                                                 'accept-encoding': 'gzip, zstd'},
+                                     'headers_complete': True, 'auth_hints': [], 'json': None, 'form': []},
+                'observed_response': {'headers': {'x-trace-id': 'fixture-trace'}, 'auth_hints': [],
+                                      'headers_array': [{'name': 'Set-Cookie', 'value': 'one=1'}, {'name': 'Set-Cookie', 'value': 'two=2'}],
                                       'body': {'items': [{'id': sequence, 'name': keyword}]}},
             },
         )
@@ -119,6 +124,12 @@ def verify(origin, fixture, output):
             expect(urls.nth(1)).to_contain_text('https://fixture.invalid/items?keyword=second-item')
             expect(group.locator('.sample-preview').first).not_to_be_visible()
             group.screenshot(path=str(output / 'sample-request-urls.png'), animations='disabled')
+            group.locator('.el-collapse-item__header').first.click()
+            expect(group.locator('.sample-preview').first).to_contain_text('zh-CN,zh;q=0.9')
+            expect(group.locator('.sample-preview').first).to_contain_text('session=fixture-cookie')
+            expect(group.locator('.sample-preview').first).to_contain_text('two=2')
+            group.screenshot(path=str(output / 'full-request-headers.png'), animations='disabled')
+            group.locator('.el-collapse-item__header').first.click()
             expect(group.get_by_role('checkbox')).to_have_count(2)
             group.locator('.el-checkbox').nth(0).click()
             group.locator('.el-checkbox').nth(1).click()
@@ -257,6 +268,12 @@ def verify(origin, fixture, output):
             assert [step['query']['keyword'] for step in plan['steps']] == ['first-item', 'second-item']
             assert len(plan['steps']) == 2
             assert plan['steps'][0]['assertions'][0]['expected'] == 200
+            for step in plan['steps']:
+                assert step['headers']['accept-language'] == 'zh-CN,zh;q=0.9'
+                assert step['headers']['x-tenant-id'] == 'fixture-tenant'
+                assert step['headers']['cookie'] == 'session=fixture-cookie'
+                assert 'host' not in step['headers']
+                assert 'accept-encoding' not in step['headers']
             page.reload()
             expect(editor).not_to_be_visible()
             assert not external, external

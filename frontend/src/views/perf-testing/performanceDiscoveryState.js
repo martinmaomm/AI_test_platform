@@ -44,8 +44,8 @@ export const buildPerformanceDiscoveryCreatePayload = (form) => ({
 });
 
 /**
- * `public_summary` is the server-redacted view intended for the UI.  Keep the
- * request variants visible without ever reconstructing a raw captured request.
+ * Display the project-authorized evidence supplied by the server, including
+ * ordered header entries so repeated response headers remain observable.
  */
 export const publicDiscoverySamplePreview = (record) => {
   const summary = record?.public_summary || {};
@@ -54,10 +54,15 @@ export const publicDiscoverySamplePreview = (record) => {
   return {
     query: request.query ?? [],
     headers: request.headers ?? {},
+    ...(request.headers_array ? { headers_array: request.headers_array } : {}),
+    ...(request.headers_complete !== undefined ? { headers_complete: request.headers_complete } : {}),
+    ...(request.body !== undefined ? { body: request.body } : {}),
     json: request.json,
     form: request.form,
     response: {
       headers: response.headers ?? {},
+      ...(response.headers_array ? { headers_array: response.headers_array } : {}),
+      ...(response.headers_complete !== undefined ? { headers_complete: response.headers_complete } : {}),
       body: response.body,
     },
   };
@@ -71,6 +76,8 @@ export const publicDiscoveryRequestUrl = (record) => {
   // Query and fragment text must never be recovered from a raw/legacy path.
   const pathname = path.split(/[?#]/, 1)[0];
   const summary = record?.public_summary || {};
+  const capturedUrl = summary.source_authorized === true ? summary.observed_request?.url : null;
+  if (typeof capturedUrl === "string" && origin(capturedUrl) === requestOrigin) return capturedUrl;
   const query = summary.source_authorized === false ? null : summary.observed_request?.query;
   const pairs = Array.isArray(query)
     ? query

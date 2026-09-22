@@ -357,22 +357,22 @@ def _redact(value: Any, *, key: str = '') -> Any:
     return str(value)[:4096]
 
 
-def _body_value(value: Any) -> Any:
+def _body_value(value: Any, *, retain_values: bool = False) -> Any:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except (TypeError, ValueError):
-            return value[:4096]
-    return _redact(value)
+            return value if retain_values else value[:4096]
+    return deepcopy(value) if retain_values else _redact(value)
 
 
-def _header_value(value: Any) -> dict[str, Any]:
+def _header_value(value: Any, *, retain_values: bool = False) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {
-        str(key): _redact(item, key=str(key))
+        str(key): deepcopy(item) if retain_values else _redact(item, key=str(key))
         for key, item in value.items()
-        if str(key).lower() in _SAFE_HEADER
+        if retain_values or str(key).lower() in _SAFE_HEADER
     }
 
 
@@ -428,7 +428,7 @@ def _body_read_diagnostic(value: Any) -> dict[str, str] | None:
 
 
 def sanitize_public_summary(value: Any) -> dict[str, Any]:
-    """Return a public-safe copy, including summaries stored before scheme hardening."""
+    """Normalize auth hints/diagnostics without changing the task's value policy."""
     if not isinstance(value, dict):
         return {}
     summary = deepcopy(value)
@@ -445,20 +445,23 @@ def sanitize_public_summary(value: Any) -> dict[str, Any]:
     return summary
 
 
-def _pairs(value: Any, fallback_query: str = '') -> list[dict[str, Any]]:
+def _pairs(value: Any, fallback_query: str = '', *, retain_values: bool = False) -> list[dict[str, Any]]:
     """Keep repeated query/form keys observable instead of collapsing to dict."""
+    def retained(item, name):
+        return deepcopy(item) if retain_values else _redact(item, key=name)
+
     if isinstance(value, dict):
-        return [{'name': str(name), 'value': _redact(item, key=str(name))} for name, item in value.items()]
+        return [{'name': str(name), 'value': retained(item, str(name))} for name, item in value.items()]
     if isinstance(value, list):
         pairs = []
         for item in value[:100]:
             if isinstance(item, dict) and isinstance(item.get('name'), str):
-                pairs.append({'name': item['name'], 'value': _redact(item.get('value'), key=item['name'])})
+                pairs.append({'name': item['name'], 'value': retained(item.get('value'), item['name'])})
             elif isinstance(item, (list, tuple)) and len(item) == 2:
-                pairs.append({'name': str(item[0]), 'value': _redact(item[1], key=str(item[0]))})
+                pairs.append({'name': str(item[0]), 'value': retained(item[1], str(item[0]))})
         return pairs
     if fallback_query:
-        return [{'name': name, 'value': _redact(item, key=name)} for name, item in parse_qsl(fallback_query, keep_blank_values=True)]
+        return [{'name': name, 'value': retained(item, name)} for name, item in parse_qsl(fallback_query, keep_blank_values=True)]
     return []
 
 
@@ -644,7 +647,9 @@ def _public_record(
         'body_read_error', 'network_failed', 'failed',
     )) or isinstance(raw.get('failure'), dict) or not isinstance(response.get('status'), int) or any(
         bool(body.get('truncated') or body.get('parse_error')) for body in (request_body.get('body'), response.get('body')) if isinstance(body, dict)
-    ) or any(request.get(flag) for flag in ('query_truncated', 'url_truncated', 'metadata_truncated'))
+    ) or any(request.get(flag) for flag in ('query_truncated', 'url_truncated', 'metadata_truncated')) or any(
+        part.get('headers_complete') is False for part in (request, response)
+    )
     declared_length = _header(request_headers, 'content-length')
     if declared_length.isdigit() and int(declared_length) > 0 and not request_body:
         incomplete = True
@@ -706,22 +711,37 @@ def _public_record(
     # A collector-unresolved origin is intentionally metadata-only.  It must
     # not disclose a query/body sample just because a trace line names it.
     if source_authorized:
+        # Performance samples are project-permission-protected execution
+        # evidence. Keep the user's captured values instead of changing the
+        # request semantics; API source publication keeps its existing policy.
+        retain_values = task.project.project_type == 'perf'
         request_body_value = request_body.get('body', {}).get('value') if isinstance(request_body.get('body'), dict) else None
         summary['observed_request'] = {
-            'query': _pairs(request.get('query'), parts.query if parts else ''),
-            'headers': _header_value(request_headers),
+            'query': _pairs(request.get('query'), parts.query if parts else '', retain_values=retain_values),
+            'headers': _header_value(request_headers, retain_values=retain_values),
             'auth_hints': _auth_hints(request.get('authentication_headers') or request_headers),
-            'json': _body_value(request_body_value if request_body_value is not None else _lookup(request, 'json', 'post_data_json')) if content_type_base == 'application/json' else None,
-            'form': _pairs(request_body_value if request_body_value is not None else _lookup(request, 'form', 'data', 'post_data')) if content_type_base == 'application/x-www-form-urlencoded' else None,
+            'json': _body_value(request_body_value if request_body_value is not None else _lookup(request, 'json', 'post_data_json'), retain_values=retain_values) if content_type_base == 'application/json' else None,
+            'form': _pairs(request_body_value if request_body_value is not None else _lookup(request, 'form', 'data', 'post_data'), retain_values=retain_values) if content_type_base == 'application/x-www-form-urlencoded' else None,
         }
         summary['observed_response'] = {
-            'headers': _header_value(response.get('response_headers') or response.get('headers')),
+            'headers': _header_value(response.get('response_headers') or response.get('headers'), retain_values=retain_values),
             'auth_hints': _auth_hints(response.get('authentication_headers')),
             'body': _body_value(
                 response.get('body', {}).get('value') if isinstance(response.get('body'), dict) and 'value' in response['body']
-                else _lookup(response, 'json', 'body')
+                else _lookup(response, 'json', 'body'), retain_values=retain_values,
             ),
         }
+        if retain_values:
+            summary['observed_request']['url'] = request_url
+            summary['observed_request']['body'] = deepcopy(request_body_value)
+            for part, observed_key, array_key in (
+                (request, 'observed_request', 'request_headers_array'),
+                (response, 'observed_response', 'response_headers_array'),
+            ):
+                if isinstance(part.get(array_key), list):
+                    summary[observed_key]['headers_array'] = deepcopy(part[array_key])
+                if 'headers_complete' in part:
+                    summary[observed_key]['headers_complete'] = part['headers_complete'] is True
     return {
         'task': task, 'sequence': sequence, 'request_id': summary['request_id'], 'captured_at': captured_at,
         'origin': origin, 'method': method, 'path': path, 'resource_type': resource_type,
@@ -777,7 +797,7 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
             if event == 'capture_limit':
                 over_limit += 1
                 continue
-            if event not in {'request', 'request_body', 'response', 'failure'} or not isinstance(request_id, str) or not request_id:
+            if event not in {'request', 'request_headers', 'request_body', 'response', 'failure'} or not isinstance(request_id, str) or not request_id:
                 invalid += 1
                 continue
             if event == 'request':
@@ -788,6 +808,11 @@ def ingest_trace(task: BrowserDiscoveryTask) -> dict[str, int]:
                 # A checkpoint may see only an append suffix after a process
                 # restart. It is safer to wait for its request line than to
                 # invent a request from a body/response event.
+                continue
+            if event == 'request_headers':
+                for key in ('request_headers', 'request_headers_array', 'authentication_headers', 'headers_complete'):
+                    if key in payload:
+                        item['request'][key] = payload[key]
                 continue
             if event == 'request_body':
                 item['request_body'] = payload

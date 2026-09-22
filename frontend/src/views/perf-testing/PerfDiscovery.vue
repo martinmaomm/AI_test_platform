@@ -146,7 +146,7 @@
           <p>
             相同方法/路径会分组，仍可按参数或请求体变体选择。导入仅生成未保存的性能计划草稿。
           </p>
-          <p class="preview-help">请求 URL 显示采集到的实际接口地址，查询参数沿用脱敏结果。</p>
+          <p class="preview-help">新探索保留实际请求 URL、完整请求头和响应头及已采集的参数、正文原值。历史样本中缺失的信息需要重新探索。</p>
           <div v-for="group in groups" :key="group.key" class="group">
             <strong>{{ group.method }} {{ group.path }}</strong
             ><el-checkbox-group v-model="selected"
@@ -181,7 +181,7 @@
                   候选依赖记录 ID：{{ record.dependency_record_ids.join("、") }}。确切数据依赖会自动纳入草稿；认证等不确定依赖需要人工确认。
                 </p>
                 <p v-else class="dependency-note">此样本没有已声明的前置请求依赖。</p>
-                <p class="preview-help">以下是服务端脱敏后的 query、请求体和响应摘要，可据此辨别同一路径的变体。</p>
+                <p class="preview-help">以下展示采集原值，重复响应头按原始列表保留。生成草稿时，Host、Content-Length 等传输字段交由执行客户端计算，其他请求头沿用样本。</p>
                 <pre class="sample-preview">{{ samplePreview(record) }}</pre>
               </el-collapse-item>
             </el-collapse>

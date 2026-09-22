@@ -191,6 +191,7 @@ def run_performance_browser_discovery_async(self, discovery_id: str, version: in
         trace_dir = task_trace_dir(task)
         trace_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         capture_limits = {
+            'capture_all_headers': True,
             'max_requests': task.limits['max_requests'],
             'max_body_bytes': task.limits['max_body_bytes'],
             'max_total_body_bytes': task.limits['max_total_bytes'],
@@ -348,13 +349,25 @@ def _request_from_record(
     query = _pairs_to_object(
         observed.get('query'), record_id=record.id, location='query', registry=registry, warnings=warnings,
     )
-    headers = _replace_redacted(
-        observed.get('headers') if isinstance(observed.get('headers'), dict) else {},
-        record_id=record.id, location='headers', registry=registry,
-    )
+    headers = deepcopy(observed.get('headers')) if isinstance(observed.get('headers'), dict) else {}
+    from .serializers import _FORBIDDEN_HEADERS
+    # Preserve every observed header in evidence, but let the HTTP client build
+    # framing and negotiate its supported compression for the rendered request.
+    managed = _FORBIDDEN_HEADERS | {'accept-encoding', 'keep-alive', 'te', 'trailer', 'upgrade'}
+    connection = next((str(value) for name, value in headers.items() if name.lower() == 'connection'), '')
+    managed |= {name.strip().lower() for name in connection.split(',') if name.strip()}
+    omitted = [name for name in headers if name.lower() in managed or name.startswith(':')]
+    for name in omitted:
+        del headers[name]
+    if omitted:
+        warnings.append(
+            f'记录 {record.id} 的 {", ".join(omitted)} 已完整保留在样本中；'
+            '这些传输请求头在执行时由 HTTP 客户端按实际目标、正文和压缩能力生成，不复制进草稿。'
+        )
+    headers = _replace_redacted(headers, record_id=record.id, location='headers', registry=registry)
     for hint in observed.get('auth_hints') if isinstance(observed.get('auth_hints'), list) else []:
         name = hint.get('name') if isinstance(hint, dict) else None
-        if not isinstance(name, str) or not _HTTP_HEADER_NAME.fullmatch(name):
+        if not isinstance(name, str) or not _HTTP_HEADER_NAME.fullmatch(name) or name.lower() in managed:
             continue
         if not any(str(existing).lower() == name.lower() for existing in headers):
             headers[name] = registry.add(

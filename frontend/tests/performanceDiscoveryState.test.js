@@ -57,6 +57,26 @@ test("sample preview retains server-public query, body and response variants", (
   assert.deepEqual(preview.response.body, { items: [] });
 });
 
+test("full performance evidence preserves URL encoding and repeated header entries", () => {
+  const url = "https://api.example.test/search?name=RIO%20%E9%85%92&empty=&tag=a&tag=b";
+  const cookies = [{ name: "Set-Cookie", value: "first=one" }, { name: "Set-Cookie", value: "second=two" }];
+  const record = {
+    origin: "https://api.example.test", path: "/search",
+    public_summary: {
+      source_authorized: true,
+      observed_request: { url, headers: { "accept-language": "zh-CN", cookie: "session=fixture" }, headers_complete: true },
+      observed_response: { headers_array: cookies, headers_complete: true, body: { total: 1 } },
+    },
+  };
+  assert.equal(publicDiscoveryRequestUrl(record), url);
+  const preview = publicDiscoverySamplePreview(record);
+  assert.equal(preview.headers["accept-language"], "zh-CN");
+  assert.equal(preview.headers.cookie, "session=fixture");
+  assert.deepEqual(preview.response.headers_array, cookies);
+  record.public_summary.source_authorized = false;
+  assert.equal(publicDiscoveryRequestUrl(record), "https://api.example.test/search");
+});
+
 test("capture failure distinguishes classified errors from missing historic diagnostics", () => {
   assert.match(discoveryCaptureIssue({ public_summary: {
     capture_reason: "body_read_failed",

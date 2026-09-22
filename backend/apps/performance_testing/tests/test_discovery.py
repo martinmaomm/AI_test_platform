@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from copy import deepcopy
 from pathlib import Path
 import tempfile
@@ -18,6 +19,7 @@ from api_testing.models import (
     BrowserDiscoveryRecord,
     BrowserDiscoveryTask,
 )
+from api_testing.browser_discovery import ingest_trace, task_trace_file
 from performance_testing.discovery import (
     _claim_performance_discovery,
     clone_retry_task,
@@ -647,9 +649,85 @@ class PerformanceDiscoveryAPITests(TestCase):
         self.assertEqual(options['target_url'], queued.target_url)
         self.assertEqual(options['api_origin'], queued.api_origin)
         self.assertIs(options['auto_approve_origins'], True)
+        self.assertIs(options['capture_limits']['capture_all_headers'], True)
         self.assertTrue(callable(options['checkpoint']))
         self.assertTrue(callable(options['is_cancelled']))
         finish.assert_called_once()
+
+    def test_full_browser_evidence_survives_ingest_preview_and_draft(self):
+        task = self.task(status=BrowserDiscoveryTask.Status.COMPLETED)
+        headers = {
+            'accept-language': 'zh-CN,zh;q=0.9', 'origin': 'https://shop.example.test',
+            'referer': 'https://shop.example.test/page', 'user-agent': 'fixture browser',
+            'x-tenant-id': 'fixture-tenant', 'x-custom-routing': 'blue',
+            'authorization': 'Bearer fixture-token', 'cookie': 'session=fixture-cookie',
+            'host': 'api.example.test', 'content-length': '29',
+            'connection': 'keep-alive, x-hop', 'x-hop': 'connection-only',
+            'proxy-authorization': 'fixture-proxy', 'accept-encoding': 'gzip, zstd',
+            'content-type': 'application/json',
+        }
+        entries = [{'name': name, 'value': value} for name, value in headers.items()]
+        response_entries = [
+            {'name': 'Set-Cookie', 'value': 'one=1; Path=/'},
+            {'name': 'Set-Cookie', 'value': 'two=2; Path=/'},
+        ]
+        events = [
+            {'event': 'request', 'request_sequence': 1, 'url': task.api_origin + '/search?token=fixture-query',
+             'method': 'POST', 'resource_type': 'fetch', 'headers_complete': False,
+             'request_headers': {'content-type': 'application/json'}, 'capture_status': 'pending'},
+            {'event': 'request_headers', 'request_headers': headers, 'request_headers_array': entries,
+             'headers_complete': True},
+            {'event': 'request_body', 'capture_status': 'captured',
+             'body': {'kind': 'json', 'value': {'password': 'fixture-password'}, 'bytes': 29}},
+            {'event': 'response', 'status': 200, 'capture_status': 'captured', 'headers_complete': True,
+             'response_headers': {'set-cookie': 'one=1; Path=/\ntwo=2; Path=/', 'x-trace-id': 'trace-fixture'},
+             'response_headers_array': response_entries,
+             'body': {'value': {'total': 1, 'access_token': 'fixture-response-token'}, 'bytes': 55}},
+        ]
+        with tempfile.TemporaryDirectory() as directory, override_settings(MEDIA_ROOT=directory):
+            trace = task_trace_file(task)
+            trace.parent.mkdir(parents=True, exist_ok=True)
+            trace.write_text('\n'.join(json.dumps({'protocol_version': 1, 'request_id': 'full', **event}) for event in events) + '\n', encoding='utf-8')
+            self.assertEqual(ingest_trace(task)['ingested'], 1)
+        record = task.records.get()
+        self.assertTrue(record.is_eligible)
+        observed = record.public_summary['observed_request']
+        self.assertEqual(observed['headers'], headers)
+        self.assertEqual(observed['headers_array'], entries)
+        self.assertEqual(observed['query'], [{'name': 'token', 'value': 'fixture-query'}])
+        self.assertEqual(observed['json'], {'password': 'fixture-password'})
+        self.assertEqual(record.public_summary['observed_response']['headers_array'], response_entries)
+        self.assertEqual(record.public_summary['observed_response']['body']['access_token'], 'fixture-response-token')
+        self.auth()
+        preview = self.client.get(self.path(f'tasks/{task.id}/records/'))
+        self.assertEqual(preview.data['data']['items'][0]['public_summary']['observed_request']['headers'], headers)
+        reply = self.client.post(self.path(f'tasks/{task.id}/draft/'), {
+            'version': task.version, 'record_ids': [record.id], 'target_id': self.target.id,
+        }, format='json')
+        self.assertEqual(reply.status_code, 200, reply.data)
+        step = reply.data['data']['draft']['steps'][0]
+        expected = {name: value for name, value in headers.items() if name not in {
+            'host', 'content-length', 'connection', 'x-hop', 'proxy-authorization', 'accept-encoding',
+        }}
+        self.assertEqual(step['headers'], expected)
+        self.assertEqual(step['body'], {'password': 'fixture-password'})
+        self.assertEqual(reply.data['data']['source']['required_variables'], [])
+        self.assertTrue(any('HTTP 客户端' in warning for warning in reply.data['data']['warnings']))
+
+    def test_incomplete_full_headers_cannot_be_imported_as_complete_evidence(self):
+        from api_testing.browser_discovery import _public_record
+
+        task = self.task()
+        for part in ('request', 'response'):
+            with self.subTest(part=part):
+                raw = {
+                    'request': {'url': task.api_origin + '/items', 'method': 'GET', 'resource_type': 'fetch'},
+                    'response': {'status': 200, 'body': {'value': {'total': 1}}},
+                }
+                raw[part]['headers_complete'] = False
+                row = _public_record(task, raw, sequence=1, raw_line=1, resolved_origins={task.api_origin})
+                self.assertFalse(row['is_eligible'])
+                self.assertEqual(row['exclusion_reason'], 'capture_incomplete')
 
     def test_retry_preserves_explicit_manual_origin_confirmation_setting(self):
         original = self.task(status=BrowserDiscoveryTask.Status.FAILED)

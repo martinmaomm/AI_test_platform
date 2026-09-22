@@ -16,6 +16,7 @@ import {
   NETWORK_CAPTURE_DIR_ENV,
   NETWORK_CAPTURE_ENV,
   NETWORK_CAPTURE_TARGET_URL_ENV,
+  NETWORK_CAPTURE_ALL_HEADERS_ENV,
   NetworkCapture,
   authenticationHeadersForStorage,
   installChromiumDurableResponseRetention,
@@ -155,6 +156,98 @@ function readJsonLines(filePath) {
 
 test('capture is disabled unless the task switch is exactly enabled', () => {
   assert.deepEqual(readNetworkCaptureConfig({}), { enabled: false });
+});
+
+test('real Chrome full capture retains sent cookies, custom headers and repeated response headers', { timeout: 60000 }, async (t) => {
+  if (!fs.existsSync(chromePath)) return t.skip('Google Chrome is unavailable');
+  let packageRoot;
+  try { packageRoot = resolvePlaywrightMcpPackageRoot(); }
+  catch { return t.skip('the pinned Playwright MCP package is unavailable'); }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-full-headers-'));
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ url: req.url, headers: req.headers });
+    if (req.url === '/') return response(res, 200, 'text/html', '<body>fixture</body>');
+    if (req.url !== '/search') return response(res, 204, 'text/plain', '');
+    response(res, 200, 'application/json', JSON.stringify({ total: req.headers['accept-language']?.startsWith('zh-CN') ? 1 : 0 }), {
+      'set-cookie': ['first=one; Path=/; HttpOnly', 'second=two; Path=/'],
+      'x-response-custom': 'retained-response',
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let browser;
+  try {
+    const config = readNetworkCaptureConfig({
+      [NETWORK_CAPTURE_ENV]: '1', [NETWORK_CAPTURE_DIR_ENV]: root,
+      [NETWORK_CAPTURE_ALLOWED_ORIGINS_ENV]: origin, [NETWORK_CAPTURE_ALL_HEADERS_ENV]: '1',
+      MCP_NETWORK_CAPTURE_MAX_TOTAL_BODY_BYTES: '262144',
+    });
+    assert.equal(config.captureAllHeaders, true);
+    const capture = new NetworkCapture(config);
+    const playwright = createRequire(path.join(packageRoot, 'package.json'))('playwright');
+    browser = await playwright.chromium.launch({ executablePath: chromePath, headless: true });
+    capture.attachBrowser(browser);
+    const context = await browser.newContext({ locale: 'zh-CN' });
+    await context.addCookies([{ name: 'session', value: 'fixture-cookie', url: origin, httpOnly: true }]);
+    const page = await context.newPage();
+    await page.goto(origin);
+    await page.evaluate(async () => {
+      const reply = await fetch('/search', { headers: {
+        authorization: 'Bearer fixture-token', 'x-tenant-id': 'fixture-tenant',
+        'x-custom-long': 'x'.repeat(5000),
+      } });
+      return reply.json();
+    });
+    await capture.flushPendingTerminals({ markUnfinished: false });
+    const events = readJsonLines(path.join(root, 'network.jsonl'));
+    const request = events.find((item) => item.event === 'request' && item.path === '/search');
+    const full = events.find((item) => item.event === 'request_headers' && item.request_id === request.request_id);
+    const terminal = events.find((item) => item.event === 'response' && item.request_id === request.request_id);
+    assert.equal(full.headers_complete, true);
+    assert.deepEqual(full.request_headers, seen.find((item) => item.url === '/search').headers);
+    assert.equal(full.request_headers.cookie, 'session=fixture-cookie');
+    assert.equal(full.request_headers['x-custom-long'].length, 5000);
+    assert.equal(full.request_headers.authorization, 'Bearer fixture-token');
+    assert.equal(terminal.headers_complete, true);
+    assert.equal(terminal.body.value.total, 1);
+    assert.equal(terminal.response_headers['x-response-custom'], 'retained-response');
+    assert.deepEqual(terminal.response_headers_array.filter((item) => item.name.toLowerCase() === 'set-cookie').map((item) => item.value),
+      ['first=one; Path=/; HttpOnly', 'second=two; Path=/']);
+    assert.equal(fs.statSync(path.join(root, 'network.jsonl')).mode & 0o777, 0o600);
+  } finally {
+    await browser?.close();
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('full header read failure remains explicitly incomplete without error details', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'automation-header-failure-'));
+  try {
+    const origin = 'http://fixture.test';
+    const capture = new NetworkCapture({ directory: root, allowedOrigins: new Set([origin]), captureAllHeaders: true,
+      limits: { maxRequests: 10, maxBodyBytes: 1024, maxTotalBodyBytes: 8192, bodyTimeoutMs: 100 } });
+    const unavailable = async () => { throw new Error('private-fixture-header-error'); };
+    const request = fakeRequest({ url: origin + '/items', page: fakePage(origin) });
+    Object.assign(request, {
+      allHeaders: unavailable, headersArray: unavailable,
+      sizes: async () => ({ responseBodySize: 2, requestBodySize: 0 }),
+      response: async () => ({
+        status: () => 200, statusText: () => 'OK',
+        headers: () => ({ 'content-type': 'application/json' }),
+        allHeaders: unavailable, headersArray: unavailable, body: async () => Buffer.from('{}'),
+      }),
+    });
+    capture.recordRequest(request);
+    await capture.onRequestFinished(request);
+    const events = readJsonLines(path.join(root, 'network.jsonl'));
+    const entry = events.find((item) => item.event === 'request_headers');
+    assert.equal(entry.headers_complete, false);
+    assert.equal(entry.request_headers, undefined);
+    assert.equal(events.find((item) => item.event === 'response').headers_complete, false);
+    assert.doesNotMatch(JSON.stringify(events), /private-fixture-header-error/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('unsupported durable retention preserves browser initialization and emits only a safe diagnostic', async () => {
@@ -724,7 +817,7 @@ test('real Chrome 307 cross-origin redirect is sent but retained as redacted met
     const requireFromPackage = createRequire(path.join(packageRoot, 'package.json'));
     const playwright = requireFromPackage('playwright');
     const capture = new NetworkCapture({
-      directory: tempRoot, allowedOrigins: new Set(), autoOrigin: true,
+      directory: tempRoot, allowedOrigins: new Set(), autoOrigin: true, captureAllHeaders: true,
       targetOrigin: fixture.origin, targetHostname: '127.0.0.1',
       limits: { maxRequests: 100, maxBodyBytes: 8192, maxTotalBodyBytes: 65536, bodyTimeoutMs: 1000 },
     });
@@ -892,7 +985,7 @@ test('real Chrome preserves login JSON across immediate reload, navigation and p
           const context = await browser.newContext();
           try {
             const capture = new NetworkCapture({
-              directory: root, allowedOrigins: new Set(), autoOrigin: true, autoApproveOrigins: true,
+              directory: root, allowedOrigins: new Set(), autoOrigin: true, autoApproveOrigins: true, captureAllHeaders: true,
               targetOrigin: origin, targetHostname: '127.0.0.1',
               limits,
             });
@@ -927,6 +1020,9 @@ test('real Chrome preserves login JSON across immediate reload, navigation and p
             assert.ok(login, `${run}: login request recorded`);
             assert.equal(terminals.length, 1, `${run}: exactly one terminal`);
             assert.equal(terminals[0].capture_status, 'captured', `${run}: ${JSON.stringify(terminals[0].body_read_diagnostic)}`);
+            assert.equal(terminals[0].headers_complete, true, run);
+            const headerEvent = readJsonLines(path.join(root, 'network.jsonl')).find((item) => item.event === 'request_headers' && item.request_id === login.request_id);
+            assert.equal(headerEvent?.headers_complete, true, run);
             assert.deepEqual(terminals[0].body.value, { ok: true, run });
             const requestBody = readJsonLines(path.join(root, 'network.jsonl')).find((event) => event.event === 'request_body' && event.request_id === login.request_id);
             assert.equal(requestBody?.capture_status, 'captured');

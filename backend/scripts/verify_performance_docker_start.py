@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 LABEL = 'com.automation-platform.acceptance'
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'performance-node/src'))
-from performance_node import __version__
+from performance_node import PROTOCOL_VERSION, __version__
 
 
 def certificates(root):
@@ -113,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(413, {})
             return
         payload = json.loads(self.rfile.read(size))
-        common = {'protocol_version': 2, 'heartbeat_interval_seconds': 1,
+        common = {'protocol_version': PROTOCOL_VERSION, 'heartbeat_interval_seconds': 1,
                   'lease_seconds': 15, 'execution_enabled': False}
         if self.path == '/api/v1/performance-agent/enroll/':
             supplied = payload.get('enrollment_token', '')

@@ -31,7 +31,11 @@ logger = logging.getLogger(__name__)
 ACTIVE = ('preparing', 'running', 'stopping')
 TERMINAL = ('completed', 'failed', 'cancelled', 'incomplete')
 LEASE_SECONDS = 15
-REAP_SECONDS = 25
+REAP_SECONDS = 30
+SHUTDOWN_SECONDS = 30
+# A delivered renewal may arrive after the DB transaction commits. Heartbeat
+# transport is bounded; leave time for delivery, lease expiry and SIGKILL.
+LEASE_RECLAIM_SECONDS = LEASE_SECONDS + 15 + 5 + 5
 
 
 class ControllerLeaseLost(RuntimeError):
@@ -55,7 +59,7 @@ def bounded_validation_steps(value, snapshot=None):
 
 def bounded_metrics(metrics, snapshot=None, mode=None):
     """Defend the reporting database even if a local engine file is malformed."""
-    result = dict(metrics)
+    result = {key: value for key, value in metrics.items() if key != 'nodes'}
     samples = result.get('failure_samples')
     normalized = []
     required = {
@@ -64,7 +68,7 @@ def bounded_metrics(metrics, snapshot=None, mode=None):
     }
     if isinstance(samples, list):
         for sample in samples[:MAX_FAILURE_SAMPLES]:
-            if not isinstance(sample, dict) or set(sample) != required:
+            if not isinstance(sample, dict) or set(sample) not in (required, required | {'node_id'}):
                 continue
             normalized.append({
                 'step_index': sample['step_index'] if type(sample['step_index']) is int else 0,
@@ -77,6 +81,8 @@ def bounded_metrics(metrics, snapshot=None, mode=None):
                 'error_type': str(sample['error_type'])[:64],
                 'message': str(sample['message'])[:500],
             })
+            if sample.get('node_id') in {item['node_id'] for item in (snapshot or {}).get('nodes', [])}:
+                normalized[-1]['node_id'] = sample['node_id']
     result['failure_samples'] = normalized
     details = result.pop('validation_steps', None)
     if mode != 'load' and isinstance(details, list):
@@ -119,6 +125,7 @@ class PerformanceController:
         self.shutting_down = False
         self.orphan = False
         self.last_sample = 0
+        self.stopping_since = None
 
     def claim(self):
         if not self.config.enabled:
@@ -138,18 +145,42 @@ class PerformanceController:
             state.heartbeat_at = now
             state.lease_until = now + timedelta(seconds=LEASE_SECONDS)
             state.save()
-            old = PerformanceRun.objects.filter(status__in=ACTIVE).order_by('created_at').first()
+            old = PerformanceRun.objects.select_for_update().filter(status__in=ACTIVE).order_by('created_at').first()
             if old:
                 self.current = old.pk
                 self.orphan = True
                 self.reaping_since = time.monotonic()
-                self.pending_result = ('incomplete', 'controller_restarted', '控制器重启，旧运行已停止，未自动重跑')
+                status = 'incomplete' if old.started_at else 'failed'
+                self.pending_result = self._terminal_result(old, status, 'controller_restarted',
+                                                           '控制器重启，旧运行已停止，未自动重跑')
                 old.status = 'stopping'
-                old.node_command = {'type': 'stop', 'run_id': str(old.pk), 'reason': '控制器重启'}
-                old.save(update_fields=['status', 'node_command'])
+                old.reason_code, old.reason = self.pending_result[1:]
+                old.latest_metrics = {**old.latest_metrics, 'complete': False}
+                old.save(update_fields=['status', 'reason_code', 'reason', 'latest_metrics'])
+                self._stop_members(old, '控制器重启')
                 state.current_run = old
                 state.save(update_fields=['current_run'])
         return True
+
+    @staticmethod
+    def _terminal_result(run, status, code, reason):
+        # All callers hold the parent Run lock. First persisted cause wins;
+        # clocks on different nodes are not used to order termination events.
+        if run.reason_code:
+            if run.reason_code == 'cancelled':
+                status = 'cancelled'
+            elif status in ('completed', 'cancelled'):
+                status = 'incomplete' if run.started_at else 'failed'
+            return status, run.reason_code, run.reason
+        return status, code, str(reason)[:500]
+
+    @staticmethod
+    def _stop_members(run, reason):
+        for member in run.participants.select_for_update().order_by('node_id'):
+            member.node_command = {'type': 'stop', 'run_id': str(run.pk), 'reason': str(reason)[:500]}
+            if member.status not in ('stopped', 'failed', 'lost'):
+                member.status = 'stopping'
+            member.save(update_fields=['node_command', 'status'])
 
     def renew(self):
         now = timezone.now()
@@ -195,7 +226,7 @@ class PerformanceController:
                 logger.exception('性能运行准备失败，run_id=%s', run.pk)
                 self.begin_reap('failed', 'prepare_failed', '准备压测进程或 TLS 失败，请检查控制器日志')
             return
-        run = PerformanceRun.objects.select_related('node').get(pk=self.current)
+        run = PerformanceRun.objects.get(pk=self.current)
         if self.reaping_since is not None:
             self.reap(run)
             return
@@ -206,42 +237,87 @@ class PerformanceController:
         metrics = read_json(self.directory / 'metrics.json')
         if metrics:
             self.record_metrics(run, metrics)
+            run.refresh_from_db()
         done = read_json(self.directory / 'complete.json')
         result = read_json(self.directory / 'supervisor-result.json')
+        exited = result is not None or (self.process and self.process.poll() is not None)
+        if done is None and exited:
+            # complete.json is atomically written before exit. It can appear
+            # between our first file read and process.poll(); recover that tail.
+            self.stop_process()
+            done = read_json(self.directory / 'complete.json')
         if done is not None:
+            if isinstance(done.get('metrics'), dict):
+                self.record_metrics(run, done['metrics'])
+                run.refresh_from_db()
             if done.get('complete'):
                 cancelled = run.stop_requested_at is not None or done.get('reason') == 'cancelled'
                 self.begin_reap('cancelled' if cancelled else 'completed', '',
                                 '已手动停止' if cancelled else '压测执行完成')
             else:
-                status = 'cancelled' if done.get('reason') == 'cancelled' and not run.started_at else 'incomplete'
+                status = ('cancelled' if done.get('reason') == 'cancelled' or run.reason_code == 'cancelled'
+                          else 'incomplete' if run.started_at else 'failed')
                 self.begin_reap(status, done.get('reason', 'missing_final_metrics'), '运行结束但最终统计不完整')
             return
-        if result is not None or (self.process and self.process.poll() is not None):
+        if exited:
             self.begin_reap('incomplete' if run.started_at else 'failed', 'engine_exited', '执行进程异常结束，未收到完整最终统计')
             return
-        if run.node.revoked_at or not run.node.agent_token_digest or run.node.status_at() != 'online':
-            identity_changed = run.reason_code == 'node_revoked'
-            self.begin_reap('incomplete' if run.started_at else 'failed',
-                            run.reason_code if identity_changed else 'node_unavailable',
-                            run.reason if identity_changed else '节点已离线或身份已失效，运行已停止')
-            return
-        if run.node_report.get('state') == 'failed':
-            self.begin_reap('incomplete' if run.started_at else 'failed', 'node_execution_failed', run.node_report.get('reason') or '节点准备或执行失败')
-            return
+        members = list(run.participants.select_related('node').order_by('node_id'))
+        for member in members:
+            node = member.node
+            if node.revoked_at or not node.agent_token_digest or node.status_at() != 'online':
+                self.begin_reap('incomplete' if run.started_at else 'failed',
+                                'node_unavailable', f'节点 {member.node_name or node.name} 已离线或身份已失效')
+                return
+            if member.node_report.get('state') == 'failed':
+                self.begin_reap('incomplete' if run.started_at else 'failed', 'node_execution_failed',
+                                f'节点 {member.node_name or node.name}：{member.node_report.get("reason") or "准备或执行失败"}')
+                return
         if run.status == 'stopping' or run.stop_requested_at:
             touch_lease(self.directory / 'start.stop')
+            if self.stopping_since is None:
+                self.stopping_since = time.monotonic()
+            elif time.monotonic() - self.stopping_since > SHUTDOWN_SECONDS + 5:
+                self.begin_reap('cancelled' if run.reason_code == 'cancelled' else 'incomplete',
+                                'shutdown_timeout', '收尾超时，未收到全部最终统计')
             return
-        if run.node_report.get('state') in ('ready', 'running') and metrics and metrics.get('admitted_workers') == 1:
-            touch_lease(self.directory / 'start')
+        expected = {str(member.node_id) for member in members}
+        admitted = set(metrics.get('admitted_node_ids', [])) if metrics else set()
+        if expected and admitted == expected and all(
+                member.node_report.get('state') in ('ready', 'running') for member in members):
+            with self.owned_run(run.pk) as (_, locked):
+                # A heartbeat can report failure between the outer read and
+                # acquiring Run. Re-read here, in the same ordering as reports.
+                current_members = list(locked.participants.select_related('node').order_by('node_id'))
+                frozen_ids = {item['node_id'] for item in locked.snapshot.get('nodes', [])}
+                current_ids = {str(member.node_id) for member in current_members}
+                ready = bool(current_ids and current_ids == frozen_ids == admitted and all(
+                    member.node_report.get('state') in ('ready', 'running')
+                    and member.node.status_at() == 'online' and not member.node.revoked_at
+                    and member.node.agent_token_digest
+                    for member in current_members))
+                if locked.status == 'preparing' and not locked.stop_requested_at and not locked.reason_code and ready:
+                    touch_lease(self.directory / 'start')
 
     def prepare(self, run):
         run.refresh_from_db()
-        if run.node.status_at() != 'online' or run.node.revoked_at:
-            raise ValueError('节点已离线')
+        from .run_services import _node_is_compatible
+        members = list(run.participants.select_related('node').order_by('node_id'))
+        if not members or any(not _node_is_compatible(member.node, timezone.now()) for member in members):
+            raise ValueError('参与节点已离线、身份失效或需要升级')
         validate_snapshot(run.snapshot)
         if canonical_sha256(run.snapshot) != run.snapshot_sha256:
             raise ValueError('运行快照摘要不符')
+        frozen = {item['node_id']: item for item in run.snapshot['nodes']}
+        if set(frozen) != {str(member.node_id) for member in members}:
+            raise ValueError('参与节点集合与快照不符')
+        for member in members:
+            if (member.assigned_users != frozen[str(member.node_id)]['users']
+                    or member.validation_key != frozen[str(member.node_id)]['validation_key']
+                    or member.node_agent_version != member.node.agent_version
+                    or member.node_protocol_version != member.node.protocol_version
+                    or member.node_engine_version != member.node.engine_version):
+                raise ValueError('参与节点能力或分配已变化，请重新验证并创建运行')
         # Re-check target approval after queueing; never mutate the frozen snapshot.
         if run.plan_id:
             target = run.plan.target
@@ -249,14 +325,14 @@ class PerformanceController:
                 raise ValueError('目标批准范围已变化')
         self.directory = self.config.root / str(run.pk)
         self.directory.mkdir(mode=0o700, exist_ok=False)
-        credentials = create_run_certificates(self.directory, self.config.server_name, run.pk, run.node_id)
+        credentials = create_run_certificates(self.directory, self.config.server_name, run.pk, frozen)
         with socket.socket() as available:
             available.bind(('127.0.0.1', 0))
             raw_port = available.getsockname()[1]
-        handshake = secrets.token_urlsafe(32)
+        handshakes = {node_id: secrets.token_urlsafe(32) for node_id in frozen}
         script = (NODE_SOURCE / 'performance_node/locust_runtime.py').read_text(encoding='utf-8')
         private_write(self.directory / 'engine.py', script)
-        private_write(self.directory / 'run.json', json.dumps({'snapshot': run.snapshot, 'handshake_token': handshake}, ensure_ascii=False))
+        private_write(self.directory / 'run.json', json.dumps({'snapshot': run.snapshot, 'handshake_tokens': handshakes}, ensure_ascii=False))
         bind = f'[{self.config.bind_host}]' if ':' in self.config.bind_host else self.config.bind_host
         private_write(self.directory / 'stunnel.conf',
                       'foreground = yes\npid =\nsyslog = no\ndebug = warning\n[rpc]\n'
@@ -264,7 +340,7 @@ class PerformanceController:
                       f'cert = {self.directory / "server.pem"}\nkey = {self.directory / "server.key"}\n'
                       f'CAfile = {self.directory / "ca.pem"}\nverifyChain = yes\nrequireCert = yes\n'
                       'sslVersionMin = TLSv1.2\nTIMEOUTclose = 0\n')
-        max_seconds = run.snapshot['duration_seconds'] + 75
+        max_seconds = run.snapshot['duration_seconds'] + 120
         engine_argv = [sys.executable, str(self.directory / 'engine.py'), '--role', 'master', '--config', str(self.directory / 'run.json'),
                        '--master-host', '127.0.0.1', '--master-port', str(raw_port), '--start-file', str(self.directory / 'start'),
                        '--metrics-file', str(self.directory / 'metrics.json'), '--complete-file', str(self.directory / 'complete.json')]
@@ -275,73 +351,144 @@ class PerformanceController:
             'max_seconds': max_seconds, 'result_file': str(self.directory / 'supervisor-result.json')}
         private_write(self.directory / 'supervisor.json', json.dumps(supervisor))
         touch_lease(self.directory / 'lease')
-        with (self.directory / 'supervisor.log').open('ab') as output:
-            self.process = subprocess.Popen([sys.executable, '-m', 'performance_node.process_supervisor', str(self.directory / 'supervisor.json')],
-                                            cwd=self.directory, env=child_environment(), stdin=subprocess.DEVNULL,
-                                            stdout=output, stderr=output, start_new_session=True)
-        command = {'type': 'prepare', 'run_id': str(run.pk), 'snapshot': run.snapshot, 'snapshot_sha256': run.snapshot_sha256,
-                   'script_source': script, 'script_sha256': hashlib.sha256(script.encode()).hexdigest(), 'lease_seconds': LEASE_SECONDS,
-                   'max_seconds': max_seconds, 'handshake_token': handshake,
-                   'tls': {**credentials, 'host': self.config.public_host, 'port': self.config.port, 'server_name': self.config.server_name}}
         with self.owned_run(run.pk) as (_, locked):
-            if locked.status not in ACTIVE:
+            if locked.status != 'preparing' or locked.stop_requested_at or locked.reason_code:
                 raise RuntimeError('运行已终止，禁止下发准备指令')
-            if locked.reason_code == 'node_revoked':
-                return  # Revocation wins over a concurrently finishing prepare.
-            locked.node_command = command
-            locked.save(update_fields=['node_command'])
+            # Revalidate after certificate generation, while the parent lock
+            # serializes revocation/stop. Do not lock Nodes in reverse order.
+            for member in locked.participants.select_related('node').order_by('node_id'):
+                if not _node_is_compatible(member.node, timezone.now()):
+                    raise ValueError('准备期间节点资格发生变化')
+            with (self.directory / 'supervisor.log').open('ab') as output:
+                self.process = subprocess.Popen([sys.executable, '-m', 'performance_node.process_supervisor', str(self.directory / 'supervisor.json')],
+                                                cwd=self.directory, env=child_environment(), stdin=subprocess.DEVNULL,
+                                                stdout=output, stderr=output, start_new_session=True)
+            for member in locked.participants.select_for_update().order_by('node_id'):
+                node_id = str(member.node_id)
+                member.node_command = {
+                    'type': 'prepare', 'run_id': str(run.pk), 'node_id': node_id,
+                    'snapshot': run.snapshot, 'snapshot_sha256': run.snapshot_sha256,
+                    'script_source': script, 'script_sha256': hashlib.sha256(script.encode()).hexdigest(),
+                    'lease_seconds': LEASE_SECONDS, 'max_seconds': max_seconds,
+                    'handshake_token': handshakes[node_id],
+                    'tls': {**credentials[node_id], 'host': self.config.public_host,
+                            'port': self.config.port, 'server_name': self.config.server_name},
+                }
+                member.status = 'preparing'
+                member.save(update_fields=['node_command', 'status'])
 
     def record_metrics(self, run, metrics):
         if not isinstance(metrics, dict) or type(metrics.get('requests')) is not int:
             return
+        node_metrics = metrics.get('nodes', {})
         metrics = bounded_metrics(metrics, run.snapshot, run.mode)
         with self.owned_run(run.pk) as (_, locked):
             if locked.status in ACTIVE:
-                self._record_metrics(locked, metrics)
+                self._record_metrics(locked, metrics, node_metrics)
 
-    def _record_metrics(self, run, metrics):
+    def _record_metrics(self, run, metrics, node_metrics=None):
         history = list(run.metrics_samples or [])
-        if time.monotonic() - self.last_sample >= 2 or metrics.get('complete'):
+        sample_due = time.monotonic() - self.last_sample >= 2 or metrics.get('complete')
+        now = timezone.now()
+        if sample_due:
             history.append({'timestamp': timezone.now().isoformat(),
                             'metrics': {key: value for key, value in metrics.items() if key != 'validation_steps'}})
             history = history[-400:]
             self.last_sample = time.monotonic()
         updates = {'latest_metrics': metrics, 'metrics_samples': history}
         if metrics.get('started') and not run.started_at:
-            updates['started_at'] = timezone.now()
+            updates['started_at'] = now
         if metrics.get('started') and run.status == 'preparing':
             # Do not overwrite a concurrent user's stop request.
             PerformanceRun.objects.filter(pk=run.pk, status='preparing').update(status='running')
         PerformanceRun.objects.filter(pk=run.pk, status__in=ACTIVE).update(**updates)
+        if not isinstance(node_metrics, dict):
+            return
+        # Each member owns its own bounded series. Do not multiply the global
+        # failure-sample budget by keeping a second independent collection.
+        for member in run.participants.select_for_update().order_by('node_id'):
+            data = node_metrics.get(str(member.node_id))
+            if not isinstance(data, dict) or type(data.get('requests')) is not int:
+                continue
+            data = bounded_metrics(data, run.snapshot, 'load')
+            data['failure_samples'] = [sample for sample in metrics['failure_samples']
+                                       if sample.get('node_id') == str(member.node_id)]
+            member.latest_metrics = data
+            if sample_due:
+                member.metrics_samples = [*(member.metrics_samples or []),
+                    {'timestamp': now.isoformat(), 'metrics': data}][-400:]
+            fields = ['latest_metrics', 'metrics_samples']
+            if metrics.get('started') and member.started_at is None:
+                member.started_at = now
+                fields.append('started_at')
+            if data.get('status') in ('lost', 'failed') and member.status not in ('stopped', 'failed', 'lost'):
+                member.status = data['status']
+                fields.append('status')
+            if data.get('reason_code') and not member.reason_code:
+                member.reason_code = str(data['reason_code'])[:64]
+                member.reason = str(data.get('reason') or '')[:500]
+                fields.extend(['reason_code', 'reason'])
+            member.save(update_fields=fields)
 
     def begin_reap(self, status, code, reason):
+        # Called only after Master has finalized, or on emergency termination.
+        # User stop takes the start.stop path first and keeps renewing leases.
         self.stop_process()
-        self.pending_result = (status, code, str(reason)[:500])
+        with self.owned_run(self.current) as (_, run):
+            self.pending_result = self._terminal_result(run, status, code, reason)
+            run.status = 'stopping'
+            run.reason_code, run.reason = self.pending_result[1:]
+            if status in ('failed', 'incomplete') and run.latest_metrics:
+                run.latest_metrics = {**run.latest_metrics, 'complete': False}
+            run.save(update_fields=['status', 'reason_code', 'reason', 'latest_metrics'])
+            self._stop_members(run, reason)
         self.reaping_since = time.monotonic()
-        with self.owned_run(self.current):
-            PerformanceRun.objects.filter(pk=self.current, status__in=ACTIVE).update(
-                status='stopping', node_command={'type': 'stop', 'run_id': str(self.current), 'reason': str(reason)[:500]})
 
     def reap(self, run):
         self.stop_process()
         if self.process and self.process.poll() is None:
             return  # Never release the global slot while our supervisor is alive.
-        acknowledged = run.node_report.get('state') in ('stopped', 'failed')
-        if not acknowledged and time.monotonic() - self.reaping_since < REAP_SECONDS:
+        # For a predecessor we cannot wait() on its process. Its unrenewed
+        # independent lease plus forced-shutdown bound is the proof instead.
+        if self.orphan and time.monotonic() - self.reaping_since < LEASE_RECLAIM_SECONDS:
             return
         status, code, reason = self.pending_result
-        with self.owned_run(run.pk) as (state, _):
+        with self.owned_run(run.pk) as (state, locked):
+            now = timezone.now()
+            members = list(locked.participants.select_for_update().order_by('node_id'))
+            for member in members:
+                acknowledged = member.node_report.get('state') in ('stopped', 'failed')
+                expired = member.last_command_at is None or (
+                    now - member.last_command_at).total_seconds() >= LEASE_RECLAIM_SECONDS
+                if not acknowledged and not expired:
+                    return
+            status, code, reason = self._terminal_result(locked, status, code, reason)
+            for member in members:
+                member.node_command = {}
+                if member.node_report.get('state') in ('stopped', 'failed'):
+                    if member.status not in ('failed', 'lost'):
+                        member.status = member.node_report['state']
+                    member.stopped_at = member.stopped_at or now
+                elif member.last_command_at:
+                    member.status = 'lost'
+                    member.reason_code = member.reason_code or 'lease_expired'
+                    member.reason = member.reason or '未收到停止确认，已等待命令租约及强制回收期限'
+                else:
+                    member.status = 'stopped'
+                    member.stopped_at = member.stopped_at or now
+                member.save(update_fields=['node_command', 'status', 'stopped_at', 'reason_code', 'reason'])
             PerformanceRun.objects.filter(pk=run.pk, status__in=ACTIVE).update(
-                status=status, reason_code=code, reason=reason, finished_at=timezone.now(), node_command={})
+                status=status, reason_code=code, reason=reason, finished_at=now)
             state.current_run = None
             state.save(update_fields=['current_run'])
         # Only delete secrets that this controller generated for this exact run.
         if self.directory and self.directory.name == str(run.pk):
-            for name in ('client.key', 'server.key', 'run.json'):
+            for name in ('server.key', 'run.json', *(f'client-{member.node_id}.key' for member in members)):
                 (self.directory / name).unlink(missing_ok=True)
         self.current = self.process = self.directory = self.reaping_since = self.pending_result = None
         self.orphan = False
         self.last_sample = 0
+        self.stopping_since = None
 
     def stop_process(self):
         if self.process and self.process.poll() is None:

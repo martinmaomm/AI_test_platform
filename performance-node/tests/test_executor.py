@@ -25,15 +25,14 @@ from performance_node.locust_runtime import canonical_sha256, validate_snapshot
 
 def make_snapshot(run_id: str, node_id: str) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": run_id,
-        "node_id": node_id,
+        "nodes": [{"node_id": node_id, "users": 1, "validation_key": "a" * 64}],
         "engine_version": "2.43.3",
         "plan_name": "fixture",
         "base_url": "https://target.example",
         "allowed_methods": ["GET"],
         "mode": "validation",
-        "validation_key": "a" * 64,
         "users": 1,
         "spawn_rate": 1,
         "duration_seconds": 5,
@@ -111,6 +110,7 @@ class RunExecutorTests(unittest.TestCase):
         result = {
             "type": "prepare",
             "run_id": self.run_id,
+            "node_id": self.node_id,
             "snapshot": snapshot,
             "snapshot_sha256": canonical_sha256(snapshot),
             "script_source": source,
@@ -221,7 +221,7 @@ class RunExecutorTests(unittest.TestCase):
             lambda value: value.update(script_source=value["script_source"] + "\n"),
             lambda value: value.update(snapshot_sha256="0" * 64),
             lambda value: value.update(handshake_token="short"),
-            lambda value: value.update(max_seconds=81),
+            lambda value: value.update(max_seconds=126),
         ):
             candidate = json.loads(json.dumps(command))
             mutation(candidate)

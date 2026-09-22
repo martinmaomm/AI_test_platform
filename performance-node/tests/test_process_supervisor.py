@@ -152,6 +152,37 @@ class ProcessSupervisorTests(unittest.TestCase):
                 "timeout",
             )
 
+    def test_requested_stop_keeps_tunnel_until_engine_gracefully_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            engine_done = root / "engine.done"
+            tunnel_observed = root / "tunnel-observed"
+            engine = [sys.executable, "-c", (
+                "import pathlib,signal,time; stopped=[False]; "
+                "signal.signal(signal.SIGTERM,lambda *_:stopped.__setitem__(0,True)); "
+                "\nwhile not stopped[0]: time.sleep(.02)\n"
+                f"pathlib.Path({str(engine_done)!r}).write_text('done')"
+            )]
+            tunnel = [sys.executable, "-c", (
+                "import pathlib,signal,time; stopped=[False]; "
+                "signal.signal(signal.SIGTERM,lambda *_:stopped.__setitem__(0,True)); "
+                "\nwhile not stopped[0]: time.sleep(.02)\n"
+                f"pathlib.Path({str(tunnel_observed)!r}).write_text(str(pathlib.Path({str(engine_done)!r}).exists()))"
+            )]
+            config = load_config(self.make_config(root, engine, tunnel_argv=tunnel))
+            supervisor = ProcessSupervisor(config)
+            thread = threading.Thread(target=supervisor.run)
+            thread.start()
+            deadline = time.monotonic() + 3
+            while len(supervisor.children) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(len(supervisor.children), 2)
+            time.sleep(0.2)
+            supervisor.request_stop()
+            thread.join(timeout=4)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(tunnel_observed.read_text(encoding="utf-8"), "True")
+
     def test_config_rejects_remote_shape_shell_strings_and_excessive_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -159,7 +190,7 @@ class ProcessSupervisorTests(unittest.TestCase):
             raw = json.loads(path.read_text(encoding="utf-8"))
             for mutate in (
                 lambda value: value["processes"][0].update(argv="python -c pass"),
-                lambda value: value.update(max_seconds=676),
+                lambda value: value.update(max_seconds=721),
                 lambda value: value["processes"][0].update(name="remote"),
             ):
                 candidate = json.loads(json.dumps(raw))

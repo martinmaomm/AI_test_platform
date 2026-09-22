@@ -9,15 +9,18 @@ import uuid
 from performance_node.locust_runtime import (
     MISSING, add_failure_samples, assertion_failures, canonical_sha256, compare_value,
     resolve_path, resolve_value, select_value, validate_snapshot,
-    ValidationTrace, evidence_preview, format_evidence, evidence_secrets, normalize_validation_steps,
+    ReportSequence, ValidationTrace, evidence_preview, format_evidence, evidence_secrets,
+    normalize_validation_steps,
 )
 
 
 def snapshot():
+    node_id = str(uuid.uuid4())
     return {
-        'schema_version': 2, 'run_id': str(uuid.uuid4()), 'node_id': str(uuid.uuid4()),
+        'schema_version': 3, 'run_id': str(uuid.uuid4()),
         'engine_version': '2.43.3', 'plan_name': 'fixture', 'base_url': 'http://127.0.0.1:8080',
-        'allowed_methods': ['GET'], 'mode': 'validation', 'validation_key': 'a' * 64,
+        'allowed_methods': ['GET'], 'mode': 'validation',
+        'nodes': [{'node_id': node_id, 'users': 1, 'validation_key': 'a' * 64}],
         'users': 1, 'spawn_rate': 1, 'duration_seconds': 5, 'wait_seconds': .5,
         'variables': {'page': 1}, 'unique_variables': [{'name': 'name', 'prefix': 'load_'}],
         'steps': [{'name': 'fixture', 'phase': 'main', 'method': 'GET', 'path': '/ok',
@@ -29,6 +32,18 @@ def snapshot():
 
 
 class FixedRuntimeTests(unittest.TestCase):
+    def test_report_sequence_deduplicates_and_detects_gaps_and_final_mutation(self):
+        sequence = ReportSequence()
+        self.assertTrue(sequence.accept(1, None, 'one'))
+        self.assertFalse(sequence.accept(1, None, 'one'))
+        with self.assertRaises(ValueError):
+            sequence.accept(1, None, 'changed')
+        self.assertTrue(sequence.accept(3, 3, 'three'))
+        self.assertTrue(sequence.gap)
+        self.assertEqual((sequence.last, sequence.final), (3, 3))
+        with self.assertRaises(ValueError):
+            sequence.accept(4, None, 'four')
+
     def test_import_does_not_patch_or_load_locust(self):
         result = subprocess.run([sys.executable, '-c',
             'import sys; import performance_node.locust_runtime; '
@@ -45,7 +60,7 @@ class FixedRuntimeTests(unittest.TestCase):
         self.assertNotEqual(canonical_sha256(value), canonical_sha256(changed))
 
     def test_bad_load_and_origins_are_rejected(self):
-        for field, value in [('users', True), ('users', 101), ('duration_seconds', 601),
+        for field, value in [('users', True), ('users', 1001), ('duration_seconds', 601),
                              ('wait_seconds', float('nan')), ('spawn_rate', 0),
                              ('base_url', 'https://user:pass@example.test'),
                              ('base_url', 'https://example.test/a'), ('base_url', 'file:///tmp/a'),
@@ -53,6 +68,24 @@ class FixedRuntimeTests(unittest.TestCase):
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 candidate = snapshot()
                 candidate[field] = value
+                validate_snapshot(candidate)
+
+    def test_multi_node_members_are_sorted_unique_and_evenly_assigned(self):
+        value = snapshot()
+        node_ids = sorted(str(uuid.uuid4()) for _ in range(3))
+        value.update(mode='load', users=1000, nodes=[
+            {'node_id': node_id, 'users': users, 'validation_key': str(index) * 64}
+            for index, (node_id, users) in enumerate(zip(node_ids, (334, 333, 333)), start=1)
+        ])
+        self.assertIs(validate_snapshot(value), value)
+        for mutation in (
+            lambda item: item['nodes'].reverse(),
+            lambda item: item['nodes'][0].update(users=333),
+            lambda item: item['nodes'].append(copy.deepcopy(item['nodes'][-1])),
+        ):
+            candidate = copy.deepcopy(value)
+            mutation(candidate)
+            with self.assertRaises(ValueError):
                 validate_snapshot(candidate)
 
     def test_no_redirect_path_header_override_or_unsupported_step(self):

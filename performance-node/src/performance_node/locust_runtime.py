@@ -1,4 +1,4 @@
-"""Frozen schema-v2 request runtime; safe to import outside Locust/gevent."""
+"""Frozen schema-v3 request runtime; safe to import outside Locust/gevent."""
 from __future__ import annotations
 
 import hashlib
@@ -26,6 +26,36 @@ COMPARATORS = ('eq', 'ne', 'contains', 'not_contains', 'gt', 'ge', 'lt', 'le',
                'type', 'length', 'length_gt', 'exists')
 FORBIDDEN_HEADERS = {'host', 'content-length', 'transfer-encoding', 'connection',
                      'proxy-authorization', 'proxy-connection'}
+
+
+class ReportSequence:
+    """Accept immutable, monotonic incremental batches and remember any gap."""
+
+    def __init__(self):
+        self.last = 0
+        self.final = None
+        self.gap = False
+        self._digests = {}
+
+    def accept(self, sequence, final_sequence, digest):
+        if (type(sequence) is not int or sequence <= 0
+                or type(digest) is not str or not digest
+                or (final_sequence is not None
+                    and (type(final_sequence) is not int or final_sequence != sequence))):
+            raise ValueError('统计序号无效')
+        if sequence <= self.last:
+            if self._digests.get(sequence) != digest:
+                raise ValueError('重复序号内容不一致')
+            return False
+        if self.final is not None:
+            raise ValueError('最终统计后出现更高序号')
+        if sequence != self.last + 1:
+            self.gap = True
+        self.last = sequence
+        self._digests[sequence] = digest
+        if final_sequence is not None:
+            self.final = final_sequence
+        return True
 
 
 def canonical_sha256(value):
@@ -116,29 +146,53 @@ def _validate_assertion(assertion):
 
 
 def validate_snapshot(value):
-    fields = {'schema_version', 'run_id', 'node_id', 'engine_version', 'plan_name', 'base_url',
-              'allowed_methods', 'mode', 'validation_key', 'users', 'spawn_rate',
+    fields = {'schema_version', 'run_id', 'nodes', 'engine_version', 'plan_name', 'base_url',
+              'allowed_methods', 'mode', 'users', 'spawn_rate',
               'duration_seconds', 'wait_seconds', 'variables', 'unique_variables', 'steps'}
     if type(value) is not dict or set(value) != fields:
         raise ValueError('运行快照字段无效')
-    if type(value['schema_version']) is not int or value['schema_version'] != 2 or value['engine_version'] != ENGINE_VERSION:
+    if type(value['schema_version']) is not int or value['schema_version'] != 3 or value['engine_version'] != ENGINE_VERSION:
         raise ValueError('运行快照版本不匹配')
-    for key in ('run_id', 'node_id'):
-        if type(value[key]) is not str or str(uuid.UUID(value[key])) != value[key]:
-            raise ValueError('运行身份无效')
+    if type(value['run_id']) is not str or str(uuid.UUID(value['run_id'])) != value['run_id']:
+        raise ValueError('运行身份无效')
     if type(value['plan_name']) is not str or not 1 <= len(value['plan_name']) <= 200:
         raise ValueError('计划名称无效')
     if value['mode'] not in ('validation', 'load'):
         raise ValueError('运行模式无效')
-    if type(value['validation_key']) is not str or not re.fullmatch(r'[0-9a-f]{64}', value['validation_key']):
-        raise ValueError('验证指纹无效')
-    for key, low, high, integer in [('users', 1, 100, True), ('spawn_rate', .000001, 100, False),
+    for key, low, high, integer in [('users', 1, 1000, True), ('spawn_rate', .000001, 100, False),
                                     ('duration_seconds', 1, 600, True), ('wait_seconds', .1, 60, False)]:
         number = value[key]
         if type(number) not in (int, float) or not math.isfinite(number) or not low <= number <= high or (integer and type(number) is not int):
             raise ValueError('运行负载参数无效')
     if value['mode'] == 'validation' and (value['users'] != 1 or value['spawn_rate'] != 1):
         raise ValueError('验证模式必须为单用户')
+    nodes = value['nodes']
+    if type(nodes) is not list or not 1 <= len(nodes) <= 5:
+        raise ValueError('参与节点数量无效')
+    normalized_node_ids = []
+    for item in nodes:
+        if type(item) is not dict or set(item) != {'node_id', 'users', 'validation_key'}:
+            raise ValueError('参与节点字段无效')
+        try:
+            normalized_node_id = str(uuid.UUID(item['node_id']))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError('参与节点身份无效') from exc
+        if normalized_node_id != item['node_id']:
+            raise ValueError('参与节点身份无效')
+        if type(item['users']) is not int or item['users'] <= 0:
+            raise ValueError('参与节点用户数无效')
+        if type(item['validation_key']) is not str or not re.fullmatch(r'[0-9a-f]{64}', item['validation_key']):
+            raise ValueError('验证指纹无效')
+        normalized_node_ids.append(normalized_node_id)
+    if normalized_node_ids != sorted(normalized_node_ids) or len(normalized_node_ids) != len(set(normalized_node_ids)):
+        raise ValueError('参与节点必须按身份排序且不得重复')
+    if value['users'] < len(nodes) or sum(item['users'] for item in nodes) != value['users']:
+        raise ValueError('参与节点用户数与总用户数不一致')
+    base, remainder = divmod(value['users'], len(nodes))
+    if [item['users'] for item in nodes] != [base + (index < remainder) for index in range(len(nodes))]:
+        raise ValueError('参与节点用户数不是稳定均分结果')
+    if value['mode'] == 'validation' and len(nodes) != 1:
+        raise ValueError('验证模式必须且只能选择一个节点')
     origin = value['base_url']
     if type(origin) is not str or any(character.isspace() or character in '\\?#' or ord(character) < 32 for character in origin):
         raise ValueError('压测目标无效')
@@ -663,6 +717,9 @@ def main():
     from gevent import monkey
     monkey.patch_all()
     import argparse
+    import copy
+    from datetime import datetime, timezone
+    import hmac
     from importlib.metadata import version
     import os
     from pathlib import Path
@@ -674,6 +731,8 @@ def main():
     from locust.env import Environment
     from locust.event import Events
     from locust.exception import StopUser
+    from locust.dispatch import UsersDispatcher
+    from locust.stats import RequestStats, StatsEntry, StatsError
     from requests.exceptions import RequestException
 
     parser = argparse.ArgumentParser()
@@ -681,6 +740,7 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--master-host', default='127.0.0.1')
     parser.add_argument('--master-port', type=int, required=True)
+    parser.add_argument('--node-id')
     parser.add_argument('--start-file')
     parser.add_argument('--metrics-file')
     parser.add_argument('--complete-file')
@@ -689,16 +749,32 @@ def main():
         raise ValueError('引擎版本或本地转接地址无效')
     configuration = json.loads(Path(args.config).read_text(encoding='utf-8'))
     snapshot = validate_snapshot(configuration['snapshot'])
-    hello = {'run_id': snapshot['run_id'], 'node_id': snapshot['node_id'],
-             'snapshot_sha256': canonical_sha256(snapshot), 'token': configuration['handshake_token']}
-    if type(hello['token']) is not str or len(hello['token']) < 32:
-        raise ValueError('运行握手凭证无效')
+    snapshot_sha256 = canonical_sha256(snapshot)
+    assignments = {item['node_id']: item['users'] for item in snapshot['nodes']}
+    if args.role == 'worker':
+        if set(configuration) != {'snapshot', 'handshake_token'} or args.node_id not in assignments:
+            raise ValueError('Worker 运行身份配置无效')
+        runtime_node_id = str(uuid.UUID(args.node_id))
+        handshake_token = configuration['handshake_token']
+        if type(handshake_token) is not str or len(handshake_token) < 32:
+            raise ValueError('运行握手凭证无效')
+        hello = {'run_id': snapshot['run_id'], 'node_id': runtime_node_id,
+                 'snapshot_sha256': snapshot_sha256, 'token': handshake_token}
+    else:
+        if set(configuration) != {'snapshot', 'handshake_tokens'} or args.node_id is not None:
+            raise ValueError('Master 运行身份配置无效')
+        handshake_tokens = configuration['handshake_tokens']
+        if (type(handshake_tokens) is not dict or set(handshake_tokens) != set(assignments)
+                or any(type(token) is not str or len(token) < 32 for token in handshake_tokens.values())):
+            raise ValueError('Master 握手白名单无效')
+        runtime_node_id = None
     failures = []
     failure_keys = set()
     trace = ValidationTrace(snapshot)
     validation = {'finished': False, 'passed': False, 'main_steps_completed': 0,
                   'main_steps_total': sum(step['phase'] == 'main' for step in snapshot['steps'])}
     user_sequence = [0]
+    stop_requested = [False]
 
     def add_failures(items):
         if trace.enabled:
@@ -722,6 +798,8 @@ def main():
             for index, step in enumerate(snapshot['steps']):
                 if step['phase'] != 'setup':
                     break
+                if stop_requested[0]:
+                    raise StopUser()
                 succeeded, extracted = self.execute_step(step, index + 1, self.setup_variables)
                 if not succeeded:
                     if snapshot['mode'] == 'validation':
@@ -857,13 +935,15 @@ def main():
             variables.update(self.setup_variables)
             for item in snapshot['unique_variables']:
                 variables[item['name']] = (
-                    f'{item["prefix"]}{snapshot["run_id"][:8]}-u{self.platform_user}'
+                    f'{item["prefix"]}{snapshot["run_id"][:8]}-{runtime_node_id[:8]}-u{self.platform_user}'
                     f'-r{self.round_number}-{uuid.uuid4().hex[:12]}'
                 )
             completed = 0
             for index, step in enumerate(snapshot['steps']):
                 if step['phase'] != 'main':
                     continue
+                if stop_requested[0]:
+                    raise StopUser()
                 succeeded, extracted = self.execute_step(step, index + 1, variables)
                 if not succeeded:
                     if snapshot['mode'] == 'validation':
@@ -878,56 +958,271 @@ def main():
                 self.finish_validation(completed == validation['main_steps_total'])
                 raise StopUser()
 
-    environment = Environment(user_classes=[RequestUser], host=RequestUser.host, events=Events(), stop_timeout=3)
+    environment = Environment(user_classes=[RequestUser], host=RequestUser.host, events=Events(), stop_timeout=10)
     stop = [False]
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__(0, True))
     if args.role == 'worker':
         runner = environment.create_worker_runner(args.master_host, args.master_port)
+        finalizing = [False]
+        report_state = {'sequence': 0, 'final_sequence': None, 'final_payload': None}
+
         def worker_report(client_id, data, **_):
-            data.update(platform_final=runner.state == 'stopped',
+            if report_state['final_payload'] is not None:
+                data.clear()
+                data.update(copy.deepcopy(report_state['final_payload']))
+                return
+            report_state['sequence'] += 1
+            is_final = bool(runner.state == 'stopped' and runner.user_count == 0)
+            final_sequence = report_state['sequence'] if is_final else None
+            data.update(platform_node_id=runtime_node_id,
+                        platform_worker_instance_id=runner.client_id,
+                        platform_report_seq=report_state['sequence'],
+                        platform_final_seq=final_sequence,
                         platform_failure_samples=failures[:MAX_FAILURE_SAMPLES],
-                        platform_validation=dict(validation))
+                        platform_validation=dict(validation),
+                        platform_worker_cpu=float(runner.current_cpu_usage),
+                        platform_worker_memory=int(runner.current_memory_usage),
+                        platform_reason_code='stopped' if is_final else '',
+                        platform_reason='Worker 已停止' if is_final else '')
             if trace.enabled:
                 data['platform_validation_steps'] = trace.report()
+            if is_final:
+                report_state['final_sequence'] = final_sequence
+                report_state['final_payload'] = copy.deepcopy(data)
+
         environment.events.report_to_master.add_listener(worker_report)
         environment.events.test_stop.add_listener(lambda **_: runner._send_stats())
+        hello['worker_instance_id'] = runner.client_id
         runner.send_message('platform_hello', hello)
+        original_handle_message = runner.handle_message
+        last_spawn_users = [0]
+
+        def reject_spawn(reason_code):
+            stop_requested[0] = True
+            finalizing[0] = True
+            runner.stop()
+            if report_state['final_payload'] is None:
+                runner._send_stats()
+            runner.send_message('platform_protocol_error', {
+                'node_id': runtime_node_id, 'reason_code': reason_code,
+            })
+
+        def fixed_handle_message(msg):
+            if msg.type == 'spawn':
+                counts = msg.data.get('user_classes_count') if type(msg.data) is dict else None
+                count = counts.get('RequestUser') if type(counts) is dict else None
+                if (stop_requested[0] or report_state['final_payload'] is not None
+                        or type(counts) is not dict or set(counts) != {'RequestUser'}
+                        or type(count) is not int or not last_spawn_users[0] <= count <= assignments[runtime_node_id]):
+                    reject_spawn('assigned_users_mismatch')
+                    return
+                last_spawn_users[0] = count
+            elif msg.type == 'spawning_complete':
+                if last_spawn_users[0] != assignments[runtime_node_id]:
+                    reject_spawn('final_assigned_users_mismatch')
+                    return
+            elif msg.type == 'stop':
+                stop_requested[0] = True
+                finalizing[0] = True
+                runner.stop()
+                if report_state['final_payload'] is None:
+                    runner._send_stats()
+                runner.worker_state = 'stopped'
+                runner.send_message('platform_stopped', {
+                    'node_id': runtime_node_id, 'final_seq': report_state['final_sequence'],
+                })
+                return
+            original_handle_message(msg)
+
+        runner.handle_message = fixed_handle_message
         while not stop[0] and len(runner.greenlet):
             gevent.sleep(.2)
+        if stop[0] and len(runner.greenlet):
+            stop_requested[0] = True
+            finalizing[0] = True
+            runner.stop()
+            if report_state['final_payload'] is None:
+                runner._send_stats()
         runner.quit()
         return 0
 
     if not all((args.start_file, args.metrics_file, args.complete_file)):
         raise ValueError('Master 缺少运行文件配置')
+
+    expected_node_ids = set(assignments)
+    client_to_node = {}
+    node_to_client = {}
+    member_changed = [False]
+    stopping = [False]
+
+    class FixedMembersDispatcher(UsersDispatcher):
+        def _sort_workers(self):
+            if any(worker.id not in client_to_node for worker in self._worker_nodes):
+                raise ValueError('存在未准入 Worker')
+            self._worker_nodes = sorted(self._worker_nodes, key=lambda worker: client_to_node[worker.id])
+            for worker in self._worker_nodes:
+                worker._index_within_host = 0
+
+        def add_worker(self, worker_node):
+            if not stopping[0]:
+                member_changed[0] = True
+
+        def remove_worker(self, worker_node):
+            if not stopping[0]:
+                member_changed[0] = True
+
+    environment.dispatcher_class = FixedMembersDispatcher
     runner = environment.create_master_runner('127.0.0.1', args.master_port)
     admitted = set()
-    final_reports = set()
     invalid = [False]
+    invalid_reason = ['worker_identity_invalid']
     master_validation = dict(validation)
     master_steps = trace.report()
+    node_reports = {
+        node_id: {
+            'stats': RequestStats(), 'sequence': ReportSequence(),
+            'protocol_error': False, 'users': 0, 'worker_cpu': None,
+            'worker_memory': None, 'status': 'waiting', 'reason_code': '', 'reason': '',
+        }
+        for node_id in assignments
+    }
     started_at = None
+    metrics_cutoff = None
     reason = 'completed'
+    phase = ['preparing']
+    spawn_greenlet = [None]
 
     def on_hello(environment, msg, **_):
-        if msg.data != hello or (admitted and msg.node_id not in admitted):
+        data = msg.data
+        if type(data) is not dict or set(data) != {
+            'run_id', 'node_id', 'snapshot_sha256', 'token', 'worker_instance_id',
+        }:
             invalid[0] = True
-        else:
-            admitted.add(msg.node_id)
+            return
+        node_id = data.get('node_id')
+        expected_token = handshake_tokens.get(node_id)
+        valid = (
+            data.get('run_id') == snapshot['run_id']
+            and data.get('snapshot_sha256') == snapshot_sha256
+            and data.get('worker_instance_id') == msg.node_id
+            and expected_token is not None
+            and hmac.compare_digest(data.get('token', ''), expected_token)
+            and (node_id not in node_to_client or node_to_client[node_id] == msg.node_id)
+            and (msg.node_id not in client_to_node or client_to_node[msg.node_id] == node_id)
+        )
+        if not valid or started_at is not None:
+            invalid[0] = True
+            return
+        client_to_node[msg.node_id] = node_id
+        node_to_client[node_id] = msg.node_id
+        admitted.add(node_id)
+        node_reports[node_id]['status'] = 'ready'
+
+    def merge_stats(target, entries, total, errors):
+        for entry in entries:
+            key = (entry.name, entry.method)
+            if key not in target.entries:
+                target.entries[key] = StatsEntry(target, entry.name, entry.method, use_response_times_cache=True)
+            target.entries[key].extend(entry)
+        target.total.extend(total)
+        for error_key, error in errors.items():
+            if error_key not in target.errors:
+                target.errors[error_key] = StatsError.unserialize(error.serialize())
+            else:
+                target.errors[error_key].occurrences += error.occurrences
+
+    def fail_protocol(node_id, code, message):
+        if not invalid[0]:
+            invalid_reason[0] = code
+        invalid[0] = True
+        if node_id in node_reports:
+            state = node_reports[node_id]
+            state.update(protocol_error=True, status='failed', reason_code=code, reason=message)
 
     def on_report(client_id, data, **_):
-        if client_id in admitted:
-            add_failures(data.get('platform_failure_samples') or [])
-            reported_validation = data.get('platform_validation')
-            if type(reported_validation) is dict and reported_validation.get('finished'):
-                master_validation.update(reported_validation)
-            if trace.enabled and isinstance(data.get('platform_validation_steps'), list):
-                master_steps[:] = normalize_validation_steps(data['platform_validation_steps'])
-            if data.get('platform_final') and started_at is not None:
-                final_reports.add(client_id)
+        node_id = client_to_node.get(client_id)
+        if node_id is None or type(data) is not dict:
+            fail_protocol(node_id, 'unadmitted_report', '未准入 Worker 上报统计')
+            return
+        state = node_reports[node_id]
+        try:
+            if data.get('platform_node_id') != node_id or data.get('platform_worker_instance_id') != client_id:
+                raise ValueError('统计身份不匹配')
+            sequence = data.get('platform_report_seq')
+            final_sequence = data.get('platform_final_seq')
+            digest = canonical_sha256(data)
+            accepted = state['sequence'].accept(sequence, final_sequence, digest)
+            if not accepted:
+                return
+            if state['sequence'].gap:
+                state.update(reason_code='report_sequence_gap', reason='统计批次序号存在缺口')
+            entries = [StatsEntry.unserialize(item) for item in data['stats']]
+            total = StatsEntry.unserialize(data['stats_total'])
+            errors = {key: StatsError.unserialize(item) for key, item in data['errors'].items()}
+            user_classes_count = data['user_classes_count']
+            user_count = data['user_count']
+            if (type(user_classes_count) is not dict or type(user_count) is not int or user_count < 0
+                    or any(type(value) is not int or value < 0 for value in user_classes_count.values())
+                    or sum(user_classes_count.values()) != user_count):
+                raise ValueError('Worker 用户数无效')
+            worker_cpu = data.get('platform_worker_cpu')
+            worker_memory = data.get('platform_worker_memory')
+            if type(worker_cpu) not in (int, float) or not math.isfinite(worker_cpu):
+                worker_cpu = None
+            if type(worker_memory) is not int or worker_memory < 0:
+                worker_memory = None
+        except (KeyError, TypeError, ValueError):
+            fail_protocol(node_id, 'report_protocol_error', 'Worker 统计消息不符合协议')
+            return
+        merge_stats(environment.stats, entries, total, errors)
+        merge_stats(state['stats'], entries, total, errors)
+        state['users'] = user_count
+        state['worker_cpu'] = worker_cpu
+        state['worker_memory'] = worker_memory
+        state['status'] = 'stopped' if final_sequence is not None else ('running' if started_at is not None else 'ready')
+        if final_sequence is not None:
+            state['reason_code'] = data.get('platform_reason_code') or state['reason_code']
+            state['reason'] = data.get('platform_reason') or state['reason']
+        if client_id in runner.clients:
+            runner.clients[client_id].user_classes_count = dict(user_classes_count)
+        samples = data.get('platform_failure_samples') or []
+        if type(samples) is list:
+            add_failures([{**item, 'node_id': node_id} for item in samples if type(item) is dict])
+        reported_validation = data.get('platform_validation')
+        if type(reported_validation) is dict and reported_validation.get('finished'):
+            master_validation.update(reported_validation)
+        if trace.enabled and isinstance(data.get('platform_validation_steps'), list):
+            master_steps[:] = normalize_validation_steps(data['platform_validation_steps'])
+
+    def on_protocol_error(environment, msg, **_):
+        node_id = client_to_node.get(msg.node_id)
+        fail_protocol(node_id, 'worker_protocol_error', 'Worker 拒绝了分配命令')
+
+    def on_stopped(environment, msg, **_):
+        node_id = client_to_node.get(msg.node_id)
+        if node_id is None or type(msg.data) is not dict or msg.data.get('node_id') != node_id:
+            fail_protocol(node_id, 'worker_stop_identity_invalid', 'Worker 停止确认身份无效')
 
     runner.register_message('platform_hello', on_hello)
-    environment.events.worker_report.add_listener(on_report)
+    runner.register_message('platform_protocol_error', on_protocol_error)
+    runner.register_message('platform_stopped', on_stopped)
+    # The pinned Locust listener merges before later application listeners. Replace
+    # that entry point so identity and monotonic sequence checks happen first.
+    environment.events.worker_report._handlers[:] = [on_report]
+
+    actual_runner_start = runner.start
+    start_invoked = [False]
+
+    def guarded_start(user_count, spawn_rate, wait=False, user_classes=None):
+        if start_invoked[0]:
+            if not stopping[0]:
+                member_changed[0] = True
+            return
+        start_invoked[0] = True
+        return actual_runner_start(user_count, spawn_rate, wait=wait, user_classes=user_classes)
+
+    runner.start = guarded_start
 
     def write_json(filename, item):
         path = Path(filename)
@@ -948,11 +1243,33 @@ def main():
 
     def metrics(complete=False):
         total = environment.stats.total
-        elapsed = max(.001, time.monotonic() - started_at) if started_at is not None else 0
+        report_time = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        endpoint = metrics_cutoff if metrics_cutoff is not None else time.monotonic()
+        elapsed = max(.001, endpoint - started_at) if started_at is not None else 0
+        nodes = {}
+        for node_id in sorted(assignments):
+            state = node_reports[node_id]
+            node_total = state['stats'].total
+            node_complete = bool(
+                state['sequence'].final is not None and state['sequence'].final == state['sequence'].last
+                and not state['sequence'].gap and not state['protocol_error'] and state['users'] == 0
+            )
+            nodes[node_id] = {
+                **entry_data(node_total),
+                'rps': node_total.num_requests / elapsed if elapsed else 0,
+                'error_rate': node_total.num_failures / node_total.num_requests if node_total.num_requests else 0,
+                'users': state['users'], 'entries': [entry_data(item) for item in state['stats'].entries.values()],
+                'assigned_users': assignments[node_id], 'worker_cpu': state['worker_cpu'],
+                'worker_memory': state['worker_memory'], 'status': state['status'],
+                'report_time': report_time,
+                'complete': node_complete, 'report_seq': state['sequence'].last,
+                'final_seq': state['sequence'].final, 'reason_code': state['reason_code'], 'reason': state['reason'],
+            }
         result = {**entry_data(total), 'rps': total.num_requests / elapsed if elapsed else 0,
                   'error_rate': total.num_failures / total.num_requests if total.num_requests else 0,
                   'users': runner.user_count, 'elapsed_seconds': elapsed,
                   'worker_count': runner.worker_count, 'admitted_workers': len(admitted),
+                  'admitted_node_ids': sorted(admitted), 'phase': phase[0], 'nodes': nodes,
                   'started': started_at is not None, 'complete': complete,
                   'failure_samples': failures[:MAX_FAILURE_SAMPLES],
                   'entries': [entry_data(item) for item in environment.stats.entries.values()]}
@@ -970,8 +1287,8 @@ def main():
     try:
         while True:
             now = time.monotonic()
-            if invalid[0] or runner.worker_count > 1:
-                reason = 'worker_identity_invalid'
+            if invalid[0]:
+                reason = invalid_reason[0]
                 break
             if stop[0] or stop_file.exists():
                 reason = 'cancelled'
@@ -980,28 +1297,63 @@ def main():
                 if now > deadline:
                     reason = 'prepare_timeout'
                     break
-                if len(admitted) == 1 and runner.worker_count == 1 and Path(args.start_file).exists():
+                exact_clients = set(runner.clients) == set(client_to_node)
+                if (admitted == expected_node_ids and exact_clients
+                        and runner.worker_count == len(expected_node_ids) and Path(args.start_file).exists()):
                     started_at = time.monotonic()
-                    gevent.spawn(runner.start, snapshot['users'], snapshot['spawn_rate'])
+                    phase[0] = 'running'
+                    for state in node_reports.values():
+                        state['status'] = 'running'
+                    spawn_greenlet[0] = gevent.spawn(runner.start, snapshot['users'], snapshot['spawn_rate'])
             elif snapshot['mode'] == 'validation' and master_validation['finished']:
                 break
             elif now - started_at >= snapshot['duration_seconds']:
                 break
-            elif runner.worker_count != 1:
+            elif member_changed[0] or set(runner.clients) != set(client_to_node) or runner.worker_count != len(expected_node_ids):
                 reason = 'worker_lost'
                 break
             if now - last_write >= 2:
                 write_json(args.metrics_file, metrics())
                 last_write = now
             gevent.sleep(.1)
-        with gevent.Timeout(8, False):
-            runner.stop()
-            limit = time.monotonic() + 5
-            while started_at is not None and final_reports != admitted and time.monotonic() < limit:
-                gevent.sleep(.1)
-        complete = bool(started_at is not None and len(admitted) == 1 and final_reports == admitted
-                        and reason in ('completed', 'cancelled') and runner.user_count == 0)
+        phase[0] = 'stopping'
+        stopping[0] = True
+        stop_requested[0] = True
+        shutdown_deadline = time.monotonic() + 30
+        if started_at is not None:
+            if spawn_greenlet[0] is not None and not spawn_greenlet[0].ready():
+                spawn_greenlet[0].kill(block=True)
+            with gevent.Timeout(30, False):
+                runner.stop()
+        metrics_cutoff = time.monotonic()
+        final_deadline = min(shutdown_deadline, time.monotonic() + 15)
+        while (started_at is not None and time.monotonic() < final_deadline
+               and any(node_reports[node_id]['sequence'].final is None for node_id in expected_node_ids)):
+            gevent.sleep(.1)
+        # quit asks Workers to resend their immutable final batch and keeps the
+        # listener alive for Locust's bounded .5 second drain window.
         runner.quit()
+        node_complete = all(
+            node_reports[node_id]['sequence'].final == node_reports[node_id]['sequence'].last
+            and node_reports[node_id]['sequence'].final is not None
+            and not node_reports[node_id]['sequence'].gap and not node_reports[node_id]['protocol_error']
+            and node_reports[node_id]['users'] == 0
+            for node_id in expected_node_ids
+        )
+        complete = bool(started_at is not None and admitted == expected_node_ids and node_complete
+                        and not invalid[0] and reason in ('completed', 'cancelled') and runner.user_count == 0)
+        if invalid[0] and reason == 'completed':
+            reason = invalid_reason[0]
+        elif reason == 'completed' and not complete:
+            reason = 'final_report_incomplete'
+        for node_id, state in node_reports.items():
+            if state['sequence'].final is None and started_at is not None:
+                state.update(status='lost' if reason == 'worker_lost' else 'incomplete',
+                             reason_code=state['reason_code'] or 'final_report_missing',
+                             reason=state['reason'] or '未收到最终统计批次')
+                if reason == 'worker_lost':
+                    state['users'] = None
+        phase[0] = 'finished'
         result = metrics(complete)
         write_json(args.metrics_file, result)
         write_json(args.complete_file, {'reason': reason, 'metrics': result, 'complete': complete})

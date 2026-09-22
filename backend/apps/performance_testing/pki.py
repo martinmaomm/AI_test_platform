@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import ipaddress
 import os
 from pathlib import Path
+import uuid
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -17,7 +18,10 @@ def private_write(path, content):
         output.write(content)
 
 
-def create_run_certificates(directory, server_name, run_id, node_id):
+def create_run_certificates(directory, server_name, run_id, node_ids):
+    node_ids = [str(uuid.UUID(str(node_id))) for node_id in node_ids]
+    if not 1 <= len(node_ids) <= 5 or len(set(node_ids)) != len(node_ids):
+        raise ValueError('运行证书必须对应 1–5 个不同节点')
     now = datetime.now(timezone.utc)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f'Performance run {run_id}')])
@@ -35,8 +39,10 @@ def create_run_certificates(directory, server_name, run_id, node_id):
     ca_pem = ca.public_bytes(serialization.Encoding.PEM).decode()
     private_write(directory / 'ca.pem', ca_pem)
     certs = {}
-    for role, name, usage in [('server', server_name, ExtendedKeyUsageOID.SERVER_AUTH),
-                               ('client', str(node_id), ExtendedKeyUsageOID.CLIENT_AUTH)]:
+    roles = [('server', server_name, ExtendedKeyUsageOID.SERVER_AUTH)]
+    roles.extend((f'client-{node_id}', node_id, ExtendedKeyUsageOID.CLIENT_AUTH)
+                 for node_id in sorted(node_ids))
+    for role, name, usage in roles:
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
         cert = (builder(key, subject).add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
@@ -54,4 +60,5 @@ def create_run_certificates(directory, server_name, run_id, node_id):
         private_write(directory / f'{role}.pem', certificate)
         private_write(directory / f'{role}.key', private_key)
         certs[role] = {'cert_pem': certificate, 'key_pem': private_key}
-    return {'ca_pem': ca_pem, **certs['client']}
+    return {node_id: {'ca_pem': ca_pem, **certs[f'client-{node_id}']}
+            for node_id in node_ids}

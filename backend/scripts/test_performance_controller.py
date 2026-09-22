@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
-from performance_testing.controller import PerformanceController, bounded_metrics, child_environment
+from performance_testing.controller import PerformanceController, bounded_metrics, child_environment, LEASE_RECLAIM_SECONDS
 from performance_testing.models import PerformanceControllerState, PerformanceNode, PerformanceRun
 from performance_testing.runtime_settings import RuntimeSettings
 from projects.models import Project
@@ -26,13 +26,20 @@ class ControllerIsolationTests(TestCase):
         self.node = PerformanceNode.objects.create(project=self.project, name='fixture', network_mode='lan')
 
     def run_record(self, status='running'):
-        return PerformanceRun.objects.create(project=self.project, node=self.node, created_by=self.user,
-            request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='0' * 64, status=status)
+        run = PerformanceRun.objects.create(project=self.project, created_by=self.user,
+            request_id=uuid.uuid4(), snapshot={'nodes': [{'node_id': str(self.node.pk), 'users': 1}]},
+            snapshot_sha256='0' * 64, status=status)
+        run.participants.create(node=self.node, node_name=self.node.name, assigned_users=1)
+        return run
 
     def attach(self, run):
+        status = run.status
         self.assertTrue(self.controller.claim())
         self.controller.current = run.pk
         self.controller.reaping_since = None
+        self.controller.orphan = False
+        PerformanceRun.objects.filter(pk=run.pk).update(status=status, reason_code='', reason='',
+                                                       latest_metrics=run.latest_metrics)
         PerformanceControllerState.objects.filter(pk=1).update(current_run=run)
 
     def test_lease_cannot_be_stolen_or_resurrected(self):
@@ -50,7 +57,7 @@ class ControllerIsolationTests(TestCase):
         self.assertTrue(self.controller.claim())
         run.refresh_from_db()
         self.assertEqual(run.status, 'stopping')
-        self.assertEqual(run.node_command['type'], 'stop')
+        self.assertEqual(run.participants.get().node_command['type'], 'stop')
         with patch.object(self.controller, 'prepare') as prepare:
             self.controller.tick()
             prepare.assert_not_called()
@@ -83,7 +90,7 @@ class ControllerIsolationTests(TestCase):
     def test_report_ack_does_not_release_live_master_supervisor(self):
         run = self.run_record()
         self.attach(run)
-        run.node_report = {'state': 'stopped'}
+        run.participants.update(node_report={'state': 'stopped'})
         self.controller.pending_result = ('completed', '', '')
         self.controller.reaping_since = 0
         with patch.object(self.controller, 'stop_process'), patch.object(self.controller, 'process') as process:
@@ -140,4 +147,151 @@ class ControllerIsolationTests(TestCase):
         self.controller.directory = Path(self.temporary.name)
         with patch('performance_testing.controller.read_json', return_value=None), patch.object(self.controller, 'begin_reap') as reap:
             self.controller.tick()
-        reap.assert_called_once_with('failed', 'node_revoked', '节点已吊销')
+        reap.assert_called_once()
+        # begin_reap retains the first persisted cause under the Run lock.
+        self.controller.begin_reap('failed', 'node_unavailable', '离线')
+        run.refresh_from_db()
+        self.assertEqual(run.reason_code, 'node_revoked')
+
+    def test_all_members_must_acknowledge_or_prove_their_last_lease_expired(self):
+        run = self.run_record()
+        other = PerformanceNode.objects.create(project=self.project, name='second', network_mode='lan')
+        second = run.participants.create(node=other, node_name=other.name, assigned_users=1,
+            last_command_at=timezone.now())
+        self.attach(run)
+        run.participants.filter(node=self.node).update(node_report={'state': 'stopped'})
+        self.controller.begin_reap('incomplete', 'worker_lost', 'lost')
+        self.controller.reaping_since = 0  # waiting alone never proves expiry
+        self.controller.reap(run)
+        self.assertEqual(self.controller.current, run.pk)
+        second.last_command_at = timezone.now() - timedelta(seconds=LEASE_RECLAIM_SECONDS + 1)
+        second.save(update_fields=['last_command_at'])
+        self.controller.reap(run)
+        run.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(run.status, 'incomplete')
+        self.assertEqual(second.status, 'lost')
+        self.assertEqual(second.reason_code, 'lease_expired')
+        self.assertEqual(second.node_command, {})
+        self.assertIsNone(self.controller.current)
+
+    def test_exact_member_identity_set_is_required_before_start(self):
+        from performance_testing.constants import AGENT_VERSION, ENGINE_VERSION, PROTOCOL_VERSION
+        run = self.run_record('preparing')
+        self.attach(run)
+        self.node.last_seen_at = timezone.now()
+        self.node.agent_token_digest = '1' * 64
+        self.node.agent_version, self.node.engine_version = AGENT_VERSION, ENGINE_VERSION
+        self.node.protocol_version = PROTOCOL_VERSION
+        self.node.save()
+        run.participants.update(node_report={'state': 'ready'})
+        self.controller.directory = Path(self.temporary.name)
+        metrics = {'requests': 0, 'admitted_workers': 1, 'admitted_node_ids': [str(uuid.uuid4())]}
+
+        def read(path):
+            return metrics if path.name == 'metrics.json' else None
+
+        with patch('performance_testing.controller.read_json', side_effect=read):
+            self.controller.tick()
+            self.assertFalse((self.controller.directory / 'start').exists())
+            metrics['admitted_node_ids'] = [str(self.node.pk)]
+            self.controller.tick()
+            self.assertTrue((self.controller.directory / 'start').exists())
+
+    def test_user_stop_signals_master_and_keeps_members_leased_for_final_metrics(self):
+        run = self.run_record('running')
+        self.attach(run)
+        self.node.last_seen_at = timezone.now()
+        self.node.agent_token_digest = '1' * 64
+        self.node.save()
+        run.participants.update(node_command={'type': 'prepare'}, node_report={'state': 'running'})
+        PerformanceRun.objects.filter(pk=run.pk).update(
+            status='stopping', stop_requested_at=timezone.now(), reason_code='cancelled')
+        self.controller.directory = Path(self.temporary.name)
+        with patch('performance_testing.controller.read_json', return_value=None), \
+                patch.object(self.controller, 'stop_process') as stop:
+            self.controller.tick()
+            stop.assert_not_called()
+        self.assertTrue((self.controller.directory / 'start.stop').exists())
+        self.assertEqual(run.participants.get().node_command['type'], 'prepare')
+
+    def test_final_file_appearing_between_read_and_process_exit_is_not_lost(self):
+        run = self.run_record()
+        self.attach(run)
+        self.controller.directory = Path(self.temporary.name)
+        final_reads = 0
+
+        def read(path):
+            nonlocal final_reads
+            if path.name == 'complete.json':
+                final_reads += 1
+                return None if final_reads == 1 else {'complete': True, 'reason': 'completed',
+                    'metrics': {'requests': 20, 'complete': True, 'started': True}}
+            if path.name == 'metrics.json':
+                return {'requests': 10, 'started': True}
+            return {'reason': 'finished'}
+
+        with patch('performance_testing.controller.read_json', side_effect=read), \
+                patch.object(self.controller, 'begin_reap') as reap:
+            self.controller.tick()
+        run.refresh_from_db()
+        self.assertEqual(run.latest_metrics['requests'], 20)
+        reap.assert_called_once_with('completed', '', '压测执行完成')
+
+    def test_ready_report_changing_before_parent_lock_cannot_start(self):
+        from contextlib import contextmanager
+        run = self.run_record('preparing')
+        self.attach(run)
+        self.node.last_seen_at = timezone.now()
+        self.node.agent_token_digest = '1' * 64
+        self.node.save()
+        run.participants.update(node_report={'state': 'ready'})
+        self.controller.directory = Path(self.temporary.name)
+        original = self.controller.owned_run
+        calls = 0
+
+        @contextmanager
+        def changing_lock(run_id):
+            nonlocal calls
+            calls += 1
+            if calls == 2:  # first is metric write, second is start barrier
+                run.participants.update(node_report={'state': 'failed'})
+            with original(run_id) as value:
+                yield value
+
+        def read(path):
+            return {'requests': 0, 'admitted_node_ids': [str(self.node.pk)]} if path.name == 'metrics.json' else None
+
+        with patch('performance_testing.controller.read_json', side_effect=read), \
+                patch.object(self.controller, 'owned_run', side_effect=changing_lock):
+            self.controller.tick()
+        self.assertEqual(calls, 2)
+        self.assertFalse((self.controller.directory / 'start').exists())
+
+    def test_member_metrics_cannot_update_foreign_nodes_or_repeat_validation_details(self):
+        run = self.run_record('running')
+        self.attach(run)
+        self.controller.record_metrics(run, {'requests': 5, 'started': True, 'complete': True,
+            'nodes': {str(self.node.pk): {'requests': 5, 'users': 0, 'complete': True,
+                       'validation_steps': [{'private': 'detail'}]},
+                      str(uuid.uuid4()): {'requests': 99}}})
+        run.refresh_from_db()
+        member = run.participants.get()
+        self.assertNotIn('nodes', run.latest_metrics)
+        self.assertEqual(member.latest_metrics['requests'], 5)
+        self.assertNotIn('validation_steps', member.latest_metrics)
+        self.assertEqual(len(member.metrics_samples), 1)
+
+    def test_per_node_certificates_have_distinct_keys_and_shared_run_ca(self):
+        from cryptography import x509
+        from performance_testing.pki import create_run_certificates
+        nodes = [str(self.node.pk), str(uuid.uuid4())]
+        result = create_run_certificates(Path(self.temporary.name), 'localhost', uuid.uuid4(), nodes)
+        self.assertEqual(set(result), set(nodes))
+        first, second = (result[node] for node in nodes)
+        self.assertEqual(first['ca_pem'], second['ca_pem'])
+        self.assertNotEqual(first['key_pem'], second['key_pem'])
+        for node_id in nodes:
+            certificate = x509.load_pem_x509_certificate(result[node_id]['cert_pem'].encode())
+            self.assertEqual(certificate.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value, node_id)
+            self.assertEqual((Path(self.temporary.name) / f'client-{node_id}.key').stat().st_mode & 0o777, 0o600)

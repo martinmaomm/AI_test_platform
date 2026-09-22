@@ -228,7 +228,7 @@ class ClientTests(unittest.TestCase):
             client.heartbeat()
             self.assertEqual(session.calls[0][1]["headers"]["Authorization"], f"Node {TOKEN}")
 
-    def test_v2_heartbeat_sends_run_report_and_returns_execution_command(self):
+    def test_v3_heartbeat_sends_run_report_and_returns_execution_command(self):
         with tempfile.TemporaryDirectory() as directory:
             run_id = str(uuid.uuid4())
             report = {
@@ -246,6 +246,22 @@ class ClientTests(unittest.TestCase):
             result = client.heartbeat(run_report=report)
             self.assertEqual(result.command, command)
             self.assertEqual(session.calls[0][1]["json"]["run_report"], report)
+
+    def test_prepare_response_over_15_seconds_is_rejected_without_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = {"type": "prepare", "run_id": str(uuid.uuid4())}
+            response = common(
+                node_id=NODE_ID, server_time="2026-09-22T00:00:00Z",
+                command=command, execution_enabled=True,
+            )
+            client = PerformanceNodeClient(
+                self.config(directory),
+                AgentTransport(session=Session([Response(200, wrapped(response))])),
+            )
+            client.store.save(NodeIdentity(NODE_ID, TOKEN))
+            with patch("performance_node.client.time.monotonic", side_effect=[10.0, 25.01]):
+                with self.assertRaisesRegex(AgentStopped, "15 秒接受窗口"):
+                    client.heartbeat()
 
     def test_heartbeat_does_not_reuse_a_strict_report_sequence_on_transport_retry(self):
         with tempfile.TemporaryDirectory() as directory:

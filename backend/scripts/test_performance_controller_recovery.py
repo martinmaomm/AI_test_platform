@@ -172,13 +172,15 @@ class ControllerRecordRecoveryTests(TestCase):
             self.assertTrue(original.claim())
 
             def run_record(status):
-                return PerformanceRun.objects.create(
-                    project=project, node=node, created_by=user, request_id=uuid.uuid4(),
-                    snapshot={}, snapshot_sha256='0' * 64, status=status)
+                run = PerformanceRun.objects.create(
+                    project=project, created_by=user, request_id=uuid.uuid4(),
+                    snapshot={}, snapshot_sha256='0' * 64, status=status,
+                    started_at=timezone.now() if status == 'running' else None)
+                run.participants.create(node=node, node_name=node.name, assigned_users=1)
+                return run
 
             active, queued = run_record('running'), run_record('queued')
-            active.node_report = {'state': 'stopped'}
-            active.save(update_fields=['node_report'])
+            active.participants.update(node_report={'state': 'stopped'})
             original.current = active.pk
             PerformanceControllerState.objects.filter(pk=1).update(current_run=active)
             created = []
@@ -205,13 +207,14 @@ class ControllerRecordRecoveryTests(TestCase):
                  patch.object(command.connections, 'close_all'), \
                  patch.object(original, 'claim', return_value=True), \
                  patch.object(original, 'tick', side_effect=OperationalError(2013, 'offline')), \
-                 patch.object(PerformanceController, 'prepare') as prepare:
+                 patch.object(PerformanceController, 'prepare') as prepare, \
+                 patch('performance_testing.controller.LEASE_RECLAIM_SECONDS', 0):
                 runner.run(stopping)
             active.refresh_from_db()
             queued.refresh_from_db()
             self.assertEqual(active.status, 'incomplete')
             self.assertEqual(active.reason_code, 'controller_restarted')
-            self.assertEqual(active.node_command, {})
+            self.assertEqual(active.participants.get().node_command, {})
             self.assertEqual(queued.status, 'queued')
             prepare.assert_not_called()
             self.assertEqual(stopping.waits, [1, 2, .5])
@@ -226,7 +229,7 @@ class ControllerRecordRecoveryTests(TestCase):
             controller = PerformanceController(config)
             self.assertTrue(controller.claim())
             run = PerformanceRun.objects.create(
-                project=project, node=node, created_by=user, request_id=uuid.uuid4(),
+                project=project, created_by=user, request_id=uuid.uuid4(),
                 snapshot={}, snapshot_sha256='0' * 64, status='queued')
             with patch.object(controller, 'prepare', side_effect=OperationalError(2013, 'offline')), \
                  patch.object(controller, 'begin_reap') as reap:

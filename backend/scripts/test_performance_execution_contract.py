@@ -174,7 +174,7 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
 
                     def execute(mode, *, stop_early=False):
                         before = len(fixture.observed)
-                        request = {'node_id': identity.node_id, 'request_id': str(uuid.uuid4()),
+                        request = {'node_ids': [identity.node_id], 'request_id': str(uuid.uuid4()),
                                    'mode': mode}
                         response = api.post(base + f'plans/{plan.pk}/runs/', request, format='json')
                         self.assertEqual(response.status_code, 201, response.content)
@@ -282,7 +282,7 @@ class PerformanceExecutionIntegrationTests(TransactionTestCase):
                     self.assertIn('第 2 步失败', details[2]['message'])
 
                     blocked = api.post(base + f'plans/{plan.pk}/runs/', {
-                        'node_id': identity.node_id, 'request_id': str(uuid.uuid4()), 'mode': 'load',
+                        'node_ids': [identity.node_id], 'request_id': str(uuid.uuid4()), 'mode': 'load',
                     }, format='json')
                     self.assertEqual(blocked.status_code, 400, blocked.content)
                     self.assertEqual(blocked.json()['error']['code'], 'run_validation_failed')

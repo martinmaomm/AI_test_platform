@@ -24,8 +24,9 @@ from typing import Any
 
 POLL_SECONDS = 0.1
 TUNNEL_STARTUP_SECONDS = 0.5
-SHUTDOWN_SECONDS = 5.0
-MAX_SECONDS_LIMIT = 675
+ENGINE_SHUTDOWN_SECONDS = 10.0
+CHILD_SHUTDOWN_SECONDS = 5.0
+MAX_SECONDS_LIMIT = 720
 _PROCESS_NAMES = {"engine", "tunnel"}
 
 
@@ -243,14 +244,23 @@ class ProcessSupervisor:
                 return "timeout"
             self.stop_event.wait(POLL_SECONDS)
 
-    def _terminate_all(self) -> None:
+    def _terminate_all(self, *, graceful_engine: bool) -> None:
+        engine = self.children.get("engine")
+        if graceful_engine and engine is not None and engine.poll() is None:
+            try:
+                os.killpg(engine.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + ENGINE_SHUTDOWN_SECONDS
+            while engine.poll() is None and time.monotonic() < deadline:
+                time.sleep(POLL_SECONDS)
         for child in self.children.values():
             if child.poll() is None:
                 try:
                     os.killpg(child.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-        deadline = time.monotonic() + SHUTDOWN_SECONDS
+        deadline = time.monotonic() + CHILD_SHUTDOWN_SECONDS
         while time.monotonic() < deadline and any(child.poll() is None for child in self.children.values()):
             time.sleep(POLL_SECONDS)
         for child in self.children.values():
@@ -277,7 +287,10 @@ class ProcessSupervisor:
         except (OSError, subprocess.SubprocessError):
             reason = "child_failed"
         finally:
-            self._terminate_all()
+            # Explicit Agent/controller stops preserve the engine's final-report
+            # window. Lease expiry, timeout, and infrastructure failure fail closed
+            # and use only the bounded child termination interval.
+            self._terminate_all(graceful_engine=reason == "stopped")
             exit_codes = {
                 spec.name: self.children[spec.name].poll() if spec.name in self.children else None
                 for spec in self.config.processes

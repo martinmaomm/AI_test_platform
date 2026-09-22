@@ -173,7 +173,7 @@ class LocalInstallationServer:
 
         def common(**values):
             result = {
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "heartbeat_interval_seconds": 5,
                 "lease_seconds": 30,
                 "execution_enabled": False,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -76,6 +77,7 @@ class PerformanceNodeClient:
         run_report: dict[str, Any] | None = None,
     ) -> HeartbeatResult:
         identity = identity or self.store.load()
+        started_at = time.monotonic()
         data = self.transport.post(
             self.config.endpoint("heartbeat"),
             {"protocol_version": PROTOCOL_VERSION, "agent_version": __version__,
@@ -96,6 +98,8 @@ class PerformanceNodeClient:
         command = data.get("command")
         if not isinstance(command, dict) or command.get("type") not in {"idle", "prepare", "stop"}:
             raise AgentStopped("收到未知或不可执行命令，已停止")
+        if command.get("type") == "prepare" and time.monotonic() - started_at > 15:
+            raise AgentStopped("prepare 命令响应超过 15 秒接受窗口，已停止且不会执行")
         return HeartbeatResult(
             interval_seconds=_positive_int(data.get("heartbeat_interval_seconds"), "heartbeat_interval_seconds"),
             lease_seconds=_positive_int(data.get("lease_seconds"), "lease_seconds"),

@@ -1,4 +1,4 @@
-"""Persistent, fail-closed execution lifecycle for protocol-v2 node commands."""
+"""Persistent, fail-closed execution lifecycle for protocol-v3 node commands."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ _LOCK_FILENAME = "execution.lock"
 _RUNS_DIRECTORY = "runs"
 _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PREPARE_FIELDS = {
-    "type", "run_id", "snapshot", "snapshot_sha256", "script_source",
+    "type", "run_id", "node_id", "snapshot", "snapshot_sha256", "script_source",
     "script_sha256", "lease_seconds", "max_seconds", "tls", "handshake_token",
 }
 _TLS_FIELDS = {"host", "port", "server_name", "ca_pem", "cert_pem", "key_pem"}
@@ -54,6 +54,7 @@ class RuntimeContract:
 @dataclass(frozen=True)
 class PreparedCommand:
     run_id: str
+    node_id: str
     snapshot: dict[str, Any]
     snapshot_sha256: str
     script_source: str
@@ -208,14 +209,14 @@ def validate_prepare_command(command: dict[str, Any], node_id: str) -> PreparedC
     if set(command) != _PREPARE_FIELDS or command.get("type") != "prepare":
         raise ProtocolError("prepare 命令字段不符合协议")
     run_id = _uuid(command["run_id"], "run_id")
+    command_node_id = _uuid(command["node_id"], "node_id")
+    if command_node_id != node_id:
+        raise ProtocolError("prepare 命令不属于当前节点")
     snapshot = command["snapshot"]
     if not isinstance(snapshot, dict):
         raise ProtocolError("命令 snapshot 不符合协议")
     if _uuid(snapshot.get("run_id"), "snapshot.run_id") != run_id:
         raise ProtocolError("命令 run_id 与快照不一致")
-    if _uuid(snapshot.get("node_id"), "snapshot.node_id") != node_id:
-        raise ProtocolError("命令快照不属于当前节点")
-
     contract = load_runtime_contract()
     try:
         contract.validate_snapshot(snapshot)
@@ -225,6 +226,8 @@ def validate_prepare_command(command: dict[str, Any], node_id: str) -> PreparedC
     snapshot_sha = _sha(command["snapshot_sha256"], "snapshot_sha256")
     if actual_snapshot_sha != snapshot_sha:
         raise ProtocolError("命令 snapshot 摘要不匹配")
+    if command_node_id not in {item["node_id"] for item in snapshot["nodes"]}:
+        raise ProtocolError("当前节点不在冻结成员清单中")
 
     script_source = command["script_source"]
     if not isinstance(script_source, str) or not script_source or len(script_source.encode("utf-8")) > 262_144:
@@ -241,9 +244,9 @@ def validate_prepare_command(command: dict[str, Any], node_id: str) -> PreparedC
         raise ProtocolError("平台固定脚本与本机版本不一致；请升级节点")
 
     lease_seconds = _positive_int(command["lease_seconds"], "lease_seconds", 60)
-    max_seconds = _positive_int(command["max_seconds"], "max_seconds", 675)
+    max_seconds = _positive_int(command["max_seconds"], "max_seconds", 720)
     duration = _positive_int(snapshot.get("duration_seconds"), "snapshot.duration_seconds", 600)
-    if max_seconds > duration + 75:
+    if max_seconds > duration + 120:
         raise ProtocolError("命令 max_seconds 超出本地运行边界")
 
     tls = command["tls"]
@@ -264,6 +267,7 @@ def validate_prepare_command(command: dict[str, Any], node_id: str) -> PreparedC
         raise ProtocolError("命令 handshake_token 不符合协议")
     return PreparedCommand(
         run_id=run_id,
+        node_id=command_node_id,
         snapshot=snapshot,
         snapshot_sha256=snapshot_sha,
         script_source=script_source,
@@ -362,7 +366,7 @@ class RunExecutor:
             return
         try:
             process.send_signal(signal.SIGTERM)
-            process.wait(timeout=7)
+            process.wait(timeout=18)
         except psutil.TimeoutExpired:
             try:
                 process.kill()
@@ -729,6 +733,7 @@ class RunExecutor:
                     "argv": [
                         sys.executable, str(run_dir / "locust_runtime.py"),
                         "--role", "worker", "--config", str(run_dir / "runtime.json"),
+                        "--node-id", command.node_id,
                         "--master-host", "127.0.0.1", "--master-port", str(local_port),
                     ],
                     "cwd": str(run_dir),

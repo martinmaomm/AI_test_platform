@@ -1,4 +1,4 @@
-"""CLI entry point for enrollment and the protocol-v2 execution agent."""
+"""CLI entry point for enrollment and the protocol-v3 execution agent."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Protocol-v2 heartbeat and persistent execution loop."""
+"""Protocol-v3 heartbeat and persistent execution loop."""
 
 from __future__ import annotations
 

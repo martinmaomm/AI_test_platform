@@ -48,6 +48,16 @@ python3 backend/scripts/test_performance_node_upgrade_docker.py --source-mode st
 
 该验收在 macOS 上只替换测试专用的 Linux/root 主机检查与锁目录，实际容器仍由 Linux Docker daemon 创建；平台地址使用容器内关闭的 loopback 端口，不向真实平台注册或发心跳。它验证容器和身份保留及恢复，不证明远端设备上的主机依赖、真实平台心跳或业务请求成功。
 
+## 主工作区启用与回读
+
+2026-09-22 20:29（北京时间）已将功能提交 `8e0eedb` 快进合入主工作区，复制已验收前端构建，仅通过服务管理器停止/启动后端与 Caddy。无需数据库迁移、发行目录变更或新镜像发布；Celery 与控制器保持原进程。
+
+- 四项服务均运行、纳管且健康：backend PID70457、Caddy PID70459、Celery PID43013、controller PID43014。
+- 管理员真实 HTTP 接口返回 `unraid`、`osjp` 两台旧节点可用升级信息、目标 0.4.0 固定镜像及对应节点参数；远端节点版本仍是 0.3.2 / 协议 2。
+- 通过原 CA 严格 TLS 回读 Caddy 升级脚本，GET/HEAD 成功、POST 被拒绝、Cache-Control 为 no-store；字节及 SHA256 与页面和已提交脚本一致：`ebb9810e4945570920216cf21d2e1f5d4651ef28145e0a6caf6bb49abda4a183`。
+- 原 CA 未改变；Vite 实际入口已包含“升级节点”。活动压测 0，11 条历史运行内容哈希与切换前完全一致，没有新增运行。
+- 三个浏览器 ZIP 保持未跟踪，没有提交或修改。切换前版本记录、前端构建备份及只读回读摘要位于主工作区 Git 忽略目录 `backend/temp/performance-node-upgrade-rollout/`。
+
 ## 使用边界
 
 页面空闲检查不会创建平台维护锁；命令复制以后到升级结束期间仍需避免安排新任务。脚本在本机停止前后检查执行与待确认报告。自动工具仅支持独立容器的单一动态 bridge 网络，受管理或复杂配置回原管理工具操作。

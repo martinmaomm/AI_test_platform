@@ -31,7 +31,10 @@
             <p v-for="warning in draftWarnings" :key="warning">{{ warning }}</p>
             <p v-if="requiredVariables.length">
               来源样本还需要填写固定变量 JSON：
-              <code v-for="variable in requiredVariables" :key="requiredVariableKey(variable)">
+              <code
+                v-for="variable in requiredVariables"
+                :key="requiredVariableKey(variable)"
+              >
                 ${{ "{" }}{{ variable.name }}{{ "}" }}
               </code>
               。请在下方“固定变量 JSON 值”中补齐后再保存。
@@ -84,42 +87,78 @@
           </section>
           <section>
             <h3>负载配置</h3>
-            <p class="load-note">正式压测按以下参数运行。单用户验证固定为 1 个用户执行 1 轮，完成即结束，执行时限为 120 秒。</p>
+            <p class="load-note">
+              正式压测按以下总量参数运行：总用户数由本轮所有参与节点共同承担，总每秒启动用户数也由全部节点合计。单用户验证固定为
+              1 个用户执行 1 轮，完成即结束，执行时限为 120 秒。
+            </p>
             <div class="grid">
-              <el-form-item label="虚拟用户数" prop="users"
+              <el-form-item label="总虚拟用户数" prop="users"
                 ><el-input-number
                   v-model="form.users"
                   :min="1"
-                  :max="limits.max_users" />
-                <p class="load-help">希望同时模拟多少个用户。每个用户独立执行请求步骤，例如填 10 表示目标为 10 个虚拟用户并发运行。</p></el-form-item
-              ><el-form-item label="每秒启动用户数" prop="spawn_rate"
+                  :max="limits.max_users"
+                />
+                <p class="load-help">
+                  本轮所有参与节点共同承担的用户总数。正式运行会按节点 UUID
+                  排序均分余数，例如 1000 个用户分到 3 个节点为 334、333、333。
+                </p></el-form-item
+              ><el-form-item label="总每秒启动用户数" prop="spawn_rate"
                 ><el-input-number
                   v-model="form.spawn_rate"
                   :min="0.000001"
-                  :max="limits.max_spawn_rate" />
-                <p class="load-help">每秒新增多少个用户，直到达到目标用户数。例如 10 个用户、每秒启动 2 个，约需 5 秒启动完毕。它控制用户启动速度，实际每秒请求数还取决于接口耗时和每轮等待。</p></el-form-item
+                  :max="limits.max_spawn_rate"
+                />
+                <p class="load-help">
+                  所有节点合计每秒新增多少个用户，直到达到总目标。例如总计 10
+                  个用户、每秒启动 2 个，约需 5
+                  秒启动完毕。实际每秒请求数还取决于接口耗时和每轮等待。
+                </p></el-form-item
               ><el-form-item label="持续时间（秒）" prop="duration_seconds"
                 ><el-input-number
                   v-model="form.duration_seconds"
                   :min="1"
-                  :max="limits.max_duration_seconds" />
-                <p class="load-help">从开始启动用户起计时，包含用户逐步启动的时间。例如填 60 表示约运行 1 分钟，到时开始停止运行并汇总结果。</p></el-form-item
+                  :max="limits.max_duration_seconds"
+                />
+                <p class="load-help">
+                  从开始启动用户起计时，包含用户逐步启动的时间。例如填 60
+                  表示约运行 1 分钟，到时开始停止运行并汇总结果。
+                </p></el-form-item
               ><el-form-item label="每轮等待（秒）" prop="wait_seconds"
-                ><el-input-number v-model="form.wait_seconds" :min="0"
-              />
-                <p class="load-help">每个用户完成一轮主流程后，等待多久再开始下一轮。例如填 1 表示每轮后等待 1 秒；同一轮的步骤按顺序连续执行。等待越长，通常请求频率越低。</p></el-form-item>
+                ><el-input-number v-model="form.wait_seconds" :min="0" />
+                <p class="load-help">
+                  每个用户完成一轮主流程后，等待多久再开始下一轮。例如填 1
+                  表示每轮后等待 1
+                  秒；同一轮的步骤按顺序连续执行。等待越长，通常请求频率越低。
+                </p></el-form-item
+              >
             </div>
+            <el-alert
+              v-if="rampWarning"
+              type="warning"
+              :closable="false"
+              show-icon
+              >预计在本轮结束前无法形成持续的满负载阶段，请增加时长或总每秒启动用户数。</el-alert
+            >
           </section>
           <section>
             <h3>变量</h3>
             <el-form-item label="固定变量 JSON 值"
               ><div id="plan-fixed-variables-help" class="variable-help">
-                <p>在这里统一填写多个请求步骤共用的参数。所有虚拟用户在每轮使用相同的固定值。</p>
                 <p>
-                  例如填写 <code>{"product_id":1001,"quantity":2}</code>，在请求的查询参数值中写
-                  <code v-pre>${product_id}</code>，执行时就会替换成 <code>1001</code>。
+                  在这里统一填写多个请求步骤共用的参数。所有虚拟用户在每轮使用相同的固定值。
                 </p>
-                <p>不需要变量时保留 <code>{}</code>。探索草稿提示缺少变量时，按顶部列出的变量名在这里补齐。</p>
+                <p>
+                  例如填写
+                  <code>{"product_id":1001,"quantity":2}</code
+                  >，在请求的查询参数值中写
+                  <code v-pre>${product_id}</code>，执行时就会替换成
+                  <code>1001</code>。
+                </p>
+                <p>
+                  不需要变量时保留
+                  <code>{}</code
+                  >。探索草稿提示缺少变量时，按顶部列出的变量名在这里补齐。
+                </p>
               </div>
               <el-input
                 v-model="form.variablesText"
@@ -137,7 +176,8 @@
               <h4>每轮唯一变量</h4>
               <p class="variable-help">
                 每个虚拟用户每轮生成一个新值，适合订单号等需要避免重复的数据。填写名称和可选前缀，再用
-                <code v-pre>${变量名}</code> 在主流程请求中引用；名称不能与固定变量或响应提取变量重复。
+                <code v-pre>${变量名}</code>
+                在主流程请求中引用；名称不能与固定变量或响应提取变量重复。
               </p>
               <div
                 v-for="(item, index) in form.unique_variables"
@@ -242,13 +282,23 @@
                   最终 URL：{{ previewStepUrl(selectedTarget, currentStep) }}
                 </p>
                 <el-form-item label="Query 参数" :error="stepError.query"
-                  ><p class="variable-help" data-testid="step-query-help">Query 参数会拼接到请求 URL 的 ? 后面，与 Body 请求体分别发送。可在下方填写参数，并通过上方“最终 URL”核对。</p><KeyValueRows
+                  ><p class="variable-help" data-testid="step-query-help">
+                    Query 参数会拼接到请求 URL 的 ? 后面，与 Body
+                    请求体分别发送。可在下方填写参数，并通过上方“最终 URL”核对。
+                  </p>
+                  <KeyValueRows
                     v-model="currentStep.query"
                     data-testid="step-query-rows"
                     key-placeholder="参数名"
                     value-placeholder="参数值" /></el-form-item
                 ><el-form-item label="Headers" :error="stepError.headers"
-                  ><p class="variable-help" data-testid="step-header-help">例如 Header 名称填写 <code>Authorization</code>，值填写 <code v-pre>Bearer ${token}</code>。<code>Bearer</code> 后有一个空格；<code v-pre>${token}</code> 会替换为前面步骤提取的值。</p><KeyValueRows
+                  ><p class="variable-help" data-testid="step-header-help">
+                    例如 Header 名称填写 <code>Authorization</code>，值填写
+                    <code v-pre>Bearer ${token}</code>。<code>Bearer</code>
+                    后有一个空格；<code v-pre>${token}</code>
+                    会替换为前面步骤提取的值。
+                  </p>
+                  <KeyValueRows
                     v-model="currentStep.headers"
                     data-testid="step-header-rows"
                     key-placeholder="Header 名称"
@@ -276,15 +326,32 @@
                 <div data-testid="step-extract">
                   <h4>响应变量提取</h4>
                   <div class="variable-help" data-testid="step-extract-help">
-                    <p>例如响应包含 <code>{"access_token":"示例令牌"}</code>，名称填写 <code>token</code>，路径填写 <code>body.access_token</code>。</p>
-                    <p>本步骤通过后，后续步骤可在请求头、Query 参数或请求体中用 <code v-pre>${token}</code> 引用。引用时必须带 <code>$</code>；<code>{token}</code> 会作为普通文本发送。</p>
+                    <p>
+                      例如响应包含
+                      <code>{"access_token":"示例令牌"}</code>，名称填写
+                      <code>token</code>，路径填写
+                      <code>body.access_token</code>。
+                    </p>
+                    <p>
+                      本步骤通过后，后续步骤可在请求头、Query 参数或请求体中用
+                      <code v-pre>${token}</code> 引用。引用时必须带
+                      <code>$</code>；<code>{token}</code> 会作为普通文本发送。
+                    </p>
                   </div>
                   <div
                     v-for="(item, index) in currentStep.extract"
                     :key="item.id"
                     class="row extraction-row"
                   >
-                    <label>名称<el-input v-model="item.name" placeholder="token" /><span v-if="item.name" class="reference-hint">后续引用：<code>{{ '${' + item.name + '}' }}</code></span></label
+                    <label
+                      >名称<el-input
+                        v-model="item.name"
+                        placeholder="token"
+                      /><span v-if="item.name" class="reference-hint"
+                        >后续引用：<code>{{
+                          "${" + item.name + "}"
+                        }}</code></span
+                      ></label
                     ><label
                       >路径<el-input
                         v-model="item.check"
@@ -445,6 +512,18 @@ const rules = {
   target_id: [{ required: true, message: "请选择压测目标", trigger: "change" }],
 };
 const currentStep = computed(() => form.steps[selectedIndex.value]);
+const rampWarning = computed(() => {
+  const users = Number(form.users);
+  const rate = Number(form.spawn_rate);
+  const duration = Number(form.duration_seconds);
+  return (
+    Number.isFinite(users) &&
+    Number.isFinite(rate) &&
+    Number.isFinite(duration) &&
+    rate > 0 &&
+    users / rate >= duration
+  );
+});
 const stepError = computed(() => errors.value[selectedIndex.value] || {});
 const selectedTarget = computed(
   () =>

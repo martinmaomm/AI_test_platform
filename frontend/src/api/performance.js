@@ -32,6 +32,8 @@ export const getPerformanceNodeInstallation = async (projectId, id) => {
 export const getPerformanceRuns = (projectId) => get(`${base(projectId)}/runs/`)
 export const getPerformanceRun = (projectId, runId) => get(`${base(projectId)}/runs/${runId}/`)
 export const createPerformanceRun = (projectId, planId, data) => post(`${base(projectId)}/plans/${planId}/runs/`, data)
+export const getPerformanceNodeEligibility = (projectId, planId) =>
+  get(`${base(projectId)}/plans/${planId}/node-eligibility/`)
 export const stopPerformanceRun = (projectId, runId) => post(`${base(projectId)}/runs/${runId}/stop/`, {})
 
 // 仅这两个显式响应会返回 enrollment_token；调用方必须只保留在临时弹窗状态中。

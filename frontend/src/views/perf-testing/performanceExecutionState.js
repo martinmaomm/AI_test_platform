@@ -14,12 +14,15 @@ export const PERFORMANCE_TERMINAL_STATUSES = new Set([
 const RUN_STATUS_LABELS = {
   queued: "排队中",
   preparing: "准备中",
+  ready: "已就绪",
   running: "执行中",
   stopping: "停止中",
   completed: "已完成",
   failed: "执行失败",
   cancelled: "已取消",
   incomplete: "执行不完整",
+  stopped: "已停止",
+  lost: "已失联",
 };
 
 export const performanceRunStatusLabel = (status) =>
@@ -90,7 +93,10 @@ export const requestQueryRows = (url) => {
   try {
     const parsed = new URL(url);
     if (!["http:", "https:"].includes(parsed.protocol)) return null;
-    return Array.from(parsed.searchParams, ([name, value]) => ({ name, value }));
+    return Array.from(parsed.searchParams, ([name, value]) => ({
+      name,
+      value,
+    }));
   } catch {
     return null;
   }
@@ -110,7 +116,60 @@ export const formatMetric = (value) => {
   return Number.isFinite(numeric) ? numeric.toFixed(2) : "-";
 };
 
+export const sortedNodeIds = (nodeIds = []) =>
+  [...new Set(nodeIds.map(String))].sort((left, right) =>
+    left.localeCompare(right),
+  );
+export const assignedUsersByNode = (users, nodeIds = []) => {
+  const ids = sortedNodeIds(nodeIds);
+  const total = Number(users);
+  if (!ids.length || !Number.isInteger(total) || total < ids.length) return [];
+  const base = Math.floor(total / ids.length);
+  const remainder = total % ids.length;
+  return ids.map((nodeId, index) => ({
+    nodeId,
+    assignedUsers: base + (index < remainder ? 1 : 0),
+  }));
+};
+export const eligibilityCanValidate = (item = {}) =>
+  item.status === "online" && item.compatible === true;
+export const eligibilityCanLoad = (item = {}) =>
+  eligibilityCanValidate(item) && item.validation_valid === true;
+export const eligibilityReason = (item = {}) =>
+  item.reason ||
+  (!eligibilityCanValidate(item)
+    ? "节点离线或执行版本不兼容"
+    : !item.validation_valid
+      ? "该节点尚未通过当前计划的单用户验证"
+      : "");
+
+export const loadSelectionQuery = (projectId, planId, nodeIds) => ({
+  return_project: String(projectId),
+  return_plan: String(planId),
+  return_nodes: sortedNodeIds(nodeIds).join(","),
+});
+export const readLoadSelection = (query = {}, projectId) => {
+  if (
+    String(query.return_project) !== String(projectId) ||
+    !/^[1-9]\d*$/.test(String(query.return_plan || ""))
+  )
+    return null;
+  const nodeIds = String(query.return_nodes || "")
+    .split(",")
+    .filter(Boolean);
+  if (nodeIds.length > 5 || nodeIds.some((id) => !/^[0-9a-f-]{36}$/.test(id)))
+    return null;
+  return { planId: String(query.return_plan), nodeIds: sortedNodeIds(nodeIds) };
+};
+
 export const samePerformanceRunScope = (captured, current) =>
   captured.scopeEpoch === current.scopeEpoch &&
   String(captured.projectId) === String(current.projectId) &&
   String(captured.runId) === String(current.runId);
+
+export const performanceRunNodeName = (node = {}) => {
+  const name = node.node_name || node.node_id || "-";
+  return node.node_name_source === "current_node"
+    ? `${name}（当前名称，旧版未记录）`
+    : name;
+};

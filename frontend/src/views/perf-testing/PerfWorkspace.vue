@@ -36,8 +36,8 @@
         >
         <el-table-column label="负载" min-width="180"
           ><template #default="{ row }"
-            >{{ row.users }} users / 每秒启动
-            {{ row.spawn_rate }} users</template
+            >总 {{ row.users }} 用户 / 总每秒启动
+            {{ row.spawn_rate }} 用户</template
           ></el-table-column
         >
         <el-table-column label="步骤" width="90"
@@ -131,12 +131,13 @@
             >Agent {{ row.agent_version || "-" }} / 引擎
             {{ row.engine_version || "-"
             }}<el-alert
-              v-if="
-                requiresPerformanceNodeUpgrade(row, config.agent_version)
-              "
+              v-if="requiresPerformanceNodeUpgrade(row, config.agent_version)"
               type="warning"
               :closable="false"
-              >需手动升级至 Agent {{ config.agent_version }}；请在安装指导中查看镜像摘要与升级说明。</el-alert
+              >需手动升级至 Agent
+              {{
+                config.agent_version
+              }}；请在安装指导中查看镜像摘要与升级说明。</el-alert
             ></template
           ></el-table-column
         >
@@ -346,29 +347,20 @@
           }}</el-descriptions-item></el-descriptions
         >
         <el-alert
-          v-if="
-            installationInfo?.upgrade_required
-          "
+          v-if="installationInfo?.upgrade_required"
           type="warning"
           :closable="false"
           >该节点需要手动升级至 Agent
-          {{ installationInfo.agent_version }}。确认无运行任务后，保留原启动参数和身份卷，仅更换镜像；不能同时启动两个同身份节点。</el-alert
+          {{
+            installationInfo.agent_version
+          }}。确认无运行任务后，保留原启动参数和身份卷，仅更换镜像；不能同时启动两个同身份节点。</el-alert
         >
         <el-input
-          v-if="
-            installationInfo?.image_ref
-          "
-          :model-value="
-            installationInfo.image_ref
-          "
+          v-if="installationInfo?.image_ref"
+          :model-value="installationInfo.image_ref"
           readonly
           ><template #append
-            ><el-button
-              @click="
-                copyUpgradeImage(
-                  installationInfo.image_ref,
-                )
-              "
+            ><el-button @click="copyUpgradeImage(installationInfo.image_ref)"
               >复制镜像摘要</el-button
             ></template
           ></el-input
@@ -504,45 +496,134 @@
       @closed="resetRun"
     >
       <el-alert type="warning" :closable="false" show-icon
-        >将向受控目标发起真实请求。当前每次仅运行一个节点；单用户验证与正式压测使用相同断言。旧版节点必须手动升级至
-        Agent {{ config.agent_version || '当前版本' }}，与平台执行模板保持一致。</el-alert
+        >将向受控目标发起真实请求。单用户验证每次只运行一个节点；正式压测可选择
+        1–5 个节点。旧版节点必须手动升级至 Agent
+        {{
+          config.agent_version || "当前版本"
+        }}，与平台执行模板保持一致。</el-alert
       >
       <el-descriptions
         v-if="runDialog.plan"
         :column="1"
         border
         class="run-summary"
-        ><el-descriptions-item label="计划">{{
+      >
+        <el-descriptions-item label="计划">{{
           runDialog.plan.name
-        }}</el-descriptions-item
-        ><el-descriptions-item label="负载"
-          >{{ runDialog.plan.users }} 个虚拟用户；每秒启动
+        }}</el-descriptions-item>
+        <el-descriptions-item label="负载">
+          总 {{ runDialog.plan.users }} 个虚拟用户；总每秒启动
           {{ runDialog.plan.spawn_rate }} 个虚拟用户；{{
             runDialog.plan.duration_seconds
           }}
-          秒</el-descriptions-item
-        ><el-descriptions-item label="节点"
-          ><el-radio-group
+          秒
+        </el-descriptions-item>
+        <el-descriptions-item label="节点">
+          <el-radio-group
+            v-if="runDialog.mode === 'validation'"
             v-model="runDialog.nodeId"
             @change="resetRunRequestId"
             ><el-radio
-              v-for="node in onlineNodes"
-              :key="node.id"
-              :label="node.id"
-              >{{ node.name }}（{{
+              v-for="node in eligibilityItems"
+              :key="node.node_id"
+              :label="node.node_id"
+              :disabled="!eligibilityCanValidate(node)"
+              >{{ node.node_name }}（{{
                 performanceNodeStatusLabel(node.status)
-              }}）</el-radio
+              }}）{{
+                eligibilityReason(node) ? `：${eligibilityReason(node)}` : ""
+              }}</el-radio
             ></el-radio-group
-          ><span v-if="onlineNodes.length === 0" class="empty-node"
-            >暂无可用在线节点</span
-          ></el-descriptions-item
-        ></el-descriptions
+          ><el-checkbox-group
+            v-else
+            v-model="runDialog.nodeIds"
+            @change="resetRunRequestId"
+            ><div
+              v-for="node in eligibilityItems"
+              :key="node.node_id"
+              class="run-node-row"
+            >
+              <el-checkbox
+                :label="node.node_id"
+                :disabled="!eligibilityCanValidate(node)"
+              >
+                {{ node.node_name }}（{{
+                  performanceNodeStatusLabel(node.status)
+                }}）
+              </el-checkbox>
+              <span class="node-reason">{{
+                eligibilityReason(node) || "已通过验证"
+              }}</span>
+              <span
+                v-if="assignedFor(node.node_id) !== null"
+                class="node-assignment"
+                >预计 {{ assignedFor(node.node_id) }} 用户</span
+              >
+              <el-button
+                v-if="
+                  node.validation_valid && node.validation_run_id && canReport
+                "
+                link
+                type="primary"
+                @click="viewNodeValidation(node)"
+                >查看验证</el-button
+              >
+              <el-button
+                v-else-if="
+                  eligibilityCanValidate(node) && !node.validation_valid
+                "
+                link
+                type="primary"
+                @click="openValidationFromLoad(node.node_id)"
+                >单用户验证</el-button
+              >
+            </div>
+          </el-checkbox-group>
+          <span
+            v-if="!eligibilityLoading && !eligibilityItems.length"
+            class="empty-node"
+            >暂无可用节点</span
+          >
+        </el-descriptions-item>
+      </el-descriptions>
+      <el-button
+        :loading="eligibilityLoading"
+        @click="loadEligibility(captureScope(), runDialog.plan.id)"
+        >刷新节点资格</el-button
+      >
+      <el-alert v-if="eligibilityError" type="error" :closable="false">{{
+        eligibilityError
+      }}</el-alert>
+      <el-alert
+        v-if="runDialog.mode === 'load' && runDialog.nodeIds.length"
+        type="info"
+        :closable="false"
+        class="run-load-summary"
+      >
+        已选 {{ runDialog.nodeIds.length }} 个节点，共
+        {{ runDialog.plan?.users }} 用户；全局每秒启动
+        {{ runDialog.plan?.spawn_rate }} 用户，预计约
+        {{ rampSeconds }} 秒达到目标用户数，实际以运行曲线为准。
+      </el-alert>
+      <el-button
+        v-if="runDialog.mode === 'validation' && runDialog.fromLoad"
+        link
+        type="primary"
+        @click="openRun(runDialog.plan, 'load', runDialog.loadNodeIds)"
+        >返回正式压测节点选择</el-button
+      >
+      <el-alert
+        v-if="runDialog.mode === 'load' && loadBlockReason"
+        type="warning"
+        :closable="false"
+        class="run-load-summary"
+        >{{ loadBlockReason }}</el-alert
       >
       <template #footer
         ><el-button @click="runDialog.visible = false">取消</el-button
         ><el-button
           :type="runDialog.mode === 'validation' ? 'success' : 'danger'"
-          :disabled="!runDialog.nodeId"
+          :disabled="runSubmitDisabled"
           :loading="saving.run"
           @click="submitRun"
           >{{
@@ -581,6 +662,7 @@ import {
   getPerformanceConfig,
   getPerformanceNodeInstallation,
   getPerformanceNodes,
+  getPerformanceNodeEligibility,
   getPerformancePlans,
   getPerformanceTargets,
   performanceErrorMessage,
@@ -612,7 +694,13 @@ import {
   samePerformanceScope,
 } from "./performanceWorkspaceState";
 import {
+  assignedUsersByNode,
   createPerformanceRequestId,
+  eligibilityCanLoad,
+  eligibilityCanValidate,
+  eligibilityReason,
+  loadSelectionQuery,
+  readLoadSelection,
   executionUnavailableMessage,
   performanceExecutionPermissions,
 } from "./performanceExecutionState";
@@ -663,9 +751,16 @@ const runDialog = reactive({
   visible: false,
   plan: null,
   nodeId: null,
+  nodeIds: [],
+  loadNodeIds: [],
+  fromLoad: false,
   requestId: "",
   mode: "load",
 });
+const eligibilityItems = ref([]);
+const eligibilityLoading = ref(false);
+const eligibilityError = ref("");
+let eligibilityEpoch = 0;
 const installationDialog = reactive({
   visible: false,
   node: null,
@@ -716,6 +811,52 @@ const executionUnavailableReason = computed(() =>
 );
 const onlineNodes = computed(() =>
   nodes.value.filter((node) => node.status === "online"),
+);
+const selectedAssignments = computed(() =>
+  assignedUsersByNode(runDialog.plan?.users, runDialog.nodeIds),
+);
+const assignedFor = (nodeId) =>
+  selectedAssignments.value.find((item) => item.nodeId === String(nodeId))
+    ?.assignedUsers ?? null;
+const rampSeconds = computed(() => {
+  const users = Number(runDialog.plan?.users);
+  const rate = Number(runDialog.plan?.spawn_rate);
+  return Number.isFinite(users) && Number.isFinite(rate) && rate > 0
+    ? Math.ceil(users / rate)
+    : "-";
+});
+const selectedEligibility = computed(() =>
+  eligibilityItems.value.filter((item) =>
+    runDialog.nodeIds.includes(item.node_id),
+  ),
+);
+const loadBlockReason = computed(() => {
+  if (eligibilityError.value) return eligibilityError.value;
+  if (selectedEligibility.value.length !== runDialog.nodeIds.length)
+    return "所选节点资格已变化或未能读取，请刷新节点资格。";
+  if (runDialog.nodeIds.length > 5)
+    return "首期一次正式压测最多选择 5 个节点。";
+  if (Number(runDialog.plan?.users) < runDialog.nodeIds.length)
+    return "总用户数不能少于所选节点数。";
+  const blocked = selectedEligibility.value.filter(
+    (item) => !eligibilityCanLoad(item),
+  );
+  return blocked.length
+    ? `以下节点阻止正式压测：${blocked.map((item) => `${item.node_name}（${eligibilityReason(item)}）`).join("；")}`
+    : "";
+});
+const runSubmitDisabled = computed(
+  () =>
+    saving.run ||
+    eligibilityLoading.value ||
+    Boolean(eligibilityError.value) ||
+    !runDialog.requestId ||
+    (runDialog.mode === "validation"
+      ? !eligibilityItems.value.some(
+          (item) =>
+            item.node_id === runDialog.nodeId && eligibilityCanValidate(item),
+        )
+      : !runDialog.nodeIds.length || Boolean(loadBlockReason.value)),
 );
 const installationNode = computed(
   () =>
@@ -925,9 +1066,16 @@ function resetPlan() {
   planDialog.draftSource = null;
 }
 function resetRun() {
+  ++eligibilityEpoch;
+  eligibilityLoading.value = false;
+  eligibilityError.value = "";
+  eligibilityItems.value = [];
   Object.assign(runDialog, {
     plan: null,
     nodeId: null,
+    nodeIds: [],
+    loadNodeIds: [],
+    fromLoad: false,
     requestId: "",
     mode: "load",
   });
@@ -935,31 +1083,100 @@ function resetRun() {
 function resetRunRequestId() {
   if (runDialog.visible) runDialog.requestId = createPerformanceRequestId();
 }
-function openRun(plan, mode = "load") {
+async function loadEligibility(scope, planId) {
+  const requestEpoch = ++eligibilityEpoch;
+  const isCurrent = () =>
+    requestEpoch === eligibilityEpoch &&
+    scopeIsCurrent(scope) &&
+    runDialog.visible &&
+    String(runDialog.plan?.id) === String(planId);
+  eligibilityLoading.value = true;
+  eligibilityError.value = "";
+  try {
+    const response = dataOf(
+      await getPerformanceNodeEligibility(scope.projectId, planId),
+    );
+    if (!isCurrent()) return;
+    eligibilityItems.value = response?.items || [];
+    if (runDialog.mode === "validation") {
+      if (
+        !runDialog.nodeId ||
+        !eligibilityItems.value.some(
+          (item) =>
+            item.node_id === runDialog.nodeId && eligibilityCanValidate(item),
+        )
+      )
+        runDialog.nodeId =
+          eligibilityItems.value.find(eligibilityCanValidate)?.node_id || null;
+    } else if (!runDialog.nodeIds.length)
+      runDialog.nodeIds = eligibilityItems.value
+        .filter(eligibilityCanLoad)
+        .slice(0, 1)
+        .map((item) => item.node_id);
+  } catch (error) {
+    if (isCurrent())
+      eligibilityError.value = performanceErrorMessage(
+        error,
+        "加载节点执行资格失败，请重试",
+      );
+  } finally {
+    if (isCurrent()) eligibilityLoading.value = false;
+  }
+}
+function openRun(plan, mode = "load", preservedNodeIds = []) {
   if (!executionEnabled.value) return;
   Object.assign(runDialog, {
     visible: true,
     plan,
-    nodeId: onlineNodes.value[0]?.id || null,
+    nodeId: null,
+    nodeIds: preservedNodeIds,
+    loadNodeIds: [],
+    fromLoad: false,
     requestId: createPerformanceRequestId(),
     mode,
   });
+  eligibilityItems.value = [];
+  loadEligibility(captureScope(), plan.id);
+}
+function openValidationFromLoad(nodeId) {
+  const selected = [...runDialog.nodeIds];
+  openRun(runDialog.plan, "validation", selected);
+  runDialog.loadNodeIds = selected;
+  runDialog.fromLoad = true;
+  runDialog.nodeId = nodeId;
+}
+function viewNodeValidation(node) {
+  router.push({
+    name: "PerfRunDetail",
+    params: { runId: node.validation_run_id },
+    query: loadSelectionQuery(
+      projectId.value,
+      runDialog.plan.id,
+      runDialog.nodeIds,
+    ),
+  });
+  runDialog.visible = false;
 }
 async function submitRun() {
   if (
-    saving.run ||
+    runSubmitDisabled.value ||
     !runDialog.plan ||
-    !runDialog.nodeId ||
+    (runDialog.mode === "validation"
+      ? !runDialog.nodeId
+      : !runDialog.nodeIds.length) ||
     !runDialog.requestId
   )
     return;
   const scope = captureScope();
-  const { plan, nodeId, requestId } = runDialog;
+  const { plan, nodeId, nodeIds, requestId } = runDialog;
+  const returnQuery = runDialog.fromLoad
+    ? loadSelectionQuery(scope.projectId, plan.id, runDialog.loadNodeIds)
+    : {};
   saving.run = true;
   try {
     const run = dataOf(
       await createPerformanceRun(scope.projectId, plan.id, {
-        node_id: nodeId,
+        node_ids: runDialog.mode === "validation" ? [nodeId] : nodeIds,
         request_id: requestId,
         mode: runDialog.mode || "load",
       }),
@@ -969,7 +1186,11 @@ async function submitRun() {
     runDialog.visible = false;
     if (canReport.value) {
       ElMessage.success("运行已创建");
-      await router.push({ name: "PerfRunDetail", params: { runId: run.id } });
+      await router.push({
+        name: "PerfRunDetail",
+        params: { runId: run.id },
+        query: returnQuery,
+      });
     } else ElMessage.success("运行已创建；你没有查看执行详情的权限");
   } catch (error) {
     if (scopeIsCurrent(scope))
@@ -1378,6 +1599,18 @@ const activate = () => {
   active = true;
   syncActiveTab();
   refreshAll({ preservePlanDraft: planDialog.visible }).then(() => {
+    if (!active) return;
+    const selection = readLoadSelection(route.query, projectId.value);
+    if (selection) {
+      const plan = plans.value.find(
+        (item) => String(item.id) === selection.planId,
+      );
+      if (plan) openRun(plan, "load", selection.nodeIds);
+      else ElMessage.warning("原压测计划已不存在，请重新选择计划");
+      // MainLayout caches by fullPath. Keep these non-sensitive return fields;
+      // stripping them here would activate a different cached workspace and
+      // immediately discard the restored dialog.
+    }
     const imported = projectStore.consumePerformanceDraft(projectId.value);
     if (!imported?.draft || !active) return;
     openPlan(null, imported.draft, imported);
@@ -1443,6 +1676,21 @@ onBeforeUnmount(() => {
 }
 .run-summary {
   margin-top: 16px;
+}
+.run-node-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0;
+}
+.node-reason,
+.node-assignment {
+  color: var(--app-text-muted);
+  font-size: 13px;
+}
+.run-load-summary {
+  margin-top: 12px;
 }
 @media (max-width: 760px) {
   .toolbar {

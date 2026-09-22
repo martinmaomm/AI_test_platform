@@ -3,6 +3,10 @@
     <div class="toolbar">
       <el-button @click="router.push({ name: 'PerfRuns' })"
         >返回执行记录</el-button
+      ><el-button
+        v-if="returnSelection"
+        @click="router.push({ name: 'PerfPlans', query: route.query })"
+        >返回正式压测节点选择</el-button
       ><el-button :loading="loading" @click="loadRun">刷新</el-button
       ><el-button
         v-if="canExecute && canStopPerformanceRun(run?.status)"
@@ -30,12 +34,25 @@
         show-icon
         >执行完成，存在失败请求。</el-alert
       >
+      <el-alert
+        v-if="
+          run.status === 'incomplete' ||
+          (['completed', 'cancelled', 'failed'].includes(run.status) &&
+            metrics.complete === false)
+        "
+        type="error"
+        :closable="false"
+        show-icon
+        >本轮结果不完整：{{
+          run.reason || "存在节点失联、停止确认或统计缺口。"
+        }}</el-alert
+      >
       <el-descriptions :column="2" border class="summary">
         <el-descriptions-item label="计划">{{
           run.plan_name || "-"
         }}</el-descriptions-item
-        ><el-descriptions-item label="节点">{{
-          run.node_name || "-"
+        ><el-descriptions-item label="参与节点">{{
+          nodeNames
         }}</el-descriptions-item>
         <el-descriptions-item label="状态"
           ><el-tag :type="statusType(run.status)">{{
@@ -58,6 +75,12 @@
         ><el-descriptions-item label="结束时间">{{
           formatTime(run.finished_at)
         }}</el-descriptions-item>
+        <el-descriptions-item label="总目标用户">{{
+          run.snapshot?.users ?? "-"
+        }}</el-descriptions-item>
+        <el-descriptions-item label="总每秒启动用户">{{
+          run.snapshot?.spawn_rate ?? "-"
+        }}</el-descriptions-item>
       </el-descriptions>
       <PerformanceValidationSteps
         v-if="run.mode === 'validation'"
@@ -72,6 +95,20 @@
         </div>
       </div>
       <h3>指标趋势</h3>
+      <el-radio-group
+        v-if="runNodes.length"
+        v-model="selectedNodeId"
+        size="small"
+        class="node-filter"
+      >
+        <el-radio-button label="">全部节点</el-radio-button>
+        <el-radio-button
+          v-for="node in runNodes"
+          :key="node.node_id"
+          :label="node.node_id"
+          >{{ performanceRunNodeName(node) }}</el-radio-button
+        >
+      </el-radio-group>
       <v-chart
         v-if="samples.length"
         class="trend"
@@ -79,7 +116,7 @@
         autoresize
       /><el-empty v-else description="尚无指标采样" />
       <h3>接口明细</h3>
-      <el-table :data="metricEntries(run.latest_metrics)"
+      <el-table :data="metricEntries(displayMetrics)"
         ><el-table-column
           prop="name"
           label="名称"
@@ -110,6 +147,74 @@
           }}</template></el-table-column
         ></el-table
       >
+      <template v-if="run.mode === 'load'">
+        <h3>节点明细</h3>
+        <el-table :data="runNodes" row-key="node_id">
+          <el-table-column label="节点" min-width="140"
+            ><template #default="{ row }">{{
+              performanceRunNodeName(row)
+            }}</template></el-table-column
+          >
+          <el-table-column label="分配 / 当前用户" min-width="140"
+            ><template #default="{ row }"
+              >{{ row.assigned_users ?? "-" }} /
+              {{ currentUsers(row) }}</template
+            ></el-table-column
+          >
+          <el-table-column label="状态" min-width="110"
+            ><template #default="{ row }"
+              ><el-tag :type="statusType(row.status)">{{
+                runSummaryText(row)
+              }}</el-tag></template
+            ></el-table-column
+          >
+          <el-table-column label="请求 / 失败" min-width="115"
+            ><template #default="{ row }"
+              >{{ row.latest_metrics?.requests ?? "-" }} /
+              {{ row.latest_metrics?.failures ?? "-" }}</template
+            ></el-table-column
+          >
+          <el-table-column label="错误率" width="100"
+            ><template #default="{ row }">{{
+              formatErrorRate(row.latest_metrics?.error_rate)
+            }}</template></el-table-column
+          >
+          <el-table-column label="P95(ms)" width="100"
+            ><template #default="{ row }">{{
+              formatMetric(row.latest_metrics?.p95)
+            }}</template></el-table-column
+          >
+          <el-table-column label="Worker CPU / RSS" min-width="150"
+            ><template #default="{ row }">{{
+              resourceText(row)
+            }}</template></el-table-column
+          >
+          <el-table-column label="最后采样" min-width="165"
+            ><template #default="{ row }">{{
+              formatTime(row.metrics_samples?.at(-1)?.timestamp)
+            }}</template></el-table-column
+          >
+          <el-table-column label="停止 / 统计" min-width="140"
+            ><template #default="{ row }"
+              >{{
+                row.stopped_at
+                  ? "已确认"
+                  : row.reason_code === "lease_expired"
+                    ? "租约已失效"
+                    : row.status === "lost"
+                      ? "等待租约失效"
+                      : "-"
+              }}
+              / {{ completenessText(row) }}</template
+            ></el-table-column
+          >
+          <el-table-column label="原因" min-width="180"
+            ><template #default="{ row }">{{
+              row.reason || "-"
+            }}</template></el-table-column
+          >
+        </el-table>
+      </template>
       <template v-if="run.mode === 'validation'"
         ><h3>验证执行</h3>
         <el-descriptions :column="3" border
@@ -126,7 +231,7 @@
         ></template
       >
       <template v-if="failureEvidence.length && !run.validation_steps?.length"
-        ><h3>断言失败证据</h3>
+        ><h3>错误样本</h3>
         <el-table :data="failureEvidence"
           ><el-table-column
             prop="step_index"
@@ -162,7 +267,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import PerformanceValidationSteps from './PerformanceValidationSteps.vue';
+import PerformanceValidationSteps from "./PerformanceValidationSteps.vue";
 import { useRoute, useRouter } from "vue-router";
 import dayjs from "dayjs";
 import VChart from "vue-echarts";
@@ -194,7 +299,9 @@ import {
   metricEntries,
   metricSamples,
   performanceExecutionPermissions,
+  performanceRunNodeName,
   runSummaryText,
+  readLoadSelection,
   samePerformanceRunScope,
   sampleMetrics,
   validationStatusLabel,
@@ -218,6 +325,7 @@ const loading = ref(false);
 const stopping = ref(false);
 const pollError = ref("");
 const pollFailures = ref(0);
+const selectedNodeId = ref("");
 let pollTimer;
 let scopeEpoch = 0;
 let requestEpoch = 0;
@@ -233,25 +341,62 @@ const permissions = computed(() =>
 );
 const canReport = computed(() => permissions.value.canReport);
 const canExecute = computed(() => permissions.value.canExecute);
-const samples = computed(() => metricSamples(run.value?.metrics_samples));
+const returnSelection = computed(() =>
+  readLoadSelection(route.query, projectId.value),
+);
+const runNodes = computed(() =>
+  Array.isArray(run.value?.nodes) ? run.value.nodes : [],
+);
+const selectedNode = computed(
+  () =>
+    runNodes.value.find(
+      (node) => String(node.node_id) === String(selectedNodeId.value),
+    ) || null,
+);
+const displayMetrics = computed(
+  () => selectedNode.value?.latest_metrics || run.value?.latest_metrics || {},
+);
+const samples = computed(() =>
+  metricSamples(
+    selectedNode.value?.metrics_samples || run.value?.metrics_samples,
+  ),
+);
 const metrics = computed(() => run.value?.latest_metrics || {});
-const failureEvidence = computed(() => failureSamples(metrics.value));
+const failureEvidence = computed(() => {
+  const all = failureSamples(metrics.value);
+  return selectedNodeId.value
+    ? all.filter(
+        (item) => String(item.node_id) === String(selectedNodeId.value),
+      )
+    : all;
+});
+const nodeNames = computed(() => {
+  const names = runNodes.value.map(performanceRunNodeName);
+  return names.length ? names.join("、") : run.value?.node_name || "-";
+});
 const metricCards = computed(() => [
-  { label: "请求数", value: metrics.value.requests ?? "-" },
-  { label: "失败数", value: metrics.value.failures ?? "-" },
-  { label: "RPS（累计）", value: formatMetric(metrics.value.rps) },
-  { label: "错误率", value: formatErrorRate(metrics.value.error_rate) },
+  { label: "请求数", value: displayMetrics.value.requests ?? "-" },
+  { label: "失败数", value: displayMetrics.value.failures ?? "-" },
+  { label: "平均 RPS", value: formatMetric(displayMetrics.value.rps) },
+  { label: "错误率", value: formatErrorRate(displayMetrics.value.error_rate) },
   {
     label: "平均响应(ms)",
-    value: formatMetric(metrics.value.avg_response_time),
+    value: formatMetric(displayMetrics.value.avg_response_time),
   },
-  { label: "P95(ms)", value: formatMetric(metrics.value.p95) },
-  { label: "P99(ms)", value: formatMetric(metrics.value.p99) },
-  { label: "虚拟用户", value: metrics.value.users ?? "-" },
+  { label: "P95(ms)", value: formatMetric(displayMetrics.value.p95) },
+  { label: "P99(ms)", value: formatMetric(displayMetrics.value.p99) },
+  {
+    label: "虚拟用户",
+    value: selectedNode.value
+      ? currentUsers(selectedNode.value)
+      : ["incomplete", "failed"].includes(run.value?.status)
+        ? "未知"
+        : (displayMetrics.value.users ?? "-"),
+  },
 ]);
 const trendOption = computed(() => ({
   tooltip: { trigger: "axis", valueFormatter: (value) => formatMetric(value) },
-  legend: { data: ["RPS（累计）", "失败数", "P95(ms)"] },
+  legend: { data: ["平均 RPS", "失败数", "实际用户数", "P95(ms)"] },
   grid: { left: 55, right: 135, top: 40, bottom: 32 },
   xAxis: {
     type: "category",
@@ -259,12 +404,12 @@ const trendOption = computed(() => ({
   },
   yAxis: [
     { type: "value", name: "RPS" },
-    { type: "value", name: "失败数", position: "right" },
+    { type: "value", name: "失败/用户数", position: "right" },
     { type: "value", name: "P95 (ms)", position: "right", offset: 58 },
   ],
   series: [
     {
-      name: "RPS（累计）",
+      name: "平均 RPS",
       type: "line",
       smooth: true,
       yAxisIndex: 0,
@@ -275,6 +420,12 @@ const trendOption = computed(() => ({
       type: "line",
       yAxisIndex: 1,
       data: samples.value.map((item) => sampleMetrics(item).failures ?? 0),
+    },
+    {
+      name: "实际用户数",
+      type: "line",
+      yAxisIndex: 1,
+      data: samples.value.map((item) => sampleMetrics(item).users ?? null),
     },
     {
       name: "P95(ms)",
@@ -297,6 +448,29 @@ const statusType = (status) =>
     queued: "warning",
     running: "primary",
   })[status] || "info";
+const currentUsers = (node) => {
+  if (["offline", "lost", "incomplete", "failed"].includes(node?.status))
+    return "未知";
+  return node?.latest_metrics?.users ?? "暂无数据";
+};
+const resourceText = (node) => {
+  const metrics = node?.latest_metrics || {};
+  if (metrics.worker_cpu == null && metrics.worker_memory == null)
+    return "暂无数据";
+  const cpu =
+    metrics.worker_cpu == null ? "-" : `${formatMetric(metrics.worker_cpu)}%`;
+  const memory =
+    metrics.worker_memory == null
+      ? "-"
+      : `${formatMetric(metrics.worker_memory / 1024 / 1024)} MiB`;
+  return `${cpu} / ${memory}`;
+};
+const completenessText = (node) =>
+  node?.latest_metrics?.complete === true
+    ? "完整"
+    : node?.latest_metrics?.complete === false
+      ? "不完整"
+      : "旧版未记录";
 function stopPolling() {
   clearTimeout(pollTimer);
   pollTimer = undefined;
@@ -325,6 +499,13 @@ async function loadRun() {
     if (currentRequestEpoch !== requestEpoch || !scopeIsCurrent(scope)) return;
     project.value = access?.data ?? access;
     run.value = response?.data ?? response;
+    if (
+      selectedNodeId.value &&
+      !runNodes.value.some(
+        (node) => String(node.node_id) === String(selectedNodeId.value),
+      )
+    )
+      selectedNodeId.value = "";
     pollFailures.value = 0;
     pollError.value = "";
     if (isPerformanceRunActive(run.value?.status)) schedulePolling();
@@ -398,6 +579,9 @@ onBeforeUnmount(() => {
 }
 .summary {
   margin: 16px 0;
+}
+.node-filter {
+  margin: -4px 0 12px;
 }
 .metrics {
   display: grid;

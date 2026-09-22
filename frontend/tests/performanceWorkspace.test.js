@@ -24,8 +24,12 @@ import {
 } from "../src/utils/performanceInstallation.js";
 import {
   canStopPerformanceRun,
+  assignedUsersByNode,
   completedWithFailures,
   createPerformanceRequestId,
+  eligibilityCanLoad,
+  eligibilityCanValidate,
+  eligibilityReason,
   formatErrorRate,
   formatMetric,
   metricEntries,
@@ -33,6 +37,8 @@ import {
   performanceExecutionPermissions,
   performanceRunStatusLabel,
   requestQueryRows,
+  loadSelectionQuery,
+  readLoadSelection,
   samePerformanceRunScope,
   sampleMetrics,
 } from "../src/views/perf-testing/performanceExecutionState.js";
@@ -136,7 +142,7 @@ test("performance API keeps management responses in response.data and node lifec
   assert.match(source, /performanceErrorMessage/);
 });
 
-test("workspace creates one-node execution requests and delegates plan editing to the scoped drawer", async () => {
+test("workspace creates eligibility-checked multi-node runs and delegates plan editing to the scoped drawer", async () => {
   const source = await read("../src/views/perf-testing/PerfWorkspace.vue");
   assert.match(source, /PerformancePlanEditor/);
   assert.doesNotMatch(source, /<el-tabs/);
@@ -190,13 +196,13 @@ test("workspace creates one-node execution requests and delegates plan editing t
     /if\s*\(\s*!canRegenerateInstallation\(\s*node,\s*installationDialog\.installation,\s*installationCommandIsExpired\.value,?\s*\)\s*\)\s*return[\s\S]*?regeneratePerformanceNodeInstallation/,
   );
   assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/);
-  assert.match(
-    source,
-    /createPerformanceRun\(scope\.projectId, plan\.id, \{\s*node_id: nodeId,\s*request_id: requestId,\s*mode: runDialog\.mode \|\| "load",?\s*\}\)/,
-  );
+  assert.match(source, /getPerformanceNodeEligibility/);
+  assert.match(source, /node_ids: runDialog\.mode === "validation" \? \[nodeId\] : nodeIds/);
+  assert.match(source, /eligibilityCanLoad/);
+  assert.match(source, /预计 \{\{ assignedFor\(node\.node_id\) \}\} 用户/);
   assert.match(source, /openRun\(row, ['"]validation['"]\)/);
   assert.match(source, /execution_unavailable_reason/);
-  assert.match(source, /每次仅运行一个节点/);
+  assert.match(source, /正式压测可选择\s+1–5\s+个节点/);
   assert.match(source, /运行任务（含停止中）。吊销将请求停止，报告可能不完整/);
   assert.match(source, /activeRunConflictCount\(error\)/);
   assert.match(
@@ -232,6 +238,29 @@ test("workspace creates one-node execution requests and delegates plan editing t
   assert.match(source, /onActivated\(activate\)/);
   assert.match(source, /onDeactivated\(deactivate\)/);
   assert.match(source, /preservePlanDraft: planDialog\.visible/);
+});
+
+test("multi-node allocation is UUID-stable, balanced and blocks invalid eligibility", () => {
+  assert.deepEqual(
+    assignedUsersByNode(1000, ["c", "a", "b"]),
+    [
+      { nodeId: "a", assignedUsers: 334 },
+      { nodeId: "b", assignedUsers: 333 },
+      { nodeId: "c", assignedUsers: 333 },
+    ],
+  );
+  assert.deepEqual(assignedUsersByNode(2, ["a", "b", "c"]), []);
+  assert.equal(eligibilityCanValidate({ status: "online", compatible: true }), true);
+  assert.equal(eligibilityCanLoad({ status: "online", compatible: true, validation_valid: true }), true);
+  assert.equal(eligibilityCanLoad({ status: "online", compatible: true, validation_valid: false }), false);
+  assert.match(eligibilityReason({ status: "online", compatible: true, validation_valid: false }), /尚未通过/);
+});
+
+test("run detail only treats an explicit complete flag as complete statistics", async () => {
+  const source = await read("../src/views/perf-testing/PerfRunDetail.vue");
+  assert.match(source, /latest_metrics\?\.complete === true/);
+  assert.match(source, /"旧版未记录"/);
+  assert.doesNotMatch(source, /final_seq != null/);
 });
 
 test("only the backend platform-admin definition can manage nodes and targets", () => {
@@ -668,4 +697,14 @@ test("run detail separates route scope from polling requests so a delayed confir
     detail,
     /if \(scopeIsCurrent\(scope\)\) stopping\.value = false/,
   );
+});
+
+
+test("validation return selection survives navigation but is bound to the project", () => {
+  const nodes = ["00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000001"];
+  const query = loadSelectionQuery(3, 7, nodes);
+  assert.deepEqual(readLoadSelection(query, 3), { planId: "7", nodeIds: [...nodes].reverse() });
+  assert.equal(readLoadSelection(query, 4), null);
+  assert.equal(readLoadSelection({ ...query, return_nodes: "invalid" }, 3), null);
+  assert.deepEqual(readLoadSelection(loadSelectionQuery(3, 7, []), 3), { planId: "7", nodeIds: [] });
 });

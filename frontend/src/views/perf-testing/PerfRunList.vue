@@ -13,7 +13,9 @@
     />
     <el-table v-else v-loading="loading" :data="runs" row-key="id">
       <el-table-column prop="plan_name" label="计划" min-width="150" />
-      <el-table-column prop="node_name" label="节点" min-width="130" />
+      <el-table-column label="节点" min-width="180">
+        <template #default="{ row }">{{ nodeSummary(row) }}</template>
+      </el-table-column>
       <el-table-column label="模式 / 验证" min-width="160"
         ><template #default="{ row }"
           >{{ row.mode === "validation" ? "单用户验证" : "正式压测"
@@ -71,6 +73,7 @@ import { getProject } from "@/api/projects";
 import { getPerformanceRuns, performanceErrorMessage } from "@/api/performance";
 import {
   performanceExecutionPermissions,
+  performanceRunNodeName,
   runSummaryText,
   validationStatusLabel,
   validationStatusType,
@@ -100,6 +103,14 @@ const canReport = computed(
 );
 const formatTime = (value) =>
   value ? dayjs(value).format("YYYY-MM-DD HH:mm:ss") : "-";
+const nodeSummary = (run) => {
+  const nodes = Array.isArray(run?.nodes) ? run.nodes : [];
+  if (nodes.length > 1 || Number(run?.node_count) > 1) {
+    const names = nodes.map(performanceRunNodeName);
+    return `${run.node_count || nodes.length} 个节点${names.length ? ` · ${names.join("、")}` : ""}`;
+  }
+  return nodes[0] ? performanceRunNodeName(nodes[0]) : run?.node_name || "-";
+};
 const statusType = (status) =>
   ({
     completed: "success",

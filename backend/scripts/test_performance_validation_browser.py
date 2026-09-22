@@ -49,9 +49,11 @@ def seed(fixture):
         'validation_complete': True, 'validation_passed': False, 'main_steps_completed': 0,
         'main_steps_total': 2, 'failure_samples': failures, 'validation_steps': trace.report()}, snapshot, 'validation')
     def run(mode, metrics):
-        return PerformanceRun.objects.create(project_id=fixture['project']['id'], node=node,
+        record = PerformanceRun.objects.create(project_id=fixture['project']['id'],
             request_id=uuid.uuid4(), mode=mode, status='completed', snapshot=snapshot,
             snapshot_sha256='0' * 64, latest_metrics=metrics)
+        record.participants.create(node=node, node_name=node.name, assigned_users=1, latest_metrics=metrics)
+        return record
     fixture['detailed'] = str(run('validation', metrics).pk)
     fixture['legacy'] = str(run('validation', {'requests': 2, 'failures': 1, 'failure_samples': failures}).pk)
     fixture['load'] = str(run('load', {'requests': 2, 'failures': 1, 'failure_samples': failures}).pk)
@@ -122,9 +124,9 @@ def verify(origin, fixture):
             details.screenshot(path=str(output / 'raw-details.png'), animations='disabled')
             page.goto(origin + '/perf-testing/runs/' + fixture['legacy'])
             expect(page.get_by_test_id('validation-details-unavailable')).to_contain_text('历史缺失响应无法补回')
-            expect(page.get_by_text('断言失败证据', exact=True)).to_be_visible()
+            expect(page.get_by_text('错误样本', exact=True)).to_be_visible()
             page.goto(origin + '/perf-testing/runs/' + fixture['load'])
-            expect(page.get_by_text('断言失败证据', exact=True)).to_be_visible()
+            expect(page.get_by_text('错误样本', exact=True)).to_be_visible()
             expect(page.get_by_test_id('validation-step-details')).not_to_be_visible()
             assert not errors and not external, (errors, external)
             print(json.dumps({'browser': 'real Vue/Django/Chrome', 'assertion_details': True,

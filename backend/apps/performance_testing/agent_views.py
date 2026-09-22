@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 
 from .auth import NodeTokenAuthentication
 from .constants import HEARTBEAT_INTERVAL_SECONDS, NODE_OFFLINE_AFTER_SECONDS
-from .constants import PROTOCOL_VERSION
+from .constants import AGENT_VERSION, ENGINE_VERSION, PROTOCOL_VERSION
 from .parsers import LimitedJSONParser
 from .serializers import EnrollmentSerializer, HeartbeatSerializer
 from .run_services import RunReportRejected, execution_configuration
@@ -84,12 +84,20 @@ class AgentHeartbeatView(APIView):
                 'error': {'code': 'run_report_rejected', 'message': str(exc)},
             }, status=409)
         configuration = execution_configuration()
+        execution_compatible = bool(
+            data['protocol_version'] == PROTOCOL_VERSION
+            and data['agent_version'] == AGENT_VERSION
+            and data['engine_version'] == ENGINE_VERSION
+        )
         return _ok({
             'node_id': str(request.performance_node.pk),
             'server_time': server_time,
             'heartbeat_interval_seconds': HEARTBEAT_INTERVAL_SECONDS,
             'lease_seconds': NODE_OFFLINE_AFTER_SECONDS,
-            'protocol_version': PROTOCOL_VERSION,
+            # Echo a supported legacy management protocol so an old Agent can
+            # keep heartbeating and surface the upgrade prompt. It remains
+            # execution-disabled and can never receive a protocol-3 prepare.
+            'protocol_version': data['protocol_version'],
             'command': command,
-            'execution_enabled': bool(configuration['available']),
+            'execution_enabled': bool(configuration['available'] and execution_compatible),
         })

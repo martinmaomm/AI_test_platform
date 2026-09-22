@@ -70,3 +70,50 @@ class PerformanceMigrationTests(SimpleTestCase):
         self.assertEqual(migration.operations[1].model_name, 'performancenode')
         self.assertEqual(migration.operations[1].name, 'deleted_at')
         self.assertTrue(all(item.reversible for item in migration.operations))
+
+    def test_multi_node_migration_backfills_before_removing_single_node_fields(self):
+        module = importlib.import_module(
+            'performance_testing.migrations.0005_performancerunnode_and_more',
+        )
+        operations = module.Migration.operations
+        data_index = next(
+            index for index, item in enumerate(operations) if isinstance(item, RunPython)
+        )
+        self.assertFalse(operations[data_index].reversible)
+        removed = [
+            index for index, item in enumerate(operations)
+            if isinstance(item, RemoveField) and item.model_name == 'performancerun'
+        ]
+        self.assertEqual(len(removed), 4)
+        self.assertTrue(all(data_index < index for index in removed))
+
+        run = SimpleNamespace(
+            pk='run-id', node_id='node-id', snapshot={'users': 7},
+            validation_key='v' * 64, mode='validation', status='completed',
+            node_command={'type': 'prepare'}, node_report={'state': 'stopped'},
+            node_report_seq=9, started_at='start', reason_code='', reason='',
+            latest_metrics={'requests': 3}, metrics_samples=[{'metrics': {}}],
+        )
+        run_manager = Mock()
+        run_manager.all.return_value.iterator.return_value = iter([run])
+        run_model = SimpleNamespace(objects=run_manager)
+        participant_manager = Mock()
+        participant_model = Mock()
+        participant_model.objects = participant_manager
+        apps = Mock()
+        apps.get_model.side_effect = (run_model, participant_model)
+
+        module.backfill_run_participants(apps, None)
+
+        created = participant_model.call_args.kwargs
+        self.assertEqual(created['run_id'], 'run-id')
+        self.assertEqual(created['node_id'], 'node-id')
+        self.assertEqual(created['assigned_users'], 7)
+        self.assertEqual(created['validation_run_id'], 'run-id')
+        self.assertEqual(created['status'], 'stopped')
+        self.assertEqual(created['node_report_seq'], 9)
+        self.assertEqual(created['started_at'], 'start')
+        self.assertEqual(created['node_name'], '')
+        self.assertIsNone(created['node_protocol_version'])
+        self.assertNotIn('ready_at', created)
+        participant_manager.bulk_create.assert_called_once()

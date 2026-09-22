@@ -1,6 +1,10 @@
 from datetime import timedelta
+from pathlib import Path
+import sys
+import tempfile
 import uuid
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from django.test import TestCase
 from django.utils import timezone
@@ -8,7 +12,8 @@ from rest_framework.test import APIClient
 
 from performance_testing.constants import AGENT_VERSION, ENGINE_VERSION, PROTOCOL_VERSION
 from performance_testing.models import (
-    PerformanceNode, PerformancePlan, PerformanceRun, PerformanceTarget,
+    PerformanceNode, PerformancePlan, PerformanceRun, PerformanceRunNode,
+    PerformanceTarget,
 )
 from performance_testing.services import revoke_node as revoke_node_service
 from projects.models import Project, ProjectMember
@@ -53,6 +58,16 @@ class PerformanceManagementAPITests(TestCase):
 
     def auth(self, user):
         self.client.force_authenticate(user=user)
+
+    def create_run_for_node(self, node, **kwargs):
+        defaults = {
+            'project': self.project, 'created_by': self.admin,
+            'request_id': uuid.uuid4(), 'snapshot': {}, 'snapshot_sha256': '0' * 64,
+        }
+        defaults.update(kwargs)
+        run = PerformanceRun.objects.create(**defaults)
+        PerformanceRunNode.objects.create(run=run, node=node, node_name=node.name)
+        return run
 
     def create_target(self, project=None, methods=None):
         return PerformanceTarget.objects.create(
@@ -202,7 +217,7 @@ class PerformanceManagementAPITests(TestCase):
             lambda item: item['steps'][0].update(method='POST'),
             lambda item: item['steps'][0].update(path='//evil.example/x'),
             lambda item: item['steps'][0].update(path='https://evil.example/x'),
-            lambda item: item.update(users=101),
+            lambda item: item.update(users=1001),
             lambda item: item.update(users=True),
             lambda item: item.update(users='2'),
             lambda item: item.update(target_id=True),
@@ -293,15 +308,9 @@ class PerformanceManagementAPITests(TestCase):
         second = PerformanceNode.objects.create(
             project=self.project, name='second', network_mode='lan',
         )
-        PerformanceRun.objects.create(
-            project=self.project, node=first, created_by=self.admin,
-            request_id=uuid.uuid4(), status=PerformanceRun.Status.RUNNING,
-            snapshot={}, snapshot_sha256='0' * 64,
-        )
-        PerformanceRun.objects.create(
-            project=self.project, node=first, created_by=self.admin,
-            request_id=uuid.uuid4(), status=PerformanceRun.Status.COMPLETED,
-            snapshot={}, snapshot_sha256='0' * 64, finished_at=timezone.now(),
+        self.create_run_for_node(first, status=PerformanceRun.Status.RUNNING)
+        self.create_run_for_node(
+            first, status=PerformanceRun.Status.COMPLETED, finished_at=timezone.now(),
         )
 
         self.auth(self.viewer)
@@ -326,9 +335,8 @@ class PerformanceManagementAPITests(TestCase):
             project=self.project, name='historical-node', network_mode='lan',
             revoked_at=timezone.now(),
         )
-        run = PerformanceRun.objects.create(
-            project=self.project, node=node, created_by=self.admin,
-            request_id=uuid.uuid4(), status=PerformanceRun.Status.COMPLETED,
+        run = self.create_run_for_node(
+            node, status=PerformanceRun.Status.COMPLETED,
             snapshot={'plan_name': 'historical-plan'}, snapshot_sha256='a' * 64,
             finished_at=timezone.now(),
         )
@@ -370,8 +378,8 @@ class PerformanceManagementAPITests(TestCase):
 
         detail = self.client.get(self.path(f'runs/{run.pk}/'))
         self.assertEqual(detail.status_code, 200, detail.data)
-        self.assertEqual(detail.data['data']['node_name'], 'historical-node')
-        self.assertEqual(PerformanceRun.objects.get(pk=run.pk).node_id, node.pk)
+        self.assertEqual(detail.data['data']['nodes'][0]['node_name'], 'historical-node')
+        self.assertEqual(PerformanceRun.objects.get(pk=run.pk).participants.get().node_id, node.pk)
 
     def test_soft_delete_rejects_unrevoked_and_every_active_status(self):
         unrevoked = PerformanceNode.objects.create(
@@ -389,11 +397,7 @@ class PerformanceManagementAPITests(TestCase):
                     project=self.project, name=f'active-{run_status}', network_mode='lan',
                     revoked_at=timezone.now(),
                 )
-                PerformanceRun.objects.create(
-                    project=self.project, node=node, created_by=self.admin,
-                    request_id=uuid.uuid4(), status=run_status,
-                    snapshot={}, snapshot_sha256='0' * 64,
-                )
+                self.create_run_for_node(node, status=run_status)
                 response = self.client.delete(self.path(f'nodes/{node.pk}/'))
                 self.assertEqual(response.status_code, 409, response.data)
                 node.refresh_from_db()
@@ -559,6 +563,60 @@ class PerformanceAgentProtocolTests(TestCase):
         self.assertEqual(node.agent_version, '0.2.0')
         self.assertEqual(node.protocol_version, PROTOCOL_VERSION)
         self.assertEqual(node.engine_version, ENGINE_VERSION)
+
+    @patch(
+        'performance_testing.agent_views.execution_configuration',
+        return_value={'available': True},
+    )
+    @patch(
+        'performance_testing.services.execution_configuration',
+        return_value={'available': True},
+    )
+    def test_real_032_protocol2_client_keeps_idle_management_heartbeat(self, _, __):
+        repository = Path(__file__).resolve().parents[4]
+        node_source = repository / 'performance-node' / 'src'
+        sys.path.insert(0, str(node_source))
+        try:
+            import performance_node.client as legacy_client
+            from performance_node.config import NodeConfig
+
+            api = self.client
+
+            class APITransport:
+                def post(self, url, payload, *, token=None, **_kwargs):
+                    path = urlsplit(url).path
+                    headers = {'HTTP_AUTHORIZATION': f'Node {token}'} if token else {}
+                    response = api.post(path, payload, format='json', **headers)
+                    if response.status_code != 200:
+                        raise AssertionError(response.data)
+                    return response.json()['data']
+
+            with tempfile.TemporaryDirectory(prefix='legacy-performance-node-') as temporary:
+                configuration = NodeConfig(
+                    'https://platform.example.test', Path(temporary), True,
+                )
+                with patch.object(legacy_client, 'PROTOCOL_VERSION', 2), patch.object(
+                    legacy_client, '__version__', '0.3.2',
+                ):
+                    agent = legacy_client.PerformanceNodeClient(
+                        configuration, transport=APITransport(),
+                    )
+                    identity = agent.enroll(
+                        self.enrollment_token, expected_node_id=self.node_id,
+                    )
+                    result = agent.heartbeat(identity)
+            self.assertEqual(result.command, {'type': 'idle'})
+            node = PerformanceNode.objects.get(pk=self.node_id)
+            self.assertEqual(node.protocol_version, 2)
+            self.assertEqual(node.agent_version, '0.3.2')
+            raw = self.heartbeat(
+                identity.agent_token, protocol_version=2, agent_version='0.3.2',
+            )
+            self.assertEqual(raw.data['data']['protocol_version'], 2)
+            self.assertFalse(raw.data['data']['execution_enabled'])
+            self.assertEqual(raw.data['data']['command'], {'type': 'idle'})
+        finally:
+            sys.path.remove(str(node_source))
 
     def test_resources_are_strict_bounded_and_finite(self):
         agent_token = self.enroll().data['data']['agent_token']

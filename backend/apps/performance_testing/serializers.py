@@ -9,9 +9,12 @@ from rest_framework import serializers
 
 from .constants import (
     ALLOWED_HTTP_METHODS, MAX_DURATION_SECONDS, MAX_REQUEST_BYTES,
-    MAX_SPAWN_RATE, MAX_STEPS, MAX_USERS,
+    MAX_NODES_PER_RUN, MAX_SPAWN_RATE, MAX_STEPS, MAX_USERS,
 )
-from .models import PerformanceNode, PerformancePlan, PerformanceRun, PerformanceTarget
+from .models import (
+    PerformanceNode, PerformancePlan, PerformanceRun, PerformanceRunNode,
+    PerformanceTarget,
+)
 
 
 _CONTROL_RE = re.compile(r'[\x00-\x1f\x7f]')
@@ -532,9 +535,19 @@ class RunReportSerializer(StrictSerializer):
 
 
 class PerformanceRunCreateSerializer(StrictSerializer):
-    node_id = serializers.UUIDField()
+    node_ids = serializers.ListField(
+        child=serializers.UUIDField(), allow_empty=False, max_length=MAX_NODES_PER_RUN,
+    )
     request_id = serializers.UUIDField()
     mode = serializers.ChoiceField(choices=('validation', 'load'), default='load')
+
+    def validate(self, attrs):
+        node_ids = attrs['node_ids']
+        if len(node_ids) != len(set(node_ids)):
+            raise serializers.ValidationError({'node_ids': '不能包含重复节点。'})
+        if attrs['mode'] == PerformanceRun.Mode.VALIDATION and len(node_ids) != 1:
+            raise serializers.ValidationError({'node_ids': '单用户验证必须且只能选择一个节点。'})
+        return attrs
 
 
 class StrictBooleanField(serializers.BooleanField):
@@ -548,16 +561,57 @@ class NodeRevokeSerializer(StrictSerializer):
     confirm_stop = StrictBooleanField(required=False, default=False)
 
 
+class PerformanceRunNodeListSerializer(serializers.ModelSerializer):
+    node_id = serializers.UUIDField(read_only=True)
+    node_name = serializers.SerializerMethodField()
+    node_name_source = serializers.SerializerMethodField()
+    latest_metrics = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PerformanceRunNode
+        fields = (
+            'node_id', 'node_name', 'node_name_source', 'assigned_users', 'status',
+            'reason_code', 'reason', 'latest_metrics',
+        )
+        read_only_fields = fields
+
+    def get_node_name(self, obj):
+        return obj.node_name or obj.node.name
+
+    def get_node_name_source(self, obj):
+        return 'snapshot' if obj.node_name else 'current_node'
+
+    def get_latest_metrics(self, obj):
+        # Step request/response evidence is only exposed through the bounded,
+        # REPORT-protected validation_steps detail field on the parent run.
+        return {
+            key: value for key, value in (obj.latest_metrics or {}).items()
+            if key != 'validation_steps'
+        }
+
+
+class PerformanceRunNodeDetailSerializer(PerformanceRunNodeListSerializer):
+    validation_run_id = serializers.UUIDField(read_only=True, allow_null=True)
+
+    class Meta(PerformanceRunNodeListSerializer.Meta):
+        fields = PerformanceRunNodeListSerializer.Meta.fields + (
+            'node_agent_version', 'node_protocol_version', 'node_engine_version',
+            'validation_key', 'validation_run_id', 'node_report_seq', 'ready_at',
+            'started_at', 'stopped_at', 'last_command_at', 'metrics_samples',
+        )
+
+
 class PerformanceRunListSerializer(serializers.ModelSerializer):
     plan_name = serializers.SerializerMethodField()
-    node_name = serializers.SerializerMethodField()
+    node_count = serializers.SerializerMethodField()
+    nodes = serializers.SerializerMethodField()
     validation_status = serializers.SerializerMethodField()
     latest_metrics = serializers.SerializerMethodField()
 
     class Meta:
         model = PerformanceRun
         fields = (
-            'id', 'plan_id', 'plan_name', 'node_id', 'node_name', 'mode',
+            'id', 'plan_id', 'plan_name', 'node_count', 'nodes', 'mode',
             'status', 'validation_status',
             'created_at', 'started_at', 'finished_at', 'reason_code', 'reason',
             'latest_metrics',
@@ -567,8 +621,15 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
     def get_plan_name(self, obj):
         return (obj.snapshot or {}).get('plan_name', '')
 
-    def get_node_name(self, obj):
-        return obj.node.name
+    def get_node_count(self, obj):
+        return len(self._participants(obj))
+
+    def get_nodes(self, obj):
+        return PerformanceRunNodeListSerializer(self._participants(obj), many=True).data
+
+    @staticmethod
+    def _participants(obj):
+        return list(obj.participants.all())
 
     def get_latest_metrics(self, obj):
         # Response bodies belong only to the REPORT-protected detail endpoint.
@@ -584,8 +645,11 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
         if obj.plan_id is None:
             return 'stale'
         from .run_services import validation_key_for
+        participants = self._participants(obj)
+        if len(participants) != 1:
+            return 'stale'
         try:
-            current = validation_key_for(obj.plan, obj.node)
+            current = validation_key_for(obj.plan, participants[0].node)
         except (TypeError, ValueError):
             return 'stale'
         return 'passed' if current == obj.validation_key else 'stale'
@@ -599,6 +663,9 @@ class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
             return []
         from .controller import bounded_validation_steps
         return bounded_validation_steps((obj.latest_metrics or {}).get('validation_steps', []), obj.snapshot)
+
+    def get_nodes(self, obj):
+        return PerformanceRunNodeDetailSerializer(self._participants(obj), many=True).data
 
     class Meta(PerformanceRunListSerializer.Meta):
         fields = PerformanceRunListSerializer.Meta.fields + ('metrics_samples', 'snapshot', 'validation_steps')

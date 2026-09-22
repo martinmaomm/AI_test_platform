@@ -58,7 +58,9 @@ def _visible_nodes(project):
         project=project, deleted_at__isnull=True,
     ).annotate(
         active_run_count=Count(
-            'runs', filter=Q(runs__status__in=PerformanceRun.ACTIVE_STATUSES),
+            'run_participations__run',
+            filter=Q(run_participations__run__status__in=PerformanceRun.ACTIVE_STATUSES),
+            distinct=True,
         ),
     )
 
@@ -243,7 +245,7 @@ class NodeDetailView(ManagementAPIView):
             if node.revoked_at is None:
                 return _conflict('节点必须先吊销才能删除。')
             active_run_count = PerformanceRun.objects.filter(
-                node=node, status__in=PerformanceRun.ACTIVE_STATUSES,
+                participants__node=node, status__in=PerformanceRun.ACTIVE_STATUSES,
             ).count()
             if active_run_count:
                 return _conflict(f'节点仍有 {active_run_count} 个未结束运行，不能删除。')

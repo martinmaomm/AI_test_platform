@@ -11,9 +11,9 @@ from django.utils import timezone
 from projects.models import Project
 
 from .constants import (
-    ENGINE_VERSION, ENROLLMENT_TTL_SECONDS,
+    AGENT_VERSION, ENGINE_VERSION, ENROLLMENT_TTL_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS, NODE_OFFLINE_AFTER_SECONDS, PROTOCOL_VERSION,
-    SUPPORTED_AGENT_VERSIONS,
+    SUPPORTED_AGENT_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS,
 )
 from .models import PerformanceNode, PerformanceRun
 from .run_services import execution_configuration, stop_runs_for_node_identity_change
@@ -76,7 +76,7 @@ def _parse_credential(raw):
 
 def ensure_supported_versions(data):
     if (
-        data.get('protocol_version') != PROTOCOL_VERSION
+        data.get('protocol_version') not in SUPPORTED_PROTOCOL_VERSIONS
         or data.get('agent_version') not in SUPPORTED_AGENT_VERSIONS
         or data.get('engine_version') != ENGINE_VERSION
     ):
@@ -233,7 +233,7 @@ def revoke_node(node, confirm_stop=False):
     if locked is None:
         raise PerformanceNode.DoesNotExist
     active_run_count = PerformanceRun.objects.filter(
-        node=locked, status__in=PerformanceRun.ACTIVE_STATUSES,
+        participants__node=locked, status__in=PerformanceRun.ACTIVE_STATUSES,
     ).count()
     if active_run_count and not confirm_stop:
         raise NodeHasActiveRuns(active_run_count)
@@ -265,11 +265,16 @@ def enrollment_response(node, token, serializer_class):
 
 def agent_enrollment_response(node, agent_token):
     configuration = execution_configuration()
+    execution_compatible = bool(
+        node.protocol_version == PROTOCOL_VERSION
+        and node.agent_version == AGENT_VERSION
+        and node.engine_version == ENGINE_VERSION
+    )
     return {
         'node_id': str(node.pk),
         'agent_token': agent_token,
         'heartbeat_interval_seconds': HEARTBEAT_INTERVAL_SECONDS,
         'lease_seconds': NODE_OFFLINE_AFTER_SECONDS,
-        'protocol_version': PROTOCOL_VERSION,
-        'execution_enabled': bool(configuration['available']),
+        'protocol_version': node.protocol_version,
+        'execution_enabled': bool(configuration['available'] and execution_compatible),
     }

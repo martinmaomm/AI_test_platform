@@ -1,8 +1,9 @@
-PROTOCOL_VERSION = 2
-AGENT_VERSION = '0.3.2'
+PROTOCOL_VERSION = 3
+AGENT_VERSION = '0.4.0'
 # Old agents may keep heartbeating so the management UI can show an upgrade
 # prompt. Execution compatibility requires the matching fixed runtime version.
-SUPPORTED_AGENT_VERSIONS = ('0.2.0', '0.2.1', '0.3.0', '0.3.1', AGENT_VERSION)
+SUPPORTED_AGENT_VERSIONS = ('0.2.0', '0.2.1', '0.3.0', '0.3.1', '0.3.2', AGENT_VERSION)
+SUPPORTED_PROTOCOL_VERSIONS = (2, PROTOCOL_VERSION)
 ENGINE_VERSION = '2.43.3'
 
 HEARTBEAT_INTERVAL_SECONDS = 5
@@ -12,7 +13,8 @@ CONTROLLER_FRESH_SECONDS = 15
 COMMAND_LEASE_SECONDS = 15
 MAX_METRICS_SAMPLES = 400
 
-MAX_USERS = 100
+MAX_USERS = 1000
+MAX_NODES_PER_RUN = 5
 MAX_DURATION_SECONDS = 600
 MAX_SPAWN_RATE = 100
 MAX_STEPS = 20
@@ -38,7 +40,7 @@ def platform_config(*, controller_online=False, execution_available=False, unava
         'controller_online': bool(controller_online),
         'execution_enabled': execution_enabled,
         'execution_unavailable_reason': reason,
-        'max_nodes_per_run': 1,
+        'max_nodes_per_run': MAX_NODES_PER_RUN,
         'protocol_version': PROTOCOL_VERSION,
         'engine_version': ENGINE_VERSION,
         'agent_version': AGENT_VERSION,

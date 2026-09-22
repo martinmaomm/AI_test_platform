@@ -6,7 +6,7 @@ from .views import (
     TargetDetailView, TargetListCreateView,
 )
 from .run_views import (
-    PerformanceRunCreateView, PerformanceRunDetailView, PerformanceRunListView,
+    PerformanceNodeEligibilityView, PerformanceRunCreateView, PerformanceRunDetailView, PerformanceRunListView,
     PerformanceRunStopView,
 )
 from .discovery_views import (
@@ -37,6 +37,7 @@ urlpatterns = [
     path('targets/<int:pk>/', TargetDetailView.as_view(), name='target-detail'),
     path('plans/', PlanListCreateView.as_view(), name='plan-list'),
     path('plans/<int:pk>/runs/', PerformanceRunCreateView.as_view(), name='run-create'),
+    path('plans/<int:pk>/node-eligibility/', PerformanceNodeEligibilityView.as_view(), name='node-eligibility'),
     path('plans/<int:pk>/', PlanDetailView.as_view(), name='plan-detail'),
     path('runs/', PerformanceRunListView.as_view(), name='run-list'),
     path('runs/<uuid:run_id>/stop/', PerformanceRunStopView.as_view(), name='run-stop'),

@@ -53,8 +53,8 @@ class PerformancePlan(models.Model):
         ordering = ('-created_at', '-id')
         constraints = [
             models.CheckConstraint(
-                check=models.Q(users__gte=1) & models.Q(users__lte=100),
-                name='perf_plan_users_1_100',
+                check=models.Q(users__gte=1) & models.Q(users__lte=1000),
+                name='perf_plan_users_1_1000',
             ),
             models.CheckConstraint(
                 check=models.Q(spawn_rate__gt=0) & models.Q(spawn_rate__lte=100),
@@ -142,9 +142,6 @@ class PerformanceRun(models.Model):
         PerformancePlan, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='runs',
     )
-    node = models.ForeignKey(
-        PerformanceNode, on_delete=models.RESTRICT, related_name='runs',
-    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='created_performance_runs',
@@ -157,9 +154,6 @@ class PerformanceRun(models.Model):
     )
     snapshot = models.JSONField(default=dict)
     snapshot_sha256 = models.CharField(max_length=64)
-    node_command = models.JSONField(default=dict, blank=True, editable=False)
-    node_report = models.JSONField(default=dict, blank=True, editable=False)
-    node_report_seq = models.PositiveBigIntegerField(default=0, editable=False)
     latest_metrics = models.JSONField(default=dict, blank=True)
     metrics_samples = models.JSONField(default=list, blank=True)
     reason_code = models.CharField(max_length=64, blank=True, default='')
@@ -184,6 +178,64 @@ class PerformanceRun(models.Model):
     @property
     def is_terminal(self):
         return self.status in self.TERMINAL_STATUSES
+
+
+class PerformanceRunNode(models.Model):
+    class Status(models.TextChoices):
+        QUEUED = 'queued', 'Queued'
+        PREPARING = 'preparing', 'Preparing'
+        READY = 'ready', 'Ready'
+        RUNNING = 'running', 'Running'
+        STOPPING = 'stopping', 'Stopping'
+        STOPPED = 'stopped', 'Stopped'
+        FAILED = 'failed', 'Failed'
+        LOST = 'lost', 'Lost'
+
+    run = models.ForeignKey(
+        PerformanceRun, on_delete=models.CASCADE, related_name='participants',
+    )
+    node = models.ForeignKey(
+        PerformanceNode, on_delete=models.RESTRICT, related_name='run_participations',
+    )
+    node_name = models.CharField(max_length=200, blank=True, default='')
+    node_agent_version = models.CharField(max_length=32, blank=True, default='')
+    node_protocol_version = models.PositiveIntegerField(null=True, blank=True)
+    node_engine_version = models.CharField(max_length=32, blank=True, default='')
+    assigned_users = models.PositiveIntegerField(default=1)
+    validation_key = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    validation_run = models.ForeignKey(
+        PerformanceRun, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='validated_participants',
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.QUEUED,
+    )
+    node_command = models.JSONField(default=dict, blank=True, editable=False)
+    node_report = models.JSONField(default=dict, blank=True, editable=False)
+    node_report_seq = models.PositiveBigIntegerField(default=0, editable=False)
+    ready_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    stopped_at = models.DateTimeField(null=True, blank=True)
+    reason_code = models.CharField(max_length=64, blank=True, default='')
+    reason = models.TextField(blank=True, default='')
+    latest_metrics = models.JSONField(default=dict, blank=True)
+    metrics_samples = models.JSONField(default=list, blank=True)
+    last_command_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    class Meta:
+        db_table = 'performance_run_nodes'
+        ordering = ('node_id', 'id')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('run', 'node'), name='perf_run_node_unique',
+            ),
+            models.CheckConstraint(
+                check=models.Q(assigned_users__gte=1), name='perf_run_node_users_gte_1',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('node', 'status'), name='perf_runnode_node_status'),
+        ]
 
 
 class PerformanceControllerState(models.Model):

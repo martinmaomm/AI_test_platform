@@ -11,7 +11,7 @@ from rest_framework.test import APIClient
 from performance_testing.constants import AGENT_VERSION, ENGINE_VERSION, PROTOCOL_VERSION
 from performance_testing.models import (
     PerformanceControllerState, PerformanceNode, PerformancePlan, PerformanceRun,
-    PerformanceTarget,
+    PerformanceRunNode, PerformanceTarget,
 )
 from performance_testing.services import consume_enrollment, issue_enrollment
 from projects.models import Project, ProjectMember
@@ -34,12 +34,19 @@ class PerformanceRunContractTests(TestCase):
                 'body': {'content': '{"data":[],"token":"fixture-detail-token"}', 'truncated': False}},
         }]}
         run.save(update_fields=['latest_metrics'])
+        participant = run.participants.get()
+        participant.latest_metrics = {
+            'requests': 1,
+            'validation_steps': [{'response': {'body': 'participant-private-token'}}],
+        }
+        participant.save(update_fields=['latest_metrics'])
         detail_path = self._path(f'runs/{run.pk}/')
         self.client.force_authenticate(self.reader)
         listing = self.client.get(self._path('runs/'))
         self.assertEqual(listing.status_code, 200)
         self.assertNotIn('validation_steps', listing.data['data']['items'][0]['latest_metrics'])
         self.assertNotIn('fixture-detail-token', str(listing.data))
+        self.assertNotIn('participant-private-token', str(listing.data))
         self.assertEqual(self.client.get(detail_path).status_code, 403)
         self.client.force_authenticate(self.executor)
         detail = self.client.get(detail_path)
@@ -127,10 +134,114 @@ class PerformanceRunContractTests(TestCase):
         self.client.force_authenticate(self.executor)
         return self.client.post(
             self._path(f'plans/{self.plan.pk}/runs/'),
-            {'node_id': str((node or self.node).pk),
+            {'node_ids': [str((node or self.node).pk)],
              'request_id': str(request_id or uuid.uuid4()), 'mode': mode},
             format='json',
         )
+
+    def _direct_run(self, *, node=None, **kwargs):
+        selected = node or self.node
+        defaults = {
+            'project': self.project,
+            'plan': self.plan,
+            'created_by': self.admin,
+            'request_id': uuid.uuid4(),
+            'snapshot': {},
+            'snapshot_sha256': '0' * 64,
+        }
+        defaults.update(kwargs)
+        run = PerformanceRun.objects.create(**defaults)
+        PerformanceRunNode.objects.create(
+            run=run, node=selected, node_name=selected.name,
+            node_agent_version=selected.agent_version,
+            node_protocol_version=selected.protocol_version,
+            node_engine_version=selected.engine_version,
+        )
+        return run
+
+    def _complete_validation(self, node):
+        response = self._create(node=node, mode='validation')
+        self.assertEqual(response.status_code, 201, response.data)
+        run = PerformanceRun.objects.get(pk=response.data['data']['id'])
+        run.status = PerformanceRun.Status.COMPLETED
+        run.finished_at = timezone.now()
+        run.latest_metrics = {
+            'complete': True, 'requests': 1, 'failures': 0,
+            'validation_complete': True, 'validation_passed': True,
+            'main_steps_completed': 1, 'main_steps_total': 1,
+        }
+        run.save(update_fields=('status', 'finished_at', 'latest_metrics'))
+        return run
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_multi_node_distribution_eligibility_idempotency_and_serialization(self, _):
+        second, _ = self._node('node-two')
+        third, _ = self._node('node-three')
+        nodes = sorted((self.node, second, third), key=lambda item: str(item.pk))
+        self.plan.users = 1000
+        self.plan.save(update_fields=('users',))
+        validations = {node.pk: self._complete_validation(node) for node in nodes}
+
+        self.client.force_authenticate(self.executor)
+        eligibility = self.client.get(
+            self._path(f'plans/{self.plan.pk}/node-eligibility/'),
+        )
+        self.assertEqual(eligibility.status_code, 200, eligibility.data)
+        by_node = {item['node_id']: item for item in eligibility.data['data']['items']}
+        for node in nodes:
+            item = by_node[str(node.pk)]
+            self.assertTrue(item['compatible'])
+            self.assertTrue(item['validation_valid'])
+            self.assertEqual(item['validation_run_id'], str(validations[node.pk].pk))
+            self.assertEqual((item['reason_code'], item['reason']), ('', ''))
+
+        request_id = uuid.uuid4()
+        payload = {
+            'node_ids': [str(node.pk) for node in reversed(nodes)],
+            'request_id': str(request_id), 'mode': 'load',
+        }
+        created = self.client.post(
+            self._path(f'plans/{self.plan.pk}/runs/'), payload, format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        run = PerformanceRun.objects.get(pk=created.data['data']['id'])
+        participants = list(run.participants.order_by('node_id'))
+        self.assertEqual([item.assigned_users for item in participants], [334, 333, 333])
+        self.assertEqual([item.node_id for item in participants], [node.pk for node in nodes])
+        self.assertEqual([item.validation_run_id for item in participants], [
+            validations[node.pk].pk for node in nodes
+        ])
+        self.assertEqual(run.snapshot['schema_version'], 3)
+        self.assertNotIn('node_id', run.snapshot)
+        self.assertNotIn('validation_key', run.snapshot)
+        self.assertEqual(
+            [set(item) for item in run.snapshot['nodes']],
+            [{'node_id', 'users', 'validation_key'}] * 3,
+        )
+        self.assertEqual(created.data['data']['node_count'], 3)
+        self.assertEqual([item['assigned_users'] for item in created.data['data']['nodes']], [334, 333, 333])
+
+        repeated = self.client.post(
+            self._path(f'plans/{self.plan.pk}/runs/'), {
+                **payload, 'node_ids': [str(node.pk) for node in nodes],
+            }, format='json',
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.data)
+        self.assertEqual(repeated.data['data']['id'], str(run.pk))
+        changed = self.client.post(
+            self._path(f'plans/{self.plan.pk}/runs/'), {
+                **payload, 'node_ids': [str(nodes[0].pk), str(nodes[1].pk)],
+            }, format='json',
+        )
+        self.assertEqual(changed.status_code, 409, changed.data)
+
+        duplicate = self.client.post(
+            self._path(f'plans/{self.plan.pk}/runs/'), {
+                'node_ids': [str(nodes[0].pk), str(nodes[0].pk)],
+                'request_id': str(uuid.uuid4()), 'mode': 'load',
+            }, format='json',
+        )
+        self.assertEqual(duplicate.status_code, 400, duplicate.data)
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_config_and_create_freeze_exact_snapshot_and_never_serialize_private_command(self, _):
@@ -138,28 +249,30 @@ class PerformanceRunContractTests(TestCase):
         config = self.client.get(self._path('config/'))
         self.assertTrue(config.data['data']['controller_online'])
         self.assertTrue(config.data['data']['execution_enabled'])
-        self.assertEqual(config.data['data']['max_nodes_per_run'], 1)
+        self.assertEqual(config.data['data']['max_nodes_per_run'], 5)
 
         created = self._create()
         self.assertEqual(created.status_code, 201, created.data)
         run = PerformanceRun.objects.get(pk=created.data['data']['id'])
         self.assertEqual(set(run.snapshot), {
-            'schema_version', 'run_id', 'node_id', 'engine_version', 'plan_name',
-            'base_url', 'allowed_methods', 'mode', 'validation_key', 'users',
+            'schema_version', 'run_id', 'nodes', 'engine_version', 'plan_name',
+            'base_url', 'allowed_methods', 'mode', 'users',
             'spawn_rate', 'duration_seconds', 'wait_seconds', 'variables',
             'unique_variables', 'steps',
         })
-        self.assertEqual(run.snapshot['schema_version'], 2)
+        self.assertEqual(run.snapshot['schema_version'], 3)
+        self.assertEqual(run.snapshot['nodes'][0]['node_id'], str(self.node.pk))
         self.assertEqual((run.snapshot['users'], run.snapshot['spawn_rate']), (1, 1))
         self.assertEqual(run.snapshot['duration_seconds'], 120)
         self.assertEqual(created.data['data']['validation_status'], 'pending')
         self.assertEqual(run.snapshot['run_id'], str(run.pk))
         self.assertEqual(len(run.snapshot_sha256), 64)
-        run.node_command = {
+        participant = run.participants.get()
+        participant.node_command = {
             'type': 'prepare', 'run_id': str(run.pk), 'handshake_token': 'private',
             'tls': {'key_pem': 'private-key'},
         }
-        run.save(update_fields=('node_command',))
+        participant.save(update_fields=('node_command',))
         detail = self.client.get(self._path(f'runs/{run.pk}/'))
         encoded = str(detail.data)
         self.assertNotIn('node_command', encoded)
@@ -192,7 +305,7 @@ class PerformanceRunContractTests(TestCase):
         self.client.force_authenticate(self.executor)
         no_validation = self.client.post(
             self._path(f'plans/{self.plan.pk}/runs/'),
-            {'node_id': str(self.node.pk), 'request_id': str(uuid.uuid4())},
+            {'node_ids': [str(self.node.pk)], 'request_id': str(uuid.uuid4())},
             format='json',
         )
         self.assertEqual(no_validation.status_code, 400, no_validation.data)
@@ -200,7 +313,7 @@ class PerformanceRunContractTests(TestCase):
 
         invalid_mode = self.client.post(
             self._path(f'plans/{self.plan.pk}/runs/'),
-            {'node_id': str(self.node.pk), 'request_id': str(uuid.uuid4()), 'mode': 'smoke'},
+            {'node_ids': [str(self.node.pk)], 'request_id': str(uuid.uuid4()), 'mode': 'smoke'},
             format='json',
         )
         self.assertEqual(invalid_mode.status_code, 400, invalid_mode.data)
@@ -275,12 +388,57 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(created.status_code, 400, created.data)
         self.assertIn(AGENT_VERSION, created.data['error']['message'])
 
+    @patch('performance_testing.agent_views.execution_configuration', return_value=AVAILABLE)
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_legacy_heartbeat_remains_visible_but_cannot_keep_protocol3_command(self, _, __):
+        run = PerformanceRun.objects.get(pk=self._create().data['data']['id'])
+        run.status = PerformanceRun.Status.RUNNING
+        run.save(update_fields=('status',))
+        participant = run.participants.get()
+        participant.node_command = {
+            'type': 'prepare', 'run_id': str(run.pk), 'snapshot': run.snapshot,
+            'snapshot_sha256': run.snapshot_sha256,
+        }
+        participant.save(update_fields=('node_command',))
+        self._fresh_controller(run)
+
+        self.client.force_authenticate(None)
+        response = self.client.post('/api/v1/performance-agent/heartbeat/', {
+            'protocol_version': 2,
+            'agent_version': '0.3.2',
+            'engine_version': ENGINE_VERSION,
+            'resources': {'cpu_percent': 1.0, 'memory_percent': 2.0},
+            'run_report': None,
+        }, format='json', HTTP_AUTHORIZATION=f'Node {self.agent_token}')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['data']['command']['type'], 'stop')
+        self.node.refresh_from_db()
+        run.refresh_from_db()
+        participant.refresh_from_db()
+        self.assertEqual(self.node.protocol_version, 2)
+        self.assertEqual(self.node.agent_version, '0.3.2')
+        self.assertEqual(run.status, PerformanceRun.Status.STOPPING)
+        self.assertEqual(run.reason_code, 'node_identity_changed')
+        self.assertEqual(participant.status, PerformanceRunNode.Status.LOST)
+        self.assertEqual(participant.node_command['type'], 'stop')
+
+        eligibility = self.client.get(
+            self._path(f'plans/{self.plan.pk}/node-eligibility/'),
+            HTTP_AUTHORIZATION='',
+        )
+        self.assertEqual(eligibility.status_code, 401)
+        self.client.force_authenticate(self.executor)
+        eligibility = self.client.get(self._path(f'plans/{self.plan.pk}/node-eligibility/'))
+        item = eligibility.data['data']['items'][0]
+        self.assertFalse(item['compatible'])
+        self.assertEqual(item['reason_code'], 'version_mismatch')
+
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_new_run_rejects_deleted_node_even_with_valid_plan_and_version(self, _):
         PerformanceNode.objects.filter(pk=self.node.pk).update(deleted_at=timezone.now())
         rejected = self._create()
         self.assertEqual(rejected.status_code, 400, rejected.data)
-        self.assertIn('性能节点不存在', rejected.data['error']['message'])
+        self.assertIn('已删除', rejected.data['error']['message'])
         self.assertFalse(PerformanceRun.objects.exists())
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
@@ -317,14 +475,11 @@ class PerformanceRunContractTests(TestCase):
     def test_execute_and_report_permissions_are_independent(self, _):
         self.client.force_authenticate(self.reader)
         denied = self.client.post(self._path(f'plans/{self.plan.pk}/runs/'), {
-            'node_id': str(self.node.pk), 'request_id': str(uuid.uuid4()),
+            'node_ids': [str(self.node.pk)], 'request_id': str(uuid.uuid4()),
         }, format='json')
         self.assertEqual(denied.status_code, 403, denied.data)
 
-        run = PerformanceRun.objects.create(
-            project=self.project, plan=self.plan, node=self.node, created_by=self.admin,
-            request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='0' * 64,
-        )
+        run = self._direct_run()
         self.assertEqual(self.client.get(self._path('runs/')).status_code, 200)
         self.assertEqual(self.client.get(self._path(f'runs/{run.pk}/')).status_code, 403)
         self.assertEqual(self.client.post(self._path(f'runs/{run.pk}/stop/'), {}, format='json').status_code, 403)
@@ -332,7 +487,7 @@ class PerformanceRunContractTests(TestCase):
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_execute_without_report_never_receives_detail_fields(self, _):
         request_id = uuid.uuid4()
-        payload = {'node_id': str(self.node.pk), 'request_id': str(request_id),
+        payload = {'node_ids': [str(self.node.pk)], 'request_id': str(request_id),
                    'mode': 'validation'}
         self.client.force_authenticate(self.execute_only)
         created = self.client.post(
@@ -351,9 +506,11 @@ class PerformanceRunContractTests(TestCase):
 
         run = PerformanceRun.objects.get(pk=created.data['data']['id'])
         run.status = PerformanceRun.Status.RUNNING
-        run.node_command = {'type': 'prepare', 'run_id': str(run.pk), 'secret': 'private'}
+        participant = run.participants.get()
+        participant.node_command = {'type': 'prepare', 'run_id': str(run.pk), 'secret': 'private'}
         run.metrics_samples = [{'timestamp': timezone.now().isoformat(), 'metrics': {'requests': 1}}]
-        run.save(update_fields=('status', 'node_command', 'metrics_samples'))
+        run.save(update_fields=('status', 'metrics_samples'))
+        participant.save(update_fields=('node_command',))
         stopped = self.client.post(self._path(f'runs/{run.pk}/stop/'), {}, format='json')
         self.assertEqual(stopped.status_code, 200, stopped.data)
         self.assertEqual(stopped.data['data']['status'], PerformanceRun.Status.STOPPING)
@@ -372,15 +529,18 @@ class PerformanceRunContractTests(TestCase):
         }
         run.status = PerformanceRun.Status.RUNNING
         run.started_at = timezone.now()
-        run.node_command = prepare
-        run.save(update_fields=('status', 'started_at', 'node_command'))
+        participant = run.participants.get()
+        participant.node_command = prepare
+        run.save(update_fields=('status', 'started_at'))
+        participant.save(update_fields=('node_command',))
         self._fresh_controller(run)
 
         self.client.force_authenticate(self.executor)
         stopped = self.client.post(self._path(f'runs/{run.pk}/stop/'), {}, format='json')
         self.assertEqual(stopped.data['data']['status'], PerformanceRun.Status.STOPPING)
         run.refresh_from_db()
-        self.assertEqual(run.node_command, prepare)
+        participant.refresh_from_db()
+        self.assertEqual(participant.node_command, prepare)
 
         self.client.force_authenticate(None)
         report = {
@@ -392,7 +552,8 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(heartbeat.data['data']['command'], prepare)
         run.refresh_from_db()
         self.assertEqual(run.status, PerformanceRun.Status.STOPPING)
-        self.assertEqual(run.node_report_seq, 1)
+        participant.refresh_from_db()
+        self.assertEqual(participant.node_report_seq, 1)
 
         duplicate = self._heartbeat(report)
         self.assertEqual(duplicate.status_code, 409, duplicate.data)
@@ -427,11 +588,13 @@ class PerformanceRunContractTests(TestCase):
     def test_node_never_receives_another_nodes_private_command(self, _, __):
         run = PerformanceRun.objects.get(pk=self._create().data['data']['id'])
         run.status = PerformanceRun.Status.PREPARING
-        run.node_command = {
+        participant = run.participants.get()
+        participant.node_command = {
             'type': 'prepare', 'run_id': str(run.pk), 'snapshot': run.snapshot,
             'snapshot_sha256': run.snapshot_sha256, 'handshake_token': 'secret',
         }
-        run.save(update_fields=('status', 'node_command'))
+        run.save(update_fields=('status',))
+        participant.save(update_fields=('node_command',))
         other_node, other_token = self._node('isolated-node')
         self.client.force_authenticate(None)
         response = self.client.post('/api/v1/performance-agent/heartbeat/', {
@@ -478,7 +641,7 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(self.node.last_seen_at, original_last_seen_at)
         self.assertEqual(run.status, PerformanceRun.Status.RUNNING)
         self.assertEqual(run.reason_code, '')
-        self.assertEqual(run.node_command, {})
+        self.assertEqual(run.participants.get().node_command, {})
         self.assertIsNone(run.stop_requested_at)
 
         for payload in (
@@ -505,15 +668,12 @@ class PerformanceRunContractTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, PerformanceRun.Status.STOPPING)
         self.assertEqual(run.reason_code, 'node_revoked')
-        self.assertEqual(run.node_command['type'], 'stop')
+        self.assertEqual(run.participants.get().node_command['type'], 'stop')
         self.assertIsNotNone(run.stop_requested_at)
         self.assertIsNone(run.finished_at)
 
         queued_node, _ = self._node('node-queued')
-        queued = PerformanceRun.objects.create(
-            project=self.project, plan=self.plan, node=queued_node, created_by=self.admin,
-            request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='0' * 64,
-        )
+        queued = self._direct_run(node=queued_node)
         revoked = self.client.post(
             self._path(f'nodes/{queued_node.pk}/revoke/'),
             {'confirm_stop': True}, format='json',
@@ -525,10 +685,7 @@ class PerformanceRunContractTests(TestCase):
         self.assertIsNotNone(queued.finished_at)
 
     def test_active_run_restricts_project_delete_but_terminal_run_does_not(self):
-        run = PerformanceRun.objects.create(
-            project=self.project, plan=self.plan, node=self.node, created_by=self.admin,
-            request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='0' * 64,
-        )
+        run = self._direct_run()
         with self.assertRaises(RestrictedError), transaction.atomic():
             self.project.delete()
         self.assertTrue(Project.objects.filter(pk=self.project.pk).exists())
@@ -539,11 +696,7 @@ class PerformanceRunContractTests(TestCase):
         self.assertFalse(Project.objects.filter(pk=self.project.pk).exists())
 
     def test_project_delete_api_rejects_active_run_before_cleanup(self):
-        PerformanceRun.objects.create(
-            project=self.project, plan=self.plan, node=self.node, created_by=self.admin,
-            request_id=uuid.uuid4(), status=PerformanceRun.Status.RUNNING,
-            snapshot={}, snapshot_sha256='0' * 64,
-        )
+        self._direct_run(status=PerformanceRun.Status.RUNNING)
         self.client.force_authenticate(self.admin)
         with patch.object(ProjectViewSet, 'perform_destroy') as cleanup:
             result = self.client.delete(f'/api/v1/projects/{self.project.pk}/')
@@ -553,10 +706,8 @@ class PerformanceRunContractTests(TestCase):
         self.assertTrue(Project.objects.filter(pk=self.project.pk).exists())
 
     def test_project_delete_api_allows_terminal_performance_run(self):
-        PerformanceRun.objects.create(
-            project=self.project, plan=self.plan, node=self.node, created_by=self.admin,
-            request_id=uuid.uuid4(), status=PerformanceRun.Status.COMPLETED,
-            snapshot={}, snapshot_sha256='0' * 64, finished_at=timezone.now(),
+        self._direct_run(
+            status=PerformanceRun.Status.COMPLETED, finished_at=timezone.now(),
         )
         project_id = self.project.pk
         self.client.force_authenticate(self.admin)

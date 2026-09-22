@@ -21,9 +21,21 @@
         <template v-if="step.request">
           <h4>请求</h4>
           <p class="request-url" data-testid="validation-request-url"><strong>{{ step.method }}</strong> {{ step.request.url }}</p>
+          <div class="query-details" data-testid="validation-query">
+            <h5>Query 参数</h5>
+            <p class="help">以下参数来自本次记录的请求 URL。Query 位于 URL 的 ? 后面，请求体为空也可以携带 Query 参数。</p>
+            <p v-if="requestQueries.get(step.step_index) === null" class="help">请求 URL 缺失或格式无效，无法解析 Query 参数，请查看上方记录。</p>
+            <el-table v-else-if="requestQueries.get(step.step_index)?.length" :data="requestQueries.get(step.step_index)" :max-height="320">
+              <el-table-column prop="name" label="参数名" min-width="150" />
+              <el-table-column label="参数值" min-width="220">
+                <template #default="{ row }"><span v-if="row.value === ''" class="help">（空字符串）</span><code v-else class="query-value">{{ row.value }}</code></template>
+              </el-table-column>
+            </el-table>
+            <p v-else class="help">本次请求 URL 未携带 Query 参数。</p>
+          </div>
           <div class="payload-grid">
             <div><h5>请求头</h5><PerformanceEvidenceValue :value="step.request.headers" /></div>
-            <div><h5>请求体 · {{ bodyType(step.request.body_type) }}</h5><PerformanceEvidenceValue :value="step.request.body" /></div>
+            <div><h5>请求体 · {{ bodyType(step.request.body_type) }}</h5><p v-if="step.request.body_type === 'none'" class="help">本步骤未配置请求体；Query 参数请查看上方列表。</p><PerformanceEvidenceValue v-else :value="step.request.body" /></div>
           </div>
         </template>
         <template v-if="step.response">
@@ -50,6 +62,7 @@
           <h4>响应变量提取</h4>
           <el-table :data="step.extractions" :max-height="320" data-testid="validation-extractions">
             <el-table-column prop="name" label="变量" min-width="120" />
+            <el-table-column label="后续引用" min-width="140"><template #default="{ row }"><code>{{ '${' + row.name + '}' }}</code></template></el-table-column>
             <el-table-column prop="check" label="提取字段" min-width="140" />
             <el-table-column label="结果" width="88"><template #default="{ row }"><el-tag :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="提取值" min-width="150"><template #default="{ row }"><PerformanceEvidenceValue :value="row.value" /></template></el-table-column>
@@ -64,9 +77,10 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
 import PerformanceEvidenceValue from './PerformanceEvidenceValue.vue';
-import { formatMetric, isPerformanceRunActive } from './performanceExecutionState';
+import { formatMetric, isPerformanceRunActive, requestQueryRows } from './performanceExecutionState';
 const props = defineProps({ steps: { type: Array, default: () => [] }, runStatus: String });
 const active = computed(() => isPerformanceRunActive(props.runStatus));
+const requestQueries = computed(() => new Map(props.steps.map(step => [step.step_index, requestQueryRows(step.request?.url)])));
 const expanded = ref([]);
 const revealed = new Set();
 watch(() => props.steps, (steps) => {
@@ -95,6 +109,8 @@ const errorLabel = (type) => ({ assertion_failed: '与期望值不符', missing_
 .step-title strong, .request-url { overflow-wrap: anywhere; }
 .payload-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 16px; }
 .payload-grid > div { min-width: 0; padding: 12px; background: var(--app-bg-secondary); border-radius: 6px; }
+.query-details { margin-bottom: 16px; }
+.query-value { white-space: pre-wrap; overflow-wrap: anywhere; }
 h4 { margin: 18px 0 10px; }
 h5 { margin: 0 0 8px; }
 :deep(.el-collapse-item__header) { height: auto; min-height: 48px; }

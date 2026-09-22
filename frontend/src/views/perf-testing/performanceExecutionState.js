@@ -86,6 +86,15 @@ export const displayEvidenceValue = (value) =>
   value && typeof value === "object" && value.missing === true
     ? "缺失"
     : JSON.stringify(value);
+export const requestQueryRows = (url) => {
+  try {
+    const parsed = new URL(url);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    return Array.from(parsed.searchParams, ([name, value]) => ({ name, value }));
+  } catch {
+    return null;
+  }
+};
 export const metricSamples = (samples) =>
   Array.isArray(samples) ? samples.slice(-400) : [];
 export const sampleMetrics = (sample = {}) =>

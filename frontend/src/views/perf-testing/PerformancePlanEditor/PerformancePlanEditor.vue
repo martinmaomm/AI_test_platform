@@ -242,13 +242,13 @@
                   最终 URL：{{ previewStepUrl(selectedTarget, currentStep) }}
                 </p>
                 <el-form-item label="Query 参数" :error="stepError.query"
-                  ><KeyValueRows
+                  ><p class="variable-help" data-testid="step-query-help">Query 参数会拼接到请求 URL 的 ? 后面，与 Body 请求体分别发送。可在下方填写参数，并通过上方“最终 URL”核对。</p><KeyValueRows
                     v-model="currentStep.query"
                     data-testid="step-query-rows"
                     key-placeholder="参数名"
                     value-placeholder="参数值" /></el-form-item
                 ><el-form-item label="Headers" :error="stepError.headers"
-                  ><KeyValueRows
+                  ><p class="variable-help" data-testid="step-header-help">例如 Header 名称填写 <code>Authorization</code>，值填写 <code v-pre>Bearer ${token}</code>。<code>Bearer</code> 后有一个空格；<code v-pre>${token}</code> 会替换为前面步骤提取的值。</p><KeyValueRows
                     v-model="currentStep.headers"
                     data-testid="step-header-rows"
                     key-placeholder="Header 名称"
@@ -275,12 +275,16 @@
                 /></el-form-item>
                 <div data-testid="step-extract">
                   <h4>响应变量提取</h4>
+                  <div class="variable-help" data-testid="step-extract-help">
+                    <p>例如响应包含 <code>{"access_token":"示例令牌"}</code>，名称填写 <code>token</code>，路径填写 <code>body.access_token</code>。</p>
+                    <p>本步骤通过后，后续步骤可在请求头、Query 参数或请求体中用 <code v-pre>${token}</code> 引用。引用时必须带 <code>$</code>；<code>{token}</code> 会作为普通文本发送。</p>
+                  </div>
                   <div
                     v-for="(item, index) in currentStep.extract"
                     :key="item.id"
-                    class="row"
+                    class="row extraction-row"
                   >
-                    <label>名称<el-input v-model="item.name" /></label
+                    <label>名称<el-input v-model="item.name" placeholder="token" /><span v-if="item.name" class="reference-hint">后续引用：<code>{{ '${' + item.name + '}' }}</code></span></label
                     ><label
                       >路径<el-input
                         v-model="item.check"
@@ -660,6 +664,19 @@ const requestClose = () => {
 }
 .variable-help code {
   color: var(--app-text-primary);
+}
+.reference-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--app-text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.extraction-row {
+  align-items: flex-start;
+}
+.extraction-row > .el-button {
+  margin-top: 20px;
 }
 .shell > footer {
   display: flex;

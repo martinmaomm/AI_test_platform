@@ -6,6 +6,7 @@ import tempfile
 import threading
 import uuid
 from unittest.mock import patch
+from urllib.parse import urlencode
 from wsgiref.simple_server import make_server
 
 from test_performance_plan_browser import BACKEND, bootstrap, guarded_application, loopback_only
@@ -28,6 +29,8 @@ def seed(fixture):
         {'check': 'body.items', 'comparator': 'length_gt', 'expected': 0},
         {'check': 'body.count', 'comparator': 'eq', 'expected': 3},
     ]
+    steps[1]['query'] = {'page': 1, 'tag': ['first', 'second'], 'empty': '',
+                         'keyword': '中文 +&', 'note': '<script>window.queryExecuted=true</script>'}
     snapshot = {'mode': 'validation', 'plan_name': '验证明细隔离样本', 'variables': {}, 'steps': steps}
     trace = ValidationTrace(snapshot)
     first = {'status_code': 200, 'headers': {'Set-Cookie': 'fixture_session=browser-cookie; Path=/'}, 'body': {'token': 'fixture-private-token'}, 'text': ''}
@@ -37,7 +40,8 @@ def seed(fixture):
     response = {'status_code': 200, 'headers': {'Content-Type': 'application/json'},
                 'body': {'items': [], 'count': '3', 'diagnostic': '库存不足',
                          'html': '<script>window.evidenceExecuted=true</script>', 'large': 'x' * 10000}, 'text': ''}
-    trace.request(2, steps[1], 'https://fixture.invalid/items?page=1', {'Authorization': 'Bearer fixture-private-token'}, None)
+    trace.request(2, steps[1], 'https://fixture.invalid/items?' + urlencode(steps[1]['query'], doseq=True),
+                  {'Authorization': 'Bearer fixture-private-token'}, None)
     failures = assertion_failures(steps[1], 2, response)
     trace.finish_step(2, steps[1], response, failures=failures, elapsed=45.67)
     trace.finish()
@@ -92,6 +96,17 @@ def verify(origin, fixture):
             expect(failed_step.get_by_test_id('validation-response')).to_contain_text('库存不足')
             expect(failed_step.get_by_test_id('validation-response')).to_contain_text('内容过长，已截断展示')
             expect(failed_step.get_by_test_id('validation-request-url')).to_contain_text('https://fixture.invalid/items?page=1')
+            query = failed_step.get_by_test_id('validation-query')
+            expect(query).to_be_visible()
+            rows = query.locator('.el-table__body tbody tr')
+            expect(rows).to_have_count(6)
+            expect(rows.nth(1)).to_contain_text('first')
+            expect(rows.nth(2)).to_contain_text('second')
+            expect(rows.nth(3)).to_contain_text('（空字符串）')
+            expect(rows.nth(4)).to_contain_text('中文 +&')
+            expect(rows.nth(5)).to_contain_text('<script>window.queryExecuted=true</script>')
+            expect(failed_step).to_contain_text('本步骤未配置请求体')
+            assert not page.evaluate('window.queryExecuted === true')
             assert not page.evaluate('window.evidenceExecuted === true')
             expect(failed_step).to_contain_text('Bearer fixture-private-token')
             details.screenshot(path=str(output / 'failed-step.png'), animations='disabled')
@@ -99,6 +114,7 @@ def verify(origin, fixture):
             expect(details.get_by_text('第 2 步失败，后续步骤未执行', exact=True)).to_be_visible()
             titles.nth(0).click()
             expect(page.get_by_test_id('validation-extractions')).to_contain_text('fixture-private-token')
+            expect(page.get_by_test_id('validation-extractions')).to_contain_text('${token}')
             login = details.locator('.el-collapse-item').nth(0)
             for original in ('fixture-password', 'fixture-query-token', 'fixture_session=request-cookie',
                              'fixture_session=browser-cookie; Path=/'):
@@ -112,6 +128,7 @@ def verify(origin, fixture):
             expect(page.get_by_test_id('validation-step-details')).not_to_be_visible()
             assert not errors and not external, (errors, external)
             print(json.dumps({'browser': 'real Vue/Django/Chrome', 'assertion_details': True,
+                'query_repeated_empty_encoded_values': True, 'query_html_escaped': True,
                 'response_and_truncation': True, 'skipped_steps': True, 'original_credentials': True,
                 'legacy_record_hint': True, 'load_mode_unchanged': True, 'page_errors': 0}, ensure_ascii=False))
         except Exception:

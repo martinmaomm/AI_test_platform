@@ -32,12 +32,34 @@ import {
   metricSamples,
   performanceExecutionPermissions,
   performanceRunStatusLabel,
+  requestQueryRows,
   samePerformanceRunScope,
   sampleMetrics,
 } from "../src/views/perf-testing/performanceExecutionState.js";
 import { performanceErrorMessage } from "../src/api/performanceError.js";
 
 const read = (path) => readFile(new URL(path, import.meta.url), "utf8");
+
+test("execution Query rows preserve duplicates, empty values and decode URL values once", () => {
+  assert.deepEqual(
+    requestQueryRows("https://fixture.invalid/items?tag=first&tag=second&empty=&flag&keyword=%E4%B8%AD%E6%96%87+%2B%26&encoded=%2520#ignored=1"),
+    [
+      { name: "tag", value: "first" },
+      { name: "tag", value: "second" },
+      { name: "empty", value: "" },
+      { name: "flag", value: "" },
+      { name: "keyword", value: "中文 +&" },
+      { name: "encoded", value: "%20" },
+    ],
+  );
+});
+
+test("execution Query rows distinguish an empty query from an unavailable URL", () => {
+  assert.deepEqual(requestQueryRows("http://fixture.invalid/items"), []);
+  for (const url of [undefined, null, "", "not a URL", "javascript:alert(1)"]) {
+    assert.equal(requestQueryRows(url), null);
+  }
+});
 
 test("node upgrade guidance uses the actual configuration and installation response fields", async () => {
   assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.2.1"}, "0.3.0"), true);

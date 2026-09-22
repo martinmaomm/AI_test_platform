@@ -103,6 +103,18 @@
           >添加节点</el-button
         >
       </div>
+      <el-alert
+        v-if="nodeVersionWarnings.size"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="execution-unavailable"
+        data-testid="node-version-notice"
+      >
+        有 {{ nodeVersionWarnings.size }} 个节点的版本不符合平台要求，暂不能执行验证或压测。
+        <template v-if="canManageNodes">请点击对应节点的“重新安装”更新，原节点和历史记录会保留。</template>
+        <template v-else>请联系管理员通过“重新安装”更新节点，原节点和历史记录会保留。</template>
+      </el-alert>
       <el-empty
         v-if="!loading.nodes && nodes.length === 0"
         description="暂无节点"
@@ -126,12 +138,17 @@
             formatTime(row.last_seen_at)
           }}</template></el-table-column
         >
-        <el-table-column label="版本" min-width="240"
-          ><template #default="{ row }"
-            >Agent {{ row.agent_version || "-" }} / 引擎
-            {{ row.engine_version || "-" }}</template
-          ></el-table-column
-        >
+        <el-table-column label="版本" min-width="300">
+          <template #default="{ row }">
+            <div class="node-version">
+              <span>Agent {{ row.agent_version || "-" }} / 引擎 {{ row.engine_version || "-" }}</span>
+              <template v-if="nodeVersionWarnings.has(row.id)">
+                <el-tag type="warning" size="small">版本不匹配</el-tag>
+                <span class="node-version-hint" data-testid="node-version-warning">{{ nodeVersionWarnings.get(row.id) }}</span>
+              </template>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column
           v-if="canManageNodes"
           label="操作"
@@ -717,6 +734,9 @@ const authStore = useAuthStore();
 const projectStore = useProjectStore();
 const methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 const defaults = {
+  agent_version: null,
+  protocol_version: null,
+  engine_version: null,
   heartbeat_interval_seconds: 5,
   execution_enabled: false,
   controller_online: false,
@@ -734,6 +754,23 @@ const projectId = computed(() => projectStore.currentProjectId);
 const detail = ref(null);
 const plans = ref([]);
 const nodes = ref([]);
+const nodeVersionWarnings = computed(() => {
+  const requirements = [
+    ["agent_version", "Agent"],
+    ["protocol_version", "协议"],
+    ["engine_version", "引擎"],
+  ];
+  const warnings = new Map();
+  if (requirements.some(([key]) => config[key] == null || config[key] === "")) return warnings;
+  for (const node of nodes.value) {
+    if (!isRegisteredPerformanceNode(node)) continue;
+    const differences = requirements
+      .filter(([key]) => node[key] !== config[key])
+      .map(([key, label]) => `${label} ${node[key] || "未上报"}（要求 ${config[key]}）`);
+    if (differences.length) warnings.set(node.id, differences.join("；"));
+  }
+  return warnings;
+});
 const targets = ref([]);
 const loading = reactive({ plans: false, nodes: false, targets: false });
 const saving = reactive({
@@ -1717,6 +1754,17 @@ onBeforeUnmount(() => {
 }
 .method-tag {
   margin: 2px;
+}
+.node-version {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.node-version-hint {
+  color: var(--el-color-warning-dark-2);
+  font-size: 12px;
+  line-height: 1.5;
 }
 .installation-summary,
 .installation-requirements {

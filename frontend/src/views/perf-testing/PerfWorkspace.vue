@@ -45,6 +45,16 @@
             row.steps?.length || 0
           }}</template></el-table-column
         >
+        <el-table-column prop="created_at" label="创建时间" min-width="175"
+          ><template #default="{ row }">{{
+            formatTime(row.created_at)
+          }}</template></el-table-column
+        >
+        <el-table-column prop="updated_at" label="修改时间" min-width="175"
+          ><template #default="{ row }">{{
+            formatTime(row.updated_at)
+          }}</template></el-table-column
+        >
         <el-table-column
           v-if="canExecute || canManagePlans || canDeletePlans"
           label="操作"

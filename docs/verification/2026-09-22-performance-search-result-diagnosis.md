@@ -1,6 +1,34 @@
 # 商品搜索 total 差异诊断
 
-## 当前结论：差异尚未定位
+## 当前结论：Accept-Language 缺失能复现搜索结果差异
+
+2026-09-22 12:48–12:49（北京时间）已通过单变量 HTTP 对照定位到 `Accept-Language`。同一目标 IP `117.72.83.248`、相同 URL、无认证和 Cookie，只改变这个请求头，原商品名“RIO西柚伏特加风味鸡尾酒”稳定地从 `total=0` 变为 `total=1`。复测前后移除、恢复语言头，结果相应回到 0、1；仅修改 Windows User-Agent 或页面导航 Accept 不能产生这一变化。
+
+| Accept-Language | 原商品名的 total | 另一名称的 total |
+| --- | --- | --- |
+| 不发送 | 0 | 1 |
+| `zh-CN,zh;q=0.9`（用户 Windows 实际值） | 1 | 0 |
+| `zh-CN,zh;q=0.9,en;q=0.8` | 1 | 0 |
+| `en-US,en;q=0.9` | 1 | 0 |
+| `zh-CN` | 1 | 未单独验证 |
+
+原商品名命中时仍是商品 ID 41，价格 9.9。英文语言头也可命中原商品名，因此不能将结果简化为“中文商品与英文商品不同”；已确认的是请求头的有无及上述具体值会改变这个接口的搜索结果，目标服务内部的语言解析、查询或路由逻辑尚无后端证据。
+
+现场计划 ID 2 的两个步骤，以及运行 `ab5ec810-acd1-4263-910d-4d5acdae8f56` 的实际请求头，均没有 `Accept-Language`。当前计划可保留原商品名、token 引用及断言，在第二步请求头补充与用户 Windows 浏览器一致且已验证的 `Accept-Language: zh-CN,zh;q=0.9`。这次只完成对照和诊断，未修改计划、业务代码或运行节点，没有重新启动单用户验证或压测。
+
+平台侧也发现确定的保留缺口：`backend/apps/api_testing/browser_discovery.py` 的 `_SAFE_HEADER` 只有 `content-type` 和 `accept`；`_header_value()` 因此会过滤 `Accept-Language`。压测草稿编译读取过滤后的 `observed_request.headers`，不会自动恢复这一项。后续应保留实际采集到的语言头并验证样本、草稿、执行的完整链路，而非给所有网站硬编码中文。已记入 `docs/TODO-OPT.md`。
+
+原始无凭据对照结果保存在 `backend/temp/performance-search-recheck/windows-browser-header-comparison.json` 和 `accept-language-isolated-comparison.json`。以下 Windows PowerShell 命令可重复对照，只改变一个请求头：
+
+```powershell
+$searchUrl = 'http://shop.lemonban.com:8107/search/searchProdPage?categoryId=&current=1&isAllProdType=true&orderBy=0&size=12&sort=0&st=0&prodName=RIO%E8%A5%BF%E6%9F%9A%E4%BC%8F%E7%89%B9%E5%8A%A0%E9%A3%8E%E5%91%B3%E9%B8%A1%E5%B0%BE%E9%85%92'
+curl.exe --noproxy '*' --resolve 'shop.lemonban.com:8107:117.72.83.248' --connect-timeout 5 --max-time 10 -sS "$searchUrl"
+curl.exe --noproxy '*' --resolve 'shop.lemonban.com:8107:117.72.83.248' --connect-timeout 5 --max-time 10 -sS -H 'Accept-Language: zh-CN,zh;q=0.9' "$searchUrl"
+```
+
+用户确认 Windows 无痕窗口仍返回 `total=0`，提供的 Network Request URL 与对照 URL 一致，随后确认原请求的 `Accept-Language` 为 `zh-CN,zh;q=0.9`。12:52 使用这一确切值复测：原商品名返回 1，另一名称返回 0，原始结果保存在 `backend/temp/performance-search-recheck/windows-exact-accept-language.json`。Windows 浏览器、curl 与节点之间的请求差异已有对应证据；Mac mini 浏览器的实际语言头尚未取得，不能把其具体语言配置写成已核实事实。
+
+## 此前判断与排查记录
 
 用户随后重新在被测站点网页和网页版 Postman 验证，仍需搜索“RIO西柚伏特加风味鸡尾酒”才能命中，未发现工具返回的另一个名称。此前将工具侧结果直接归因为“商品已改名”的判断证据不足，现撤回该结论；不能据此要求用户更改查询词。
 
@@ -56,6 +84,6 @@
 
 上述信息不支持继续将普通浏览器缓存或两台设备的 DNS 差异作为已确认原因。`603 B` 是用户报告的 Network Size，并非已经核实的响应正文长度；仅凭大小和相同远程 IP，也不能证明两次请求的 URL、请求头、会话及后端处理完全相同。
 
-下一步只对照两项：Windows 无痕 / InPrivate 窗口打开给定的完整百分号编码 URL 后的 `total`，以及原窗口失败请求在 Network → Headers → General 中的实际 Request URL。前者用于检查差异是否与现有浏览器环境有关，后者用于核对查询参数与编码；即便无痕窗口成功，也不能单凭该结果断定具体是 Cookie 或扩展。当前等待用户提供，不要求发送 Cookie、令牌或登录信息。
+随后对照 Windows 无痕 / InPrivate 窗口和原窗口 Network Request URL：用户报告无痕仍为 0，实际 URL 与给定百分号编码 URL 一致。现有 Cookie 差异与 URL 编码差异均缺少支持，后续语言请求头对照结果见本文当前结论。
 
 用户消息中的 curl URL 带有 Markdown 链接表示；不能据此认定实际命令或浏览器请求包含反斜杠，需以上述 Network Request URL 为准。

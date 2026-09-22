@@ -7,10 +7,7 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
 
-from .installation import (
-    ReleaseConfigurationError, ca_certificate_bytes, installer_script_bytes,
-    upgrade_script_bytes,
-)
+from .installation import ReleaseConfigurationError, ca_certificate_bytes, installer_script_bytes
 
 
 def _plain_response(content, *, status):
@@ -36,27 +33,6 @@ class InstallScriptView(APIView):
         response['X-Content-Type-Options'] = 'nosniff'
         response['Content-Disposition'] = 'inline; filename="install-node.sh"'
         return response
-
-
-class UpgradeScriptView(View):
-    """Public static code only; target instructions remain admin-protected."""
-
-    http_method_names = ('get', 'head')
-
-    def get(self, request):
-        if request.META.get('QUERY_STRING'):
-            return _plain_response('升级脚本地址不接受查询参数。\n', status=400)
-        try:
-            content = upgrade_script_bytes()
-        except ReleaseConfigurationError:
-            return _plain_response('性能节点升级脚本暂不可用。\n', status=503)
-        response = HttpResponse(content, content_type='text/x-python; charset=utf-8')
-        response['Cache-Control'] = 'no-store'
-        response['X-Content-Type-Options'] = 'nosniff'
-        response['Content-Disposition'] = 'inline; filename="upgrade-node.py"'
-        return response
-
-    head = get
 
 
 @method_decorator(csrf_exempt, name='dispatch')

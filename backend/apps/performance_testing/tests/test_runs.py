@@ -174,6 +174,50 @@ class PerformanceRunContractTests(TestCase):
         return run
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_new_enrollment_generation_invalidates_old_same_version_validation(self, _):
+        validation = self._complete_validation(self.node)
+        self.client.force_authenticate(self.executor)
+        path = self._path(f'plans/{self.plan.pk}/node-eligibility/')
+        before = self.client.get(path)
+        self.assertEqual(before.status_code, 200, before.data)
+        self.assertTrue(before.data['data']['items'][0]['validation_valid'])
+        validation_before = self.client.get(self._path(f'runs/{validation.pk}/'))
+        self.assertEqual(validation_before.data['data']['validation_status'], 'passed')
+
+        PerformanceNode.objects.filter(pk=self.node.pk).update(
+            enrollment_consumed_at=timezone.now(),
+        )
+        self.node.refresh_from_db()
+        after = self.client.get(path)
+        self.assertEqual(after.status_code, 200, after.data)
+        self.assertFalse(after.data['data']['items'][0]['validation_valid'])
+        self.assertEqual(after.data['data']['items'][0]['reason_code'], 'validation_required')
+        validation_after = self.client.get(self._path(f'runs/{validation.pk}/'))
+        self.assertEqual(validation_after.data['data']['validation_status'], 'stale')
+        listed = self.client.get(self._path('runs/'))
+        listed_validation = next(
+            item for item in listed.data['data']['items']
+            if item['id'] == str(validation.pk)
+        )
+        self.assertEqual(listed_validation['validation_status'], 'stale')
+
+        replacement = self._complete_validation(self.node)
+        restored = self.client.get(path)
+        self.assertEqual(restored.status_code, 200, restored.data)
+        self.assertTrue(restored.data['data']['items'][0]['validation_valid'])
+        self.assertEqual(
+            restored.data['data']['items'][0]['validation_run_id'], str(replacement.pk),
+        )
+
+        # Reinstallation does not delete the historical validation report.
+        historical = self.client.get(self._path(f'runs/{validation.pk}/'))
+        self.assertEqual(historical.status_code, 200, historical.data)
+        self.assertEqual(historical.data['data']['id'], str(validation.pk))
+        self.assertEqual(historical.data['data']['validation_status'], 'stale')
+        replacement_detail = self.client.get(self._path(f'runs/{replacement.pk}/'))
+        self.assertEqual(replacement_detail.data['data']['validation_status'], 'passed')
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_multi_node_distribution_eligibility_idempotency_and_serialization(self, _):
         second, _ = self._node('node-two')
         third, _ = self._node('node-three')

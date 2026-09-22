@@ -207,6 +207,8 @@ def _node_is_compatible(node, now):
 
 
 def _matching_validation(plan, node, validation_key, *, lock=False):
+    if node.enrollment_consumed_at is None:
+        return None
     candidates = PerformanceRun.objects.filter(
         plan=plan,
         participants__node=node,
@@ -214,6 +216,7 @@ def _matching_validation(plan, node, validation_key, *, lock=False):
         mode=PerformanceRun.Mode.VALIDATION,
         status=PerformanceRun.Status.COMPLETED,
         validation_key=validation_key,
+        created_at__gte=node.enrollment_consumed_at,
     ).order_by('-finished_at', '-created_at')
     if lock:
         candidates = candidates.select_for_update()

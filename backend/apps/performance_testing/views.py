@@ -15,16 +15,17 @@ from projects.models import Project
 from users.permissions import is_platform_admin
 
 from .constants import platform_config
-from .installation import installation_metadata
+from .installation import ReleaseConfigurationError, installation_metadata
 from .models import PerformanceNode, PerformancePlan, PerformanceRun, PerformanceTarget
 from .parsers import LimitedJSONParser
 from .serializers import (
-    NodeRevokeSerializer, PerformanceNodeSerializer, PerformancePlanSerializer,
+    NodeReinstallSerializer, NodeRevokeSerializer, PerformanceNodeSerializer, PerformancePlanSerializer,
     PerformanceTargetSerializer,
 )
 from .services import (
-    EnrollmentRejected, NodeHasActiveRuns, create_node_with_enrollment,
-    enrollment_response, issue_enrollment, revoke_node,
+    EnrollmentRejected, NodeHasActiveRuns, NodeReinstallRejected,
+    create_node_with_enrollment, enrollment_response, issue_enrollment,
+    reinstall_node, revoke_node,
 )
 from .run_services import controller_execution_status
 
@@ -280,6 +281,33 @@ class NodeInstallationView(ManagementAPIView):
             ).data,
             'installation': installation_metadata(node=node),
         })
+
+
+class NodeReinstallView(ManagementAPIView):
+    def post(self, request, project_id, node_id):
+        project = _admin_project(request, project_id)
+        serializer = NodeReinstallSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                node, token, installation = reinstall_node(project, node_id)
+                node = get_object_or_404(_visible_nodes(project), pk=node.pk)
+                payload = enrollment_response(node, token, PerformanceNodeSerializer)
+                payload['installation'] = installation
+        except PerformanceNode.DoesNotExist as exc:
+            raise Http404('性能节点不存在。') from exc
+        except NodeHasActiveRuns as exc:
+            return Response({
+                'success': False,
+                'error': {
+                    'code': 'node_has_active_runs',
+                    'message': f'节点存在 {exc.count} 个未结束运行，不能重新安装。',
+                    'count': exc.count,
+                },
+            }, status=status.HTTP_409_CONFLICT)
+        except (NodeReinstallRejected, ReleaseConfigurationError) as exc:
+            return _conflict(str(exc))
+        return _ok(payload)
 
 
 class NodeRevokeView(ManagementAPIView):

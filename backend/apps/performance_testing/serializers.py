@@ -561,6 +561,15 @@ class NodeRevokeSerializer(StrictSerializer):
     confirm_stop = StrictBooleanField(required=False, default=False)
 
 
+class NodeReinstallSerializer(StrictSerializer):
+    confirm_old_container_removed = StrictBooleanField(required=True)
+
+    def validate_confirm_old_container_removed(self, value):
+        if value is not True:
+            raise serializers.ValidationError('必须确认旧容器已停止并删除。')
+        return value
+
+
 class PerformanceRunNodeListSerializer(serializers.ModelSerializer):
     node_id = serializers.UUIDField(read_only=True)
     node_name = serializers.SerializerMethodField()
@@ -648,8 +657,14 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
         participants = self._participants(obj)
         if len(participants) != 1:
             return 'stale'
+        node = participants[0].node
+        if (
+            node.enrollment_consumed_at is None
+            or obj.created_at < node.enrollment_consumed_at
+        ):
+            return 'stale'
         try:
-            current = validation_key_for(obj.plan, participants[0].node)
+            current = validation_key_for(obj.plan, node)
         except (TypeError, ValueError):
             return 'stale'
         return 'passed' if current == obj.validation_key else 'stale'

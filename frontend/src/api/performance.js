@@ -36,7 +36,7 @@ export const getPerformanceNodeEligibility = (projectId, planId) =>
   get(`${base(projectId)}/plans/${planId}/node-eligibility/`)
 export const stopPerformanceRun = (projectId, runId) => post(`${base(projectId)}/runs/${runId}/stop/`, {})
 
-// 仅这两个显式响应会返回 enrollment_token；调用方必须只保留在临时弹窗状态中。
+// 创建、重新生成和重新安装响应会返回 enrollment_token；调用方必须只保留在临时弹窗状态中。
 export const createPerformanceNode = async (projectId, data) => {
   const response = await post(`${base(projectId)}/nodes/`, data)
   return response?.data ?? response
@@ -46,6 +46,13 @@ export const updatePerformanceNode = (projectId, id, data) => patch(`${base(proj
 
 export const regeneratePerformanceNodeInstallation = async (projectId, id) => {
   const response = await post(`${base(projectId)}/nodes/${id}/enrollment/`, {})
+  return response?.data ?? response
+}
+
+export const reinstallPerformanceNodeInstallation = async (projectId, id) => {
+  const response = await post(`${base(projectId)}/nodes/${id}/reinstall/`, {
+    confirm_old_container_removed: true,
+  })
   return response?.data ?? response
 }
 

@@ -79,6 +79,7 @@ class Fixture(ThreadingHTTPServer):
         self.ca_bytes = ca_bytes
         self.counts = {}
         self.registrations = {}
+        self.enrollment_tokens = {}
         self.reject = set()
         self.lock = threading.Lock()
         self.unsafe_requests = 0
@@ -121,7 +122,7 @@ class Handler(BaseHTTPRequestHandler):
             with self.server.lock:
                 counts = self.server.counts.setdefault(node_id, {'enroll': 0, 'heartbeat': 0})
                 counts['enroll'] += 1
-                if node_id in self.server.reject:
+                if node_id in self.server.reject or supplied != self.server.enrollment_tokens.get(node_id):
                     self.respond(401, {})
                     return
                 if node_id in self.server.registrations:
@@ -175,9 +176,12 @@ def run_case(server, image, architecture, *, mode):
     token = node_id + '.' + secrets.token_urlsafe(24)
     name = 'performance-start-check-' + uuid.uuid4().hex[:12]
     volume = name + '-identity'
+    volumes = [volume]
+    tokens = [token]
     run_label = str(uuid.uuid4())
     created = False
     docker('volume', 'create', '--label', LABEL + '=' + run_label, volume)
+    server.enrollment_tokens[node_id] = token
     if mode == 'denied':
         server.reject.add(node_id)
     fingerprint = hashlib.sha256(server.ca_bytes).hexdigest() if mode != 'wrong-ca' else '0' * 64
@@ -194,13 +198,47 @@ def run_case(server, image, architecture, *, mode):
         ]
         docker(*args)
         created = True
-        if mode == 'valid':
+        if mode in {'valid', 'reinstall'}:
             wait_for(lambda: server.counts.get(node_id, {}).get('heartbeat', 0) >= 2, 'startup heartbeat missing')
             assert server.counts[node_id]['enroll'] == 1
+            expected_enrollments = 1
+            if mode == 'reinstall':
+                old_agent_token = server.registrations[node_id]
+                old_identity_hash = docker('exec', name, 'python', '-c',
+                    'import hashlib,pathlib; print(hashlib.sha256(pathlib.Path("/var/lib/performance-node/identity.json").read_bytes()).hexdigest())')
+                docker('stop', name)
+                docker('rm', name)  # Keep the previous identity volume.
+                created = False
+                new_token = node_id + '.' + secrets.token_urlsafe(24)
+                tokens.append(new_token)
+                new_volume = name + '-identity-' + hashlib.sha256(new_token.encode()).hexdigest()[:16]
+                docker('volume', 'create', '--label', LABEL + '=' + run_label, new_volume)
+                volumes.append(new_volume)
+                with server.lock:
+                    server.registrations.pop(node_id)
+                    server.enrollment_tokens[node_id] = new_token
+                    before = server.counts[node_id]['heartbeat']
+                replacement = list(args)
+                replacement[replacement.index('--mount') + 1] = f'type=volume,src={new_volume},dst=/var/lib/performance-node'
+                replacement[replacement.index('--token') + 1] = new_token
+                docker(*replacement)
+                created = True
+                wait_for(lambda: server.counts[node_id]['heartbeat'] >= before + 2, 'reinstall heartbeat missing')
+                assert server.counts[node_id]['enroll'] == 2
+                assert server.registrations[node_id] != old_agent_token
+                new_node_id = docker('exec', name, 'python', '-c',
+                    'import json,pathlib; print(json.loads(pathlib.Path("/var/lib/performance-node/identity.json").read_text())["node_id"])')
+                assert new_node_id == node_id
+                retained_hash = docker('run', '--rm', '--network', 'none', '--user', '0',
+                    '--label', LABEL + '=' + run_label,
+                    '--mount', f'type=volume,src={volume},dst=/state,readonly', '--entrypoint', 'python', image, '-c',
+                    'import hashlib,pathlib; print(hashlib.sha256(pathlib.Path("/state/identity.json").read_bytes()).hexdigest())')
+                assert retained_hash == old_identity_hash, 'old identity volume was changed'
+                expected_enrollments = 2
             before = server.counts[node_id]['heartbeat']
             docker('restart', name)
             wait_for(lambda: server.counts[node_id]['heartbeat'] >= before + 2, 'restart heartbeat missing')
-            assert server.counts[node_id]['enroll'] == 1, 'restart attempted re-enrollment'
+            assert server.counts[node_id]['enroll'] == expected_enrollments, 'restart attempted re-enrollment'
             result = docker('exec', name, 'python', '-c',
                             'import os,stat,pathlib; p=pathlib.Path("/var/lib/performance-node/identity.json");'
                             'print(os.getuid(),oct(stat.S_IMODE(p.stat().st_mode)))')
@@ -214,7 +252,7 @@ def run_case(server, image, architecture, *, mode):
             time.sleep(3)
             assert server.counts.get(node_id, {}).get('enroll', 0) == (1 if mode == 'denied' else 0)
             assert server.counts.get(node_id, {}).get('heartbeat', 0) == 0
-        assert token not in container_logs(name)
+        assert all(value not in container_logs(name) for value in tokens)
         assert server.unsafe_requests == 0
         print(json.dumps({'architecture': architecture, 'case': mode, 'passed': True,
                           'counts': server.counts.get(node_id, {})}), flush=True)
@@ -223,7 +261,8 @@ def run_case(server, image, architecture, *, mode):
             # Tokens here are ephemeral fixture-only values, but keep even
             # those out of persistent tool output and exception diagnostics.
             logs = container_logs(name)
-            logs = logs.replace(token, '[fixture-token]')
+            for value in tokens:
+                logs = logs.replace(value, '[fixture-token]')
             for value in server.registrations.values():
                 logs = logs.replace(value, '[fixture-identity]')
             print(logs[-3000:], flush=True)
@@ -236,16 +275,18 @@ def run_case(server, image, architecture, *, mode):
             if owner != run_label:
                 raise RuntimeError('refuse cleanup: container ownership mismatch')
             docker('rm', '-f', name)
-        owner = docker('volume', 'inspect', '--format', '{{index .Labels "' + LABEL + '"}}', volume)
-        if owner != run_label:
-            raise RuntimeError('refuse cleanup: volume ownership mismatch')
-        docker('volume', 'rm', volume)
+        for owned_volume in volumes:
+            owner = docker('volume', 'inspect', '--format', '{{index .Labels "' + LABEL + '"}}', owned_volume)
+            if owner != run_label:
+                raise RuntimeError('refuse cleanup: volume ownership mismatch')
+            docker('volume', 'rm', owned_volume)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', required=True)
     parser.add_argument('--architecture', choices=['amd64', 'arm64'], default='arm64')
+    parser.add_argument('--case', choices=['valid', 'wrong-ca', 'denied', 'reinstall'])
     args = parser.parse_args()
     inspected = json.loads(docker('image', 'inspect', '--platform', 'linux/' + args.architecture,
                                   args.image))[0]
@@ -262,7 +303,7 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            for mode in ('valid', 'wrong-ca', 'denied'):
+            for mode in ([args.case] if args.case else ('valid', 'wrong-ca', 'denied', 'reinstall')):
                 run_case(server, immutable_image, args.architecture, mode=mode)
         finally:
             server.shutdown()

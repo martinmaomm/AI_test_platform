@@ -129,16 +129,7 @@
         <el-table-column label="版本" min-width="240"
           ><template #default="{ row }"
             >Agent {{ row.agent_version || "-" }} / 引擎
-            {{ row.engine_version || "-"
-            }}<el-alert
-              v-if="requiresPerformanceNodeUpgrade(row, config.agent_version)"
-              type="warning"
-              :closable="false"
-              >需手动升级至 Agent
-              {{
-                config.agent_version
-              }}；请在安装指导中查看镜像摘要与升级说明。</el-alert
-            ></template
+            {{ row.engine_version || "-" }}</template
           ></el-table-column
         >
         <el-table-column
@@ -159,11 +150,11 @@
               ></template
             ><template v-else
               ><el-button
-                v-if="requiresPerformanceNodeUpgrade(row, config.agent_version)"
+                v-if="isRegisteredPerformanceNode(row)"
                 link
                 type="warning"
                 @click="openInstallation(row)"
-                >升级节点</el-button
+                >重新安装</el-button
               ><el-button link type="primary" @click="openInstallation(row)"
                 >安装指导</el-button
               ><el-button link type="primary" @click="openNode(row)"
@@ -315,14 +306,16 @@
 
     <el-dialog
       v-model="installationDialog.visible"
-      :title="installationInfo?.upgrade ? '节点升级指导' : '节点安装向导'"
+      :title="installationInfo?.reinstall ? '节点重新安装' : '节点安装向导'"
       width="680px"
       :close-on-click-modal="false"
+      :close-on-press-escape="!reinstallSubmitting"
+      :show-close="!reinstallSubmitting"
       @closed="clearInstallationGuide"
     >
       <template v-if="installationNode">
         <el-alert
-          v-if="!installationInfo?.upgrade"
+          v-if="!installationInfo?.reinstall"
           :type="
             installationStage.key === 'online'
               ? 'success'
@@ -345,9 +338,7 @@
             performanceNodeStatusLabel(installationNode.status)
           }}</el-descriptions-item
           ><el-descriptions-item label="平台地址">{{
-            installationInfo?.upgrade?.platform_url ||
-            installationInfo?.platform_url ||
-            "-"
+            installationInfo?.platform_url || "-"
           }}</el-descriptions-item
           ><el-descriptions-item label="支持架构">{{
             installationArchitectureText(
@@ -355,13 +346,13 @@
             )
           }}</el-descriptions-item></el-descriptions
         >
-        <PerformanceNodeUpgrade
-          v-if="installationDialog.visible && installationInfo?.upgrade"
+        <PerformanceNodeReinstall
+          v-if="installationDialog.visible && installationInfo?.reinstall"
           :key="String(installationNode?.id || '')"
           :node="installationNode"
-          :upgrade="installationInfo.upgrade"
-          @copy-docker="copyUpgradeCommand('docker', $event)"
-          @copy-compose="copyUpgradeCommand('compose', $event)"
+          :installation="installationInfo"
+          :submitting="reinstallSubmitting"
+          @submit="reinstallNode(installationNode)"
         />
         <el-alert
           v-else
@@ -374,7 +365,8 @@
         >
         <ul
           v-if="
-            !installationInfo?.upgrade && installationInfo?.requirements?.length
+            !installationInfo?.reinstall &&
+            installationInfo?.requirements?.length
           "
           class="installation-requirement-list"
         >
@@ -387,7 +379,8 @@
         </ul>
         <el-alert
           v-if="
-            !installationInfo?.upgrade && installationInfo?.available === false
+            !installationInfo?.reinstall &&
+            installationInfo?.available === false
           "
           type="warning"
           :closable="false"
@@ -398,7 +391,7 @@
         >
         <template
           v-if="
-            !installationInfo?.upgrade &&
+            !installationInfo?.reinstall &&
             canUseInstallationCommand(
               installationNode,
               installationDialog.installation,
@@ -430,6 +423,7 @@
             readonly
             type="textarea"
             :rows="4"
+            data-testid="installation-command"
           />
           <el-button
             class="copy-command"
@@ -440,7 +434,7 @@
         </template>
         <template
           v-else-if="
-            !installationInfo?.upgrade &&
+            !installationInfo?.reinstall &&
             installationDialog.loaded &&
             installationAvailable &&
             canRegenerateInstallation(
@@ -469,7 +463,7 @@
         </template>
         <template
           v-else-if="
-            !installationInfo?.upgrade &&
+            !installationInfo?.reinstall &&
             ['offline', 'registered'].includes(installationStage.key)
           "
         >
@@ -674,6 +668,7 @@ import {
   getPerformancePlans,
   getPerformanceTargets,
   performanceErrorMessage,
+  reinstallPerformanceNodeInstallation,
   regeneratePerformanceNodeInstallation,
   revokePerformanceNode,
   updatePerformanceNode,
@@ -691,12 +686,9 @@ import {
   nodeHasActiveRuns,
   performanceInstallationStage,
   performanceNodeActiveRunCount,
-  requiresPerformanceNodeUpgrade,
+  canReinstallPerformanceNode,
+  isRegisteredPerformanceNode,
 } from "@/utils/performanceInstallation";
-import {
-  buildPerformanceNodeComposeCommand,
-  buildPerformanceNodeUpgradeCommand,
-} from "@/utils/performanceNodeUpgrade";
 import {
   buildPerformanceTargetPayload,
   isPerformancePlatformAdmin,
@@ -717,7 +709,7 @@ import {
   performanceExecutionPermissions,
 } from "./performanceExecutionState";
 import PerformancePlanEditor from "./PerformancePlanEditor/PerformancePlanEditor.vue";
-import PerformanceNodeUpgrade from "./PerformanceNodeUpgrade.vue";
+import PerformanceNodeReinstall from "./PerformanceNodeReinstall.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -781,6 +773,7 @@ const installationDialog = reactive({
   expiresAt: "",
   loaded: false,
 });
+const reinstallSubmitting = ref(false);
 const nodeFormRef = ref();
 const targetFormRef = ref();
 const targetForm = reactive({
@@ -871,12 +864,7 @@ const runSubmitDisabled = computed(
         )
       : !runDialog.nodeIds.length || Boolean(loadBlockReason.value)),
 );
-const installationNode = computed(
-  () =>
-    nodes.value.find(
-      (node) => String(node.id) === String(installationDialog.node?.id),
-    ) || installationDialog.node,
-);
+const installationNode = computed(() => installationDialog.node);
 const installationInfo = computed(
   () => installationDialog.installation || config.installation || null,
 );
@@ -963,6 +951,7 @@ function invalidateProjectUi() {
   nodeDialog.visible = false;
   runDialog.visible = false;
   installationDialog.visible = false;
+  reinstallSubmitting.value = false;
   resetPlan();
   resetTarget();
   resetNode();
@@ -1018,6 +1007,18 @@ async function loadList(
     const result = listOf(await call(requestProjectId));
     if (!isCurrent()) return;
     ({ plans, nodes, targets })[kind].value = result;
+    if (
+      kind === "nodes" &&
+      installationDialog.visible &&
+      installationDialog.node
+    ) {
+      const latestNode = result.find(
+        (item) => String(item.id) === String(installationDialog.node?.id),
+      );
+      // The command comes only from the create/reinstall response. Polling may
+      // refresh the node lifecycle state, but must never replace that command.
+      if (latestNode) installationDialog.node = latestNode;
+    }
     if (kind === "targets") targetLoadError.value = "";
   } catch (error) {
     if (!isCurrent()) return;
@@ -1378,6 +1379,7 @@ function showInstallation(result) {
 }
 function clearInstallationGuide() {
   installationRequestNonce += 1;
+  reinstallSubmitting.value = false;
   Object.assign(installationDialog, {
     node: null,
     installation: null,
@@ -1436,13 +1438,20 @@ async function copyInstallationCommand() {
     ElMessage.warning("无法自动复制，请手动复制命令");
   }
 }
-async function copyUpgradeCommand(kind, name) {
-  const node = installationNode.value;
+async function reinstallNode(node) {
+  if (reinstallSubmitting.value || !node) return;
   const scope = captureScope();
   const dialogNonce = installationRequestNonce;
-  if (!node || !scopeIsCurrent(scope)) return;
+  if (
+    !scopeIsCurrent(scope) ||
+    !canReinstallPerformanceNode(node, installationDialog.installation)
+  ) {
+    ElMessage.warning("节点状态或重新安装信息已变化，请刷新后确认。");
+    return;
+  }
+  reinstallSubmitting.value = true;
   try {
-    const result = await getPerformanceNodeInstallation(
+    const result = await reinstallPerformanceNodeInstallation(
       scope.projectId,
       node.id,
     );
@@ -1453,30 +1462,33 @@ async function copyUpgradeCommand(kind, name) {
       String(installationDialog.node?.id) !== String(node.id)
     )
       return;
+    installationClock.value = Date.now();
     Object.assign(installationDialog, {
       node: result?.node || node,
       installation: result?.installation || null,
+      expiresAt: result?.expires_at || "",
       loaded: true,
     });
-    const currentNode = result?.node || node;
-    const upgrade = result?.installation?.upgrade;
-    const command =
-      kind === "compose"
-        ? buildPerformanceNodeComposeCommand(currentNode, upgrade, name)
-        : buildPerformanceNodeUpgradeCommand(currentNode, upgrade, name);
-    if (!command) {
-      ElMessage.warning(
-        "节点状态或升级信息已变化，无法复制升级命令；请刷新后确认。",
+    if (result?.node) {
+      // Fence any nodes-list request issued before the reinstall response; it
+      // could otherwise reintroduce the old online state over this pending node.
+      listRequestIds.nodes += 1;
+      nodes.value = nodes.value.map((item) =>
+        String(item.id) === String(result.node.id) ? result.node : item,
       );
-      return;
     }
-    await copyText(command);
     ElMessage.success(
-      kind === "compose" ? "Compose 命令已复制" : "Docker 升级命令已复制",
+      hasInstallationCommand(result)
+        ? "已生成新版安装命令"
+        : "已生成新的注册凭证",
     );
-  } catch {
-    if (scopeIsCurrent(scope))
-      ElMessage.warning("无法刷新节点升级信息，请稍后重试");
+    await loadList("nodes", scope.projectId, scope.epoch, { silent: true });
+  } catch (error) {
+    if (scopeIsCurrent(scope) && !isCancelled(error))
+      ElMessage.error(performanceErrorMessage(error, "生成新版安装命令失败"));
+  } finally {
+    if (scopeIsCurrent(scope) && installationRequestNonce === dialogNonce)
+      reinstallSubmitting.value = false;
   }
 }
 const isCancelled = (error) => ["cancel", "close"].includes(error);
@@ -1675,6 +1687,7 @@ const deactivate = () => {
     target: false,
     run: false,
   });
+  reinstallSubmitting.value = false;
 };
 onActivated(activate);
 onDeactivated(deactivate);

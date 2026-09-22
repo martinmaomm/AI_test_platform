@@ -21,6 +21,9 @@ from performance_testing.installation import (
     _sha256_file, installation_metadata, load_release_configuration,
 )
 from performance_testing.models import PerformanceNode, PerformanceRun
+from performance_testing.services import (
+    CredentialRejected, authenticate_agent_token, handle_agent_heartbeat,
+)
 from projects.models import Project, ProjectMember
 from users.models import User
 
@@ -44,10 +47,6 @@ class ReleaseFixtureMixin:
         self.installer_path.parent.mkdir(parents=True)
         self.installer_bytes = b'#!/usr/bin/env bash\nset -euo pipefail\n'
         self.installer_path.write_bytes(self.installer_bytes)
-        self.upgrade_path = self.installer_path.with_name('upgrade-node.py')
-        self.upgrade_bytes = b'#!/usr/bin/env python3\nprint("public upgrade fixture")\n'
-        self.upgrade_path.write_bytes(self.upgrade_bytes)
-
         self.release_directory = self.root / 'release'
         self.release_directory.mkdir()
         images = {}
@@ -281,23 +280,28 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
                 self.assertNotIn('command', metadata)
                 self.manifest['registry_index_ref'] = expected
 
-    def test_existing_node_metadata_exposes_pinned_image_and_upgrade_without_command(self):
+    def test_registered_node_metadata_exposes_reinstall_eligibility_without_command(self):
         old = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000001',
             'agent_version': '0.2.1', 'enrollment_expires_at': None,
+            'agent_token_digest': 'a' * 64, 'revoked_at': None,
+            'active_run_count': 0,
         })()
         current = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000002',
             'agent_version': AGENT_VERSION, 'enrollment_expires_at': None,
+            'agent_token_digest': 'b' * 64, 'revoked_at': None,
+            'active_run_count': 0,
         })()
         with self.release_environment():
             old_metadata = installation_metadata(node=old)
             current_metadata = installation_metadata(node=current)
         self.assertEqual(old_metadata['image_ref'], self.manifest['registry_index_ref'])
-        self.assertTrue(old_metadata['upgrade_required'])
+        self.assertEqual(old_metadata['reinstall'], {'available': True, 'reason': ''})
         self.assertNotIn('command', old_metadata)
+        self.assertNotIn('upgrade', old_metadata)
         self.assertEqual(current_metadata['image_ref'], self.manifest['registry_index_ref'])
-        self.assertFalse(current_metadata['upgrade_required'])
+        self.assertEqual(current_metadata['reinstall'], {'available': True, 'reason': ''})
         self.assertNotIn('command', current_metadata)
 
     def test_release_archive_symlink_is_rejected(self):
@@ -432,11 +436,12 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         mount = arguments[5 + len(expected_options)]
         self.assertRegex(
             mount,
-            r'^type=volume,src=performance-node-[0-9a-f-]{36}-identity,dst=/var/lib/performance-node$',
+            r'^type=volume,src=performance-node-[0-9a-f-]{36}-identity-[0-9a-f]{16},dst=/var/lib/performance-node$',
         )
         self.assertEqual(
             mount,
-            'type=volume,src=performance-node-00000000-0000-0000-0000-000000000001-identity,'
+            'type=volume,src=performance-node-00000000-0000-0000-0000-000000000001-identity-'
+            f'{hashlib.sha256(token.encode()).hexdigest()[:16]},'
             'dst=/var/lib/performance-node',
         )
         image_position = 6 + len(expected_options)
@@ -451,7 +456,7 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         self.assertNotIn('--network', arguments)
         self.assertNotIn('/var/run/docker.sock', command)
 
-    def test_regenerated_command_reuses_node_owned_container_and_identity_volume(self):
+    def test_regenerated_command_reuses_container_but_gets_a_fresh_identity_volume(self):
         node = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000001',
             'enrollment_expires_at': timezone.now() + timedelta(minutes=15),
@@ -462,7 +467,7 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         first_arguments = shlex.split(first['command'])
         second_arguments = shlex.split(second['command'])
         self.assertEqual(first['container_name'], second['container_name'])
-        self.assertEqual(
+        self.assertNotEqual(
             first_arguments[first_arguments.index('--mount') + 1],
             second_arguments[second_arguments.index('--mount') + 1],
         )
@@ -514,6 +519,21 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
             'name': 'safe node name; $(ignored)',
             'network_mode': 'public',
         }, format='json')
+
+    def register_node(self):
+        created = self.create_node()
+        node_id = created.data['data']['node']['id']
+        enrollment_token = created.data['data']['enrollment_token']
+        self.client.force_authenticate(user=None)
+        enrolled = self.client.post('/api/v1/performance-agent/enroll/', {
+            'enrollment_token': enrollment_token,
+            'protocol_version': PROTOCOL_VERSION,
+            'agent_version': AGENT_VERSION,
+            'engine_version': ENGINE_VERSION,
+        }, format='json')
+        self.assertEqual(enrolled.status_code, 200, enrolled.data)
+        self.authenticate(self.admin)
+        return PerformanceNode.objects.get(pk=node_id), enrolled.data['data']['agent_token']
 
     def test_create_get_and_registered_at_contract(self):
         created = self.create_node()
@@ -589,11 +609,12 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         self.assertNotIn('container_name', installation)
         self.assertNotIn(token, json.dumps(response.data, default=str))
 
-    def test_registered_020_node_does_not_guess_the_legacy_container_name(self):
+    def test_registered_legacy_node_does_not_guess_the_existing_container_name(self):
         created = self.create_node()
         node_id = created.data['data']['node']['id']
         PerformanceNode.objects.filter(pk=node_id).update(
             agent_version='0.2.0', enrollment_consumed_at=timezone.now(),
+            agent_token_digest='a' * 64,
         )
         response = self.client.get(
             self.root_url + f'nodes/{node_id}/installation/',
@@ -602,6 +623,7 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         installation = response.data['data']['installation']
         self.assertNotIn('command', installation)
         self.assertNotIn('container_name', installation)
+        self.assertEqual(installation['reinstall'], {'available': True, 'reason': ''})
 
     def registered_legacy_node(self):
         created = self.create_node()
@@ -612,27 +634,208 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         )
         return PerformanceNode.objects.get(pk=node_id), created.data['data']['enrollment_token']
 
-    def test_existing_node_upgrade_has_bound_digest_and_no_registration_credential(self):
+    def test_existing_node_reinstall_metadata_has_no_registration_credential(self):
         node, token = self.registered_legacy_node()
         response = self.client.get(self.root_url + f'nodes/{node.pk}/installation/')
         self.assertEqual(response.status_code, 200)
         metadata = response.data['data']['installation']
-        upgrade = metadata['upgrade']
-        self.assertEqual(upgrade, {
-            'available': True, 'reason': '', 'agent_version': AGENT_VERSION,
-            'image_ref': self.manifest['registry_index_ref'], 'node_id': str(node.pk),
-            'platform_url': 'https://platform.example.test/base',
-            'script_url': 'https://platform.example.test/base/api/v1/performance-agent/install/upgrade-node.py',
-            'script_sha256': hashlib.sha256(self.upgrade_bytes).hexdigest(),
-        })
+        self.assertEqual(metadata['reinstall'], {'available': True, 'reason': ''})
         self.assertNotIn('command', metadata)
-        self.assertNotIn('container_name', metadata)
+        self.assertNotIn('upgrade', metadata)
         self.assertNotIn(token, json.dumps(response.data, default=str))
         self.assertNotIn('a' * 64, json.dumps(response.data, default=str))
         self.authenticate(self.editor)
         self.assertEqual(self.client.get(self.root_url + f'nodes/{node.pk}/installation/').status_code, 403)
 
-    def test_upgrade_instructions_block_queued_and_stopping_runs_until_finished(self):
+    def test_reinstall_rotates_identity_preserves_history_and_rejects_late_agent_report(self):
+        node, old_agent_token = self.register_node()
+        authenticated_node, old_credential = authenticate_agent_token(old_agent_token)
+        PerformanceNode.objects.filter(pk=node.pk).update(
+            last_seen_at=timezone.now(), resources={'cpu_percent': 1, 'memory_percent': 2},
+        )
+        node.refresh_from_db()
+        original = {
+            'id': node.pk, 'name': node.name, 'project_id': node.project_id,
+            'network_mode': node.network_mode, 'created_at': node.created_at,
+        }
+        historical = PerformanceRun.objects.create(
+            project=self.project, mode='validation', status='completed',
+            request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='c' * 64,
+        )
+        participant = historical.participants.create(node=node, assigned_users=1)
+
+        response = self.client.post(
+            self.root_url + f'nodes/{node.pk}/reinstall/',
+            {'confirm_old_container_removed': True}, format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        data = response.data['data']
+        new_enrollment = data['enrollment_token']
+        self.assertEqual(data['node']['status'], 'pending')
+        self.assertIsNone(data['node']['registered_at'])
+        self.assertIn('command', data['installation'])
+        arguments = shlex.split(data['installation']['command'])
+        self.assertEqual(arguments[arguments.index('--token') + 1], new_enrollment)
+        self.assertEqual(arguments[arguments.index('--name') + 1], f'performance-node-{node.pk}')
+        mount = arguments[arguments.index('--mount') + 1]
+        expected_suffix = hashlib.sha256(new_enrollment.encode()).hexdigest()[:16]
+        self.assertIn(f'-identity-{expected_suffix},', mount)
+
+        repeated = self.client.post(
+            self.root_url + f'nodes/{node.pk}/reinstall/',
+            {'confirm_old_container_removed': True}, format='json',
+        )
+        self.assertEqual(repeated.status_code, 409, repeated.data)
+
+        node.refresh_from_db()
+        self.assertEqual({key: getattr(node, key) for key in original}, original)
+        self.assertIsNone(node.enrollment_consumed_at)
+        self.assertEqual(node.agent_token_digest, '')
+        self.assertIsNone(node.last_seen_at)
+        self.assertEqual(node.agent_version, '')
+        self.assertEqual(node.engine_version, '')
+        self.assertIsNone(node.protocol_version)
+        self.assertEqual(node.resources, {})
+        self.assertTrue(PerformanceRun.objects.filter(pk=historical.pk).exists())
+        self.assertEqual(historical.participants.get().node_id, node.pk)
+
+        with self.assertRaises(CredentialRejected):
+            handle_agent_heartbeat(
+                authenticated_node, old_credential,
+                {
+                    'protocol_version': PROTOCOL_VERSION,
+                    'agent_version': AGENT_VERSION,
+                    'engine_version': ENGINE_VERSION,
+                },
+                {'cpu_percent': 9, 'memory_percent': 8},
+                {
+                    'run_id': historical.pk, 'sequence': 1, 'state': 'stopped',
+                    'reason_code': '', 'reason': '',
+                },
+            )
+        node.refresh_from_db()
+        self.assertIsNone(node.last_seen_at)
+        participant.refresh_from_db()
+        self.assertEqual(participant.node_report, {})
+
+        self.client.force_authenticate(user=None)
+        late = self.client.post('/api/v1/performance-agent/heartbeat/', {
+            'protocol_version': PROTOCOL_VERSION,
+            'agent_version': AGENT_VERSION,
+            'engine_version': ENGINE_VERSION,
+            'resources': {'cpu_percent': 1, 'memory_percent': 2},
+            'run_report': {
+                'run_id': str(historical.pk), 'sequence': 1, 'state': 'stopped',
+                'reason_code': '', 'reason': '',
+            },
+        }, format='json', HTTP_AUTHORIZATION=f'Node {old_agent_token}')
+        self.assertEqual(late.status_code, 401, late.data)
+        self.assertNotIn('command', json.dumps(late.data, default=str))
+        participant.refresh_from_db()
+        self.assertEqual(participant.node_report, {})
+
+        enrolled = self.client.post('/api/v1/performance-agent/enroll/', {
+            'enrollment_token': new_enrollment,
+            'protocol_version': PROTOCOL_VERSION,
+            'agent_version': AGENT_VERSION,
+            'engine_version': ENGINE_VERSION,
+        }, format='json')
+        self.assertEqual(enrolled.status_code, 200, enrolled.data)
+        node.refresh_from_db()
+        self.assertIsNotNone(node.enrollment_consumed_at)
+        self.assertTrue(PerformanceRun.objects.filter(pk=historical.pk).exists())
+
+    def test_reinstall_requires_explicit_true_confirmation_and_registered_identity(self):
+        node, old_agent_token = self.register_node()
+        original_digest = node.agent_token_digest
+        path = self.root_url + f'nodes/{node.pk}/reinstall/'
+        for payload in ({}, {'confirm_old_container_removed': False},
+                        {'confirm_old_container_removed': 1},
+                        {'confirm_old_container_removed': True, 'extra': True}):
+            with self.subTest(payload=payload):
+                response = self.client.post(path, payload, format='json')
+                self.assertEqual(response.status_code, 400, response.data)
+        node.refresh_from_db()
+        self.assertEqual(node.agent_token_digest, original_digest)
+
+        pending = self.create_node().data['data']['node']['id']
+        rejected = self.client.post(
+            self.root_url + f'nodes/{pending}/reinstall/',
+            {'confirm_old_container_removed': True}, format='json',
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        self.client.force_authenticate(user=None)
+        heartbeat = self.client.post('/api/v1/performance-agent/heartbeat/', {
+            'protocol_version': PROTOCOL_VERSION, 'agent_version': AGENT_VERSION,
+            'engine_version': ENGINE_VERSION,
+            'resources': {'cpu_percent': 1, 'memory_percent': 2},
+        }, format='json', HTTP_AUTHORIZATION=f'Node {old_agent_token}')
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.data)
+
+    def test_reinstall_blocks_all_active_states_without_rotating_identity(self):
+        node, old_agent_token = self.register_node()
+        run = PerformanceRun.objects.create(
+            project=self.project, mode='load', request_id=uuid.uuid4(),
+            snapshot={}, snapshot_sha256='d' * 64,
+        )
+        run.participants.create(node=node, assigned_users=1)
+        path = self.root_url + f'nodes/{node.pk}/reinstall/'
+        original_digest = node.agent_token_digest
+        for run_status in PerformanceRun.ACTIVE_STATUSES:
+            with self.subTest(run_status=run_status):
+                PerformanceRun.objects.filter(pk=run.pk).update(status=run_status)
+                response = self.client.post(
+                    path, {'confirm_old_container_removed': True}, format='json',
+                )
+                self.assertEqual(response.status_code, 409, response.data)
+                self.assertEqual(response.data['error']['code'], 'node_has_active_runs')
+                node.refresh_from_db()
+                self.assertEqual(node.agent_token_digest, original_digest)
+        self.client.force_authenticate(user=None)
+        alive = self.client.post('/api/v1/performance-agent/heartbeat/', {
+            'protocol_version': PROTOCOL_VERSION, 'agent_version': AGENT_VERSION,
+            'engine_version': ENGINE_VERSION,
+            'resources': {'cpu_percent': 1, 'memory_percent': 2},
+        }, format='json', HTTP_AUTHORIZATION=f'Node {old_agent_token}')
+        self.assertEqual(alive.status_code, 200, alive.data)
+
+    def test_unavailable_release_does_not_rotate_registered_identity(self):
+        node, old_agent_token = self.register_node()
+        original_digest = node.agent_token_digest
+        (self.release_directory / 'manifest.json').write_text('{broken', encoding='utf-8')
+        response = self.client.post(
+            self.root_url + f'nodes/{node.pk}/reinstall/',
+            {'confirm_old_container_removed': True}, format='json',
+        )
+        self.assertEqual(response.status_code, 409, response.data)
+        node.refresh_from_db()
+        self.assertEqual(node.agent_token_digest, original_digest)
+        self.assertIsNotNone(node.enrollment_consumed_at)
+        self.client.force_authenticate(user=None)
+        heartbeat = self.client.post('/api/v1/performance-agent/heartbeat/', {
+            'protocol_version': PROTOCOL_VERSION, 'agent_version': AGENT_VERSION,
+            'engine_version': ENGINE_VERSION,
+            'resources': {'cpu_percent': 1, 'memory_percent': 2},
+        }, format='json', HTTP_AUTHORIZATION=f'Node {old_agent_token}')
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.data)
+
+    def test_reinstall_rejects_revoked_and_deleted_nodes(self):
+        node, _ = self.register_node()
+        path = self.root_url + f'nodes/{node.pk}/reinstall/'
+        revoked = self.client.post(
+            self.root_url + f'nodes/{node.pk}/revoke/', {}, format='json',
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.data)
+        self.assertEqual(self.client.post(
+            path, {'confirm_old_container_removed': True}, format='json',
+        ).status_code, 409)
+        deleted = self.client.delete(self.root_url + f'nodes/{node.pk}/')
+        self.assertEqual(deleted.status_code, 200, deleted.data)
+        self.assertEqual(self.client.post(
+            path, {'confirm_old_container_removed': True}, format='json',
+        ).status_code, 404)
+
+    def test_reinstall_metadata_blocks_every_active_run_until_finished(self):
         node, _ = self.registered_legacy_node()
         run = PerformanceRun.objects.create(project=self.project, mode='load',
             request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='b' * 64)
@@ -640,38 +843,26 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         path = self.root_url + f'nodes/{node.pk}/installation/'
         for status in ('queued', 'preparing', 'running', 'stopping'):
             PerformanceRun.objects.filter(pk=run.pk).update(status=status)
-            metadata = self.client.get(path).data['data']['installation']['upgrade']
+            metadata = self.client.get(path).data['data']['installation']['reinstall']
             self.assertFalse(metadata['available'])
             self.assertIn('未结束', metadata['reason'])
-            self.assertNotIn('script_url', metadata)
         PerformanceRun.objects.filter(pk=run.pk).update(status='cancelled')
-        self.assertTrue(self.client.get(path).data['data']['installation']['upgrade']['available'])
+        self.assertTrue(self.client.get(path).data['data']['installation']['reinstall']['available'])
 
-    def test_missing_upgrade_script_does_not_break_new_installation_or_show_command(self):
+    def test_unavailable_release_blocks_reinstall_without_showing_a_command(self):
         node, _ = self.registered_legacy_node()
-        self.upgrade_path.unlink()
+        (self.release_directory / 'manifest.json').write_text('{broken', encoding='utf-8')
         metadata = self.client.get(self.root_url + f'nodes/{node.pk}/installation/').data['data']['installation']
-        self.assertTrue(metadata['available'])
-        self.assertFalse(metadata['upgrade']['available'])
-        self.assertNotIn(str(self.root), metadata['upgrade']['reason'])
-        created = self.create_node()
-        self.assertIn('command', created.data['data']['installation'])
+        self.assertFalse(metadata['available'])
+        self.assertFalse(metadata['reinstall']['available'])
+        self.assertNotIn('command', metadata)
+        self.assertNotIn(str(self.root), metadata['reinstall']['reason'])
 
-    def test_public_upgrade_script_is_read_only_no_store_and_query_free(self):
+    def test_old_public_upgrade_script_route_is_removed(self):
         self.client.force_authenticate(user=None)
         path = '/api/v1/performance-agent/install/upgrade-node.py'
-        response = self.client.get(path, HTTP_ACCEPT='text/x-python')
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.content, self.upgrade_bytes)
-        self.assertEqual(response['Cache-Control'], 'no-store')
-        self.assertEqual(response['X-Content-Type-Options'], 'nosniff')
-        self.assertEqual(self.client.head(path).status_code, 200)
-        self.assertEqual(self.client.post(path, {}).status_code, 405)
-        rejected = self.client.get(path + '?token=do-not-echo')
-        self.assertEqual(rejected.status_code, 400)
-        self.assertNotIn(b'do-not-echo', rejected.content)
-        self.upgrade_path.unlink()
-        self.assertEqual(self.client.get(path).status_code, 503)
+        self.assertEqual(self.client.get(path).status_code, 404)
+        self.assertEqual(self.client.head(path).status_code, 404)
 
     def test_public_installer_is_raw_no_store_and_rejects_queries(self):
         self.client.force_authenticate(user=None)

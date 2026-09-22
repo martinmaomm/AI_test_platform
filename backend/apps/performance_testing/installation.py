@@ -377,36 +377,19 @@ def installer_script_bytes():
     )
 
 
-def upgrade_script_bytes():
-    return _read_small_file(
-        _repo_root() / 'deploy' / 'performance' / 'upgrade-node.py',
-        description='节点升级脚本', maximum_bytes=_MAX_INSTALLER_BYTES,
-    )
-
-
-def _upgrade_metadata(node, configuration):
-    """Instructions only: no registration credentials or remote container guesses."""
+def _reinstall_metadata(node, *, release_available, release_reason=''):
+    """Expose only eligibility; credentials and commands require an explicit POST."""
     unavailable = {'available': False, 'reason': ''}
-    if node.revoked_at or not node.agent_token_digest:
-        return {**unavailable, 'reason': '节点身份已失效，不能升级。'}
+    if getattr(node, 'revoked_at', None) or not getattr(node, 'agent_token_digest', ''):
+        return None
     active_count = getattr(node, 'active_run_count', None)
     if active_count is None:
         return {**unavailable, 'reason': '请刷新节点状态，确认没有正在执行或排队的任务。'}
     if active_count > 0:
-        return {**unavailable, 'reason': '节点仍有未结束的运行，请结束任务后再升级。'}
-    try:
-        script = upgrade_script_bytes()
-    except ReleaseConfigurationError:
-        return {**unavailable, 'reason': '升级脚本暂不可用，请联系平台管理员。'}
-    return {
-        'available': True, 'reason': '',
-        'agent_version': configuration.agent_version,
-        'image_ref': configuration.registry_index_ref,
-        'node_id': str(node.pk),
-        'platform_url': configuration.platform_url,
-        'script_url': configuration.platform_url + '/api/v1/performance-agent/install/upgrade-node.py',
-        'script_sha256': hashlib.sha256(script).hexdigest(),
-    }
+        return {**unavailable, 'reason': '节点仍有未结束的运行，请结束任务后再重新安装。'}
+    if not release_available:
+        return {**unavailable, 'reason': release_reason or '当前发行不可用，请联系平台管理员。'}
+    return {'available': True, 'reason': ''}
 
 
 def ca_certificate_bytes():
@@ -430,7 +413,7 @@ def load_release_configuration():
     )
 
 
-def _node_resource_names(node_id):
+def _node_resource_names(node_id, enrollment_token=None):
     raw_node_id = str(node_id)
     try:
         canonical_node_id = str(uuid.UUID(raw_node_id))
@@ -438,10 +421,14 @@ def _node_resource_names(node_id):
         raise ReleaseConfigurationError('节点 ID 必须是规范 UUID。') from exc
     if raw_node_id != canonical_node_id:
         raise ReleaseConfigurationError('节点 ID 必须是规范 UUID。')
-    return (
-        f'performance-node-{canonical_node_id}',
-        f'performance-node-{canonical_node_id}-identity',
-    )
+    container_name = f'performance-node-{canonical_node_id}'
+    identity_volume = f'{container_name}-identity'
+    if enrollment_token is not None:
+        if not isinstance(enrollment_token, str) or not enrollment_token:
+            raise ReleaseConfigurationError('一次性注册凭证格式无效。')
+        suffix = hashlib.sha256(enrollment_token.encode('utf-8')).hexdigest()[:16]
+        identity_volume = f'{identity_volume}-{suffix}'
+    return container_name, identity_volume
 
 
 def _known_container_name(node):
@@ -453,7 +440,7 @@ def _known_container_name(node):
 
 
 def _docker_command(configuration, *, node_id, enrollment_token):
-    container_name, identity_volume = _node_resource_names(node_id)
+    container_name, identity_volume = _node_resource_names(node_id, enrollment_token)
     arguments = [
         'docker', 'run', '-d', '--name', container_name,
         '--restart', 'unless-stopped', '--init', '--read-only',
@@ -474,7 +461,7 @@ def _docker_command(configuration, *, node_id, enrollment_token):
     return shlex.join(arguments)
 
 
-def installation_metadata(*, node=None, enrollment_token=None):
+def installation_metadata(*, node=None, enrollment_token=None, configuration=None):
     expires_at = getattr(node, 'enrollment_expires_at', None)
     container_name = None
     if node is not None:
@@ -491,7 +478,7 @@ def installation_metadata(*, node=None, enrollment_token=None):
                 'requirements': list(INSTALLATION_REQUIREMENTS),
             }
     try:
-        configuration = load_release_configuration()
+        configuration = configuration or load_release_configuration()
     except ReleaseConfigurationError as exc:
         platform_url = ''
         try:
@@ -509,6 +496,11 @@ def installation_metadata(*, node=None, enrollment_token=None):
         }
         if container_name is not None:
             metadata['container_name'] = container_name
+        reinstall = _reinstall_metadata(
+            node, release_available=False, release_reason=str(exc),
+        ) if node is not None else None
+        if reinstall is not None:
+            metadata['reinstall'] = reinstall
         return metadata
 
     metadata = {
@@ -519,21 +511,17 @@ def installation_metadata(*, node=None, enrollment_token=None):
             release.architecture for release in configuration.architectures
         ],
         'agent_version': configuration.agent_version,
-        # Public immutable image reference; existing nodes need it for a manual
-        # image-only upgrade, without issuing a second enrollment credential.
         'image_ref': configuration.registry_index_ref,
-        'upgrade_required': bool(
-            node is not None and getattr(node, 'agent_version', '')
-            and node.agent_version != configuration.agent_version
-        ),
         'expires_at': expires_at,
         'requirements': list(INSTALLATION_REQUIREMENTS),
     }
     if container_name is not None:
         metadata['container_name'] = container_name
-    if (metadata['upgrade_required'] and node is not None
-            and getattr(node, 'enrollment_consumed_at', None) is not None):
-        metadata['upgrade'] = _upgrade_metadata(node, configuration)
+    reinstall = _reinstall_metadata(
+        node, release_available=True,
+    ) if node is not None else None
+    if reinstall is not None:
+        metadata['reinstall'] = reinstall
     if enrollment_token is None:
         return metadata
     if node is None or expires_at is None or expires_at <= timezone.now():

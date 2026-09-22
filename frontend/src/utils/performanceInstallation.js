@@ -32,8 +32,17 @@ export const canDeletePerformanceNode = (node) => (
 
 export const nodeHasActiveRuns = (node) => performanceNodeActiveRunCount(node) > 0
 
-export const requiresPerformanceNodeUpgrade = (node, expectedVersion) => Boolean(
-  node?.status !== 'revoked' && node?.agent_version && expectedVersion && node.agent_version !== expectedVersion
+export const isRegisteredPerformanceNode = (node) => Boolean(
+  node?.status !== 'revoked' && node?.registered_at
+)
+
+export const hasKnownNoActiveRuns = (node) => (
+  (typeof node?.active_run_count === 'number' && Number.isInteger(node.active_run_count) && node.active_run_count === 0) ||
+  (typeof node?.active_run_count === 'string' && /^\d+$/.test(node.active_run_count) && Number(node.active_run_count) === 0)
+)
+
+export const canReinstallPerformanceNode = (node, installation) => (
+  isRegisteredPerformanceNode(node) && hasKnownNoActiveRuns(node) && installation?.reinstall?.available === true
 )
 
 export const activeRunConflictCount = (error) => {

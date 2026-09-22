@@ -1,18 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readFile,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import {
   buildPerformanceTargetPayload,
   isPerformancePlatformAdmin,
@@ -31,16 +20,10 @@ import {
   nodeHasActiveRuns,
   performanceNodeActiveRunCount,
   performanceInstallationStage,
-  requiresPerformanceNodeUpgrade,
+  canReinstallPerformanceNode,
+  hasKnownNoActiveRuns,
+  isRegisteredPerformanceNode,
 } from "../src/utils/performanceInstallation.js";
-import {
-  buildPerformanceNodeComposeCommand,
-  buildPerformanceNodeUpgradeCommand,
-  isComposeServiceName,
-  isDockerContainerName,
-  performanceNodeReadyForUpgrade,
-  validPerformanceNodeUpgrade,
-} from "../src/utils/performanceNodeUpgrade.js";
 import {
   canStopPerformanceRun,
   assignedUsersByNode,
@@ -88,50 +71,49 @@ test("execution Query rows distinguish an empty query from an unavailable URL", 
   }
 });
 
-test("node upgrade guidance uses the actual configuration and installation response fields", async () => {
+test("node reinstall guidance uses the actual installation response fields", async () => {
+  const node = {
+    status: "online",
+    registered_at: "2026-09-22T00:00:00Z",
+    active_run_count: 0,
+  };
+  assert.equal(isRegisteredPerformanceNode(node), true);
+  assert.equal(hasKnownNoActiveRuns(node), true);
   assert.equal(
-    requiresPerformanceNodeUpgrade(
-      { status: "online", agent_version: "0.2.1" },
-      "0.3.0",
-    ),
+    canReinstallPerformanceNode(node, { reinstall: { available: true } }),
     true,
   );
   assert.equal(
-    requiresPerformanceNodeUpgrade(
-      { status: "online", agent_version: "0.3.0" },
-      "0.3.0",
+    canReinstallPerformanceNode(
+      { ...node, active_run_count: 1 },
+      { reinstall: { available: true } },
     ),
     false,
   );
   assert.equal(
-    requiresPerformanceNodeUpgrade(
-      { status: "pending", agent_version: "" },
-      "0.3.0",
-    ),
-    false,
-  );
-  assert.equal(
-    requiresPerformanceNodeUpgrade(
-      { status: "revoked", agent_version: "0.2.1" },
-      "0.3.0",
-    ),
-    false,
-  );
-  assert.equal(
-    requiresPerformanceNodeUpgrade(
-      { status: "online", agent_version: "0.2.1" },
-      undefined,
+    canReinstallPerformanceNode(
+      { ...node, active_run_count: null },
+      { reinstall: { available: true } },
     ),
     false,
   );
   const source = await read("../src/views/perf-testing/PerfWorkspace.vue");
-  assert.match(
-    source,
-    /requiresPerformanceNodeUpgrade\(row, config\.agent_version\)/,
-  );
-  assert.match(source, /PerformanceNodeUpgrade/);
-  assert.match(source, /installationInfo\?\.upgrade/);
+  assert.match(source, /isRegisteredPerformanceNode\(row\)/);
+  assert.match(source, /PerformanceNodeReinstall/);
+  assert.match(source, /installationInfo\?\.reinstall/);
+  assert.match(source, /reinstallPerformanceNodeInstallation/);
   assert.doesNotMatch(source, /installation_metadata/);
+  const panel = await read(
+    "../src/views/perf-testing/PerformanceNodeReinstall.vue",
+  );
+  for (const testId of [
+    "node-reinstall-panel",
+    "node-reinstall-confirm",
+    "node-reinstall-submit",
+  ])
+    assert.match(panel, new RegExp(testId));
+  assert.match(panel, /我已停止并删除旧容器/);
+  assert.match(panel, /新的身份卷/);
 });
 
 test("performance workspace exposes plan, run, node and target routes", async () => {
@@ -182,16 +164,12 @@ test("performance API keeps management responses in response.data and node lifec
     source,
     /getPerformanceNodeInstallation[\s\S]*nodes\/\$\{id\}\/installation/,
   );
-  assert.ok(
-    source.includes(
-      "revokePerformanceNode = (projectId, id, data = {}) => post(`${base(projectId)}/nodes/${id}/revoke/`, data)",
-    ),
+  assert.match(
+    source,
+    /reinstallPerformanceNodeInstallation[\s\S]*nodes\/\$\{id\}\/reinstall/,
   );
-  assert.ok(
-    source.includes(
-      "deletePerformanceNode = (projectId, id) => remove(`${base(projectId)}/nodes/${id}/`)",
-    ),
-  );
+  assert.match(source, /confirm_old_container_removed: true/);
+  assert.match(source, /deletePerformanceNode[\s\S]*nodes\/\$\{id\}\//);
   assert.doesNotMatch(source, /resetPerformanceNodeEnrollment/);
   assert.match(source, /performanceErrorMessage/);
 });
@@ -202,7 +180,7 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   assert.doesNotMatch(source, /<el-tabs/);
   assert.doesNotMatch(source, /phase-notice/);
   assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/);
-  assert.match(source, /节点升级指导/);
+  assert.match(source, /节点重新安装/);
   assert.match(source, /getPerformanceNodeInstallation/);
   assert.match(
     source,
@@ -232,10 +210,22 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
     /docker rm -f \{\{ installationInfo\?\.container_name \}\}/,
   );
   assert.match(source, /不要删除身份\s+volume/);
-  assert.match(source, /升级节点/);
-  assert.match(source, /不要重复执行 docker run/);
-  assert.match(source, /旧版已注册节点/);
-  assert.match(source, /不要按新版命名猜测/);
+  assert.match(source, /重新安装/);
+  assert.match(source, /reinstallSubmitting/);
+  assert.match(source, /reinstallNode\(installationNode\)/);
+  assert.match(source, /listRequestIds\.nodes \+= 1/);
+  assert.match(
+    source,
+    /kind === "nodes"\s*&&\s*installationDialog\.visible\s*&&\s*installationDialog\.node/,
+  );
+  assert.match(
+    source,
+    /if \(latestNode\) installationDialog\.node = latestNode/,
+  );
+  assert.match(
+    source,
+    /Polling may\s*\/\/\s*refresh the node lifecycle state, but must never replace that command/,
+  );
   assert.match(
     source,
     /window\.setInterval\(\s*\(\) => \{\s*installationClock\.value = Date\.now\(\);\s*return Promise\.all\(\s*\[\s*loadConfig\(requestProjectId, requestEpoch\),\s*loadList\("nodes"/,
@@ -295,183 +285,6 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   assert.match(source, /onActivated\(activate\)/);
   assert.match(source, /onDeactivated\(deactivate\)/);
   assert.match(source, /preservePlanDraft: planDialog\.visible/);
-});
-
-test("node upgrade commands require safe metadata and reject injected names", () => {
-  const node = { active_run_count: 0 };
-  const upgrade = {
-    available: true,
-    node_id: "1f7f46d6-09ec-4c06-9c94-10b4d5f7d191",
-    platform_url: "https://platform.example.test",
-    script_url: "https://platform.example.test/api/performance/node-upgrade.py",
-    script_sha256: "a".repeat(64),
-    image_ref: `docker.io/example/performance-node@sha256:${"b".repeat(64)}`,
-    agent_version: "0.4.0",
-  };
-  assert.equal(validPerformanceNodeUpgrade(node, upgrade), true);
-  const automatic = buildPerformanceNodeUpgradeCommand(node, upgrade);
-  assert.match(automatic, /set -euo pipefail/);
-  assert.match(automatic, /bash <<'PERFORMANCE_NODE_UPGRADE_EOF'/);
-  assert.match(automatic, /umask 077/);
-  assert.match(automatic, /--proto '=https'/);
-  assert.match(automatic, /sha256sum -c -/);
-  assert.match(automatic, /--node-id/);
-  assert.doesNotMatch(automatic, /--container/);
-  assert.match(
-    buildPerformanceNodeUpgradeCommand(node, upgrade, "legacy-node"),
-    /'--container' 'legacy-node'/,
-  );
-  for (const invalid of [
-    "bad name",
-    "node; id",
-    "$(id)",
-    "--help",
-    "node\nnext",
-  ]) {
-    assert.equal(isDockerContainerName(invalid), false);
-    assert.equal(
-      buildPerformanceNodeUpgradeCommand(node, upgrade, invalid),
-      null,
-    );
-  }
-  assert.equal(
-    buildPerformanceNodeUpgradeCommand({ active_run_count: 1 }, upgrade),
-    null,
-  );
-  assert.equal(
-    validPerformanceNodeUpgrade(node, {
-      ...upgrade,
-      script_url: "https://platform.example.test/upgrade.py?bad=1",
-    }),
-    false,
-  );
-  assert.equal(
-    validPerformanceNodeUpgrade(node, {
-      ...upgrade,
-      platform_url: "https://platform.example.test/#fragment",
-    }),
-    false,
-  );
-  assert.equal(buildPerformanceNodeUpgradeCommand({}, upgrade), null);
-  assert.equal(performanceNodeReadyForUpgrade({ active_run_count: 0 }), true);
-  assert.equal(performanceNodeReadyForUpgrade({}), false);
-  assert.equal(
-    performanceNodeReadyForUpgrade({ active_run_count: null }),
-    false,
-  );
-  assert.equal(
-    buildPerformanceNodeUpgradeCommand(node, {
-      ...upgrade,
-      script_sha256: "bad",
-    }),
-    null,
-  );
-});
-
-test("upgrade command round-trips quoted arguments and confines shell state", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "performance-node-upgrade-"));
-  const fakeBin = join(directory, "bin");
-  const script = join(directory, "upgrade.py");
-  const capture = join(directory, "argv.json");
-  const fakeCurl = join(fakeBin, "curl");
-  const fakeDocker = join(fakeBin, "docker");
-  await mkdir(fakeBin);
-  await writeFile(
-    script,
-    "import json, os, sys\nopen(os.environ['ARGV_CAPTURE'], 'w').write(json.dumps(sys.argv[1:]))\n",
-  );
-  await writeFile(
-    fakeCurl,
-    '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = --output ]; then output=$2; shift 2; continue; fi\n  shift\ndone\ncp "$FAKE_UPGRADE_SCRIPT" "$output"\n',
-  );
-  await writeFile(fakeDocker, "#!/bin/sh\nexit 0\n");
-  await chmod(fakeCurl, 0o755);
-  await chmod(fakeDocker, 0o755);
-  const node = { active_run_count: 0 };
-  const upgrade = {
-    available: true,
-    node_id: "1f7f46d6-09ec-4c06-9c94-10b4d5f7d191",
-    platform_url: "https://platform.example.test/base'o",
-    script_url: "https://platform.example.test/upgrade'a.py",
-    script_sha256: createHash("sha256")
-      .update(await readFile(script))
-      .digest("hex"),
-    image_ref: `docker.io/example/performance-node@sha256:${"b".repeat(64)}`,
-    agent_version: "0.4.0",
-  };
-  const env = {
-    ...process.env,
-    PATH: `${fakeBin}:${process.env.PATH}`,
-    FAKE_UPGRADE_SCRIPT: script,
-    ARGV_CAPTURE: capture,
-  };
-  try {
-    const command = buildPerformanceNodeUpgradeCommand(
-      node,
-      upgrade,
-      "legacy-node",
-    );
-    const result = spawnSync(
-      "bash",
-      ["-c", `${command}\nfalse\nprintf outer-shell-still-running`],
-      {
-        env,
-        encoding: "utf8",
-      },
-    );
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /outer-shell-still-running/);
-    assert.deepEqual(JSON.parse(await readFile(capture, "utf8")), [
-      "--node-id",
-      upgrade.node_id,
-      "--platform",
-      upgrade.platform_url,
-      "--image",
-      upgrade.image_ref,
-      "--agent-version",
-      upgrade.agent_version,
-      "--container",
-      "legacy-node",
-    ]);
-
-    await rm(capture);
-    const mismatched = buildPerformanceNodeUpgradeCommand(node, {
-      ...upgrade,
-      script_sha256: "0".repeat(64),
-    });
-    const failed = spawnSync("bash", ["-c", mismatched], {
-      env,
-      encoding: "utf8",
-    });
-    assert.notEqual(failed.status, 0);
-    assert.equal(existsSync(capture), false);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("Compose upgrade command uses only an explicit safe service name", () => {
-  const node = { active_run_count: 0 };
-  const upgrade = {
-    available: true,
-    node_id: "1f7f46d6-09ec-4c06-9c94-10b4d5f7d191",
-    platform_url: "https://platform.example.test",
-    script_url: "https://platform.example.test/api/performance/node-upgrade.py",
-    script_sha256: "a".repeat(64),
-    image_ref: `docker.io/example/performance-node@sha256:${"b".repeat(64)}`,
-    agent_version: "0.4.0",
-  };
-  assert.equal(isComposeServiceName("performance-node"), true);
-  assert.equal(isComposeServiceName("node; shutdown"), false);
-  assert.equal(buildPerformanceNodeComposeCommand(node, upgrade, ""), null);
-  assert.equal(
-    buildPerformanceNodeComposeCommand(node, upgrade, "node; shutdown"),
-    null,
-  );
-  assert.equal(
-    buildPerformanceNodeComposeCommand(node, upgrade, "load_worker"),
-    "docker compose pull -- 'load_worker'\ndocker compose up -d --no-deps --no-build --pull never -- 'load_worker'",
-  );
 });
 
 test("multi-node allocation is UUID-stable, balanced and blocks invalid eligibility", () => {

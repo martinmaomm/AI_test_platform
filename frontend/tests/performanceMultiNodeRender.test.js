@@ -16,13 +16,10 @@ const projectModule = dataModule(
 );
 const projectApiModule = dataModule("export const getProject=async()=>({});");
 const performanceApiModule = dataModule(
-  "export const createPerformanceNode=async()=>({}); export const createPerformancePlan=async()=>({}); export const createPerformanceRun=async()=>({}); export const createPerformanceTarget=async()=>({}); export const deletePerformanceNode=async()=>({}); export const deletePerformancePlan=async()=>({}); export const deletePerformanceTarget=async()=>({}); export const getPerformanceConfig=async()=>({}); export const getPerformanceNodeInstallation=async()=>({}); export const getPerformanceNodes=async()=>({}); export const getPerformanceNodeEligibility=async()=>({}); export const getPerformancePlans=async()=>({}); export const getPerformanceTargets=async()=>({}); export const performanceErrorMessage=()=>''; export const regeneratePerformanceNodeInstallation=async()=>({}); export const revokePerformanceNode=async()=>({}); export const updatePerformanceNode=async()=>({}); export const updatePerformancePlan=async()=>({}); export const updatePerformanceTarget=async()=>({});",
+  "export const createPerformanceNode=async()=>({}); export const createPerformancePlan=async()=>({}); export const createPerformanceRun=async()=>({}); export const createPerformanceTarget=async()=>({}); export const deletePerformanceNode=async()=>({}); export const deletePerformancePlan=async()=>({}); export const deletePerformanceTarget=async()=>({}); export const getPerformanceConfig=async()=>({}); export const getPerformanceNodeInstallation=async()=>({}); export const getPerformanceNodes=async()=>({}); export const getPerformanceNodeEligibility=async()=>({}); export const getPerformancePlans=async()=>({}); export const getPerformanceTargets=async()=>({}); export const performanceErrorMessage=()=>''; export const regeneratePerformanceNodeInstallation=async()=>({}); export const reinstallPerformanceNodeInstallation=async()=>({}); export const revokePerformanceNode=async()=>({}); export const updatePerformanceNode=async()=>({}); export const updatePerformancePlan=async()=>({}); export const updatePerformanceTarget=async()=>({});",
 );
 const installationModule = dataModule(
-  "export const activeRunConflictCount=()=>0; export const canDeletePerformanceNode=()=>false; export const canRegenerateInstallation=()=>false; export const canUseInstallationCommand=()=>false; export const installationArchitectureText=()=>''; export const installationCommandExpired=()=>false; export const nodeHasActiveRuns=()=>false; export const performanceInstallationStage=()=>({}); export const performanceNodeActiveRunCount=()=>0; export const requiresPerformanceNodeUpgrade=()=>false;",
-);
-const upgradeModule = dataModule(
-  "export const buildPerformanceNodeComposeCommand=()=>null; export const buildPerformanceNodeUpgradeCommand=()=>null;",
+  "export const activeRunConflictCount=()=>0; export const canDeletePerformanceNode=()=>false; export const canRegenerateInstallation=()=>false; export const canReinstallPerformanceNode=()=>false; export const canUseInstallationCommand=()=>false; export const installationArchitectureText=()=>''; export const installationCommandExpired=()=>false; export const isRegisteredPerformanceNode=()=>false; export const nodeHasActiveRuns=()=>false; export const performanceInstallationStage=()=>({}); export const performanceNodeActiveRunCount=()=>0;",
 );
 const workspaceStateModule = dataModule(
   "export const buildPerformanceTargetPayload=x=>x; export const isPerformancePlatformAdmin=()=>false; export const performanceNetworkModeLabel=x=>x; export const performanceNodeStatusLabel=x=>x; export const performancePlanPermissions=()=>({canEdit:false,canDelete:false}); export const samePerformanceScope=()=>true;",
@@ -75,10 +72,6 @@ async function compiledWorkspace() {
       `from ${JSON.stringify(installationModule)}`,
     )
     .replaceAll(
-      'from "@/utils/performanceNodeUpgrade"',
-      `from ${JSON.stringify(upgradeModule)}`,
-    )
-    .replaceAll(
       'from "./performanceWorkspaceState"',
       `from ${JSON.stringify(workspaceStateModule)}`,
     )
@@ -88,8 +81,8 @@ async function compiledWorkspace() {
       `import PerformancePlanEditor from ${JSON.stringify(emptyModule)};`,
     )
     .replace(
-      /import PerformanceNodeUpgrade from ".*?";/,
-      `import PerformanceNodeUpgrade from ${JSON.stringify(emptyModule)};`,
+      /import PerformanceNodeReinstall from ".*?";/,
+      `import PerformanceNodeReinstall from ${JSON.stringify(emptyModule)};`,
     )
     .replace(
       /from "vue-router"/,

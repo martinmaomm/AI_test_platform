@@ -40,6 +40,10 @@ class NodeHasActiveRuns(Exception):
         super().__init__(f'节点存在 {count} 个活跃运行。')
 
 
+class NodeReinstallRejected(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class NodeCredential:
     node_id: uuid.UUID
@@ -106,6 +110,54 @@ def issue_enrollment(node):
 def create_node_with_enrollment(project, validated_data):
     node = PerformanceNode.objects.create(project=project, **validated_data)
     return issue_enrollment(node)
+
+
+@transaction.atomic
+def reinstall_node(project, node_id):
+    """Rotate a registered node back to one-time enrollment without changing history."""
+    locked_project = Project.objects.select_for_update().get(pk=project.pk)
+    node = PerformanceNode.objects.select_for_update().filter(
+        pk=node_id, project=locked_project,
+    ).first()
+    if node is None or node.deleted_at is not None:
+        raise PerformanceNode.DoesNotExist
+    if node.revoked_at is not None:
+        raise NodeReinstallRejected('已吊销节点不能重新安装。')
+    if node.enrollment_consumed_at is None or not node.agent_token_digest:
+        raise NodeReinstallRejected('节点尚未完成注册，不能进入重新安装流程。')
+    active_run_count = PerformanceRun.objects.filter(
+        participants__node=node, status__in=PerformanceRun.ACTIVE_STATUSES,
+    ).count()
+    if active_run_count:
+        raise NodeHasActiveRuns(active_run_count)
+
+    # Validate the complete current release and command before changing the
+    # durable identity. Any error rolls the transaction back unchanged.
+    from .installation import installation_metadata, load_release_configuration
+    configuration = load_release_configuration()
+    token, digest = _new_credential(node.pk)
+    now = timezone.now()
+    node.enrollment_token_digest = digest
+    node.enrollment_expires_at = now + timedelta(seconds=ENROLLMENT_TTL_SECONDS)
+    node.enrollment_consumed_at = None
+    node.agent_token_digest = ''
+    node.last_seen_at = None
+    node.agent_version = ''
+    node.engine_version = ''
+    node.protocol_version = None
+    node.resources = {}
+    installation = installation_metadata(
+        node=node, enrollment_token=token, configuration=configuration,
+    )
+    if not installation.get('available') or not installation.get('command'):
+        raise NodeReinstallRejected('当前发行无法生成重新安装命令。')
+    node.save(update_fields=(
+        'enrollment_token_digest', 'enrollment_expires_at',
+        'enrollment_consumed_at', 'agent_token_digest', 'last_seen_at',
+        'agent_version', 'engine_version', 'protocol_version', 'resources',
+        'updated_at',
+    ))
+    return node, token, installation
 
 
 @transaction.atomic

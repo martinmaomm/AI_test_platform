@@ -116,7 +116,7 @@ def verify(origin, fixture, output):
             expect(dialog.get_by_role('button', name='开始正式压测')).to_be_disabled()
             state['fail_eligibility'] = False
             dialog.get_by_role('button', name='刷新节点资格').click()
-            dialog.get_by_role('button', name='单用户验证', exact=True).click()
+            dialog.get_by_role('button', name='验证此节点', exact=True).click()
             dialog.get_by_role('button', name='开始单用户验证', exact=True).click()
             expect(page).to_have_url(re.compile('/perf-testing/runs/' + fixture['validations'][1]))
             back = page.locator('.performance-run-detail .toolbar').get_by_role('button', name='返回正式压测节点选择')

@@ -601,7 +601,7 @@
                 link
                 type="primary"
                 @click="openValidationFromLoad(node.node_id)"
-                >单用户验证</el-button
+                >验证此节点</el-button
               >
             </div>
           </el-checkbox-group>

@@ -197,13 +197,15 @@
           <el-table-column label="停止 / 统计" min-width="140"
             ><template #default="{ row }"
               >{{
-                row.stopped_at
-                  ? "已确认"
-                  : row.reason_code === "lease_expired"
-                    ? "租约已失效"
-                    : row.status === "lost"
-                      ? "等待租约失效"
-                      : "-"
+                row.node_name_source === "current_node"
+                  ? "旧版未记录"
+                  : row.stopped_at
+                    ? "已确认"
+                    : row.reason_code === "lease_expired"
+                      ? "租约已失效"
+                      : row.status === "lost"
+                        ? "等待租约失效"
+                        : "-"
               }}
               / {{ completenessText(row) }}</template
             ></el-table-column
@@ -466,11 +468,13 @@ const resourceText = (node) => {
   return `${cpu} / ${memory}`;
 };
 const completenessText = (node) =>
-  node?.latest_metrics?.complete === true
-    ? "完整"
-    : node?.latest_metrics?.complete === false
-      ? "不完整"
-      : "旧版未记录";
+  node?.node_name_source === "current_node"
+    ? "旧版未记录"
+    : node?.latest_metrics?.complete === true
+      ? "完整"
+      : node?.latest_metrics?.complete === false
+        ? "不完整"
+        : "旧版未记录";
 function stopPolling() {
   clearTimeout(pollTimer);
   pollTimer = undefined;

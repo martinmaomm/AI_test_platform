@@ -43,7 +43,7 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
 当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。0.4.0 单条命令使用固定摘要的多架构索引，节点机器无需登录 Docker Hub。协议 2 旧节点（如 0.3.1、0.3.2）可继续管理心跳和显示升级提示，但不能接收协议 3 的执行任务；更早且不使用协议 2 的节点必须升级，不能依赖兼容心跳。旧节点须保留原身份卷并手动升级至 0.4.0，完成单用户验证后才能加入多节点运行。设计见 [单条 Docker 接入](../../docs/plans/2026-09-18-performance-direct-docker-install.md)和[多节点方案](../../docs/plans/2026-09-22-performance-multi-node.md)。
 
-0.4.0 发布完成后，应单独保存双架构固定索引、匿名拉取、镜像启动、协议 3 和平台切换证据；[0.3.2 发布验收](../../docs/verification/2026-09-21-performance-node-0.3.2-release.md)仅作为上一版本的历史证据，不能代替本次验收。
+本次固定索引、匿名拉取、双架构启动、协议 3 和本机平台切换证据见 [0.4.0 发布验收](../../docs/verification/2026-09-22-performance-node-0.4.0-release.md)。
 
 只发布 `performance-node/` 的独立客户端，不发布平台镜像或整个项目目录。Docker 构建上下文已使用白名单，仅允许节点 Python 源码、包配置、README 和 Dockerfile；不包含平台 `.env`、身份卷、日志、数据库和私钥。
 

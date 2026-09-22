@@ -377,6 +377,38 @@ def installer_script_bytes():
     )
 
 
+def upgrade_script_bytes():
+    return _read_small_file(
+        _repo_root() / 'deploy' / 'performance' / 'upgrade-node.py',
+        description='节点升级脚本', maximum_bytes=_MAX_INSTALLER_BYTES,
+    )
+
+
+def _upgrade_metadata(node, configuration):
+    """Instructions only: no registration credentials or remote container guesses."""
+    unavailable = {'available': False, 'reason': ''}
+    if node.revoked_at or not node.agent_token_digest:
+        return {**unavailable, 'reason': '节点身份已失效，不能升级。'}
+    active_count = getattr(node, 'active_run_count', None)
+    if active_count is None:
+        return {**unavailable, 'reason': '请刷新节点状态，确认没有正在执行或排队的任务。'}
+    if active_count > 0:
+        return {**unavailable, 'reason': '节点仍有未结束的运行，请结束任务后再升级。'}
+    try:
+        script = upgrade_script_bytes()
+    except ReleaseConfigurationError:
+        return {**unavailable, 'reason': '升级脚本暂不可用，请联系平台管理员。'}
+    return {
+        'available': True, 'reason': '',
+        'agent_version': configuration.agent_version,
+        'image_ref': configuration.registry_index_ref,
+        'node_id': str(node.pk),
+        'platform_url': configuration.platform_url,
+        'script_url': configuration.platform_url + '/api/v1/performance-agent/install/upgrade-node.py',
+        'script_sha256': hashlib.sha256(script).hexdigest(),
+    }
+
+
 def ca_certificate_bytes():
     """Return only the configured, fully validated public CA PEM bytes."""
     return _load_ca_certificate(os.environ.get('PERFORMANCE_NODE_CA_CERT_FILE', ''))
@@ -499,6 +531,9 @@ def installation_metadata(*, node=None, enrollment_token=None):
     }
     if container_name is not None:
         metadata['container_name'] = container_name
+    if (metadata['upgrade_required'] and node is not None
+            and getattr(node, 'enrollment_consumed_at', None) is not None):
+        metadata['upgrade'] = _upgrade_metadata(node, configuration)
     if enrollment_token is None:
         return metadata
     if node is None or expires_at is None or expires_at <= timezone.now():

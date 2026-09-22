@@ -21,6 +21,9 @@ const performanceApiModule = dataModule(
 const installationModule = dataModule(
   "export const activeRunConflictCount=()=>0; export const canDeletePerformanceNode=()=>false; export const canRegenerateInstallation=()=>false; export const canUseInstallationCommand=()=>false; export const installationArchitectureText=()=>''; export const installationCommandExpired=()=>false; export const nodeHasActiveRuns=()=>false; export const performanceInstallationStage=()=>({}); export const performanceNodeActiveRunCount=()=>0; export const requiresPerformanceNodeUpgrade=()=>false;",
 );
+const upgradeModule = dataModule(
+  "export const buildPerformanceNodeComposeCommand=()=>null; export const buildPerformanceNodeUpgradeCommand=()=>null;",
+);
 const workspaceStateModule = dataModule(
   "export const buildPerformanceTargetPayload=x=>x; export const isPerformancePlatformAdmin=()=>false; export const performanceNetworkModeLabel=x=>x; export const performanceNodeStatusLabel=x=>x; export const performancePlanPermissions=()=>({canEdit:false,canDelete:false}); export const samePerformanceScope=()=>true;",
 );
@@ -72,6 +75,10 @@ async function compiledWorkspace() {
       `from ${JSON.stringify(installationModule)}`,
     )
     .replaceAll(
+      'from "@/utils/performanceNodeUpgrade"',
+      `from ${JSON.stringify(upgradeModule)}`,
+    )
+    .replaceAll(
       'from "./performanceWorkspaceState"',
       `from ${JSON.stringify(workspaceStateModule)}`,
     )
@@ -79,6 +86,10 @@ async function compiledWorkspace() {
     .replace(
       /import PerformancePlanEditor from ".*?";/,
       `import PerformancePlanEditor from ${JSON.stringify(emptyModule)};`,
+    )
+    .replace(
+      /import PerformanceNodeUpgrade from ".*?";/,
+      `import PerformanceNodeUpgrade from ${JSON.stringify(emptyModule)};`,
     )
     .replace(
       /from "vue-router"/,

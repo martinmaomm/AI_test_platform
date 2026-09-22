@@ -158,6 +158,12 @@
                 >删除</el-button
               ></template
             ><template v-else
+              ><el-button
+                v-if="requiresPerformanceNodeUpgrade(row, config.agent_version)"
+                link
+                type="warning"
+                @click="openInstallation(row)"
+                >升级节点</el-button
               ><el-button link type="primary" @click="openInstallation(row)"
                 >安装指导</el-button
               ><el-button link type="primary" @click="openNode(row)"
@@ -309,13 +315,14 @@
 
     <el-dialog
       v-model="installationDialog.visible"
-      title="节点安装向导"
+      :title="installationInfo?.upgrade ? '节点升级指导' : '节点安装向导'"
       width="680px"
       :close-on-click-modal="false"
       @closed="clearInstallationGuide"
     >
       <template v-if="installationNode">
         <el-alert
+          v-if="!installationInfo?.upgrade"
           :type="
             installationStage.key === 'online'
               ? 'success'
@@ -338,7 +345,9 @@
             performanceNodeStatusLabel(installationNode.status)
           }}</el-descriptions-item
           ><el-descriptions-item label="平台地址">{{
-            installationInfo?.platform_url || "-"
+            installationInfo?.upgrade?.platform_url ||
+            installationInfo?.platform_url ||
+            "-"
           }}</el-descriptions-item
           ><el-descriptions-item label="支持架构">{{
             installationArchitectureText(
@@ -346,26 +355,16 @@
             )
           }}</el-descriptions-item></el-descriptions
         >
+        <PerformanceNodeUpgrade
+          v-if="installationDialog.visible && installationInfo?.upgrade"
+          :key="String(installationNode?.id || '')"
+          :node="installationNode"
+          :upgrade="installationInfo.upgrade"
+          @copy-docker="copyUpgradeCommand('docker', $event)"
+          @copy-compose="copyUpgradeCommand('compose', $event)"
+        />
         <el-alert
-          v-if="installationInfo?.upgrade_required"
-          type="warning"
-          :closable="false"
-          >该节点需要手动升级至 Agent
-          {{
-            installationInfo.agent_version
-          }}。确认无运行任务后，保留原启动参数和身份卷，仅更换镜像；不能同时启动两个同身份节点。</el-alert
-        >
-        <el-input
-          v-if="installationInfo?.image_ref"
-          :model-value="installationInfo.image_ref"
-          readonly
-          ><template #append
-            ><el-button @click="copyUpgradeImage(installationInfo.image_ref)"
-              >复制镜像摘要</el-button
-            ></template
-          ></el-input
-        >
-        <el-alert
+          v-else
           class="installation-requirements"
           type="info"
           :closable="false"
@@ -374,7 +373,9 @@
           会按主机架构选择固定摘要镜像；节点主动连接平台，无需开放节点入站端口。</el-alert
         >
         <ul
-          v-if="installationInfo?.requirements?.length"
+          v-if="
+            !installationInfo?.upgrade && installationInfo?.requirements?.length
+          "
           class="installation-requirement-list"
         >
           <li
@@ -385,7 +386,9 @@
           </li>
         </ul>
         <el-alert
-          v-if="installationInfo?.available === false"
+          v-if="
+            !installationInfo?.upgrade && installationInfo?.available === false
+          "
           type="warning"
           :closable="false"
           >{{
@@ -395,6 +398,7 @@
         >
         <template
           v-if="
+            !installationInfo?.upgrade &&
             canUseInstallationCommand(
               installationNode,
               installationDialog.installation,
@@ -436,6 +440,7 @@
         </template>
         <template
           v-else-if="
+            !installationInfo?.upgrade &&
             installationDialog.loaded &&
             installationAvailable &&
             canRegenerateInstallation(
@@ -463,7 +468,10 @@
           >
         </template>
         <template
-          v-else-if="['offline', 'registered'].includes(installationStage.key)"
+          v-else-if="
+            !installationInfo?.upgrade &&
+            ['offline', 'registered'].includes(installationStage.key)
+          "
         >
           <el-alert
             v-if="installationInfo?.container_name"
@@ -686,6 +694,10 @@ import {
   requiresPerformanceNodeUpgrade,
 } from "@/utils/performanceInstallation";
 import {
+  buildPerformanceNodeComposeCommand,
+  buildPerformanceNodeUpgradeCommand,
+} from "@/utils/performanceNodeUpgrade";
+import {
   buildPerformanceTargetPayload,
   isPerformancePlatformAdmin,
   performanceNetworkModeLabel,
@@ -705,6 +717,7 @@ import {
   performanceExecutionPermissions,
 } from "./performanceExecutionState";
 import PerformancePlanEditor from "./PerformancePlanEditor/PerformancePlanEditor.vue";
+import PerformanceNodeUpgrade from "./PerformanceNodeUpgrade.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -1423,12 +1436,47 @@ async function copyInstallationCommand() {
     ElMessage.warning("无法自动复制，请手动复制命令");
   }
 }
-async function copyUpgradeImage(imageRef) {
+async function copyUpgradeCommand(kind, name) {
+  const node = installationNode.value;
+  const scope = captureScope();
+  const dialogNonce = installationRequestNonce;
+  if (!node || !scopeIsCurrent(scope)) return;
   try {
-    await copyText(imageRef);
-    ElMessage.success("镜像摘要已复制");
+    const result = await getPerformanceNodeInstallation(
+      scope.projectId,
+      node.id,
+    );
+    if (
+      !scopeIsCurrent(scope) ||
+      !installationDialog.visible ||
+      installationRequestNonce !== dialogNonce ||
+      String(installationDialog.node?.id) !== String(node.id)
+    )
+      return;
+    Object.assign(installationDialog, {
+      node: result?.node || node,
+      installation: result?.installation || null,
+      loaded: true,
+    });
+    const currentNode = result?.node || node;
+    const upgrade = result?.installation?.upgrade;
+    const command =
+      kind === "compose"
+        ? buildPerformanceNodeComposeCommand(currentNode, upgrade, name)
+        : buildPerformanceNodeUpgradeCommand(currentNode, upgrade, name);
+    if (!command) {
+      ElMessage.warning(
+        "节点状态或升级信息已变化，无法复制升级命令；请刷新后确认。",
+      );
+      return;
+    }
+    await copyText(command);
+    ElMessage.success(
+      kind === "compose" ? "Compose 命令已复制" : "Docker 升级命令已复制",
+    );
   } catch {
-    ElMessage.warning("无法自动复制镜像摘要");
+    if (scopeIsCurrent(scope))
+      ElMessage.warning("无法刷新节点升级信息，请稍后重试");
   }
 }
 const isCancelled = (error) => ["cancel", "close"].includes(error);

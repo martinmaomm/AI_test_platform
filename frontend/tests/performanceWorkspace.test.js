@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   buildPerformanceTargetPayload,
   isPerformancePlatformAdmin,
@@ -22,6 +33,14 @@ import {
   performanceInstallationStage,
   requiresPerformanceNodeUpgrade,
 } from "../src/utils/performanceInstallation.js";
+import {
+  buildPerformanceNodeComposeCommand,
+  buildPerformanceNodeUpgradeCommand,
+  isComposeServiceName,
+  isDockerContainerName,
+  performanceNodeReadyForUpgrade,
+  validPerformanceNodeUpgrade,
+} from "../src/utils/performanceNodeUpgrade.js";
 import {
   canStopPerformanceRun,
   assignedUsersByNode,
@@ -48,7 +67,9 @@ const read = (path) => readFile(new URL(path, import.meta.url), "utf8");
 
 test("execution Query rows preserve duplicates, empty values and decode URL values once", () => {
   assert.deepEqual(
-    requestQueryRows("https://fixture.invalid/items?tag=first&tag=second&empty=&flag&keyword=%E4%B8%AD%E6%96%87+%2B%26&encoded=%2520#ignored=1"),
+    requestQueryRows(
+      "https://fixture.invalid/items?tag=first&tag=second&empty=&flag&keyword=%E4%B8%AD%E6%96%87+%2B%26&encoded=%2520#ignored=1",
+    ),
     [
       { name: "tag", value: "first" },
       { name: "tag", value: "second" },
@@ -68,15 +89,48 @@ test("execution Query rows distinguish an empty query from an unavailable URL", 
 });
 
 test("node upgrade guidance uses the actual configuration and installation response fields", async () => {
-  assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.2.1"}, "0.3.0"), true);
-  assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.3.0"}, "0.3.0"), false);
-  assert.equal(requiresPerformanceNodeUpgrade({status: "pending", agent_version: ""}, "0.3.0"), false);
-  assert.equal(requiresPerformanceNodeUpgrade({status: "revoked", agent_version: "0.2.1"}, "0.3.0"), false);
-  assert.equal(requiresPerformanceNodeUpgrade({status: "online", agent_version: "0.2.1"}, undefined), false);
+  assert.equal(
+    requiresPerformanceNodeUpgrade(
+      { status: "online", agent_version: "0.2.1" },
+      "0.3.0",
+    ),
+    true,
+  );
+  assert.equal(
+    requiresPerformanceNodeUpgrade(
+      { status: "online", agent_version: "0.3.0" },
+      "0.3.0",
+    ),
+    false,
+  );
+  assert.equal(
+    requiresPerformanceNodeUpgrade(
+      { status: "pending", agent_version: "" },
+      "0.3.0",
+    ),
+    false,
+  );
+  assert.equal(
+    requiresPerformanceNodeUpgrade(
+      { status: "revoked", agent_version: "0.2.1" },
+      "0.3.0",
+    ),
+    false,
+  );
+  assert.equal(
+    requiresPerformanceNodeUpgrade(
+      { status: "online", agent_version: "0.2.1" },
+      undefined,
+    ),
+    false,
+  );
   const source = await read("../src/views/perf-testing/PerfWorkspace.vue");
-  assert.match(source, /requiresPerformanceNodeUpgrade\(row, config\.agent_version\)/);
-  assert.match(source, /installationInfo\?\.upgrade_required/);
-  assert.match(source, /copyUpgradeImage\(\s*installationInfo\.image_ref/);
+  assert.match(
+    source,
+    /requiresPerformanceNodeUpgrade\(row, config\.agent_version\)/,
+  );
+  assert.match(source, /PerformanceNodeUpgrade/);
+  assert.match(source, /installationInfo\?\.upgrade/);
   assert.doesNotMatch(source, /installation_metadata/);
 });
 
@@ -148,7 +202,7 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   assert.doesNotMatch(source, /<el-tabs/);
   assert.doesNotMatch(source, /phase-notice/);
   assert.doesNotMatch(source, /爬升 RPS|\}\} RPS|每秒请求速率/);
-  assert.match(source, /节点安装向导/);
+  assert.match(source, /节点升级指导/);
   assert.match(source, /getPerformanceNodeInstallation/);
   assert.match(
     source,
@@ -158,7 +212,10 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   assert.match(source, /v-if="canManageNodes"\s+label="操作"/);
   assert.match(source, /installationRequestNonce/);
   assert.match(source, /installationClock\.value = Date\.now\(\)/);
-  assert.match(source, /installationAvailable\s+&&\s+canRegenerateInstallation/);
+  assert.match(
+    source,
+    /installationAvailable\s+&&\s+canRegenerateInstallation/,
+  );
   assert.match(source, /安装命令已过期。若此前已执行过命令/);
   assert.match(source, /root 或 Docker\s+操作权限/);
   assert.match(source, /一条单行 docker run 命令/);
@@ -175,10 +232,7 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
     /docker rm -f \{\{ installationInfo\?\.container_name \}\}/,
   );
   assert.match(source, /不要删除身份\s+volume/);
-  assert.match(
-    source,
-    /docker restart \{\{ installationInfo\.container_name \}\}/,
-  );
+  assert.match(source, /升级节点/);
   assert.match(source, /不要重复执行 docker run/);
   assert.match(source, /旧版已注册节点/);
   assert.match(source, /不要按新版命名猜测/);
@@ -197,7 +251,10 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   );
   assert.doesNotMatch(source, /localStorage|router\.push\([^\n]*token/);
   assert.match(source, /getPerformanceNodeEligibility/);
-  assert.match(source, /node_ids: runDialog\.mode === "validation" \? \[nodeId\] : nodeIds/);
+  assert.match(
+    source,
+    /node_ids: runDialog\.mode === "validation" \? \[nodeId\] : nodeIds/,
+  );
   assert.match(source, /eligibilityCanLoad/);
   assert.match(source, /预计 \{\{ assignedFor\(node\.node_id\) \}\} 用户/);
   assert.match(source, /openRun\(row, ['"]validation['"]\)/);
@@ -240,20 +297,218 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   assert.match(source, /preservePlanDraft: planDialog\.visible/);
 });
 
-test("multi-node allocation is UUID-stable, balanced and blocks invalid eligibility", () => {
-  assert.deepEqual(
-    assignedUsersByNode(1000, ["c", "a", "b"]),
-    [
-      { nodeId: "a", assignedUsers: 334 },
-      { nodeId: "b", assignedUsers: 333 },
-      { nodeId: "c", assignedUsers: 333 },
-    ],
+test("node upgrade commands require safe metadata and reject injected names", () => {
+  const node = { active_run_count: 0 };
+  const upgrade = {
+    available: true,
+    node_id: "1f7f46d6-09ec-4c06-9c94-10b4d5f7d191",
+    platform_url: "https://platform.example.test",
+    script_url: "https://platform.example.test/api/performance/node-upgrade.py",
+    script_sha256: "a".repeat(64),
+    image_ref: `docker.io/example/performance-node@sha256:${"b".repeat(64)}`,
+    agent_version: "0.4.0",
+  };
+  assert.equal(validPerformanceNodeUpgrade(node, upgrade), true);
+  const automatic = buildPerformanceNodeUpgradeCommand(node, upgrade);
+  assert.match(automatic, /set -euo pipefail/);
+  assert.match(automatic, /bash <<'PERFORMANCE_NODE_UPGRADE_EOF'/);
+  assert.match(automatic, /umask 077/);
+  assert.match(automatic, /--proto '=https'/);
+  assert.match(automatic, /sha256sum -c -/);
+  assert.match(automatic, /--node-id/);
+  assert.doesNotMatch(automatic, /--container/);
+  assert.match(
+    buildPerformanceNodeUpgradeCommand(node, upgrade, "legacy-node"),
+    /'--container' 'legacy-node'/,
   );
+  for (const invalid of [
+    "bad name",
+    "node; id",
+    "$(id)",
+    "--help",
+    "node\nnext",
+  ]) {
+    assert.equal(isDockerContainerName(invalid), false);
+    assert.equal(
+      buildPerformanceNodeUpgradeCommand(node, upgrade, invalid),
+      null,
+    );
+  }
+  assert.equal(
+    buildPerformanceNodeUpgradeCommand({ active_run_count: 1 }, upgrade),
+    null,
+  );
+  assert.equal(
+    validPerformanceNodeUpgrade(node, {
+      ...upgrade,
+      script_url: "https://platform.example.test/upgrade.py?bad=1",
+    }),
+    false,
+  );
+  assert.equal(
+    validPerformanceNodeUpgrade(node, {
+      ...upgrade,
+      platform_url: "https://platform.example.test/#fragment",
+    }),
+    false,
+  );
+  assert.equal(buildPerformanceNodeUpgradeCommand({}, upgrade), null);
+  assert.equal(performanceNodeReadyForUpgrade({ active_run_count: 0 }), true);
+  assert.equal(performanceNodeReadyForUpgrade({}), false);
+  assert.equal(
+    performanceNodeReadyForUpgrade({ active_run_count: null }),
+    false,
+  );
+  assert.equal(
+    buildPerformanceNodeUpgradeCommand(node, {
+      ...upgrade,
+      script_sha256: "bad",
+    }),
+    null,
+  );
+});
+
+test("upgrade command round-trips quoted arguments and confines shell state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "performance-node-upgrade-"));
+  const fakeBin = join(directory, "bin");
+  const script = join(directory, "upgrade.py");
+  const capture = join(directory, "argv.json");
+  const fakeCurl = join(fakeBin, "curl");
+  const fakeDocker = join(fakeBin, "docker");
+  await mkdir(fakeBin);
+  await writeFile(
+    script,
+    "import json, os, sys\nopen(os.environ['ARGV_CAPTURE'], 'w').write(json.dumps(sys.argv[1:]))\n",
+  );
+  await writeFile(
+    fakeCurl,
+    '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = --output ]; then output=$2; shift 2; continue; fi\n  shift\ndone\ncp "$FAKE_UPGRADE_SCRIPT" "$output"\n',
+  );
+  await writeFile(fakeDocker, "#!/bin/sh\nexit 0\n");
+  await chmod(fakeCurl, 0o755);
+  await chmod(fakeDocker, 0o755);
+  const node = { active_run_count: 0 };
+  const upgrade = {
+    available: true,
+    node_id: "1f7f46d6-09ec-4c06-9c94-10b4d5f7d191",
+    platform_url: "https://platform.example.test/base'o",
+    script_url: "https://platform.example.test/upgrade'a.py",
+    script_sha256: createHash("sha256")
+      .update(await readFile(script))
+      .digest("hex"),
+    image_ref: `docker.io/example/performance-node@sha256:${"b".repeat(64)}`,
+    agent_version: "0.4.0",
+  };
+  const env = {
+    ...process.env,
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    FAKE_UPGRADE_SCRIPT: script,
+    ARGV_CAPTURE: capture,
+  };
+  try {
+    const command = buildPerformanceNodeUpgradeCommand(
+      node,
+      upgrade,
+      "legacy-node",
+    );
+    const result = spawnSync(
+      "bash",
+      ["-c", `${command}\nfalse\nprintf outer-shell-still-running`],
+      {
+        env,
+        encoding: "utf8",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /outer-shell-still-running/);
+    assert.deepEqual(JSON.parse(await readFile(capture, "utf8")), [
+      "--node-id",
+      upgrade.node_id,
+      "--platform",
+      upgrade.platform_url,
+      "--image",
+      upgrade.image_ref,
+      "--agent-version",
+      upgrade.agent_version,
+      "--container",
+      "legacy-node",
+    ]);
+
+    await rm(capture);
+    const mismatched = buildPerformanceNodeUpgradeCommand(node, {
+      ...upgrade,
+      script_sha256: "0".repeat(64),
+    });
+    const failed = spawnSync("bash", ["-c", mismatched], {
+      env,
+      encoding: "utf8",
+    });
+    assert.notEqual(failed.status, 0);
+    assert.equal(existsSync(capture), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Compose upgrade command uses only an explicit safe service name", () => {
+  const node = { active_run_count: 0 };
+  const upgrade = {
+    available: true,
+    node_id: "1f7f46d6-09ec-4c06-9c94-10b4d5f7d191",
+    platform_url: "https://platform.example.test",
+    script_url: "https://platform.example.test/api/performance/node-upgrade.py",
+    script_sha256: "a".repeat(64),
+    image_ref: `docker.io/example/performance-node@sha256:${"b".repeat(64)}`,
+    agent_version: "0.4.0",
+  };
+  assert.equal(isComposeServiceName("performance-node"), true);
+  assert.equal(isComposeServiceName("node; shutdown"), false);
+  assert.equal(buildPerformanceNodeComposeCommand(node, upgrade, ""), null);
+  assert.equal(
+    buildPerformanceNodeComposeCommand(node, upgrade, "node; shutdown"),
+    null,
+  );
+  assert.equal(
+    buildPerformanceNodeComposeCommand(node, upgrade, "load_worker"),
+    "docker compose pull -- 'load_worker'\ndocker compose up -d --no-deps --no-build --pull never -- 'load_worker'",
+  );
+});
+
+test("multi-node allocation is UUID-stable, balanced and blocks invalid eligibility", () => {
+  assert.deepEqual(assignedUsersByNode(1000, ["c", "a", "b"]), [
+    { nodeId: "a", assignedUsers: 334 },
+    { nodeId: "b", assignedUsers: 333 },
+    { nodeId: "c", assignedUsers: 333 },
+  ]);
   assert.deepEqual(assignedUsersByNode(2, ["a", "b", "c"]), []);
-  assert.equal(eligibilityCanValidate({ status: "online", compatible: true }), true);
-  assert.equal(eligibilityCanLoad({ status: "online", compatible: true, validation_valid: true }), true);
-  assert.equal(eligibilityCanLoad({ status: "online", compatible: true, validation_valid: false }), false);
-  assert.match(eligibilityReason({ status: "online", compatible: true, validation_valid: false }), /尚未通过/);
+  assert.equal(
+    eligibilityCanValidate({ status: "online", compatible: true }),
+    true,
+  );
+  assert.equal(
+    eligibilityCanLoad({
+      status: "online",
+      compatible: true,
+      validation_valid: true,
+    }),
+    true,
+  );
+  assert.equal(
+    eligibilityCanLoad({
+      status: "online",
+      compatible: true,
+      validation_valid: false,
+    }),
+    false,
+  );
+  assert.match(
+    eligibilityReason({
+      status: "online",
+      compatible: true,
+      validation_valid: false,
+    }),
+    /尚未通过/,
+  );
 });
 
 test("run detail only treats an explicit complete flag as complete statistics", async () => {
@@ -699,12 +954,23 @@ test("run detail separates route scope from polling requests so a delayed confir
   );
 });
 
-
 test("validation return selection survives navigation but is bound to the project", () => {
-  const nodes = ["00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000001"];
+  const nodes = [
+    "00000000-0000-4000-8000-000000000002",
+    "00000000-0000-4000-8000-000000000001",
+  ];
   const query = loadSelectionQuery(3, 7, nodes);
-  assert.deepEqual(readLoadSelection(query, 3), { planId: "7", nodeIds: [...nodes].reverse() });
+  assert.deepEqual(readLoadSelection(query, 3), {
+    planId: "7",
+    nodeIds: [...nodes].reverse(),
+  });
   assert.equal(readLoadSelection(query, 4), null);
-  assert.equal(readLoadSelection({ ...query, return_nodes: "invalid" }, 3), null);
-  assert.deepEqual(readLoadSelection(loadSelectionQuery(3, 7, []), 3), { planId: "7", nodeIds: [] });
+  assert.equal(
+    readLoadSelection({ ...query, return_nodes: "invalid" }, 3),
+    null,
+  );
+  assert.deepEqual(readLoadSelection(loadSelectionQuery(3, 7, []), 3), {
+    planId: "7",
+    nodeIds: [],
+  });
 });

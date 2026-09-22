@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import uuid
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -19,7 +20,7 @@ from performance_testing.constants import AGENT_VERSION, ENGINE_VERSION, PROTOCO
 from performance_testing.installation import (
     _sha256_file, installation_metadata, load_release_configuration,
 )
-from performance_testing.models import PerformanceNode
+from performance_testing.models import PerformanceNode, PerformanceRun
 from projects.models import Project, ProjectMember
 from users.models import User
 
@@ -43,6 +44,9 @@ class ReleaseFixtureMixin:
         self.installer_path.parent.mkdir(parents=True)
         self.installer_bytes = b'#!/usr/bin/env bash\nset -euo pipefail\n'
         self.installer_path.write_bytes(self.installer_bytes)
+        self.upgrade_path = self.installer_path.with_name('upgrade-node.py')
+        self.upgrade_bytes = b'#!/usr/bin/env python3\nprint("public upgrade fixture")\n'
+        self.upgrade_path.write_bytes(self.upgrade_bytes)
 
         self.release_directory = self.root / 'release'
         self.release_directory.mkdir()
@@ -598,6 +602,76 @@ class InstallationAPITests(ReleaseFixtureMixin, TestCase):
         installation = response.data['data']['installation']
         self.assertNotIn('command', installation)
         self.assertNotIn('container_name', installation)
+
+    def registered_legacy_node(self):
+        created = self.create_node()
+        node_id = created.data['data']['node']['id']
+        PerformanceNode.objects.filter(pk=node_id).update(
+            agent_version='0.3.2', protocol_version=2,
+            enrollment_consumed_at=timezone.now(), agent_token_digest='a' * 64,
+        )
+        return PerformanceNode.objects.get(pk=node_id), created.data['data']['enrollment_token']
+
+    def test_existing_node_upgrade_has_bound_digest_and_no_registration_credential(self):
+        node, token = self.registered_legacy_node()
+        response = self.client.get(self.root_url + f'nodes/{node.pk}/installation/')
+        self.assertEqual(response.status_code, 200)
+        metadata = response.data['data']['installation']
+        upgrade = metadata['upgrade']
+        self.assertEqual(upgrade, {
+            'available': True, 'reason': '', 'agent_version': AGENT_VERSION,
+            'image_ref': self.manifest['registry_index_ref'], 'node_id': str(node.pk),
+            'platform_url': 'https://platform.example.test/base',
+            'script_url': 'https://platform.example.test/base/api/v1/performance-agent/install/upgrade-node.py',
+            'script_sha256': hashlib.sha256(self.upgrade_bytes).hexdigest(),
+        })
+        self.assertNotIn('command', metadata)
+        self.assertNotIn('container_name', metadata)
+        self.assertNotIn(token, json.dumps(response.data, default=str))
+        self.assertNotIn('a' * 64, json.dumps(response.data, default=str))
+        self.authenticate(self.editor)
+        self.assertEqual(self.client.get(self.root_url + f'nodes/{node.pk}/installation/').status_code, 403)
+
+    def test_upgrade_instructions_block_queued_and_stopping_runs_until_finished(self):
+        node, _ = self.registered_legacy_node()
+        run = PerformanceRun.objects.create(project=self.project, mode='load',
+            request_id=uuid.uuid4(), snapshot={}, snapshot_sha256='b' * 64)
+        run.participants.create(node=node, assigned_users=1)
+        path = self.root_url + f'nodes/{node.pk}/installation/'
+        for status in ('queued', 'preparing', 'running', 'stopping'):
+            PerformanceRun.objects.filter(pk=run.pk).update(status=status)
+            metadata = self.client.get(path).data['data']['installation']['upgrade']
+            self.assertFalse(metadata['available'])
+            self.assertIn('未结束', metadata['reason'])
+            self.assertNotIn('script_url', metadata)
+        PerformanceRun.objects.filter(pk=run.pk).update(status='cancelled')
+        self.assertTrue(self.client.get(path).data['data']['installation']['upgrade']['available'])
+
+    def test_missing_upgrade_script_does_not_break_new_installation_or_show_command(self):
+        node, _ = self.registered_legacy_node()
+        self.upgrade_path.unlink()
+        metadata = self.client.get(self.root_url + f'nodes/{node.pk}/installation/').data['data']['installation']
+        self.assertTrue(metadata['available'])
+        self.assertFalse(metadata['upgrade']['available'])
+        self.assertNotIn(str(self.root), metadata['upgrade']['reason'])
+        created = self.create_node()
+        self.assertIn('command', created.data['data']['installation'])
+
+    def test_public_upgrade_script_is_read_only_no_store_and_query_free(self):
+        self.client.force_authenticate(user=None)
+        path = '/api/v1/performance-agent/install/upgrade-node.py'
+        response = self.client.get(path, HTTP_ACCEPT='text/x-python')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, self.upgrade_bytes)
+        self.assertEqual(response['Cache-Control'], 'no-store')
+        self.assertEqual(response['X-Content-Type-Options'], 'nosniff')
+        self.assertEqual(self.client.head(path).status_code, 200)
+        self.assertEqual(self.client.post(path, {}).status_code, 405)
+        rejected = self.client.get(path + '?token=do-not-echo')
+        self.assertEqual(rejected.status_code, 400)
+        self.assertNotIn(b'do-not-echo', rejected.content)
+        self.upgrade_path.unlink()
+        self.assertEqual(self.client.get(path).status_code, 503)
 
     def test_public_installer_is_raw_no_store_and_rejects_queries(self):
         self.client.force_authenticate(user=None)

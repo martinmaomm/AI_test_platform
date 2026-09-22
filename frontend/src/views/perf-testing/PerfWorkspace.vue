@@ -515,7 +515,7 @@
       @closed="resetRun"
     >
       <el-alert type="warning" :closable="false" show-icon
-        >将向受控目标发起真实请求。单用户验证每次只运行一个节点；正式压测可选择
+        >将向受控目标发起真实请求。单用户验证固定为 1 个用户，在 1 个节点执行一轮；正式压测可选择
         1–5 个节点。旧版节点必须手动升级至 Agent
         {{
           config.agent_version || "当前版本"
@@ -531,11 +531,18 @@
           runDialog.plan.name
         }}</el-descriptions-item>
         <el-descriptions-item label="负载">
-          总 {{ runDialog.plan.users }} 个虚拟用户；总每秒启动
-          {{ runDialog.plan.spawn_rate }} 个虚拟用户；{{
-            runDialog.plan.duration_seconds
-          }}
-          秒
+          <div data-testid="run-effective-load">
+            <template v-if="runDialog.mode === 'validation'">
+              固定 1 个虚拟用户；每秒启动 1 个用户；仅执行一轮，完成后自动结束。
+              本次验证不会修改计划中正式压测的负载配置。
+            </template>
+            <template v-else>
+              总 {{ runDialog.plan.users }} 个虚拟用户；总每秒启动
+              {{ runDialog.plan.spawn_rate }} 个虚拟用户；{{
+                runDialog.plan.duration_seconds
+              }} 秒
+            </template>
+          </div>
         </el-descriptions-item>
         <el-descriptions-item label="节点">
           <el-radio-group

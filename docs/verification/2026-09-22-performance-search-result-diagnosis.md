@@ -31,3 +31,17 @@
 辅助检查中，补充 JSON Content-Type、换浏览器 User-Agent、修改 Accept、关闭压缩、移除认证与 Cookie，都没有使旧商品名命中。仅分页查询返回 33 条，完整列表中的 ID 41 已是当前名称。只用原商品名或 ASCII 关键字 RIO 查询同样为空。
 
 后续应对照同一时刻用户成功请求与工具请求的原始响应、请求头及实际访问链路。在来源差异确认前保留用户原有查询词，不把修改筛选条件当作修复。
+
+## 两台设备浏览器与网络对照
+
+用户补充的两张浏览器截图均查询“挺好的金额还怪别人替换”：第一台设备返回 `total=0`，Mac mini 浏览器返回 `total=1`、商品 ID 41。这独立确认了两台设备观察到的数据差异，仍不证明商品在被测站点上被统一改名。
+
+- 当前工具实际运行主机为 macOS 的 Mac mini。系统 HTTP/HTTPS 代理为 `127.0.0.1:1088`，该监听属于 Shadowrocket 的 MacPacketTunnel 进程；Shadowrocket 正在运行。
+- Mac mini 默认 DNS 为 `utun4` 上的 `198.18.0.2`，域名通过系统解析得到 `198.18.0.87`；该地址不能当作被测服务的真实公网地址。
+- 用户在第一台设备使用阿里 DNS `223.5.5.5`，得到 `117.72.83.248`。Mac mini 向 `223.5.5.5`、`114.114.114.114`、`1.1.1.1` 查询也得到该 A 记录。没有观察到两边公网 DNS A 记录不同。
+- Mac mini 的普通路由走 `utun4`，指定 `en0` 的路由查询指向本地网关。单次 curl 使用 `--interface en0 --resolve shop.lemonban.com:8107:117.72.83.248 --noproxy '*'`，连接地址为该公网 IP，仍是原名称 0、另一个名称 1。此结果不足以认定代理导致差异，也不能仅凭网卡绑定选项确认所有透明网络层均被绕过。
+- Mac mini 固定该公网 IP、不传 Cookie、添加 `Cache-Control: no-cache` 查询另一名称，仍返回 1；响应日期为 `Tue, 22 Sep 2026 04:30:40 GMT`，响应 Cache-Control 为 `no-cache, no-store, max-age=0, must-revalidate`。
+
+用户随后在第一台 Windows 设备执行了固定 IP、不带浏览器 Cookie、添加 `Cache-Control: no-cache` 的 curl 查询，返回 `total=1`、商品 ID 41、名称“挺好的金额还怪别人替换”，并显示 `REMOTE_IP=117.72.83.248`。该结果与 Mac mini 一致。
+
+因此目前的差异集中在第一台设备的浏览器请求与同设备 curl 请求之间，尚不能确定是浏览器缓存、代理、会话、扩展或其他请求差异。已请用户在开发者工具 Network 中停用缓存并强制刷新，回报实际 total、Remote Address 和缓存标记；当前等待结果。未更改系统代理、VPN、DNS 或被测服务配置。

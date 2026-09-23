@@ -11,12 +11,16 @@ from celery.exceptions import SoftTimeLimitExceeded
 from performance_testing.analysis_data import build_analysis_input
 from performance_testing.analysis_engine import (
     AnalysisOutputError, MAX_OUTPUT_CHARS, generate_analysis, parse_analysis_output,
+    _stream_analysis_text,
 )
 from .test_analysis_data import fixture_run
 
 
 class AnalysisEngineTests(TestCase):
     def setUp(self):
+        transport_patch = patch('performance_testing.analysis_engine.stream_in_process', _stream_analysis_text)
+        transport_patch.start()
+        self.addCleanup(transport_patch.stop)
         self.payload = build_analysis_input(fixture_run(), {})
         self.output = {'summary': '本次运行存在读取超时，未配置性能目标。', 'findings': [{
             'category': 'errors', 'kind': 'observation', 'severity': 'warning',

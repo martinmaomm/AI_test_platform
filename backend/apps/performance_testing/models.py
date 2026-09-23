@@ -286,6 +286,8 @@ class PerformanceAnalysis(models.Model):
     targets = models.JSONField(default=dict, blank=True, editable=False)
     input_snapshot = models.JSONField(default=dict, blank=True, editable=False)
     result = models.JSONField(null=True, blank=True, editable=False)
+    timeout_seconds = models.PositiveIntegerField(default=600, editable=False)
+    progress = models.JSONField(default=dict, blank=True, editable=False)
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.QUEUED,
     )

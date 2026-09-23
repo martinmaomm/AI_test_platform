@@ -3,6 +3,8 @@ import json
 
 from celery.exceptions import SoftTimeLimitExceeded
 
+from .analysis_process import AnalysisTransportError, stream_in_process
+
 
 MAX_OUTPUT_CHARS = 24000
 MAX_FINDINGS = 12
@@ -92,7 +94,7 @@ def parse_analysis_output(raw, payload):
             'assessment': payload['assessment'], 'evidence': payload['evidence']}
 
 
-def generate_analysis(model_config_id, payload, check_active, remaining_seconds):
+def _stream_analysis_text(model_config_id, payload, check_active, remaining_seconds, on_event=None):
     # Reuse the existing bounded streaming transport without the agent/tool layer.
     from project_knowledge.llm import stream_call
     size = 0
@@ -109,6 +111,7 @@ def generate_analysis(model_config_id, payload, check_active, remaining_seconds)
             messages=[{'role': 'system', 'content': SYSTEM_PROMPT},
                       {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False, allow_nan=False)}],
             on_chunk=on_chunk, check_active=check_active, remaining_seconds=remaining_seconds,
+            on_event=on_event,
         )
     except Exception as exc:
         # The shared transport wraps callback failures once a stream has text.
@@ -121,5 +124,12 @@ def generate_analysis(model_config_id, payload, check_active, remaining_seconds)
             if cause is None:
                 break
         raise
+    return raw
+
+
+def generate_analysis(model_config_id, payload, check_active, remaining_seconds, on_event=None):
+    raw = stream_in_process(model_config_id, payload, check_active, remaining_seconds, on_event)
     check_active()
+    if on_event:
+        on_event({'phase': 'validating'})
     return parse_analysis_output(raw, payload)

@@ -48,6 +48,7 @@ class PerformanceAnalysisSerializer(serializers.ModelSerializer):
         model = PerformanceAnalysis
         fields = (
             'id', 'run_id', 'status', 'model_info', 'targets', 'result',
-            'error_code', 'error_message', 'created_at', 'started_at', 'finished_at',
+            'timeout_seconds', 'progress', 'error_code', 'error_message',
+            'created_at', 'started_at', 'finished_at',
         )
         read_only_fields = fields

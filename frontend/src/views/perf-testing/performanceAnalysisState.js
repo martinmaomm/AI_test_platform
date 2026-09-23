@@ -31,6 +31,76 @@ export const analysisStatusType = (status) =>
     completed: "success",
     failed: "danger",
   })[status] || "info";
+export const analysisPhaseLabel = (phase) =>
+  ({
+    queued: "排队等待",
+    preparing: "准备分析",
+    waiting_response: "等待响应",
+    receiving: "正在接收正文",
+    retrying: "正在重试",
+    validating: "正在核验结果",
+    completed: "已完成",
+  })[phase] ||
+  phase ||
+  "未记录阶段信息";
+export const analysisRetryReasonLabel = (reason) =>
+  ({
+    timeout: "等待响应超时",
+    connection_error: "连接暂时异常",
+    rate_limited: "服务繁忙，请求受限",
+    upstream_error: "服务暂时异常",
+    auth_error: "模型服务认证异常",
+    stream_interrupted: "响应中断",
+    unknown: "未知原因",
+  })[reason] ||
+  reason ||
+  "-";
+export const analysisRetryDescription = (progress = {}) => {
+  if (!progress.retry_reason) return "暂无";
+  const delay = Number(progress.retry_delay_seconds);
+  const suffix =
+    Number.isFinite(delay) && delay > 0 ? `，上次重试等待 ${delay} 秒` : "";
+  return `${analysisRetryReasonLabel(progress.retry_reason)}${suffix}`;
+};
+export const analysisProgress = (analysis) => {
+  const progress = analysis?.progress;
+  return progress &&
+    typeof progress === "object" &&
+    !Array.isArray(progress) &&
+    progress.phase
+    ? progress
+    : null;
+};
+export const analysisElapsedSeconds = (analysis, now = Date.now()) => {
+  const progressSeconds = Number(analysisProgress(analysis)?.elapsed_seconds);
+  const savedSeconds =
+    Number.isFinite(progressSeconds) && progressSeconds >= 0
+      ? progressSeconds
+      : 0;
+  if (!isAnalysisActive(analysis)) return savedSeconds;
+  const started = Date.parse(
+    analysis?.started_at || analysis?.created_at || "",
+  );
+  if (!Number.isFinite(started)) return savedSeconds;
+  return Math.max(savedSeconds, Math.floor(Math.max(0, now - started) / 1000));
+};
+export const formatAnalysisDuration = (seconds) => {
+  const value = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(value / 60);
+  const remainder = value % 60;
+  return minutes ? `${minutes} 分 ${remainder} 秒` : `${remainder} 秒`;
+};
+export const analysisBodyTextLabel = (progress) => {
+  const characters = Math.max(0, Number(progress?.received_chars) || 0);
+  if (characters > 0) return `已收到正文 ${characters} 字`;
+  if (Number(progress?.stream_chunks) > 0)
+    return "已收到内容片段，尚未收到正文";
+  return "尚未收到正文";
+};
+export const analysisModelTimeoutSeconds = (progress) => {
+  const seconds = Number(progress?.model_timeout_seconds);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+};
 export const analysisFindingKindLabel = (kind) =>
   ({ observation: "已观测", hypothesis: "待验证推测" })[kind] || kind || "-";
 export const analysisSeverityLabel = (severity) =>

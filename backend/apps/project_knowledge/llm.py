@@ -112,6 +112,26 @@ def _is_transient_error(exc: BaseException) -> bool:
     ))
 
 
+def _safe_retry_reason(exc: BaseException) -> str:
+    """Return a fixed category; never expose provider text or request details."""
+    message = str(exc).lower()
+    if _is_auth_error(exc):
+        return 'auth_error'
+    if re.search(r'\b429\b|rate.?limit|too many requests', message):
+        return 'rate_limited'
+    if 'timeout' in message or 'timed out' in message:
+        return 'timeout'
+    if 'connection' in message or 'network' in message:
+        return 'connection_error'
+    if re.search(r'\b5\d\d\b|service unavailable|bad gateway', message):
+        return 'upstream_error'
+    return 'unknown'
+
+
+class ProgressCallbackError(KnowledgeLLMError):
+    """A local observer failed; this is never an upstream retry condition."""
+
+
 def _retry_after_seconds(exc: BaseException) -> float:
     """Use a provider retry hint when exposed, otherwise a small backoff."""
     response = getattr(exc, 'response', None)
@@ -177,6 +197,7 @@ def stream_call(
     on_chunk: Callable[[str], None] | None,
     check_active: Callable[[], Any],
     remaining_seconds: Callable[[], float] | float,
+    on_event: Callable[[dict], None] | None = None,
 ) -> str:
     """Call the selected configured model through its streaming transport only.
 
@@ -186,6 +207,23 @@ def stream_call(
     """
     normalized_messages = _as_langchain_messages(messages)
     last_error: BaseException | None = None
+    stream_chunks = received_chars = 0
+    last_event_at = float('-inf')
+
+    def emit(phase, *, force=False, **extra):
+        nonlocal last_event_at
+        if on_event is None:
+            return
+        now = time.monotonic()
+        if not force and now - last_event_at < 1.0:
+            return
+        event = {'phase': phase, 'attempt': attempt + 1,
+                 'stream_chunks': stream_chunks, 'received_chars': received_chars, **extra}
+        try:
+            on_event(event)
+        except Exception as exc:
+            raise ProgressCallbackError('模型进度回调失败。') from exc
+        last_event_at = now
 
     for attempt in range(MAX_STREAM_ATTEMPTS):
         _ensure_active(check_active)
@@ -195,6 +233,7 @@ def stream_call(
 
         received: list[str] = []
         try:
+            emit('waiting_response', force=True)
             # Manager construction can also expose an upstream availability
             # failure (for example a provider health probe), so it belongs to
             # the same bounded pre-output retry policy as stream creation.
@@ -205,6 +244,7 @@ def stream_call(
             call_budget = _single_request_budget(manager, remaining_seconds)
             if call_budget <= 0:
                 raise KnowledgeLLMTimeout('知识任务的模型调用时间已用尽。')
+            emit('waiting_response', force=True, model_timeout_seconds=call_budget)
             call_deadline = time.monotonic() + call_budget
             # LangChain providers pass this through to their client transport.
             # It is intentionally per-call instead of mutating saved config.
@@ -212,18 +252,25 @@ def stream_call(
                 if time.monotonic() >= call_deadline:
                     raise KnowledgeLLMTimeout('单次流式模型调用已超过其时间预算。')
                 _ensure_active(check_active)
+                stream_chunks += 1
                 text = _extract_text(chunk)
+                first_text = bool(text) and received_chars == 0
+                received_chars += len(text)
                 if text:
                     received.append(text)
                     if on_chunk:
                         on_chunk(text)
+                emit('receiving' if received_chars else 'waiting_response', force=first_text)
             # Empty streams still have to honour both task activity and the
             # single-call deadline before being treated as a completed response.
             if time.monotonic() >= call_deadline:
                 raise KnowledgeLLMTimeout('单次流式模型调用已超过其时间预算。')
             _ensure_active(check_active)
+            emit('receiving' if received_chars else 'waiting_response', force=True)
             return ''.join(received)
         except Exception as exc:
+            if isinstance(exc, ProgressCallbackError):
+                raise exc.__cause__ from None
             if _is_task_stopped(exc) or isinstance(exc, (KnowledgeLLMTimeout, KnowledgeTaskInactive, StreamingUnsupportedError)):
                 raise
             if received:
@@ -238,6 +285,8 @@ def stream_call(
             remaining_after_error = _remaining_seconds(remaining_seconds)
             if wait_seconds >= remaining_after_error:
                 raise KnowledgeLLMTimeout('等待模型服务重试将超出知识任务剩余时限。') from exc
+            emit('retrying', force=True, retry_reason=_safe_retry_reason(exc),
+                 retry_delay_seconds=wait_seconds)
             _wait_before_retry(wait_seconds, check_active, remaining_seconds)
 
     raise KnowledgeLLMError('流式模型调用失败。') from last_error

@@ -8,8 +8,6 @@ from .models import PerformanceAnalysis
 @shared_task(
     bind=True,
     name='performance_testing.tasks.run_performance_analysis_async',
-    soft_time_limit=185,
-    time_limit=195,
 )
 def run_performance_analysis_async(self, analysis_id):
     from .analysis_runtime import execute_analysis

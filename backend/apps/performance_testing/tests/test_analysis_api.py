@@ -3,7 +3,7 @@ import math
 import uuid
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -95,6 +95,9 @@ class PerformanceAnalysisAPITests(TestCase):
         data = created.data['data']
         self.assertEqual(data['run_id'], str(self.run.pk))
         self.assertEqual(data['status'], 'queued')
+        self.assertEqual(data['timeout_seconds'], 600)
+        self.assertEqual(data['progress']['phase'], 'queued')
+        self.assertEqual(data['progress']['received_chars'], 0)
         self.assertEqual(data['model_info'], {
             'config_id': self.model.pk,
             'name': '离线模型 - analysis-fixture',
@@ -105,6 +108,8 @@ class PerformanceAnalysisAPITests(TestCase):
         self.assertNotIn('base_url', str(data))
         queued.assert_called_once()
         self.assertEqual(queued.call_args.kwargs['args'], (data['id'],))
+        self.assertEqual(queued.call_args.kwargs['soft_time_limit'], 605)
+        self.assertEqual(queued.call_args.kwargs['time_limit'], 615)
 
         listed = self.client.get(self._path())
         self.assertEqual(listed.status_code, 200, listed.data)
@@ -112,6 +117,19 @@ class PerformanceAnalysisAPITests(TestCase):
         detail = self.client.get(self._path(suffix=f'{data["id"]}/'))
         self.assertEqual(detail.status_code, 200, detail.data)
         self.assertEqual(detail.data['data'], data)
+
+    @override_settings(PERFORMANCE_ANALYSIS_TIMEOUT_SECONDS=720)
+    def test_create_snapshots_configured_timeout_and_dispatch_limits(self):
+        with patch(
+            'performance_testing.tasks.run_performance_analysis_async.apply_async',
+        ) as queued, self.captureOnCommitCallbacks(execute=True):
+            created = self.client.post(self._path(), self._payload(), format='json')
+        self.assertEqual(created.status_code, 202, created.data)
+        self.assertEqual(created.data['data']['timeout_seconds'], 720)
+        analysis = PerformanceAnalysis.objects.get(pk=created.data['data']['id'])
+        self.assertEqual(analysis.timeout_seconds, 720)
+        self.assertEqual(queued.call_args.kwargs['soft_time_limit'], 725)
+        self.assertEqual(queued.call_args.kwargs['time_limit'], 735)
 
     def test_create_requires_report_and_execute_but_read_only_requires_report(self):
         self.client.force_authenticate(self.reporter)

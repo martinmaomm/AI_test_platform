@@ -70,6 +70,19 @@ try:
 except (TypeError, ValueError):
     PROJECT_KNOWLEDGE_TOTAL_TIMEOUT = 1200
 
+
+def _bounded_timeout_setting(name, default, minimum, maximum):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if minimum <= value <= maximum else default
+
+
+PERFORMANCE_ANALYSIS_TIMEOUT_SECONDS = _bounded_timeout_setting(
+    'PERFORMANCE_ANALYSIS_TIMEOUT_SECONDS', 600, 60, 1800,
+)
+
 # Browser-derived API discovery is opt-in. Its budgets are intentionally
 # independent of WebUI generation and the global Celery time limit.
 API_BROWSER_DISCOVERY_ENABLED = os.getenv('API_BROWSER_DISCOVERY_ENABLED', 'false').lower() == 'true'

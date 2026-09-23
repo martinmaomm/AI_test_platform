@@ -88,7 +88,9 @@
             controls-position="right"
         /></el-form-item>
       </el-form>
-      <p class="target-note">目标仅用于本次分析；未填写时，只分析实际表现，不判定是否达标。</p>
+      <p class="target-note">
+        目标仅用于本次分析；未填写时，只分析实际表现，不判定是否达标。
+      </p>
       <el-empty
         v-if="!loading && !selectedAnalysis && !analyses.length"
         description="尚无 AI 分析记录"
@@ -120,6 +122,37 @@
             >完成：{{ formatTime(selectedAnalysis.finished_at) }}</span
           >
         </div>
+        <el-descriptions class="analysis-progress" :column="2" border>
+          <el-descriptions-item label="任务总时限（不含排队）">
+            {{ timeoutText }}
+          </el-descriptions-item>
+          <template v-if="progress">
+            <el-descriptions-item label="当前阶段">
+              {{ analysisPhaseLabel(progress.phase) }}
+            </el-descriptions-item>
+            <el-descriptions-item :label="elapsedLabel">
+              {{ elapsedText }}
+            </el-descriptions-item>
+            <el-descriptions-item label="正文接收">
+              {{ analysisBodyTextLabel(progress) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="尝试次数">
+              {{ progress.attempt || 0 }}
+            </el-descriptions-item>
+            <el-descriptions-item
+              v-if="modelTimeoutSeconds"
+              label="单次模型调用时限"
+            >
+              {{ modelTimeoutSeconds }} 秒
+            </el-descriptions-item>
+            <el-descriptions-item label="最近重试原因">
+              {{ retryReasonText }}
+            </el-descriptions-item>
+          </template>
+          <el-descriptions-item v-else label="执行阶段" :span="2">
+            未记录阶段信息
+          </el-descriptions-item>
+        </el-descriptions>
         <el-alert
           v-if="selectedAnalysis.status === 'failed'"
           type="error"
@@ -231,10 +264,16 @@ import {
   performanceErrorMessage,
 } from "@/api/performance";
 import {
+  analysisBodyTextLabel,
   analysisCheckLabel,
   analysisFindingKindLabel,
   analysisItems,
+  analysisModelTimeoutSeconds,
   analysisRecord,
+  analysisElapsedSeconds,
+  analysisPhaseLabel,
+  analysisProgress,
+  analysisRetryDescription,
   analysisSeverityLabel,
   analysisStatusLabel,
   analysisStatusType,
@@ -243,6 +282,7 @@ import {
   canAnalyzePerformanceRun,
   displayAnalysisValue,
   displayEvidenceValue,
+  formatAnalysisDuration,
   isAnalysisActive,
   isAnalysisCompleted,
   isDefinitiveAnalysisCreateError,
@@ -272,7 +312,9 @@ const targets = ref({
   rps_min: undefined,
 });
 const evidenceExpanded = ref([]);
+const now = ref(Date.now());
 let pollTimer;
+let elapsedTimer;
 let scopeEpoch = 0;
 let requestEpoch = 0;
 let detailEpoch = 0;
@@ -312,6 +354,24 @@ const limitations = computed(() =>
     ? selectedAnalysis.value.result.limitations
     : [],
 );
+const progress = computed(() => analysisProgress(selectedAnalysis.value));
+const timeoutText = computed(
+  () => `${selectedAnalysis.value?.timeout_seconds ?? 180} 秒`,
+);
+const modelTimeoutSeconds = computed(() =>
+  analysisModelTimeoutSeconds(progress.value),
+);
+const elapsedLabel = computed(() =>
+  progress.value?.phase === "queued" ? "已等待" : "已执行",
+);
+const elapsedText = computed(() =>
+  formatAnalysisDuration(
+    analysisElapsedSeconds(selectedAnalysis.value, now.value),
+  ),
+);
+const retryReasonText = computed(() =>
+  analysisRetryDescription(progress.value),
+);
 const scope = () => ({
   projectId: String(props.projectId || ""),
   runId: String(props.runId || ""),
@@ -335,6 +395,18 @@ const unwrapModels = (response) => {
 const stopPolling = () => {
   clearTimeout(pollTimer);
   pollTimer = undefined;
+};
+const stopElapsedTimer = () => {
+  clearInterval(elapsedTimer);
+  elapsedTimer = undefined;
+};
+const syncElapsedTimer = () => {
+  stopElapsedTimer();
+  if (!isAnalysisActive(selectedAnalysis.value)) return;
+  now.value = Date.now();
+  elapsedTimer = window.setInterval(() => {
+    now.value = Date.now();
+  }, 1000);
 };
 const schedulePolling = () => {
   stopPolling();
@@ -418,6 +490,7 @@ async function loadSelected(refreshSequence = null) {
     )
       return null;
     selectedAnalysis.value = analysisRecord(response);
+    syncElapsedTimer();
     if (isAnalysisActive(selectedAnalysis.value)) schedulePolling();
     return selectedAnalysis.value;
   } catch (cause) {
@@ -453,6 +526,7 @@ async function refresh() {
       String(selectedAnalysis.value?.id) !== String(selectedId.value)
     )
       selectedAnalysis.value = null;
+    syncElapsedTimer();
     error.value = "";
     if (selectedId.value) await loadSelected(sequence);
     if (sequence !== requestEpoch || !scopeCurrent(captured)) return;
@@ -518,6 +592,7 @@ function reset() {
   requestEpoch += 1;
   detailEpoch += 1;
   stopPolling();
+  stopElapsedTimer();
   analyses.value = [];
   selectedId.value = null;
   selectedAnalysis.value = null;
@@ -555,6 +630,7 @@ onBeforeUnmount(() => {
   scopeEpoch += 1;
   detailEpoch += 1;
   stopPolling();
+  stopElapsedTimer();
 });
 </script>
 

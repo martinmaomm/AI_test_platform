@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import uuid
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -26,6 +27,18 @@ from performance_testing.services import (
 )
 from projects.models import Project, ProjectMember
 from users.models import User
+
+
+def split_shell_commands(command):
+    commands = [[]]
+    for argument in shlex.split(command):
+        if argument == '&&':
+            commands.append([])
+        else:
+            commands[-1].append(argument)
+    if len(commands) != 3 or any(not item for item in commands):
+        raise AssertionError(f'预期三段 Docker 命令，实际为：{commands!r}')
+    return commands
 
 
 class ReleaseFixtureMixin:
@@ -280,6 +293,45 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
                 self.assertNotIn('command', metadata)
                 self.manifest['registry_index_ref'] = expected
 
+    def test_published_version_ref_is_optional_but_must_match_verified_index_and_version(self):
+        index_ref = self.manifest['registry_index_ref']
+        expected = f'{index_ref.rsplit("@", 1)[0]}:{AGENT_VERSION}'
+
+        # Historical manifests without the convenient version alias stay valid.
+        with self.release_environment():
+            old_configuration = load_release_configuration()
+        self.assertEqual(old_configuration.registry_index_ref, index_ref)
+
+        # This is the exact additional field emitted by the current publisher.
+        self.manifest['registry_version_ref'] = expected
+        self.write_manifest()
+        with self.release_environment():
+            configuration = load_release_configuration()
+            metadata = installation_metadata()
+        self.assertEqual(configuration.registry_index_ref, index_ref)
+        self.assertTrue(metadata['available'], metadata)
+        self.assertEqual(metadata['image_ref'], index_ref)
+        self.assertEqual(metadata['image_tag'], expected)
+
+        invalid_references = (
+            None,
+            401,
+            ['docker.io/automationplatform/performance-node', AGENT_VERSION],
+            f'docker.io/other/performance-node:{AGENT_VERSION}',
+            f'{index_ref.rsplit("@", 1)[0]}:0.0.0',
+            f' {expected}',
+            f'{expected} ',
+        )
+        for invalid in invalid_references:
+            with self.subTest(invalid=invalid):
+                self.manifest['registry_version_ref'] = invalid
+                self.write_manifest()
+                with self.release_environment():
+                    rejected = installation_metadata()
+                self.assertFalse(rejected['available'], rejected)
+                self.assertIn('版本标签', rejected['reason'])
+                self.assertNotIn('command', rejected)
+
     def test_registered_node_metadata_exposes_reinstall_eligibility_without_command(self):
         old = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000001',
@@ -296,11 +348,14 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         with self.release_environment():
             old_metadata = installation_metadata(node=old)
             current_metadata = installation_metadata(node=current)
+        expected_tag = f'docker.io/automationplatform/performance-node:{AGENT_VERSION}'
         self.assertEqual(old_metadata['image_ref'], self.manifest['registry_index_ref'])
+        self.assertEqual(old_metadata['image_tag'], expected_tag)
         self.assertEqual(old_metadata['reinstall'], {'available': True, 'reason': ''})
         self.assertNotIn('command', old_metadata)
         self.assertNotIn('upgrade', old_metadata)
         self.assertEqual(current_metadata['image_ref'], self.manifest['registry_index_ref'])
+        self.assertEqual(current_metadata['image_tag'], expected_tag)
         self.assertEqual(current_metadata['reinstall'], {'available': True, 'reason': ''})
         self.assertNotIn('command', current_metadata)
 
@@ -405,7 +460,7 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         self.assertIn('文件过大', metadata['reason'])
         self.assertNotIn('command', metadata)
 
-    def test_web_install_is_one_safe_docker_run_with_fixed_index_and_hardening(self):
+    def test_web_install_pulls_tags_and_runs_fixed_index_with_hardening(self):
         token = "node.$(touch /tmp/must-not-run)'"
         node = type('Node', (), {
             'pk': '00000000-0000-0000-0000-000000000001',
@@ -414,10 +469,18 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         with self.release_environment():
             metadata = installation_metadata(node=node, enrollment_token=token)
         command = metadata['command']
-        arguments = shlex.split(command)
+        pull_arguments, tag_arguments, arguments = split_shell_commands(command)
+        expected_tag = f'docker.io/automationplatform/performance-node:{AGENT_VERSION}'
 
         self.assertTrue(metadata['available'])
         self.assertNotIn('\n', command)
+        self.assertEqual(command.count(' && '), 2)
+        self.assertEqual(pull_arguments, ['docker', 'pull', self.manifest['registry_index_ref']])
+        self.assertEqual(tag_arguments, [
+            'docker', 'image', 'tag', self.manifest['registry_index_ref'], expected_tag,
+        ])
+        self.assertEqual(metadata['image_ref'], self.manifest['registry_index_ref'])
+        self.assertEqual(metadata['image_tag'], expected_tag)
         self.assertEqual(arguments[:4], ['docker', 'run', '-d', '--name'])
         self.assertEqual(metadata['container_name'], arguments[4])
         self.assertRegex(
@@ -450,11 +513,86 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
             'start', '--server', 'https://platform.example.test/base',
             '--node-id', str(node.pk), '--token', token,
         ])
-        for forbidden in ('bash', 'curl', 'base64', 'sh', '&&'):
-            self.assertNotIn(forbidden, arguments)
+        for forbidden in ('bash', 'curl', 'base64', 'sh'):
+            self.assertNotIn(forbidden, pull_arguments + tag_arguments + arguments)
         self.assertNotIn('--privileged', arguments)
         self.assertNotIn('--network', arguments)
         self.assertNotIn('/var/run/docker.sock', command)
+
+    def test_install_command_real_shell_order_short_circuit_and_token_quoting(self):
+        node = type('Node', (), {
+            'pk': '00000000-0000-0000-0000-000000000001',
+            'enrollment_expires_at': timezone.now() + timedelta(minutes=15),
+        })()
+        with TemporaryDirectory(prefix='fake-docker-') as directory:
+            root = Path(directory)
+            sentinel = root / 'token-was-executed'
+            token = f"node.$(touch {sentinel})'; && echo leaked"
+            docker = root / 'docker'
+            docker.write_text(
+                '#!/usr/bin/env python3\n'
+                'import json, os, sys\n'
+                'with open(os.environ["DOCKER_LOG"], "a", encoding="utf-8") as output:\n'
+                '    output.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                'if os.environ.get("FAIL_DOCKER_SUBCOMMAND") == sys.argv[1]:\n'
+                '    raise SystemExit(17)\n',
+                encoding='utf-8',
+            )
+            docker.chmod(0o700)
+            log = root / 'docker.log'
+            environment = {
+                **os.environ,
+                'PATH': f'{root}{os.pathsep}{os.environ.get("PATH", "")}',
+                'DOCKER_LOG': str(log),
+            }
+            with self.release_environment():
+                metadata = installation_metadata(node=node, enrollment_token=token)
+
+            failed = subprocess.run(
+                ['/bin/sh', '-c', metadata['command']],
+                env={**environment, 'FAIL_DOCKER_SUBCOMMAND': 'pull'},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(failed.returncode, 17)
+            failed_calls = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(failed_calls, [['pull', self.manifest['registry_index_ref']]])
+            self.assertNotIn(token, failed.stdout + failed.stderr + log.read_text(encoding='utf-8'))
+
+            log.unlink()
+            tag_failed = subprocess.run(
+                ['/bin/sh', '-c', metadata['command']],
+                env={**environment, 'FAIL_DOCKER_SUBCOMMAND': 'image'},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(tag_failed.returncode, 17)
+            tag_failed_calls = [
+                json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()
+            ]
+            self.assertEqual(tag_failed_calls, [
+                ['pull', self.manifest['registry_index_ref']],
+                ['image', 'tag', self.manifest['registry_index_ref'],
+                 f'docker.io/automationplatform/performance-node:{AGENT_VERSION}'],
+            ])
+            self.assertNotIn(token, tag_failed.stdout + tag_failed.stderr + log.read_text(encoding='utf-8'))
+
+            log.unlink()
+            completed = subprocess.run(
+                ['/bin/sh', '-c', metadata['command']],
+                env=environment, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            calls = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+            expected_tag = f'docker.io/automationplatform/performance-node:{AGENT_VERSION}'
+            self.assertEqual(calls[0], ['pull', self.manifest['registry_index_ref']])
+            self.assertEqual(calls[1], [
+                'image', 'tag', self.manifest['registry_index_ref'], expected_tag,
+            ])
+            self.assertEqual(calls[2][:3], ['run', '-d', '--name'])
+            self.assertEqual(calls[2][calls[2].index('--token') + 1], token)
+            self.assertEqual(calls[2][calls[2].index('--mount') + 2],
+                             self.manifest['registry_index_ref'])
+            self.assertFalse(sentinel.exists())
+            self.assertNotIn(token, completed.stdout + completed.stderr)
 
     def test_regenerated_command_reuses_container_but_gets_a_fresh_identity_volume(self):
         node = type('Node', (), {
@@ -464,8 +602,8 @@ class InstallationConfigurationTests(ReleaseFixtureMixin, SimpleTestCase):
         with self.release_environment():
             first = installation_metadata(node=node, enrollment_token='first-token')
             second = installation_metadata(node=node, enrollment_token='second-token')
-        first_arguments = shlex.split(first['command'])
-        second_arguments = shlex.split(second['command'])
+        first_arguments = split_shell_commands(first['command'])[-1]
+        second_arguments = split_shell_commands(second['command'])[-1]
         self.assertEqual(first['container_name'], second['container_name'])
         self.assertNotEqual(
             first_arguments[first_arguments.index('--mount') + 1],

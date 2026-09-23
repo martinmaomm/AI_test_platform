@@ -377,8 +377,8 @@
           type="info"
           :closable="false"
           >需要 Linux 主机、Docker，以及 root 或 Docker
-          操作权限。新节点安装使用一条单行 docker run 命令，Docker
-          会按主机架构选择固定摘要镜像；节点主动连接平台，无需开放节点入站端口。</el-alert
+          操作权限。复制整条安装命令执行后，会自动拉取镜像、添加版本标签并启动节点；Docker
+          会按主机架构选择固定摘要镜像，任一步骤失败即停止。节点主动连接平台，无需开放节点入站端口。</el-alert
         >
         <ul
           v-if="
@@ -394,6 +394,10 @@
             {{ requirement }}
           </li>
         </ul>
+        <p v-if="installationInfo?.image_tag" class="expiry" data-testid="installation-image-tag">
+          镜像版本标签：<code>{{ installationInfo.image_tag }}</code>。安装后可在
+          <code>docker images</code> 中查看，实际启动仍固定到已核验的镜像摘要。
+        </p>
         <el-alert
           v-if="
             !installationInfo?.reinstall &&

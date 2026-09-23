@@ -537,15 +537,115 @@ class MultiarchIndexTests(unittest.TestCase):
 
     def test_publish_checks_both_anonymous_platform_pulls(self):
         with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
-                patch.object(publisher, 'remote_index', side_effect=[None, self.index, self.index]), \
+                patch.object(publisher, 'remote_index', side_effect=[
+                    None, self.index, self.index, None, self.index, self.index,
+                ]) as remote_index, \
                 patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
                 patch.object(publisher.subprocess, 'check_output', side_effect=self.docker_command) as docker:
             result = publisher.publish_registry_index(self.manifest, self.registry)
         self.assertEqual(result, self.registry + '@' + self.index['digest'])
+        version_reference = self.registry + ':' + publisher.__version__
+        self.assertEqual(self.manifest['registry_version_ref'], version_reference)
         commands = [item.args[0] for item in docker.call_args_list]
         self.assertEqual(commands[0][:4], ['docker', 'buildx', 'imagetools', 'create'])
+        self.assertIn([
+            'docker', 'buildx', 'imagetools', 'create', '--tag', version_reference, result,
+        ], commands)
         for arch in self.members:
             self.assertIn(['docker', 'image', 'pull', '--platform', 'linux/' + arch, result], commands)
+        self.assertEqual(remote_index.call_args_list[-1].args[0], version_reference)
+        self.assertIn('environment', remote_index.call_args_list[-1].kwargs)
+
+    def test_existing_identical_version_alias_is_reused_idempotently(self):
+        version_reference = self.registry + ':' + publisher.__version__
+        self.manifest['registry_index_ref'] = self.registry + '@' + self.index['digest']
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', side_effect=[
+                    self.index, self.index, self.index,
+                    self.index, self.index, self.index,
+                ]), \
+                patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
+                patch.object(publisher.subprocess, 'check_output', side_effect=self.docker_command) as docker:
+            result = publisher.publish_registry_index(self.manifest, self.registry)
+        self.assertEqual(result, self.registry + '@' + self.index['digest'])
+        self.assertEqual(self.manifest['registry_version_ref'], version_reference)
+        creates = [
+            item.args[0] for item in docker.call_args_list
+            if item.args[0][:4] == ['docker', 'buildx', 'imagetools', 'create']
+        ]
+        self.assertEqual(creates, [])
+
+    def test_recorded_immutable_digest_mismatch_blocks_alias_even_when_members_match(self):
+        self.manifest['registry_index_ref'] = self.registry + '@sha256:' + '0' * 64
+        before = json.loads(json.dumps(self.manifest))
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', side_effect=[self.index, self.index]), \
+                patch.object(publisher.subprocess, 'check_output') as docker:
+            with self.assertRaisesRegex(ValueError, '不同固定索引摘要.*拒绝'):
+                publisher.publish_registry_index(self.manifest, self.registry)
+        self.assertEqual(self.manifest, before)
+        docker.assert_not_called()
+
+    def test_missing_fixed_tag_is_not_recreated_when_manifest_already_records_an_index(self):
+        self.manifest['registry_index_ref'] = self.registry + '@' + self.index['digest']
+        before = json.loads(json.dumps(self.manifest))
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', return_value=None), \
+                patch.object(publisher.subprocess, 'check_output') as docker:
+            with self.assertRaisesRegex(ValueError, '固定 tag 不存在.*拒绝重新生成'):
+                publisher.publish_registry_index(self.manifest, self.registry)
+        self.assertEqual(self.manifest, before)
+        docker.assert_not_called()
+
+    def test_recorded_immutable_must_be_a_digest_in_the_selected_repository(self):
+        invalid_references = (
+            self.registry + ':0.4.1',
+            'docker.io/other/performance-node@' + self.index['digest'],
+            self.registry + '@not-a-digest',
+        )
+        for invalid in invalid_references:
+            manifest = {**self.manifest, 'registry_index_ref': invalid}
+            with self.subTest(invalid=invalid), \
+                    patch.object(publisher, 'remote_manifest') as remote_manifest, \
+                    patch.object(publisher, 'remote_index') as remote_index:
+                with self.assertRaisesRegex(ValueError, '本仓库合法摘要引用'):
+                    publisher.publish_registry_index(manifest, self.registry)
+            remote_manifest.assert_not_called()
+            remote_index.assert_not_called()
+
+    def test_existing_version_alias_digest_or_members_collision_is_never_overwritten(self):
+        collisions = (
+            {**self.index, 'digest': 'sha256:' + '0' * 64},
+            {**self.index, 'members': {**self.members, 'amd64': 'sha256:' + '0' * 64}},
+        )
+        for collision in collisions:
+            with self.subTest(collision=collision), \
+                    patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                    patch.object(publisher, 'remote_index', side_effect=[
+                        self.index, self.index, self.index, collision,
+                    ]), \
+                    patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
+                    patch.object(publisher.subprocess, 'check_output', side_effect=self.docker_command) as docker:
+                with self.assertRaisesRegex(ValueError, '同版本 tag.*拒绝覆盖'):
+                    publisher.publish_registry_index(self.manifest, self.registry)
+            self.assertNotIn('registry_version_ref', self.manifest)
+            alias_creates = [
+                item.args[0] for item in docker.call_args_list
+                if item.args[0][:4] == ['docker', 'buildx', 'imagetools', 'create']
+            ]
+            self.assertEqual(alias_creates, [])
+
+    def test_version_alias_anonymous_read_failure_is_not_recorded(self):
+        anonymous_failure = ValueError('fixture anonymous alias failure')
+        with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \
+                patch.object(publisher, 'remote_index', side_effect=[
+                    self.index, self.index, self.index, None, self.index, anonymous_failure,
+                ]), \
+                patch.object(publisher, 'current_docker_host', return_value='unix:///fixture.sock'), \
+                patch.object(publisher.subprocess, 'check_output', side_effect=self.docker_command):
+            with self.assertRaisesRegex(ValueError, 'anonymous alias failure'):
+                publisher.publish_registry_index(self.manifest, self.registry)
+        self.assertNotIn('registry_version_ref', self.manifest)
 
     def test_existing_conflicting_index_never_overwritten(self):
         with patch.object(publisher, 'remote_manifest', side_effect=self.remote_member), \

@@ -222,7 +222,8 @@ def _load_manifest(release_directory):
         'release', 'protocol_version', 'agent_version', 'engine_version',
         'runtime_sha256', 'registry_index_ref', 'images',
     }
-    if set(manifest) != required:
+    optional = {'registry_version_ref'}
+    if not required.issubset(manifest) or set(manifest) - required - optional:
         raise ReleaseConfigurationError('发行 manifest.json 字段不符合固定格式。')
     if (
         manifest['release'] != AGENT_VERSION
@@ -245,6 +246,13 @@ def _load_manifest(release_directory):
         or not _REGISTRY_REF_RE.fullmatch(registry_index_ref)
     ):
         raise ReleaseConfigurationError('发行 manifest.json 的 multi-arch Docker Hub 镜像引用无效。')
+    if 'registry_version_ref' in manifest:
+        repository = registry_index_ref.rsplit('@', 1)[0]
+        expected_version_ref = f'{repository}:{manifest["agent_version"]}'
+        if manifest['registry_version_ref'] != expected_version_ref:
+            raise ReleaseConfigurationError(
+                '发行 manifest.json 的 Docker Hub 版本标签与固定镜像不匹配。'
+            )
     return manifest
 
 
@@ -439,9 +447,20 @@ def _known_container_name(node):
     return container_name
 
 
+def _versioned_image_tag(configuration):
+    repository, separator, _digest = configuration.registry_index_ref.partition('@')
+    if not separator:
+        raise ReleaseConfigurationError('Docker Hub 镜像引用缺少固定摘要。')
+    return f'{repository}:{configuration.agent_version}'
+
+
 def _docker_command(configuration, *, node_id, enrollment_token):
     container_name, identity_volume = _node_resource_names(node_id, enrollment_token)
-    arguments = [
+    image_ref = configuration.registry_index_ref
+    image_tag = _versioned_image_tag(configuration)
+    pull_arguments = ['docker', 'pull', image_ref]
+    tag_arguments = ['docker', 'image', 'tag', image_ref, image_tag]
+    run_arguments = [
         'docker', 'run', '-d', '--name', container_name,
         '--restart', 'unless-stopped', '--init', '--read-only',
         '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
@@ -450,15 +469,19 @@ def _docker_command(configuration, *, node_id, enrollment_token):
         '--stop-timeout', '25', '--log-opt', 'max-size=10m',
         '--log-opt', 'max-file=3', '--mount',
         f'type=volume,src={identity_volume},dst=/var/lib/performance-node',
-        configuration.registry_index_ref,
+        image_ref,
         'start', '--server', configuration.platform_url,
         '--node-id', str(node_id), '--token', enrollment_token,
     ]
     if configuration.ca_certificate is not None:
-        arguments.extend((
+        run_arguments.extend((
             '--ca-sha256', hashlib.sha256(configuration.ca_certificate).hexdigest(),
         ))
-    return shlex.join(arguments)
+    return ' && '.join((
+        shlex.join(pull_arguments),
+        shlex.join(tag_arguments),
+        shlex.join(run_arguments),
+    ))
 
 
 def installation_metadata(*, node=None, enrollment_token=None, configuration=None):
@@ -512,6 +535,7 @@ def installation_metadata(*, node=None, enrollment_token=None, configuration=Non
         ],
         'agent_version': configuration.agent_version,
         'image_ref': configuration.registry_index_ref,
+        'image_tag': _versioned_image_tag(configuration),
         'expires_at': expires_at,
         'requirements': list(INSTALLATION_REQUIREMENTS),
     }

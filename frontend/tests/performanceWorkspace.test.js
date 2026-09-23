@@ -196,7 +196,9 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   );
   assert.match(source, /安装命令已过期。若此前已执行过命令/);
   assert.match(source, /root 或 Docker\s+操作权限/);
-  assert.match(source, /一条单行 docker run 命令/);
+  assert.match(source, /复制整条安装命令执行后/);
+  assert.match(source, /自动拉取镜像、添加版本标签并启动节点/);
+  assert.match(source, /installationInfo\.image_tag/);
   assert.match(source, /终端历史和 docker inspect/);
   assert.match(
     source,
@@ -412,7 +414,7 @@ test("installation presentation follows actual node state without retaining a co
     ),
     {
       key: "installing",
-      text: "请在节点终端执行下方单行 docker run 命令，等待节点注册并发送 heartbeat。",
+      text: "请在节点终端完整执行下方安装命令，等待节点注册并发送 heartbeat。",
     },
   );
   assert.deepEqual(

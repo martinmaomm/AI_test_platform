@@ -345,10 +345,23 @@ def remote_index(reference, *, environment=None, absent_ok=False):
 
 
 def publish_registry_index(manifest, registry):
-    """Bind both audited architecture images to one immutable, public reference."""
+    """Bind both images to one immutable index and a verified version alias."""
     images = manifest.get('images', {})
     if set(images) != {'amd64', 'arm64'}:
         raise ValueError('一条 Docker 命令发行必须同时包含 amd64 和 arm64')
+    version_reference = f'{registry}:{__version__}'
+    recorded_version_reference = manifest.get('registry_version_ref')
+    if recorded_version_reference not in (None, version_reference):
+        raise ValueError('发行 manifest 记录了其他版本 tag；拒绝继续')
+    recorded_index_reference = manifest.get('registry_index_ref')
+    if recorded_index_reference is not None:
+        index_prefix = registry + '@'
+        if (
+            not isinstance(recorded_index_reference, str)
+            or not recorded_index_reference.startswith(index_prefix)
+            or not _IMAGE_ID_RE.fullmatch(recorded_index_reference[len(index_prefix):])
+        ):
+            raise ValueError('发行 manifest 的固定索引不是本仓库合法摘要引用')
     expected = {}
     references = []
     for architecture in ('amd64', 'arm64'):
@@ -369,6 +382,8 @@ def publish_registry_index(manifest, registry):
     existing = remote_index(tag, absent_ok=True)
     if existing is not None and existing['members'] != expected:
         raise ValueError('Docker Hub 已有同名索引但镜像不同；拒绝覆盖')
+    if existing is None and recorded_index_reference is not None:
+        raise ValueError('发行 manifest 已记录固定索引，但对应固定 tag 不存在；拒绝重新生成')
     if existing is None:
         try:
             subprocess.check_output([
@@ -380,6 +395,8 @@ def publish_registry_index(manifest, registry):
     if verified['members'] != expected:
         raise ValueError('Docker Hub 多架构索引发布后核验失败')
     immutable = f'{registry}@{verified["digest"]}'
+    if recorded_index_reference is not None and recorded_index_reference != immutable:
+        raise ValueError('发行 manifest 已记录不同固定索引摘要；拒绝补充版本 tag 或改写引用')
     with tempfile.TemporaryDirectory(prefix='performance-node-index-') as temporary:
         # Homebrew discovers buildx through cliPluginsExtraDirs. Preserve only
         # plugin search paths: never copy auths, credsStore or credential helpers.
@@ -413,6 +430,25 @@ def publish_registry_index(manifest, registry):
             if (info.get('Id') not in {verified['digest'], expected[architecture], images[architecture]['image_config_id']}
                     or info.get('Os') != 'linux' or info.get('Architecture') != architecture):
                 raise ValueError('Docker Hub 索引拉取结果不是预期架构或内容')
+        existing_version = remote_index(version_reference, absent_ok=True)
+        if existing_version is not None and existing_version != verified:
+            raise ValueError('Docker Hub 已有同版本 tag 但索引摘要或成员不同；拒绝覆盖')
+        if existing_version is None:
+            try:
+                subprocess.check_output([
+                    'docker', 'buildx', 'imagetools', 'create',
+                    '--tag', version_reference, immutable,
+                ], stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as exc:
+                raise ValueError('Docker Hub 版本 tag 发布失败') from exc
+        verified_version = remote_index(version_reference)
+        if verified_version != verified:
+            raise ValueError('Docker Hub 版本 tag 与固定索引摘要或成员不一致')
+        if remote_index(version_reference, environment=environment) != verified:
+            raise ValueError('Docker Hub 版本 tag 无法匿名读取或内容不一致')
+    # Only persist the convenient tag after both the fixed index and alias pass
+    # authenticated and anonymous readback. Historical manifests may omit it.
+    manifest['registry_version_ref'] = version_reference
     return immutable
 
 
@@ -470,6 +506,7 @@ def publish_image(root, architecture, reference, manifest):
             record['registry_ref'] = previous['registry_ref']
     else:
         manifest.pop('registry_index_ref', None)
+        manifest.pop('registry_version_ref', None)
     manifest['images'][architecture] = record
 
 

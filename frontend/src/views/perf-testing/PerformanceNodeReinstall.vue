@@ -15,7 +15,7 @@
       <li>
         在 Docker 中停止并删除旧节点容器。不必删除旧身份卷；新版确认正常后，旧镜像可按需清理。
       </li>
-      <li>勾选确认后生成新版安装命令，复制到节点主机执行。</li>
+      <li>勾选确认后生成新版安装命令，整条复制到节点主机执行；命令会自动拉取镜像、添加版本标签并启动节点。</li>
     </ol>
     <el-alert v-if="!available" type="info" :closable="false">
       {{ unavailableMessage }}

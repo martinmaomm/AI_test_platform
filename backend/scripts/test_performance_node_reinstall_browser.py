@@ -139,7 +139,12 @@ def verify(origin, fixture, output):
             expect(command_input).to_be_visible()
             command = command_input.input_value()
             args = shlex.split(command)
-            assert args[:3] == ['docker', 'run', '-d'] and '\n' not in command
+            assert args[:2] == ['docker', 'pull'] and '\n' not in command
+            assert args[3:7] == ['&&', 'docker', 'image', 'tag']
+            assert args[7] == args[2]
+            assert args[8] == args[2].split('@')[0] + ':' + AGENT_VERSION
+            assert args[9:13] == ['&&', 'docker', 'run', '-d']
+            expect(page.get_by_test_id('installation-image-tag')).to_contain_text(args[8])
             assert 'bash' not in args and 'python3' not in args and 'upgrade-node.py' not in command
             assert args[args.index('--node-id') + 1] == fixture['node_id']
             token = args[args.index('--token') + 1]
@@ -179,7 +184,7 @@ def verify(origin, fixture, output):
             assert not errors and not outside, (errors, outside)
             print(json.dumps({'browser': 'Vue/Django/Chrome', 'same_node_and_history_preserved': True,
                 'confirmation_and_inflight_close_guard': True, 'failure_keeps_old_identity': True,
-                'single_docker_command_new_volume': True, 'registration_and_heartbeat': True,
+                'single_copyable_install_command_new_volume': True, 'registration_and_heartbeat': True,
                 'token_not_persisted_or_returned_by_get': True, 'external_requests': 0,
                 'real_nodes_modified': 0, 'load_runs_started': 0}, ensure_ascii=False))
         except Exception:
@@ -204,6 +209,10 @@ def main():
         runtime = (BACKEND.parent / 'performance-node/src/performance_node/locust_runtime.py').read_bytes()
         release_fixture.runtime_path.write_bytes(runtime)
         release_fixture.manifest['runtime_sha256'] = hashlib.sha256(runtime).hexdigest()
+        release_fixture.manifest['registry_version_ref'] = (
+            release_fixture.manifest['registry_index_ref'].split('@')[0]
+            + ':' + release_fixture.manifest['agent_version']
+        )
         release_fixture.write_manifest()
         from django.core.wsgi import get_wsgi_application
         attempted_runs = []

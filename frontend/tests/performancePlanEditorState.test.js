@@ -4,9 +4,49 @@ import { readFile } from "node:fs/promises";
 import {
   createPlanStep,
   clonePlanStep,
+  DEFAULT_CONNECT_TIMEOUT_SECONDS,
+  DEFAULT_READ_TIMEOUT_SECONDS,
   formatJsonText,
+  normalizePlanRequestTimeouts,
   serializePlanSteps,
+  validatePlanRequestTimeouts,
 } from "../src/views/perf-testing/performancePlanEditorState.js";
+
+test("request timeout defaults, persisted values, and strict integer bounds are preserved", () => {
+  assert.deepEqual(normalizePlanRequestTimeouts({}), {
+    connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
+  });
+  assert.deepEqual(normalizePlanRequestTimeouts({
+    connect_timeout_seconds: 12,
+    read_timeout_seconds: 45,
+  }), {
+    connect_timeout_seconds: 12,
+    read_timeout_seconds: 45,
+  });
+  assert.deepEqual(normalizePlanRequestTimeouts({
+    connect_timeout_seconds: 0,
+    read_timeout_seconds: 121,
+  }), {
+    connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
+  });
+  assert.deepEqual(validatePlanRequestTimeouts({
+    connect_timeout_seconds: 1,
+    read_timeout_seconds: 120,
+  }), {
+    connect_timeout_seconds: "",
+    read_timeout_seconds: "",
+  });
+  for (const invalid of [0, true, 1.5, "10", null]) {
+    const errors = validatePlanRequestTimeouts({
+      connect_timeout_seconds: invalid,
+      read_timeout_seconds: invalid,
+    });
+    assert.match(errors.connect_timeout_seconds, /整数秒/);
+    assert.match(errors.read_timeout_seconds, /整数秒/);
+  }
+});
 
 test('raw text and JSON scalar/null survive open, clone and save', () => {
   for (const [body_type, body] of [['raw', 'plain ${value}'], ['json', 'a string'], ['json', null]]) {
@@ -132,6 +172,9 @@ test("editor preserves legacy selectors and exposes the v2 controls", async () =
     "plan-save",
     "plan-variables",
     "plan-unique-variables",
+    "plan-request-timeouts",
+    "plan-connect-timeout",
+    "plan-read-timeout",
     "step-phase",
     "step-body-type",
     "step-extract",
@@ -141,4 +184,7 @@ test("editor preserves legacy selectors and exposes the v2 controls", async () =
   assert.doesNotMatch(source, /expected_status/);
   assert.match(source, /currentTarget:\s*Object,[\s\S]*targets:/);
   assert.match(source, /props\.plan\s*\|\|\s*props\.item/);
+  assert.match(source, /normalizePlanRequestTimeouts\(source\)/);
+  assert.match(source, /connect_timeout_seconds:\s*form\.connect_timeout_seconds/);
+  assert.match(source, /read_timeout_seconds:\s*form\.read_timeout_seconds/);
 });

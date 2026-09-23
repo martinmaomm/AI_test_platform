@@ -19,6 +19,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
     requests: list[str] = []
     lock = threading.Lock()
     delay_seconds = 0.0
+    body_delay_seconds = 0.0
 
     def do_GET(self):
         with self.lock:
@@ -29,7 +30,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        time.sleep(self.body_delay_seconds)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, _format, *_args):
         pass
@@ -47,7 +52,7 @@ def snapshot(
 ) -> dict:
     users = len(node_ids) * users_per_node
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_id": str(uuid.uuid4()),
         "nodes": [
             {"node_id": node_id, "users": users_per_node, "validation_key": f"{index:x}" * 64}
@@ -62,6 +67,8 @@ def snapshot(
         "spawn_rate": spawn_rate if spawn_rate is not None else users,
         "duration_seconds": duration,
         "wait_seconds": 0.1,
+        "connect_timeout_seconds": 10,
+        "read_timeout_seconds": 30,
         "variables": {},
         "unique_variables": [{"name": "run_user", "prefix": "fixture-"}],
         "steps": [{
@@ -77,6 +84,7 @@ class MultiNodeRuntimeTests(unittest.TestCase):
     def setUp(self):
         FixtureHandler.requests = []
         FixtureHandler.delay_seconds = 0.0
+        FixtureHandler.body_delay_seconds = 0.0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
@@ -138,6 +146,35 @@ class MultiNodeRuntimeTests(unittest.TestCase):
             self.assertTrue(all(item["complete"] for item in metrics["nodes"].values()))
             observed_nodes = {value.split("-")[2] for value in FixtureHandler.requests if value}
             self.assertEqual(observed_nodes, {node_id[:8] for node_id in node_ids})
+
+    def test_validation_uses_snapshot_read_timeout_and_reports_incomplete_response(self):
+        FixtureHandler.body_delay_seconds = 1.5
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node_ids = [str(uuid.uuid4())]
+            frozen = snapshot(
+                f"http://127.0.0.1:{self.server.server_port}", node_ids, duration=5,
+            )
+            frozen.update(
+                mode="validation", connect_timeout_seconds=7, read_timeout_seconds=1,
+            )
+            tokens = {node_ids[0]: "token-" + "x" * 32}
+            started = time.monotonic()
+            master, workers, complete_file = self.launch(root, frozen, tokens)
+            results = self.finish([master, *workers], timeout=20)
+            elapsed = time.monotonic() - started
+            self.assertEqual([item[0] for item in results], [0, 0], results)
+            self.assertLess(elapsed, 5, results)
+            report = json.loads(complete_file.read_text(encoding="utf-8"))
+            metrics = report["metrics"]
+            self.assertTrue(metrics["validation_complete"])
+            self.assertFalse(metrics["validation_passed"])
+            self.assertEqual(metrics["failure_samples"][0]["error_type"], "read_timeout")
+            self.assertEqual(metrics["failure_samples"][0]["message"],
+                             "读取响应超时（ReadTimeoutError）")
+            step = metrics["validation_steps"][0]
+            self.assertTrue(step["response"]["incomplete"])
+            self.assertEqual(step["assertions"][0]["status"], "skipped")
 
     def test_wrong_member_token_never_crosses_start_barrier(self):
         with tempfile.TemporaryDirectory() as directory:

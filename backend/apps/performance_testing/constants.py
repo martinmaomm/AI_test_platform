@@ -1,8 +1,10 @@
 PROTOCOL_VERSION = 3
-AGENT_VERSION = '0.4.0'
+AGENT_VERSION = '0.4.1'
 # Old agents may keep heartbeating so the management UI can show an upgrade
 # prompt. Execution compatibility requires the matching fixed runtime version.
-SUPPORTED_AGENT_VERSIONS = ('0.2.0', '0.2.1', '0.3.0', '0.3.1', '0.3.2', AGENT_VERSION)
+SUPPORTED_AGENT_VERSIONS = (
+    '0.2.0', '0.2.1', '0.3.0', '0.3.1', '0.3.2', '0.4.0', AGENT_VERSION,
+)
 SUPPORTED_PROTOCOL_VERSIONS = (2, PROTOCOL_VERSION)
 ENGINE_VERSION = '2.43.3'
 
@@ -18,6 +20,10 @@ MAX_NODES_PER_RUN = 5
 MAX_DURATION_SECONDS = 600
 MAX_SPAWN_RATE = 100
 MAX_STEPS = 20
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_READ_TIMEOUT_SECONDS = 30
+MAX_CONNECT_TIMEOUT_SECONDS = 60
+MAX_READ_TIMEOUT_SECONDS = 120
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_FAILURE_SAMPLES = 20
 MAX_FAILURE_VALUE_BYTES = 2048
@@ -51,5 +57,7 @@ def platform_config(*, controller_online=False, execution_available=False, unava
             'max_duration_seconds': MAX_DURATION_SECONDS,
             'max_spawn_rate': MAX_SPAWN_RATE,
             'max_steps': MAX_STEPS,
+            'max_connect_timeout_seconds': MAX_CONNECT_TIMEOUT_SECONDS,
+            'max_read_timeout_seconds': MAX_READ_TIMEOUT_SECONDS,
         },
     }

@@ -109,7 +109,7 @@ def validation_key_for(plan, node):
     """Fingerprint request/data and the exact node capability used to validate it."""
     target = plan.target
     payload = {
-        'contract': 3,
+        'contract': 4,
         'plan_id': plan.pk,
         'target_id': target.pk,
         'base_url': target.base_url,
@@ -117,6 +117,8 @@ def validation_key_for(plan, node):
         'variables': deepcopy(plan.variables),
         'unique_variables': deepcopy(plan.unique_variables),
         'steps': deepcopy(plan.steps),
+        'connect_timeout_seconds': plan.connect_timeout_seconds,
+        'read_timeout_seconds': plan.read_timeout_seconds,
         'node': {
             'id': str(node.pk),
             'protocol_version': node.protocol_version,
@@ -154,6 +156,8 @@ def _snapshot_for(run_id, plan, allocations, mode):
         'spawn_rate': plan.spawn_rate,
         'duration_seconds': plan.duration_seconds,
         'wait_seconds': plan.wait_seconds,
+        'connect_timeout_seconds': plan.connect_timeout_seconds,
+        'read_timeout_seconds': plan.read_timeout_seconds,
         'variables': deepcopy(plan.variables),
         'unique_variables': deepcopy(plan.unique_variables),
         'steps': deepcopy(plan.steps),
@@ -161,7 +165,7 @@ def _snapshot_for(run_id, plan, allocations, mode):
     if not target_validator.is_valid() or not plan_validator.is_valid():
         raise RunValidationRejected('计划或目标不再满足完整管理契约。')
     snapshot = {
-        'schema_version': 3,
+        'schema_version': 4,
         'run_id': str(run_id),
         'engine_version': ENGINE_VERSION,
         'plan_name': plan.name,
@@ -182,6 +186,8 @@ def _snapshot_for(run_id, plan, allocations, mode):
         # budget so a short load duration cannot truncate setup/login.
         'duration_seconds': 120 if mode == PerformanceRun.Mode.VALIDATION else plan.duration_seconds,
         'wait_seconds': plan.wait_seconds,
+        'connect_timeout_seconds': plan.connect_timeout_seconds,
+        'read_timeout_seconds': plan.read_timeout_seconds,
         'variables': deepcopy(plan.variables),
         'unique_variables': deepcopy(plan.unique_variables),
         'steps': deepcopy(plan.steps),

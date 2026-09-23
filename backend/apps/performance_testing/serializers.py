@@ -8,8 +8,9 @@ from django.core.validators import URLValidator
 from rest_framework import serializers
 
 from .constants import (
-    ALLOWED_HTTP_METHODS, MAX_DURATION_SECONDS, MAX_REQUEST_BYTES,
-    MAX_NODES_PER_RUN, MAX_SPAWN_RATE, MAX_STEPS, MAX_USERS,
+    ALLOWED_HTTP_METHODS, DEFAULT_CONNECT_TIMEOUT_SECONDS, DEFAULT_READ_TIMEOUT_SECONDS,
+    MAX_CONNECT_TIMEOUT_SECONDS, MAX_DURATION_SECONDS, MAX_REQUEST_BYTES,
+    MAX_NODES_PER_RUN, MAX_READ_TIMEOUT_SECONDS, MAX_SPAWN_RATE, MAX_STEPS, MAX_USERS,
 )
 from .models import (
     PerformanceNode, PerformancePlan, PerformanceRun, PerformanceRunNode,
@@ -325,6 +326,14 @@ class PerformancePlanSerializer(StrictModelSerializer):
     spawn_rate = StrictFloatField(min_value=0.000001, max_value=MAX_SPAWN_RATE, default=1)
     duration_seconds = StrictIntegerField(min_value=1, max_value=MAX_DURATION_SECONDS, default=30)
     wait_seconds = StrictFloatField(min_value=0.1, max_value=60, default=1)
+    connect_timeout_seconds = StrictIntegerField(
+        min_value=1, max_value=MAX_CONNECT_TIMEOUT_SECONDS,
+        default=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    )
+    read_timeout_seconds = StrictIntegerField(
+        min_value=1, max_value=MAX_READ_TIMEOUT_SECONDS,
+        default=DEFAULT_READ_TIMEOUT_SECONDS,
+    )
     variables = serializers.DictField(default=dict)
     unique_variables = UniqueVariableSerializer(many=True, default=list)
     steps = PlanStepSerializer(many=True, allow_empty=False)
@@ -333,8 +342,9 @@ class PerformancePlanSerializer(StrictModelSerializer):
         model = PerformancePlan
         fields = (
             'id', 'name', 'description', 'target_id', 'users', 'spawn_rate',
-            'duration_seconds', 'wait_seconds', 'variables', 'unique_variables',
-            'steps', 'created_at', 'updated_at',
+            'duration_seconds', 'wait_seconds', 'connect_timeout_seconds',
+            'read_timeout_seconds', 'variables', 'unique_variables', 'steps',
+            'created_at', 'updated_at',
         )
         read_only_fields = ('id', 'created_at', 'updated_at')
 
@@ -457,6 +467,14 @@ class PerformancePlanSerializer(StrictModelSerializer):
             'spawn_rate': attrs.get('spawn_rate', getattr(self.instance, 'spawn_rate', 1)),
             'duration_seconds': attrs.get('duration_seconds', getattr(self.instance, 'duration_seconds', 30)),
             'wait_seconds': attrs.get('wait_seconds', getattr(self.instance, 'wait_seconds', 1)),
+            'connect_timeout_seconds': attrs.get(
+                'connect_timeout_seconds',
+                getattr(self.instance, 'connect_timeout_seconds', DEFAULT_CONNECT_TIMEOUT_SECONDS),
+            ),
+            'read_timeout_seconds': attrs.get(
+                'read_timeout_seconds',
+                getattr(self.instance, 'read_timeout_seconds', DEFAULT_READ_TIMEOUT_SECONDS),
+            ),
             'variables': variables,
             'unique_variables': unique_variables,
             'steps': steps,

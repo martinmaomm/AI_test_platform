@@ -81,6 +81,16 @@
         <el-descriptions-item label="总每秒启动用户">{{
           run.snapshot?.spawn_rate ?? "-"
         }}</el-descriptions-item>
+        <el-descriptions-item label="连接建立等待">
+          <template v-if="run.snapshot?.connect_timeout_seconds != null"
+            >{{ run.snapshot.connect_timeout_seconds }} 秒</template
+          ><template v-else>未记录</template>
+        </el-descriptions-item>
+        <el-descriptions-item label="响应读取等待">
+          <template v-if="run.snapshot?.read_timeout_seconds != null"
+            >{{ run.snapshot.read_timeout_seconds }} 秒</template
+          ><template v-else>未记录</template>
+        </el-descriptions-item>
       </el-descriptions>
       <PerformanceValidationSteps
         v-if="run.mode === 'validation'"

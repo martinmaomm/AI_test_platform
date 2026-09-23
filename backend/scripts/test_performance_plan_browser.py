@@ -139,6 +139,8 @@ def verify_browser(origin, fixture, output):
             expect(page.locator('.perf-workspace > .phase-notice')).to_have_count(0)
             open_plan()
             expect(page.get_by_test_id('plan-target-empty')).to_be_visible()
+            expect(input_of('plan-connect-timeout')).to_have_value('10')
+            expect(input_of('plan-read-timeout')).to_have_value('30')
             close_plan()
 
             # Create only in the disposable service while plans is cached.
@@ -157,6 +159,8 @@ def verify_browser(origin, fixture, output):
             expect(option).to_be_visible()
             option.click()
             input_of('plan-name').fill('可重复编辑的隔离计划')
+            input_of('plan-connect-timeout').fill('12')
+            input_of('plan-read-timeout').fill('45')
             input_of('step-name').fill('列表查询')
             input_of('step-path').fill('/products')
             input_of('plan-variables').fill('{"page_size":10,"enabled":true}')
@@ -206,6 +210,8 @@ def verify_browser(origin, fixture, output):
                 page.get_by_test_id('plan-save').click()
             assert saved.value.status == 201, saved.value.text()
             saved_plan = saved.value.json()['data']
+            assert saved_plan['connect_timeout_seconds'] == 12
+            assert saved_plan['read_timeout_seconds'] == 45
             step = saved_plan['steps'][0]
             assert set(step) == {
                 'name', 'phase', 'method', 'path', 'query', 'headers',
@@ -224,6 +230,9 @@ def verify_browser(origin, fixture, output):
             page.get_by_role('button', name='编辑', exact=True).click()
             expect(editor()).to_be_visible()
             expect(input_of('step-name')).to_have_value('列表查询')
+            expect(input_of('plan-connect-timeout')).to_have_value('12')
+            expect(input_of('plan-read-timeout')).to_have_value('45')
+            page.get_by_test_id('plan-request-timeouts').screenshot(path=str(output / 'request-timeouts.png'), animations='disabled')
             expect(page.get_by_test_id('step-query-rows').locator('input')).to_have_count(6)
             expect(page.get_by_test_id('step-header-rows').locator('input')).to_have_count(2)
             assert json.loads(input_of('step-body-json').input_value()) == step['body']
@@ -234,6 +243,8 @@ def verify_browser(origin, fixture, output):
             with page.expect_response(lambda response: response.request.method == 'PATCH' and response.url.endswith(f"/plans/{saved_plan['id']}/")) as updated:
                 page.get_by_test_id('plan-save').click()
             assert updated.value.status == 200, updated.value.text()
+            assert updated.value.json()['data']['connect_timeout_seconds'] == 12
+            assert updated.value.json()['data']['read_timeout_seconds'] == 45
             expect(editor()).not_to_be_visible()
             page.get_by_role('button', name='编辑', exact=True).click()
             expect(page.get_by_test_id('step-query-rows').locator('input').nth(1)).to_have_value('更新后的值')
@@ -308,13 +319,18 @@ def main():
         try:
             result = verify_browser(f'http://127.0.0.1:{server.server_port}', fixture, output)
             from performance_testing.models import PerformancePlan, PerformanceRun, PerformanceNode
-            from performance_testing.run_services import _snapshot_for
+            from performance_testing.run_services import _snapshot_for, validation_key_for
             import uuid
             plan = PerformancePlan.objects.get(pk=result.pop('plan_id'))
             # Validate the exact saved payload with the real node contract;
             # no run row, node row, Worker or target request is created.
-            snapshot, digest = _snapshot_for(uuid.uuid4(), plan, PerformanceNode(project=plan.project), 'load')
+            node = PerformanceNode(project=plan.project)
+            allocations = [{'node': node, 'users': plan.users,
+                            'validation_key': validation_key_for(plan, node)}]
+            snapshot, digest = _snapshot_for(uuid.uuid4(), plan, allocations, 'load')
             assert snapshot['steps'] == plan.steps
+            assert snapshot['connect_timeout_seconds'] == 12
+            assert snapshot['read_timeout_seconds'] == 45
             assert digest
             assert not PerformanceRun.objects.exists() and not attempted_runs
             print(json.dumps({**result, 'node_snapshot_contract': True, 'pressure_runs': 0}, ensure_ascii=False))

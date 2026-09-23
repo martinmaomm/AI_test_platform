@@ -93,6 +93,7 @@ class PerformanceRunContractTests(TestCase):
         self.plan = PerformancePlan.objects.create(
             project=self.project, target=self.target, name='frozen plan', users=2,
             spawn_rate=1.5, duration_seconds=5, wait_seconds=.5,
+            connect_timeout_seconds=14, read_timeout_seconds=47,
             variables={}, unique_variables=[],
             steps=[{
                 'name': 'list', 'phase': 'main', 'method': 'GET', 'path': '/items',
@@ -255,7 +256,7 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual([item.validation_run_id for item in participants], [
             validations[node.pk].pk for node in nodes
         ])
-        self.assertEqual(run.snapshot['schema_version'], 3)
+        self.assertEqual(run.snapshot['schema_version'], 4)
         self.assertNotIn('node_id', run.snapshot)
         self.assertNotIn('validation_key', run.snapshot)
         self.assertEqual(
@@ -301,13 +302,16 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(set(run.snapshot), {
             'schema_version', 'run_id', 'nodes', 'engine_version', 'plan_name',
             'base_url', 'allowed_methods', 'mode', 'users',
-            'spawn_rate', 'duration_seconds', 'wait_seconds', 'variables',
+            'spawn_rate', 'duration_seconds', 'wait_seconds',
+            'connect_timeout_seconds', 'read_timeout_seconds', 'variables',
             'unique_variables', 'steps',
         })
-        self.assertEqual(run.snapshot['schema_version'], 3)
+        self.assertEqual(run.snapshot['schema_version'], 4)
         self.assertEqual(run.snapshot['nodes'][0]['node_id'], str(self.node.pk))
         self.assertEqual((run.snapshot['users'], run.snapshot['spawn_rate']), (1, 1))
         self.assertEqual(run.snapshot['duration_seconds'], 120)
+        self.assertEqual(run.snapshot['connect_timeout_seconds'], 14)
+        self.assertEqual(run.snapshot['read_timeout_seconds'], 47)
         self.assertEqual(created.data['data']['validation_status'], 'pending')
         self.assertEqual(run.snapshot['run_id'], str(run.pk))
         self.assertEqual(len(run.snapshot_sha256), 64)
@@ -380,6 +384,8 @@ class PerformanceRunContractTests(TestCase):
         load = PerformanceRun.objects.get(pk=allowed.data['data']['id'])
         self.assertEqual((load.snapshot['users'], load.snapshot['spawn_rate']), (2, 1.5))
         self.assertEqual(load.snapshot['duration_seconds'], 5)
+        self.assertEqual(load.snapshot['connect_timeout_seconds'], 14)
+        self.assertEqual(load.snapshot['read_timeout_seconds'], 47)
         self.assertEqual(allowed.data['data']['validation_status'], 'not_applicable')
 
         self.plan.variables = {'changed': True}
@@ -388,6 +394,32 @@ class PerformanceRunContractTests(TestCase):
         self.assertEqual(stale.data['data']['validation_status'], 'stale')
         rejected = self._create(mode='load')
         self.assertEqual(rejected.status_code, 400, rejected.data)
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_changing_request_timeout_invalidates_previous_validation(self, _):
+        validation = self._complete_validation(self.node)
+        self.client.force_authenticate(self.executor)
+        detail_path = self._path(f'runs/{validation.pk}/')
+        self.assertEqual(self.client.get(detail_path).data['data']['validation_status'], 'passed')
+
+        self.plan.connect_timeout_seconds = 15
+        self.plan.save(update_fields=('connect_timeout_seconds',))
+        self.assertEqual(self.client.get(detail_path).data['data']['validation_status'], 'stale')
+        rejected = self._create(mode='load')
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+
+    def test_historical_schema3_run_detail_remains_readable(self):
+        historical = self._direct_run(
+            status=PerformanceRun.Status.COMPLETED,
+            finished_at=timezone.now(),
+            snapshot={'schema_version': 3, 'users': 1, 'steps': []},
+            latest_metrics={'complete': True, 'requests': 1, 'failures': 0},
+        )
+        self.client.force_authenticate(self.executor)
+        detail = self.client.get(self._path(f'runs/{historical.pk}/'))
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data['data']['id'], str(historical.pk))
+        self.assertEqual(detail.data['data']['status'], PerformanceRun.Status.COMPLETED)
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_validation_must_include_real_requests_and_all_main_steps(self, _):

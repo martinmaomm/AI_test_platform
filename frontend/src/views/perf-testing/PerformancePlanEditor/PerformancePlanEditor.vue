@@ -206,6 +206,32 @@
               >
             </div>
           </section>
+          <section data-testid="plan-request-timeouts">
+            <h3>请求超时</h3>
+            <p class="load-note">
+              连接建立等待用于建立 TCP/TLS 连接；响应读取等待是等待响应首字节或后续数据的最长空闲时间。两者都不是整个请求的总时长，对所有步骤生效，验证和正式压测使用同一配置；单用户验证整轮最长 120 秒。
+            </p>
+            <div class="grid">
+              <el-form-item label="连接建立等待（秒）" :error="formError.connect_timeout_seconds"
+                ><el-input-number
+                  v-model="form.connect_timeout_seconds"
+                  data-testid="plan-connect-timeout"
+                  :min="1"
+                  :max="connectTimeoutMaximum"
+                  :step="1"
+                  :precision="0"
+              /></el-form-item>
+              <el-form-item label="响应读取等待（秒）" :error="formError.read_timeout_seconds"
+                ><el-input-number
+                  v-model="form.read_timeout_seconds"
+                  data-testid="plan-read-timeout"
+                  :min="1"
+                  :max="readTimeoutMaximum"
+                  :step="1"
+                  :precision="0"
+              /></el-form-item>
+            </div>
+          </section>
           <section>
             <div class="heading">
               <h3>请求步骤</h3>
@@ -439,9 +465,13 @@ import {
   createAssertion,
   createExtract,
   createPlanStep,
+  DEFAULT_CONNECT_TIMEOUT_SECONDS,
+  DEFAULT_READ_TIMEOUT_SECONDS,
   jsonErrorMessage,
+  normalizePlanRequestTimeouts,
   previewStepUrl,
   serializePlanSteps,
+  validatePlanRequestTimeouts,
 } from "../performancePlanEditorState";
 const props = defineProps({
   visible: Boolean,
@@ -465,7 +495,11 @@ const emit = defineEmits([
 const formRef = ref();
 const selectedIndex = ref(0);
 const errors = ref([]);
-const formError = reactive({ variables: "" });
+const formError = reactive({
+  variables: "",
+  connect_timeout_seconds: "",
+  read_timeout_seconds: "",
+});
 const initialSnapshot = ref("");
 const comparators = [
   "eq",
@@ -489,6 +523,8 @@ const blank = () => ({
   spawn_rate: 1,
   duration_seconds: 30,
   wait_seconds: 1,
+  connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+  read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
   variablesText: "{}",
   unique_variables: [],
   steps: [createPlanStep()],
@@ -512,6 +548,12 @@ const rules = {
   target_id: [{ required: true, message: "请选择压测目标", trigger: "change" }],
 };
 const currentStep = computed(() => form.steps[selectedIndex.value]);
+const connectTimeoutMaximum = computed(
+  () => props.limits.max_connect_timeout_seconds ?? 60,
+);
+const readTimeoutMaximum = computed(
+  () => props.limits.max_read_timeout_seconds ?? 120,
+);
 const rampWarning = computed(() => {
   const users = Number(form.users);
   const rate = Number(form.spawn_rate);
@@ -549,6 +591,7 @@ function reset() {
       ? {
           ...blank(),
           ...source,
+          ...normalizePlanRequestTimeouts(source),
           variablesText: JSON.stringify(source.variables || {}, null, 2),
           unique_variables: (source.unique_variables || []).map(
             (item, index) => ({
@@ -564,6 +607,8 @@ function reset() {
   selectedIndex.value = 0;
   errors.value = [];
   formError.variables = "";
+  formError.connect_timeout_seconds = "";
+  formError.read_timeout_seconds = "";
   initialSnapshot.value = snapshot();
 }
 watch(
@@ -623,6 +668,12 @@ async function save() {
     return;
   }
   formError.variables = "";
+  Object.assign(
+    formError,
+    validatePlanRequestTimeouts(form, props.limits),
+  );
+  if (formError.connect_timeout_seconds || formError.read_timeout_seconds)
+    return;
   const serialized = serializePlanSteps(form.steps, targetMethods.value);
   errors.value = serialized.errors;
   const invalid = errors.value.findIndex(Boolean);
@@ -638,6 +689,8 @@ async function save() {
     spawn_rate: form.spawn_rate,
     duration_seconds: form.duration_seconds,
     wait_seconds: form.wait_seconds,
+    connect_timeout_seconds: form.connect_timeout_seconds,
+    read_timeout_seconds: form.read_timeout_seconds,
     variables,
     unique_variables: form.unique_variables.map(({ name, prefix }) => ({
       name: name.trim(),

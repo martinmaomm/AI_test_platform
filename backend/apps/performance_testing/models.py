@@ -7,7 +7,10 @@ from django.utils import timezone
 
 from projects.models import Project
 
-from .constants import NODE_OFFLINE_AFTER_SECONDS
+from .constants import (
+    DEFAULT_CONNECT_TIMEOUT_SECONDS, DEFAULT_READ_TIMEOUT_SECONDS,
+    MAX_CONNECT_TIMEOUT_SECONDS, MAX_READ_TIMEOUT_SECONDS, NODE_OFFLINE_AFTER_SECONDS,
+)
 
 
 def default_allowed_methods():
@@ -42,6 +45,12 @@ class PerformancePlan(models.Model):
     spawn_rate = models.FloatField(default=1)
     duration_seconds = models.PositiveIntegerField(default=30)
     wait_seconds = models.FloatField(default=1)
+    connect_timeout_seconds = models.PositiveIntegerField(
+        default=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    )
+    read_timeout_seconds = models.PositiveIntegerField(
+        default=DEFAULT_READ_TIMEOUT_SECONDS,
+    )
     variables = models.JSONField(default=dict)
     unique_variables = models.JSONField(default=list)
     steps = models.JSONField(default=list)
@@ -67,6 +76,20 @@ class PerformancePlan(models.Model):
             models.CheckConstraint(
                 check=models.Q(wait_seconds__gte=0.1) & models.Q(wait_seconds__lte=60),
                 name='perf_plan_wait_01_60',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(connect_timeout_seconds__gte=1)
+                    & models.Q(connect_timeout_seconds__lte=MAX_CONNECT_TIMEOUT_SECONDS)
+                ),
+                name='perf_plan_connect_timeout_1_60',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(read_timeout_seconds__gte=1)
+                    & models.Q(read_timeout_seconds__lte=MAX_READ_TIMEOUT_SECONDS)
+                ),
+                name='perf_plan_read_timeout_1_120',
             ),
         ]
 

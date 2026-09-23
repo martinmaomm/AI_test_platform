@@ -544,6 +544,10 @@
             </template>
           </div>
         </el-descriptions-item>
+        <el-descriptions-item label="请求超时">
+          连接建立等待 {{ runDialog.plan.connect_timeout_seconds }} 秒；响应读取等待
+          {{ runDialog.plan.read_timeout_seconds }} 秒。
+        </el-descriptions-item>
         <el-descriptions-item label="节点">
           <el-radio-group
             v-if="runDialog.mode === 'validation'"
@@ -753,6 +757,8 @@ const defaults = {
     max_duration_seconds: 600,
     max_spawn_rate: 100,
     max_steps: 20,
+    max_connect_timeout_seconds: 60,
+    max_read_timeout_seconds: 120,
   },
 };
 const config = reactive({ ...defaults, limits: { ...defaults.limits } });

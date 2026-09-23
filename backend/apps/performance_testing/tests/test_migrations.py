@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 from django.db.migrations.operations.fields import AddField, RemoveField
 from django.db.migrations.operations.special import RunPython
-from django.db.migrations.operations.models import CreateModel
+from django.db.migrations.operations.models import AddConstraint, CreateModel
 from django.test import SimpleTestCase
 
 
@@ -117,3 +117,18 @@ class PerformanceMigrationTests(SimpleTestCase):
         self.assertIsNone(created['node_protocol_version'])
         self.assertNotIn('ready_at', created)
         participant_manager.bulk_create.assert_called_once()
+
+    def test_request_timeout_migration_adds_fields_and_constraints_without_rewriting_history(self):
+        migration = importlib.import_module(
+            'performance_testing.migrations.0006_performanceplan_request_timeouts',
+        ).Migration
+        added = [item for item in migration.operations if isinstance(item, AddField)]
+        self.assertEqual([item.name for item in added], [
+            'connect_timeout_seconds', 'read_timeout_seconds',
+        ])
+        self.assertEqual([item.field.default for item in added], [10, 30])
+        self.assertEqual(
+            len([item for item in migration.operations if isinstance(item, AddConstraint)]),
+            2,
+        )
+        self.assertFalse(any(isinstance(item, RunPython) for item in migration.operations))

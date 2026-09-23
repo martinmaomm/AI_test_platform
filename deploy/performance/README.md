@@ -1,6 +1,6 @@
 # 公网性能节点部署与联调
 
-这是 0.4.0 多节点执行的部署参考，不是整个平台的公网发布方案。每个节点主动连接平台，无需 VPN；不修改节点机器上的已有网站、代理或容器。
+这是 0.4.1 可配置请求超时与多节点执行的部署参考，不是整个平台的公网发布方案。每个节点主动连接平台，无需 VPN；不修改节点机器上的已有网站、代理或容器。
 
 ## 推荐：从网页一键接入
 
@@ -37,26 +37,26 @@
 网页 Docker 命令依赖已发布的双架构镜像索引，不能只配置域名。先在对应架构构建（或从可信构建机导入）镜像，固定命名：
 
 ```text
-automation-platform-performance-node:0.4.0-amd64
-automation-platform-performance-node:0.4.0-arm64
+automation-platform-performance-node:0.4.1-amd64
+automation-platform-performance-node:0.4.1-arm64
 ```
 
 发布机需要能运行对应架构的镜像以核对安装包内的 Agent、Locust、协议和固定执行脚本。以下命令只生成归档，供审计或手工部署使用，**不能单独启用网页安装命令**；网页发行继续执行下一节的双架构公开发布：
 
 ```bash
 backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
-  --image amd64=automation-platform-performance-node:0.4.0-amd64 \
-  --image arm64=automation-platform-performance-node:0.4.0-arm64 \
-  --output backend/resource/performance-node-dockerhub-0.4.0
+  --image amd64=automation-platform-performance-node:0.4.1-amd64 \
+  --image arm64=automation-platform-performance-node:0.4.1-arm64 \
+  --output backend/resource/performance-node-dockerhub-0.4.1
 ```
 
 生成目录默认 `backend/resource/performance-node/`，包含 manifest 和受控镜像归档，已被 Git 忽略。同版本已发布镜像拒绝直接覆盖，修改引擎后应按版本契约重新发布。这个目录只放可公开的发行资产，禁止放 `.env`、身份文件、数据库备份、CA 私钥和符号链接。
 
 #### 推荐：公开 Docker Hub 发行（仅限测试使用）
 
-当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。0.4.0 单条命令使用固定摘要的多架构索引，节点机器无需登录 Docker Hub。协议 2 旧节点（如 0.3.1、0.3.2）可继续管理心跳和显示升级提示，但不能接收协议 3 的执行任务；更早且不使用协议 2 的节点必须升级，不能依赖兼容心跳。旧节点须保留原身份卷并手动升级至 0.4.0，完成单用户验证后才能加入多节点运行。设计见 [单条 Docker 接入](../../docs/plans/2026-09-18-performance-direct-docker-install.md)和[多节点方案](../../docs/plans/2026-09-22-performance-multi-node.md)。
+当前测试发行仓库：[martinmao9/performance-node](https://hub.docker.com/r/martinmao9/performance-node)。0.4.1 单条命令使用固定摘要的多架构索引，节点机器无需登录 Docker Hub。协议 2 旧节点（如 0.3.1、0.3.2）可继续管理心跳和显示升级提示，但不能接收协议 3 的执行任务；更早且不使用协议 2 的节点必须升级，不能依赖兼容心跳。0.4.0 节点可继续心跳并显示版本提示，但无法执行新版快照。旧节点按上方“保留原节点重新安装新版”流程手动更新至 0.4.1，完成单用户验证后才能加入运行。设计见 [单条 Docker 接入](../../docs/plans/2026-09-18-performance-direct-docker-install.md)和[多节点方案](../../docs/plans/2026-09-22-performance-multi-node.md)。
 
-本次固定索引、匿名拉取、双架构启动、协议 3 和本机平台切换证据见 [0.4.0 发布验收](../../docs/verification/2026-09-22-performance-node-0.4.0-release.md)。
+本次固定索引、匿名拉取、双架构启动、协议 3 和本机平台切换证据见 [0.4.1 发布验收](../../docs/verification/2026-09-23-performance-node-0.4.1-release.md)。
 
 只发布 `performance-node/` 的独立客户端，不发布平台镜像或整个项目目录。Docker 构建上下文已使用白名单，仅允许节点 Python 源码、包配置、README 和 Dockerfile；不包含平台 `.env`、身份卷、日志、数据库和私钥。
 
@@ -66,18 +66,18 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
    ```bash
    docker buildx build --platform linux/amd64 --provenance=false --load \
-     -t automation-platform-performance-node:0.4.0-amd64 performance-node
+     -t automation-platform-performance-node:0.4.1-amd64 performance-node
    docker buildx build --platform linux/arm64 --provenance=false --load \
-     -t automation-platform-performance-node:0.4.0-arm64 performance-node
+     -t automation-platform-performance-node:0.4.1-arm64 performance-node
    ```
 
 4. 把下方 `YOUR_DOCKER_ID` 替换成真实 Docker ID，显式启用公开发布：
 
    ```bash
    backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
-     --image amd64=automation-platform-performance-node:0.4.0-amd64 \
-     --image arm64=automation-platform-performance-node:0.4.0-arm64 \
-     --output backend/resource/performance-node-dockerhub-0.4.0 \
+     --image amd64=automation-platform-performance-node:0.4.1-amd64 \
+     --image arm64=automation-platform-performance-node:0.4.1-arm64 \
+     --output backend/resource/performance-node-dockerhub-0.4.1 \
      --registry docker.io/YOUR_DOCKER_ID/performance-node --publish-index
    ```
 
@@ -85,9 +85,9 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
 发布工具验证各架构远端摘要、配置与匿名拉取后写入 `registry_ref`；`--publish-index` 将两种已验证的镜像组成固定索引，验证索引及其两个平台均可匿名拉取后，才写入顶层 `registry_index_ref`。网页仅生成该索引的 Docker 命令，**不使用 `latest`，不因仓库失败自动降级或关闭 TLS**。平台公共 CA 只用于平台控制连接，不传给 Docker Hub。Docker Hub 在目标网络不可达或限流时仍可能下载失败，并不能保证所有网络都提速。
 
-发布成功后，将下方 `PERFORMANCE_NODE_RELEASE_DIR` 改为新发行目录的绝对路径，并在没有活动压测时重启后端和性能控制器，确保两个进程同时加载 0.4.0、协议 3 和相同的固定执行模板。Caddy 使用更新后的白名单，允许 GET/HEAD 公共 CA 路径；若保留手工归档下载，Caddy 的发行目录也同步更新。改版后从网页重新生成命令，不使用之前复制的长 Shell 命令。
+发布成功后，将下方 `PERFORMANCE_NODE_RELEASE_DIR` 改为新发行目录的绝对路径，并在没有活动压测时重启后端和性能控制器，确保两个进程同时加载 0.4.1、协议 3 和相同的固定执行模板。Caddy 使用更新后的白名单，允许 GET/HEAD 公共 CA 路径；若保留手工归档下载，Caddy 的发行目录也同步更新。改版后从网页重新生成命令，不使用之前复制的长 Shell 命令。
 
-已有节点不会自动升级。需要安装新版时，使用上方“保留原节点重新安装新版”流程。平台显示 Agent 0.4.0、协议 3 且心跳正常后，逐节点重新运行单用户验证，再将节点加入多节点计划。重装已经轮换凭证，旧容器和旧身份卷不能直接恢复连接；旧执行记录不受影响。
+已有节点不会自动升级。需要安装新版时，使用上方“保留原节点重新安装新版”流程。平台显示 Agent 0.4.1、协议 3 且心跳正常后，逐节点重新运行单用户验证，再将节点加入多节点计划。重装已经轮换凭证，旧容器和旧身份卷不能直接恢复连接；旧执行记录不受影响。
 
 新命令不接管旧安装器的容器、网络和身份卷。旧安装器中途失败时，先确认机器上的实际容器已经停止并移除：已注册节点使用“重新安装”，尚未注册节点使用“重新生成安装命令”。旧机器资源按归属单独清理，切勿删除不明身份卷。
 
@@ -95,7 +95,7 @@ backend/.venv/bin/python backend/scripts/publish_performance_node_release.py \
 
 ```dotenv
 PERFORMANCE_NODE_PUBLIC_URL=https://load.example.com:18443
-PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node-dockerhub-0.4.0
+PERFORMANCE_NODE_RELEASE_DIR=/absolute/path/backend/resource/performance-node-dockerhub-0.4.1
 # 私有 CA 场景填公共证书；可信公共 CA 场景留空。
 PERFORMANCE_NODE_CA_CERT_FILE=/absolute/private/gateway/storage/pki/authorities/local/root.crt
 ```
@@ -106,14 +106,16 @@ PERFORMANCE_NODE_CA_CERT_FILE=/absolute/private/gateway/storage/pki/authorities/
 
 ### 平台数据库迁移与回退
 
+从 0.4.0 升级到 0.4.1 时，`performance_testing.0006` 仅给计划增加连接超时、读取超时及取值约束；现有计划初始化为 10 秒、30 秒，历史运行快照和报告不变。回退 0006 会删除新增的超时设置，须先备份这些值；回退时仍须恢复匹配的代码、发行目录和节点版本。
+
 0.4.0 的 `performance_testing.0005` 会把旧 Run 执行数据回填到参与表，并删除 Run 上的旧单节点执行字段。该迁移明确不可逆，不能用 `migrate performance_testing 0004` 恢复旧结构或数据。
 
 1. 在维护窗口先停止接收新运行，通过页面等待现有轮次结束或明确停止；排队轮次按升级原因取消，不能跨版本继续执行。确认没有活动性能运行后，在仓库根目录执行 `./platform stop`，再用 `./platform status` 确认后端、Celery、控制器和 Caddy 均已停止，避免迁移期间继续写入。
 2. 使用组织既定工具创建数据库完整一致性备份并实际验证可恢复；同时记录当前 Git revision、发行目录和 `.env` 键名（不记录或提交值），保留旧平台代码和旧发行目录。备份必须包含性能运行、节点、验证与报告数据。
-3. 使用待发布代码执行 `backend/.venv/bin/python backend/manage.py migrate performance_testing`，检查迁移记录为 `0005`，并核对历史 Run 数、参与者回填、快照 SHA 和报告证据。迁移失败时保持入口关闭，不要反复执行、`--fake` 或手工拼回旧字段；MySQL/MariaDB 的部分 DDL 可能已经提交，应先检查实际结构，再从已验证备份恢复。
-4. 配置 0.4.0 发行目录后执行 `./platform start` 和 `./platform status`，确认四项托管服务健康，再核对配置接口返回 Agent 0.4.0、协议 3，并逐节点升级和重新验证。
+3. 使用待发布代码执行 `backend/.venv/bin/python backend/manage.py migrate performance_testing`，检查迁移记录包含 `0006`，并核对历史 Run 数、参与者、快照 SHA 和报告证据，以及现有计划的 10/30 秒默认值。跨过 0.4.0 升级时还须核对 0005 的参与者回填。迁移失败时保持入口关闭，不要反复执行、`--fake` 或手工拼回旧字段；MySQL/MariaDB 的部分 DDL 可能已经提交，应先检查实际结构，再从已验证备份恢复。
+4. 配置 0.4.1 发行目录后执行 `./platform start` 和 `./platform status`，确认四项托管服务健康，再核对配置接口返回 Agent 0.4.1、协议 3，并逐节点升级和重新验证。
 
-需要回退时，先再次关闭执行入口并停止、清理全部新轮次，保留升级后产生的报告与审计证据；停止托管服务后恢复升级前的完整数据库备份，同时恢复匹配的旧代码、旧发行目录和节点镜像。备份之后产生的数据须另行决定保留或合并方式，不能仅切换镜像或发行目录后继续使用 0005 数据库。
+需要回退时，先再次关闭执行入口并停止全部新轮次，保留升级后产生的报告与审计证据；停止托管服务后恢复升级前的完整数据库备份，同时恢复匹配的旧代码、旧发行目录和节点镜像。备份之后产生的数据须另行决定保留或合并方式。涉及不可逆的 0005 迁移时，不能仅切换镜像或发行目录恢复旧平台。
 
 ## 1. 两条独立连接
 
@@ -175,7 +177,7 @@ backend/temp/performance-gateway/storage/pki/authorities/local/root.crt
 只传输 `performance-node/` 源码，在目标架构机器构建：
 
 ```bash
-docker build -t automation-platform-performance-node:0.4.0 /opt/automation-performance-node/source
+docker build -t automation-platform-performance-node:0.4.1 /opt/automation-performance-node/source
 docker network create automation-performance-net
 docker volume create automation-performance-state
 ```
@@ -199,7 +201,7 @@ docker run --rm --name automation-performance-enroll \
   --mount type=volume,src=automation-performance-state,dst=/var/lib/performance-node \
   --mount type=bind,src=/opt/automation-performance-node/config/gateway-ca.crt,dst=/run/gateway-ca.crt,readonly \
   --mount type=bind,src=/opt/automation-performance-node/config/enrollment-token,dst=/run/enrollment-token,readonly \
-  automation-platform-performance-node:0.4.0 enroll
+  automation-platform-performance-node:0.4.1 enroll
 ```
 
 确认“节点注册成功”后删除**本轮已消费的一次性凭证文件**，不删除 volume/identity.json。启动常驻 Agent：
@@ -216,7 +218,7 @@ docker run -d --name automation-performance-node \
   -e PERFORMANCE_NODE_CA_BUNDLE=/run/gateway-ca.crt \
   --mount type=volume,src=automation-performance-state,dst=/var/lib/performance-node \
   --mount type=bind,src=/opt/automation-performance-node/config/gateway-ca.crt,dst=/run/gateway-ca.crt,readonly \
-  automation-platform-performance-node:0.4.0 run
+  automation-platform-performance-node:0.4.1 run
 ```
 
 这里 1 CPU/512MiB 仅作为低负载联调限制，不代表正式压测容量配置。身份目录由镜像初始化为 UID10001、0700；身份文件为0600。运行容器不含一次性登记凭证，不挂载 Docker socket 或平台目录。重启容器使用同一 volume，不再次执行 enroll。镜像升级必须与平台 Agent 协议、Locust 版本和固定脚本摘要一致。
@@ -232,7 +234,7 @@ docker run -d --name automation-performance-fixture \
   --memory 64m --cpus 0.25 --pids-limit 64 \
   --log-opt max-size=5m --log-opt max-file=2 \
   --mount type=bind,src=/opt/automation-performance-node/smoke_fixture.py,dst=/app/smoke_fixture.py,readonly \
-  --entrypoint python automation-platform-performance-node:0.4.0 /app/smoke_fixture.py
+  --entrypoint python automation-platform-performance-node:0.4.1 /app/smoke_fixture.py
 ```
 
 在平台创建专用性能项目，目标为 `http://performance-fixture.test:8080`，仅允许 GET；计划为 1 用户、生成速率1、时长5秒、等待1秒，步骤 `GET /probe`，预期200。域名只在节点 Docker 网络解析，不是可从 Mac 浏览器打开的网站。

@@ -8,7 +8,7 @@ import uuid
 
 from performance_node.locust_runtime import (
     MISSING, add_failure_samples, assertion_failures, canonical_sha256, compare_value,
-    resolve_path, resolve_value, select_value, validate_snapshot,
+    classify_network_exception, resolve_path, resolve_value, select_value, validate_snapshot,
     ReportSequence, ValidationTrace, evidence_preview, format_evidence, evidence_secrets,
     normalize_validation_steps,
 )
@@ -17,11 +17,12 @@ from performance_node.locust_runtime import (
 def snapshot():
     node_id = str(uuid.uuid4())
     return {
-        'schema_version': 3, 'run_id': str(uuid.uuid4()),
+        'schema_version': 4, 'run_id': str(uuid.uuid4()),
         'engine_version': '2.43.3', 'plan_name': 'fixture', 'base_url': 'http://127.0.0.1:8080',
         'allowed_methods': ['GET'], 'mode': 'validation',
         'nodes': [{'node_id': node_id, 'users': 1, 'validation_key': 'a' * 64}],
         'users': 1, 'spawn_rate': 1, 'duration_seconds': 5, 'wait_seconds': .5,
+        'connect_timeout_seconds': 10, 'read_timeout_seconds': 30,
         'variables': {'page': 1}, 'unique_variables': [{'name': 'name', 'prefix': 'load_'}],
         'steps': [{'name': 'fixture', 'phase': 'main', 'method': 'GET', 'path': '/ok',
                    'query': {'page': '${page}'}, 'headers': {}, 'body_type': 'none',
@@ -58,6 +59,47 @@ class FixedRuntimeTests(unittest.TestCase):
         changed = copy.deepcopy(value)
         changed['users'] = 2
         self.assertNotEqual(canonical_sha256(value), canonical_sha256(changed))
+
+    def test_request_timeouts_are_required_bounded_integers(self):
+        for field, invalid_values in (
+            ('connect_timeout_seconds', (None, True, 0, 61, 1.5)),
+            ('read_timeout_seconds', (None, True, 0, 121, 1.5)),
+        ):
+            for invalid in invalid_values:
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                    candidate = snapshot()
+                    candidate[field] = invalid
+                    validate_snapshot(candidate)
+        for missing in ('connect_timeout_seconds', 'read_timeout_seconds'):
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                candidate = snapshot()
+                candidate.pop(missing)
+                validate_snapshot(candidate)
+
+    def test_network_exception_classification_uses_nested_evidence_without_leaking_text(self):
+        def error(name, text='https://user:secret@private.invalid/?token=hidden', wrapped=None):
+            cls = type(name, (Exception,), {})
+            return cls(wrapped if wrapped is not None else text)
+
+        cases = (
+            (error('ConnectTimeout'), 'connect_timeout', '连接超时（ConnectTimeout）'),
+            (error('ConnectionError', wrapped=error('ReadTimeoutError')), 'read_timeout',
+             '读取响应超时（ReadTimeoutError）'),
+            (error('MaxRetryError', wrapped=error('NameResolutionError')), 'dns_error',
+             'DNS 解析失败（NameResolutionError）'),
+            (error('ConnectionError', wrapped=error('SSLError')), 'tls_error',
+             'TLS 连接失败（SSLError）'),
+            (error('ConnectionError'), 'connection_error', '网络连接失败（ConnectionError）'),
+            (error('Timeout'), 'connection_error', '网络连接失败（Timeout）'),
+            (error('CustomerSecretFailure'), 'connection_error', '网络连接失败（NetworkError）'),
+        )
+        for exc, expected_type, expected_message in cases:
+            with self.subTest(expected_type=expected_type):
+                actual_type, message = classify_network_exception(exc)
+                self.assertEqual((actual_type, message), (expected_type, expected_message))
+                self.assertNotIn('private.invalid', message)
+                self.assertNotIn('secret', message)
+                self.assertNotIn('hidden', message)
 
     def test_bad_load_and_origins_are_rejected(self):
         for field, value in [('users', True), ('users', 1001), ('duration_seconds', 601),

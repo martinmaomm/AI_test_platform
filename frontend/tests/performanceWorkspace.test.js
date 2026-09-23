@@ -250,6 +250,10 @@ test("workspace creates eligibility-checked multi-node runs and delegates plan e
   assert.match(source, /openRun\(row, ['"]validation['"]\)/);
   assert.match(source, /execution_unavailable_reason/);
   assert.match(source, /正式压测可选择\s+1–5\s+个节点/);
+  assert.match(source, /连接建立等待 \{\{ runDialog\.plan\.connect_timeout_seconds \}\} 秒/);
+  assert.match(source, /响应读取等待\s+\{\{ runDialog\.plan\.read_timeout_seconds \}\} 秒/);
+  assert.match(source, /max_connect_timeout_seconds: 60/);
+  assert.match(source, /max_read_timeout_seconds: 120/);
   assert.match(source, /运行任务（含停止中）。吊销将请求停止，报告可能不完整/);
   assert.match(source, /activeRunConflictCount\(error\)/);
   assert.match(
@@ -328,6 +332,9 @@ test("run detail only treats an explicit complete flag as complete statistics", 
   const source = await read("../src/views/perf-testing/PerfRunDetail.vue");
   assert.match(source, /latest_metrics\?\.complete === true/);
   assert.match(source, /"旧版未记录"/);
+  assert.match(source, /run\.snapshot\?\.connect_timeout_seconds != null/);
+  assert.match(source, /run\.snapshot\?\.read_timeout_seconds != null/);
+  assert.match(source, /<template v-else>未记录<\/template>/);
   assert.doesNotMatch(source, /final_seq != null/);
 });
 

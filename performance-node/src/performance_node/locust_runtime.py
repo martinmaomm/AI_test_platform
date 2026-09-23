@@ -1,4 +1,4 @@
-"""Frozen schema-v3 request runtime; safe to import outside Locust/gevent."""
+"""Frozen schema-v4 request runtime; safe to import outside Locust/gevent."""
 from __future__ import annotations
 
 import hashlib
@@ -26,6 +26,49 @@ COMPARATORS = ('eq', 'ne', 'contains', 'not_contains', 'gt', 'ge', 'lt', 'le',
                'type', 'length', 'length_gt', 'exists')
 FORBIDDEN_HEADERS = {'host', 'content-length', 'transfer-encoding', 'connection',
                      'proxy-authorization', 'proxy-connection'}
+
+_NETWORK_EXCEPTION_KINDS = {
+    'ConnectTimeout': ('connect_timeout', '连接超时'),
+    'ConnectTimeoutError': ('connect_timeout', '连接超时'),
+    'ReadTimeout': ('read_timeout', '读取响应超时'),
+    'ReadTimeoutError': ('read_timeout', '读取响应超时'),
+    'NameResolutionError': ('dns_error', 'DNS 解析失败'),
+    'SSLError': ('tls_error', 'TLS 连接失败'),
+}
+_SAFE_NETWORK_EXCEPTION_NAMES = {
+    'BrokenPipeError', 'ChunkedEncodingError', 'ConnectionError', 'ConnectionResetError',
+    'ContentDecodingError', 'HTTPError', 'MaxRetryError', 'NetworkError',
+    'NewConnectionError', 'OSError', 'PoolError', 'ProtocolError', 'ProxyError',
+    'ReadTimeout', 'ReadTimeoutError', 'RemoteDisconnected', 'RequestException',
+    'ResponseError', 'SSLError', 'Timeout', 'TooManyRedirects',
+}
+
+
+def classify_network_exception(exc):
+    """Classify requests/urllib3 failures without importing either library."""
+    pending = [exc]
+    seen = set()
+    names = []
+    while pending and len(seen) < 20:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        name = type(current).__name__
+        if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', name):
+            names.append(name)
+        for linked in (getattr(current, '__cause__', None), getattr(current, '__context__', None)):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+        pending.extend(item for item in getattr(current, 'args', ()) if isinstance(item, BaseException))
+    for expected in ('ReadTimeout', 'ReadTimeoutError', 'ConnectTimeout', 'ConnectTimeoutError',
+                     'NameResolutionError', 'SSLError'):
+        if expected in names:
+            error_type, label = _NETWORK_EXCEPTION_KINDS[expected]
+            return error_type, f'{label}（{expected}）'
+    safe_name = next((name for name in names if name in _SAFE_NETWORK_EXCEPTION_NAMES),
+                     'NetworkError')
+    return 'connection_error', f'网络连接失败（{safe_name}）'
 
 
 class ReportSequence:
@@ -148,10 +191,11 @@ def _validate_assertion(assertion):
 def validate_snapshot(value):
     fields = {'schema_version', 'run_id', 'nodes', 'engine_version', 'plan_name', 'base_url',
               'allowed_methods', 'mode', 'users', 'spawn_rate',
-              'duration_seconds', 'wait_seconds', 'variables', 'unique_variables', 'steps'}
+              'duration_seconds', 'wait_seconds', 'connect_timeout_seconds',
+              'read_timeout_seconds', 'variables', 'unique_variables', 'steps'}
     if type(value) is not dict or set(value) != fields:
         raise ValueError('运行快照字段无效')
-    if type(value['schema_version']) is not int or value['schema_version'] != 3 or value['engine_version'] != ENGINE_VERSION:
+    if type(value['schema_version']) is not int or value['schema_version'] != 4 or value['engine_version'] != ENGINE_VERSION:
         raise ValueError('运行快照版本不匹配')
     if type(value['run_id']) is not str or str(uuid.UUID(value['run_id'])) != value['run_id']:
         raise ValueError('运行身份无效')
@@ -164,6 +208,11 @@ def validate_snapshot(value):
         number = value[key]
         if type(number) not in (int, float) or not math.isfinite(number) or not low <= number <= high or (integer and type(number) is not int):
             raise ValueError('运行负载参数无效')
+    for key, low, high in (('connect_timeout_seconds', 1, 60),
+                           ('read_timeout_seconds', 1, 120)):
+        number = value[key]
+        if type(number) is not int or not low <= number <= high:
+            raise ValueError('请求超时参数无效')
     if value['mode'] == 'validation' and (value['users'] != 1 or value['spawn_rate'] != 1):
         raise ValueError('验证模式必须为单用户')
     nodes = value['nodes']
@@ -848,7 +897,9 @@ def main():
                     start_time=time.time(),
                 )
                 return False, {}
-            request_options = {'params': query, 'headers': headers, 'timeout': (3, 5),
+            request_options = {'params': query, 'headers': headers,
+                               'timeout': (snapshot['connect_timeout_seconds'],
+                                           snapshot['read_timeout_seconds']),
                                'stream': True, 'allow_redirects': False, 'catch_response': True}
             if step['body_type'] == 'json':
                 request_options['json'] = body
@@ -865,11 +916,13 @@ def main():
                     payload = bytearray()
                     status_code = getattr(result, 'status_code', None)
                     network_failure = None
-                    if getattr(result, 'error', None) is not None or type(status_code) is not int or status_code <= 0:
+                    result_error = getattr(result, 'error', None)
+                    if result_error is not None or type(status_code) is not int or status_code <= 0:
+                        error_type, message = classify_network_exception(result_error)
                         network_failure = {'step_index': step_index, 'step_name': step['name'],
                             'phase': step['phase'], 'check': 'network', 'comparator': 'eq',
                             'expected': 'success', 'actual': 'request_failed',
-                            'error_type': 'network_error', 'message': '连接失败或请求超时'}
+                            'error_type': error_type, 'message': message}
                     try:
                         if network_failure is None:
                             for chunk in result.iter_content(65536):
@@ -880,11 +933,12 @@ def main():
                                         'expected': MAX_RESPONSE_BYTES, 'actual': len(payload),
                                         'error_type': 'response_too_large', 'message': '响应内容超过 1 MiB 限制'}
                                     break
-                    except RequestException:
+                    except RequestException as exc:
+                        error_type, message = classify_network_exception(exc)
                         network_failure = {'step_index': step_index, 'step_name': step['name'],
                             'phase': step['phase'], 'check': 'network', 'comparator': 'eq',
                             'expected': 'success', 'actual': 'read_failed',
-                            'error_type': 'network_error', 'message': '读取响应失败或超时'}
+                            'error_type': error_type, 'message': message}
                     network_elapsed = (time.perf_counter() - started) * 1000
                     result.request_meta['response_time'] = network_elapsed
                     result.request_meta['response_length'] = min(len(payload), MAX_RESPONSE_BYTES)
@@ -920,10 +974,11 @@ def main():
                         return False, {}
                     result.success()
                     return True, extracted
-            except RequestException:
+            except RequestException as exc:
+                error_type, message = classify_network_exception(exc)
                 failed = {'step_index': step_index, 'step_name': step['name'], 'phase': step['phase'],
                     'check': 'network', 'comparator': 'eq', 'expected': 'success', 'actual': 'request_failed',
-                    'error_type': 'network_error', 'message': '请求失败或超时'}
+                    'error_type': error_type, 'message': message}
                 add_failures([failed])
                 trace.finish_step(step_index, step, failures=[failed], elapsed=(time.perf_counter() - started) * 1000)
                 return False, {}

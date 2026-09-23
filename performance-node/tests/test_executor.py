@@ -25,7 +25,7 @@ from performance_node.locust_runtime import canonical_sha256, validate_snapshot
 
 def make_snapshot(run_id: str, node_id: str) -> dict:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_id": run_id,
         "nodes": [{"node_id": node_id, "users": 1, "validation_key": "a" * 64}],
         "engine_version": "2.43.3",
@@ -37,6 +37,8 @@ def make_snapshot(run_id: str, node_id: str) -> dict:
         "spawn_rate": 1,
         "duration_seconds": 5,
         "wait_seconds": 0.1,
+        "connect_timeout_seconds": 10,
+        "read_timeout_seconds": 30,
         "variables": {},
         "unique_variables": [],
         "steps": [{

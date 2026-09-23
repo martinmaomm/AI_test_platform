@@ -86,6 +86,8 @@ class PerformanceManagementAPITests(TestCase):
             'spawn_rate': 1,
             'duration_seconds': 30,
             'wait_seconds': 1,
+            'connect_timeout_seconds': 10,
+            'read_timeout_seconds': 30,
             'variables': {},
             'unique_variables': [],
             'steps': [{
@@ -103,6 +105,8 @@ class PerformanceManagementAPITests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data['data']['phase'], 'execution')
         self.assertFalse(response.data['data']['execution_enabled'])
+        self.assertEqual(response.data['data']['limits']['max_connect_timeout_seconds'], 60)
+        self.assertEqual(response.data['data']['limits']['max_read_timeout_seconds'], 120)
 
         self.auth(self.outsider)
         self.assertEqual(self.client.get(self.path('config/')).status_code, 404)
@@ -189,10 +193,14 @@ class PerformanceManagementAPITests(TestCase):
         payload.pop('spawn_rate')
         payload.pop('duration_seconds')
         payload.pop('wait_seconds')
+        payload.pop('connect_timeout_seconds')
+        payload.pop('read_timeout_seconds')
         created = self.client.post(self.path('plans/'), payload, format='json')
         self.assertEqual(created.status_code, 201, created.data)
         self.assertEqual(created.data['data']['users'], 1)
         self.assertEqual(created.data['data']['duration_seconds'], 30)
+        self.assertEqual(created.data['data']['connect_timeout_seconds'], 10)
+        self.assertEqual(created.data['data']['read_timeout_seconds'], 30)
 
         self.auth(self.viewer)
         self.assertEqual(self.client.get(self.path('plans/')).status_code, 200)
@@ -221,12 +229,46 @@ class PerformanceManagementAPITests(TestCase):
             lambda item: item.update(users=True),
             lambda item: item.update(users='2'),
             lambda item: item.update(target_id=True),
+            lambda item: item.update(connect_timeout_seconds=True),
+            lambda item: item.update(connect_timeout_seconds=1.5),
+            lambda item: item.update(connect_timeout_seconds=0),
+            lambda item: item.update(connect_timeout_seconds=61),
+            lambda item: item.update(read_timeout_seconds=False),
+            lambda item: item.update(read_timeout_seconds=30.5),
+            lambda item: item.update(read_timeout_seconds=0),
+            lambda item: item.update(read_timeout_seconds=121),
             lambda item: item['steps'][0].update(python='print(1)'),
         ):
             payload = self.valid_plan(own_target)
             mutation(payload)
             response = self.client.post(self.path('plans/'), payload, format='json')
             self.assertEqual(response.status_code, 400, response.data)
+
+    def test_plan_request_timeouts_round_trip_and_partial_patch_preserves_them(self):
+        target = self.create_target()
+        self.auth(self.editor)
+        payload = self.valid_plan(target)
+        payload['connect_timeout_seconds'] = 17
+        payload['read_timeout_seconds'] = 91
+        created = self.client.post(self.path('plans/'), payload, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        plan_id = created.data['data']['id']
+        self.assertEqual(created.data['data']['connect_timeout_seconds'], 17)
+        self.assertEqual(created.data['data']['read_timeout_seconds'], 91)
+
+        updated = self.client.patch(
+            self.path(f'plans/{plan_id}/'), {'description': '只修改说明'}, format='json',
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(updated.data['data']['connect_timeout_seconds'], 17)
+        self.assertEqual(updated.data['data']['read_timeout_seconds'], 91)
+        plan = PerformancePlan.objects.get(pk=plan_id)
+        self.assertEqual((plan.connect_timeout_seconds, plan.read_timeout_seconds), (17, 91))
+
+        detail = self.client.get(self.path(f'plans/{plan_id}/'))
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data['data']['connect_timeout_seconds'], 17)
+        self.assertEqual(detail.data['data']['read_timeout_seconds'], 91)
 
     def test_v2_plan_data_flow_body_types_and_assertions_are_strict(self):
         target = self.create_target(methods=['GET', 'POST'])

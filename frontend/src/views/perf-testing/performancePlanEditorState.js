@@ -1,6 +1,10 @@
 let sequence = 0;
 const nextId = (kind) => `perf-${kind}-${++sequence}`;
 const text = (value) => (value == null ? "" : String(value));
+export const DEFAULT_CONNECT_TIMEOUT_SECONDS = 10;
+export const DEFAULT_READ_TIMEOUT_SECONDS = 30;
+export const MAX_CONNECT_TIMEOUT_SECONDS = 60;
+export const MAX_READ_TIMEOUT_SECONDS = 120;
 const headerToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const controlCharacter = /[\x00-\x1f\x7f]/;
 const dangerousHeader =
@@ -246,3 +250,37 @@ export const previewStepUrl = (target, step) =>
   target?.base_url
     ? `${target.base_url.replace(/\/$/, "")}${joinPathAndQuery(step.path || "/", step.query)}`
     : "请选择压测目标后预览最终 URL";
+
+const validTimeout = (value, maximum) =>
+  typeof value === "number" &&
+  Number.isInteger(value) &&
+  value >= 1 &&
+  value <= maximum;
+
+export const normalizePlanRequestTimeouts = (source = {}) => ({
+  connect_timeout_seconds: validTimeout(
+    source.connect_timeout_seconds,
+    MAX_CONNECT_TIMEOUT_SECONDS,
+  )
+    ? source.connect_timeout_seconds
+    : DEFAULT_CONNECT_TIMEOUT_SECONDS,
+  read_timeout_seconds: validTimeout(
+    source.read_timeout_seconds,
+    MAX_READ_TIMEOUT_SECONDS,
+  )
+    ? source.read_timeout_seconds
+    : DEFAULT_READ_TIMEOUT_SECONDS,
+});
+
+export const validatePlanRequestTimeouts = (source = {}, limits = {}) => {
+  const connectMaximum = limits.max_connect_timeout_seconds ?? MAX_CONNECT_TIMEOUT_SECONDS;
+  const readMaximum = limits.max_read_timeout_seconds ?? MAX_READ_TIMEOUT_SECONDS;
+  return {
+    connect_timeout_seconds: validTimeout(source.connect_timeout_seconds, connectMaximum)
+      ? ""
+      : `连接建立等待必须是 1 到 ${connectMaximum} 的整数秒。`,
+    read_timeout_seconds: validTimeout(source.read_timeout_seconds, readMaximum)
+      ? ""
+      : `响应读取等待必须是 1 到 ${readMaximum} 的整数秒。`,
+  };
+};

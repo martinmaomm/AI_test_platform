@@ -100,8 +100,24 @@
       />
       <div class="metrics">
         <div v-for="item in metricCards" :key="item.label" class="metric-card">
-          <span>{{ item.label }}</span
-          ><strong>{{ item.value }}</strong>
+          <div class="metric-label-row">
+            <span>{{ item.label }}</span>
+            <el-tooltip
+              :content="`${item.help} ${metricScopeText}`"
+              :trigger="['hover', 'focus']"
+              :popper-style="{ maxWidth: '320px', lineHeight: '1.6' }"
+              placement="top"
+            >
+              <button
+                type="button"
+                class="metric-help"
+                :aria-label="`查看${item.label}说明`"
+              >
+                <el-icon aria-hidden="true"><QuestionFilled /></el-icon>
+              </button>
+            </el-tooltip>
+          </div>
+          <strong>{{ item.value }}</strong>
         </div>
       </div>
       <h3>指标趋势</h3>
@@ -292,6 +308,7 @@ import {
   TooltipComponent,
 } from "echarts/components";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { QuestionFilled } from "@element-plus/icons-vue";
 import { useAuthStore } from "@/stores/auth";
 import { useProjectStore } from "@/stores/project";
 import { getProject } from "@/api/projects";
@@ -386,17 +403,47 @@ const nodeNames = computed(() => {
   const names = runNodes.value.map(performanceRunNodeName);
   return names.length ? names.join("、") : run.value?.node_name || "-";
 });
+const metricScopeText = computed(() =>
+  selectedNode.value
+    ? "统计范围：当前选中节点，数据截至最近一次上报。"
+    : "统计范围：全部参与节点汇总，数据截至最近一次上报。",
+);
 const metricCards = computed(() => [
-  { label: "请求数", value: displayMetrics.value.requests ?? "-" },
-  { label: "失败数", value: displayMetrics.value.failures ?? "-" },
-  { label: "平均 RPS", value: formatMetric(displayMetrics.value.rps) },
-  { label: "错误率", value: formatErrorRate(displayMetrics.value.error_rate) },
+  {
+    label: "请求数",
+    value: displayMetrics.value.requests ?? "-",
+    help: "累计记录的请求尝试次数，包括成功和失败，准备步骤与主步骤均计入。发送前的变量处理失败也会计入，未执行的步骤不计入。",
+  },
+  {
+    label: "失败数",
+    value: displayMetrics.value.failures ?? "-",
+    help: "累计判定失败的请求次数，包括网络、超时、断言和变量处理等失败。同一请求即使多项断言失败，也只计一次。",
+  },
+  {
+    label: "平均 RPS",
+    value: formatMetric(displayMetrics.value.rps),
+    help: "累计请求数 ÷ 本轮已运行秒数，表示平均每秒请求数，包含失败请求；不是最近一秒的瞬时请求量。",
+  },
+  {
+    label: "错误率",
+    value: formatErrorRate(displayMetrics.value.error_rate),
+    help: "失败请求数占请求总数的百分比，即失败数 ÷ 请求数 × 100%。按请求次数计算，不是失败断言的占比。",
+  },
   {
     label: "平均响应(ms)",
     value: formatMetric(displayMetrics.value.avg_response_time),
+    help: "已记录的成功和失败请求耗时的平均值，包含等待和读取响应，不包含步骤间等待。单位为毫秒，1000ms = 1 秒；多节点按请求样本汇总计算。",
   },
-  { label: "P95(ms)", value: formatMetric(displayMetrics.value.p95) },
-  { label: "P99(ms)", value: formatMetric(displayMetrics.value.p99) },
+  {
+    label: "P95(ms)",
+    value: formatMetric(displayMetrics.value.p95),
+    help: "约 95% 的已记录请求耗时不超过该值，单位为毫秒。例如 200ms 表示约 95% 的请求耗时不超过 200 毫秒。该值根据分桶后的耗时分布估算。",
+  },
+  {
+    label: "P99(ms)",
+    value: formatMetric(displayMetrics.value.p99),
+    help: "约 99% 的已记录请求耗时不超过该值，单位为毫秒，用于观察最慢的一小部分请求。该值根据分桶后的耗时分布估算，不是最大响应时间。",
+  },
   {
     label: "虚拟用户",
     value: selectedNode.value
@@ -404,6 +451,7 @@ const metricCards = computed(() => [
       : ["incomplete", "failed"].includes(run.value?.status)
         ? "未知"
         : (displayMetrics.value.users ?? "-"),
+    help: "最近一次统计时仍在运行的虚拟用户数，不是计划目标用户数或累计用户数。结束后通常为 0，无法确认时显示“未知”。",
   },
 ]);
 const trendOption = computed(() => ({
@@ -616,6 +664,32 @@ onBeforeUnmount(() => {
 }
 .metric-card strong {
   font-size: 20px;
+}
+.metric-label-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.metric-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--app-text-muted);
+  cursor: help;
+  font-size: 14px;
+}
+.metric-help:hover,
+.metric-help:focus-visible {
+  color: var(--el-color-primary);
+}
+.metric-help:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 2px;
 }
 .trend {
   height: 280px;

@@ -31,4 +31,28 @@ docker pull <固定索引摘要> && docker image tag <固定索引摘要> <仓�
 
 ## 发布与启用
 
-公开版本标签和本机接口回读结果在实际启用后补充。
+已公开发布：
+
+```text
+docker.io/martinmao9/performance-node:0.4.1
+```
+
+版本标签指向原多架构索引，保持为：
+
+```text
+docker.io/martinmao9/performance-node@sha256:1c21a293a3972c33d6d2a2dc268df397b48603af167b38a7b7b235c106da4a9d
+```
+
+使用现有 0.4.1 的两种架构镜像及发行目录重新执行发布工具，复用已有镜像与归档。固定索引、两个平台匿名拉取、版本标签的认证及匿名回读均通过；manifest 只增加 `registry_version_ref`，原索引、架构元数据、归档哈希及固定运行时哈希完全不变。
+
+主工作区从 `ea53d19` 快进至 `61caaa0`。切换前确认无活动压测，Celery active/reserved/scheduled 均为空；保存旧 manifest、前端构建及数据摘要。先同步前端、重启后端，使新旧 manifest 的安装读取兼容生效，再公开补发版本标签。没有执行数据库迁移，没有重启控制器、Celery 或 Caddy。
+
+实际验收结果：
+
+- 四项服务均运行且健康，性能控制器在线。
+- 平台配置与两个真实节点的安装 GET 接口均可用，显示 `image_tag=...:0.4.1`，`image_ref` 仍为上述固定摘要；GET 没有返回注册命令或凭据。
+- 实际 Vite 响应包含新的版本标签展示与完整命令说明；按 UTF-8 解码核对，避免 JavaScript 响应未声明 charset 导致测试工具误读中文。
+- Run、参与记录、计划、节点身份字段和原公共 CA 的切换前后摘要一致，活动运行仍为 0。
+- 三个浏览器压缩包保持未跟踪，未修改、未提交。
+
+只读基线、发布输出、验收摘要及脱敏截图保存在 Git 忽略目录 `backend/temp/performance-image-tags-rollout/`。真实节点容器不受影响，已存在的远端镜像不会因平台更新自动获得标签；之后生成并执行的安装命令会自动添加本地版本标签。

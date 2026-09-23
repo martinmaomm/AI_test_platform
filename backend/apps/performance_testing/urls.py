@@ -20,6 +20,9 @@ from .discovery_views import (
     PerformanceDiscoveryRecordsView,
     PerformanceDiscoveryRetryView,
 )
+from .analysis_views import (
+    PerformanceAnalysisDetailView, PerformanceAnalysisListCreateView,
+)
 
 
 app_name = 'performance_testing'
@@ -41,6 +44,14 @@ urlpatterns = [
     path('plans/<int:pk>/node-eligibility/', PerformanceNodeEligibilityView.as_view(), name='node-eligibility'),
     path('plans/<int:pk>/', PlanDetailView.as_view(), name='plan-detail'),
     path('runs/', PerformanceRunListView.as_view(), name='run-list'),
+    path(
+        'runs/<uuid:run_id>/analyses/', PerformanceAnalysisListCreateView.as_view(),
+        name='analysis-list-create',
+    ),
+    path(
+        'runs/<uuid:run_id>/analyses/<uuid:analysis_id>/',
+        PerformanceAnalysisDetailView.as_view(), name='analysis-detail',
+    ),
     path('runs/<uuid:run_id>/stop/', PerformanceRunStopView.as_view(), name='run-stop'),
     path('runs/<uuid:run_id>/', PerformanceRunDetailView.as_view(), name='run-detail'),
     path('nodes/', NodeListCreateView.as_view(), name='node-list'),

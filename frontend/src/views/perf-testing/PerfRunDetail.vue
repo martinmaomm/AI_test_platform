@@ -289,6 +289,13 @@
             label="诊断"
             min-width="180" /></el-table
       ></template>
+      <PerformanceRunAnalysis
+        :project-id="projectId"
+        :run-id="runId"
+        :run="run"
+        :can-report="canReport"
+        :can-execute="canExecute"
+      />
     </template>
   </section>
 </template>
@@ -296,6 +303,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PerformanceValidationSteps from "./PerformanceValidationSteps.vue";
+import PerformanceRunAnalysis from "./PerformanceRunAnalysis.vue";
 import { useRoute, useRouter } from "vue-router";
 import dayjs from "dayjs";
 import VChart from "vue-echarts";

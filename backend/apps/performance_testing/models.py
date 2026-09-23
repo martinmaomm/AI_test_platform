@@ -261,6 +261,58 @@ class PerformanceRunNode(models.Model):
         ]
 
 
+class PerformanceAnalysis(models.Model):
+    class Status(models.TextChoices):
+        QUEUED = 'queued', 'Queued'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    ACTIVE_STATUSES = (Status.QUEUED, Status.RUNNING)
+    TERMINAL_STATUSES = (Status.COMPLETED, Status.FAILED)
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(
+        PerformanceRun, on_delete=models.CASCADE, related_name='analyses',
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_performance_analyses',
+    )
+    request_id = models.UUIDField()
+    request_hash = models.CharField(max_length=64, editable=False)
+    model_config_id = models.PositiveBigIntegerField(editable=False)
+    model_info = models.JSONField(default=dict, editable=False)
+    targets = models.JSONField(default=dict, blank=True, editable=False)
+    input_snapshot = models.JSONField(default=dict, blank=True, editable=False)
+    result = models.JSONField(null=True, blank=True, editable=False)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.QUEUED,
+    )
+    error_code = models.CharField(max_length=64, blank=True, default='')
+    error_message = models.CharField(max_length=500, blank=True, default='')
+    celery_task_id = models.CharField(max_length=64, blank=True, default='', editable=False)
+    queued_deadline_at = models.DateTimeField(editable=False)
+    running_deadline_at = models.DateTimeField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'performance_analyses'
+        ordering = ('-created_at', '-id')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('run', 'request_id'), name='perf_analysis_run_request_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=('run', 'status', 'created_at'), name='perf_analysis_run_status',
+            ),
+        ]
+
+
 class PerformanceControllerState(models.Model):
     id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
     owner_id = models.CharField(max_length=200, blank=True, default='')

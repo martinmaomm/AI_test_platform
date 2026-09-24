@@ -57,6 +57,62 @@ class PerformanceRunContractTests(TestCase):
         run.save(update_fields=['latest_metrics'])
         self.assertEqual(self.client.get(detail_path).data['data']['validation_steps'], [])
 
+    def test_throughput_is_derived_only_on_run_and_node_details(self):
+        run = self._direct_run(
+            mode=PerformanceRun.Mode.LOAD,
+            status=PerformanceRun.Status.COMPLETED,
+            latest_metrics={
+                'requests': 50, 'rps': 10, 'elapsed_seconds': 5,
+                'entries': [{'method': 'GET', 'name': '/items', 'requests': 25}],
+            },
+            metrics_samples=[
+                {'timestamp': '2026-09-24T00:00:00Z', 'metrics': {
+                    'requests': 0, 'elapsed_seconds': 0,
+                }},
+                {'timestamp': '2026-09-24T00:00:02Z', 'metrics': {
+                    'requests': 20, 'elapsed_seconds': 2,
+                }},
+                {'timestamp': '2026-09-24T00:00:05Z', 'metrics': {
+                    'requests': 50, 'elapsed_seconds': 5,
+                }},
+            ],
+        )
+        participant = run.participants.get()
+        participant.latest_metrics = {
+            'requests': 50, 'rps': 10,
+            'entries': [{'method': 'GET', 'name': '/items', 'requests': 25}],
+        }
+        participant.metrics_samples = [
+            {'timestamp': '2026-09-24T00:00:02Z', 'metrics': {
+                'requests': 20, 'rps': 10,
+            }},
+            {'timestamp': '2026-09-24T00:00:05Z', 'metrics': {
+                'requests': 50, 'rps': 10,
+            }},
+        ]
+        participant.save(update_fields=('latest_metrics', 'metrics_samples'))
+
+        self.client.force_authenticate(self.executor)
+        detail = self.client.get(self._path(f'runs/{run.pk}/'))
+        self.assertEqual(detail.status_code, 200, detail.data)
+        throughput = detail.data['data']['throughput']
+        self.assertEqual(throughput['average_rps'], 10.0)
+        self.assertEqual(throughput['peak_interval_rps'], 10.0)
+        self.assertEqual(throughput['valid_intervals'], 2)
+        self.assertEqual(throughput['endpoint_rps'], [5.0])
+        self.assertEqual(len(throughput['intervals']), 3)
+        node_throughput = detail.data['data']['nodes'][0]['throughput']
+        self.assertEqual(node_throughput['peak_interval_rps'], 10.0)
+        self.assertEqual(node_throughput['endpoint_rps'], [5.0])
+
+        listing = self.client.get(self._path('runs/'))
+        listed = next(
+            item for item in listing.data['data']['items']
+            if item['id'] == str(run.pk)
+        )
+        self.assertNotIn('throughput', listed)
+        self.assertNotIn('throughput', listed['nodes'][0])
+
     def setUp(self):
         self.client = APIClient()
         self.admin = User.objects.create_user(

@@ -80,7 +80,7 @@
             :precision="2"
             controls-position="right"
         /></el-form-item>
-        <el-form-item label="RPS 下限（可选）"
+        <el-form-item label="平均请求吞吐量下限（次/秒，可选）"
           ><el-input-number
             v-model="targets.rps_min"
             :min="0"
@@ -209,7 +209,7 @@
                 v-for="item in findingEvidence(finding)"
                 :key="item.id"
                 >{{ evidenceLabel(item) }}：{{ displayEvidenceValue(item.value)
-                }}{{ item.unit || "" }}；</span
+                }}{{ evidenceUnit(item) }}；</span
               >
             </p>
           </div>
@@ -231,7 +231,7 @@
                   ><el-table-column label="值" min-width="220"
                     ><template #default="{ row }"
                       >{{ displayEvidenceValue(row.value) }}
-                      {{ row.unit || "" }}</template
+                      {{ evidenceUnit(row) }}</template
                     ></el-table-column
                   ></el-table
                 ></el-collapse-item
@@ -271,6 +271,8 @@ import {
   analysisModelTimeoutSeconds,
   analysisRecord,
   analysisElapsedSeconds,
+  analysisEvidenceLabel,
+  analysisEvidenceUnit,
   analysisPhaseLabel,
   analysisProgress,
   analysisRetryDescription,
@@ -430,7 +432,7 @@ const findingKindType = (value) =>
   ({ observation: "success", hypothesis: "warning" })[value] || "info";
 const evidenceLabel = (item = {}) => {
   const match = /^(endpoint|node)\.(\d+)$/.exec(String(item.id || ""));
-  if (!match) return item.label || item.id || "-";
+  if (!match) return analysisEvidenceLabel(item);
   const index = Number(match[2]) - 1;
   const source =
     match[1] === "endpoint"
@@ -444,6 +446,7 @@ const evidenceLabel = (item = {}) => {
     ? `${item.label || item.id}（${localName}）`
     : item.label || item.id;
 };
+const evidenceUnit = (item) => analysisEvidenceUnit(item);
 const findingEvidence = (finding = {}) =>
   (Array.isArray(finding.evidence_ids) ? finding.evidence_ids : [])
     .map((id) => evidenceById.value.get(String(id)))

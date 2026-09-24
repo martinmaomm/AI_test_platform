@@ -619,12 +619,18 @@ class PerformanceRunNodeListSerializer(serializers.ModelSerializer):
 
 class PerformanceRunNodeDetailSerializer(PerformanceRunNodeListSerializer):
     validation_run_id = serializers.UUIDField(read_only=True, allow_null=True)
+    throughput = serializers.SerializerMethodField()
+
+    def get_throughput(self, obj):
+        from .throughput import derive_throughput
+        return derive_throughput(obj.latest_metrics, obj.metrics_samples)
 
     class Meta(PerformanceRunNodeListSerializer.Meta):
         fields = PerformanceRunNodeListSerializer.Meta.fields + (
             'node_agent_version', 'node_protocol_version', 'node_engine_version',
             'validation_key', 'validation_run_id', 'node_report_seq', 'ready_at',
             'started_at', 'stopped_at', 'last_command_at', 'metrics_samples',
+            'throughput',
         )
 
 
@@ -690,6 +696,11 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
 
 class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
     validation_steps = serializers.SerializerMethodField()
+    throughput = serializers.SerializerMethodField()
+
+    def get_throughput(self, obj):
+        from .throughput import derive_throughput
+        return derive_throughput(obj.latest_metrics, obj.metrics_samples)
 
     def get_validation_steps(self, obj):
         if obj.mode != PerformanceRun.Mode.VALIDATION:
@@ -701,4 +712,6 @@ class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
         return PerformanceRunNodeDetailSerializer(self._participants(obj), many=True).data
 
     class Meta(PerformanceRunListSerializer.Meta):
-        fields = PerformanceRunListSerializer.Meta.fields + ('metrics_samples', 'snapshot', 'validation_steps')
+        fields = PerformanceRunListSerializer.Meta.fields + (
+            'metrics_samples', 'snapshot', 'validation_steps', 'throughput',
+        )

@@ -141,6 +141,11 @@
         :option="trendOption"
         autoresize
       /><el-empty v-else description="尚无指标采样" />
+      <p class="throughput-note">
+        区间吞吐量 = 相邻有效采样请求增量 ÷
+        时间增量；峰值仅来自当前保留的采样区间。长时间运行最多保留最近 400
+        个采样点。
+      </p>
       <h3>接口明细</h3>
       <el-table :data="metricEntries(displayMetrics)"
         ><el-table-column
@@ -170,6 +175,10 @@
         ><el-table-column label="P99(ms)" width="100"
           ><template #default="{ row }">{{
             formatMetric(row.p99)
+          }}</template></el-table-column
+        ><el-table-column label="平均吞吐量(次/秒)" min-width="150"
+          ><template #default="{ $index }">{{
+            formatMetric(endpointThroughput(selectedThroughput, $index))
           }}</template></el-table-column
         ></el-table
       >
@@ -208,6 +217,11 @@
           <el-table-column label="P95(ms)" width="100"
             ><template #default="{ row }">{{
               formatMetric(row.latest_metrics?.p95)
+            }}</template></el-table-column
+          >
+          <el-table-column label="平均吞吐量(次/秒)" min-width="150"
+            ><template #default="{ row }">{{
+              formatMetric(throughputValue(row.throughput, "average_rps"))
             }}</template></el-table-column
           >
           <el-table-column label="Worker CPU / RSS" min-width="150"
@@ -329,6 +343,7 @@ import {
   canStopPerformanceRun,
   completedWithFailures,
   displayEvidenceValue,
+  endpointThroughput,
   failureSamples,
   formatErrorRate,
   formatMetric,
@@ -341,6 +356,9 @@ import {
   readLoadSelection,
   samePerformanceRunScope,
   sampleMetrics,
+  throughputIntervals,
+  throughputSeries,
+  throughputValue,
   validationStatusLabel,
   validationStatusType,
 } from "./performanceExecutionState";
@@ -399,6 +417,17 @@ const samples = computed(() =>
   ),
 );
 const metrics = computed(() => run.value?.latest_metrics || {});
+const selectedThroughput = computed(() =>
+  selectedNode.value
+    ? selectedNode.value.throughput || {}
+    : run.value?.throughput || {},
+);
+const intervalThroughput = computed(() =>
+  throughputSeries(samples.value, selectedThroughput.value),
+);
+const intervalSeconds = computed(() =>
+  throughputIntervals(selectedThroughput.value),
+);
 const failureEvidence = computed(() => {
   const all = failureSamples(metrics.value);
   return selectedNodeId.value
@@ -428,9 +457,18 @@ const metricCards = computed(() => [
     help: "累计判定失败的请求次数，包括网络、超时、断言和变量处理等失败。同一请求即使多项断言失败，也只计一次。",
   },
   {
-    label: "平均 RPS",
-    value: formatMetric(displayMetrics.value.rps),
-    help: "累计请求数 ÷ 本轮已运行秒数，表示平均每秒请求数，包含失败请求；不是最近一秒的瞬时请求量。",
+    label: "平均请求吞吐量（次/秒）",
+    value: formatMetric(
+      throughputValue(selectedThroughput.value, "average_rps"),
+    ),
+    help: "累计请求数 ÷ 本轮已运行秒数，表示平均每秒请求数，即 RPS。计入失败请求、准备步骤和渲染失败；不是最近一秒的瞬时值。",
+  },
+  {
+    label: "采样区间峰值（次/秒）",
+    value: formatMetric(
+      throughputValue(selectedThroughput.value, "peak_interval_rps"),
+    ),
+    help: "区间吞吐量由相邻有效采样的请求增量除以时间增量得出。峰值仅来自当前保留的采样区间，不代表瞬时值或全程保证；至少需要两个采样点。",
   },
   {
     label: "错误率",
@@ -463,31 +501,59 @@ const metricCards = computed(() => [
   },
 ]);
 const trendOption = computed(() => ({
-  tooltip: { trigger: "axis", valueFormatter: (value) => formatMetric(value) },
-  legend: { data: ["平均 RPS", "失败数", "实际用户数", "P95(ms)"] },
+  tooltip: {
+    trigger: "axis",
+    formatter: (params) => {
+      const index = params?.[0]?.dataIndex;
+      const seconds = throughputValue(
+        intervalSeconds.value[index],
+        "interval_seconds",
+      );
+      const lines = params.map(
+        (item) =>
+          `${item.marker}${item.seriesName}：${formatMetric(item.value)}`,
+      );
+      if (seconds != null) lines.push(`采样区间：${formatMetric(seconds)} 秒`);
+      return [formatTime(samples.value[index]?.timestamp), ...lines].join(
+        "<br/>",
+      );
+    },
+  },
+  legend: {
+    data: ["平均吞吐量", "区间吞吐量", "失败数", "实际用户数", "P95(ms)"],
+  },
   grid: { left: 55, right: 135, top: 40, bottom: 32 },
   xAxis: {
     type: "category",
     data: samples.value.map((item) => item.timestamp || ""),
   },
   yAxis: [
-    { type: "value", name: "RPS" },
+    { type: "value", name: "次/秒" },
     { type: "value", name: "失败/用户数", position: "right" },
     { type: "value", name: "P95 (ms)", position: "right", offset: 58 },
   ],
   series: [
     {
-      name: "平均 RPS",
+      name: "平均吞吐量",
       type: "line",
-      smooth: true,
       yAxisIndex: 0,
-      data: samples.value.map((item) => sampleMetrics(item).rps ?? 0),
+      data: samples.value.map((item) =>
+        throughputValue(sampleMetrics(item), "rps"),
+      ),
+    },
+    {
+      name: "区间吞吐量",
+      type: "line",
+      yAxisIndex: 0,
+      data: intervalThroughput.value,
     },
     {
       name: "失败数",
       type: "line",
       yAxisIndex: 1,
-      data: samples.value.map((item) => sampleMetrics(item).failures ?? 0),
+      data: samples.value.map((item) =>
+        throughputValue(sampleMetrics(item), "failures"),
+      ),
     },
     {
       name: "实际用户数",
@@ -499,7 +565,9 @@ const trendOption = computed(() => ({
       name: "P95(ms)",
       type: "line",
       yAxisIndex: 2,
-      data: samples.value.map((item) => sampleMetrics(item).p95 ?? 0),
+      data: samples.value.map((item) =>
+        throughputValue(sampleMetrics(item), "p95"),
+      ),
     },
   ],
 }));
@@ -702,6 +770,11 @@ onBeforeUnmount(() => {
 .trend {
   height: 280px;
   width: 100%;
+}
+.throughput-note {
+  color: var(--app-text-muted);
+  font-size: 13px;
+  margin: 8px 0 18px;
 }
 @media (max-width: 760px) {
   .metrics {

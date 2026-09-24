@@ -111,7 +111,7 @@ export const analysisCheckLabel = (key) =>
   ({
     p95_ms: "P95 上限",
     error_rate_percent: "错误率上限",
-    rps_min: "RPS 下限",
+    rps_min: "平均请求吞吐量下限",
   })[key] ||
   key ||
   "-";
@@ -189,7 +189,9 @@ export const displayAnalysisValue = (value) => {
 const EVIDENCE_VALUE_LABELS = {
   requests: "请求数",
   failures: "失败数",
-  rps: "平均 RPS",
+  rps: "平均请求吞吐量",
+  peak_interval_rps: "采样区间峰值",
+  interval_seconds: "采样区间时长",
   avg_response_time: "平均响应时间",
   p95: "P95",
   p99: "P99",
@@ -201,6 +203,21 @@ const EVIDENCE_VALUE_LABELS = {
   peak_worker_cpu_percent: "Worker CPU 峰值",
   peak_worker_memory_mib: "Worker 内存峰值",
 };
+export const analysisEvidenceLabel = (evidence = {}) =>
+  ({
+    "overall.rps": "平均请求吞吐量",
+    "overall.peak_interval_rps": "采样区间峰值",
+    "trend.throughput": "采样区间吞吐量趋势",
+  })[evidence.id] ||
+  evidence.label ||
+  evidence.id ||
+  "-";
+export const analysisEvidenceUnit = (evidence = {}) =>
+  evidence.unit ||
+  { "overall.peak_interval_rps": "次/秒", "trend.throughput": "次/秒" }[
+    evidence.id
+  ] ||
+  "";
 export const displayEvidenceValue = (value) => {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return displayAnalysisValue(value);

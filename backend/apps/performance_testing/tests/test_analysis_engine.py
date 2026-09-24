@@ -10,8 +10,8 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from performance_testing.analysis_data import build_analysis_input
 from performance_testing.analysis_engine import (
-    AnalysisOutputError, MAX_OUTPUT_CHARS, generate_analysis, parse_analysis_output,
-    _stream_analysis_text,
+    AnalysisOutputError, MAX_OUTPUT_CHARS, SYSTEM_PROMPT, generate_analysis,
+    parse_analysis_output, _stream_analysis_text,
 )
 from .test_analysis_data import fixture_run
 
@@ -37,6 +37,11 @@ class AnalysisEngineTests(TestCase):
         self.assertEqual(result['assessment']['status'], 'not_configured')
         self.assertEqual(result['evidence'], self.payload['evidence'])
         self.assertTrue(all(value in result['limitations'] for value in self.payload['limitations']))
+
+    def test_prompt_distinguishes_interval_average_from_instantaneous_qps(self):
+        self.assertIn('trend.throughput', SYSTEM_PROMPT)
+        self.assertIn('不是瞬时 QPS', SYSTEM_PROMPT)
+        self.assertIn('被截断的更早历史', SYSTEM_PROMPT)
 
     def test_unknown_or_missing_evidence_references_reject_output(self):
         for refs in ([], ['database.cpu'], ['overall.p95', {}]):

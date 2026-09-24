@@ -36,15 +36,55 @@ class AnalysisEvidenceTests(TestCase):
     def evidence(self, payload, key):
         return next(item['value'] for item in payload['evidence'] if item['id'] == key)
 
+    def evidence_item(self, payload, key):
+        return next(item for item in payload['evidence'] if item['id'] == key)
+
     def test_only_allowlisted_statistics_leave_platform(self):
-        payload = build_analysis_input(fixture_run(), {})
+        run = fixture_run()
+        run.metrics_samples[0]['timestamp'] = 'secret://sensitive-sample-marker'
+        payload = build_analysis_input(run, {})
         encoded = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn('secret-', encoded)
         self.assertNotIn('Authorization', encoded)
         self.assertNotIn('/login', encoded)
+        self.assertNotIn('sensitive-sample-marker', encoded)
         self.assertEqual(self.evidence(payload, 'errors.samples'), {'read_timeout': 1})
         self.assertEqual(self.evidence(payload, 'endpoint.1')['method'], 'POST')
         self.assertEqual(payload['assessment']['status'], 'not_configured')
+
+    def test_throughput_evidence_uses_derived_average_intervals_and_endpoints(self):
+        run = fixture_run()
+        run.latest_metrics.update(
+            requests=30, rps=7.5, elapsed_seconds=4,
+            entries=[{
+                'name': '/private/path', 'method': 'GET', 'requests': 15,
+                'failures': 0,
+            }],
+        )
+        run.metrics_samples = [
+            {'timestamp': '2026-09-24T00:00:00Z', 'metrics': {
+                'requests': 0, 'elapsed_seconds': 0,
+            }},
+            {'timestamp': '2026-09-24T00:00:02Z', 'metrics': {
+                'requests': 10, 'elapsed_seconds': 2,
+            }},
+            {'timestamp': '2026-09-24T00:00:04Z', 'metrics': {
+                'requests': 30, 'elapsed_seconds': 4,
+            }},
+        ]
+
+        payload = build_analysis_input(run, {'rps_min': 7})
+        overall = self.evidence_item(payload, 'overall.rps')
+        self.assertEqual(overall['label'], '平均请求吞吐量')
+        self.assertEqual(overall['value'], 7.5)
+        self.assertEqual(self.evidence(payload, 'overall.peak_interval_rps'), 10.0)
+        self.assertEqual(self.evidence(payload, 'endpoint.1')['rps'], 3.75)
+        trend = self.evidence(payload, 'trend.throughput')
+        self.assertEqual([point['rps'] for point in trend], [None, 5.0, 10.0])
+        self.assertEqual([point['sample_index'] for point in trend], [1, 2, 3])
+        self.assertTrue(all('timestamp' not in point for point in trend))
+        self.assertEqual(payload['assessment']['checks'][0]['actual'], 7.5)
+        self.assertNotIn('/private/path', json.dumps(payload, ensure_ascii=False))
 
     def test_cpu_memory_and_peak_users_use_history_not_only_finished_zero(self):
         payload = build_analysis_input(fixture_run(), {})
@@ -113,7 +153,9 @@ class AnalysisEvidenceTests(TestCase):
         run.metrics_samples = [{'metrics': {'elapsed_seconds': i, 'users': i % 10, 'p95': i}} for i in range(400)]
         payload = build_analysis_input(run, {})
         points = self.evidence(payload, 'trend.overall')
+        throughput = self.evidence(payload, 'trend.throughput')
         self.assertEqual(len(points), 60)
+        self.assertEqual(len(throughput), 60)
         self.assertEqual(points[0]['elapsed_seconds'], 0)
         self.assertEqual(points[-1]['elapsed_seconds'], 399)
         self.assertEqual(len([x for x in payload['evidence'] if x['id'].startswith('endpoint.')]), 50)

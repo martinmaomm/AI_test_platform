@@ -112,9 +112,27 @@ export const formatErrorRate = (value) => {
     : "-";
 };
 export const formatMetric = (value) => {
+  if (value == null || value === "" || typeof value === "boolean") return "-";
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(2) : "-";
 };
+
+export const throughputValue = (throughput, key) => {
+  const value = throughput?.[key];
+  if (value == null || value === "" || typeof value === "boolean") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+};
+export const throughputIntervals = (throughput) =>
+  Array.isArray(throughput?.intervals) ? throughput.intervals : [];
+export const throughputSeries = (samples, throughput) => {
+  const intervals = throughputIntervals(throughput);
+  return metricSamples(samples).map((_, index) =>
+    throughputValue(intervals[index], "rps"),
+  );
+};
+export const endpointThroughput = (throughput, index) =>
+  throughputValue({ value: throughput?.endpoint_rps?.[index] }, "value");
 
 export const sortedNodeIds = (nodeIds = []) =>
   [...new Set(nodeIds.map(String))].sort((left, right) =>

@@ -82,7 +82,7 @@ test("analysis state reads wrapped history and safely displays evidence values",
 test("analysis presentation labels program conclusions and evidence in Chinese", () => {
   assert.equal(analysisCheckLabel("p95_ms"), "P95 上限");
   assert.equal(analysisCheckLabel("error_rate_percent"), "错误率上限");
-  assert.equal(analysisCheckLabel("rps_min"), "RPS 下限");
+  assert.equal(analysisCheckLabel("rps_min"), "平均请求吞吐量下限");
   assert.equal(analysisFindingKindLabel("observation"), "已观测");
   assert.equal(analysisFindingKindLabel("hypothesis"), "待验证推测");
   assert.equal(analysisSeverityLabel("critical"), "严重");

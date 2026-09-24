@@ -7,6 +7,8 @@ from collections import Counter
 from datetime import datetime
 import math
 
+from .throughput import derive_throughput
+
 
 MAX_ENDPOINTS = 50
 MAX_TREND_POINTS = 60
@@ -124,7 +126,9 @@ def evaluate_targets(targets, metrics, complete):
 
 def build_analysis_input(run, targets):
     latest = _dict(run.latest_metrics)
+    throughput = derive_throughput(latest, run.metrics_samples)
     metrics = _metrics(latest)
+    metrics['rps'] = throughput['average_rps']
     snapshot = _dict(run.snapshot)
     participants = list(run.participants.all())
     nodes_complete = bool(participants) and all(
@@ -134,7 +138,8 @@ def build_analysis_input(run, targets):
     complete = run.status == 'completed' and latest.get('complete') is True and nodes_complete
     limitations = [
         '当前仅有发压端数据，没有被测服务的 CPU、数据库、调用链等监控，无法直接确定服务端根因。',
-        'RPS 是累计请求数除以运行时间；趋势中的 RPS 和响应分位数均为截至采样时的累计统计，不是瞬时值。',
+        '平均请求吞吐量是累计请求数除以本轮统计时长；整体累计趋势中的吞吐量和响应分位数均为截至采样时的累计统计。',
+        '区间吞吐量由相邻采样的累计请求增量除以统计时长增量得到，是采样区间平均值而非瞬时 QPS；采样间尖峰可能未被观测，历史超过 400 点时峰值仅覆盖保留窗口。趋势抽样后每行仍代表原采样区间，不能对展示行再次相减。',
         'P95/P99 是响应时间直方图估算值；请求数包含准备步骤，失败按请求计数，非 2xx 是否失败取决于配置的断言。',
         '节点 CPU/RSS 是 Worker 进程观测，不代表整台节点或被测服务；结束时当前用户数为 0 不代表未达到目标并发。',
     ]
@@ -159,20 +164,29 @@ def build_analysis_input(run, targets):
     add('load.config', '本次运行的负载与超时配置', load)
     labels = {
         'requests': ('请求数', '次'), 'failures': ('失败请求数', '次'),
-        'rps': ('平均 RPS', 'requests/s'), 'avg_response_time': ('平均响应时间', 'ms'),
+        'rps': ('平均请求吞吐量', 'requests/s'), 'avg_response_time': ('平均响应时间', 'ms'),
         'p95': ('P95 响应时间', 'ms'), 'p99': ('P99 响应时间', 'ms'),
         'error_rate_percent': ('错误率', '%'), 'users': ('最后上报的当前用户数', '人'),
     }
     for key, (label, unit) in labels.items():
         add(f'overall.{key}', label, metrics[key], unit)
     add('overall.elapsed_seconds', '实际统计时长', number(latest.get('elapsed_seconds')), '秒')
+    add(
+        'overall.peak_interval_rps', '保留采样中的峰值区间请求吞吐量',
+        throughput['peak_interval_rps'], 'requests/s',
+    )
 
     entries = _list(latest.get('entries'))
     for index, entry in enumerate(entries[:MAX_ENDPOINTS], 1):
         entry = _dict(entry)
         method = entry.get('method')
         method = method if isinstance(method, str) and method in METHODS else 'UNKNOWN'
-        add(f'endpoint.{index}', f'接口 {index}（{method}）累计指标', {'method': method, **_metrics(entry)})
+        endpoint_metrics = _metrics(entry)
+        endpoint_metrics['rps'] = throughput['endpoint_rps'][index - 1]
+        add(
+            f'endpoint.{index}', f'接口 {index}（{method}）累计指标',
+            {'method': method, **endpoint_metrics},
+        )
     if len(entries) > MAX_ENDPOINTS:
         limitations.append(f'接口明细仅包含前 {MAX_ENDPOINTS} 项，全局统计仍包含全部接口。')
     if not entries:
@@ -180,6 +194,18 @@ def build_analysis_input(run, targets):
 
     series = _series(run.metrics_samples)
     add('trend.overall', '整体累计指标趋势（elapsed_seconds 单位为秒）', _downsample(series))
+    safe_throughput_trend = [
+        {
+            'sample_index': index,
+            'rps': row['rps'],
+            'interval_seconds': row['interval_seconds'],
+        }
+        for index, row in enumerate(throughput['intervals'], 1)
+    ]
+    add(
+        'trend.throughput', '原采样区间的请求吞吐量趋势（sample_index 为原位置）',
+        _downsample(safe_throughput_trend),
+    )
     peaks = [row['users'] for row in series if row['users'] is not None]
     add('load.observed_peak_users', '采样中观测到的最高并发用户数', max(peaks) if peaks else None, '人')
     if len(series) < 2:

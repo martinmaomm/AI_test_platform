@@ -721,7 +721,7 @@ test("run screens poll only active runs, use nested samples, and do not expose p
   assert.match(list, /v-if="canReport"[\s\S]*PerfRunDetail/);
   assert.match(detail, /isPerformanceRunActive/);
   assert.match(detail, /window\.setTimeout\(loadRun, delay\)/);
-  assert.match(detail, /sampleMetrics\(item\)\.rps/);
+  assert.match(detail, /throughputValue\(sampleMetrics\(item\), "rps"\)/);
   assert.match(
     detail,
     /await stopPerformanceRun\(scope\.projectId, scope\.runId\)/,

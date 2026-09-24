@@ -10,7 +10,8 @@ from .analysis_runtime import (
     AnalysisConflict, AnalysisUnavailable, enqueue_analysis, recover_expired_analyses,
 )
 from .analysis_serializers import (
-    PerformanceAnalysisCreateSerializer, PerformanceAnalysisSerializer,
+    PerformanceAnalysisCreateSerializer, PerformanceAnalysisListQuerySerializer,
+    PerformanceAnalysisSerializer,
 )
 from .models import PerformanceAnalysis, PerformanceRun
 from .parsers import LimitedJSONParser
@@ -47,7 +48,14 @@ class PerformanceAnalysisListCreateView(PerformanceAnalysisAPIView):
         project = _project(request, project_id, REPORT)
         run = _run(project, run_id)
         recover_expired_analyses(run.pk)
-        items = PerformanceAnalysis.objects.filter(run=run).order_by(
+        query = PerformanceAnalysisListQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        filters = {'run': run}
+        if 'analysis_type' in query.validated_data:
+            filters['analysis_type'] = query.validated_data['analysis_type']
+        if 'comparison_run_id' in query.validated_data:
+            filters['comparison_run_id'] = query.validated_data['comparison_run_id']
+        items = PerformanceAnalysis.objects.filter(**filters).order_by(
             '-created_at', '-id',
         )[:20]
         return _ok({'items': PerformanceAnalysisSerializer(items, many=True).data})
@@ -63,6 +71,8 @@ class PerformanceAnalysisListCreateView(PerformanceAnalysisAPIView):
             analysis, created = enqueue_analysis(
                 run.pk, request.user, values['request_id'],
                 values['model_config_id'], values['targets'],
+                analysis_type=values['analysis_type'],
+                comparison_run_id=values['comparison_run_id'],
             )
         except AnalysisConflict as exc:
             return _error('analysis_conflict', str(exc), status.HTTP_409_CONFLICT)

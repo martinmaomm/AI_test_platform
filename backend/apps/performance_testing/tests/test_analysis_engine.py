@@ -10,8 +10,9 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from performance_testing.analysis_data import build_analysis_input
 from performance_testing.analysis_engine import (
-    AnalysisOutputError, MAX_OUTPUT_CHARS, SYSTEM_PROMPT, generate_analysis,
-    parse_analysis_output, _stream_analysis_text,
+    AnalysisOutputError, COMPARISON_SYSTEM_PROMPT, MAX_OUTPUT_CHARS, SYSTEM_PROMPT,
+    VALIDATION_SYSTEM_PROMPT, generate_analysis, parse_analysis_output,
+    _stream_analysis_text,
 )
 from .test_analysis_data import fixture_run
 
@@ -49,6 +50,71 @@ class AnalysisEngineTests(TestCase):
             with self.assertRaises(AnalysisOutputError):
                 self.parse()
 
+    def test_type_specific_categories_and_assessment_statuses_are_enforced(self):
+        cases = (
+            ('validation_diagnosis', 'failed', 'request'),
+            ('load_comparison', 'comparable', 'comparison'),
+        )
+        for analysis_type, assessment_status, category in cases:
+            payload = {
+                'analysis_type': analysis_type,
+                'assessment': {'status': assessment_status},
+                'evidence': [{'id': 'safe.evidence', 'value': 1}],
+                'limitations': [],
+            }
+            output = {
+                **self.output,
+                'findings': [{
+                    **self.output['findings'][0],
+                    'category': category,
+                    'evidence_ids': ['safe.evidence'],
+                }],
+            }
+            parsed = parse_analysis_output(json.dumps(output), payload)
+            self.assertEqual(parsed['assessment']['status'], assessment_status)
+
+        invalid_payloads = (
+            {**self.payload, 'analysis_type': 'unknown'},
+            {**self.payload, 'analysis_type': []},
+            {**self.payload, 'analysis_type': 'validation_diagnosis',
+             'assessment': {'status': 'met'}},
+            {**self.payload, 'analysis_type': 'validation_diagnosis',
+             'assessment': {'status': []}},
+            {**self.payload, 'analysis_type': 'validation_diagnosis',
+             'assessment': {'status': {}}},
+            {**self.payload, 'analysis_type': 'load_comparison',
+             'assessment': {'status': 'not_met'}},
+        )
+        for payload in invalid_payloads:
+            with self.assertRaises(AnalysisOutputError):
+                parse_analysis_output(json.dumps(self.output), payload)
+
+    def test_each_analysis_type_has_a_fixed_non_action_prompt(self):
+        self.assertIn('不执行请求', VALIDATION_SYSTEM_PROMPT)
+        self.assertIn('单用户验证', VALIDATION_SYSTEM_PROMPT)
+        self.assertIn('不执行请求', COMPARISON_SYSTEM_PROMPT)
+        self.assertIn('历史压测对比', COMPARISON_SYSTEM_PROMPT)
+        self.assertIn('不调用工具', SYSTEM_PROMPT)
+
+        cases = (
+            ('validation_diagnosis', 'failed', VALIDATION_SYSTEM_PROMPT),
+            ('load_comparison', 'comparable', COMPARISON_SYSTEM_PROMPT),
+        )
+        for analysis_type, status, expected_prompt in cases:
+            transport = Mock(return_value='{}')
+            payload = {
+                'analysis_type': analysis_type,
+                'assessment': {'status': status},
+                'evidence': [], 'limitations': [],
+            }
+            with patch.dict(sys.modules, {
+                'project_knowledge.llm': SimpleNamespace(stream_call=transport),
+            }):
+                _stream_analysis_text(7, payload, lambda: True, lambda: 10)
+            self.assertEqual(
+                transport.call_args.kwargs['messages'][0]['content'], expected_prompt,
+            )
+
     def test_model_cannot_replace_target_evaluation_or_add_html_field(self):
         for key, value in (('assessment', {'status': 'met'}), ('html', '<script>alert(1)</script>')):
             candidate = {**self.output, key: value}
@@ -62,7 +128,8 @@ class AnalysisEngineTests(TestCase):
                 parse_analysis_output(raw, self.payload)
 
     def test_invalid_classification_missing_text_and_excess_findings_rejected(self):
-        for key, value in (('kind', 'proven_database_issue'), ('severity', []), ('detail', ''),
+        for key, value in (('category', []), ('category', {}),
+                           ('kind', 'proven_database_issue'), ('severity', []), ('detail', ''),
                            ('recommendation', 'x' * 1201)):
             saved = self.output['findings'][0][key]
             self.output['findings'][0][key] = value

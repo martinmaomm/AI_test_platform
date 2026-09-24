@@ -11,6 +11,23 @@ const FINISHED_RUN_STATUSES = new Set([
 
 export const canAnalyzePerformanceRun = (run) =>
   run?.mode === "load" && FINISHED_RUN_STATUSES.has(run?.status);
+export const canAnalyzeRunType = (run, analysisType = "load_summary") => {
+  if (!FINISHED_RUN_STATUSES.has(run?.status)) return false;
+  if (analysisType === "validation_diagnosis")
+    return run?.mode === "validation";
+  return run?.mode === "load";
+};
+export const analysisTypeLabel = (analysisType) =>
+  ({
+    load_summary: "AI 分析结果",
+    validation_diagnosis: "AI 验证诊断",
+    load_comparison: "AI 对比解读",
+  })[analysisType] || "AI 分析结果";
+export const analysisEmptyLabel = (analysisType) =>
+  ({
+    validation_diagnosis: "尚无 AI 验证诊断记录",
+    load_comparison: "尚无 AI 对比解读记录",
+  })[analysisType] || "尚无 AI 分析记录";
 export const isAnalysisActive = (analysis) =>
   ANALYSIS_ACTIVE_STATUSES.has(analysis?.status);
 export const isAnalysisCompleted = (analysis) =>
@@ -157,11 +174,24 @@ export const analysisTargetsIssue = (values = {}) => {
   return "";
 };
 
-export const buildAnalysisRequest = (modelConfigId, values, requestId) => ({
-  request_id: requestId || createPerformanceRequestId(),
-  model_config_id: modelConfigId,
-  targets: buildAnalysisTargets(values),
-});
+export const buildAnalysisRequest = (
+  modelConfigId,
+  values,
+  requestId,
+  analysisType = "load_summary",
+  comparisonRunId = null,
+) => {
+  const payload = {
+    request_id: requestId || createPerformanceRequestId(),
+    model_config_id: modelConfigId,
+    analysis_type: analysisType,
+    targets:
+      analysisType === "load_summary" ? buildAnalysisTargets(values) : {},
+  };
+  if (analysisType === "load_comparison" && comparisonRunId)
+    payload.comparison_run_id = comparisonRunId;
+  return payload;
+};
 
 export const analysisItems = (response) => {
   const body = response?.data ?? response;
@@ -185,6 +215,34 @@ export const displayAnalysisValue = (value) => {
     return String(value);
   }
 };
+export const formatComparisonNumber = (value, precision = 3) => {
+  if (typeof value === "boolean" || value === "" || value == null) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Number(number.toFixed(precision)).toString();
+};
+export const formatComparisonMetric = (value, unit = "") => {
+  const number = formatComparisonNumber(value);
+  const text = number ?? displayAnalysisValue(value);
+  return `${text}${value == null || !unit ? "" : ` ${unit}`}`;
+};
+export const formatComparisonDelta = (row = {}) => {
+  const delta = formatComparisonNumber(row.delta);
+  if (delta == null) return "-";
+  const deltaNumber = Number(delta);
+  const unit = row.unit === "%" ? " 个百分点" : row.unit ? ` ${row.unit}` : "";
+  const percent = formatComparisonNumber(row.delta_percent, 2);
+  const percentText = percent == null ? "" : `（${percent}%）`;
+  return `${deltaNumber > 0 ? "+" : ""}${delta}${unit}${percentText}`;
+};
+export const isCurrentComparisonResponse = (
+  responseSequence,
+  currentSequence,
+  requestedBaselineId,
+  selectedBaselineId,
+) =>
+  responseSequence === currentSequence &&
+  String(requestedBaselineId || "") === String(selectedBaselineId || "");
 
 const EVIDENCE_VALUE_LABELS = {
   requests: "请求数",
@@ -203,6 +261,25 @@ const EVIDENCE_VALUE_LABELS = {
   peak_worker_cpu_percent: "Worker CPU 峰值",
   peak_worker_memory_mib: "Worker 内存峰值",
 };
+const comparisonMatchStatusLabel = (status) =>
+  ({
+    matched: "已匹配",
+    baseline_only: "仅基准存在",
+    current_only: "仅本次存在",
+    ambiguous: "无法唯一匹配",
+  })[status] || "未记录";
+const comparisonStatusLabel = (status) =>
+  ({
+    comparable: "可比较",
+    conditions_changed: "条件有变化",
+    insufficient_data: "数据不足",
+  })[status] || "未记录";
+const isComparisonMetricValue = (value) =>
+  Object.hasOwn(value, "baseline") &&
+  Object.hasOwn(value, "current") &&
+  Object.hasOwn(value, "delta");
+const comparisonMetricSummary = (value) =>
+  `基准 ${formatComparisonMetric(value.baseline, value.unit)}；本次 ${formatComparisonMetric(value.current, value.unit)}；变化 ${formatComparisonDelta(value)}`;
 export const analysisEvidenceLabel = (evidence = {}) =>
   ({
     "overall.rps": "平均请求吞吐量",
@@ -219,8 +296,99 @@ export const analysisEvidenceUnit = (evidence = {}) =>
   ] ||
   "";
 export const displayEvidenceValue = (value) => {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    return displayAnalysisValue(value);
+  if (!value || typeof value !== "object") return displayAnalysisValue(value);
+  if (Array.isArray(value)) {
+    const dependencies = value
+      .filter(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          (Object.hasOwn(item, "producer_step") ||
+            Object.hasOwn(item, "consumer_step")),
+      )
+      .slice(0, 12);
+    if (!dependencies.length) return displayAnalysisValue(value);
+    const availability = { true: "可用", false: "不可用", null: "未确定" };
+    const rows = dependencies.map((item) => {
+      const producer =
+        item.producer_step == null ? "配置" : `步骤 ${item.producer_step}`;
+      const consumer =
+        item.consumer_step == null ? "未记录" : `步骤 ${item.consumer_step}`;
+      return `${producer} → ${consumer}：${availability[String(item.available)] || "未确定"}`;
+    });
+    return `${rows.join("；")}${value.length > dependencies.length ? "；其余已省略" : ""}`;
+  }
+  if (isComparisonMetricValue(value)) return comparisonMetricSummary(value);
+  if (Array.isArray(value.metrics) && Object.hasOwn(value, "match_status")) {
+    const metrics = value.metrics
+      .slice(0, 7)
+      .map((item) => {
+        if (!item || typeof item !== "object" || !isComparisonMetricValue(item))
+          return null;
+        return `${item.label || item.key || "指标"}：${formatComparisonMetric(item.baseline, item.unit)} → ${formatComparisonMetric(item.current, item.unit)}（${formatComparisonDelta(item)}）`;
+      })
+      .filter(Boolean);
+    const match = comparisonMatchStatusLabel(value.match_status);
+    return `接口匹配：${match}${metrics.length ? `；${metrics.join("；")}` : ""}${value.metrics.length > metrics.length ? "；其余指标已省略" : ""}`;
+  }
+  if (Object.hasOwn(value, "conditions") && Object.hasOwn(value, "status")) {
+    const reasons = Array.isArray(value.reasons)
+      ? value.reasons.filter((item) => typeof item === "string").slice(0, 5)
+      : [];
+    return `可比性：${comparisonStatusLabel(value.status)}${reasons.length ? `；${reasons.join("；")}` : ""}`;
+  }
+  if (Number.isInteger(value.step_index)) {
+    const status =
+      {
+        passed: "通过",
+        failed: "失败",
+        skipped: "跳过",
+        pending: "未执行",
+        running: "执行中",
+      }[value.status] || "未记录";
+    const failedIndexes = (items) =>
+      (Array.isArray(items) ? items : [])
+        .filter((item) => item?.status === "failed")
+        .map((item, index) => item?.index ?? index + 1);
+    const assertionIndexes = failedIndexes(value.assertions);
+    const extractionIndexes = failedIndexes(value.extractions);
+    const parts = [`步骤状态：${status}`];
+    if (value.response?.status_code != null)
+      parts.push(`HTTP：${value.response.status_code}`);
+    if (assertionIndexes.length)
+      parts.push(`失败断言：${assertionIndexes.join("、")}`);
+    if (extractionIndexes.length)
+      parts.push(`失败提取：${extractionIndexes.join("、")}`);
+    if (value.extractions_committed === true) parts.push("提取结果：已提交");
+    else if (value.extractions_committed === false)
+      parts.push("提取结果：未提交");
+    return parts.join("；");
+  }
+  if (
+    Object.hasOwn(value, "validation_passed") ||
+    Object.hasOwn(value, "planned_steps")
+  ) {
+    const status =
+      {
+        completed: "已结束",
+        failed: "执行失败",
+        cancelled: "已取消",
+        incomplete: "不完整",
+      }[value.status] || "未记录";
+    const complete =
+      value.complete === true
+        ? "完整"
+        : value.complete === false
+          ? "不完整"
+          : "未记录";
+    const passed =
+      value.validation_passed === true
+        ? "通过"
+        : value.validation_passed === false
+          ? "未通过"
+          : "未记录";
+    return `运行：${status}；统计：${complete}；验证：${passed}；步骤：${displayAnalysisValue(value.reported_steps)} / ${displayAnalysisValue(value.planned_steps)}`;
+  }
   return Object.entries(value)
     .map(
       ([key, item]) =>

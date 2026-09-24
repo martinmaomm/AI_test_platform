@@ -23,6 +23,7 @@ from .discovery_views import (
 from .analysis_views import (
     PerformanceAnalysisDetailView, PerformanceAnalysisListCreateView,
 )
+from .comparison_views import PerformanceComparisonCandidatesView, PerformanceComparisonView
 
 
 app_name = 'performance_testing'
@@ -44,6 +45,8 @@ urlpatterns = [
     path('plans/<int:pk>/node-eligibility/', PerformanceNodeEligibilityView.as_view(), name='node-eligibility'),
     path('plans/<int:pk>/', PlanDetailView.as_view(), name='plan-detail'),
     path('runs/', PerformanceRunListView.as_view(), name='run-list'),
+    path('runs/<uuid:run_id>/comparison-candidates/', PerformanceComparisonCandidatesView.as_view(), name='comparison-candidates'),
+    path('runs/<uuid:run_id>/comparison/', PerformanceComparisonView.as_view(), name='run-comparison'),
     path(
         'runs/<uuid:run_id>/analyses/', PerformanceAnalysisListCreateView.as_view(),
         name='analysis-list-create',

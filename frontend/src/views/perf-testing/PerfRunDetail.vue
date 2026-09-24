@@ -98,6 +98,15 @@
         :steps="run.validation_steps || []"
         :run-status="run.status"
       />
+      <PerformanceRunAnalysis
+        v-if="run.mode === 'validation'"
+        :project-id="projectId"
+        :run-id="runId"
+        :run="run"
+        :can-report="canReport"
+        :can-execute="canExecute"
+        analysis-type="validation_diagnosis"
+      />
       <div class="metrics">
         <div v-for="item in metricCards" :key="item.label" class="metric-card">
           <div class="metric-label-row">
@@ -303,7 +312,16 @@
             label="诊断"
             min-width="180" /></el-table
       ></template>
+      <PerformanceRunComparison
+        v-if="run.mode === 'load'"
+        :project-id="projectId"
+        :run-id="runId"
+        :run="run"
+        :can-report="canReport"
+        :can-execute="canExecute"
+      />
       <PerformanceRunAnalysis
+        v-if="run.mode === 'load'"
         :project-id="projectId"
         :run-id="runId"
         :run="run"
@@ -318,6 +336,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import PerformanceValidationSteps from "./PerformanceValidationSteps.vue";
 import PerformanceRunAnalysis from "./PerformanceRunAnalysis.vue";
+import PerformanceRunComparison from "./PerformanceRunComparison.vue";
 import { useRoute, useRouter } from "vue-router";
 import dayjs from "dayjs";
 import VChart from "vue-echarts";

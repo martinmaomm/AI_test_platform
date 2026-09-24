@@ -6,7 +6,7 @@
   >
     <div class="analysis-heading">
       <div>
-        <h3>AI 分析结果</h3>
+        <h3>{{ analysisTypeLabel(analysisType) }}</h3>
         <p>只发送统计摘要，不发送原始请求或响应内容。</p>
       </div>
       <el-button :loading="loading" @click="refresh">刷新记录</el-button>
@@ -45,7 +45,7 @@
           :loading="creating"
           :disabled="!canCreate"
           @click="create"
-          >AI 分析结果</el-button
+          >{{ analysisTypeLabel(analysisType) }}</el-button
         >
       </div>
       <el-alert
@@ -58,7 +58,14 @@
       <el-alert v-if="!canExecute" type="info" :closable="false"
         >你可以查看结果；发起 AI 分析需要执行权限。</el-alert
       >
+      <el-alert
+        v-if="analysisType === 'load_comparison' && !comparisonRunId"
+        type="info"
+        :closable="false"
+        >请先选择一个基准运行，再发起 AI 对比解读。</el-alert
+      >
       <el-form
+        v-if="isSummary"
         class="target-form"
         label-position="top"
         :disabled="
@@ -88,12 +95,12 @@
             controls-position="right"
         /></el-form-item>
       </el-form>
-      <p class="target-note">
+      <p v-if="isSummary" class="target-note">
         目标仅用于本次分析；未填写时，只分析实际表现，不判定是否达标。
       </p>
       <el-empty
         v-if="!loading && !selectedAnalysis && !analyses.length"
-        description="尚无 AI 分析记录"
+        :description="analysisEmptyLabel(analysisType)"
       />
       <el-radio-group
         v-if="analyses.length"
@@ -167,7 +174,7 @@
             selectedAnalysis.result && isAnalysisCompleted(selectedAnalysis)
           "
         >
-          <h4>性能目标判断</h4>
+          <h4>{{ assessmentTitle }}</h4>
           <el-descriptions :column="1" border
             ><el-descriptions-item label="结论">{{
               assessmentLabel(selectedAnalysis.result.assessment?.status)
@@ -183,6 +190,33 @@
               }}）</el-descriptions-item
             ></el-descriptions
           >
+          <el-descriptions
+            v-if="analysisType === 'validation_diagnosis'"
+            :column="1"
+            border
+          >
+            <el-descriptions-item label="首个失败步骤">
+              {{
+                validationStepLabel(
+                  selectedAnalysis.result.assessment?.first_failed_step,
+                )
+              }}
+            </el-descriptions-item>
+            <el-descriptions-item label="失败步骤">
+              {{
+                validationStepLabels(
+                  selectedAnalysis.result.assessment?.failed_steps,
+                )
+              }}
+            </el-descriptions-item>
+            <el-descriptions-item label="跳过步骤">
+              {{
+                validationStepLabels(
+                  selectedAnalysis.result.assessment?.skipped_steps,
+                )
+              }}
+            </el-descriptions-item>
+          </el-descriptions>
           <h4>分析摘要</h4>
           <p class="preserve-text">
             {{ selectedAnalysis.result.summary || "未返回摘要。" }}
@@ -208,7 +242,7 @@
               依据：<span
                 v-for="item in findingEvidence(finding)"
                 :key="item.id"
-                >{{ evidenceLabel(item) }}：{{ displayEvidenceValue(item.value)
+                >{{ evidenceLabel(item) }}：{{ evidenceValue(item)
                 }}{{ evidenceUnit(item) }}；</span
               >
             </p>
@@ -230,7 +264,7 @@
                     }}</template></el-table-column
                   ><el-table-column label="值" min-width="220"
                     ><template #default="{ row }"
-                      >{{ displayEvidenceValue(row.value) }}
+                      >{{ evidenceValue(row) }}
                       {{ evidenceUnit(row) }}</template
                     ></el-table-column
                   ></el-table
@@ -281,7 +315,9 @@ import {
   analysisStatusType,
   analysisTargetsIssue,
   buildAnalysisRequest,
-  canAnalyzePerformanceRun,
+  analysisEmptyLabel,
+  analysisTypeLabel,
+  canAnalyzeRunType,
   displayAnalysisValue,
   displayEvidenceValue,
   formatAnalysisDuration,
@@ -297,8 +333,22 @@ const props = defineProps({
   run: { type: Object, default: null },
   canReport: Boolean,
   canExecute: Boolean,
+  analysisType: { type: String, default: "load_summary" },
+  comparisonRunId: { type: [String, Number], default: null },
+  comparisonData: { type: Object, default: null },
 });
-const available = computed(() => canAnalyzePerformanceRun(props.run));
+const analysisType = computed(() => props.analysisType || "load_summary");
+const isSummary = computed(() => analysisType.value === "load_summary");
+const available = computed(() =>
+  canAnalyzeRunType(props.run, analysisType.value),
+);
+const assessmentTitle = computed(() =>
+  analysisType.value === "validation_diagnosis"
+    ? "验证诊断结论"
+    : analysisType.value === "load_comparison"
+      ? "对比解读结论"
+      : "性能目标判断",
+);
 const models = ref([]);
 const modelConfigId = ref(null);
 const modelsLoading = ref(false);
@@ -336,7 +386,9 @@ const canCreate = computed(
       (model) => String(model.id) === String(modelConfigId.value),
     ) &&
     !creating.value &&
-    !activeAnalysis.value,
+    !activeAnalysis.value &&
+    (analysisType.value !== "load_comparison" ||
+      Boolean(props.comparisonRunId)),
 );
 const findings = computed(() =>
   Array.isArray(selectedAnalysis.value?.result?.findings)
@@ -377,12 +429,16 @@ const retryReasonText = computed(() =>
 const scope = () => ({
   projectId: String(props.projectId || ""),
   runId: String(props.runId || ""),
+  analysisType: analysisType.value,
+  comparisonRunId: String(props.comparisonRunId || ""),
   epoch: scopeEpoch,
 });
 const scopeCurrent = (value) =>
   value.epoch === scopeEpoch &&
   value.projectId === String(props.projectId || "") &&
-  value.runId === String(props.runId || "");
+  value.runId === String(props.runId || "") &&
+  value.analysisType === analysisType.value &&
+  value.comparisonRunId === String(props.comparisonRunId || "");
 const unwrapModels = (response) => {
   const body = response?.data ?? response;
   const list = Array.isArray(body)
@@ -423,6 +479,11 @@ const assessmentLabel = (status) =>
     not_met: "未达标",
     not_configured: "未配置目标",
     insufficient_data: "数据不足",
+    passed: "通过",
+    failed: "未通过",
+    incomplete: "结果不完整",
+    comparable: "可比较",
+    conditions_changed: "条件有变化",
   })[status] ||
   status ||
   "-";
@@ -431,6 +492,32 @@ const severityType = (value) =>
 const findingKindType = (value) =>
   ({ observation: "success", hypothesis: "warning" })[value] || "info";
 const evidenceLabel = (item = {}) => {
+  const comparisonMatch = /^comparison\.endpoint\.(\d+)$/.exec(
+    String(item.id || ""),
+  );
+  if (comparisonMatch) {
+    const endpoint =
+      props.comparisonData?.endpoints?.[Number(comparisonMatch[1]) - 1];
+    const current =
+      endpoint?.current_index == null
+        ? null
+        : props.run?.latest_metrics?.entries?.[endpoint.current_index];
+    const endpointName =
+      endpoint?.name ||
+      [current?.method, current?.name].filter(Boolean).join(" ");
+    return endpointName
+      ? `${item.label || item.id}（${endpointName}）`
+      : item.label || item.id;
+  }
+  const validationMatch = /^(?:validation\.)?step\.(\d+)$/.exec(
+    String(item.id || ""),
+  );
+  if (validationMatch) {
+    const label = validationStepLabel(Number(validationMatch[1]));
+    return label === `步骤 ${validationMatch[1]}`
+      ? item.label || item.id
+      : `${item.label || item.id}（${label}）`;
+  }
   const match = /^(endpoint|node)\.(\d+)$/.exec(String(item.id || ""));
   if (!match) return analysisEvidenceLabel(item);
   const index = Number(match[2]) - 1;
@@ -447,10 +534,52 @@ const evidenceLabel = (item = {}) => {
     : item.label || item.id;
 };
 const evidenceUnit = (item) => analysisEvidenceUnit(item);
+const validationStepByIndex = (index) =>
+  [
+    ...(Array.isArray(props.run?.latest_metrics?.validation_steps)
+      ? props.run.latest_metrics.validation_steps
+      : []),
+    ...(Array.isArray(props.run?.validation_steps)
+      ? props.run.validation_steps
+      : []),
+  ].find((step) => String(step?.step_index) === String(index));
+const localFailedCheckSummary = (step, field, label) => {
+  const checks = Array.isArray(step?.[field]) ? step[field] : [];
+  const failed = checks
+    .map((item, index) => ({ item, index: item?.index ?? index + 1 }))
+    .filter(({ item }) => item?.status === "failed")
+    .map(
+      ({ item, index }) =>
+        `${label} ${index}${item?.check ? `（${item.check}）` : ""}`,
+    );
+  return failed.join("；");
+};
+const evidenceValue = (item = {}) => {
+  const summary = displayEvidenceValue(item.value);
+  const stepMatch = /^(?:validation\.)?step\.(\d+)$/.exec(
+    String(item.id || ""),
+  );
+  if (!stepMatch) return summary;
+  const step = validationStepByIndex(stepMatch[1]);
+  const details = [
+    localFailedCheckSummary(step, "assertions", "失败断言"),
+    localFailedCheckSummary(step, "extractions", "失败提取"),
+  ].filter(Boolean);
+  return details.length ? `${summary}；${details.join("；")}` : summary;
+};
 const findingEvidence = (finding = {}) =>
   (Array.isArray(finding.evidence_ids) ? finding.evidence_ids : [])
     .map((id) => evidenceById.value.get(String(id)))
     .filter(Boolean);
+const validationStepLabel = (index) => {
+  if (index == null) return "-";
+  const step = validationStepByIndex(index);
+  return step?.step_name ? `${index}. ${step.step_name}` : `步骤 ${index}`;
+};
+const validationStepLabels = (indexes) =>
+  Array.isArray(indexes) && indexes.length
+    ? indexes.map(validationStepLabel).join("；")
+    : "-";
 
 async function loadModels(captured) {
   modelsLoading.value = true;
@@ -517,6 +646,13 @@ async function refresh() {
     const response = await getPerformanceRunAnalyses(
       captured.projectId,
       captured.runId,
+      {
+        analysisType: captured.analysisType,
+        comparisonRunId:
+          captured.analysisType === "load_comparison"
+            ? captured.comparisonRunId
+            : null,
+      },
     );
     if (sequence !== requestEpoch || !scopeCurrent(captured)) return;
     analyses.value = analysisItems(response);
@@ -545,12 +681,21 @@ async function refresh() {
 async function create() {
   const captured = scope();
   if (!canCreate.value) return;
-  const issue = pendingPayload.value ? "" : analysisTargetsIssue(targets.value);
+  const issue =
+    pendingPayload.value || !isSummary.value
+      ? ""
+      : analysisTargetsIssue(targets.value);
   if (issue) return ElMessage.warning(issue);
   const retryingUncertainRequest = Boolean(pendingPayload.value);
   const payload =
     pendingPayload.value ||
-    buildAnalysisRequest(modelConfigId.value, targets.value);
+    buildAnalysisRequest(
+      modelConfigId.value,
+      targets.value,
+      undefined,
+      analysisType.value,
+      props.comparisonRunId,
+    );
   creating.value = true;
   try {
     pendingPayload.value = payload;
@@ -625,6 +770,8 @@ watch(
     props.run?.status,
     props.run?.mode,
     props.canReport,
+    props.analysisType,
+    props.comparisonRunId,
   ],
   reset,
   { immediate: true },

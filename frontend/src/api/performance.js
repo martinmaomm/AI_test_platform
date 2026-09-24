@@ -37,12 +37,22 @@ export const getPerformanceNodeEligibility = (projectId, planId) =>
 export const stopPerformanceRun = (projectId, runId) => post(`${base(projectId)}/runs/${runId}/stop/`, {})
 
 // AI 分析记录只使用运行统计快照；模型凭据不会经过此业务接口。
-export const getPerformanceRunAnalyses = (projectId, runId) =>
-  get(`${base(projectId)}/runs/${runId}/analyses/`)
+export const getPerformanceRunAnalyses = (projectId, runId, filters = {}) => {
+  const query = new URLSearchParams()
+  if (filters.analysisType) query.set('analysis_type', filters.analysisType)
+  if (filters.comparisonRunId)
+    query.set('comparison_run_id', filters.comparisonRunId)
+  const suffix = query.size ? `?${query}` : ''
+  return get(`${base(projectId)}/runs/${runId}/analyses/${suffix}`)
+}
 export const createPerformanceRunAnalysis = (projectId, runId, data) =>
   post(`${base(projectId)}/runs/${runId}/analyses/`, data)
 export const getPerformanceRunAnalysis = (projectId, runId, analysisId) =>
   get(`${base(projectId)}/runs/${runId}/analyses/${analysisId}/`)
+export const getPerformanceRunComparisonCandidates = (projectId, runId) =>
+  get(`${base(projectId)}/runs/${runId}/comparison-candidates/`)
+export const getPerformanceRunComparison = (projectId, runId, baselineRunId) =>
+  get(`${base(projectId)}/runs/${runId}/comparison/?${new URLSearchParams({ baseline_run_id: baselineRunId })}`)
 
 // 创建、重新生成和重新安装响应会返回 enrollment_token；调用方必须只保留在临时弹窗状态中。
 export const createPerformanceNode = async (projectId, data) => {

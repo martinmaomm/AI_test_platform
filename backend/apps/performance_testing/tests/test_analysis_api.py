@@ -1,4 +1,6 @@
 from datetime import timedelta
+import hashlib
+import json
 import math
 import uuid
 from unittest.mock import patch
@@ -94,6 +96,8 @@ class PerformanceAnalysisAPITests(TestCase):
         self.assertEqual(created.status_code, 202, created.data)
         data = created.data['data']
         self.assertEqual(data['run_id'], str(self.run.pk))
+        self.assertEqual(data['analysis_type'], 'load_summary')
+        self.assertIsNone(data['comparison_run_id'])
         self.assertEqual(data['status'], 'queued')
         self.assertEqual(data['timeout_seconds'], 600)
         self.assertEqual(data['progress']['phase'], 'queued')
@@ -156,6 +160,106 @@ class PerformanceAnalysisAPITests(TestCase):
                 self.assertEqual(response.status_code, 409, response.data)
         self.assertFalse(PerformanceAnalysis.objects.filter(run__in=(active, validation)).exists())
 
+    def test_validation_and_comparison_types_enforce_run_contracts(self):
+        validation = self._run(mode=PerformanceRun.Mode.VALIDATION)
+        comparison_current = self._run()
+        baseline = self._run()
+        with patch(
+            'performance_testing.tasks.run_performance_analysis_async.apply_async',
+        ), self.captureOnCommitCallbacks(execute=True):
+            validation_response = self.client.post(self._path(validation), {
+                'request_id': str(uuid.uuid4()),
+                'model_config_id': self.model.pk,
+                'analysis_type': 'validation_diagnosis',
+            }, format='json')
+            comparison_response = self.client.post(self._path(comparison_current), {
+                'request_id': str(uuid.uuid4()),
+                'model_config_id': self.model.pk,
+                'analysis_type': 'load_comparison',
+                'comparison_run_id': str(baseline.pk),
+            }, format='json')
+        self.assertEqual(validation_response.status_code, 202, validation_response.data)
+        self.assertEqual(validation_response.data['data']['targets'], {})
+        self.assertEqual(
+            validation_response.data['data']['analysis_type'], 'validation_diagnosis',
+        )
+        self.assertEqual(comparison_response.status_code, 202, comparison_response.data)
+        self.assertEqual(
+            comparison_response.data['data']['comparison_run_id'], str(baseline.pk),
+        )
+
+        invalid_cases = (
+            (validation, {
+                'analysis_type': 'validation_diagnosis',
+                'targets': {'p95_ms': 1},
+            }, 400),
+            (self._run(), {
+                'analysis_type': 'load_comparison',
+            }, 400),
+            (self._run(), {
+                'comparison_run_id': str(baseline.pk),
+            }, 400),
+            (self._run(), {
+                'analysis_type': 'load_comparison',
+                'comparison_run_id': None,
+            }, 400),
+            (baseline, {
+                'analysis_type': 'load_comparison',
+                'comparison_run_id': str(baseline.pk),
+                'targets': {},
+            }, 409),
+        )
+        for run, overrides, expected in invalid_cases:
+            response = self.client.post(
+                self._path(run), self._payload(**overrides), format='json',
+            )
+            self.assertEqual(response.status_code, expected, (overrides, response.data))
+
+        cross_project = self._run(project=self.other_project)
+        response = self.client.post(self._path(self._run()), self._payload(
+            analysis_type='load_comparison',
+            comparison_run_id=str(cross_project.pk),
+            targets={},
+        ), format='json')
+        self.assertEqual(response.status_code, 409, response.data)
+
+    def test_list_filters_are_strict_and_optional(self):
+        summary = PerformanceAnalysis.objects.create(
+            run=self.run, created_by=self.user, request_id=uuid.uuid4(),
+            request_hash='a' * 64, model_config_id=self.model.pk,
+            model_info={}, targets={}, queued_deadline_at=timezone.now() + timedelta(minutes=5),
+        )
+        baseline = self._run()
+        comparison = PerformanceAnalysis.objects.create(
+            run=self.run, comparison_run=baseline, created_by=self.user,
+            request_id=uuid.uuid4(), request_hash='b' * 64,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+            model_config_id=self.model.pk, model_info={}, targets={},
+            status=PerformanceAnalysis.Status.FAILED,
+            queued_deadline_at=timezone.now() + timedelta(minutes=5),
+        )
+        unfiltered = self.client.get(self._path())
+        self.assertEqual(unfiltered.status_code, 200, unfiltered.data)
+        self.assertEqual(len(unfiltered.data['data']['items']), 2)
+        by_type = self.client.get(self._path(), {'analysis_type': 'load_comparison'})
+        self.assertEqual(
+            [item['id'] for item in by_type.data['data']['items']], [str(comparison.pk)],
+        )
+        by_baseline = self.client.get(
+            self._path(), {'comparison_run_id': str(baseline.pk)},
+        )
+        self.assertEqual(
+            [item['id'] for item in by_baseline.data['data']['items']],
+            [str(comparison.pk)],
+        )
+        for query in (
+            {'analysis_type': 'unknown'},
+            {'comparison_run_id': 'bad'},
+            {'unexpected': 'value'},
+        ):
+            self.assertEqual(self.client.get(self._path(), query).status_code, 400)
+        summary.refresh_from_db()
+
     def test_strict_request_validation_rejects_unknown_boolean_and_nonfinite_numbers(self):
         invalid_payloads = (
             self._payload(extra=True),
@@ -209,6 +313,62 @@ class PerformanceAnalysisAPITests(TestCase):
         ), self.captureOnCommitCallbacks(execute=True):
             retry = self.client.post(self._path(), self._payload(), format='json')
         self.assertEqual(retry.status_code, 202, retry.data)
+
+    def test_legacy_summary_request_hash_remains_idempotent_after_backfill(self):
+        request_id = uuid.uuid4()
+        targets = {'p95_ms': 500.0, 'error_rate_percent': 1.0, 'rps_min': 10.0}
+        legacy_hash = hashlib.sha256(json.dumps(
+            {'model_config_id': self.model.pk, 'targets': targets},
+            ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False,
+        ).encode('utf-8')).hexdigest()
+        existing = PerformanceAnalysis.objects.create(
+            run=self.run, created_by=self.user, request_id=request_id,
+            request_hash=legacy_hash,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_SUMMARY,
+            model_config_id=self.model.pk,
+            model_info={}, targets=targets,
+            status=PerformanceAnalysis.Status.COMPLETED,
+            queued_deadline_at=timezone.now() + timedelta(minutes=5),
+            finished_at=timezone.now(),
+        )
+
+        response = self.client.post(
+            self._path(), self._payload(request_id, targets=targets), format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['data']['id'], str(existing.pk))
+        self.assertEqual(PerformanceAnalysis.objects.filter(run=self.run).count(), 1)
+
+    def test_comparison_idempotency_hash_includes_type_and_baseline(self):
+        current = self._run()
+        baseline = self._run()
+        replacement = self._run()
+        request_id = uuid.uuid4()
+        payload = self._payload(
+            request_id,
+            analysis_type='load_comparison',
+            comparison_run_id=str(baseline.pk),
+            targets={},
+        )
+        with patch(
+            'performance_testing.tasks.run_performance_analysis_async.apply_async',
+        ) as queued, self.captureOnCommitCallbacks(execute=True):
+            first = self.client.post(self._path(current), payload, format='json')
+        self.assertEqual(first.status_code, 202, first.data)
+        queued.assert_called_once()
+        repeated = self.client.post(self._path(current), payload, format='json')
+        self.assertEqual(repeated.status_code, 200, repeated.data)
+        changed_baseline = self.client.post(self._path(current), {
+            **payload, 'comparison_run_id': str(replacement.pk),
+        }, format='json')
+        self.assertEqual(changed_baseline.status_code, 409, changed_baseline.data)
+        changed_type = self.client.post(self._path(current), {
+            **payload,
+            'analysis_type': 'load_summary',
+            'comparison_run_id': None,
+        }, format='json')
+        self.assertEqual(changed_type.status_code, 409, changed_type.data)
 
     def test_queue_failure_is_sanitized_and_record_remains_readable(self):
         with patch(

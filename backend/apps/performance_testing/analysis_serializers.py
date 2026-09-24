@@ -38,16 +38,49 @@ class PerformanceAnalysisTargetsSerializer(StrictSerializer):
 class PerformanceAnalysisCreateSerializer(StrictSerializer):
     request_id = serializers.UUIDField()
     model_config_id = StrictIntegerField(min_value=1, max_value=9223372036854775807)
-    targets = PerformanceAnalysisTargetsSerializer()
+    analysis_type = serializers.ChoiceField(
+        choices=PerformanceAnalysis.AnalysisType.choices,
+        default=PerformanceAnalysis.AnalysisType.LOAD_SUMMARY,
+    )
+    comparison_run_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    targets = PerformanceAnalysisTargetsSerializer(required=False, default=dict)
+
+    def validate(self, attrs):
+        analysis_type = attrs['analysis_type']
+        comparison_run_id = attrs.get('comparison_run_id')
+        targets = attrs.get('targets') or {}
+        if analysis_type == PerformanceAnalysis.AnalysisType.LOAD_COMPARISON:
+            if comparison_run_id is None:
+                raise serializers.ValidationError({
+                    'comparison_run_id': '历史压测对比必须选择基线运行。',
+                })
+        elif comparison_run_id is not None:
+            raise serializers.ValidationError({
+                'comparison_run_id': '当前分析类型不支持基线运行。',
+            })
+        if analysis_type != PerformanceAnalysis.AnalysisType.LOAD_SUMMARY and targets:
+            raise serializers.ValidationError({
+                'targets': '当前分析类型不支持性能目标。',
+            })
+        return attrs
+
+
+class PerformanceAnalysisListQuerySerializer(StrictSerializer):
+    analysis_type = serializers.ChoiceField(
+        choices=PerformanceAnalysis.AnalysisType.choices, required=False,
+    )
+    comparison_run_id = serializers.UUIDField(required=False)
 
 
 class PerformanceAnalysisSerializer(serializers.ModelSerializer):
     run_id = serializers.UUIDField(read_only=True)
+    comparison_run_id = serializers.UUIDField(read_only=True, allow_null=True)
 
     class Meta:
         model = PerformanceAnalysis
         fields = (
-            'id', 'run_id', 'status', 'model_info', 'targets', 'result',
+            'id', 'run_id', 'analysis_type', 'comparison_run_id',
+            'status', 'model_info', 'targets', 'result',
             'timeout_seconds', 'progress', 'error_code', 'error_message',
             'created_at', 'started_at', 'finished_at',
         )

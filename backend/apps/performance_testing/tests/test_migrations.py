@@ -2,6 +2,7 @@ import importlib
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from django.db import models
 from django.db.migrations.operations.fields import AddField, RemoveField
 from django.db.migrations.operations.special import RunPython
 from django.db.migrations.operations.models import AddConstraint, CreateModel
@@ -130,5 +131,25 @@ class PerformanceMigrationTests(SimpleTestCase):
         self.assertEqual(
             len([item for item in migration.operations if isinstance(item, AddConstraint)]),
             2,
+        )
+        self.assertFalse(any(isinstance(item, RunPython) for item in migration.operations))
+
+    def test_analysis_type_migration_is_additive_and_keeps_old_rows_as_summaries(self):
+        migration = importlib.import_module(
+            'performance_testing.migrations.0009_performanceanalysis_types',
+        ).Migration
+        added = [item for item in migration.operations if isinstance(item, AddField)]
+        self.assertEqual([item.name for item in added], [
+            'analysis_type', 'comparison_run',
+        ])
+        self.assertEqual(added[0].field.default, 'load_summary')
+        self.assertIs(added[1].field.remote_field.on_delete, models.SET_NULL)
+        constraints = [
+            item.constraint for item in migration.operations
+            if isinstance(item, AddConstraint)
+        ]
+        self.assertEqual(
+            {item.name for item in constraints},
+            {'perf_analysis_comparison_not_self', 'perf_analysis_baseline_type'},
         )
         self.assertFalse(any(isinstance(item, RunPython) for item in migration.operations))

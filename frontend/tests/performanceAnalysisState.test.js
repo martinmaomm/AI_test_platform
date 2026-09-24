@@ -15,10 +15,14 @@ import {
   analysisTargetsIssue,
   buildAnalysisRequest,
   buildAnalysisTargets,
+  canAnalyzeRunType,
   canAnalyzePerformanceRun,
   displayAnalysisValue,
   displayEvidenceValue,
+  formatComparisonDelta,
+  formatComparisonMetric,
   isDefinitiveAnalysisCreateError,
+  isCurrentComparisonResponse,
   formatAnalysisDuration,
   isAnalysisActive,
 } from "../src/views/perf-testing/performanceAnalysisState.js";
@@ -38,6 +42,18 @@ test("only finished formal load runs can display AI analysis", () => {
   );
   assert.equal(
     canAnalyzePerformanceRun({ mode: "load", status: "running" }),
+    false,
+  );
+});
+
+test("analysis types keep validation diagnosis and load comparison in their own terminal run scopes", () => {
+  const validation = { mode: "validation", status: "completed" };
+  const load = { mode: "load", status: "completed" };
+  assert.equal(canAnalyzeRunType(validation, "validation_diagnosis"), true);
+  assert.equal(canAnalyzeRunType(validation, "load_summary"), false);
+  assert.equal(canAnalyzeRunType(load, "load_comparison"), true);
+  assert.equal(
+    canAnalyzeRunType({ mode: "load", status: "running" }, "load_comparison"),
     false,
   );
 });
@@ -66,8 +82,105 @@ test("analysis request retains request id for uncertain network retries", () => 
   assert.deepEqual(buildAnalysisRequest(8, { p95_ms: 100 }, "request-1"), {
     request_id: "request-1",
     model_config_id: 8,
+    analysis_type: "load_summary",
     targets: { p95_ms: 100 },
   });
+});
+
+test("non-summary analysis requests retain their type and only comparisons carry a baseline", () => {
+  assert.deepEqual(
+    buildAnalysisRequest(
+      8,
+      { p95_ms: 100 },
+      "request-2",
+      "validation_diagnosis",
+    ),
+    {
+      request_id: "request-2",
+      model_config_id: 8,
+      analysis_type: "validation_diagnosis",
+      targets: {},
+    },
+  );
+  assert.deepEqual(
+    buildAnalysisRequest(8, {}, "request-3", "load_comparison", "baseline-1"),
+    {
+      request_id: "request-3",
+      model_config_id: 8,
+      analysis_type: "load_comparison",
+      comparison_run_id: "baseline-1",
+      targets: {},
+    },
+  );
+});
+
+test("comparison presentation rounds deltas while preserving zero and missing values", () => {
+  assert.equal(formatComparisonMetric(0, "ms"), "0 ms");
+  assert.equal(formatComparisonMetric(null, "ms"), "-");
+  assert.equal(formatComparisonMetric(0.0009, "requests/s"), "0.001 requests/s");
+  assert.equal(formatComparisonDelta({ delta: -0.0001, unit: "ms" }), "0 ms");
+  assert.equal(
+    formatComparisonDelta({
+      delta: 1.23456,
+      delta_percent: 12.3456,
+      unit: "ms",
+    }),
+    "+1.235 ms（12.35%）",
+  );
+  assert.equal(
+    formatComparisonDelta({ delta: 0, delta_percent: null, unit: "%" }),
+    "0 个百分点",
+  );
+  assert.equal(formatComparisonDelta({ delta: null, unit: "ms" }), "-");
+});
+
+test("comparison evidence summarizes metrics, endpoints and comparability without JSON arrays", () => {
+  assert.equal(
+    displayEvidenceValue({
+      key: "p95",
+      label: "P95",
+      unit: "ms",
+      baseline: 123.4567,
+      current: 130,
+      delta: 6.5433,
+      delta_percent: 5.3,
+    }),
+    "基准 123.457 ms；本次 130 ms；变化 +6.543 ms（5.3%）",
+  );
+  assert.equal(
+    displayEvidenceValue({
+      method: "GET",
+      match_status: "baseline_only",
+      baseline_index: 2,
+      current_index: null,
+      metrics: [
+        {
+          key: "requests",
+          label: "请求数",
+          unit: "",
+          baseline: 0,
+          current: null,
+          delta: null,
+          delta_percent: null,
+        },
+      ],
+    }),
+    "接口匹配：仅基准存在；请求数：0 → -（-）",
+  );
+  assert.equal(
+    displayEvidenceValue({
+      status: "conditions_changed",
+      reasons: ["用户数不同"],
+      conditions: [{ key: "users" }],
+    }),
+    "可比性：条件有变化；用户数不同",
+  );
+});
+
+test("A-to-B-to-A baseline switching rejects the first A response by request sequence", () => {
+  assert.equal(isCurrentComparisonResponse(1, 3, "A", "A"), false);
+  assert.equal(isCurrentComparisonResponse(2, 3, "B", "A"), false);
+  assert.equal(isCurrentComparisonResponse(3, 3, "A", "A"), true);
 });
 
 test("analysis state reads wrapped history and safely displays evidence values", () => {
@@ -89,6 +202,27 @@ test("analysis presentation labels program conclusions and evidence in Chinese",
   assert.equal(
     displayEvidenceValue({ requests: 12, error_rate_percent: 1.5 }),
     "请求数：12；错误率：1.5",
+  );
+});
+
+test("diagnosis evidence stays concise and does not serialize check metadata", () => {
+  assert.equal(
+    displayEvidenceValue({
+      step_index: 7,
+      status: "failed",
+      response: { status_code: 500 },
+      assertions: [{ index: 2, status: "failed", actual: "secret" }],
+      extractions: [{ index: 1, status: "passed" }],
+      extractions_committed: false,
+    }),
+    "步骤状态：失败；HTTP：500；失败断言：2；提取结果：未提交",
+  );
+  assert.equal(
+    displayEvidenceValue([
+      { producer_step: 2, consumer_step: 4, available: false },
+      { producer_step: null, consumer_step: 5, available: true },
+    ]),
+    "步骤 2 → 步骤 4：不可用；配置 → 步骤 5：可用",
   );
 });
 

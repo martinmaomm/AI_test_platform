@@ -262,6 +262,11 @@ class PerformanceRunNode(models.Model):
 
 
 class PerformanceAnalysis(models.Model):
+    class AnalysisType(models.TextChoices):
+        LOAD_SUMMARY = 'load_summary', 'Load summary'
+        VALIDATION_DIAGNOSIS = 'validation_diagnosis', 'Validation diagnosis'
+        LOAD_COMPARISON = 'load_comparison', 'Load comparison'
+
     class Status(models.TextChoices):
         QUEUED = 'queued', 'Queued'
         RUNNING = 'running', 'Running'
@@ -275,12 +280,19 @@ class PerformanceAnalysis(models.Model):
     run = models.ForeignKey(
         PerformanceRun, on_delete=models.CASCADE, related_name='analyses',
     )
+    comparison_run = models.ForeignKey(
+        PerformanceRun, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='comparison_analyses',
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='created_performance_analyses',
     )
     request_id = models.UUIDField()
     request_hash = models.CharField(max_length=64, editable=False)
+    analysis_type = models.CharField(
+        max_length=32, choices=AnalysisType.choices, default=AnalysisType.LOAD_SUMMARY,
+    )
     model_config_id = models.PositiveBigIntegerField(editable=False)
     model_info = models.JSONField(default=dict, editable=False)
     targets = models.JSONField(default=dict, blank=True, editable=False)
@@ -306,6 +318,20 @@ class PerformanceAnalysis(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=('run', 'request_id'), name='perf_analysis_run_request_unique',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(comparison_run__isnull=True)
+                    | ~models.Q(run=models.F('comparison_run'))
+                ),
+                name='perf_analysis_comparison_not_self',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(analysis_type='load_comparison')
+                    | models.Q(comparison_run__isnull=True)
+                ),
+                name='perf_analysis_baseline_type',
             ),
         ]
         indexes = [

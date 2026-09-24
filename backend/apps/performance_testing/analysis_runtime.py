@@ -74,6 +74,7 @@ _SAFE_FAILURES = {
     'permission_revoked': '项目权限已变化，分析任务已停止。',
     'model_unavailable': '所选模型已停用或不可用，请重新选择模型。',
     'run_unavailable': '压测运行已不可用于分析。',
+    'comparison_run_unavailable': '基线压测运行已不存在或不可用于对比。',
     'INVALID_MODEL_OUTPUT': '模型返回的分析结构无效，请重新分析。',
     'model_error': '模型服务调用失败，请稍后重新分析。',
     'analysis_failed': '分析任务执行失败，请重新分析。',
@@ -143,12 +144,62 @@ def _failure_message(code: str, progress: dict | None) -> str:
     return message + ''.join(details)
 
 
-def _request_hash(model_config_id: int, targets: dict) -> str:
+def _request_hash(
+    model_config_id: int, targets: dict, *, analysis_type: str,
+    comparison_run_id=None,
+) -> str:
+    # Keep the original load-summary fingerprint so pre-migration clients can
+    # safely replay an existing request_id after analysis_type is backfilled.
+    if (
+        analysis_type == PerformanceAnalysis.AnalysisType.LOAD_SUMMARY
+        and comparison_run_id is None
+    ):
+        value = {'model_config_id': model_config_id, 'targets': targets}
+    else:
+        value = {
+            'analysis_type': analysis_type,
+            'comparison_run_id': str(comparison_run_id) if comparison_run_id else None,
+            'model_config_id': model_config_id,
+            'targets': targets,
+        }
     encoded = json.dumps(
-        {'model_config_id': model_config_id, 'targets': targets},
+        value,
         ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False,
     ).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _locked_runs(*run_ids):
+    ids = sorted({run_id for run_id in run_ids if run_id is not None}, key=str)
+    return {
+        str(run.pk): run
+        for run in PerformanceRun.objects.select_for_update().filter(
+            pk__in=ids,
+        ).order_by('pk')
+    }
+
+
+def _current_run_available(analysis_type, run) -> bool:
+    if run is None or run.status not in PerformanceRun.TERMINAL_STATUSES:
+        return False
+    if analysis_type == PerformanceAnalysis.AnalysisType.VALIDATION_DIAGNOSIS:
+        return run.mode == PerformanceRun.Mode.VALIDATION
+    if analysis_type in (
+        PerformanceAnalysis.AnalysisType.LOAD_SUMMARY,
+        PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+    ):
+        return run.mode == PerformanceRun.Mode.LOAD
+    return False
+
+
+def _comparison_run_available(run, comparison_run) -> bool:
+    return bool(
+        comparison_run is not None
+        and comparison_run.pk != run.pk
+        and comparison_run.project_id == run.project_id
+        and comparison_run.mode == PerformanceRun.Mode.LOAD
+        and comparison_run.status in PerformanceRun.TERMINAL_STATUSES
+    )
 
 
 def _model(model_config_id: int):
@@ -222,18 +273,26 @@ def recover_expired_analyses(run_id) -> int:
 
 def _finish(analysis_id, expected_status, *, status, result=None, code='') -> bool:
     """Finish through a status CAS so an expired task cannot overwrite recovery."""
-    run_id = PerformanceAnalysis.objects.filter(pk=analysis_id).values_list('run_id', flat=True).first()
-    if run_id is None:
+    identity = PerformanceAnalysis.objects.filter(pk=analysis_id).values(
+        'run_id', 'comparison_run_id',
+    ).first()
+    if identity is None:
         return False
+    run_id = identity['run_id']
     with transaction.atomic():
-        if not PerformanceRun.objects.select_for_update().filter(pk=run_id).exists():
+        locked_runs = _locked_runs(run_id, identity['comparison_run_id'])
+        if str(run_id) not in locked_runs:
             return False
         _recover_locked(run_id)
-        analysis = PerformanceAnalysis.objects.filter(
+        analysis = PerformanceAnalysis.objects.select_related(
+            'created_by', 'run', 'comparison_run',
+        ).filter(
             pk=analysis_id, status=expected_status,
         ).first()
         if analysis is None:
             return False
+        if status == PerformanceAnalysis.Status.COMPLETED:
+            _require_runtime_access(analysis)
         values = {
             'status': status,
             'finished_at': timezone.now(),
@@ -256,11 +315,19 @@ def _finish(analysis_id, expected_status, *, status, result=None, code='') -> bo
         return updated
 
 
-def enqueue_analysis(run_id, user, request_id, model_config_id, targets):
+def enqueue_analysis(
+    run_id, user, request_id, model_config_id, targets, *,
+    analysis_type=PerformanceAnalysis.AnalysisType.LOAD_SUMMARY,
+    comparison_run_id=None,
+):
     """Create one analysis under the run lock and publish only after commit."""
-    fingerprint = _request_hash(model_config_id, targets)
+    fingerprint = _request_hash(
+        model_config_id, targets, analysis_type=analysis_type,
+        comparison_run_id=comparison_run_id,
+    )
     with transaction.atomic():
-        run = PerformanceRun.objects.select_for_update().filter(pk=run_id).first()
+        locked_runs = _locked_runs(run_id, comparison_run_id)
+        run = locked_runs.get(str(run_id))
         if run is None:
             raise PerformanceRun.DoesNotExist
         _recover_locked(run.pk)
@@ -273,8 +340,18 @@ def enqueue_analysis(run_id, user, request_id, model_config_id, targets):
                 raise AnalysisConflict('相同 request_id 对应的分析内容已变化，请使用新的请求编号。')
             return existing, False
 
-        if run.mode != PerformanceRun.Mode.LOAD or run.status not in PerformanceRun.TERMINAL_STATUSES:
-            raise AnalysisUnavailable('仅已结束的正式压测运行可以发起分析。')
+        if not _current_run_available(analysis_type, run):
+            raise AnalysisUnavailable('当前运行的类型或状态不支持所选分析。')
+        if analysis_type != PerformanceAnalysis.AnalysisType.LOAD_SUMMARY and targets:
+            raise AnalysisUnavailable('当前分析类型不支持性能目标。')
+        comparison_run = (
+            locked_runs.get(str(comparison_run_id)) if comparison_run_id else None
+        )
+        if analysis_type == PerformanceAnalysis.AnalysisType.LOAD_COMPARISON:
+            if not _comparison_run_available(run, comparison_run):
+                raise AnalysisUnavailable('基线运行必须是同一项目下另一条已结束的正式压测。')
+        elif comparison_run_id is not None:
+            raise AnalysisUnavailable('当前分析类型不支持基线运行。')
         if PerformanceAnalysis.objects.filter(
             run=run, status__in=PerformanceAnalysis.ACTIVE_STATUSES,
         ).exists():
@@ -289,9 +366,11 @@ def enqueue_analysis(run_id, user, request_id, model_config_id, targets):
         timeout_seconds = analysis_timeout_seconds()
         analysis = PerformanceAnalysis.objects.create(
             run=run,
+            comparison_run=comparison_run,
             created_by=user,
             request_id=request_id,
             request_hash=fingerprint,
+            analysis_type=analysis_type,
             model_config_id=config.pk,
             model_info=_model_info(config),
             targets=targets,
@@ -344,9 +423,16 @@ def _require_runtime_access(analysis):
         or config.model_name != analysis.model_info.get('model_name')
     ):
         raise TaskStopped('model_unavailable')
+    if not _current_run_available(analysis.analysis_type, analysis.run):
+        raise TaskStopped('run_unavailable')
+    if analysis.analysis_type == PerformanceAnalysis.AnalysisType.LOAD_COMPARISON:
+        if not _comparison_run_available(analysis.run, analysis.comparison_run):
+            raise TaskStopped('comparison_run_unavailable')
+    elif analysis.comparison_run_id is not None:
+        raise TaskStopped('run_unavailable')
     if (
-        analysis.run.mode != PerformanceRun.Mode.LOAD
-        or analysis.run.status not in PerformanceRun.TERMINAL_STATUSES
+        analysis.analysis_type != PerformanceAnalysis.AnalysisType.LOAD_SUMMARY
+        and analysis.targets
     ):
         raise TaskStopped('run_unavailable')
 
@@ -383,7 +469,7 @@ class AnalysisContext:
         ):
             return True
         analysis = PerformanceAnalysis.objects.select_related(
-            'created_by', 'run',
+            'created_by', 'run', 'comparison_run',
         ).filter(pk=self.analysis_id).first()
         if analysis is None or analysis.status != PerformanceAnalysis.Status.RUNNING:
             raise TaskStopped('analysis_timeout')
@@ -512,16 +598,20 @@ class AnalysisContext:
 
 
 def _claim(analysis_id):
-    run_id = PerformanceAnalysis.objects.filter(pk=analysis_id).values_list('run_id', flat=True).first()
-    if run_id is None:
+    identity = PerformanceAnalysis.objects.filter(pk=analysis_id).values(
+        'run_id', 'comparison_run_id',
+    ).first()
+    if identity is None:
         return None
+    run_id = identity['run_id']
     with transaction.atomic():
-        run = PerformanceRun.objects.select_for_update().filter(pk=run_id).first()
+        locked_runs = _locked_runs(run_id, identity['comparison_run_id'])
+        run = locked_runs.get(str(run_id))
         if run is None:
             return None
         _recover_locked(run.pk)
         analysis = PerformanceAnalysis.objects.select_for_update().select_related(
-            'created_by', 'run',
+            'created_by', 'run', 'comparison_run',
         ).filter(pk=analysis_id).first()
         if analysis is None or analysis.status != PerformanceAnalysis.Status.QUEUED:
             return None
@@ -560,6 +650,47 @@ def _claim(analysis_id):
         return analysis
 
 
+def _build_payload(analysis):
+    run_ids = [analysis.run_id]
+    if analysis.comparison_run_id is not None:
+        run_ids.append(analysis.comparison_run_id)
+    runs = {
+        run.pk: run
+        for run in PerformanceRun.objects.filter(pk__in=run_ids).prefetch_related(
+            'participants',
+        )
+    }
+    run = runs.get(analysis.run_id)
+    if run is None:
+        raise TaskStopped('run_unavailable')
+
+    if analysis.analysis_type == PerformanceAnalysis.AnalysisType.LOAD_SUMMARY:
+        from .analysis_data import build_analysis_input
+        payload = build_analysis_input(run, analysis.targets)
+    elif analysis.analysis_type == PerformanceAnalysis.AnalysisType.VALIDATION_DIAGNOSIS:
+        from .diagnosis_data import build_validation_input
+        payload = build_validation_input(run)
+    elif analysis.analysis_type == PerformanceAnalysis.AnalysisType.LOAD_COMPARISON:
+        comparison_run = runs.get(analysis.comparison_run_id)
+        if comparison_run is None:
+            raise TaskStopped('comparison_run_unavailable')
+        from .comparison_data import build_comparison_input
+        payload = build_comparison_input(run, comparison_run)
+    else:
+        raise TaskStopped('run_unavailable')
+
+    if not isinstance(payload, dict):
+        raise TaskStopped('analysis_failed')
+    payload = dict(payload)
+    payload_type = payload.get(
+        'analysis_type', PerformanceAnalysis.AnalysisType.LOAD_SUMMARY,
+    )
+    if payload_type != analysis.analysis_type:
+        raise TaskStopped('analysis_failed')
+    payload['analysis_type'] = analysis.analysis_type
+    return payload
+
+
 def execute_analysis(analysis_id):
     analysis = _claim(analysis_id)
     if analysis is None:
@@ -568,13 +699,11 @@ def execute_analysis(analysis_id):
     context = AnalysisContext(analysis)
     try:
         from project_knowledge.llm import KnowledgeLLMTimeout
-        from .analysis_data import build_analysis_input
         from .analysis_engine import AnalysisOutputError, generate_analysis
 
         context.check_active(force=True)
         context.on_event({'phase': 'preparing'}, force=True)
-        run = PerformanceRun.objects.prefetch_related('participants').get(pk=analysis.run_id)
-        payload = build_analysis_input(run, analysis.targets)
+        payload = _build_payload(analysis)
         updated = PerformanceAnalysis.objects.filter(
             pk=analysis.pk, status=PerformanceAnalysis.Status.RUNNING,
         ).update(input_snapshot=payload)

@@ -1,6 +1,8 @@
 from datetime import timedelta
+import sys
 import uuid
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from celery.exceptions import SoftTimeLimitExceeded
 from django.test import TestCase, override_settings
@@ -146,6 +148,249 @@ class PerformanceAnalysisRuntimeTests(TestCase):
         execute_analysis(str(changed_model.pk))
         changed_model.refresh_from_db()
         self.assertEqual((changed_model.status, changed_model.error_code), ('failed', 'model_unavailable'))
+
+    def test_runtime_dispatches_validation_and_comparison_builders(self):
+        validation_run = PerformanceRun.objects.create(
+            project=self.project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.VALIDATION,
+            status=PerformanceRun.Status.COMPLETED,
+            snapshot={}, snapshot_sha256='1' * 64,
+        )
+        validation = self._analysis(
+            run=validation_run,
+            analysis_type=PerformanceAnalysis.AnalysisType.VALIDATION_DIAGNOSIS,
+            targets={},
+        )
+        validation_payload = {
+            'analysis_type': 'validation_diagnosis',
+            'assessment': {'status': 'passed'},
+            'evidence': [], 'limitations': [],
+        }
+        validation_builder = Mock(return_value=validation_payload)
+        module = SimpleNamespace(build_validation_input=validation_builder)
+        with patch.dict(sys.modules, {
+            'performance_testing.diagnosis_data': module,
+        }), patch(
+            'performance_testing.analysis_engine.generate_analysis',
+            side_effect=lambda model_config_id, payload, check_active,
+            remaining_seconds, on_event=None: self._result(payload),
+        ):
+            response = execute_analysis(str(validation.pk))
+        self.assertEqual(response['status'], 'completed')
+        validation.refresh_from_db()
+        self.assertEqual(validation.input_snapshot, validation_payload)
+        validation_builder.assert_called_once()
+        self.assertEqual(validation_builder.call_args.args[0].pk, validation_run.pk)
+
+        current = self.run
+        baseline = PerformanceRun.objects.create(
+            project=self.project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.LOAD, status=PerformanceRun.Status.COMPLETED,
+            snapshot={}, snapshot_sha256='2' * 64,
+        )
+        comparison = self._analysis(
+            run=current, comparison_run=baseline,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+            targets={},
+        )
+        comparison_payload = {
+            'analysis_type': 'load_comparison',
+            'assessment': {'status': 'comparable'},
+            'evidence': [], 'limitations': [],
+        }
+        comparison_builder = Mock(return_value=comparison_payload)
+        module = SimpleNamespace(build_comparison_input=comparison_builder)
+        with patch.dict(sys.modules, {
+            'performance_testing.comparison_data': module,
+        }), patch(
+            'performance_testing.analysis_engine.generate_analysis',
+            side_effect=lambda model_config_id, payload, check_active,
+            remaining_seconds, on_event=None: self._result(payload),
+        ):
+            response = execute_analysis(str(comparison.pk))
+        self.assertEqual(response['status'], 'completed')
+        comparison.refresh_from_db()
+        self.assertEqual(comparison.input_snapshot, comparison_payload)
+        comparison_builder.assert_called_once()
+        self.assertEqual(
+            [item.pk for item in comparison_builder.call_args.args],
+            [current.pk, baseline.pk],
+        )
+
+    def test_real_comparison_builder_integrates_without_exposing_authored_text(self):
+        secret = 'https://user:secret@provider.invalid/private-endpoint'
+        self.run.snapshot = {
+            'plan_name': 'private comparison plan',
+            'base_url': secret,
+            'users': 5,
+            'duration_seconds': 30,
+        }
+        self.run.latest_metrics = {
+            'requests': 10, 'failures': 0, 'rps': 2,
+            'p95': 100, 'complete': True,
+            'entries': [{
+                'method': 'GET', 'name': secret,
+                'requests': 10, 'failures': 0,
+            }],
+        }
+        self.run.save(update_fields=('snapshot', 'latest_metrics'))
+        baseline = PerformanceRun.objects.create(
+            project=self.project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.LOAD, status=PerformanceRun.Status.COMPLETED,
+            snapshot={
+                'plan_name': 'private baseline plan',
+                'base_url': secret,
+                'users': 5,
+                'duration_seconds': 30,
+            },
+            snapshot_sha256='6' * 64,
+            latest_metrics={
+                'requests': 8, 'failures': 0, 'rps': 1.6,
+                'p95': 110, 'complete': True,
+                'entries': [{
+                    'method': 'GET', 'name': secret,
+                    'requests': 8, 'failures': 0,
+                }],
+            },
+        )
+        analysis = self._analysis(
+            comparison_run=baseline,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+            targets={},
+        )
+
+        def generate(
+            model_config_id, payload, check_active, remaining_seconds, on_event=None,
+        ):
+            self.assertEqual(payload['analysis_type'], 'load_comparison')
+            self.assertEqual(payload['assessment']['status'], 'insufficient_data')
+            self.assertNotIn('secret', str(payload))
+            self.assertNotIn('private comparison plan', str(payload))
+            self.assertNotIn('private baseline plan', str(payload))
+            return self._result(payload)
+
+        with patch(
+            'performance_testing.analysis_engine.generate_analysis', side_effect=generate,
+        ):
+            response = execute_analysis(str(analysis.pk))
+
+        self.assertEqual(response['status'], 'completed')
+        analysis.refresh_from_db()
+        self.assertEqual(analysis.status, PerformanceAnalysis.Status.COMPLETED)
+        self.assertEqual(analysis.input_snapshot['analysis_type'], 'load_comparison')
+        self.assertNotIn('secret', str(analysis.input_snapshot))
+        self.assertNotIn('private comparison plan', str(analysis.input_snapshot))
+        self.assertNotIn('private baseline plan', str(analysis.input_snapshot))
+
+    def test_real_validation_builder_integrates_without_exposing_authored_text(self):
+        secret = 'https://user:secret@provider.invalid/private-validation'
+        validation_run = PerformanceRun.objects.create(
+            project=self.project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.VALIDATION,
+            status=PerformanceRun.Status.COMPLETED,
+            snapshot={
+                'plan_name': 'private validation plan',
+                'variables': {'private_variable': secret},
+                'unique_variables': [],
+                'steps': [{
+                    'method': 'GET', 'phase': 'main', 'path': secret,
+                    'query': {}, 'headers': {}, 'body': None,
+                    'assertions': [], 'extract': [],
+                }],
+            },
+            snapshot_sha256='7' * 64,
+            latest_metrics={'complete': False, 'failure_samples': []},
+        )
+        analysis = self._analysis(
+            run=validation_run,
+            analysis_type=PerformanceAnalysis.AnalysisType.VALIDATION_DIAGNOSIS,
+            targets={},
+        )
+
+        def generate(
+            model_config_id, payload, check_active, remaining_seconds, on_event=None,
+        ):
+            self.assertEqual(payload['analysis_type'], 'validation_diagnosis')
+            self.assertEqual(payload['assessment']['status'], 'insufficient_data')
+            self.assertNotIn('secret', str(payload))
+            self.assertNotIn('private validation plan', str(payload))
+            self.assertNotIn('private_variable', str(payload))
+            return self._result(payload)
+
+        with patch(
+            'performance_testing.analysis_engine.generate_analysis', side_effect=generate,
+        ):
+            response = execute_analysis(str(analysis.pk))
+
+        self.assertEqual(response['status'], 'completed')
+        analysis.refresh_from_db()
+        self.assertEqual(analysis.status, PerformanceAnalysis.Status.COMPLETED)
+        self.assertEqual(analysis.input_snapshot['analysis_type'], 'validation_diagnosis')
+        self.assertNotIn('secret', str(analysis.input_snapshot))
+        self.assertNotIn('private validation plan', str(analysis.input_snapshot))
+        self.assertNotIn('private_variable', str(analysis.input_snapshot))
+
+    def test_comparison_baseline_is_rechecked_and_completed_evidence_survives_delete(self):
+        baseline = PerformanceRun.objects.create(
+            project=self.project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.LOAD, status=PerformanceRun.Status.COMPLETED,
+            snapshot={}, snapshot_sha256='3' * 64,
+        )
+        queued = self._analysis(
+            comparison_run=baseline,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+            targets={},
+        )
+        baseline.delete()
+        response = execute_analysis(str(queued.pk))
+        self.assertEqual(response['status'], 'skipped')
+        queued.refresh_from_db()
+        self.assertIsNone(queued.comparison_run_id)
+        self.assertEqual(
+            (queued.status, queued.error_code),
+            ('failed', 'comparison_run_unavailable'),
+        )
+
+        retained_baseline = PerformanceRun.objects.create(
+            project=self.project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.LOAD, status=PerformanceRun.Status.COMPLETED,
+            snapshot={}, snapshot_sha256='4' * 64,
+        )
+        completed = self._analysis(
+            comparison_run=retained_baseline,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+            targets={}, status=PerformanceAnalysis.Status.COMPLETED,
+            input_snapshot={'safe': 'input'}, result={'safe': 'result'},
+            finished_at=timezone.now(),
+        )
+        retained_baseline.delete()
+        completed.refresh_from_db()
+        self.assertIsNone(completed.comparison_run_id)
+        self.assertEqual(completed.input_snapshot, {'safe': 'input'})
+        self.assertEqual(completed.result, {'safe': 'result'})
+
+    def test_comparison_background_rejects_cross_project_baseline(self):
+        other_project = Project.objects.create(
+            name='other-analysis-project', project_type='perf', created_by=self.user,
+        )
+        baseline = PerformanceRun.objects.create(
+            project=other_project, created_by=self.user, request_id=uuid.uuid4(),
+            mode=PerformanceRun.Mode.LOAD, status=PerformanceRun.Status.COMPLETED,
+            snapshot={}, snapshot_sha256='5' * 64,
+        )
+        analysis = self._analysis(
+            comparison_run=baseline,
+            analysis_type=PerformanceAnalysis.AnalysisType.LOAD_COMPARISON,
+            targets={},
+        )
+        with patch('performance_testing.analysis_engine.generate_analysis') as generate:
+            execute_analysis(str(analysis.pk))
+        generate.assert_not_called()
+        analysis.refresh_from_db()
+        self.assertEqual(
+            (analysis.status, analysis.error_code),
+            ('failed', 'comparison_run_unavailable'),
+        )
 
     def test_permission_is_rechecked_after_model_returns(self):
         analysis = self._analysis()

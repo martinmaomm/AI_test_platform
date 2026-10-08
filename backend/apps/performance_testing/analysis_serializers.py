@@ -43,7 +43,7 @@ class PerformanceAnalysisCreateSerializer(StrictSerializer):
         default=PerformanceAnalysis.AnalysisType.LOAD_SUMMARY,
     )
     comparison_run_id = serializers.UUIDField(required=False, allow_null=True, default=None)
-    targets = PerformanceAnalysisTargetsSerializer(required=False, default=dict)
+    targets = PerformanceAnalysisTargetsSerializer(required=False)
 
     def validate(self, attrs):
         analysis_type = attrs['analysis_type']

@@ -31,6 +31,16 @@ export const getPerformanceNodeInstallation = async (projectId, id) => {
 // 执行接口只使用服务端公开的管理字段；运行命令和 TLS 材料不会经过前端。
 export const getPerformanceRuns = (projectId) => get(`${base(projectId)}/runs/`)
 export const getPerformanceRun = (projectId, runId) => get(`${base(projectId)}/runs/${runId}/`)
+export const downloadPerformanceReport = async (projectId, runId) => {
+  try {
+    return await get(`${base(projectId)}/runs/${runId}/report.html`, { responseType: 'blob' })
+  } catch (error) {
+    if (error.response?.data instanceof Blob) {
+      try { error.response.data = JSON.parse(await error.response.data.text()) } catch { /* retain HTTP error */ }
+    }
+    throw error
+  }
+}
 export const createPerformanceRun = (projectId, planId, data) => post(`${base(projectId)}/plans/${planId}/runs/`, data)
 export const getPerformanceNodeEligibility = (projectId, planId) =>
   get(`${base(projectId)}/plans/${planId}/node-eligibility/`)

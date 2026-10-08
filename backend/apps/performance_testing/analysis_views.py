@@ -68,9 +68,10 @@ class PerformanceAnalysisListCreateView(PerformanceAnalysisAPIView):
         serializer.is_valid(raise_exception=True)
         values = serializer.validated_data
         try:
+            default_targets = run.acceptance_targets if values['analysis_type'] == 'load_summary' else {}
             analysis, created = enqueue_analysis(
                 run.pk, request.user, values['request_id'],
-                values['model_config_id'], values['targets'],
+                values['model_config_id'], values.get('targets', default_targets),
                 analysis_type=values['analysis_type'],
                 comparison_run_id=values['comparison_run_id'],
             )

@@ -8,6 +8,7 @@ from datetime import datetime
 import math
 
 from .throughput import derive_throughput
+from .failure_diagnosis import build_failure_diagnosis
 
 
 MAX_ENDPOINTS = 50
@@ -241,6 +242,11 @@ def build_analysis_input(run, targets):
     add('errors.samples', '去重失败样本的类型分布（不是失败请求次数）', dict(counts))
     if counts:
         limitations.append('失败样本经过去重和数量截断，样本类型分布不代表全部失败的频率。')
+
+    failure_diagnosis = build_failure_diagnosis(run)
+    for item in failure_diagnosis['items']:
+        add(item['id'], item['label'], {key: value for key, value in item.items() if key not in {'id', 'label'}})
+    limitations.extend(failure_diagnosis['limitations'])
 
     return {
         'schema_version': 1,

@@ -141,6 +141,32 @@
             >
           </section>
           <section>
+            <h3>性能验收标准（可选，仅正式压测）</h3>
+            <p class="field-help">
+              运行前设置，留空不参与验收；全部留空时显示“未配置验收标准”。每次运行保存当时的标准，后续编辑不会改变历史结论。
+            </p>
+            <div class="grid">
+              <el-form-item
+                v-for="field in acceptanceFields"
+                :key="field.key"
+                :label="`${field.label}（${field.unit}）`"
+              >
+                <el-input-number
+                  v-model="form.acceptance_targets[field.key]"
+                  :min="0"
+                  :max="field.key === 'error_rate_percent' ? 100 : undefined"
+                  :precision="2"
+                  :data-testid="`acceptance-${field.key}`"
+                  placeholder="不设置"
+                  controls-position="right"
+                />
+              </el-form-item>
+            </div>
+            <p v-if="formError.acceptance" class="error">
+              {{ formError.acceptance }}
+            </p>
+          </section>
+          <section>
             <h3>变量</h3>
             <el-form-item label="固定变量 JSON 值"
               ><div id="plan-fixed-variables-help" class="variable-help">
@@ -209,10 +235,14 @@
           <section data-testid="plan-request-timeouts">
             <h3>请求超时</h3>
             <p class="load-note">
-              连接建立等待用于建立 TCP/TLS 连接；响应读取等待是等待响应首字节或后续数据的最长空闲时间。两者都不是整个请求的总时长，对所有步骤生效，验证和正式压测使用同一配置；单用户验证整轮最长 120 秒。
+              连接建立等待用于建立 TCP/TLS
+              连接；响应读取等待是等待响应首字节或后续数据的最长空闲时间。两者都不是整个请求的总时长，对所有步骤生效，验证和正式压测使用同一配置；单用户验证整轮最长
+              120 秒。
             </p>
             <div class="grid">
-              <el-form-item label="连接建立等待（秒）" :error="formError.connect_timeout_seconds"
+              <el-form-item
+                label="连接建立等待（秒）"
+                :error="formError.connect_timeout_seconds"
                 ><el-input-number
                   v-model="form.connect_timeout_seconds"
                   data-testid="plan-connect-timeout"
@@ -221,7 +251,9 @@
                   :step="1"
                   :precision="0"
               /></el-form-item>
-              <el-form-item label="响应读取等待（秒）" :error="formError.read_timeout_seconds"
+              <el-form-item
+                label="响应读取等待（秒）"
+                :error="formError.read_timeout_seconds"
                 ><el-input-number
                   v-model="form.read_timeout_seconds"
                   data-testid="plan-read-timeout"
@@ -473,6 +505,10 @@ import {
   serializePlanSteps,
   validatePlanRequestTimeouts,
 } from "../performancePlanEditorState";
+import {
+  acceptanceFields,
+  serializeAcceptanceTargets,
+} from "../performanceAcceptanceState";
 const props = defineProps({
   visible: Boolean,
   item: Object,
@@ -497,6 +533,7 @@ const selectedIndex = ref(0);
 const errors = ref([]);
 const formError = reactive({
   variables: "",
+  acceptance: "",
   connect_timeout_seconds: "",
   read_timeout_seconds: "",
 });
@@ -527,6 +564,7 @@ const blank = () => ({
   read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
   variablesText: "{}",
   unique_variables: [],
+  acceptance_targets: {},
   steps: [createPlanStep()],
 });
 const form = reactive(blank());
@@ -591,6 +629,7 @@ function reset() {
       ? {
           ...blank(),
           ...source,
+          acceptance_targets: { ...(source.acceptance_targets || {}) },
           ...normalizePlanRequestTimeouts(source),
           variablesText: JSON.stringify(source.variables || {}, null, 2),
           unique_variables: (source.unique_variables || []).map(
@@ -607,6 +646,7 @@ function reset() {
   selectedIndex.value = 0;
   errors.value = [];
   formError.variables = "";
+  formError.acceptance = "";
   formError.connect_timeout_seconds = "";
   formError.read_timeout_seconds = "";
   initialSnapshot.value = snapshot();
@@ -668,12 +708,12 @@ async function save() {
     return;
   }
   formError.variables = "";
-  Object.assign(
-    formError,
-    validatePlanRequestTimeouts(form, props.limits),
-  );
+  Object.assign(formError, validatePlanRequestTimeouts(form, props.limits));
   if (formError.connect_timeout_seconds || formError.read_timeout_seconds)
     return;
+  const acceptance = serializeAcceptanceTargets(form.acceptance_targets);
+  formError.acceptance = acceptance.error;
+  if (acceptance.error) return;
   const serialized = serializePlanSteps(form.steps, targetMethods.value);
   errors.value = serialized.errors;
   const invalid = errors.value.findIndex(Boolean);
@@ -692,6 +732,7 @@ async function save() {
     connect_timeout_seconds: form.connect_timeout_seconds,
     read_timeout_seconds: form.read_timeout_seconds,
     variables,
+    acceptance_targets: acceptance.value,
     unique_variables: form.unique_variables.map(({ name, prefix }) => ({
       name: name.trim(),
       prefix: prefix.trim(),

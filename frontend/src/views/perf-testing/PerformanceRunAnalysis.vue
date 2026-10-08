@@ -64,39 +64,8 @@
         :closable="false"
         >请先选择一个基准运行，再发起 AI 对比解读。</el-alert
       >
-      <el-form
-        v-if="isSummary"
-        class="target-form"
-        label-position="top"
-        :disabled="
-          creating || Boolean(activeAnalysis) || Boolean(pendingPayload)
-        "
-      >
-        <el-form-item label="P95 上限（毫秒，可选）"
-          ><el-input-number
-            v-model="targets.p95_ms"
-            :min="0"
-            :precision="2"
-            controls-position="right"
-        /></el-form-item>
-        <el-form-item label="错误率上限（%，可选）"
-          ><el-input-number
-            v-model="targets.error_rate_percent"
-            :min="0"
-            :max="100"
-            :precision="2"
-            controls-position="right"
-        /></el-form-item>
-        <el-form-item label="平均请求吞吐量下限（次/秒，可选）"
-          ><el-input-number
-            v-model="targets.rps_min"
-            :min="0"
-            :precision="2"
-            controls-position="right"
-        /></el-form-item>
-      </el-form>
       <p v-if="isSummary" class="target-note">
-        目标仅用于本次分析；未填写时，只分析实际表现，不判定是否达标。
+        新分析使用本次运行开始前保存的验收标准；未配置时只分析实际表现。历史分析保留其当时的目标与结论。失败定位仅依据已采集样本，不代表所有失败的分布。
       </p>
       <el-empty
         v-if="!loading && !selectedAnalysis && !analyses.length"
@@ -313,7 +282,6 @@ import {
   analysisSeverityLabel,
   analysisStatusLabel,
   analysisStatusType,
-  analysisTargetsIssue,
   buildAnalysisRequest,
   analysisEmptyLabel,
   analysisTypeLabel,
@@ -358,11 +326,6 @@ const selectedAnalysis = ref(null);
 const loading = ref(false);
 const creating = ref(false);
 const error = ref("");
-const targets = ref({
-  p95_ms: undefined,
-  error_rate_percent: undefined,
-  rps_min: undefined,
-});
 const evidenceExpanded = ref([]);
 const now = ref(Date.now());
 let pollTimer;
@@ -492,6 +455,11 @@ const severityType = (value) =>
 const findingKindType = (value) =>
   ({ observation: "success", hypothesis: "warning" })[value] || "info";
 const evidenceLabel = (item = {}) => {
+  if (/^failure\.\d+$/.test(String(item.id || ""))) {
+    const index = item.value?.step_index;
+    const step = index == null ? null : props.run?.snapshot?.steps?.[index - 1];
+    return `${item.label || item.id}${step?.name ? `（${step.name}）` : ""}`;
+  }
   const comparisonMatch = /^comparison\.endpoint\.(\d+)$/.exec(
     String(item.id || ""),
   );
@@ -681,17 +649,12 @@ async function refresh() {
 async function create() {
   const captured = scope();
   if (!canCreate.value) return;
-  const issue =
-    pendingPayload.value || !isSummary.value
-      ? ""
-      : analysisTargetsIssue(targets.value);
-  if (issue) return ElMessage.warning(issue);
   const retryingUncertainRequest = Boolean(pendingPayload.value);
   const payload =
     pendingPayload.value ||
     buildAnalysisRequest(
       modelConfigId.value,
-      targets.value,
+      props.run?.acceptance_targets || {},
       undefined,
       analysisType.value,
       props.comparisonRunId,
@@ -751,11 +714,6 @@ function reset() {
   modelsLoading.value = false;
   models.value = [];
   modelConfigId.value = null;
-  targets.value = {
-    p95_ms: undefined,
-    error_rate_percent: undefined,
-    rps_min: undefined,
-  };
   pendingPayload.value = null;
   if (available.value && props.canReport) {
     const captured = scope();
@@ -815,14 +773,6 @@ onBeforeUnmount(() => {
 }
 .analysis-actions .el-select {
   width: 280px;
-}
-.target-form {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.target-form .el-form-item {
-  margin-bottom: 0;
 }
 .analysis-history {
   margin: 16px 0;

@@ -231,6 +231,27 @@ class PerformanceRunContractTests(TestCase):
         return run
 
     @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
+    def test_acceptance_targets_freeze_without_changing_node_contract_or_validation(self, _):
+        validation = self._complete_validation(self.node)
+        self.assertEqual(validation.acceptance_targets, {})
+        self.plan.acceptance_targets = {'p95_ms': 500, 'error_rate_percent': 0}
+        self.plan.save(update_fields=['acceptance_targets'])
+        request_id = uuid.uuid4()
+        created = self._create(request_id=request_id, mode='load')
+        self.assertEqual(created.status_code, 201, created.data)
+        run = PerformanceRun.objects.get(pk=created.data['data']['id'])
+        self.assertEqual(run.acceptance_targets, self.plan.acceptance_targets)
+        self.assertNotIn('acceptance_targets', run.snapshot)
+        frozen = run.acceptance_targets.copy()
+        self.plan.acceptance_targets = {'p95_ms': 100}
+        self.plan.save(update_fields=['acceptance_targets'])
+        retry = self._create(request_id=request_id, mode='load')
+        self.assertEqual(retry.status_code, 200, retry.data)
+        run.refresh_from_db()
+        self.assertEqual(run.acceptance_targets, frozen)
+        self.assertEqual(created.data['data']['acceptance']['status'], 'pending')
+
+    @patch('performance_testing.run_services.execution_configuration', return_value=AVAILABLE)
     def test_new_enrollment_generation_invalidates_old_same_version_validation(self, _):
         validation = self._complete_validation(self.node)
         self.client.force_authenticate(self.executor)

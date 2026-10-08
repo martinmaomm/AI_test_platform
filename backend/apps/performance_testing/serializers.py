@@ -319,6 +319,15 @@ class PlanStepSerializer(StrictSerializer):
 
 
 class PerformancePlanSerializer(StrictModelSerializer):
+    acceptance_targets = serializers.JSONField(default=dict)
+
+    def validate_acceptance_targets(self, value):
+        from .acceptance import validate_targets
+        try:
+            return validate_targets(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
     target_id = StrictPrimaryKeyRelatedField(
         source='target', queryset=PerformanceTarget.objects.none(),
     )
@@ -343,7 +352,7 @@ class PerformancePlanSerializer(StrictModelSerializer):
         fields = (
             'id', 'name', 'description', 'target_id', 'users', 'spawn_rate',
             'duration_seconds', 'wait_seconds', 'connect_timeout_seconds',
-            'read_timeout_seconds', 'variables', 'unique_variables', 'steps',
+            'read_timeout_seconds', 'variables', 'unique_variables', 'steps', 'acceptance_targets',
             'created_at', 'updated_at',
         )
         read_only_fields = ('id', 'created_at', 'updated_at')
@@ -635,6 +644,12 @@ class PerformanceRunNodeDetailSerializer(PerformanceRunNodeListSerializer):
 
 
 class PerformanceRunListSerializer(serializers.ModelSerializer):
+    acceptance = serializers.SerializerMethodField()
+
+    def get_acceptance(self, obj):
+        from .acceptance import run_acceptance
+        return run_acceptance(obj)
+
     plan_name = serializers.SerializerMethodField()
     node_count = serializers.SerializerMethodField()
     nodes = serializers.SerializerMethodField()
@@ -645,7 +660,7 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
         model = PerformanceRun
         fields = (
             'id', 'plan_id', 'plan_name', 'node_count', 'nodes', 'mode',
-            'status', 'validation_status',
+            'status', 'validation_status', 'acceptance_targets', 'acceptance',
             'created_at', 'started_at', 'finished_at', 'reason_code', 'reason',
             'latest_metrics',
         )
@@ -697,6 +712,11 @@ class PerformanceRunListSerializer(serializers.ModelSerializer):
 class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
     validation_steps = serializers.SerializerMethodField()
     throughput = serializers.SerializerMethodField()
+    failure_diagnosis = serializers.SerializerMethodField()
+
+    def get_failure_diagnosis(self, obj):
+        from .failure_diagnosis import build_failure_diagnosis
+        return build_failure_diagnosis(obj)
 
     def get_throughput(self, obj):
         from .throughput import derive_throughput
@@ -713,5 +733,5 @@ class PerformanceRunDetailSerializer(PerformanceRunListSerializer):
 
     class Meta(PerformanceRunListSerializer.Meta):
         fields = PerformanceRunListSerializer.Meta.fields + (
-            'metrics_samples', 'snapshot', 'validation_steps', 'throughput',
+            'metrics_samples', 'snapshot', 'validation_steps', 'throughput', 'failure_diagnosis',
         )

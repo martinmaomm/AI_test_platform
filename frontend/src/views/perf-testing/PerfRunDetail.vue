@@ -8,6 +8,8 @@
         @click="router.push({ name: 'PerfPlans', query: route.query })"
         >返回正式压测节点选择</el-button
       ><el-button :loading="loading" @click="loadRun">刷新</el-button
+      ><el-button v-if="canExport" :loading="exporting" @click="exportReport"
+        >导出 HTML 报告</el-button
       ><el-button
         v-if="canExecute && canStopPerformanceRun(run?.status)"
         type="danger"
@@ -92,6 +94,10 @@
           ><template v-else>未记录</template>
         </el-descriptions-item>
       </el-descriptions>
+      <PerformanceAcceptance
+        v-if="run.mode === 'load'"
+        :result="run.acceptance"
+      />
       <PerformanceValidationSteps
         v-if="run.mode === 'validation'"
         :key="run.id"
@@ -312,6 +318,41 @@
             label="诊断"
             min-width="180" /></el-table
       ></template>
+      <section
+        v-if="run.mode === 'load'"
+        class="failure-diagnosis"
+        data-testid="load-failure-diagnosis"
+      >
+        <h3>失败定位（轻量版）</h3>
+        <p>
+          汇总全部节点现有样本，不重复发送请求。下方 AI
+          分析也会使用这些定位信息。
+        </p>
+        <el-table
+          v-if="run.failure_diagnosis?.items?.length"
+          :data="run.failure_diagnosis.items"
+        >
+          <el-table-column label="失败位置" min-width="260"
+            ><template #default="{ row }">{{
+              failureLocation(row)
+            }}</template></el-table-column
+          >
+          <el-table-column prop="sample_count" label="去重样本数" width="110" />
+          <el-table-column prop="suggestion" label="排查建议" min-width="320" />
+        </el-table>
+        <el-empty
+          v-else
+          description="没有可用失败样本，请结合失败请求数和数据完整性判断"
+          :image-size="60"
+        />
+        <p
+          v-for="note in run.failure_diagnosis?.limitations || []"
+          :key="note"
+          class="throughput-note"
+        >
+          {{ note }}
+        </p>
+      </section>
       <PerformanceRunComparison
         v-if="run.mode === 'load'"
         :project-id="projectId"
@@ -334,6 +375,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import PerformanceAcceptance from "./PerformanceAcceptance.vue";
 import PerformanceValidationSteps from "./PerformanceValidationSteps.vue";
 import PerformanceRunAnalysis from "./PerformanceRunAnalysis.vue";
 import PerformanceRunComparison from "./PerformanceRunComparison.vue";
@@ -355,6 +397,7 @@ import { useProjectStore } from "@/stores/project";
 import { getProject } from "@/api/projects";
 import {
   getPerformanceRun,
+  downloadPerformanceReport,
   performanceErrorMessage,
   stopPerformanceRun,
 } from "@/api/performance";
@@ -397,6 +440,15 @@ const run = ref(null);
 const project = ref(null);
 const loading = ref(false);
 const stopping = ref(false);
+const exporting = ref(false);
+const canExport = computed(
+  () =>
+    canReport.value &&
+    run.value?.mode === "load" &&
+    ["completed", "failed", "cancelled", "incomplete"].includes(
+      run.value?.status,
+    ),
+);
 const pollError = ref("");
 const pollFailures = ref(0);
 const selectedNodeId = ref("");
@@ -459,6 +511,16 @@ const nodeNames = computed(() => {
   const names = runNodes.value.map(performanceRunNodeName);
   return names.length ? names.join("、") : run.value?.node_name || "-";
 });
+const failureLocation = (item) => {
+  const step =
+    item.step_index == null
+      ? null
+      : run.value?.snapshot?.steps?.[item.step_index - 1];
+  const node =
+    item.node_index == null ? null : run.value?.nodes?.[item.node_index - 1];
+  const names = [step?.name, node?.node_name].filter(Boolean).join(" · ");
+  return `${item.label}${names ? `（${names}）` : ""}`;
+};
 const metricScopeText = computed(() =>
   selectedNode.value
     ? "统计范围：当前选中节点，数据截至最近一次上报。"
@@ -679,6 +741,29 @@ async function loadRun() {
       loading.value = false;
   }
 }
+async function exportReport() {
+  if (!canExport.value || exporting.value) return;
+  const scope = currentScope();
+  exporting.value = true;
+  try {
+    const blob = await downloadPerformanceReport(scope.projectId, scope.runId);
+    if (!scopeIsCurrent(scope)) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `performance-${scope.runId}.html`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    ElMessage.success("报告已导出，文件可离线打开，无需登录平台。");
+  } catch (error) {
+    if (scopeIsCurrent(scope))
+      ElMessage.error(performanceErrorMessage(error, "导出报告失败"));
+  } finally {
+    if (scopeIsCurrent(scope)) exporting.value = false;
+  }
+}
 async function stopRun() {
   const scope = currentScope();
   if (stopping.value || !canStopPerformanceRun(run.value?.status)) return;
@@ -708,6 +793,7 @@ async function stopRun() {
 watch([projectId, runId], () => {
   scopeEpoch += 1;
   stopPolling();
+  exporting.value = false;
   run.value = null;
   project.value = null;
   pollError.value = "";
@@ -718,6 +804,7 @@ watch([projectId, runId], () => {
 onMounted(loadRun);
 onBeforeUnmount(() => {
   scopeEpoch += 1;
+  exporting.value = false;
   stopping.value = false;
   stopPolling();
 });

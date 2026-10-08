@@ -114,6 +114,24 @@ class PerformanceManagementAPITests(TestCase):
         wrong_type = f'/api/v1/projects/{self.api_project.pk}/performance/config/'
         self.assertEqual(self.client.get(wrong_type).status_code, 404)
 
+    def test_plan_acceptance_targets_are_optional_strict_and_patch_preserved(self):
+        self.auth(self.editor)
+        payload = self.valid_plan(self.create_target())
+        payload['acceptance_targets'] = {'p95_ms': 500, 'error_rate_percent': 0, 'rps_min': 10}
+        response = self.client.post(self.path('plans/'), payload, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        plan_id = response.data['data']['id']
+        path = self.path(f'plans/{plan_id}/')
+        patched = self.client.patch(path, {'name': 'renamed'}, format='json')
+        self.assertEqual(patched.data['data']['acceptance_targets'], payload['acceptance_targets'])
+        for targets in (None, [], {'unknown': 1}, {'p95_ms': 0}, {'p95_ms': True},
+                        {'rps_min': '20'}, {'error_rate_percent': 101}):
+            with self.subTest(targets=targets):
+                rejected = self.client.patch(path, {'acceptance_targets': targets}, format='json')
+                self.assertEqual(rejected.status_code, 400, rejected.data)
+        cleared = self.client.patch(path, {'acceptance_targets': {}}, format='json')
+        self.assertEqual(cleared.data['data']['acceptance_targets'], {})
+
     def test_only_admin_manages_targets_but_members_can_read(self):
         self.auth(self.editor)
         denied = self.client.post(self.path('targets/'), {

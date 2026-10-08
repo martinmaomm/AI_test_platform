@@ -34,6 +34,15 @@
           }}</el-tag></template
         ></el-table-column
       >
+      <el-table-column label="性能验收" min-width="160"
+        ><template #default="{ row }"
+          ><el-tag
+            v-if="row.mode === 'load'"
+            :type="acceptanceType(row.acceptance?.status)"
+            >{{ acceptanceLabel(row.acceptance?.status) }}</el-tag
+          ><span v-else>—</span></template
+        ></el-table-column
+      >
       <el-table-column label="请求 / 失败" min-width="120"
         ><template #default="{ row }"
           >{{ row.latest_metrics?.requests ?? "-" }} /
@@ -79,6 +88,7 @@ import {
   validationStatusType,
 } from "./performanceExecutionState";
 
+import { acceptanceLabel, acceptanceType } from "./performanceAcceptanceState";
 const router = useRouter();
 const authStore = useAuthStore();
 const projectStore = useProjectStore();

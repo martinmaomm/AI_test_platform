@@ -297,6 +297,22 @@ export const analysisEvidenceUnit = (evidence = {}) =>
   "";
 export const displayEvidenceValue = (value) => {
   if (!value || typeof value !== "object") return displayAnalysisValue(value);
+  if (
+    Object.hasOwn(value, "sample_count") &&
+    Object.hasOwn(value, "rule_kind")
+  ) {
+    const types = {
+      null: "null",
+      boolean: "布尔",
+      number: "数值",
+      string: "字符串",
+      object: "对象",
+      list: "列表",
+      unknown: "未记录",
+      missing_marker: "缺失标记形态（需核对）",
+    };
+    return `去重样本 ${value.sample_count} 条（非失败请求次数）；期望值类型：${types[value.expected_meta?.type] || "未记录"}；实际值类型：${types[value.actual_meta?.type] || "未记录"}。${value.suggestion || ""}`;
+  }
   if (Array.isArray(value)) {
     const dependencies = value
       .filter(

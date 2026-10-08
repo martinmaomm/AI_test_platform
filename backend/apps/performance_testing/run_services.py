@@ -397,6 +397,7 @@ def create_run(project, plan_id, node_ids, request_id, created_by, mode='load'):
         created_by=created_by,
         request_id=request_id,
         mode=mode,
+        acceptance_targets=deepcopy(plan.acceptance_targets) if mode == PerformanceRun.Mode.LOAD else {},
         validation_key=allocations[0]['validation_key'] if len(allocations) == 1 else '',
     )
     snapshot, digest = _snapshot_for(run.pk, plan, allocations, mode)

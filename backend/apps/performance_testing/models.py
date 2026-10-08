@@ -53,6 +53,7 @@ class PerformancePlan(models.Model):
     )
     variables = models.JSONField(default=dict)
     unique_variables = models.JSONField(default=list)
+    acceptance_targets = models.JSONField(default=dict, blank=True)
     steps = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -177,6 +178,8 @@ class PerformanceRun(models.Model):
     )
     snapshot = models.JSONField(default=dict)
     snapshot_sha256 = models.CharField(max_length=64)
+    # Report-only snapshot: never enters the signed node execution contract.
+    acceptance_targets = models.JSONField(default=dict, blank=True, editable=False)
     latest_metrics = models.JSONField(default=dict, blank=True)
     metrics_samples = models.JSONField(default=list, blank=True)
     reason_code = models.CharField(max_length=64, blank=True, default='')

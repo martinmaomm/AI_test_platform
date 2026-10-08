@@ -87,6 +87,17 @@ class PerformanceAnalysisAPITests(TestCase):
         payload.update(overrides)
         return payload
 
+    def test_omitted_analysis_targets_use_frozen_run_goals(self):
+        self.run.acceptance_targets = {'error_rate_percent': 0, 'p95_ms': 400}
+        self.run.save(update_fields=['acceptance_targets'])
+        payload = self._payload()
+        payload.pop('targets')
+        with patch('performance_testing.tasks.run_performance_analysis_async.apply_async'), self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(self._path(), payload, format='json')
+        self.assertEqual(response.status_code, 202, response.data)
+        analysis = PerformanceAnalysis.objects.get(pk=response.data['data']['id'])
+        self.assertEqual(analysis.targets, self.run.acceptance_targets)
+
     def test_create_list_and_detail_expose_only_safe_contract(self):
         payload = self._payload()
         with patch(

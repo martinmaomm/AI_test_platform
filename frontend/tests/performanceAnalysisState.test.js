@@ -27,6 +27,18 @@ import {
   isAnalysisActive,
 } from "../src/views/perf-testing/performanceAnalysisState.js";
 
+test("formal failure evidence identifies sample counts and preserves uncertain value types", () => {
+  const text = displayEvidenceValue({
+    step_index: 1, rule_kind: "assertion", sample_count: 2,
+    expected_meta: { type: "number" }, actual_meta: { type: "missing_marker" },
+    suggestion: "检查单用户验证", unexpected_secret: "never-render-this",
+  });
+  assert.match(text, /非失败请求次数/);
+  assert.match(text, /缺失标记形态（需核对）/);
+  assert.match(text, /检查单用户验证/);
+  assert.doesNotMatch(text, /never-render-this/);
+});
+
 test("only finished formal load runs can display AI analysis", () => {
   assert.equal(
     canAnalyzePerformanceRun({ mode: "load", status: "completed" }),

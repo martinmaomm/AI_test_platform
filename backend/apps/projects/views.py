@@ -86,8 +86,19 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def destroy(self, request, *args, **kwargs):
-        """Lock and reject active performance projects before cleanup starts."""
+        """Lock and reject referenced security or active performance projects."""
         instance = self.get_object()
+        if instance.project_type == 'security':
+            with transaction.atomic():
+                queryset = self.filter_queryset(self.get_queryset()).select_for_update()
+                instance = get_object_or_404(queryset, pk=kwargs.get('pk'))
+                self.check_object_permissions(request, instance)
+                if instance.security_tasks.exists():
+                    message = '安全项目已有任务记录，需保留计划及测试证据，暂不支持删除。'
+                    return Response({'success': False, 'error': {'code': 'security_tasks_exist', 'message': message}},
+                                    status=status.HTTP_409_CONFLICT)
+                self.perform_destroy(instance)
+            return Response(status=status.HTTP_204_NO_CONTENT)
         if instance.project_type != 'perf':
             return super().destroy(request, *args, **kwargs)
 

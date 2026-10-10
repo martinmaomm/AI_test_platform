@@ -102,6 +102,25 @@ const routes = [
     ]
   },
 
+  {
+    path: '/security-testing/projects',
+    component: () => import('@/layouts/PortalLayout.vue'),
+    meta: { requiresAuth: true, layout: 'portal', title: '安全测试项目列表' },
+    children: [{ path: '', name: 'SecurityProjectList', component: () => import('@/views/security-testing/SecurityProjectList.vue') }]
+  },
+  {
+    path: '/security-testing',
+    component: () => import('@/layouts/MainLayout.vue'),
+    meta: { requiresAuth: true, layout: 'workspace', module: 'security', title: 'AI 安全测试', cache: false },
+    children: [
+      { path: '', redirect: '/security-testing/plans' },
+      { path: 'workspace', redirect: '/security-testing/plans' },
+      { path: 'plans', name: 'SecurityPlans', component: () => import('@/views/security-testing/SecurityWorkspace.vue'), meta: { title: '安全测试计划', cache: false } },
+      { path: 'tasks', name: 'SecurityTasks', component: () => import('@/views/security-testing/SecurityWorkspace.vue'), meta: { title: '安全任务记录', cache: false } },
+      { path: 'tasks/:taskId', name: 'SecurityTaskDetail', component: () => import('@/views/security-testing/SecurityTaskDetail.vue'), meta: { title: '安全任务详情', cache: false } }
+    ]
+  },
+
   // ========== 工作区模块 (WorkspaceLayout / MainLayout - 有动态侧边栏) ==========
 
   // 项目管理

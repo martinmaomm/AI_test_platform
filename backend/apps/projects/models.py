@@ -11,6 +11,7 @@ class Project(models.Model):
         ('api', _('API Testing')),
         ('web', _('Web Testing')),
         ('perf', _('Performance Testing')),
+        ('security', _('Security Testing')),
     ]
 
     name = models.CharField(_('project name'), max_length=200)

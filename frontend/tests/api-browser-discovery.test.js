@@ -621,8 +621,8 @@ test("browser discovery panel is feature-gated and hands off record ids with ver
   assert.match(source, /data-testid="api-browser-discovery-create-form"/);
   assert.match(source, /aria-label="完整页面 URL"/);
   assert.match(source, /默认自动识别页面实际发起的接口来源/);
-  assert.match(source, /自动确认仅覆盖页面直接发起的 fetch\/XHR/);
-  assert.match(source, /HTTP 重定向和跨站登录暂不支持/);
+  assert.match(source, /支持页面直接发起的 fetch\/XHR 与页面跳转/);
+  assert.match(source, /HTTP 重定向和复杂跨站登录仍可能由浏览器自动跟随/);
   assert.match(source, /跨主机接口的当前直接请求/);
   assert.match(source, /高级设置/);
   assert.match(source, /aria-label="手动 API origin（可选）"/);

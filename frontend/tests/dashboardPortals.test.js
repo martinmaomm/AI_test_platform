@@ -27,11 +27,12 @@ test("dashboard uses a fixed CSS grid and keeps performance before security test
   );
 });
 
-test("only the unavailable security portal remains grey and non-clickable", () => {
+test("security portal is enabled and opens its project list", () => {
   assert.match(
     source,
-    /const portalDisabled = \(i\) => \[["']portal-security["']\]\.includes\(i\)/,
+    /const portalDisabled = \(\) => false/,
   );
+  assert.match(source, /["']portal-security["']:\s*["']\/security-testing\/projects["']/);
   assert.match(source, /!portalDisabled\(item\.i\) && openPortal\(item\.i\)/);
   assert.match(source, /\.portal\.disabled/);
 });
@@ -42,9 +43,9 @@ test("performance portal enters its construction workspace without claiming exec
   assert.match(source, /["']portal-perf["']:\s*["']\/perf-testing\/projects["']/);
 });
 
-test("security placeholder has matching copy, icon and responsive grid areas", () => {
-  assert.match(source, /安全测试（开发中）/);
-  assert.match(source, /检测应用安全风险与常见漏洞，提供修复建议。/);
+test("security portal has matching copy, icon and responsive grid areas", () => {
+  assert.match(source, /AI 安全测试/);
+  assert.match(source, /规划认证、权限和配置检查，查看风险证据并导出报告。/);
   assert.match(source, /<Lock\s+v-else-if="item\.i === 'portal-security'"/);
   assert.match(source, /\.portal-security\s*\{\s*grid-area: security;/);
   assert.match(source, /"api web perf security"/);

@@ -260,6 +260,13 @@ const MENU_CONFIG = {
       }
     ]
   },
+  security: {
+    title: 'AI 安全测试',
+    items: [
+      { path: '/security-testing/plans', label: '安全测试计划' },
+      { path: '/security-testing/tasks', label: '任务记录' }
+    ]
+  },
   perf: {
     title: '性能测试',
     items: [
@@ -378,6 +385,7 @@ const currentModule = computed(() => {
   // 从路径推断模块（兜底，确保工作区路由总能正确显示菜单）
   if (route.path.startsWith('/api-testing')) return 'api'
   if (route.path.startsWith('/web-testing')) return 'web'
+  if (route.path.startsWith('/security-testing')) return 'security'
   if (route.path.startsWith('/perf-testing')) return 'perf'
   if (route.path.startsWith('/project')) return 'project'
   return null
@@ -413,6 +421,7 @@ const MODULE_PROJECT_LIST_PATH = {
   api: '/api-testing/projects',
   web: '/web-testing/projects',
   perf: '/perf-testing/projects',
+  security: '/security-testing/projects',
   project: '/project/project-list'
 }
 
@@ -428,6 +437,7 @@ const goBackToProjectList = () => {
 // -------- 菜单激活状态 --------
 const activeMenuIndex = computed(() => {
   const p = route.path
+  if (p.startsWith('/security-testing/tasks/')) return '/security-testing/tasks'
   // 动态路由兜底：详情页高亮对应父级菜单
   if (/^\/api-testing\/specs\/[^/]+/.test(p)) return '/api-testing/api-specs'
   if (p.startsWith('/api-testing/workspace/')) return '/api-testing/workspace'

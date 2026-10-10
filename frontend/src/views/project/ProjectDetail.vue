@@ -222,6 +222,7 @@ const getTypeText = (type) => {
     web: 'Web应用',
     mobile: '移动应用',
     api: 'API服务',
+    security: '安全测试',
     desktop: '桌面应用',
     other: '其他'
   }

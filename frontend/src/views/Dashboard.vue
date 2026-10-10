@@ -450,7 +450,7 @@ const portalTitle = (i) =>
   ({
     "portal-api": "API 自动化",
     "portal-web": "Web 自动化",
-    "portal-security": "AI 安全测试",
+    "portal-security": "AI 安全测试（建设中）",
     "portal-perf": "性能测试（建设中）",
     "portal-ai-config": "AI 实验室配置",
     "portal-settings": "全局系统设置",

@@ -4,7 +4,7 @@ AI测试平台是一个以项目为单位协作的测试平台，集成 **UI 自
 
 UI / API 已具备用例生成到重复执行的完整流程；性能测试支持独立 Docker 节点、业务断言、验收标准及离线报告，需要配置 HTTPS 节点入口和独立控制器。安全测试已有受控检查与证据报告的首版实现，首页仍标记为“建设中”，不代表完整的漏洞扫描或渗透测试能力。
 
-项目仍面向开发与授权测试环境。功能存在不等于已完成生产容量、安全性或所有目标网站的验收；实际验证范围以各模块验收记录为准。旧 APP 自动化 / MidScene 功能已移除，不再支持创建 APP 项目或 Appium 环境。
+项目仍面向开发与授权测试环境。功能存在不等于已完成生产容量、安全性或所有目标网站的验收；实际验证范围以各模块验收记录为准。
 
 [安装与配置](docs/installation.md) · [UI 自动化流程](#ui-自动化流程) · [API 自动化流程](#api-自动化流程) · [性能测试流程](#性能测试流程) · [安全测试首版](#安全测试首版建设中) · [项目知识库](#项目知识库流程) · [文档索引](#文档索引)
 
@@ -260,28 +260,9 @@ automation-platform/
 | --- | --- |
 | [安装与配置](docs/installation.md) | 从准备环境到启动服务、配置模型和排查故障 |
 | [安全测试指南](docs/security-testing-guide.md) | 首版检查流程、身份与资源证据配置、使用限制 |
-| [安全测试首版验收](docs/verification/2026-10-10-ai-security-testing-v1.md) | 隔离验证、本机激活及未覆盖的真实目标与模型效果 |
-| [性能验收与离线报告](docs/plans/2026-10-08-performance-acceptance-diagnosis-report.md) | 已实现的验收标准、轻量失败诊断、HTML 报告及验证边界 |
-| [性能多节点验收](docs/verification/2026-09-22-performance-multi-node.md) | 多节点调度、逐节点统计与验证范围 |
-| [性能吞吐量口径](docs/verification/2026-09-24-performance-throughput.md) | 平均吞吐量、区间峰值与采样局限 |
-| [性能测试第一批（历史）](docs/plans/2026-09-16-performance-phase1-node-access.md) | 初期节点接入设计，不代表当前全部能力 |
-| [性能测试第二批（历史）](docs/plans/2026-09-16-performance-phase1-execution.md) | 初期单节点执行与加密准入设计 |
-| [性能网页探索与断言验收](docs/verification/2026-09-18-performance-browser-discovery.md) | 真实接口导入、变量与断言、单用户验证、0.3.0 节点升级及已验证范围 |
-| [验证诊断与历史对比](docs/verification/2026-09-24-performance-diagnosis-comparison.md) | 新入口、对比口径、AI 数据边界及验证范围 |
 | [性能节点客户端](performance-node/README.md) | 独立安装、HTTPS 注册、心跳与身份持久化 |
 | [离线浏览器资源](backend/resource/README.md) | 指定版本的下载地址、目录布局和校验方式 |
-| [项目知识库指南](docs/project-knowledge-guide.md) | 资料处理、手工用例、问答和验收边界 |
-| [原生执行报告](docs/platform-native-reports.md) | UI / API / 计划任务报告规则 |
+| [项目知识库指南](docs/project-knowledge-guide.md) | 资料处理、手工用例和知识问答 |
 | [用户管理与项目分配](docs/user-management.md) | 管理员管理全部项目、普通用户多人协作、账号启停与项目分配 |
-| [优化与技术债](docs/TODO-OPT.md) | 已知限制、正式应用前的权限与隐私待办，以及已完成事项 |
 | [计划任务](docs/scheduled-tasks.md) | 顺序调度、Beat 心跳、暂停与防重复执行 |
 | [网页探索发现 API](docs/api-browser-discovery.md) | 无 Swagger 的采集、来源交接、启用配置和使用边界 |
-| [网页探索 API 验收](docs/api-browser-discovery-acceptance-2026-09-09.md) | 本地回归、真实模型/NAS、两次独立重跑与 Python 导出证据 |
-| [API 工作区全量复测记录](docs/api-workspace-live-retest-2026-09-08.md) | 2026-09-08 的实际测试证据与人工修正记录；不是所有环境和场景的质量保证 |
-| [API 系统回归清单与验收标准](docs/plans/2026-09-14-api-regression-checklist.md) | 三批执行顺序、59 项检查、真实联调样本与模块收尾标准；计划不代表已通过 |
-| [API 第一批隔离验收](docs/verification/2026-09-14-api-regression-batch1.md) | 2026-09-14 的测试维护、隔离回归、本机 MCP 证据及真实联调准备缺口 |
-| [API 第二批真实联调](docs/verification/2026-09-14-api-regression-batch2.md) | 真实模型、网页采集、独立重跑、导出及调度结果；多场景混入和计划报告排序两项待修问题 |
-| [API 缺陷修复与定向复测](docs/verification/2026-09-14-api-regression-fixes.md) | 多场景混入和报告排序已修复；记录新发现的同值更新问题及尚未完成的验收 |
-| [API 状态变化验收](docs/verification/2026-09-14-api-state-change-fix.md) | 同值更新问题的后续修复、真实改名和三次独立运行；保留原断言审核与整体验收边界 |
-
-设计讨论和历史实施方案保存在 `docs/plans/`、`docs/superpowers/`。安装与使用以当前指南和代码为准，不要直接照搬历史方案里的迁移或清理命令。

@@ -28,7 +28,7 @@ test("endpoint and scenario UI reuse the shared action-help tooltip for conseque
   assert.match(sources[3], /加入套件仅建立引用而不复制场景/);
   assert.match(sources[3], /删除会移除场景记录，无法从页面恢复/);
   assert.match(sources[4], /复制为独立副本到当前场景草稿/);
-  assert.match(sources[4], /插入动态值函数/);
+  assert.match(sources[4], /插入运行时变量/);
   assert.match(sources[4], /当前已保存的场景/);
   assert.match(sources[5], /依次执行前序步骤和当前草稿步骤/);
   assert.match(sources[5], /还需在场景编排页点击“保存”/);

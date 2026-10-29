@@ -4,14 +4,12 @@ import { readFile } from "node:fs/promises";
 
 const tlsOptionFiles = [
   "../src/components/api-workspace/WorkspaceConfigEditor.vue",
-  "../src/components/api-testing/RequestEditor.vue",
   "../src/components/APICaseEditDetail.vue",
   "../src/views/api-testing/EndpointTester.vue",
   "../src/views/api-testing/ScenarioOrchestratorPage.vue",
   "../src/components/scenario/ScenarioOrchestrator.vue",
   "../src/components/scenario/StepEditorDrawer.vue",
   "../src/views/api-testing/EndpointTestCases.vue",
-  "../src/views/api-testing/TestCases.vue",
   "../src/views/project/ProjectEnvironments.vue",
 ];
 

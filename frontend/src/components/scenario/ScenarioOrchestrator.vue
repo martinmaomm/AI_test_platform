@@ -64,7 +64,7 @@
               {{ localJSON.config._variablesList.length }} 个
             </el-tag>
             <div class="card-header-tip">可在步骤中通过 <code>${变量名}</code> 引用</div>
-            <ActionHelpTooltip label="场景变量操作" content="可添加、删除变量或插入动态值函数；变量修改属于当前草稿，保存后才可供场景步骤引用。" />
+            <ActionHelpTooltip label="场景变量操作" content="可添加、删除变量或插入运行时变量；变量修改属于当前草稿，保存后才可供场景步骤引用。" />
             <el-button
               style="margin-left: auto;"
               size="small"
@@ -99,14 +99,14 @@
             <span class="kv-sep">=</span>
             <el-input
               v-model="item.value"
-              placeholder="${get_random_phone()} 或固定值"
+              placeholder="${uuid4} 或固定值"
               size="small"
               class="vars-input-val"
               @input="markDirty"
             />
-            <!-- 插入 HttpRunner 函数 -->
+            <!-- 插入运行时变量 -->
             <el-dropdown @command="(fn) => insertVarToRow(i, fn)" trigger="click">
-              <el-button size="small" plain title="插入 HttpRunner 函数">
+              <el-button size="small" plain title="插入运行时变量">
                 <el-icon><MagicStick /></el-icon>
               </el-button>
               <template #dropdown>
@@ -523,6 +523,7 @@
 </template>
 
 <script setup>
+import { API_DYNAMIC_VARIABLES, apiCompatibilityIssue } from '@/utils/apiRuntimeContract'
 import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -547,6 +548,7 @@ const props = defineProps({
 const emit = defineEmits(['saved'])
 
 // -------- 本地 JSON 状态 --------
+const loadedCase = ref({})
 const localJSON = reactive({
   config: {
     name: '',
@@ -691,10 +693,12 @@ const initFromScenario = (scenario) => {
     rd = scenario.request_data
   }
 
+  loadedCase.value = rd || {}
   if (rd && (rd.config || rd.teststeps)) {
     const vars = rd.config?.variables ?? {}
     const headers = rd.config?.headers ?? {}
     localJSON.config = {
+      ...rd.config,
       name:      rd.config?.name     ?? scenario.title ?? '',
       base_url:  rd.config?.base_url ?? '',
       variables: vars,
@@ -757,35 +761,8 @@ const insertVarToRow = (rowIndex, fnText) => {
   markDirty()
 }
 
-// HttpRunner 常用函数列表（与 StepEditorDrawer 保持一致）
-const DYNAMIC_VARS = [
-  { group: '基础', items: [
-    { value: '${get_timestamp()}', label: '当前时间戳（毫秒）' },
-    { value: '${get_random_string(10)}', label: '随机字符串（10位）' },
-    { value: '${get_random_int(1, 100)}', label: '随机整数（1~100）' },
-    { value: '${get_uuid()}', label: 'UUID' },
-    { value: '${get_current_date()}', label: '当前日期（YYYY-MM-DD）' },
-    { value: '${get_future_date(30)}', label: '未来30天日期' },
-    { value: '${get_past_date(30)}', label: '过去30天日期' }
-  ]},
-  { group: '身份信息', items: [
-    { value: '${get_random_phone()}', label: '随机手机号' },
-    { value: '${get_random_name()}', label: '随机中文姓名' },
-    { value: '${get_random_id_card()}', label: '随机身份证号' },
-    { value: '${get_random_email()}', label: '随机邮箱' }
-  ]},
-  { group: '网络与设备', items: [
-    { value: '${get_random_ipv4()}', label: '随机 IPv4 地址' },
-    { value: '${get_random_mac_address()}', label: '随机 MAC 地址' }
-  ]},
-  { group: '金融与商业', items: [
-    { value: '${get_random_bank_card()}', label: '随机银行卡号' },
-    { value: '${get_random_company()}', label: '随机公司名称' }
-  ]},
-  { group: '地理位置', items: [
-    { value: '${get_random_address()}', label: '随机省市区地址' }
-  ]}
-]
+// 运行时变量列表（与 StepEditorDrawer 保持一致）
+const DYNAMIC_VARS = API_DYNAMIC_VARIABLES
 
 const onDragEnd = async () => {
   markDirty()
@@ -1227,6 +1204,8 @@ const saveScenario = async () => {
   const parsedHeaders = parseJsonField(localJSON.config._headersJson, '全局请求头')
   if (parsedHeaders === null) return
 
+  const issue = apiCompatibilityIssue({ ...loadedCase.value, config: { ...localJSON.config, variables: parsedVariables }, teststeps: localJSON.teststeps })
+  if (issue) { ElMessage.warning(issue); return }
   saving.value = true
   try {
     const configPayload = {

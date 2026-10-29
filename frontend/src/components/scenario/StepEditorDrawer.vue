@@ -90,7 +90,7 @@
                 </el-form-item>
                 <el-form-item label="请求 URL" required>
                   <el-input v-model="localStep.request.url" placeholder="如：/api/users/login 或 ${base_url}/path" />
-                  <div class="form-tip">支持 HttpRunner 变量引用：${variable_name}</div>
+                  <div class="form-tip">支持变量引用：${variable_name}</div>
                 </el-form-item>
 
                 <!-- Headers -->
@@ -125,7 +125,7 @@
                       <el-input v-model="item.value" placeholder="参数值，支持 ${变量名}" size="small" />
                       <!-- 插入变量/函数到当前参数值 -->
                       <el-dropdown trigger="click" @command="(cmd) => handleParamVarCommand(i, cmd)">
-                        <el-button size="small" plain title="插入变量或函数">
+                        <el-button size="small" plain title="插入变量">
                           <el-icon><MagicStick /></el-icon>
                         </el-button>
                         <template #dropdown>
@@ -145,17 +145,16 @@
                               </el-dropdown-item>
                               <el-dropdown-item divided disabled style="height:1px; padding:0;" />
                             </template>
-                            <!-- HttpRunner 函数 -->
+                            <!-- 运行时变量 -->
                             <template v-for="group in DYNAMIC_VARS" :key="group.group">
                               <el-dropdown-item disabled class="var-group-title">{{ group.group }}</el-dropdown-item>
                               <el-dropdown-item
                                 v-for="v in group.items"
-                                :key="v.value || v.funcName"
+                                :key="v.value"
                                 :command="v"
                               >
                                 <span class="var-name">
                                   {{ dynVarDisplay(v) }}
-                                  <span v-if="v.hasParams" class="param-hint">✎</span>
                                 </span>
                                 <span class="var-desc">{{ v.label }}</span>
                               </el-dropdown-item>
@@ -212,12 +211,11 @@
                             </el-dropdown-item>
                             <el-dropdown-item
                               v-for="v in group.items"
-                              :key="v.value || v.funcName"
+                              :key="v.value"
                               :command="v"
                             >
                               <span class="var-name">
                                 {{ dynVarDisplay(v) }}
-                                <span v-if="v.hasParams" class="param-hint">✎</span>
                               </span>
                               <span class="var-desc">{{ v.label }}</span>
                             </el-dropdown-item>
@@ -261,7 +259,7 @@
                     resize="vertical"
                     style="font-family: Consolas, Monaco, monospace; font-size: 12px;"
                   />
-                  <div v-if="bodyType === 'json'" class="form-tip">支持 HttpRunner 变量引用：${variable_name}</div>
+                  <div v-if="bodyType === 'json'" class="form-tip">支持变量引用：${variable_name}</div>
                 </el-form-item>
               </el-form>
             </el-tab-pane>
@@ -791,8 +789,9 @@
 </template>
 
 <script setup>
+import { API_DYNAMIC_VARIABLES, apiCompatibilityIssue } from '@/utils/apiRuntimeContract'
 import { ref, watch, computed, nextTick } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { Plus, Close, Edit, Check, ArrowDown, Document, QuestionFilled, MagicStick, VideoPlay, CopyDocument, InfoFilled, Aim } from '@element-plus/icons-vue'
 import MonacoEditor from '@/components/MonacoEditor.vue'
 import ActionHelpTooltip from '@/components/ActionHelpTooltip.vue'
@@ -1115,50 +1114,10 @@ const COMPARATORS = [
   { value: 'type_match', label: '类型匹配 (type)' }
 ]
 
-const DYNAMIC_VARS = [
-  { group: '基础', items: [
-    { value: '${get_timestamp()}', label: '当前时间戳（毫秒）' },
-    {
-      funcName: 'get_random_string', label: '随机字符串', hasParams: true,
-      defaultParams: '10', promptMsg: '请输入字符串长度（如接口要求 4-6 位，则输入 6）'
-    },
-    {
-      funcName: 'get_random_int', label: '随机整数', hasParams: true,
-      defaultParams: '1, 100', promptMsg: '请输入范围（最小值, 最大值），例如：1, 9999'
-    },
-    { value: '${get_uuid()}', label: 'UUID' },
-    { value: '${get_current_date()}', label: '当前日期（YYYY-MM-DD）' },
-    {
-      funcName: 'get_future_date', label: '未来日期', hasParams: true,
-      defaultParams: '30', promptMsg: '请输入未来天数（例如：7）'
-    },
-    {
-      funcName: 'get_past_date', label: '过去日期', hasParams: true,
-      defaultParams: '30', promptMsg: '请输入过去天数（例如：7）'
-    }
-  ]},
-  { group: '身份信息', items: [
-    { value: '${get_random_phone()}', label: '随机手机号' },
-    { value: '${get_random_name()}', label: '随机中文姓名' },
-    { value: '${get_random_id_card()}', label: '随机身份证号' },
-    { value: '${get_random_email()}', label: '随机邮箱' }
-  ]},
-  { group: '网络与设备', items: [
-    { value: '${get_random_ipv4()}', label: '随机 IPv4 地址' },
-    { value: '${get_random_mac_address()}', label: '随机 MAC 地址' }
-  ]},
-  { group: '金融与商业', items: [
-    { value: '${get_random_bank_card()}', label: '随机银行卡号' },
-    { value: '${get_random_company()}', label: '随机公司名称' }
-  ]},
-  { group: '地理位置', items: [
-    { value: '${get_random_address()}', label: '随机省市区地址' }
-  ]}
-]
+const DYNAMIC_VARS = API_DYNAMIC_VARIABLES
 
 // 返回下拉项的展示文本
-const dynVarDisplay = (v) =>
-  v.value || `\${${v.funcName}(${v.defaultParams})}`
+const dynVarDisplay = (v) => v.value
 
 // -------- 本地步骤状态 --------
 const localStep = ref(null)
@@ -1216,7 +1175,7 @@ const formatAssertionLiteral = (value) => {
   return parsed !== value ? JSON.stringify(value) : value
 }
 
-// 将 HttpRunner step 转换为可编辑形态（含 _headers 等辅助字段）
+// 将 结构化请求 step 转换为可编辑形态（含 _headers 等辅助字段）
 const deserializeStep = (step) => {
   if (!step) return null
 
@@ -1325,10 +1284,10 @@ const deserializeStep = (step) => {
   }
 }
 
-// 将最终步骤序列化回 HttpRunner 格式
+// 将最终步骤序列化回 结构化请求 格式
 /**
  * 将步骤数组中所有 request.json 字符串安全地解析为对象。
- * 这是发送前的最后一道拦截，防止 HttpRunner 对字符串进行双重序列化。
+ * 这是发送前的最后一道拦截，防止 结构化请求 对字符串进行双重序列化。
  * @param {object[]} steps  待发送的 teststeps 数组（深拷贝后传入，避免污染源数据）
  * @returns {{ ok: boolean, steps?: object[], errMsg?: string }}
  */
@@ -1795,7 +1754,7 @@ const runToHere = async () => {
           ...configVariables,
           ...envVariables
         },
-        // 将环境全局请求头合并进 config.headers，确保 HttpRunner 全局生效
+        // 将环境全局请求头合并进 config.headers，确保 结构化请求 全局生效
         headers: {
           ...configHeaders,
           ...envHeaders
@@ -1805,6 +1764,8 @@ const runToHere = async () => {
       base_url: envBaseUrl
     }
 
+    const issue = apiCompatibilityIssue({ ...payload, config: { ...props.fullConfig, ...payload.config } })
+    if (issue) { ElMessage.warning(issue); return }
     const res = await debugScenarioSteps(props.projectId, payload)
     const stepResponses = res?.data?.step_responses || []
     if (stepResponses.length === 0) {
@@ -1840,9 +1801,9 @@ const debugRequestBodyJson = computed(() => {
   return JSON.stringify(body, null, 2)
 })
 
-// -------- HttpRunner 路径解析（用于 JSONPath 实时求值） --------
+// -------- 结构化请求 路径解析（用于 JSONPath 实时求值） --------
 /**
- * 解析 HttpRunner 风格的响应路径，如：
+ * 解析 结构化请求 风格的响应路径，如：
  *   status_code → 状态码
  *   body.data.token → response body 中的 data.token
  *   headers.Content-Type → 响应头
@@ -1936,58 +1897,9 @@ const insertDynamicVar = (varText) => {
 
 // JSON 请求体下拉菜单的统一处理器
 // item 可能是字符串（上下文变量）或 DYNAMIC_VARS 中的对象
-const handleBodyVarCommand = async (item) => {
-  if (typeof item === 'string') {
-    insertDynamicVar(item)
-    return
-  }
-  if (item.hasParams) {
-    try {
-      const { value: inputVal } = await ElMessageBox.prompt(
-        item.promptMsg,
-        `设置参数：${item.label}`,
-        {
-          confirmButtonText: '确定',
-          cancelButtonText: '取消',
-          inputValue: item.defaultParams,
-          inputValidator: (v) => v !== null && v.trim() !== '' || '参数不能为空',
-        }
-      )
-      insertDynamicVar(`\${${item.funcName}(${inputVal.trim()})}`)
-    } catch {
-      // 用户取消，不做任何操作
-    }
-  } else {
-    insertDynamicVar(item.value)
-  }
-}
+const handleBodyVarCommand = (item) => insertDynamicVar(typeof item === 'string' ? item : item.value)
 
-// Query 参数行下拉菜单的统一处理器
-const handleParamVarCommand = async (rowIndex, item) => {
-  if (typeof item === 'string') {
-    insertVarToParam(rowIndex, item)
-    return
-  }
-  if (item.hasParams) {
-    try {
-      const { value: inputVal } = await ElMessageBox.prompt(
-        item.promptMsg,
-        `设置参数：${item.label}`,
-        {
-          confirmButtonText: '确定',
-          cancelButtonText: '取消',
-          inputValue: item.defaultParams,
-          inputValidator: (v) => v !== null && v.trim() !== '' || '参数不能为空',
-        }
-      )
-      insertVarToParam(rowIndex, `\${${item.funcName}(${inputVal.trim()})}`)
-    } catch {
-      // 用户取消
-    }
-  } else {
-    insertVarToParam(rowIndex, item.value)
-  }
-}
+const handleParamVarCommand = (rowIndex, item) => insertVarToParam(rowIndex, typeof item === 'string' ? item : item.value)
 
 // -------- KV 编辑 --------
 const addKV = (field) => {
@@ -2057,6 +1969,8 @@ const handleSave = () => {
     return
   }
 
+  const issue = apiCompatibilityIssue({ teststeps: sanitized.steps })
+  if (issue) { ElMessage.warning(issue); return }
   emit('save', sanitized.steps[0], props.stepIndex)
 }
 </script>

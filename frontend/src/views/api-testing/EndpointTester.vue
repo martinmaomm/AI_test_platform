@@ -38,6 +38,8 @@
       <span class="banner-id">#{{ caseInfo.id }}</span>
     </div>
 
+    <el-alert v-if="compatibilityIssue" :title="compatibilityIssue" type="warning" :closable="false" show-icon />
+
     <!-- ===== 环境选择栏 ===== -->
     <div class="env-bar">
       <el-icon class="env-icon"><Cpu /></el-icon>
@@ -154,7 +156,7 @@
         API 规范
       </el-button>
       <ActionHelpTooltip label="API 规范" content="打开当前用例关联端点的只读规范详情，不会修改用例或发送请求。" />
-      <ActionHelpTooltip label="请求编辑操作" content="参数、请求头、Body、Hooks、变量提取和断言里的添加或删除先改本地草稿；只有点击保存才会写回用例。" />
+      <ActionHelpTooltip label="请求编辑操作" content="参数、请求头、Body、变量提取和断言里的添加或删除先改本地草稿；只有点击保存才会写回用例。" />
     </div>
 
     <!-- ===== 响应状态条 ===== -->
@@ -210,7 +212,7 @@
                       v-model="row.value"
                       :fetch-suggestions="queryDataGenSuggestions"
                       value-key="value"
-                      placeholder="固定值 或 ${get_random_phone()}"
+                      placeholder="固定值 或 ${uuid4}"
                       size="small"
                       class="mono-input hook-autocomplete"
                       trigger-on-focus
@@ -319,7 +321,7 @@
                       v-model="row.value"
                       :fetch-suggestions="queryDataGenSuggestions"
                       value-key="value"
-                      placeholder="固定值 或 ${get_timestamp()}"
+                      placeholder="固定值 或 ${timestamp_ns}"
                       size="small"
                       class="mono-input hook-autocomplete"
                       trigger-on-focus
@@ -394,7 +396,7 @@
                   <el-dropdown trigger="click" @command="insertToBody" popper-class="body-fn-dropdown">
                     <el-button size="small" text type="primary" class="body-insert-btn">
                       <el-icon style="margin-right:3px"><ArrowDown /></el-icon>
-                      快捷插入动态函数
+                      快捷插入运行时变量
                     </el-button>
                     <template #dropdown>
                       <el-dropdown-menu>
@@ -435,7 +437,7 @@
                         v-model="row.value"
                         :fetch-suggestions="queryDataGenSuggestions"
                         value-key="value"
-                        placeholder="固定值 或 ${get_random_string(8)}"
+                        placeholder="固定值 或 ${uuid4}"
                         size="small"
                         class="mono-input hook-autocomplete"
                         trigger-on-focus
@@ -491,146 +493,6 @@
                 <el-icon><InfoFilled /></el-icon>
                 该请求不含 Body
               </div>
-            </div>
-          </el-tab-pane>
-
-          <!-- ---- Setup 钩子 ---- -->
-          <el-tab-pane name="setup_hooks">
-            <template #label>
-              <span>Setup 钩子
-                <el-badge
-                  v-if="requestData.setup_hooks_rows.filter(h => h.hook.trim()).length"
-                  :value="requestData.setup_hooks_rows.filter(h => h.hook.trim()).length"
-                  class="tab-badge"
-                />
-              </span>
-            </template>
-            <div class="tab-body">
-              <el-alert type="warning" :closable="false" class="hooks-alert">
-                <template #title>
-                  <strong>【核心差异】与 Postman 的 Pre-request Script 完全不同！</strong>
-                </template>
-                <div class="hooks-alert-desc">
-                  <p><strong class="warn-no-js">⚠ 请勿在此编写 JavaScript 代码！</strong></p>
-                  <p>HttpRunner 采用原生函数调用机制。请直接使用 <code>${'$'}{函数名()}</code> 语法，调用项目 <code>debugtalk.py</code> 中预定义的 Python 函数。</p>
-                  <p>例如：使用 <code>${'$'}{sign_request($request)}</code> 在请求发出前瞬间完成动态签名。</p>
-                </div>
-              </el-alert>
-              <el-table :data="requestData.setup_hooks_rows" border size="small" class="kv-table hooks-table">
-                <el-table-column label="函数调用（setup_hooks）">
-                  <template #default="{ row }">
-                    <el-autocomplete
-                      v-model="row.hook"
-                      :fetch-suggestions="queryHookSuggestions"
-                      value-key="value"
-                      placeholder="${init_data()}  — 点击或输入关键词搜索内置函数"
-                      size="small"
-                      class="mono-input hook-autocomplete"
-                      trigger-on-focus
-                      clearable
-                      popper-class="hook-suggestion-popper"
-                    >
-                      <template #default="{ item }">
-                        <div class="hook-suggestion-item">
-                          <code class="hook-fn-name">{{ item.value }}</code>
-                          <span class="hook-fn-desc">{{ item.desc }}</span>
-                        </div>
-                      </template>
-                    </el-autocomplete>
-                  </template>
-                </el-table-column>
-                <el-table-column width="50" align="center" label="删">
-                  <template #default="{ $index }">
-                    <el-button
-                      type="danger"
-                      link
-                      size="small"
-                      @click="requestData.setup_hooks_rows.splice($index, 1)"
-                    >
-                      <el-icon><Delete /></el-icon>
-                    </el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-              <el-button
-                size="small"
-                text
-                type="primary"
-                class="add-row-btn"
-                @click="requestData.setup_hooks_rows.push({ hook: '' })"
-              >
-                + 添加 Setup 钩子
-              </el-button>
-            </div>
-          </el-tab-pane>
-
-          <!-- ---- Teardown 钩子 ---- -->
-          <el-tab-pane name="teardown_hooks">
-            <template #label>
-              <span>Teardown 钩子
-                <el-badge
-                  v-if="requestData.teardown_hooks_rows.filter(h => h.hook.trim()).length"
-                  :value="requestData.teardown_hooks_rows.filter(h => h.hook.trim()).length"
-                  class="tab-badge"
-                />
-              </span>
-            </template>
-            <div class="tab-body">
-              <el-alert type="warning" :closable="false" class="hooks-alert">
-                <template #title>
-                  <strong>【核心差异】与 Postman 的 Tests 脚本完全不同！</strong>
-                </template>
-                <div class="hooks-alert-desc">
-                  <p><strong class="warn-no-js">⚠ 请勿在此编写 JavaScript 断言代码！</strong></p>
-                  <p>断言请移步<strong>"断言验证" Tab</strong>。此处专门用于通过 <code>${'$'}{函数名()}</code> 调用 Python 函数来处理响应前置逻辑。</p>
-                  <p>例如：使用 <code>${'$'}{decrypt_response($response)}</code> 将加密的响应报文解密，以便后续的变量提取和断言能够正常读取明文。</p>
-                </div>
-              </el-alert>
-              <el-table :data="requestData.teardown_hooks_rows" border size="small" class="kv-table hooks-table">
-                <el-table-column label="函数调用（teardown_hooks）">
-                  <template #default="{ row }">
-                    <el-autocomplete
-                      v-model="row.hook"
-                      :fetch-suggestions="queryHookSuggestions"
-                      value-key="value"
-                      placeholder="${clear_data()}  — 点击或输入关键词搜索内置函数"
-                      size="small"
-                      class="mono-input hook-autocomplete"
-                      trigger-on-focus
-                      clearable
-                      popper-class="hook-suggestion-popper"
-                    >
-                      <template #default="{ item }">
-                        <div class="hook-suggestion-item">
-                          <code class="hook-fn-name">{{ item.value }}</code>
-                          <span class="hook-fn-desc">{{ item.desc }}</span>
-                        </div>
-                      </template>
-                    </el-autocomplete>
-                  </template>
-                </el-table-column>
-                <el-table-column width="50" align="center" label="删">
-                  <template #default="{ $index }">
-                    <el-button
-                      type="danger"
-                      link
-                      size="small"
-                      @click="requestData.teardown_hooks_rows.splice($index, 1)"
-                    >
-                      <el-icon><Delete /></el-icon>
-                    </el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-              <el-button
-                size="small"
-                text
-                type="primary"
-                class="add-row-btn"
-                @click="requestData.teardown_hooks_rows.push({ hook: '' })"
-              >
-                + 添加 Teardown 钩子
-              </el-button>
             </div>
           </el-tab-pane>
 
@@ -835,7 +697,7 @@
             </div>
           </el-tab-pane>
 
-          <!-- ---- HttpRunner 脚本预览（只读，实时反组装） ---- -->
+          <!-- ---- 结构化请求 脚本预览（只读，实时反组装） ---- -->
           <el-tab-pane name="script-preview">
             <template #label>
               <span class="preview-tab-label">
@@ -846,7 +708,7 @@
             <div class="tab-body script-preview-tab">
               <div class="hooks-hint">
                 <el-icon><InfoFilled /></el-icon>
-                实时预览当前表单对应的完整 HttpRunner 测试用例 JSON；点击「保存」即将此内容写入 script_content 字段
+                实时预览当前表单对应的完整结构化请求配置 JSON；点击「保存」即将此内容写入 script_content 字段
               </div>
               <div class="script-preview-toolbar">
                 <el-tag type="success" size="small" effect="plain">只读 · 实时同步</el-tag>
@@ -1097,24 +959,24 @@
             </div>
           </el-tab-pane>
 
-          <!-- ---- HttpRunner 预览 ---- -->
-          <el-tab-pane name="hr-preview" label="HR 预览">
+          <!-- ---- 结构化请求 预览 ---- -->
+          <el-tab-pane name="hr-preview" label="请求预览">
             <div class="tab-body">
               <div class="hooks-hint">
                 <el-icon><InfoFilled /></el-icon>
-                实时预览当前配置对应的 HttpRunner 单步 JSON 结构（只读）
+                实时预览当前配置对应的单步请求配置 JSON（只读）
               </div>
               <el-button
                 size="small"
                 text
                 type="primary"
                 style="margin-bottom:8px"
-                @click="copyToClipboard(httprunnerPreview)"
+                @click="copyToClipboard(requestPreview)"
               >
                 <el-icon><CopyDocument /></el-icon>
                 复制 JSON
               </el-button>
-              <pre class="resp-pre preview-pre">{{ httprunnerPreview }}</pre>
+              <pre class="resp-pre preview-pre">{{ requestPreview }}</pre>
             </div>
           </el-tab-pane>
 
@@ -1286,6 +1148,7 @@
 
 <script setup>
 import { ref, reactive, computed, watch, onMounted, nextTick } from 'vue'
+import { API_DYNAMIC_VARIABLES, apiCompatibilityIssue } from '@/utils/apiRuntimeContract'
 import { ElMessage } from 'element-plus'
 import {
   CaretRight, Timer, DataLine, InfoFilled, Delete,
@@ -1374,53 +1237,8 @@ onMounted(() => {
   if (props.projectId) fetchEnvironments()
 })
 
-// ===== 内置 Hook 函数列表（对齐 httprunner/builtin/functions.py）=====
-
-// ── 动作类钩子（有副作用，适合 setup_hooks / teardown_hooks）────────
-const actionHooks = [
-  { value: '${sleep(1)}',                       desc: '强制等待 N 秒，阻塞执行流' },
-  { value: '${sleep(3)}',                       desc: '强制等待 3 秒' },
-  { value: '${sign_request($request)}',         desc: '对请求做动态签名（Setup 专用）' },
-  { value: '${decrypt_response($response)}',    desc: '解密加密响应报文（Teardown 专用）' },
-  { value: '${init_data()}',                    desc: '初始化测试前置数据（自定义函数）' },
-  { value: '${clear_data()}',                   desc: '清理测试后置数据（自定义函数）' },
-]
-
-// ── 数据生成类函数（返回动态值，适合 Params / Headers / Body 参数化）
-const dataGenFunctions = [
-  // 时间
-  { value: '${get_timestamp()}',            desc: '当前 Unix 毫秒时间戳（13位）' },
-  { value: '${get_current_date()}',         desc: '当前日期 YYYY-MM-DD' },
-  { value: '${get_future_date(30)}',        desc: '未来 N 天的日期字符串' },
-  { value: '${get_past_date(30)}',          desc: '过去 N 天的日期字符串' },
-  // 唯一标识
-  { value: '${get_uuid()}',                 desc: '生成 UUID4 字符串' },
-  { value: '${get_random_string(8)}',       desc: '生成 N 位随机字母+数字' },
-  { value: '${gen_random_string(10)}',      desc: '同 get_random_string（原始版本）' },
-  { value: '${get_random_int(1, 100)}',     desc: '生成指定范围随机整数' },
-  // 用户信息
-  { value: '${get_random_phone()}',         desc: '生成随机中国大陆手机号' },
-  { value: '${get_random_name()}',          desc: '生成随机中文姓名' },
-  { value: '${get_random_id_card()}',       desc: '生成随机 18 位身份证号' },
-  { value: '${get_random_email()}',         desc: '生成随机邮箱地址' },
-  // 其他
-  { value: '${get_random_ipv4()}',          desc: '生成随机 IPv4 地址' },
-  { value: '${get_random_mac_address()}',   desc: '生成随机 MAC 地址' },
-  { value: '${get_random_bank_card()}',     desc: '生成随机银行卡号（Luhn 合法）' },
-  { value: '${get_random_company()}',       desc: '生成随机中文公司名' },
-  { value: '${get_random_address()}',       desc: '生成随机中文地址' },
-]
-
-/** Setup / Teardown 动作钩子搜索 */
-const queryHookSuggestions = (query, cb) => {
-  const q = (query || '').toLowerCase().trim()
-  cb(q
-    ? actionHooks.filter(item =>
-        item.value.toLowerCase().includes(q) || item.desc.toLowerCase().includes(q)
-      )
-    : actionHooks
-  )
-}
+// 当前请求运行器提供的内置变量。
+const dataGenFunctions = API_DYNAMIC_VARIABLES[0].items.map(item => ({ value: item.value, desc: item.label }))
 
 /** Params / Headers / Form-data value 数据生成函数搜索 */
 const queryDataGenSuggestions = (query, cb) => {
@@ -1473,7 +1291,7 @@ const COMPARATORS = [
   { value: 'regex_match', label: '正则 (regex_match)' },
 ]
 
-// ===== 核心响应式数据（严格对齐 HttpRunner 数据结构） =====
+// ===== 核心响应式数据（严格对齐 结构化请求 数据结构） =====
 
 const requestData = reactive({
   method: 'GET',
@@ -1483,8 +1301,6 @@ const requestData = reactive({
   bodyJson:           '',
   formData:           [],
   rawBody:            '',
-  setup_hooks_rows:   [],
-  teardown_hooks_rows:[],
   extract:            [],
   validate:           [],
 })
@@ -1572,7 +1388,7 @@ const handleSaveTitle = async () => {
  */
 const scriptConfig = ref({ name: '', base_url: '', variables: {} })
 
-// HttpRunner validate 内置比较器集合
+// 结构化请求 validate 内置比较器集合
 const KNOWN_COMPARATORS = new Set([
   'eq', 'ne', 'lt', 'le', 'gt', 'ge',
   'contains', 'startswith', 'endswith', 'regex_match',
@@ -1595,7 +1411,7 @@ const parseAssertionLiteral = (raw) => {
   const text = raw.trim()
   if (!text) return ''
 
-  // HttpRunner 变量表达式不能当作 JSON 字面量解析。
+  // 结构化请求 变量表达式不能当作 JSON 字面量解析。
   if (text.startsWith('$')) return raw
 
   // 双引号是字符串类型的显式标记，使用 JSON 规则解析转义字符。
@@ -1648,7 +1464,7 @@ const formatAssertionLiteral = (value) => {
 }
 
 /**
- * 解析一个 HttpRunner dict/list 参数表（params / headers）
+ * 解析一个 结构化请求 dict/list 参数表（params / headers）
  * 兼容格式：{key: value} 字典 或 [{key, value}] 列表
  */
 const parseDictOrListToRows = (raw) => {
@@ -1675,7 +1491,7 @@ const parseDictOrListToRows = (raw) => {
 }
 
 /**
- * 解析 HttpRunner extract 段
+ * 解析 结构化请求 extract 段
  * 兼容格式：{varName: expr} 字典 或 [{varName: expr}] 列表
  */
 const parseExtract = (raw) => {
@@ -1699,7 +1515,7 @@ const parseExtract = (raw) => {
 }
 
 /**
- * 解析 HttpRunner validate 段
+ * 解析 结构化请求 validate 段
  * 兼容格式一：{ eq: ["status_code", 200] }
  * 兼容格式二：{ check: "status_code", assert: "eq", expect: 200 }
  */
@@ -1735,12 +1551,11 @@ const parseValidate = (rawList) => {
 
 /**
  * 将 testCase 对象的 script_content 深度解析并写入 requestData。
- * script_content 格式（HttpRunner 标准）：
+ * script_content 格式（结构化请求 标准）：
  * {
  *   "config":    { "name": "...", "base_url": "...", "variables": {...} },
  *   "teststeps": [{ "name": "...", "request": { method, url, params, headers,
- *                   json/data }, "extract": {}, "validate": [...],
- *                   "setup_hooks": [], "teardown_hooks": [] }]
+ *                   json/data }, "extract": {}, "validate": [...] }]
  * }
  */
 const populateFromTestCase = (tc) => {
@@ -1824,15 +1639,6 @@ const populateFromTestCase = (tc) => {
     requestData.formData = []
     requestData.rawBody  = ''
   }
-
-  // ── setup_hooks / teardown_hooks ──────────────────────────────────
-  const toHookRows = (list) =>
-    (Array.isArray(list) ? list : list ? [list] : [])
-      .filter(Boolean)
-      .map(h => ({ hook: String(h) }))
-
-  requestData.setup_hooks_rows    = toHookRows(step?.setup_hooks)
-  requestData.teardown_hooks_rows = toHookRows(step?.teardown_hooks)
 
   // ── extract ───────────────────────────────────────────────────────
   requestData.extract = parseExtract(step?.extract)
@@ -1937,8 +1743,8 @@ const HTTP_STATUS_TEXT = {
 // ===== JSONPath 实时求值 =====
 
 /**
- * 对当前 response.value.body 做 HttpRunner 风格的点路径求值
- * HttpRunner 路径格式：status_code | body.data.id | body.list.0.name | headers.Content-Type
+ * 对当前 response.value.body 做 结构化请求 风格的点路径求值
+ * 结构化请求 路径格式：status_code | body.data.id | body.list.0.name | headers.Content-Type
  *
  * 返回：
  *   { status: 'empty' }              —— path 为空，不求值
@@ -2103,7 +1909,7 @@ const evaluateJsonPath = (path) => {
     return { status: 'error', msg: '响应体非合法 JSON' }
   }
 
-  // 构造根对象：对齐 HttpRunner 的寻址根节点
+  // 构造根对象：对齐 结构化请求 的寻址根节点
   const root = {
     status_code: response.value.status,
     body:        bodyParsed,
@@ -2293,6 +2099,7 @@ const specResponseJson = computed(() => {
 // ===== 发送（调试）操作 =====
 
 const handleSend = async () => {
+  if (compatibilityIssue.value) { ElMessage.warning(compatibilityIssue.value); return }
   if (caseHasMultipleSteps.value) {
     ElMessage.warning('多步骤用例请在 API 工作区编辑和调试完整流程，快捷编辑器不会执行部分步骤。')
     return
@@ -2414,12 +2221,12 @@ const handleSend = async () => {
       size:       bytesToHumanSize(new TextEncoder().encode(bodyStr).length),
       body:       bodyStr,
       headers:    respHeaders,
-      // 保存实际发出的请求（含变量替换后的值）供"HR 预览"等参考
+      // 保存实际发出的请求（含变量替换后的值）供"请求预览"等参考
       actualRequest: firstStep.request ?? null,
     }
 
     // ── 4. 提取结果 / 断言结果 ─────────────────────────────────────────
-    // 后端从 HttpRunner 的 StepData.export_vars 和 validators 中返回结果。
+    // 后端返回每一步的变量提取与断言结果。
     const rawExtractResult = firstStep.extract_result ?? firstStep.export_vars ?? null
     extractResult.value =
       rawExtractResult && typeof rawExtractResult === 'object'
@@ -2495,11 +2302,11 @@ const actualRequestBodyStr = computed(() => {
   try { return JSON.stringify(body, null, 2) } catch { return String(body) }
 })
 
-// ===== 公共辅助：将当前 requestData 组装成一个 HttpRunner step 对象 =====
+// ===== 公共辅助：将当前 requestData 组装成一个 结构化请求 step 对象 =====
 //
-// UI → HttpRunner JSON 的正向映射（与 populateFromTestCase 完全对称）
+// UI → 结构化请求 JSON 的正向映射（与 populateFromTestCase 完全对称）
 
-const buildHttpRunnerStep = (stepName = '测试步骤') => {
+const buildRequestStep = (stepName = '测试步骤') => {
   // params: 行列表 → {key: value} dict（过滤掉禁用行和空 key）
   const params = requestData.params
     .filter(p => p.enabled !== false && String(p.key ?? '').trim())
@@ -2520,8 +2327,6 @@ const buildHttpRunnerStep = (stepName = '测试步骤') => {
     .filter(v => String(v.check ?? '').trim())
     .map(v => ({ [v.comparator]: [v.check, parseAssertionLiteral(v.expect)] }))
 
-  const setupHooks    = requestData.setup_hooks_rows.map(r => r.hook).filter(Boolean)
-  const teardownHooks = requestData.teardown_hooks_rows.map(r => r.hook).filter(Boolean)
 
   // body: bodyJson / formData / rawBody → json / data / data
   let bodyField = {}
@@ -2551,17 +2356,15 @@ const buildHttpRunnerStep = (stepName = '测试步骤') => {
     name: stepName,
     request,
   }
-  for (const key of ['setup_hooks', 'teardown_hooks', 'extract', 'validate']) delete step[key]
-  if (setupHooks.length) step.setup_hooks = setupHooks
-  if (teardownHooks.length) step.teardown_hooks = teardownHooks
+  for (const key of ['extract', 'validate']) delete step[key]
   if (Object.keys(extractMap).length) step.extract = extractMap
   if (validators.length) step.validate = validators
   return step
 }
 
-// ===== previewScript：完整 HttpRunner 测试用例 JSON（UI → script_content）=====
+// ===== previewScript：完整结构化请求配置 JSON（UI → script_content）=====
 //
-//  requestData  ──buildHttpRunnerStep()──►  teststep
+//  requestData  ──buildRequestStep()──►  teststep
 //  scriptConfig  ──────────────────────►  config
 //  两者合并 ──JSON.stringify()──►  previewScript（存入 script_content 字段）
 //
@@ -2574,21 +2377,28 @@ const previewScript = computed(() => {
 
   const testcase = {
     config,
-    teststeps: [buildHttpRunnerStep(stepName)],
+    teststeps: [buildRequestStep(stepName)],
   }
 
   return JSON.stringify(testcase, null, 2)
 })
 
-// ===== HttpRunner 单步 JSON 预览（右侧响应区 HR 预览 Tab 用）=====
+// ===== 结构化请求 单步 JSON 预览（右侧响应区 请求预览 Tab 用）=====
 
-const httprunnerPreview = computed(() =>
-  JSON.stringify(buildHttpRunnerStep(caseInfo.value?.title || '测试步骤'), null, 2)
+const requestPreview = computed(() =>
+  JSON.stringify(buildRequestStep(caseInfo.value?.title || '测试步骤'), null, 2)
 )
+
+const compatibilityIssue = computed(() => {
+  let original = rawTestCase.value?.script_content || {}
+  try { if (typeof original === 'string') original = JSON.parse(original) } catch { return '原用例内容无法解析，请在 AI 工作区核对后再编辑。' }
+  return apiCompatibilityIssue({ ...original, config: scriptConfig.value, teststeps: [JSON.parse(requestPreview.value)] })
+})
 
 // ===== 保存：将 previewScript 写入 script_content 字段 =====
 
 const handleSave = async () => {
+  if (compatibilityIssue.value) { ElMessage.warning(compatibilityIssue.value); return }
   if (caseHasMultipleSteps.value) {
     ElMessage.warning('多步骤用例请在 API 工作区编辑完整流程，快捷编辑器不会保存部分步骤。')
     return

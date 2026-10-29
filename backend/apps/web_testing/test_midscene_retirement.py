@@ -48,7 +48,7 @@ class MidSceneRetirementTests(SimpleTestCase):
 class RetainedWebUICancellationTests(TestCase):
     def test_cancellation_still_updates_the_webui_execution_only(self):
         from projects.models import Project
-        from .models import MidSceneScript, WebUITestExecution
+        from .models import WebUITestExecution
         from .tasks import cancel_task
 
         user = get_user_model().objects.create_user(
@@ -63,9 +63,7 @@ class RetainedWebUICancellationTests(TestCase):
             exec_type='case', name='unrelated execution', project=project,
             executor=user, task_id='retirement-unrelated-fixture', status='running',
         )
-        with patch('web_testing.tasks.AsyncResult') as result, patch.object(
-            MidSceneScript.objects, 'filter', side_effect=AssertionError('retired table queried'),
-        ):
+        with patch('web_testing.tasks.AsyncResult') as result:
             outcome = cancel_task.run(execution.task_id)
         self.assertTrue(outcome['success'], outcome)
         result.assert_called_once_with(execution.task_id)

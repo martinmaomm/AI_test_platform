@@ -91,7 +91,7 @@ load_mcp_config → initialize_mcp → call_mcp → save_script
 
 ### 2.3 非目标
 
-- 不恢复 Firefox、WebKit、API 或 App 执行选项；WebUI 仍只使用 Chrome/Chromium。
+- 不恢复 Firefox、WebKit 或 API 执行选项；WebUI 仍只使用 Chrome/Chromium。
 - 不把 MCP 浏览器与 Python Playwright 执行器合并。
 - 不在探索阶段默认真实提交新增、编辑、删除、上传或下载操作。
 - 不在第一版引入视觉模型、向量模型或 RAG 依赖。

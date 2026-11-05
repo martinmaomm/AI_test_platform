@@ -6,7 +6,7 @@ UI / API 已具备用例生成到重复执行的完整流程；性能测试支�
 
 项目仍面向开发与授权测试环境。功能存在不等于已完成生产容量、安全性或所有目标网站的验收；实际验证范围以各模块验收记录为准。
 
-[安装与配置](docs/installation.md) · [UI 自动化流程](#ui-自动化流程) · [API 自动化流程](#api-自动化流程) · [性能测试流程](#性能测试流程) · [安全测试首版](#安全测试首版建设中) · [项目知识库](#项目知识库流程) · [文档索引](#文档索引)
+[安装与配置](docs/installation.md) · [整体技术架构](#整体技术架构) · [UI 自动化流程](#ui-自动化流程) · [API 自动化流程](#api-自动化流程) · [性能测试流程](#性能测试流程) · [安全测试首版](#安全测试首版建设中) · [项目知识库](#项目知识库流程) · [文档索引](#文档索引)
 
 ## 平台能做什么
 
@@ -40,7 +40,100 @@ UI / API 已具备用例生成到重复执行的完整流程；性能测试支�
 
 依赖以 [Python 清单](backend/requirements.txt)、[前端清单](frontend/package.json) 和 [前端锁文件](frontend/package-lock.json) 为准。
 
-两个 Playwright 用途不同：**Node MCP 用于探索，Python Playwright 用于执行**，浏览器版本和缓存目录分开配置。平台原生报告不依赖 Allure；当前 API 工作区和执行链路使用 requests，不再使用 HttpRunner 执行用例。
+两个 Playwright 用途不同：**Node MCP 用于探索，Python Playwright 用于执行**，浏览器版本和缓存目录分开配置。
+
+## 整体技术架构
+
+下图展示主要调用与数据关系。AI 编排和测试执行由不同服务承担，任务状态与运行证据统一保存到平台；图中的模块框不代表每个模块都单独部署。
+
+```mermaid
+flowchart TB
+    UI["Vue 3 前端<br/>目标描述 · 脚本编辑 · 调试 · 报告"]
+    API["Django / DRF / Channels<br/>权限校验 · 业务接口 · WebSocket"]
+    UI <-->|HTTP / WebSocket| API
+
+    subgraph scheduling["任务调度"]
+        BEAT["Celery Beat<br/>定时派发套件任务"]
+        REDIS["Redis<br/>任务队列 · 任务结果 · 实时消息"]
+        WORKER["Celery Worker<br/>领取任务并调用业务服务"]
+        BEAT -->|到期派发| REDIS
+        REDIS -->|领取任务| WORKER
+    end
+    API <-->|提交任务 / 实时进度| REDIS
+
+    subgraph ai["AI 工作流与 Agent 状态管理"]
+        SERVICE["生成 / 修复业务服务<br/>阶段推进 · 验证反馈 · 候选审核"]
+        GRAPH["LangGraph Agent 循环<br/>模型决策 → 工具调用 → 观察反馈"]
+        STATE["Agent 运行态<br/>消息上下文 · 页面观察 · 工具预算"]
+        LIFECYCLE["平台任务状态<br/>任务归属 · 心跳 · 版本 · 草稿检查点"]
+        MODEL["模型适配器 / LangChain<br/>流式调用所选 LLM 提供商"]
+        SERVICE -->|按需启动探索 Agent| GRAPH
+        GRAPH <-->|读取 / 更新| STATE
+        GRAPH <-->|推理与工具决策| MODEL
+        SERVICE <-->|场景生成 / 脚本整理与修复| MODEL
+        SERVICE <-->|持久化 / 恢复| LIFECYCLE
+        GRAPH -->|增量草稿与操作进度| LIFECYCLE
+    end
+    WORKER --> SERVICE
+
+    subgraph browser["浏览器工具与探索证据"]
+        MCP["mcp-use / MCP Client<br/>受控工具调用 · 顺序执行"]
+        BROWSER["Playwright MCP Server<br/>独立 Chromium 会话"]
+        TRACE["探索轨迹<br/>操作 · 页面信息 · 网络样本"]
+        MCP <-->|MCP 工具请求 / 结果| BROWSER
+        MCP -->|记录调用与观察| TRACE
+    end
+    GRAPH <-->|调用工具 / 接收观察| MCP
+
+    subgraph execution["测试执行服务"]
+        UIEXEC["UI 执行<br/>Python Playwright / pytest"]
+        APIEXEC["API 执行<br/>结构化步骤 / requests"]
+        SECEXEC["安全检查首版<br/>受控 GET / HEAD 与证据判定"]
+        RESULT["执行结果<br/>日志 · 截图 · 响应 · 断言"]
+        UIEXEC --> RESULT
+        APIEXEC --> RESULT
+        SECEXEC --> RESULT
+    end
+    WORKER -->|调试 / 用例 / 套件| UIEXEC
+    WORKER -->|验证 / 用例 / 套件| APIEXEC
+    WORKER -->|安全任务| SECEXEC
+    SERVICE -->|验证候选并读取结果| UIEXEC
+    SERVICE -->|验证候选并读取结果| APIEXEC
+    RESULT -.->|失败证据用于后续 AI 修复| SERVICE
+
+    subgraph performance["独立性能执行链路"]
+        CONTROL["Performance Controller<br/>领取压测任务 · 管理 Locust Master"]
+        AGENT["Docker 节点 Agent<br/>接收命令 · 管理 Worker 生命周期"]
+        LOCUST["Locust Worker<br/>并发请求 · 业务断言 · 指标采集"]
+        CONTROL <-->|HTTPS 管理通道，经平台节点接口| AGENT
+        AGENT -->|启动 / 停止| LOCUST
+        CONTROL <-->|Master / Worker 加密通道| LOCUST
+    end
+
+    subgraph storage["持久化与知识检索"]
+        DB[("MySQL / MariaDB<br/>项目 · 任务 · 草稿 · 快照 · 结果")]
+        FILES[("文件存储<br/>脚本 · 文档 · 日志 · 截图 · trace")]
+        KNOWLEDGE["项目知识服务<br/>文档处理 · 手工用例 · 问答"]
+        VECTOR[("Chroma / Milvus<br/>文档向量索引")]
+        KNOWLEDGE <-->|向量化 / 检索| VECTOR
+        KNOWLEDGE -->|来源与生成结果| DB
+    end
+    API <-->|业务数据 / 压测任务 / 报告| DB
+    LIFECYCLE --> DB
+    TRACE --> FILES
+    RESULT -->|结果与附件引用| DB
+    RESULT -->|日志与截图| FILES
+    CONTROL <-->|任务 / 节点命令 / 指标| DB
+    WORKER --> KNOWLEDGE
+    KNOWLEDGE <-->|基于资料生成 / 回答| MODEL
+```
+
+- **LangGraph 与 Agent**：浏览器探索使用 `BudgetedMCPAgent`，通过 LangChain `create_agent` 构建 LangGraph 执行图，围绕“模型决策—工具调用—观察反馈”循环。UI 探索在同一浏览器会话中顺序操作，并维护消息上下文、工具预算和增量草稿；业务服务还负责阶段推进、候选验证和有限修复。
+- **状态与恢复**：Agent 的消息和工具状态主要用于本轮运行；跨请求的任务归属、心跳、版本、草稿及检查点由平台数据库保存，完整探索轨迹保存到文件。当前恢复依赖平台保存的产物与现场确认，并未接入 LangGraph 数据库 checkpointer 来恢复整张执行图；重新探索会创建新的浏览器会话。
+- **调度与执行**：HTTP 接口或 Beat 派发任务，Celery Worker 调用生成、调试和执行服务。UI 脚本交给 Python Playwright，API 配置交给 requests；浏览器探索生成的候选仍需实际运行验证。失败证据可用于 AI 修复，候选经过用户审核后保存。
+- **性能与结果回传**：正式压测使用独立 Controller 和节点 Agent / Locust Worker。节点通过平台 HTTPS 接口领取命令、回报状态，Locust 通过独立加密通道与 Master 通信；数据库和文件保存结果，前端通过接口查询及适用流程的 WebSocket 更新展示进度与报告。
+
+主要代码入口：[Agent 图与预算](backend/apps/ai_core/mcp_agent_budget.py)、[UI 探索与草稿工具](backend/apps/web_testing/script_exploration_agent.py)、[任务检查点](backend/apps/web_testing/generation_repository.py)、[Celery 任务](backend/apps/web_testing/tasks.py)、[性能控制器](backend/apps/performance_testing/controller.py)。
 
 ## UI 自动化流程
 
